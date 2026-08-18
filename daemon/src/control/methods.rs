@@ -7504,7 +7504,7 @@ pub fn mcp_start_session(
         let p = st.config.mcp_server_path.clone();
         if p.trim().is_empty() { None } else { Some(p) }
     };
-    let (program, argv_tail) = crate::mcp_config::build_args(
+    let (program, argv_tail, pinned_session_id) = crate::mcp_config::build_args(
         &p.type_,
         &session_uid,
         None,
@@ -7563,6 +7563,21 @@ pub fn mcp_start_session(
     );
     full_params.insert("env".into(), Value::Object(env_obj));
     full_params.insert("session_type".into(), Value::String(p.type_.clone()));
+    // H1 (restart hardening): a fresh claude spawn carries a daemon-minted
+    // `--session-id` pin — stamp the matching transcript path NOW so the
+    // session is resumable from birth (claude creates `<pin>.jsonl` at
+    // process start), instead of waiting on the detector to observe a
+    // first turn that a restart might preempt.
+    if let Some(pin) = pinned_session_id.as_deref() {
+        if let Some(path) =
+            crate::transcript_detect::claude_transcript_path(&working_dir, pin)
+        {
+            full_params.insert(
+                "transcript_path".into(),
+                Value::String(path.to_string_lossy().into_owned()),
+            );
+        }
+    }
     // Width inheritance (see the caller-resolution block above):
     // pass the caller's live PTY size through so the delegated
     // `start_session` opens the child at that size instead of its
@@ -8086,7 +8101,7 @@ fn compose_daemon_spawn_params(
         }
         (other, _) => other,
     };
-    let (program, argv_tail) = crate::mcp_config::build_args(
+    let (program, argv_tail, pinned_session_id) = crate::mcp_config::build_args(
         engine,
         uid,
         None,
@@ -8118,6 +8133,21 @@ fn compose_daemon_spawn_params(
     );
     full.insert("env".into(), Value::Object(env_obj));
     full.insert("session_type".into(), Value::String(engine.to_string()));
+    // H1 (restart hardening): same eager transcript stamp as
+    // `mcp_start_session` — a fresh claude spawn's pin IS its transcript
+    // identity, so record it before the child even starts. Resumes keep
+    // their existing path (pin is None), and the detector's idempotent
+    // same-path re-push confirms either way.
+    if let Some(pin) = pinned_session_id.as_deref() {
+        if let Some(path) =
+            crate::transcript_detect::claude_transcript_path(working_dir, pin)
+        {
+            full.insert(
+                "transcript_path".into(),
+                Value::String(path.to_string_lossy().into_owned()),
+            );
+        }
+    }
     full.insert("cols".into(), Value::Number(cols.into()));
     full.insert("rows".into(), Value::Number(rows.into()));
     if let Some(tid) = task_id {
@@ -12067,7 +12097,13 @@ fn resolve_workflow_spawn_program(
             return Ok(ov);
         }
     }
+    // Workflow roles discard the H1 `--session-id` pin (third element):
+    // their lifecycle is engine-owned (fresh-context kills/respawns mint a
+    // new conversation per activation), so the detector remains the binding
+    // authority. The pin still rides in argv, making the transcript file
+    // name deterministic from process start.
     crate::mcp_config::build_args(session_type, uid, workflow, server_path_override, None)
+        .map(|(prog, args, _pin)| (prog, args))
 }
 
 #[cfg(test)]
@@ -18514,9 +18550,23 @@ mod tests {
                 "fresh restore has no `--resume`: {:?}",
                 argv,
             );
+            // H1: a fresh claude restore is no longer transcript-less — it
+            // gets a daemon-minted `--session-id` pin stamped eagerly as
+            // transcript_path, so even a never-turned session is resumable
+            // across the NEXT restart (the 2026-08-18 four-bug-workers gap).
+            let pin_pos = argv
+                .iter()
+                .position(|a| a == "--session-id")
+                .expect("fresh restore pins a session id");
+            let pin = argv[pin_pos + 1].clone();
+            let tp = params["transcript_path"]
+                .as_str()
+                .expect("fresh restore stamps the pinned transcript_path");
             assert!(
-                params.get("transcript_path").is_none(),
-                "fresh restore sets no transcript_path",
+                tp.ends_with(&format!("{}.jsonl", pin)),
+                "stamped path {:?} must name the pinned id {:?}",
+                tp,
+                pin,
             );
         });
     }

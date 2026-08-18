@@ -660,10 +660,21 @@ pub fn codex_overrides(
     ]
 }
 
-/// Map session_type → `(program, argv-tail)` for
+/// Map session_type → `(program, argv-tail, pinned-session-id)` for
 /// `mcp_start_session`. The argv-tail is appended to a Vec that
 /// starts with `program` — i.e. the caller does
 /// `let mut argv = vec![program]; argv.extend(argv_tail);`.
+///
+/// The third element is the daemon-minted `--session-id` pin: `Some`
+/// exactly for a FRESH claude-code spawn, `None` for resumes and the
+/// other engines. Pinning makes the transcript identity a spawn-time
+/// fact instead of a detection: claude creates `<pin>.jsonl` at process
+/// start (verified on 2.1.234 — the file exists even before auth), so a
+/// pinned session is resumable from birth. The 2026-08-18 incident's
+/// four bug workers were unresumable IN PRINCIPLE — killed before the
+/// detector ever saw a transcript, nothing to `--resume`. Callers stamp
+/// the pin as the session's `transcript_path`; the detector stays armed
+/// as verification (its same-path re-push is idempotent).
 ///
 /// Restricted to the three Python MCP tool types. Anything else
 /// → `Err(io::Error::Other)` so callers surface `InvalidParams`
@@ -674,7 +685,7 @@ pub fn build_args(
     workflow: Option<&WorkflowMeta>,
     server_path_override: Option<&str>,
     resume_session_id: Option<&str>,
-) -> std::io::Result<(String, Vec<String>)> {
+) -> std::io::Result<(String, Vec<String>, Option<String>)> {
     match session_type {
         "claude-code" => {
             let cfg = write_claude_mcp_config(session_uid, workflow, server_path_override)?;
@@ -696,11 +707,23 @@ pub fn build_args(
             // `tui/src/mcp_config.rs::claude_args` — `--resume <id>`
             // after `--mcp-config`. Claude APPENDS to the same `<id>.jsonl`
             // file, so the restored session's transcript_path is unchanged.
-            if let Some(sid) = resume_session_id {
-                args.push("--resume".to_string());
-                args.push(sid.to_string());
-            }
-            Ok(("claude".to_string(), args))
+            // Fresh spawns instead get a daemon-minted `--session-id` pin
+            // (hyphenated: the CLI requires "a valid UUID"); never both
+            // flags — a resume's identity IS the resumed id.
+            let pinned = match resume_session_id {
+                Some(sid) => {
+                    args.push("--resume".to_string());
+                    args.push(sid.to_string());
+                    None
+                }
+                None => {
+                    let pin = uuid::Uuid::new_v4().to_string();
+                    args.push("--session-id".to_string());
+                    args.push(pin.clone());
+                    Some(pin)
+                }
+            };
+            Ok(("claude".to_string(), args, pinned))
         }
         "codex" => {
             let mut args = Vec::new();
@@ -722,14 +745,16 @@ pub fn build_args(
             if let Some(sid) = resume_session_id {
                 args.push(sid.to_string());
             }
-            Ok(("codex".to_string(), args))
+            // No pin for codex: `--session-id` is a claude flag; codex
+            // transcript identity stays detector-bound.
+            Ok(("codex".to_string(), args, None))
         }
         "bash" => {
             // Raw shell. No MCP injection — bash sessions have
             // no agent, so there's nothing to wire up. The
             // session uid is still tracked by the daemon for
             // sidebar / kill-session / send_input purposes.
-            Ok(("/bin/bash".to_string(), Vec::new()))
+            Ok(("/bin/bash".to_string(), Vec::new(), None))
         }
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1073,7 +1098,7 @@ mod tests {
         std::fs::write(&server, "").unwrap();
         std::fs::write(srv_dir.join("hooks/cm_stop_hook.py"), "").unwrap();
 
-        let (_prog, args) = build_args(
+        let (_prog, args, _pin) = build_args(
             "claude-code",
             "ts-hooky",
             None,
@@ -1480,7 +1505,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("bash", "ts-bash-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("bash", "ts-bash-1", None, None, None).expect("ok");
         assert_eq!(prog, "/bin/bash");
         assert!(args.is_empty(), "bash spawns raw with no args");
     }
@@ -1490,7 +1515,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("claude-code", "ts-claude-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("claude-code", "ts-claude-1", None, None, None).expect("ok");
         assert_eq!(prog, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         let mcp_idx = args
@@ -1531,7 +1556,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) =
+        let (prog, args, _pin) =
             build_args("claude-code", "ts-rsm-1", None, None, Some("sid-abc")).expect("ok");
         assert_eq!(prog, "claude");
         assert!(
@@ -1539,6 +1564,47 @@ mod tests {
             "claude resume must append `--resume <id>`: {:?}",
             args,
         );
+        assert!(
+            _pin.is_none() && !args.iter().any(|a| a == "--session-id"),
+            "a resume's identity IS the resumed id — no `--session-id` pin: {:?}",
+            args,
+        );
+    }
+
+    // ---- H1 (restart hardening): fresh-spawn `--session-id` pin -------
+
+    #[test]
+    fn build_args_claude_fresh_pins_session_id() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args, pin) =
+            build_args("claude-code", "ts-pin-1", None, None, None).expect("ok");
+        assert_eq!(prog, "claude");
+        let pin = pin.expect("fresh claude spawn must return the minted pin");
+        assert!(
+            args.windows(2).any(|w| w[0] == "--session-id" && w[1] == pin),
+            "argv must carry `--session-id <returned pin>`: {:?}",
+            args,
+        );
+        // The CLI requires "a valid UUID" — hyphenated canonical form.
+        assert_eq!(pin.len(), 36, "hyphenated uuid, got {:?}", pin);
+        assert_eq!(pin.matches('-').count(), 4, "hyphenated uuid, got {:?}", pin);
+        assert!(!args.iter().any(|a| a == "--resume"));
+    }
+
+    #[test]
+    fn build_args_codex_and_bash_never_pin() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (_p, codex_args, codex_pin) =
+            build_args("codex", "ts-pin-2", None, None, None).expect("ok");
+        assert!(codex_pin.is_none());
+        assert!(!codex_args.iter().any(|a| a == "--session-id"));
+        let (_p2, bash_args, bash_pin) =
+            build_args("bash", "ts-pin-3", None, None, None).expect("ok");
+        assert!(bash_pin.is_none() && bash_args.is_empty());
     }
 
     #[test]
@@ -1546,7 +1612,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) =
+        let (prog, args, _pin) =
             build_args("codex", "ts-rsm-2", None, None, Some("sid-xyz")).expect("ok");
         assert_eq!(prog, "codex");
         assert_eq!(
@@ -1568,14 +1634,14 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (_p, claude) =
+        let (_p, claude, _pin) =
             build_args("claude-code", "ts-nr-1", None, None, None).expect("ok");
         assert!(
             !claude.iter().any(|a| a == "--resume"),
             "no `--resume` when not resuming: {:?}",
             claude,
         );
-        let (_p2, codex) = build_args("codex", "ts-nr-2", None, None, None).expect("ok");
+        let (_p2, codex, _pin) = build_args("codex", "ts-nr-2", None, None, None).expect("ok");
         assert_ne!(
             codex.first().map(String::as_str),
             Some("resume"),
@@ -1589,7 +1655,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("codex", "ts-codex-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("codex", "ts-codex-1", None, None, None).expect("ok");
         assert_eq!(prog, "codex");
         assert!(
             args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
@@ -1676,7 +1742,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let meta = WorkflowMeta { run_id: "wf_42", role: "reviewer" };
-        let (_prog, args) =
+        let (_prog, args, _pin) =
             build_args("claude-code", "ts-wf-1", Some(&meta), None, None).expect("ok");
         let mcp_idx = args
             .iter()
@@ -1765,7 +1831,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let meta = WorkflowMeta { run_id: "wf_99", role: "manager" };
-        let (_prog, args) =
+        let (_prog, args, _pin) =
             build_args("codex", "ts-wf-codex", Some(&meta), None, None).expect("ok");
         assert!(
             args.iter().any(|a| a.contains("CM_WORKFLOW_RUN_ID=\"wf_99\"")),
