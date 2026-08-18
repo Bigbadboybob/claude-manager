@@ -37,24 +37,34 @@
 //!   5. A **safe-point registration surface**
 //!      ([`RestartCoordinator::register_subsystem`] →
 //!      [`SafePointHandle`]) that long-running loops plug into:
-//!        - **Memory-cap watchers (R12)** — the first production
+//!        - **Memory-cap watchers (R12)** — the sole production
 //!          registrant (phase 4d): each watcher thread registers
 //!          `memcap-watcher:<uid>` and parks only at no-signal loop
 //!          tops, never between its SIGTERM and delayed SIGKILL (see
 //!          `session_watch::run_watcher`'s placement note).
-//!        - **Delivery writers (R10)**: park between writes — still
-//!          pending (audit gap 6, phase-2d completion).
+//!        - **Delivery writers (R10)** ended up NOT registering here:
+//!          phase 4h (audit gap 6) gated them through
+//!          `crate::writer_gate` instead — one-shot detached delivery
+//!          threads and per-connection attach loops are the worst fit
+//!          for handle churn, and a gate freeze also excludes a
+//!          holder already mid-write with zero registration.
 //!
-//!      The **reapers (2a, R4)** and **PTY readers (2b, R3)** do NOT
-//!      register here: they quiesce through their own exclusive gates
-//!      (`crate::reap_gate::freeze()` and the reader gate's twin),
-//!      which the restart sequence takes AFTER `wait_quiesced`
-//!      succeeds. A gate freeze is stronger than handle-parking — it
-//!      also excludes a holder already mid-consumption/mid-push, with
-//!      no per-thread registration — and it carries its own
+//!      The **reapers (2a, R4)**, **PTY readers (2b, R3)**, and — as
+//!      of phase 4h — the **PTY writers (R10, audit gap 6,
+//!      `crate::writer_gate`)** do NOT register here: they quiesce
+//!      through their own exclusive gates, which the restart sequence
+//!      takes AFTER `wait_quiesced` succeeds. A gate freeze is
+//!      stronger than handle-parking — it also excludes a holder
+//!      already mid-consumption/mid-push/mid-write, with no
+//!      per-thread registration (the writer paths are one-shot
+//!      detached threads and per-connection loops, exactly the shape
+//!      registration churn fits worst) — and it carries its own
 //!      lock-ordering rule: never take a freeze while holding the
 //!      state mutex (a reaper holds its permit across `on_exit`,
-//!      which takes that lock; see `crate::reap_gate`).
+//!      which takes that lock; see `crate::reap_gate`). The writer
+//!      gate adds a pause request + bounded freeze on top, because
+//!      writer units are seconds long and not structurally bounded —
+//!      see `crate::writer_gate`'s module docs.
 //!
 //! ## What is deliberately OUT of scope here
 //!
@@ -63,9 +73,10 @@
 //! body, and attach connections leave dispatch before their long-lived
 //! stream loop starts (see the guard-release note in
 //! `control/dispatch.rs`). Raw PTY writes arriving over an established
-//! attach stream are handled by the writer safe points of a later slice
-//! (R10) — they will register through the same [`SafePointHandle`]
-//! surface above.
+//! attach stream are fenced by the writer gate (phase 4h, R10):
+//! `InputHandle::write_and_stamp` takes a `crate::writer_gate` permit
+//! around every write, and `perform_reexec` freezes that gate after
+//! `wait_quiesced` — see `crate::writer_gate`.
 //!
 //! ## How this composes with `daemon.drain` (H3)
 //!
@@ -83,10 +94,13 @@
 //! `draining == true` when its body takes the state lock — so
 //! spawn-shaped work has either completed or will be refused. Mutations
 //! that drain does NOT gate (`send_input`, workflow transitions, …) can
-//! still start after the counter's zero-crossing; fencing those is what
-//! the writer safe points and the commit step of later slices are for.
-//! This slice's counter is the R2 fix (no half-spawned children), not
-//! the whole freeze.
+//! still start after the counter's zero-crossing; fencing their PTY
+//! writes is the writer gate's job (phase 4h, R10 — `crate::writer_gate`:
+//! a post-crossing `send_input`'s write parks at the paused/frozen gate
+//! and either proceeds after an abort or dies with the old image at
+//! exec, the documented dropped-connection contract). This slice's
+//! counter is the R2 fix (no half-spawned children), not the whole
+//! freeze.
 //!
 //! ## Lock ordering
 //!
@@ -203,8 +217,8 @@ impl RestartCoordinator {
             .entered_total
     }
 
-    /// Register a long-running subsystem (reaper, PTY reader, delivery
-    /// writer, memory-cap watcher) with the quiescence barrier. The
+    /// Register a long-running subsystem (e.g. a memory-cap watcher)
+    /// with the quiescence barrier. The
     /// returned handle is held by the subsystem's own thread, which
     /// polls [`SafePointHandle::pause_requested`] (or just calls
     /// [`SafePointHandle::park_if_requested`]) at each of its safe
@@ -218,11 +232,12 @@ impl RestartCoordinator {
     ///
     /// Production registrants: the memory-cap watchers
     /// (`memcap-watcher:<uid>`, phase 4d / R12 — see
-    /// `session_watch::run_watcher`); the delivery writers (R10) are
-    /// still pending (audit gap 6). The reapers (2a) and PTY readers
-    /// (2b) deliberately do NOT register — they quiesce via their own
-    /// exclusive gate freezes, taken by the restart sequence after
-    /// `wait_quiesced`; see the module doc and `crate::reap_gate`.
+    /// `session_watch::run_watcher`). The reapers (2a), PTY readers
+    /// (2b), and — as of phase 4h (R10, audit gap 6) — the PTY
+    /// writers deliberately do NOT register: they quiesce via their
+    /// own exclusive gate freezes (`crate::reap_gate`,
+    /// `crate::reader_gate`, `crate::writer_gate`), taken by the
+    /// restart sequence after `wait_quiesced`; see the module doc.
     pub fn register_subsystem(this: &Arc<Self>, name: &str) -> SafePointHandle {
         let mut reg = this.subsystems.lock().unwrap_or_else(|p| p.into_inner());
         let shared = Arc::new(SafePointShared {

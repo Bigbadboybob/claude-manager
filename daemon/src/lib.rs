@@ -78,6 +78,7 @@ pub mod state;
 pub mod transcript_detect;
 pub mod workflow;
 pub mod worktree;
+pub mod writer_gate;
 
 #[cfg(test)]
 mod test_support;

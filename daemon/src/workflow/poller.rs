@@ -855,6 +855,17 @@ impl WorkflowPoller {
                     quiet_window: Duration::from_millis(quiet_ms),
                 };
                 let guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+                // Restart quiescence (DESIGN_SEAMLESS_RESTART phase 4h,
+                // R10): each write below takes a `writer_gate` permit
+                // inside `write_and_stamp`, so a re-exec freeze never
+                // tears a `write_all`. Cross-write recovery is the
+                // durable `PendingActivation.phase` record — a write
+                // parked at the gate when the exec lands (this thread
+                // dies mid-tick, phase NOT yet advanced) is re-driven
+                // by the new image's drainer from disk. NO state lock
+                // is held here (cloned handle, see above) — that is
+                // load-bearing for the exec sequence's deadlock
+                // freedom, not just latency.
                 let step = crate::workflow::finalize::advance_finalization(
                     &ctx,
                     &guard,

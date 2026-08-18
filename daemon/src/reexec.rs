@@ -8,7 +8,9 @@
 //!
 //! Phase 3b wired the phase-2/3a primitives together — quiesce
 //! barrier (`crate::restart_coordinator`), reap/reader gate freezes
-//! (`crate::reap_gate` / `crate::reader_gate`), sealed FD manifest
+//! (`crate::reap_gate` / `crate::reader_gate`; phase 4h added the
+//! writer-gate pause + freeze, `crate::writer_gate` — R10, audit
+//! gap 6), sealed FD manifest
 //! (`crate::reexec_manifest`), non-killing adoption
 //! (`crate::adopt`) — around a real `execveat`, and proved PTY
 //! continuity through a real daemon re-exec with one live bash
@@ -130,21 +132,33 @@
 //!
 //! [`perform_reexec`] must be called holding NO state lock. The
 //! sequence is: quiesce barrier (waits on in-flight mutating RPCs,
-//! which need the state lock to finish) → reap-gate freeze →
-//! reader-gate freeze → brief state-lock holds for the manifest
-//! build. Freezes are taken lock-free per the reap-gate module's
-//! rule (a reaper holds its read permit ACROSS `on_exit`, which
-//! takes the state lock — a freezer holding that lock would deadlock
-//! against the very permit it waits out). The reap-before-reader
-//! freeze order is arbitrary and safe: the two gates' holder sets
-//! are disjoint (reapers take only the reap permit, readers only the
-//! reader permit, and no holder of either ever acquires the other
-//! gate), so there is no thread against which the two
-//! write-acquisitions could invert — each is bounded by a single
-//! in-flight consume/push unit. Taking the state lock AFTER the
-//! freezes is consistent with the only other gate+state path in the
-//! process (reaper: permit → state lock), so gate → state is a
-//! process-wide order.
+//! which need the state lock to finish) → writer pause + writer-gate
+//! freeze (phase 4h, R10 — bounded, aborts `restart_busy` on
+//! timeout) → reap-gate freeze → reader-gate freeze → brief
+//! state-lock holds for the manifest build. Freezes are taken
+//! lock-free per the reap-gate module's rule (a reaper holds its
+//! read permit ACROSS `on_exit`, which takes the state lock — a
+//! freezer holding that lock would deadlock against the very permit
+//! it waits out). The freeze order among the THREE gates is
+//! arbitrary and safe: their holder sets are pairwise disjoint —
+//! reapers take only the reap permit, readers only the reader
+//! permit, PTY writers only writer permits (`handle_session_exit`,
+//! the reaper's `on_exit` body, performs no PTY writes; readers only
+//! push to the fanout; delivery threads / attach input / the poller
+//! drainer never touch the reap or reader gates) — so there is no
+//! thread against which the write-acquisitions could invert. The
+//! writer freeze goes FIRST purely for hold time: it is the slow one
+//! (up to one in-progress delivery step, ~3s), and taking it before
+//! the reader freeze keeps the window in which chatty children can
+//! block on undrained PTY output buffers as short as ever. Taking
+//! the state lock AFTER the freezes is consistent with the only
+//! other gate+state paths in the process (reaper: permit → state
+//! lock; writers: handle cloned OUT of state, lock dropped, then
+//! permit → write — the `InputHandle` contract), so gate → state is
+//! a process-wide order. Writer-permit holders never take the state
+//! lock while parked or writing — that established contract is now
+//! load-bearing: a writer parked at the gate while holding the state
+//! lock would deadlock `exec_stage`'s post-freeze state-lock holds.
 
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -175,6 +189,23 @@ use crate::{reader_gate, reap_gate, restart_coordinator};
 /// generous for "every in-flight mutating RPC returns" — spawns are
 /// the slowest at ~1s worst case.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on the writer-gate freeze (phase 4h, R10). Unlike the reap /
+/// reader freezes — whose holds are microsecond consume/push units and
+/// therefore acquired blocking — a writer unit is seconds long
+/// (pause-aware deliveries finish within one in-progress step window,
+/// ~3s worst case) and NOT structurally bounded (a child that stopped
+/// draining its stdin wedges `write_all` against a full PTY input
+/// buffer indefinitely). 10s covers the honest worst case with margin;
+/// at the deadline the restart aborts `restart_busy` instead of
+/// hanging. Shrunk under `cfg(test)` so the in-binary wiring test
+/// (`perform_reexec_aborts_restart_busy_on_wedged_writer_unit`)
+/// doesn't stall the suite; the e2e exercises the real binary with the
+/// production value.
+#[cfg(not(test))]
+const WRITER_FREEZE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const WRITER_FREEZE_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// Bound on the `--verify-handoff` preflight subprocess (phase 4c).
 /// It parses small state files and runs the MCP selftest (which
@@ -306,9 +337,38 @@ pub fn perform_reexec(
     }
 
     // ---- Step (c): gate freezes, on this thread, lock-free. ----
-    // Taken AFTER wait_quiesced succeeded; both are bounded in
-    // practice by a single in-flight consume/push unit. Order and
-    // deadlock-freedom argued in the module docs.
+    // Taken AFTER wait_quiesced succeeded. Order and deadlock-freedom
+    // argued in the module docs; the three gates' holder sets are
+    // pairwise disjoint, so the order among them is safety-arbitrary —
+    // it is chosen for HOLD TIME: the writer freeze first (the slow
+    // one — up to an in-progress delivery step, ~3s worst case, and
+    // bounded-with-abort because a wedged `write_all` is unbounded),
+    // then the reap and reader freezes (microsecond consume/push
+    // units), keeping the reader-freeze hold — which is what lets
+    // chatty children block on full PTY output buffers — as short as
+    // ever.
+    //
+    // The writer pause (phase 4h, R10) is requested only NOW, after
+    // the mutation counter's zero-crossing: requesting it before
+    // `wait_quiesced` would deadlock-shape the barrier (a mutating
+    // dispatch parked at the writer door could never return, so the
+    // counter could never reach zero and every restart would abort
+    // `restart_busy`). From here, new PTY-input units park at the
+    // door, in-flight delivery units wrap up promptly at their next
+    // step boundary, and the freeze's bounded try_write poll
+    // converges. Dropping `writer_pause` on any abort path reopens
+    // the door — parked writers proceed as if nothing happened.
+    let writer_pause = crate::writer_gate::request_pause();
+    let writer_freeze =
+        match crate::writer_gate::freeze(&writer_pause, WRITER_FREEZE_TIMEOUT) {
+            Ok(f) => f,
+            Err(timeout) => {
+                let err = anyhow::anyhow!("{}", timeout);
+                drop(writer_pause);
+                guard.abort();
+                return err;
+            }
+        };
     let reap_freeze = reap_gate::freeze();
     let reader_freeze = reader_gate::freeze();
 
@@ -323,6 +383,8 @@ pub fn perform_reexec(
     let err = exec_stage(state, target, &target_fd, &rollback_fd, dry_schema_version);
     drop(reader_freeze);
     drop(reap_freeze);
+    drop(writer_freeze);
+    drop(writer_pause);
     guard.abort();
     err
 }
@@ -3612,6 +3674,73 @@ mod tests {
         assert!(!st.draining, "refusal must not leave the daemon draining");
         assert!(!st.restarting, "refusal must not latch `restarting`");
         assert!(st.sessions.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4h (R10, audit gap 6): writer-gate wiring
+    // ---------------------------------------------------------------
+
+    /// `perform_reexec` takes the writer-gate freeze after
+    /// `wait_quiesced` and ABORTS `restart_busy` — with full state
+    /// restore — when a PTY-write unit never finishes (the wedged
+    /// `write_all` case the bounded freeze exists for).
+    ///
+    /// Safety of running this in-binary: with the unit permit held,
+    /// the writer freeze times out (cfg(test)-shrunk
+    /// `WRITER_FREEZE_TIMEOUT`) BEFORE `exec_stage` runs, so no exec
+    /// can happen; and even if a bug let the freeze through, this
+    /// state has no `listener_raw_fd`, so `build_manifest` errors
+    /// long before `execveat`.
+    #[test]
+    fn perform_reexec_aborts_restart_busy_on_wedged_writer_unit() {
+        let _serial = crate::writer_gate::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+
+        // A delivery unit that never finishes — the stand-in for a
+        // `write_all` wedged against a full PTY input buffer.
+        let wedged_unit = crate::writer_gate::unit_permit();
+
+        // Target must PIN successfully (the refusal under test is the
+        // writer freeze, several steps later); /bin/true is a real
+        // executable everywhere this suite runs. skip_preflight: the
+        // preflight is 4c's concern and needs a real cm-daemon target.
+        let err = perform_reexec(&state, Path::new("/bin/true"), true);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("restart_busy"),
+            "wedged writer must abort as restart_busy: {}",
+            msg
+        );
+        assert!(
+            msg.contains("writer") || msg.contains("delivery"),
+            "the abort must name the writer gate as the holdout: {}",
+            msg
+        );
+
+        // Full restore: drain + restarting cleared, and the writer
+        // pause released (a leaked pause would park every future
+        // prompt delivery at the door forever).
+        {
+            let st = state.lock().unwrap();
+            assert!(!st.draining, "abort must un-drain");
+            assert!(!st.restarting, "abort must clear `restarting`");
+        }
+        assert!(
+            !crate::writer_gate::pause_requested(),
+            "abort must drop the writer pause (door reopened)"
+        );
+
+        // The gate itself is unharmed: with the wedged unit released,
+        // a fresh pause + freeze succeeds.
+        drop(wedged_unit);
+        let pause = crate::writer_gate::request_pause();
+        let frozen =
+            crate::writer_gate::freeze(&pause, Duration::from_secs(5))
+                .expect("gate healthy after the aborted restart");
+        drop(frozen);
+        drop(pause);
     }
 
     // ---------------------------------------------------------------

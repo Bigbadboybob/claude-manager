@@ -1259,6 +1259,70 @@ to = "manager"
         std::env::remove_var("HOME");
     }
 
+    /// DESIGN_SEAMLESS_RESTART phase 4h (R10, audit gap 6): the
+    /// writer-gate durability cross-check. A workflow activation whose
+    /// body write was cut BEFORE its first byte — the delivery thread
+    /// parked at the writer gate when the exec landed, so the
+    /// `Appended` phase is persisted but NOTHING reached the PTY — is
+    /// re-driven in full by the (new image's) poller from the durable
+    /// `PendingActivation.phase` record: gating never strands an
+    /// activation. Together with
+    /// `restart_at_body_sent_resumes_without_duplicate_body` (the
+    /// between-writes cut) this pins both halves of the gap-6 claim
+    /// that workflow deliveries degrade gracefully across a swap.
+    #[test]
+    fn activation_cut_before_first_byte_redrives_body_from_persisted_phase() {
+        let _g = env_guard();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let wt = home.path().join("wt");
+        let dir = claude_dir(home.path(), &wt);
+        write_transcript(&dir, "mgr", &[(true, "ok")]);
+
+        let wf = workflow();
+        seed_run(
+            "wf-cut-prebyte",
+            &wt,
+            "manager",
+            2,
+            TriggerKind::McpTransition { from_role: "reviewer".into(), prompt: "deliver me".into(), event_id: "e".into() },
+            "deliver me",
+            false,
+            &[("manager", Some("mgr"))],
+            vec![hist("worker", 1, Some("wkr"), 0)],
+        );
+
+        let tracker = PtyModeTracker::new();
+        // Old image: advance only until the phase record says Appended
+        // — the state persisted just BEFORE the body write. Stop there:
+        // the body write itself is the step the writer gate parked (and
+        // the exec then killed). Zero bytes must have reached the PTY.
+        let mut pre_writes = Vec::new();
+        loop {
+            let s = advance_finalization(&ctx("wf-cut-prebyte", &wf, &wt, 5_000, 0), &tracker, |b| { pre_writes.push(b.to_vec()); Ok(()) }).unwrap();
+            if s == FinalizeStep::Advanced(ActivationPhase::Appended) { break; }
+            assert!(matches!(s, FinalizeStep::Advanced(_)), "unexpected step: {:?}", s);
+        }
+        assert!(pre_writes.is_empty(), "nothing may reach the PTY before the Appended arm's body write: {:?}", pre_writes);
+        assert_eq!(
+            run::load_one("wf-cut-prebyte").unwrap().pending_activation.unwrap().phase,
+            ActivationPhase::Appended,
+            "durable record parked at Appended (body not yet written)"
+        );
+
+        // New image: a fresh drainer pass reloads from disk and drives
+        // the FULL delivery — body, then (gap 0) Enter — to Done.
+        let mut post_writes = Vec::new();
+        let s = drive(&ctx("wf-cut-prebyte", &wf, &wt, 6_000, 0), &tracker, &mut post_writes);
+        assert_eq!(s, FinalizeStep::Done);
+        assert_eq!(
+            post_writes,
+            vec![b"deliver me".to_vec(), b"\r".to_vec()],
+            "post-swap re-drive delivers body + Enter exactly once"
+        );
+        std::env::remove_var("HOME");
+    }
+
     // ---- TriggerKind survives a reload (no events re-read) ----------------
 
     #[test]

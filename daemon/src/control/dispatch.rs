@@ -364,9 +364,12 @@ pub fn dispatch_request(
     // `manifest.watch`, `events.subscribe`) is before the long-lived
     // stream loop in `handle_connection` starts, so an attached client
     // can never pin the counter. PTY input flowing over an established
-    // attach stream is deliberately NOT covered by this guard — that is
-    // the writer safe-points slice's job (R10); see the scope note in
-    // `crate::restart_coordinator`.
+    // attach stream is deliberately NOT covered by this guard — it is
+    // fenced by the writer gate instead (phase 4h, R10, audit gap 6:
+    // `InputHandle::write_and_stamp` takes a `crate::writer_gate`
+    // permit around every PTY write, and `perform_reexec` freezes that
+    // gate after `wait_quiesced`); see `crate::writer_gate` and the
+    // scope note in `crate::restart_coordinator`.
     //
     // The increment happens under a brief state-lock hold (released
     // before the method body) so it is ordered against the

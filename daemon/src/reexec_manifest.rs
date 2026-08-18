@@ -225,7 +225,16 @@ pub struct ReexecManifest {
 pub struct SessionRecord {
     /// Session uid — the registry key.
     pub uid: String,
-    /// Session generation (monotonic across revives).
+    /// Session TRANSCRIPT generation — the transcript-rotation
+    /// counter (`session.set_transcript_path` bumps it on rebinds,
+    /// e.g. /clear or /compact detection), carried so post-handoff
+    /// read cursors don't reset. NOT a session-identity counter: it
+    /// is reused across revives and says nothing about which
+    /// incarnation of a uid this is (identity is pidfd +
+    /// child_start_time). The holder/brain-split design doc flagged
+    /// the previous wording here ("monotonic across revives") as
+    /// drift — its O2 finding; a future process-identity counter
+    /// must be a separate field, never this one.
     pub generation: u64,
     /// Detected transcript id, when one exists — rehydrate
     /// cross-checks it against on-disk state.

@@ -2471,11 +2471,26 @@ fn stamp_now(cell: &SharedLastActivity) {
 impl InputHandle {
     /// Write `bytes` to the PTY then stamp activity. Stamp is
     /// AFTER the write so a failed write doesn't lie about
-    /// "session was active." Lock order: writer mutex first
-    /// (blocking I/O), then activity mutex (fast cell swap).
-    /// Both are released by the time this returns.
+    /// "session was active." Lock order: writer-gate permit first
+    /// (may park across a restart handoff window), then writer
+    /// mutex (blocking I/O), then activity mutex (fast cell swap).
+    /// All are released by the time this returns.
+    ///
+    /// DESIGN_SEAMLESS_RESTART phase 4h (R10): the write+flush pair
+    /// is one single-write unit under `crate::writer_gate` — the
+    /// permit is acquired HERE so every production PTY-input path is
+    /// fenced structurally (a future input path can no more skip the
+    /// gate than skip the stamp). A thread already holding a
+    /// delivery-unit permit (`deliver_agent_body`) gets a no-op —
+    /// see `writer_gate`'s reentrancy contract. This makes the
+    /// "clone the handle out, DROP the state lock, then write"
+    /// caller pattern load-bearing for restart deadlock-freedom (a
+    /// writer parked at the gate while holding the state lock would
+    /// deadlock the exec sequence's post-freeze state-lock holds),
+    /// not just for RPC latency.
     pub fn write_and_stamp(&self, bytes: &[u8]) -> std::io::Result<()> {
         {
+            let _permit = crate::writer_gate::write_permit();
             let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
             w.write_all(bytes)?;
             w.flush()?;
@@ -2538,6 +2553,39 @@ impl InputHandle {
             last_operator_input_at: Arc::new(Mutex::new(None)),
             last_input_at: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Test-only handle whose writes are captured per-call (one
+    /// `(Instant, Vec<u8>)` per `write_and_stamp`), so delivery-shape
+    /// tests can assert WHAT was written and WHEN — the phase-4h
+    /// (R10) pause-aware delivery tests key off this.
+    #[cfg(test)]
+    pub(crate) fn test_handle_capturing(
+    ) -> (Self, Arc<Mutex<Vec<(Instant, Vec<u8>)>>>) {
+        struct CapturingWriter(Arc<Mutex<Vec<(Instant, Vec<u8>)>>>);
+        impl std::io::Write for CapturingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((Instant::now(), buf.to_vec()));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured: Arc<Mutex<Vec<(Instant, Vec<u8>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let handle = InputHandle {
+            writer: Arc::new(Mutex::new(Box::new(CapturingWriter(
+                Arc::clone(&captured),
+            )))),
+            last_activity_at: Arc::new(Mutex::new(None)),
+            last_operator_input_at: Arc::new(Mutex::new(None)),
+            last_input_at: Arc::new(Mutex::new(None)),
+        };
+        (handle, captured)
     }
 
     /// Test-only read of the activity stamp.
@@ -2676,6 +2724,12 @@ impl DaemonSession {
     /// **Test code is fine** — tests don't have RPC contention.
     /// **Production code routes through the explicit clone-out
     /// pattern** in `control/stream.rs` and `control/methods.rs`.
+    /// This convenience also bypasses the restart writer gate
+    /// (`crate::writer_gate` — phase 4h, R10), which `InputHandle::
+    /// write_and_stamp` acquires; that is acceptable ONLY because no
+    /// production path calls this method (verified: all callers are
+    /// tests). New production input paths must go through
+    /// `InputHandle`.
     pub fn send_input(&self, bytes: &[u8]) -> std::io::Result<()> {
         let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         w.write_all(bytes)?;

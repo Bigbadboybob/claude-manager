@@ -75,10 +75,12 @@
 //! ## Scope
 //!
 //! This gate covers the PTY **output** path (reader threads) only.
-//! Writer paths (`send_input` etc.) are a separate quiesce concern —
-//! R10, phase 2d — and the exit-status path has its own gate
-//! ([`crate::reap_gate`]). The two gates are independent by design:
-//! freezing bytes must not stall reaping, and vice versa.
+//! Writer paths (`send_input`, prompt deliveries, attach-stream
+//! input) have their own gate — [`crate::writer_gate`], phase 4h
+//! (R10, audit gap 6) — and the exit-status path has
+//! [`crate::reap_gate`]. The three gates are independent by design
+//! (their holder sets are pairwise disjoint): freezing bytes must not
+//! stall reaping or input delivery, and vice versa.
 
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 

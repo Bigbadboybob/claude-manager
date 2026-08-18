@@ -6560,6 +6560,16 @@ const AGENT_SUBMIT_RETRIES: usize = 2;
 /// Mirrors the TUI's separate deferred-Enter write.
 const AGENT_ENTER_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// The body→Enter gap when a restart pause is in effect
+/// (DESIGN_SEAMLESS_RESTART phase 4h, R10): the delivery finishes its
+/// unit PROMPTLY — sub-second — instead of parking a quiescing restart
+/// behind the leisurely production gap. Deliberately NOT zero: an Enter
+/// back-to-back with the body is classified as paste tail by codex (see
+/// `fresh_reset::send_clear_body`'s deviation note), so a short floor is
+/// a correctness requirement, not a courtesy.
+const AGENT_ENTER_GAP_QUIESCE: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
 /// Typing-quiet gate: how long the OPERATOR must have been quiet on a
 /// session's attach stream before an agent-prompt delivery thread will
 /// write into its PTY. Injecting while a human is mid-keystroke
@@ -6709,6 +6719,177 @@ mod operator_quiet_tests {
     }
 }
 
+/// DESIGN_SEAMLESS_RESTART phase 4h (R10, audit gap 6): the
+/// restart-aware delivery unit. `deliver_agent_body` under a
+/// MID-DELIVERY pause request must complete its Enter promptly (short
+/// gap floor, never parked between body and Enter), skip the
+/// best-effort verify windows, and release its unit permit so the
+/// coordinator's writer freeze can land.
+///
+/// Honesty note on integration coverage: the reexec e2e's sessions are
+/// bash (its `send_input` path is a synchronous single write inside
+/// dispatch, covered by the mutation counter + a single-write permit),
+/// and a REAL multi-step delivery needs a claude-code/codex child the
+/// sandbox can't spawn — so the in-flight-delivery-at-exec-moment case
+/// is pinned HERE with a controllable fake writer (captured
+/// timestamps), plus the writer_gate unit tests and the
+/// `perform_reexec` wiring test in `reexec::tests`, rather than in the
+/// e2e where the timing cannot be made deterministic.
+#[cfg(test)]
+mod delivery_quiesce_tests {
+    use super::deliver_agent_body;
+    use crate::session::{InputHandle, PtyByteFanout};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// The R10 canonical case: an exec-shaped pause request landing
+    /// between a delivery's body and its Enter. The delivery must
+    /// finish the unit (Enter written — exactly one, verify retries
+    /// skipped) instead of parking mid-prompt, and the writer freeze
+    /// must then be admissible while the pause is still in effect.
+    #[test]
+    fn paused_mid_delivery_completes_enter_and_skips_verify() {
+        let _serial = crate::writer_gate::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (handle, captured) = InputHandle::test_handle_capturing();
+        // Open, never-fed fanout: mode is never observed (bounded
+        // settle, kitty-Enter fallback) and drain slices simply time
+        // out — the delivery's real pacing, without a PTY.
+        let fanout = Arc::new(PtyByteFanout::new(64));
+
+        let cap = Arc::clone(&captured);
+        let done: Arc<Mutex<Option<(bool, Instant)>>> =
+            Arc::new(Mutex::new(None));
+        let done_w = Arc::clone(&done);
+        let t = std::thread::spawn(move || {
+            let ok = deliver_agent_body(
+                &handle,
+                &fanout,
+                "ts-quiesce",
+                "line one\nline two",
+                false,
+                "prompt",
+            );
+            *done_w.lock().unwrap() = Some((ok, Instant::now()));
+        });
+
+        // Wait for the BODY write (first captured write), then request
+        // the pause — the mid-delivery moment.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if !cap.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "body write never happened"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pause = crate::writer_gate::request_pause();
+        let paused_at = Instant::now();
+
+        t.join().expect("delivery thread");
+        let (ok, finished_at) = done.lock().unwrap().expect("delivery ran");
+        assert!(ok, "delivery must report success");
+
+        let writes = captured.lock().unwrap().clone();
+        assert_eq!(
+            writes.len(),
+            2,
+            "exactly body + one Enter under a pause (verify retries \
+             skipped): {:?}",
+            writes
+                .iter()
+                .map(|(_, w)| String::from_utf8_lossy(w).into_owned())
+                .collect::<Vec<_>>()
+        );
+        let (body_t, body) = &writes[0];
+        let (enter_t, enter) = &writes[1];
+        // Multi-line body → bracketed paste; mode never observed →
+        // assume-kitty Enter.
+        assert!(body.starts_with(b"\x1b[200~") && body.ends_with(b"\x1b[201~"));
+        assert_eq!(enter.as_slice(), b"\x1b[13u");
+        // Never parked between body and Enter, and the gap was CUT to
+        // the short floor: well under the 1.5s production gap (the
+        // pause lands within ~ms of the body; the sliced gap observes
+        // it within 250ms and floors at 250ms — 1.3s leaves load
+        // margin while still discriminating from the full gap).
+        assert!(
+            enter_t.duration_since(*body_t) < Duration::from_millis(1300),
+            "gap not shortened under pause: {:?}",
+            enter_t.duration_since(*body_t)
+        );
+        // ...and the whole unit wrapped up promptly after the pause
+        // (no 3s verify windows: without the skip this would be ≥9s).
+        assert!(
+            finished_at.duration_since(paused_at) < Duration::from_secs(3),
+            "verify windows not skipped under pause: {:?}",
+            finished_at.duration_since(paused_at)
+        );
+
+        // The unit's permit is released: the coordinator's freeze is
+        // admissible while the pause still stands — the exec sequence
+        // can proceed with no thread between a unit's first and last
+        // byte.
+        let frozen = crate::writer_gate::freeze(&pause, Duration::from_secs(5))
+            .expect("freeze admitted after the unit completed");
+        drop(frozen);
+        drop(pause);
+    }
+
+    /// Control shape: with NO pause in effect, the same delivery keeps
+    /// its production pacing — the full body→Enter gap (≥1.5s). Pinned
+    /// so the quiesce short-circuit can never leak into normal
+    /// operation. The fanout stays OPEN (and unfed) through the gap so
+    /// the sliced drain honors real wall clock, then is CLOSED once
+    /// the Enter lands so the verify phase falls through immediately
+    /// (its ~9s of windows are not this test's subject).
+    #[test]
+    fn unpaused_delivery_keeps_full_enter_gap() {
+        let _serial = crate::writer_gate::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (handle, captured) = InputHandle::test_handle_capturing();
+        let fanout = Arc::new(PtyByteFanout::new(64));
+
+        let cap = Arc::clone(&captured);
+        let fan = Arc::clone(&fanout);
+        let t = std::thread::spawn(move || {
+            deliver_agent_body(
+                &handle,
+                &fan,
+                "ts-nopause",
+                "solo",
+                false,
+                "prompt",
+            )
+        });
+        // Once body + Enter are captured, close the fanout: every
+        // remaining verify drain sees producer-gone and the delivery
+        // returns without waiting out its retry windows.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if cap.lock().unwrap().len() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Enter never captured");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fanout.close();
+        assert!(t.join().expect("delivery thread"), "delivery ok");
+
+        let writes = captured.lock().unwrap().clone();
+        let gap = writes[1].0.duration_since(writes[0].0);
+        assert!(
+            gap >= Duration::from_millis(1400),
+            "production Enter gap must not be shortened without a pause: {:?}",
+            gap
+        );
+    }
+}
+
 /// Wrap a prompt body in bracketed-paste markers (`\x1b[200~ … \x1b[201~`)
 /// when it spans multiple lines — matches the TUI's
 /// `format_body_for_delivery`. Without this, the agent submits at the first
@@ -6792,6 +6973,18 @@ fn spawn_agent_prompt_delivery(
 /// cannot double-fire on success, and it recovers the dropped-submit case
 /// (which on the `/compact` path used to leave the command sitting in the
 /// composer for the next fire's prompt to be appended to).
+///
+/// **Restart quiescence (DESIGN_SEAMLESS_RESTART phase 4h, R10)**: the
+/// body → gap → Enter sequence is one indivisible delivery unit under
+/// `crate::writer_gate` — a `unit_permit` is taken at the last instant
+/// before the first byte and held until the delivery returns, so a
+/// re-exec freeze can never land between the body and its Enter. Under a
+/// pause request the delivery finishes promptly (short Enter gap, verify
+/// windows skipped) rather than parking mid-prompt: a quiesce may wait up
+/// to one in-progress step (~3s), never tear a unit. All the pre-body
+/// waiting happens BEFORE the permit, so a still-settling delivery never
+/// delays a restart — it parks unwritten and either proceeds post-abort
+/// or dies never-started at exec (retry is the caller's contract).
 fn deliver_agent_body(
     handle: &crate::session::InputHandle,
     fanout: &std::sync::Arc<crate::session::PtyByteFanout>,
@@ -6899,6 +7092,27 @@ fn deliver_agent_body(
         agent_paste_payload(body)
     };
     let bracketed = payload.len() != body.len();
+    // DESIGN_SEAMLESS_RESTART phase 4h (R10): everything below —
+    // body → gap → Enter (→ verify) — is ONE indivisible delivery unit
+    // under the process-wide writer gate. The permit is taken here, at
+    // the last instant before the first byte, so all the settle/quiet
+    // waiting above never delays a restart: a delivery still waiting has
+    // written nothing and simply parks at the gate (post-abort it
+    // delivers; at exec it dies never-started — the caller's
+    // monitor/notify contract covers retry, and workflow activations
+    // re-drive from their durable phase record).
+    //
+    // While the unit is held the delivery is RESTART-AWARE: it polls
+    // `pause_requested` at each step boundary and finishes promptly —
+    // after the body, the Enter fires on a short floor instead of the
+    // leisurely gap; after the Enter, the best-effort verify windows are
+    // skipped. The documented trade: a quiesce may wait up to one
+    // in-progress delivery step (~3s worst case, the verify window),
+    // NEVER tear a unit — a prompt frozen unsubmitted between body and
+    // Enter is corrupted terminal input no rehydrate can repair.
+    // (Nested `write_and_stamp` calls below take no-op permits — see
+    // `writer_gate`'s reentrancy contract.)
+    let _unit = crate::writer_gate::unit_permit();
     if let Err(e) = handle.write_and_stamp(&payload) {
         eprintln!(
             "cm-daemon: agent {} body write failed for {}: {}",
@@ -6906,7 +7120,29 @@ fn deliver_agent_body(
         );
         return false;
     }
-    drain_for(&mut tracker, &mut bytes_seen, AGENT_ENTER_GAP);
+    // Step boundary: body landed. Under a restart pause, complete the
+    // Enter promptly rather than park mid-prompt: the gap is drained in
+    // short slices so a pause landing MID-gap is observed within one
+    // slice, cutting the remaining gap to the short floor (never below
+    // it — the codex paste-tail rule on AGENT_ENTER_GAP_QUIESCE).
+    let gap_started = Instant::now();
+    let mut quiesce_pause = false;
+    loop {
+        quiesce_pause = quiesce_pause || crate::writer_gate::pause_requested();
+        let target = if quiesce_pause {
+            AGENT_ENTER_GAP_QUIESCE
+        } else {
+            AGENT_ENTER_GAP
+        };
+        let elapsed = gap_started.elapsed();
+        if elapsed >= target {
+            break;
+        }
+        let slice = std::cmp::min(target - elapsed, AGENT_ENTER_GAP_QUIESCE);
+        if !drain_for(&mut tracker, &mut bytes_seen, slice) {
+            break; // producer gone (child exited)
+        }
+    }
     // Re-read the mode at Enter time — it can complete during the gap
     // (e.g. bracketed paste observed first, kitty a beat later).
     let enter: &'static [u8] = if observed {
@@ -6933,7 +7169,23 @@ fn deliver_agent_body(
     // AGENT_SUBMIT_VERIFY would read as a miss. claude-code and codex
     // both paint a spinner immediately, so that case is theoretical.
     let mut submitted = false;
+    // Whether the verify loop was cut short by a restart pause (phase
+    // 4h, R10). The Enter has landed — the unit is COMPLETE — so under
+    // a pause the delivery releases its permit promptly instead of
+    // holding a quiescing restart through up to three 3s verify
+    // windows. Cost: the rare dropped-Enter goes unrecovered this once
+    // (verification is best-effort robustness, not part of the unit);
+    // the outcome log says so instead of warning "may NOT have
+    // submitted".
+    let mut verify_skipped_for_quiesce = false;
     loop {
+        // Step boundary: the unit's bytes are all written. A pause
+        // request ends the verify phase promptly (never parks between
+        // body and Enter — those already landed above).
+        if crate::writer_gate::pause_requested() {
+            verify_skipped_for_quiesce = true;
+            break;
+        }
         drain_for(&mut tracker, &mut bytes_seen, AGENT_SUBMIT_VERIFY);
         if !tracker.quiet_for(AGENT_SUBMIT_VERIFY, Instant::now()) {
             submitted = true; // the agent reacted — the submit took
@@ -6972,7 +7224,7 @@ fn deliver_agent_body(
     eprintln!(
         "cm-daemon: agent {} delivered for {}: fresh={} mode_observed={} \
          mode_wait={}ms render_wait={}ms paint={}B body={}B bracketed={} \
-         enter={} enter_retries={} submitted={}",
+         enter={} enter_retries={} submitted={} quiesce_shortened={}",
         what,
         session_uid,
         fresh_spawn,
@@ -6985,13 +7237,25 @@ fn deliver_agent_body(
         if enter == AGENT_KITTY_ENTER { "kitty(CSI 13 u)" } else { "raw-CR" },
         retries,
         submitted,
+        quiesce_pause || verify_skipped_for_quiesce,
     );
     // A delivery that exhausted its Enter attempts with the PTY never
     // reacting is the failure this whole path exists to prevent, and it
     // is otherwise invisible: the writes all succeeded, the session just
     // sits there with the body in its composer. Say so on its own line
-    // so it is greppable in the daemon log / journal.
-    if !submitted {
+    // so it is greppable in the daemon log / journal. A verify phase cut
+    // short by a restart pause (phase 4h) is NOT that failure — the
+    // body+Enter both landed and verification simply didn't run — so it
+    // gets its own honest line instead of the false alarm.
+    if verify_skipped_for_quiesce {
+        eprintln!(
+            "cm-daemon: agent {} for {} delivered (body + Enter) but its \
+             post-Enter verification was skipped — a restart quiesce is in \
+             progress and the delivery unit finished promptly instead \
+             (DESIGN_SEAMLESS_RESTART phase 4h, R10)",
+            what, session_uid,
+        );
+    } else if !submitted {
         eprintln!(
             "cm-daemon: WARNING agent {} for {} may NOT have submitted — the PTY \
              stayed quiet through {} Enter attempt(s); the body is likely sitting \
