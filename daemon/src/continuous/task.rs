@@ -252,7 +252,7 @@ pub struct ContinuousTask {
     /// auto-escalates (last_run → Stuck) instead of spawning another.
     #[serde(default)]
     pub investigation_count: u32,
-    /// Consumer-wedge watchdog: consecutive runs the scheduler auto-closed
+    /// Run-wedge watchdog: consecutive runs the scheduler auto-closed
     /// because the session's turn ended without `report_done`
     /// (`scheduler::auth_wedge_pass`). At `[scheduler] wedge_close_limit` the
     /// scheduler escalates instead of closing (a chronic wedger burns queue
@@ -260,6 +260,15 @@ pub struct ContinuousTask {
     /// session exit, and an operator `continuous.force_done`.
     #[serde(default)]
     pub consecutive_wedge_closes: u32,
+    /// Per-task override of the run-wedge close grace (seconds of post-turn
+    /// silence before a `Running` run is judged wedged and auto-closed by
+    /// `scheduler::auth_wedge_pass`). `None` (default) falls back to
+    /// `[scheduler] consumer_wedge_grace_secs`; `Some(0)` disables the closer
+    /// for THIS task only. Wedge campaign F2 — the closer covers every
+    /// schedule, so a task with legitimately long silent gaps sets its own
+    /// budget here instead of the fleet losing the guard.
+    #[serde(default)]
+    pub wedge_grace_secs: Option<u64>,
     /// Phase 3b (stuck-story watchdog): the session_uid of the live investigator
     /// the watchdog spawned for the current stuck run, if any. `Some(_)` means
     /// an investigation is in flight (the watchdog does nothing while it is
@@ -342,6 +351,7 @@ impl ContinuousTask {
             consecutive_failures: 0,
             investigation_count: 0,
             consecutive_wedge_closes: 0,
+            wedge_grace_secs: None,
             investigator_uid: None,
             investigator_started_at: None,
             downstream: Vec::new(),
@@ -878,6 +888,7 @@ mod tests {
         // Phase 3b watchdog state: a pre-3b state.json fills these from
         // `#[serde(default)]` — no investigations spawned, no live investigator.
         assert_eq!(task.investigation_count, 0);
+        assert_eq!(task.wedge_grace_secs, None);
         assert!(task.investigator_uid.is_none());
         assert!(task.downstream.is_empty());
         assert!(task.enqueue_to.is_none());

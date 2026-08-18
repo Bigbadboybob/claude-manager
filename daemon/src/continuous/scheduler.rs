@@ -825,11 +825,18 @@ impl ContinuousScheduler {
     ///      the only thing preventing fires from claiming+acking queue items
     ///      into a dead session. Recovery is the operator's `/login` +
     ///      `continuous.force_done` (the alert says exactly that).
-    ///   2. **Consumer wedge** (Consumer schedule, both run modes): the tail
-    ///      shows a COMPLETED turn (or a delivered-but-unanswered prompt) and
-    ///      NOTHING has happened for `[scheduler] consumer_wedge_grace_secs`
-    ///      — the agent finished without `report_done` and the due-gate would
-    ///      skip every future fire forever (the 3.5-day incident shape).
+    ///   2. **Run wedge** (EVERY schedule, both run modes — wedge campaign
+    ///      F2; Consumer-only before 2026-08): the tail shows a COMPLETED
+    ///      turn (or a delivered-but-unanswered prompt) and NOTHING has
+    ///      happened for the task's wedge grace (`wedge_grace_secs` override,
+    ///      else `[scheduler] consumer_wedge_grace_secs`) — the agent
+    ///      finished without `report_done`. For a Consumer the due-gate would
+    ///      skip every future fire forever (the 3.5-day incident shape); for
+    ///      a Fresh Periodic it starves the schedule the same way; for a
+    ///      Persistent Periodic the stale `Running` record poisons every
+    ///      external monitor and demands a manual `force_done` sweep (the
+    ///      2026-08-18 characterization: six of nine orchestrators had NO
+    ///      closer at all — 881 wedged run-hours in 14 days).
     ///      Under `[scheduler] wedge_close_limit` consecutive closes:
     ///      auto-close (`Running → Failed` + runlog `"wedge_closed"` + alert);
     ///      the due-gate then refires naturally next tick. At the limit:
@@ -904,8 +911,11 @@ impl ContinuousScheduler {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&tk.task_id);
 
-            // --- 2. consumer wedge ---
-            if grace == 0 || !matches!(tk.schedule, Schedule::Consumer { .. }) {
+            // --- 2. run wedge (every schedule — F2) ---
+            // Per-task grace override; `Some(0)` opts this task out, fleet
+            // `consumer_wedge_grace_secs = 0` turns the closer off globally.
+            let grace = tk.wedge_grace_secs.unwrap_or(grace);
+            if grace == 0 {
                 continue;
             }
             // Quiet window: nothing since the newest of (transcript growth,
@@ -1020,12 +1030,12 @@ impl ContinuousScheduler {
         }
         crate::notify::notify_operator(
             notify_cmd,
-            "consumer-wedge",
+            "run-wedge",
             &format!(
                 "continuous task '{}' run seq {} WEDGED: session {} ended its turn \
                  without report_done and produced nothing for {}s. Auto-closed \
-                 (Running → Failed); the due-gate will refire. (consecutive close \
-                 {}/{} — at the limit the scheduler escalates instead)",
+                 (Running → Failed); the schedule refires naturally. (consecutive \
+                 close {}/{} — at the limit the scheduler escalates instead)",
                 tk.task_id, seq, uid, quiet_secs, closes, wedge_limit,
             ),
         );
@@ -1081,7 +1091,7 @@ impl ContinuousScheduler {
         }
         crate::notify::notify_operator(
             notify_cmd,
-            "consumer-wedge",
+            "run-wedge",
             &format!(
                 "continuous task '{}' run seq {} WEDGED AGAIN (turn ended without \
                  report_done, quiet {}s) and the auto-close limit ({}) is exhausted — \
@@ -2925,8 +2935,108 @@ mod tests {
         });
     }
 
-    /// Within the grace, mid-turn tails (long tool call), and non-Consumer
-    /// schedules are never closed.
+    /// F2: the closer covers EVERY schedule. The exact restart-orphan /
+    /// forgot-report_done shape that had no closer for six of nine live
+    /// orchestrators: a PERIODIC persistent run left `Running` while its live
+    /// session's transcript ends in a completed turn, quiet past the grace —
+    /// auto-closed with the same `wedge_closed` attribution consumers get.
+    #[test]
+    fn auth_wedge_pass_closes_wedged_periodic_run() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let grace = {
+                let s = state.lock().unwrap();
+                s.config.scheduler.consumer_wedge_grace_secs
+            };
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let uid = "ts-per-wedged-0";
+            let mtime = bind_transcript(
+                &state,
+                uid,
+                "perwedge.jsonl",
+                &[T_USER, T_ASSISTANT, T_TURN_END],
+            );
+            let now = mtime + grace + 1;
+            let mut t = periodic_task("perwedged", 3600, 0);
+            t.run_mode = RunMode::Persistent;
+            t.current_session_uid = Some(uid.into());
+            t.last_fired_at = mtime;
+            t.last_run = Some(RunRecord {
+                seq: 9,
+                fire_token: "ft-pw".into(),
+                started_at: mtime,
+                finished_at: None,
+                session_uid: Some(uid.into()),
+                status: RunStatus::Running,
+                trigger_source: "continuous-scheduler".into(),
+            });
+            task::save(&t).expect("save");
+
+            sched.auth_wedge_pass(&task::load_all(), now);
+
+            let reloaded = task::load_one("perwedged").unwrap();
+            let lr = reloaded.last_run.as_ref().unwrap();
+            assert_eq!(lr.status, RunStatus::Failed, "periodic wedge auto-closed");
+            assert_eq!(lr.finished_at, Some(now));
+            assert_eq!(reloaded.consecutive_wedge_closes, 1);
+            let runs = std::fs::read_to_string(task::runs_log_path("perwedged")).unwrap();
+            assert_eq!(runs.matches("\"wedge_closed\"").count(), 1, "{}", runs);
+        });
+    }
+
+    /// F2: the per-task `wedge_grace_secs` budget overrides the fleet grace in
+    /// both directions — a shorter budget closes earlier than the fleet
+    /// default would, a longer one holds a slow task open past it.
+    #[test]
+    fn auth_wedge_pass_honors_per_task_grace() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let fleet_grace = {
+                let s = state.lock().unwrap();
+                s.config.scheduler.consumer_wedge_grace_secs
+            };
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+
+            // (a) Short per-task budget: closed WELL before the fleet grace.
+            let m1 = bind_transcript(
+                &state,
+                "ts-g-short",
+                "gshort.jsonl",
+                &[T_USER, T_ASSISTANT, T_TURN_END],
+            );
+            let mut short = running_consumer("gshort", "ts-g-short", RunMode::Persistent, 1, m1);
+            short.wedge_grace_secs = Some(120);
+            task::save(&short).unwrap();
+
+            // (b) Long per-task budget: NOT closed even past the fleet grace.
+            let m2 = bind_transcript(
+                &state,
+                "ts-g-long",
+                "glong.jsonl",
+                &[T_USER, T_ASSISTANT, T_TURN_END],
+            );
+            let mut long = running_consumer("glong", "ts-g-long", RunMode::Persistent, 1, m2);
+            long.wedge_grace_secs = Some(fleet_grace * 10);
+            task::save(&long).unwrap();
+
+            let now = m1.max(m2) + fleet_grace + 1; // past fleet grace, under 10x
+            sched.auth_wedge_pass(&task::load_all(), now);
+
+            assert_eq!(
+                task::load_one("gshort").unwrap().last_run.unwrap().status,
+                RunStatus::Failed,
+                "short per-task grace closes",
+            );
+            assert_eq!(
+                task::load_one("glong").unwrap().last_run.unwrap().status,
+                RunStatus::Running,
+                "long per-task grace holds",
+            );
+        });
+    }
+
+    /// Within the grace, mid-turn tails (long tool call), and per-task
+    /// opted-out (`wedge_grace_secs = 0`) tasks are never closed.
     #[test]
     fn auth_wedge_pass_skips_healthy_and_non_consumer_shapes() {
         let _tmp = with_temp_home(|| {
@@ -2961,9 +3071,9 @@ mod tests {
                 m2,
             ))
             .unwrap();
-            // (c) PERIODIC persistent (non-Consumer), turn-complete + stale —
-            // a Running run here is normal persistent bookkeeping, never a
-            // wedge.
+            // (c) Per-task OPT-OUT (`wedge_grace_secs = 0`), turn-complete +
+            // stale — the closer now covers every schedule (F2), so the
+            // never-close guarantee moves to the explicit per-task opt-out.
             let m3 = bind_transcript(
                 &state,
                 "ts-w-periodic",
@@ -2974,6 +3084,7 @@ mod tests {
             periodic.run_mode = RunMode::Persistent;
             periodic.current_session_uid = Some("ts-w-periodic".into());
             periodic.last_fired_at = m3;
+            periodic.wedge_grace_secs = Some(0);
             periodic.last_run = Some(RunRecord {
                 seq: 1,
                 fire_token: "ft-p".into(),

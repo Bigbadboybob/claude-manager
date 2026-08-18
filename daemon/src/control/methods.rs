@@ -11832,6 +11832,11 @@ struct ContinuousCreateParams {
     /// config trap).
     #[serde(default)]
     mem_cap_bytes: Option<u64>,
+    /// Per-task run-wedge close grace (seconds). `None` → the daemon's
+    /// `[scheduler] consumer_wedge_grace_secs`; `Some(0)` → closer OFF for
+    /// this task. Wedge campaign F2.
+    #[serde(default)]
+    wedge_grace_secs: Option<u64>,
 }
 
 /// `continuous.create` — register a continuous task: resolve the repo, create
@@ -12014,6 +12019,7 @@ pub fn continuous_create(
         }
     }
     task.mem_cap_bytes = p.mem_cap_bytes;
+    task.wedge_grace_secs = p.wedge_grace_secs;
 
     let record_created = match crate::continuous::task::create(&task) {
         Ok(c) => c,
@@ -12070,6 +12076,12 @@ struct ContinuousUpdateParams {
     max_runtime_secs: Option<u32>,
     #[serde(default)]
     mem_cap_bytes: Option<u64>,
+    /// Per-task run-wedge close grace (seconds). `Some(0)` disables the
+    /// closer for this task; there is no clear-back-to-None path (matches the
+    /// family style — the fleet default is `[scheduler]
+    /// consumer_wedge_grace_secs`).
+    #[serde(default)]
+    wedge_grace_secs: Option<u64>,
     #[serde(default)]
     supervise: Option<bool>,
     #[serde(default)]
@@ -12173,6 +12185,10 @@ pub fn continuous_update(
         if let Some(v) = p.mem_cap_bytes {
             t.mem_cap_bytes = Some(v);
             updated.push("mem_cap_bytes");
+        }
+        if let Some(v) = p.wedge_grace_secs {
+            t.wedge_grace_secs = Some(v);
+            updated.push("wedge_grace_secs");
         }
         if let Some(v) = p.supervise {
             t.supervise = v;
