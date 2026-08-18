@@ -644,6 +644,57 @@ impl Drop for LockGuard {
     }
 }
 
+/// Strict twin of [`load_all`] for the `--verify-handoff` preflight
+/// (DESIGN_SEAMLESS_RESTART phase 4c): same directory walk, same serde
+/// parser, but a PRESENT `state.json` that fails to read or parse is an
+/// `Err` naming the file instead of being silently skipped — the
+/// preflight proves the CANDIDATE binary parses the on-disk state the
+/// old binary left, so the tolerant skip would hide exactly the schema
+/// drift it exists to catch. A missing tasks dir, or a task dir without
+/// a `state.json`, stays fine — nothing to parse.
+pub fn load_all_strict() -> Result<Vec<ContinuousTask>, String> {
+    let dir = tasks_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "read continuous-tasks dir {}: {}",
+                dir.display(),
+                e
+            ))
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!("read continuous-tasks dir {}: {}", dir.display(), e)
+        })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let state_file = path.join("state.json");
+        let contents = match fs::read_to_string(&state_file) {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!("read {}: {}", state_file.display(), e))
+            }
+        };
+        let task =
+            serde_json::from_str::<ContinuousTask>(&contents).map_err(|e| {
+                format!(
+                    "{} failed to parse as a ContinuousTask: {}",
+                    state_file.display(),
+                    e
+                )
+            })?;
+        out.push(task);
+    }
+    Ok(out)
+}
+
 /// Load all persisted tasks. Invalid/unreadable state.json files are skipped.
 /// This is the scheduler's per-tick scan in Phase 3 (cheap empty readdir when
 /// no tasks exist).

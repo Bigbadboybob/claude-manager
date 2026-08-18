@@ -21,6 +21,19 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
+    // DESIGN_SEAMLESS_RESTART phase 4c: `--verify-handoff <manifest-fd>`
+    // runs this binary as the restart preflight's verify-only
+    // subprocess — the CANDIDATE new image proving it can parse the
+    // running image's dry manifest + on-disk state BEFORE any point of
+    // no return. It never reaches `run()`: no socket bind, no session
+    // spawn/restore, no state writes (see `reexec::run_verify_handoff`).
+    // A missing fd argument falls through to the same path and fails
+    // its strict parse with a diagnosis.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--verify-handoff") {
+        let fd_arg = args.next().unwrap_or_default();
+        std::process::exit(cm_daemon::reexec::run_verify_handoff(&fd_arg));
+    }
     cm_daemon::run()
 }
 

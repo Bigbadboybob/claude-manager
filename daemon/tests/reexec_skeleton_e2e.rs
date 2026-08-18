@@ -393,6 +393,12 @@ fn reexec_skeleton_pty_continuity_end_to_end() {
     // daemon must be indistinguishable from before the call: health
     // shows restarting=false/draining=false, and the PTY still flows
     // (readers thawed, fd flags restored).
+    //
+    // Phase 4c: `skip_preflight` — the deep abort path sits BEHIND
+    // the `--verify-handoff` preflight now, so a broken target is
+    // normally refused up front (covered by
+    // `reexec_preflight_refuses_bad_target_inline`); the dev-only
+    // skip keeps the deeper rungs' e2e coverage.
     let bogus = dir.path().join("not-actually-a-binary");
     std::fs::write(&bogus, "definitely not an ELF and no shebang\n")
         .expect("write bogus target");
@@ -405,7 +411,10 @@ fn reexec_skeleton_pty_continuity_end_to_end() {
         &operator_request(
             &token,
             "daemon.reexec_dev",
-            serde_json::json!({ "binary_path": bogus.to_string_lossy() }),
+            serde_json::json!({
+                "binary_path": bogus.to_string_lossy(),
+                "skip_preflight": true
+            }),
         ),
     )
     .expect("failure case must answer inline");
@@ -498,6 +507,14 @@ fn reexec_skeleton_pty_continuity_end_to_end() {
     // And the handoff genuinely ran (same-pid-alive alone can't
     // distinguish "re-exec'd" from "never exec'd").
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    // Phase 4c: the successful fire went THROUGH the preflight — the
+    // old image's log must carry the candidate's PASS line.
+    assert!(
+        log.contains("re-exec preflight PASS"),
+        "daemon log carries no preflight PASS line.\n--- daemon log \
+         tail ---\n{}",
+        guard.log_tail()
+    );
     assert!(
         log.contains("re-exec handoff manifest validated"),
         "daemon log carries no handoff-validation line.\n--- daemon log \
@@ -663,6 +680,136 @@ fn reexec_skeleton_pty_continuity_end_to_end() {
 // CM_REEXEC=1 dev flag; the knob string NAMES the attempts to fail,
 // so it can ride the env across both execs and still scope itself).
 // ===================================================================
+
+/// Phase 4c (DESIGN_SEAMLESS_RESTART step 2): a target that FAILS
+/// `--verify-handoff` is refused INLINE, before any point of no
+/// return — the failure lands at the preflight stage now, not at
+/// execveat. The RPC must answer with the candidate's own diagnosis,
+/// the daemon must be untouched (health clean, restarting=false,
+/// draining=false — the preflight runs BEFORE the quiesce, so there
+/// is nothing to un-drain), and the session must still flow.
+///
+/// Declared before `spawn_sandbox` textually but uses it — see below.
+#[test]
+fn reexec_preflight_refuses_bad_target_inline() {
+    let mut sb = spawn_sandbox(&[]);
+    let uid = "ts-e2ef-1";
+    let (bash_pid, bash_start) = start_bash_session(&mut sb, uid);
+    println!(
+        "preflight e2e: daemon pid {} | bash child pid {} (starttime {})",
+        sb.daemon_pid, bash_pid, bash_start
+    );
+
+    // A target that RUNS but is not a cm-daemon: a shell script that
+    // exits 1 with its own message. Pre-4c this class was caught only
+    // at execveat (ENOEXEC for non-executables) or — for a real-but-
+    // wrong binary — after the exec, as a rehydrate failure.
+    let bad = sb.home.join("not-a-daemon.sh");
+    std::fs::write(
+        &bad,
+        "#!/bin/sh\necho 'not a cm-daemon: refusing to verify' >&2\nexit 1\n",
+    )
+    .expect("write bad target");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod bad target");
+    }
+
+    let resp = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "daemon.reexec_dev",
+            serde_json::json!({ "binary_path": bad.to_string_lossy() }),
+        ),
+    )
+    .expect("preflight failure must answer inline");
+    assert!(!resp.ok, "bad target must be refused: {:?}", resp.result);
+    let msg = resp.error.as_ref().map(|e| e.message.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("preflight REFUSED") && msg.contains("--verify-handoff"),
+        "error must carry the preflight refusal: {}",
+        msg
+    );
+    assert!(
+        msg.contains("not a cm-daemon: refusing to verify"),
+        "the candidate's own diagnosis must ride the RPC error: {}",
+        msg
+    );
+    println!("preflight refusal (inline): {}", msg);
+
+    // Daemon untouched: the preflight runs before the quiesce, so no
+    // drain / restart flag was ever set.
+    let health = round_trip(
+        &sb.socket,
+        &operator_request(&sb.token, "daemon.health", serde_json::json!({})),
+    )
+    .expect("health after refused preflight");
+    let hr = health.result.expect("health result");
+    assert_eq!(
+        hr["restarting"],
+        serde_json::json!(false),
+        "refused preflight must leave restarting=false"
+    );
+    assert_eq!(
+        hr["draining"],
+        serde_json::json!(false),
+        "refused preflight must leave draining=false"
+    );
+
+    // Child untouched, PTY still flows.
+    assert_eq!(
+        proc_starttime(bash_pid),
+        Some(bash_start),
+        "bash child disturbed by a refused preflight"
+    );
+    let send = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "send_input",
+            serde_json::json!({
+                "session_uid": uid,
+                "text": "echo PREFLIGHT-REFUSED-OK",
+                "submit": true
+            }),
+        ),
+    )
+    .expect("send_input after refused preflight");
+    assert!(send.ok, "send_input failed: {:?}", send.error);
+    {
+        let socket = sb.socket.clone();
+        let token = sb.token.clone();
+        wait_for(
+            Instant::now() + Duration::from_secs(20),
+            "PREFLIGHT-REFUSED-OK in output",
+            &sb.guard,
+            || {
+                let resp = round_trip(
+                    &socket,
+                    &operator_request(
+                        &token,
+                        "read_session_output",
+                        serde_json::json!({ "session_uid": uid }),
+                    ),
+                )
+                .ok()?;
+                output_text(&resp).filter(|t| t.contains("PREFLIGHT-REFUSED-OK"))
+            },
+        );
+    }
+
+    // Teardown through the daemon so the reaper path runs.
+    let _ = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "kill_session",
+            serde_json::json!({ "session_uid": uid }),
+        ),
+    );
+}
 
 /// Sandbox daemon for the ladder tests — same discipline as the
 /// skeleton test above (env_clear + tempdir HOME/socket, /proc
@@ -1502,12 +1649,20 @@ fn reexec_full_record_and_dead_record_tombstone() {
     }
 
     // Fire at the wrapper. Success = the connection dies at exec #1.
+    // Phase 4c: `skip_preflight` — the preflight would spawn the
+    // WRAPPER in --verify-handoff mode, and the wrapper blocks on the
+    // FIFO nothing has released yet, so the preflight would time out
+    // and refuse. This test targets the swap mechanics, not the
+    // preflight (which has its own e2e).
     let fired = fire_expect_drop(
         &sb.socket,
         &operator_request(
             &sb.token,
             "daemon.reexec_dev",
-            serde_json::json!({ "binary_path": wrapper.to_string_lossy() }),
+            serde_json::json!({
+                "binary_path": wrapper.to_string_lossy(),
+                "skip_preflight": true
+            }),
         ),
     );
     if let Some(resp) = fired {

@@ -51,7 +51,12 @@ pub const RECENTLY_EXITED_CAP: usize = 256;
 /// exit. Holds only the fields those two methods need — including `task_id` /
 /// `workspace_id` so the descendant-scope auth check still applies to a dead
 /// target (see `auth::check_session_caller_for_exited`).
-#[derive(Clone, Debug)]
+///
+/// Serde since DESIGN_SEAMLESS_RESTART phase 4c (R11): tombstones ride
+/// the persisted `daemon-sessions.json` (`Manifest::recently_exited`)
+/// so kill provenance and final-report facts can survive a daemon
+/// swap instead of dying with the old image (the P4b known gap).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExitedTombstone {
     pub session_uid: String,
     pub transcript_path: Option<String>,
@@ -1003,6 +1008,38 @@ impl DaemonState {
         }
     }
 
+    /// Project [`Self::recently_exited`] into the daemon-owned
+    /// tombstone sidecar shape (DESIGN_SEAMLESS_RESTART phase 4c,
+    /// R11). A SEPARATE file from `daemon-sessions.json` — the
+    /// manifest type is shared with the TUI crate (which constructs
+    /// it literally and owns its own persistence), so tombstones ride
+    /// a purely daemon-owned sidecar instead of widening the shared
+    /// shape. Pre-4c tombstones weren't persisted at all, so every
+    /// pre-swap tombstone — kill provenance included — died with the
+    /// old image (the P4b known gap).
+    pub fn build_tombstone_file(&self) -> TombstoneFile {
+        TombstoneFile {
+            version: TOMBSTONE_FILE_VERSION,
+            recently_exited: self.recently_exited.iter().cloned().collect(),
+        }
+    }
+
+    /// Checked, durable persist of the tombstone sidecar — the
+    /// [`Self::save_daemon_sessions_checked`] twin for
+    /// `daemon-tombstones.json` (phase 4c). Same fsync discipline:
+    /// temp file synced before the rename, containing directory
+    /// synced after it.
+    pub fn save_daemon_tombstones_checked(
+        &self,
+        path: &Path,
+    ) -> std::io::Result<()> {
+        let file = self.build_tombstone_file();
+        let json = serde_json::to_string_pretty(&file).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        write_json_atomic(path, &json, true)
+    }
+
     /// Atomically write the daemon's durable session registry to
     /// `path` (P0 session durability, S1). Builds the manifest from
     /// the live registry, serializes it, and rename-swaps it into
@@ -1010,6 +1047,21 @@ impl DaemonState {
     pub fn save_daemon_sessions(&self, path: &Path) -> std::io::Result<()> {
         let manifest = self.build_daemon_manifest();
         write_manifest_atomic(path, &manifest)
+    }
+
+    /// The CHECKED, DURABLE twin of [`Self::save_daemon_sessions`] for
+    /// the re-exec swap's persistence pass (DESIGN_SEAMLESS_RESTART
+    /// phase 4c, R15). Same snapshot, but the temp file is `fsync`ed
+    /// before the rename and the containing directory is `fsync`ed
+    /// after it — the rename-swap idiom keeps READERS from seeing a
+    /// torn file, but without the dir fsync the rename itself isn't
+    /// durable, and the swap must rebuild from exactly the snapshot
+    /// that was frozen. Errors are the caller's to act on (the restart
+    /// aborts); the best-effort lifecycle variant keeps its
+    /// log-and-swallow behavior for normal operation.
+    pub fn save_daemon_sessions_checked(&self, path: &Path) -> std::io::Result<()> {
+        let manifest = self.build_daemon_manifest();
+        write_manifest_atomic_impl(path, &manifest, true)
     }
 
     /// Best-effort persist to [`Self::daemon_sessions_path`]. A no-op
@@ -1109,6 +1161,57 @@ pub fn default_daemon_sessions_path() -> PathBuf {
         .join(".cm/daemon-sessions.json")
 }
 
+/// On-disk shape of the daemon-owned tombstone sidecar,
+/// `~/.cm/daemon-tombstones.json` (DESIGN_SEAMLESS_RESTART phase 4c,
+/// R11). Written by the re-exec swap's checked persistence pass
+/// ([`DaemonState::save_daemon_tombstones_checked`]) so
+/// recently-exited tombstones — kill attribution, final-report facts
+/// — survive the swap instead of dying with the old image (the P4b
+/// known gap). A sidecar rather than a `Manifest` field because the
+/// manifest shape is shared with the TUI crate; see
+/// [`DaemonState::build_tombstone_file`]. The read-side rebuild into
+/// the new image's `recently_exited` is the rehydrate-rebuild slice's
+/// consumer; [`read_daemon_tombstones`] is the loader it (and the
+/// `--verify-handoff` preflight) uses.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TombstoneFile {
+    /// Shape version — [`TOMBSTONE_FILE_VERSION`].
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub recently_exited: Vec<ExitedTombstone>,
+}
+
+/// Current [`TombstoneFile`] shape version.
+pub const TOMBSTONE_FILE_VERSION: u32 = 1;
+
+/// Default path of the tombstone sidecar — beside
+/// [`default_daemon_sessions_path`]'s file, daemon-owned like it.
+pub fn default_daemon_tombstones_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".cm/daemon-tombstones.json")
+}
+
+/// Read (parse, do NOT apply) the tombstone sidecar. `Ok(None)` when
+/// the file is absent (nothing was ever persisted — fine); parse
+/// failures bubble up (the `--verify-handoff` preflight treats a
+/// present-but-unparseable sidecar as a refusal, same rule as every
+/// other state file).
+pub fn read_daemon_tombstones(
+    path: &Path,
+) -> std::io::Result<Option<TombstoneFile>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let file: TombstoneFile = serde_json::from_str(&contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(Some(file))
+}
+
 /// Read (parse, do NOT apply) the daemon's durable session registry from
 /// `path` (P0 session durability, S2 — restore). Distinct from
 /// [`DaemonState::load_manifest_from_disk`], which mutates `self.workspaces`
@@ -1142,18 +1245,56 @@ pub fn read_daemon_sessions(path: &Path) -> std::io::Result<Option<Manifest>> {
 /// each other's partial temp file. Each writes a complete snapshot,
 /// so whichever `rename` lands last wins with a fully-valid manifest.
 fn write_manifest_atomic(path: &Path, manifest: &Manifest) -> std::io::Result<()> {
+    write_manifest_atomic_impl(path, manifest, false)
+}
+
+/// Shared body for the atomic manifest writers. `durable: false` is
+/// the historical best-effort shape (no fsync anywhere — cheap, called
+/// from lifecycle hot paths where losing one snapshot is recoverable);
+/// `durable: true` is the phase-4c checked-persist shape: the temp
+/// file's bytes are `fsync`ed before the rename and the containing
+/// directory is `fsync`ed after it, so the snapshot is on stable
+/// storage before the re-exec swap's point of no return.
+fn write_manifest_atomic_impl(
+    path: &Path,
+    manifest: &Manifest,
+    durable: bool,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(manifest)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write_json_atomic(path, &json, durable)
+}
+
+/// Rename-swap a serialized JSON document into place. The temp name
+/// is unique per write (pid + a process-global counter) so concurrent
+/// writers never clobber each other's partial temp file. With
+/// `durable`, the temp file is `fsync`ed before the rename and the
+/// containing directory after it (the rename-swap idiom needs the dir
+/// fsync for durability — phase 4c).
+fn write_json_atomic(path: &Path, json: &str, durable: bool) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    let json = serde_json::to_string_pretty(manifest)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
-    std::fs::write(&tmp, json.as_bytes())?;
+    if durable {
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, json.as_bytes())?;
+        f.sync_all()?;
+    } else {
+        std::fs::write(&tmp, json.as_bytes())?;
+    }
     std::fs::rename(&tmp, path)?;
+    if durable {
+        if let Some(parent) = path.parent() {
+            // Directory fsync makes the rename itself durable (the
+            // rename-swap idiom's missing half).
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+    }
     Ok(())
 }
 
@@ -1424,6 +1565,49 @@ mod tests {
             Some(&Some("task-rt".to_string())),
             "restored edge is immediately visible to the descendant walk",
         );
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 4c (R11): recently-exited
+    /// tombstones ride the daemon-owned sidecar. The checked
+    /// (fsynced) writer lands them on disk and the CURRENT loader
+    /// (`read_daemon_tombstones`) reads them back with kill
+    /// provenance and report facts intact. Pre-4c tombstones were
+    /// not persisted anywhere, so every pre-swap tombstone died with
+    /// the old image (the P4b known gap).
+    #[test]
+    fn checked_persist_carries_tombstones_and_reparses() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon-tombstones.json");
+        let mut state = DaemonState::default();
+        let mut t = tomb("ts-4c-dead");
+        t.killed = true;
+        t.killed_by = Some("operator".to_string());
+        t.reported_done_at = Some(1_700_000_000.0);
+        t.report_reason = Some("finished".to_string());
+        state.record_exited(t);
+
+        state
+            .save_daemon_tombstones_checked(&path)
+            .expect("checked tombstone persist");
+        let f = read_daemon_tombstones(&path)
+            .expect("reparse with the current loader")
+            .expect("file present");
+        assert_eq!(f.version, TOMBSTONE_FILE_VERSION);
+        assert_eq!(f.recently_exited.len(), 1);
+        let back = &f.recently_exited[0];
+        assert_eq!(back.session_uid, "ts-4c-dead");
+        assert!(back.killed, "kill provenance survived");
+        assert_eq!(back.killed_by.as_deref(), Some("operator"));
+        assert_eq!(back.reported_done_at, Some(1_700_000_000.0));
+        assert_eq!(back.report_reason.as_deref(), Some("finished"));
+
+        // Absent file: fine (nothing ever persisted).
+        assert!(read_daemon_tombstones(&dir.path().join("nope.json"))
+            .expect("absent is Ok(None)")
+            .is_none());
+        // Present-but-corrupt: an error, not a skip.
+        std::fs::write(&path, "{ not json").expect("corrupt file");
+        assert!(read_daemon_tombstones(&path).is_err());
     }
 
     /// With no `daemon_sessions_path` set (the test/disabled default),

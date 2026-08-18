@@ -1615,7 +1615,12 @@ fn dispatch_daemon_drain(
 
 /// `daemon.reexec_dev` — the dev-gated trigger for the re-exec handoff
 /// skeleton (DESIGN_SEAMLESS_RESTART phase 3b). Params:
-/// `{binary_path: string}` — the binary to exec in place.
+/// `{binary_path: string}` — the binary to exec in place — plus
+/// optional `skip_preflight: bool` (default false), which bypasses the
+/// phase-4c `--verify-handoff` preflight: a dev/test escape hatch the
+/// e2e uses to reach the deep abort paths (quiesce → CLOEXEC audit →
+/// execveat), which sit behind a passing preflight and are otherwise
+/// unreachable with a broken target.
 ///
 /// Dispatched ONLY when the daemon started with `CM_REEXEC=1`
 /// (checked once at startup, stored on `DaemonState::reexec_enabled`);
@@ -1672,13 +1677,21 @@ fn dispatch_daemon_reexec_dev(
             );
         }
     };
+    let skip_preflight = req
+        .params
+        .get("skip_preflight")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // No state lock held across the call: perform_reexec's quiesce
     // barrier waits on in-flight mutations that need it, and the gate
     // freezes must be taken lock-free (see `crate::reexec`'s module
     // docs). Success never reaches the line below — the exec replaces
     // the process image mid-call.
-    let err =
-        crate::reexec::perform_reexec(state, std::path::Path::new(&binary_path));
+    let err = crate::reexec::perform_reexec(
+        state,
+        std::path::Path::new(&binary_path),
+        skip_preflight,
+    );
     Response::err(
         req.id.clone(),
         ErrorCode::Internal,

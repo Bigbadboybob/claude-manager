@@ -45,9 +45,30 @@
 //! Failure injection for the e2e: [`ENV_TEST_FAIL_REHYDRATE`] — see
 //! its doc for the loud dev-flag gate.
 //!
+//! Phase 4c (R15) added the two guards around the point of no return:
+//!
+//! - **The `--verify-handoff` preflight** ([`run_verify_handoff`] on
+//!   the candidate side, [`preflight_verify_handoff`] on the old-image
+//!   side): before the quiesce, the PINNED target binary runs as a
+//!   verify-only subprocess against a DRY manifest and the current
+//!   on-disk state, so a broken binary, state-schema drift, or a dead
+//!   MCP interpreter refuses the restart while the old image is still
+//!   fully in charge — today those were caught only at exec time
+//!   (ENOEXEC) or after the exec (rehydrate failure → rollback).
+//! - **The checked persistence pass + post-freeze revalidation**
+//!   ([`persist_all_checked`] / [`post_freeze_revalidation`]): after
+//!   quiescence, one CHECKED (error-returning, fsynced — file AND
+//!   containing directory) persistence pass over sessions (tombstones
+//!   included — pre-4c they were absent from the persist, the P4b
+//!   known gap), workflow-runs state, and continuous state, then a
+//!   cheap in-process re-assertion that what the dry preflight
+//!   validated still holds against the frozen snapshot. The dry
+//!   manifest is discarded; the REAL manifest is built fresh after
+//!   quiescence — that ordering is the R15 point (the dry run races
+//!   live mutations; the handed-off snapshot is the frozen one).
+//!
 //! Deliberately OUT of scope, deferred to later phase-4 slices:
 //!
-//! - **`--verify-handoff` preflight subprocess**.
 //! - **Watcher checkpoints / full memory-cap watcher re-adoption**
 //!   (R12) — `watcher_checkpoint` is written as `None`. (4b DID
 //!   re-enable the kill-log PROBE for adopted capped sessions — real
@@ -85,6 +106,11 @@
 //! table's CLOEXEC flags are restored from a pre-audit snapshot, and
 //! the signal mask is restored from the pre-block set. The pinned
 //! target/rollback/manifest fds are locals whose drop closes them.
+//! One deliberate non-restoration (4c): a failure AFTER the checked
+//! persistence pass leaves the freshly written
+//! `daemon-sessions.json` / `daemon-tombstones.json` in place — each
+//! is a valid, current snapshot of live state (the same content the
+//! next lifecycle persist would write), not a mutation to undo.
 //!
 //! ## Lock/gate ordering (why this can't deadlock)
 //!
@@ -110,11 +136,13 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::process::CommandExt as _;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -133,6 +161,19 @@ use crate::{reader_gate, reap_gate, restart_coordinator};
 /// generous for "every in-flight mutating RPC returns" — spawns are
 /// the slowest at ~1s worst case.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on the `--verify-handoff` preflight subprocess (phase 4c).
+/// It parses small state files and runs the MCP selftest (which
+/// shells out a Python import for a few seconds); 60s is generous
+/// under suite/machine load. At the deadline the child is killed and
+/// the restart is refused — the preflight runs BEFORE the quiesce,
+/// so nothing has happened.
+const VERIFY_HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Cap on how much of the verify subprocess's stdout/stderr rides
+/// into the inline RPC error (the full streams are still written by
+/// the child; this only bounds the copy quoted in the diagnosis).
+const VERIFY_OUTPUT_CAP: usize = 2000;
 
 // ============================================================
 // The exec side (old image)
@@ -153,9 +194,16 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// entry (`daemon.reexec_dev`) is on `RESTART_BARRIER_EXEMPT_METHODS`
 /// for the same reason: it RUNS the coordinator, so counting it as a
 /// mutation would deadlock the barrier against its own caller.
+///
+/// `skip_preflight` bypasses the phase-4c `--verify-handoff` step —
+/// a dev/test escape hatch (the e2e uses it to reach the deep abort
+/// paths, which sit BEHIND a passing preflight and are otherwise
+/// unreachable with a broken target). Production callers pass
+/// `false`.
 pub fn perform_reexec(
     state: &Arc<Mutex<DaemonState>>,
     target: &Path,
+    skip_preflight: bool,
 ) -> anyhow::Error {
     // ---- Step (a): pin the executables (R7). ----
     // The target fd IS the binary that will be exec'd — everything
@@ -179,6 +227,29 @@ pub fn perform_reexec(
         }
     };
 
+    // ---- Step (a2): old-image preflight (phase 4c, design step 2). ----
+    // Runs BEFORE the quiesce, with NO state lock held across it (it
+    // shells out for seconds; the dry-manifest build inside takes the
+    // lock briefly). Any failure — nonzero exit, timeout, spawn error
+    // — returns the candidate's diagnosis inline and NOTHING has
+    // happened: no drain, no freeze, no fd-table or signal-mask
+    // mutation.
+    let dry_schema_version: Option<u32> = if skip_preflight {
+        eprintln!(
+            "cm-daemon: re-exec preflight SKIPPED (skip_preflight=true — \
+             dev/test escape hatch; the deep abort paths sit behind a \
+             passing preflight and are otherwise unreachable with a broken \
+             target)"
+        );
+        None
+    } else {
+        match preflight_verify_handoff(state, target, &target_fd, &rollback_fd)
+        {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+
     // ---- Step (b): quiesce (prepare/commit/abort barrier). ----
     let guard = match restart_coordinator::begin(state) {
         Ok(g) => g,
@@ -199,28 +270,57 @@ pub fn perform_reexec(
     let reap_freeze = reap_gate::freeze();
     let reader_freeze = reader_gate::freeze();
 
-    // Steps (d)–(g) live in `exec_stage`, which restores every
+    // Steps (c2)–(g) live in `exec_stage`, which restores every
     // mutation IT made (fd flags, signal mask) before returning its
     // error. The freezes and the quiesce guard are released here, in
     // reverse order of acquisition, so the daemon is indistinguishable
-    // from before the call.
-    let err = exec_stage(state, target, &target_fd, &rollback_fd);
+    // from before the call. (The checked persistence pass may have
+    // rewritten `daemon-sessions.json` — a valid, current snapshot,
+    // the same file every lifecycle event rewrites; not a mutation to
+    // undo.)
+    let err = exec_stage(state, target, &target_fd, &rollback_fd, dry_schema_version);
     drop(reader_freeze);
     drop(reap_freeze);
     guard.abort();
     err
 }
 
-/// Steps (d)–(g): manifest build/seal, CLOEXEC discipline, signal
-/// bracketing, the exec itself. Runs entirely under the caller's
-/// gate freezes + quiesce guard; returns ONLY on failure, having
-/// restored the fd-table flags and signal mask it changed.
+/// Steps (c2)–(g): checked persistence pass + post-freeze
+/// revalidation (phase 4c, R15), then manifest build/seal, CLOEXEC
+/// discipline, signal bracketing, the exec itself. Runs entirely
+/// under the caller's gate freezes + quiesce guard; returns ONLY on
+/// failure, having restored the fd-table flags and signal mask it
+/// changed.
+///
+/// `dry_schema_version` is the schema version the preflight's dry
+/// manifest carried (`None` when the preflight was skipped); the
+/// revalidation step re-asserts it against the constant the REAL
+/// manifest below will carry.
 fn exec_stage(
     state: &Arc<Mutex<DaemonState>>,
     target: &Path,
     target_fd: &OwnedFd,
     rollback_fd: &OwnedFd,
+    dry_schema_version: Option<u32>,
 ) -> anyhow::Error {
+    // ---- Step (c2): checked, durable persistence pass (4c, R15). ----
+    // AFTER the freezes (quiescence means this snapshot is the frozen
+    // one — no writer can race it) and BEFORE the manifest build, so
+    // the new image rebuilds from exactly the state that was frozen.
+    // Errors abort the restart through the caller's existing restore
+    // path — unlike the best-effort lifecycle persists, nothing here
+    // is swallowed.
+    if let Err(e) = persist_all_checked(state) {
+        return e;
+    }
+    // ---- Step (c3): post-freeze revalidation (4c, R15). ----
+    // The dry preflight raced live mutations; re-assert cheaply, in
+    // process, that what it validated still holds for the frozen
+    // snapshot.
+    if let Err(e) = post_freeze_revalidation(state, dry_schema_version) {
+        return e;
+    }
+
     // ---- Step (d): build + seal the FD manifest. ----
     let manifest = match build_manifest(state, rollback_fd) {
         Ok(m) => m,
@@ -363,6 +463,620 @@ fn open_pinned_executable(target: &Path) -> Result<OwnedFd, anyhow::Error> {
         ));
     }
     Ok(fd)
+}
+
+// ============================================================
+// Phase 4c: the --verify-handoff preflight (design step 2, R15)
+// ============================================================
+
+/// Step (a2): run the CANDIDATE binary as a verify-only subprocess
+/// against a DRY manifest, before any point of no return.
+///
+/// The child is spawned as `/proc/self/fd/<target fd>` — the PINNED
+/// inode from step (a), never the pathname, so the verified artifact
+/// is the artifact the exec will consume even if a deploy overwrites
+/// the path mid-sequence (the R7 discipline, extended to the
+/// preflight).
+///
+/// The dry manifest is [`build_manifest`] against LIVE state (brief
+/// state-lock hold — unlike the real build it runs without the gate
+/// freezes, so a session mid-exit can fail it; that surfaces as an
+/// inline refusal and a retry works). It is **discarded** after the
+/// subprocess: the REAL manifest is built fresh inside [`exec_stage`]
+/// AFTER quiescence — that ordering is the R15 point (the dry run
+/// races live mutations; the handed-off snapshot is the frozen one),
+/// and [`post_freeze_revalidation`] re-asserts the dry run's schema
+/// assertion against the frozen state.
+///
+/// CLOEXEC discipline (R9): the two fds the child needs — the sealed
+/// dry-manifest memfd and the pinned target-binary fd — cross into it
+/// by clearing the flag INSIDE the child via `pre_exec`: fork copies
+/// the fd table (flags included) and the child-side `fcntl` mutates
+/// only the child's copies, so no non-CLOEXEC fd ever exists in OUR
+/// table and a concurrent session spawn can never inherit either.
+/// Both are harmless in any child regardless: a same-user subprocess,
+/// no secrets — one is a kernel-sealed read-only manifest, the other
+/// a read-only fd of the candidate binary (which must stay open
+/// across the child's exec anyway so a `#!` target's interpreter can
+/// re-open `/proc/self/fd/<n>`).
+///
+/// Bounded by [`VERIFY_HANDOFF_TIMEOUT`], then killed. Nonzero exit /
+/// timeout / spawn failure → `Err` carrying the child's diagnosis;
+/// the RPC returns it inline and NOTHING has happened. On success,
+/// returns the dry manifest's schema version for the post-freeze
+/// revalidation.
+fn preflight_verify_handoff(
+    state: &Arc<Mutex<DaemonState>>,
+    target: &Path,
+    target_fd: &OwnedFd,
+    rollback_fd: &OwnedFd,
+) -> Result<u32, anyhow::Error> {
+    let dry = build_manifest(state, rollback_fd).map_err(|e| {
+        anyhow::anyhow!(
+            "re-exec preflight REFUSED: could not build the dry manifest \
+             against live state: {} — nothing has happened",
+            e
+        )
+    })?;
+    let dry_schema_version = dry.schema_version;
+    let dry_session_count = dry.sessions.len();
+    let dry_fd = reexec_manifest::write_manifest(&dry).map_err(|e| {
+        anyhow::anyhow!(
+            "re-exec preflight REFUSED: could not write the dry manifest \
+             memfd: {} — nothing has happened",
+            e
+        )
+    })?;
+
+    let target_raw = target_fd.as_raw_fd();
+    let manifest_raw = dry_fd.as_raw_fd();
+    let mut cmd = Command::new(format!("/proc/self/fd/{}", target_raw));
+    cmd.arg("--verify-handoff")
+        .arg(manifest_raw.to_string())
+        // Defense in depth: a stale bootstrap pointer in our environ
+        // (there should never be one — startup consumed it) must not
+        // confuse the verify child, whose manifest fd arrives via argv.
+        .env_remove(reexec_manifest::ENV_MANIFEST_FD)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY (pre_exec): runs post-fork in the child before exec;
+    // fcntl is async-signal-safe and touches only the child's fd
+    // table (see the fn docs for why this closes the R9 window
+    // entirely — no non-CLOEXEC fd ever exists in the parent).
+    unsafe {
+        cmd.pre_exec(move || {
+            for fd in [target_raw, manifest_raw] {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC)
+                    != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+
+    let started = Instant::now();
+    let mut child = cmd.spawn().map_err(|e| {
+        anyhow::anyhow!(
+            "re-exec preflight REFUSED: could not spawn the candidate \
+             binary {} (via /proc/self/fd/{}) in --verify-handoff mode: {} \
+             — nothing has happened",
+            target.display(),
+            target_raw,
+            e
+        )
+    })?;
+    // Bounded poll-wait. The child's output is small by construction
+    // (a PASS line or a diagnosis, both far under the pipe buffer),
+    // so deferring the pipe reads until after exit cannot deadlock.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if started.elapsed() >= VERIFY_HANDOFF_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow::anyhow!(
+                        "re-exec preflight REFUSED: `{} --verify-handoff` \
+                         did not finish within {:?} (killed) — nothing has \
+                         happened",
+                        target.display(),
+                        VERIFY_HANDOFF_TIMEOUT
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!(
+                    "re-exec preflight REFUSED: wait on the --verify-handoff \
+                     subprocess failed: {} — nothing has happened",
+                    e
+                ));
+            }
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut out);
+    }
+    let mut errout = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut errout);
+    }
+    // dry_fd drops at return — the dry manifest is discarded either way.
+
+    if status.success() {
+        eprintln!(
+            "cm-daemon: re-exec preflight PASS — candidate {} verified the \
+             handoff shape against current on-disk state ({} live \
+             session(s) in the dry manifest): {}",
+            target.display(),
+            dry_session_count,
+            out.trim(),
+        );
+        Ok(dry_schema_version)
+    } else {
+        let mut parts: Vec<String> = Vec::new();
+        let o = cap_str(out.trim(), VERIFY_OUTPUT_CAP);
+        if !o.is_empty() {
+            parts.push(o);
+        }
+        let e = cap_str(errout.trim(), VERIFY_OUTPUT_CAP);
+        if !e.is_empty() {
+            parts.push(format!("stderr: {}", e));
+        }
+        let diagnosis = if parts.is_empty() {
+            "<no output from the candidate>".to_string()
+        } else {
+            parts.join(" | ")
+        };
+        Err(anyhow::anyhow!(
+            "re-exec preflight REFUSED the restart: `{} --verify-handoff` \
+             exited {} — nothing has happened. Diagnosis: {}",
+            target.display(),
+            status,
+            diagnosis
+        ))
+    }
+}
+
+/// Truncate for inline diagnosis quoting (see [`VERIFY_OUTPUT_CAP`]).
+fn cap_str(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [{} bytes truncated]", &s[..end], s.len() - end)
+}
+
+/// Step (c2): the CHECKED, DURABLE persistence pass
+/// (DESIGN_SEAMLESS_RESTART phase 4c, design step 3's final bullet,
+/// R15). Runs under the quiesce barrier + gate freezes, so the
+/// snapshot it lands is the frozen one. Unlike the best-effort
+/// lifecycle persists (which stay log-and-swallow for normal
+/// operation), every failure here is returned and aborts the restart
+/// through the existing restore path.
+///
+/// Two shapes, matching where each store's truth lives:
+///
+/// - **Sessions and recently-exited tombstones** are
+///   memory-authoritative (`DaemonState::sessions` /
+///   `.recently_exited`), so fresh snapshots are WRITTEN —
+///   [`DaemonState::save_daemon_sessions_checked`] for the registry
+///   and [`DaemonState::save_daemon_tombstones_checked`] for the
+///   tombstone sidecar (`daemon-tombstones.json`, beside the sessions
+///   file) — each with fsynced file AND directory (the rename-swap
+///   idiom needs the dir fsync for durability). Tombstones persist at
+///   all only since 4c; pre-4c every pre-swap tombstone — kill
+///   attribution included — died with the old image (the P4b known
+///   gap).
+/// - **Workflow runs and continuous tasks** are DISK-authoritative:
+///   every mutation is a locked read-modify-write against the run's /
+///   task's `state.json` (`workflow::run::modify`,
+///   `continuous::task::save`), and the in-memory maps are caches —
+///   rewriting from memory could clobber a fresher on-disk row (the
+///   TUI writes `events_offset` into run state concurrently). The
+///   checked pass therefore makes the EXISTING bytes durable instead:
+///   fsync every `state.json`, its containing run/task dir, and the
+///   tree root.
+fn persist_all_checked(
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<(), anyhow::Error> {
+    {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        match st.daemon_sessions_path.clone() {
+            Some(path) => {
+                st.save_daemon_sessions_checked(&path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "checked persist of daemon sessions to {} failed: {} \
+                         — aborting the restart (the swap must rebuild from \
+                         a snapshot known to have landed)",
+                        path.display(),
+                        e
+                    )
+                })?;
+                // The tombstone sidecar lives beside the sessions file
+                // (in production both are the `default_*_path()` pair
+                // under ~/.cm; deriving keeps a custom-pathed test
+                // hermetic).
+                let tomb_path = path.with_file_name("daemon-tombstones.json");
+                st.save_daemon_tombstones_checked(&tomb_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "checked persist of exited-session tombstones to {} \
+                         failed: {} — aborting the restart",
+                        tomb_path.display(),
+                        e
+                    )
+                })?;
+                eprintln!(
+                    "cm-daemon: re-exec checked persist — {} live session(s) \
+                     fsynced to {}, {} tombstone(s) fsynced to {}",
+                    st.sessions.len(),
+                    path.display(),
+                    st.recently_exited.len(),
+                    tomb_path.display(),
+                );
+            }
+            None => {
+                // Tests / a daemon configured without durability. The
+                // handoff still works (sessions ride the FD manifest);
+                // only the disk snapshot is absent, honestly.
+                eprintln!(
+                    "cm-daemon: re-exec checked persist — no \
+                     daemon_sessions_path configured; skipping the session \
+                     and tombstone snapshots"
+                );
+            }
+        }
+    }
+    fsync_state_tree(&crate::workflow::run::runs_dir(), "workflow-runs")?;
+    fsync_state_tree(
+        &crate::continuous::task::tasks_dir(),
+        "continuous-tasks",
+    )?;
+    Ok(())
+}
+
+/// Fsync every `<root>/<id>/state.json` + its containing dir + the
+/// tree root — the durability half of [`persist_all_checked`] for the
+/// disk-authoritative stores (see its docs for why those are synced
+/// in place rather than rewritten). A missing root is fine (nothing
+/// was ever persisted); any real IO failure is returned.
+fn fsync_state_tree(
+    root: &Path,
+    label: &str,
+) -> Result<(), anyhow::Error> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "checked persist: read {} dir {}: {}",
+                label,
+                root.display(),
+                e
+            ))
+        }
+    };
+    let mut synced = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            anyhow::anyhow!(
+                "checked persist: read {} dir {}: {}",
+                label,
+                root.display(),
+                e
+            )
+        })?;
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let state_file = dir.join("state.json");
+        match File::open(&state_file) {
+            Ok(f) => {
+                f.sync_all().map_err(|e| {
+                    anyhow::anyhow!(
+                        "checked persist: fsync {}: {}",
+                        state_file.display(),
+                        e
+                    )
+                })?;
+                synced += 1;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "checked persist: open {} for fsync: {}",
+                    state_file.display(),
+                    e
+                ))
+            }
+        }
+        File::open(&dir).and_then(|d| d.sync_all()).map_err(|e| {
+            anyhow::anyhow!(
+                "checked persist: fsync {} dir {}: {}",
+                label,
+                dir.display(),
+                e
+            )
+        })?;
+    }
+    File::open(root).and_then(|d| d.sync_all()).map_err(|e| {
+        anyhow::anyhow!(
+            "checked persist: fsync {} root {}: {}",
+            label,
+            root.display(),
+            e
+        )
+    })?;
+    eprintln!(
+        "cm-daemon: re-exec checked persist — fsynced {} {} state file(s) \
+         under {}",
+        synced,
+        label,
+        root.display(),
+    );
+    Ok(())
+}
+
+/// Step (c3): post-freeze revalidation (phase 4c, R15). The dry
+/// preflight raced live mutations, so after quiescence and the
+/// checked persist, re-assert cheaply IN PROCESS that what it
+/// validated still holds for the frozen snapshot:
+///
+/// - the schema version the dry run embedded equals the constant the
+///   REAL manifest (built next, in [`exec_stage`]) will carry — the
+///   preflighted shape and the handed-off shape cannot silently
+///   diverge;
+/// - the just-persisted `daemon-sessions.json` re-parses with the
+///   CURRENT loader (`state::read_daemon_sessions` — a read-back
+///   check, cheap at these sizes), so the file the new image will
+///   rebuild non-session state from is known-parseable AND known to
+///   be on disk.
+///
+/// A distinct, named function so phase 6's `daemon.restart` RPC can
+/// surface its failure apart from the preflight's.
+fn post_freeze_revalidation(
+    state: &Arc<Mutex<DaemonState>>,
+    dry_schema_version: Option<u32>,
+) -> Result<(), anyhow::Error> {
+    if let Some(v) = dry_schema_version {
+        if v != MANIFEST_SCHEMA_VERSION {
+            return Err(anyhow::anyhow!(
+                "post-freeze revalidation failed: the preflight's dry \
+                 manifest carried schema version {} but the real manifest \
+                 will carry {} — the preflighted state and the handed-off \
+                 state diverged; aborting the restart",
+                v,
+                MANIFEST_SCHEMA_VERSION
+            ));
+        }
+    }
+    let sessions_path = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        st.daemon_sessions_path.clone()
+    };
+    if let Some(path) = sessions_path {
+        match crate::state::read_daemon_sessions(&path) {
+            Ok(Some(m)) => {
+                eprintln!(
+                    "cm-daemon: re-exec post-freeze revalidation — {} \
+                     re-parses with the current loader ({} workspace(s))",
+                    path.display(),
+                    m.workspaces.len(),
+                );
+            }
+            Ok(None) => {
+                return Err(anyhow::anyhow!(
+                    "post-freeze revalidation failed: the just-persisted {} \
+                     is missing at read-back — aborting the restart",
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "post-freeze revalidation failed: the just-persisted {} \
+                     does not re-parse with the current loader: {} — \
+                     aborting the restart",
+                    path.display(),
+                    e
+                ));
+            }
+        }
+        // The just-persisted tombstone sidecar, same read-back rule.
+        let tomb_path = path.with_file_name("daemon-tombstones.json");
+        if let Err(e) = crate::state::read_daemon_tombstones(&tomb_path) {
+            return Err(anyhow::anyhow!(
+                "post-freeze revalidation failed: the just-persisted {} does \
+                 not re-parse with the current loader: {} — aborting the \
+                 restart",
+                tomb_path.display(),
+                e
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ============================================================
+// The candidate side: --verify-handoff mode (phase 4c)
+// ============================================================
+
+/// Entry point for `cm-daemon --verify-handoff <manifest-fd>`
+/// (dispatched by `main.rs` before `run()` is ever reached): this
+/// process is the CANDIDATE new binary, spawned by the still-serving
+/// old image as a verify-only subprocess (design step 2 — catch
+/// state-schema drift, a broken binary, or a dead MCP interpreter
+/// BEFORE any point of no return). Prints one PASS line, or a
+/// diagnosis naming exactly what failed, and returns the exit code
+/// (0/1) for `main` to exit with.
+///
+/// **Verify-only, structurally**: this mode NEVER binds the control
+/// socket, spawns/kills/restores sessions, or writes ANY state file —
+/// it parses the inherited dry manifest and the current on-disk state
+/// with the same code paths startup uses, runs the MCP selftest, and
+/// exits. (The integration suite proves the no-writes property with a
+/// before/after directory snapshot.)
+///
+/// What it checks, in order (first failure wins the diagnosis):
+///
+/// 1. **The dry manifest** from the inherited fd — envelope,
+///    integrity, and structure via [`reexec_manifest::read_manifest`],
+///    which includes the schema-version gate: a candidate whose
+///    manifest schema drifted from the running image refuses right
+///    here, old image untouched. Explicitly **NOT**
+///    [`reexec_manifest::validate_fd_roles`]: the fd NUMBERS inside
+///    the manifest reference the PARENT's fd table — the session
+///    masters / pidfds / listener are deliberately not inherited by
+///    this subprocess (they stay CLOEXEC in the parent until the real
+///    exec's allowlist step), so a role probe here would poke
+///    unrelated slots in OUR table. Roles are re-validated for real
+///    post-exec by [`detect_handoff`].
+/// 2. **`daemon-sessions.json`** via the REAL loader
+///    (`state::read_daemon_sessions`) — the whole point is exercising
+///    THIS binary's parsers against the old binary's files. Missing
+///    file: fine (clean boot shape). Present but unparseable: FAIL,
+///    naming the file. The **tombstone sidecar**
+///    (`daemon-tombstones.json`, `state::read_daemon_tombstones`)
+///    follows the same rule.
+/// 3. **Workflow-runs state** via `workflow::run::load_all_strict`
+///    (the strict twin of the startup loader — same parser, but a
+///    present-and-broken `state.json` fails instead of being
+///    skipped).
+/// 4. **Continuous-task state** via
+///    `continuous::task::load_all_strict` (same shape).
+/// 5. **`daemon.toml`** via `config::load_or_default` at
+///    `config::default_config_path()` — exactly how `run()` loads it
+///    (and `run()` refuses to start on a config error, so the
+///    candidate would too).
+/// 6. **The MCP preflight** (`mcp_config::run_mcp_preflight` with the
+///    config's `mcp_server_path` override) — the 45-minutes-of-broken-
+///    sessions incident class. When NO server path resolves at all the
+///    selftest is skipped with a note (matching startup, which serves
+///    without one — an already-absent server must not veto a restart);
+///    a server that resolves but fails its selftest is a FAIL.
+pub fn run_verify_handoff(fd_arg: &str) -> i32 {
+    match verify_handoff_impl(fd_arg) {
+        Ok(pass) => {
+            println!("cm-daemon --verify-handoff: PASS — {}", pass);
+            0
+        }
+        Err(fail) => {
+            println!("cm-daemon --verify-handoff: FAIL — {}", fail);
+            1
+        }
+    }
+}
+
+/// The checks behind [`run_verify_handoff`]; see its docs for the
+/// list and the ordering contract.
+fn verify_handoff_impl(fd_arg: &str) -> Result<String, String> {
+    // Strict digits-only fd parse, mirroring the env bootstrap's rule
+    // (reexec_manifest::parse_fd is private; the grammar is the same).
+    if fd_arg.is_empty() || !fd_arg.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "manifest-fd argument {:?} is not a bare non-negative fd number",
+            fd_arg
+        ));
+    }
+    let fd: RawFd = fd_arg
+        .parse()
+        .map_err(|e| format!("manifest-fd argument {:?}: {}", fd_arg, e))?;
+
+    // -- 1: the dry manifest (envelope + structure ONLY; see docs). --
+    // SAFETY: validation-only borrow of the fd number the parent
+    // passed; this mode never takes ownership (the process exits
+    // right after and the kernel closes it).
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let manifest = reexec_manifest::read_manifest(borrowed)
+        .map_err(|e| format!("manifest (fd {}): {}", fd, e))?;
+
+    // -- 2: daemon-sessions.json with the real loader. --
+    let sessions_path = crate::state::default_daemon_sessions_path();
+    let sessions_note = match crate::state::read_daemon_sessions(&sessions_path)
+    {
+        Ok(Some(m)) => format!(
+            "{}: {} workspace(s)",
+            sessions_path.display(),
+            m.workspaces.len(),
+        ),
+        Ok(None) => format!("{}: absent (fine)", sessions_path.display()),
+        Err(e) => {
+            return Err(format!(
+                "state file {}: {}",
+                sessions_path.display(),
+                e
+            ))
+        }
+    };
+    // -- 2b: the tombstone sidecar, same rule (absent fine, corrupt
+    // fails).
+    let tombstones_path = crate::state::default_daemon_tombstones_path();
+    let tombstones_note =
+        match crate::state::read_daemon_tombstones(&tombstones_path) {
+            Ok(Some(f)) => format!("{} tombstone(s)", f.recently_exited.len()),
+            Ok(None) => "no tombstone sidecar (fine)".to_string(),
+            Err(e) => {
+                return Err(format!(
+                    "state file {}: {}",
+                    tombstones_path.display(),
+                    e
+                ))
+            }
+        };
+
+    // -- 3 + 4: workflow-runs + continuous state, strictly. --
+    let runs = crate::workflow::run::load_all_strict()
+        .map_err(|e| format!("workflow-runs state: {}", e))?;
+    let tasks = crate::continuous::task::load_all_strict()
+        .map_err(|e| format!("continuous-task state: {}", e))?;
+
+    // -- 5: daemon.toml, the way run() loads it. --
+    let config_path = crate::config::default_config_path();
+    let cfg = crate::config::load_or_default(&config_path)
+        .map_err(|e| format!("daemon config {}: {}", config_path.display(), e))?;
+
+    // -- 6: the MCP preflight. --
+    let server_override = if cfg.mcp_server_path.trim().is_empty() {
+        None
+    } else {
+        Some(cfg.mcp_server_path.as_str())
+    };
+    let mcp_note = match crate::mcp_config::resolve_server_path(server_override)
+    {
+        None => "no MCP server resolves on this host — selftest skipped \
+                 (matches startup, which serves without one)"
+            .to_string(),
+        Some(_) => crate::mcp_config::run_mcp_preflight(server_override)
+            .map_err(|e| {
+                format!("MCP preflight: {}", e.replace('\n', " | "))
+            })?,
+    };
+
+    Ok(format!(
+        "manifest schema v{} sealed OK ({} session record(s), attempt {}); \
+         {}; {}; {} workflow run(s); {} continuous task(s); MCP: {}",
+        manifest.schema_version,
+        manifest.sessions.len(),
+        manifest.attempt,
+        sessions_note,
+        tombstones_note,
+        runs.len(),
+        tasks.len(),
+        mcp_note,
+    ))
 }
 
 /// Step (d) helper: project live daemon state into the manifest.
@@ -2360,5 +3074,156 @@ mod tests {
         let tomb = swap_exit_tombstone(&rec, None, 1_700_000_200.0);
         assert_eq!(tomb.reported_done_at, None, "superseded report dropped");
         assert_eq!(tomb.report_reason, None);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4c (R15): checked persistence pass + post-freeze
+    // revalidation
+    // ---------------------------------------------------------------
+
+    /// RAII HOME override for the checked-persist tests —
+    /// `persist_all_checked` walks `runs_dir()` / `tasks_dir()`, which
+    /// key off HOME, so the tests must never point at the real `~/.cm`.
+    /// Held together with `env_lock` (env is process-global).
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+    fn set_home(dir: &Path) -> HomeGuard {
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir);
+        HomeGuard { prev }
+    }
+
+    /// [`persist_all_checked`] RETURNS an injected write failure
+    /// (unwritable directory) instead of swallowing it the way the
+    /// best-effort lifecycle persist does — the restart must abort on
+    /// a snapshot that didn't land.
+    #[test]
+    fn persist_all_checked_surfaces_write_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _g = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = set_home(dir.path());
+
+        let ro = dir.path().join("ro");
+        std::fs::create_dir_all(&ro).expect("mk ro dir");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod ro");
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        state
+            .lock()
+            .unwrap()
+            .daemon_sessions_path = Some(ro.join("daemon-sessions.json"));
+
+        let err = persist_all_checked(&state)
+            .expect_err("unwritable dir must surface as Err");
+        assert!(
+            err.to_string()
+                .contains("checked persist of daemon sessions"),
+            "error must name the failing pass: {}",
+            err
+        );
+
+        // Restore perms so the tempdir cleans up.
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod ro back");
+    }
+
+    /// The disk-authoritative half: an unreadable `state.json` under
+    /// the workflow-runs tree fails the fsync walk with an error
+    /// naming the file (never a silent skip).
+    #[test]
+    fn persist_all_checked_surfaces_fsync_tree_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _g = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = set_home(dir.path());
+
+        let run_dir = dir.path().join(".cm/workflow-runs/wf-broken");
+        std::fs::create_dir_all(&run_dir).expect("mk run dir");
+        let state_file = run_dir.join("state.json");
+        std::fs::write(&state_file, "{}").expect("write state.json");
+        std::fs::set_permissions(
+            &state_file,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .expect("chmod state.json");
+
+        // No daemon_sessions_path → the session half is skipped and
+        // the tree walk is what fails.
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let err = persist_all_checked(&state)
+            .expect_err("unreadable state.json must surface as Err");
+        assert!(
+            err.to_string().contains("state.json"),
+            "error must name the file: {}",
+            err
+        );
+
+        std::fs::set_permissions(
+            &state_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod back");
+    }
+
+    /// Happy path + the read-back check: the checked persist lands an
+    /// fsynced snapshot, [`post_freeze_revalidation`] accepts it, and
+    /// then refuses a corrupted / missing file and a drifted schema
+    /// version — each with a distinct diagnosis.
+    #[test]
+    fn checked_persist_then_revalidation_round_trip() {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = set_home(dir.path());
+
+        let sessions_path = dir.path().join(".cm/daemon-sessions.json");
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().daemon_sessions_path =
+            Some(sessions_path.clone());
+
+        persist_all_checked(&state).expect("checked persist lands");
+        assert!(sessions_path.exists(), "snapshot written");
+        post_freeze_revalidation(&state, Some(MANIFEST_SCHEMA_VERSION))
+            .expect("fresh snapshot revalidates");
+
+        // Schema drift between the dry run and the real build.
+        let err =
+            post_freeze_revalidation(&state, Some(MANIFEST_SCHEMA_VERSION + 1))
+                .expect_err("drifted schema version must refuse");
+        assert!(
+            err.to_string().contains("schema version"),
+            "diagnosis names the schema: {}",
+            err
+        );
+
+        // Corrupt read-back.
+        std::fs::write(&sessions_path, "{ not json").expect("corrupt file");
+        let err = post_freeze_revalidation(&state, Some(MANIFEST_SCHEMA_VERSION))
+            .expect_err("corrupt snapshot must refuse");
+        assert!(
+            err.to_string().contains("does not re-parse"),
+            "diagnosis names the re-parse: {}",
+            err
+        );
+
+        // Missing read-back (the write vanished).
+        std::fs::remove_file(&sessions_path).expect("remove file");
+        let err = post_freeze_revalidation(&state, Some(MANIFEST_SCHEMA_VERSION))
+            .expect_err("missing snapshot must refuse");
+        assert!(
+            err.to_string().contains("missing at read-back"),
+            "diagnosis names the missing file: {}",
+            err
+        );
     }
 }
