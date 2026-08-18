@@ -3221,6 +3221,12 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "sessions_with_transcript": with_transcript,
         "workspaces": state.workspaces.len(),
         "draining": state.draining,
+        // DESIGN_SEAMLESS_RESTART phase 2d: a restart attempt is in
+        // flight (the coordinator's quiescence barrier holds the
+        // latch). Rides beside `draining` because the two flip together
+        // on `restart_coordinator::begin` but only `draining` is
+        // operator-settable on its own via `daemon.drain`.
+        "restarting": state.restarting,
         "sessions_mid_turn": mid_turn,
         // DESIGN_SEAMLESS_RESTART phase 2e (R14): is the fail-closed
         // strong-operator gate satisfiable on this daemon? False when

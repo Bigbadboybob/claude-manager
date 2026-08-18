@@ -278,6 +278,73 @@ pub struct EventsSubscribeHandle {
     pub request_id: String,
 }
 
+/// Restart-quiescence classification (DESIGN_SEAMLESS_RESTART phase 2d,
+/// R2/R10): methods verified to mutate NOTHING the restart barrier
+/// cares about — pure reads of the registry / planning API / disk
+/// state. Everything NOT on this list (and not on
+/// [`RESTART_BARRIER_EXEMPT_METHODS`]) counts as a mutation and holds
+/// the in-flight guard for the duration of its dispatch body.
+///
+/// **Fail-safe direction**: an unknown or newly-added method that is
+/// really read-only but missing from this list is merely counted as a
+/// mutation — that can only DELAY a quiesce (bounded by the barrier
+/// timeout), never corrupt it. The dangerous mistake is the reverse:
+/// listing a method here that actually spawns/kills/writes would let it
+/// run mid-handoff. Only add a method after verifying its body (and
+/// keep "brief in-memory cache touch" out of scope — the bar is "no
+/// child processes, no persisted state, no PTY writes").
+///
+/// Note the STREAMING methods (`attach.open`, `manifest.watch`,
+/// `events.subscribe`) are deliberately NOT here: they mutate
+/// subscription/ticket state in their dispatch body. Their guard is
+/// released when `dispatch_request` returns the streaming outcome —
+/// BEFORE `handle_connection` runs the long-lived stream loop — so an
+/// attached TUI can never pin the counter above zero (see the guard
+/// comment in [`dispatch_request`]).
+pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
+    "ping",
+    "list_sessions",
+    "read_session_output",
+    "resolve_authorized_session",
+    "get_workflow_state",
+    "workflow.get_state",
+    "list_workflows",
+    "list_subtasks",
+    "list_tasks",
+    "get_task",
+    "backtest.result",
+    "continuous.list",
+    "continuous.dispatch_pending",
+    "queue.stats",
+];
+
+/// Coordinator-adjacent methods that must NOT count as mutations even
+/// though some of them mutate (drain flips a flag, reload swaps the
+/// config struct): the restart coordinator itself calls or waits behind
+/// these — `daemon.drain` is the front door it composes with,
+/// `daemon.health` is how the caller polls the attempt (and how
+/// cm-redeploy verifies it), `daemon.reload_config` is drain-window
+/// operator tooling, and `daemon.restart` (future slice) is the RPC
+/// that RUNS the coordinator. Counting any of them would deadlock the
+/// barrier against its own operator: a `daemon.health` poll arriving
+/// mid-quiesce would hold the counter above zero, and the eventual
+/// `daemon.restart` call would wait on a counter it is itself
+/// inflating.
+pub(crate) const RESTART_BARRIER_EXEMPT_METHODS: &[&str] = &[
+    "daemon.health",
+    "daemon.drain",
+    "daemon.reload_config",
+    "daemon.restart",
+];
+
+/// Does dispatching `method` hold the restart barrier's in-flight
+/// mutation guard? See the two lists above for the classification
+/// rules and the fail-safe direction.
+pub(crate) fn method_counts_as_restart_mutation(method: &str) -> bool {
+    !RESTART_BARRIER_READ_ONLY_METHODS.contains(&method)
+        && !RESTART_BARRIER_EXEMPT_METHODS.contains(&method)
+}
+
 /// Route `req` to the appropriate method handler. Returns
 /// `UnknownMethod` for everything that depends on App state that
 /// hasn't migrated; see the module doc for the cutoff.
@@ -285,6 +352,33 @@ pub fn dispatch_request(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> DispatchOutcome {
+    // DESIGN_SEAMLESS_RESTART phase 2d (R2): in-flight mutation guard,
+    // taken BEFORE the method body runs and dropped when this function
+    // RETURNS — which for the streaming outcomes (`attach.open`,
+    // `manifest.watch`, `events.subscribe`) is before the long-lived
+    // stream loop in `handle_connection` starts, so an attached client
+    // can never pin the counter. PTY input flowing over an established
+    // attach stream is deliberately NOT covered by this guard — that is
+    // the writer safe-points slice's job (R10); see the scope note in
+    // `crate::restart_coordinator`.
+    //
+    // The increment happens under a brief state-lock hold (released
+    // before the method body) so it is ordered against the
+    // coordinator's drain flip, which happens under the same lock:
+    // after `begin()` sets `draining` and a quiesce waiter then
+    // observes the counter at zero, every mutating dispatch that
+    // entered before the flip has fully returned, and every one that
+    // entered after will see `draining == true` when its body takes the
+    // lock — so a spawn-shaped RPC has either completed or will be
+    // refused, never left half-spawned across a handoff.
+    let _restart_mutation_guard = if method_counts_as_restart_mutation(&req.method) {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        Some(crate::restart_coordinator::RestartCoordinator::enter_mutation(
+            &st.restart_coordinator,
+        ))
+    } else {
+        None
+    };
     match req.method.as_str() {
         // Reads the caller's session (when known) to report its
         // own perms + scope; still pongs for unknown callers.
@@ -2052,6 +2146,158 @@ mod tests {
         let mut s = DaemonState::new();
         s.attach_addr = "/tmp/cm-daemon-test.sock".into();
         Arc::new(Mutex::new(s))
+    }
+
+    // --- restart quiescence barrier (DESIGN_SEAMLESS_RESTART 2d) ------
+
+    /// Barrier probe. `entered_total` is cumulative, so it can prove a
+    /// guard WAS held around a dispatch that has already returned —
+    /// which the transient `in_flight` count (always 0 by then) cannot.
+    fn barrier_counts(state: &Arc<Mutex<DaemonState>>) -> (u64, u64) {
+        let st = state.lock().unwrap();
+        (
+            st.restart_coordinator.mutations_in_flight(),
+            st.restart_coordinator.mutations_entered_total(),
+        )
+    }
+
+    /// Deliverable 2d(a), mutating half: the in-flight guard wraps
+    /// mutating dispatches — including an UNKNOWN method (the fail-safe
+    /// direction: a new method missing from the allowlist only delays a
+    /// quiesce, never corrupts it) and a mutating method that errors
+    /// (the guard covers the whole dispatch body, not just success).
+    #[test]
+    fn mutating_dispatch_holds_the_restart_mutation_guard() {
+        let state = make_state();
+
+        let resp = dispatch_request(
+            &state,
+            &operator_request("definitely.not.a.method", serde_json::json!({})),
+        )
+        .into_response();
+        assert!(!resp.ok, "unknown method still errors as before");
+        let (in_flight, entered) = barrier_counts(&state);
+        assert_eq!(in_flight, 0, "guard released when dispatch returned");
+        assert_eq!(entered, 1, "unknown method must be counted (fail-safe)");
+
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "kill_session",
+                serde_json::json!({"session_uid": "ts-nope"}),
+                "ts-caller",
+            ),
+        )
+        .into_response();
+        assert!(!resp.ok, "bogus kill errors as before");
+        let (in_flight, entered) = barrier_counts(&state);
+        assert_eq!(in_flight, 0);
+        assert_eq!(entered, 2, "an erroring mutating method is still counted");
+    }
+
+    /// Deliverable 2d(a), read-only half: allowlisted reads and the
+    /// coordinator-exempt daemon.* methods never take the guard — a
+    /// health poll or drain toggle arriving mid-quiesce must not hold
+    /// the barrier open against the coordinator itself.
+    #[test]
+    fn read_only_and_coordinator_exempt_dispatches_skip_the_guard() {
+        let state = make_state();
+
+        let _ = dispatch_request(
+            &state,
+            &session_request("ping", serde_json::Value::Null, "ts-a"),
+        );
+        let _ = dispatch_request(&state, &operator_request("list_sessions", serde_json::json!({})));
+        let _ = dispatch_request(&state, &operator_request("daemon.health", serde_json::json!({})));
+        let _ = dispatch_request(
+            &state,
+            &operator_request("daemon.drain", serde_json::json!({"enable": false})),
+        );
+
+        let (in_flight, entered) = barrier_counts(&state);
+        assert_eq!(in_flight, 0);
+        assert_eq!(
+            entered, 0,
+            "read-only + coordinator-exempt methods must never be counted"
+        );
+    }
+
+    /// Deliverable 2d(e): a streaming-outcome method's guard is
+    /// released when `dispatch_request` RETURNS the outcome — before
+    /// `handle_connection` would write the OK and enter the long-lived
+    /// stream loop. Without this, one attached TUI (`manifest.watch`
+    /// runs for the TUI's whole lifetime) pins the counter above zero
+    /// and no quiesce can ever complete.
+    #[test]
+    fn streaming_outcome_releases_the_guard_before_the_stream_loop() {
+        let state = make_state();
+        let outcome = dispatch_request(
+            &state,
+            &operator_request("manifest.watch", serde_json::json!({})),
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::ManifestWatchStream { .. }),
+            "manifest.watch must produce the streaming outcome"
+        );
+        // The stream loop has NOT run — we hold the outcome unconsumed —
+        // yet the counter is already back to zero.
+        let (in_flight, entered) = barrier_counts(&state);
+        assert_eq!(in_flight, 0, "guard released before any stream loop runs");
+        assert_eq!(
+            entered, 1,
+            "manifest.watch IS counted while its dispatch body (the \
+             subscribe-and-snapshot mutation) runs"
+        );
+    }
+
+    /// Pin the classification of the load-bearing methods so an
+    /// accidental allowlist edit that reclassifies a spawner/killer as
+    /// read-only fails a test instead of silently corrupting the
+    /// barrier (the one dangerous direction — see the list's doc).
+    #[test]
+    fn restart_barrier_classification_pins_the_dangerous_methods() {
+        for m in [
+            "start_session",
+            "mcp_start_session",
+            "send_input",
+            "kill_session",
+            "session.revive",
+            "session.attach",
+            "create_session",
+            "add_session",
+            "create_subtask",
+            "mark_subtask_done",
+            "start_workflow",
+            "stop_workflow",
+            "workflow_transition",
+            "trigger",
+            "continuous.run_now",
+            "attach.open",
+            "manifest.watch",
+            "events.subscribe",
+            "some.future.method",
+        ] {
+            assert!(
+                method_counts_as_restart_mutation(m),
+                "{} must hold the mutation guard",
+                m
+            );
+        }
+        for m in [
+            "ping",
+            "list_sessions",
+            "read_session_output",
+            "daemon.health",
+            "daemon.drain",
+            "daemon.reload_config",
+            "daemon.restart",
+        ] {
+            assert!(
+                !method_counts_as_restart_mutation(m),
+                "{} must NOT hold the mutation guard",
+                m
+            );
+        }
     }
 
     // --- ping ---------------------------------------------------------

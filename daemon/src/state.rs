@@ -377,7 +377,27 @@ pub struct DaemonState {
     /// sessions mid-flight. Set/cleared by `daemon.drain`; surfaced on
     /// `daemon.health`. Deliberately NOT persisted — drain precedes a
     /// restart, and a fresh daemon must never come up refusing spawns.
+    ///
+    /// Also set (and restored on abort, to the pre-`begin` value) by
+    /// the restart coordinator's quiescence barrier — see `restarting`
+    /// below and [`crate::restart_coordinator`].
     pub draining: bool,
+    /// DESIGN_SEAMLESS_RESTART phase 2d (R2, R10): a restart attempt is
+    /// in flight. Doubles as the single-restart latch —
+    /// `restart_coordinator::begin` refuses (`restart_in_progress`)
+    /// while it is set, and the returned `QuiesceGuard` clears it on
+    /// abort/Drop. Surfaced on `daemon.health` beside `draining`.
+    /// Deliberately NOT persisted, same rationale as `draining`: a
+    /// fresh (or re-exec'd) daemon must never come up mid-"restart".
+    pub restarting: bool,
+    /// DESIGN_SEAMLESS_RESTART phase 2d (R2, R10): the restart
+    /// coordinator — in-flight mutation counter + safe-point subsystem
+    /// registry. `Arc` so `dispatch_request` can take a mutation guard
+    /// under a brief state-lock hold and carry it for the method body's
+    /// duration WITHOUT the lock, and so a quiesce waiter can block on
+    /// the counter while mutations take the state lock to finish. See
+    /// [`crate::restart_coordinator`] for the barrier semantics.
+    pub restart_coordinator: Arc<crate::restart_coordinator::RestartCoordinator>,
     /// Recently-exited sessions, retained for read-after-exit (the MCP
     /// `read_session_output` / `list_sessions(include_exited)` contract). A
     /// session is moved here from `sessions` on exit (see
@@ -737,6 +757,10 @@ impl Default for DaemonState {
             ),
             config: crate::config::DaemonConfig::default(),
             draining: false,
+            restarting: false,
+            restart_coordinator: Arc::new(
+                crate::restart_coordinator::RestartCoordinator::new(),
+            ),
         }
     }
 }
