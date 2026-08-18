@@ -1,12 +1,23 @@
 //! Startup orphan sweep (wedge campaign F3) — close runs the previous daemon
 //! instance left `Running`.
 //!
+//! ## Restart shapes (DESIGN_SEAMLESS_RESTART changes the premise)
+//!
+//! * **Re-exec deploy** (`daemon.restart`, the default path): children are
+//!   never signaled and survive the swap — the handoff manifest names them,
+//!   and lib.rs passes the pid+starttime-verified set in as `known_live`, so
+//!   every mid-flight run is re-adopted (including bash-engine runs, which
+//!   carry no argv marker for the fallback probe to find).
+//! * **Hard restart** (`cm-redeploy --hard`) or **box reboot**: every hosted
+//!   PTY child dies with no observed exit — `handle_session_exit`'s
+//!   run-closing hook needs the reaper thread that died with the old daemon.
+//!   These stranded runs are what the sweep closes.
+//! * **Daemon crash** without its cgroup: children may survive; the argv
+//!   probe recognizes claude/codex survivors best-effort.
+//!
 //! ## Why the per-tick reconciler can't do this
 //!
-//! A daemon restart (deploy) or box reboot kills every hosted PTY child, and
-//! the exit is never observed — `handle_session_exit`'s run-closing hook needs
-//! the reaper thread that died with the old daemon. The stranded run then
-//! dodges BOTH standing reconcilers:
+//! A stranded run dodges BOTH standing reconcilers:
 //!
 //!   * `scheduler::reconcile_orphans` only closes a run whose session is DEAD
 //!     — but the S5 restore (`restore_sessions`) resumes a supervised
@@ -34,14 +45,20 @@
 
 use crate::continuous::runlog::{ContinuousRunLog, RunLogLine};
 use crate::continuous::task::{self, RunStatus};
+use std::collections::HashSet;
 
 /// Provenance stamped on every sweep-written runs.jsonl line.
 pub const STARTUP_SWEEP_TOKEN: &str = "startup-sweep";
 
 /// Run the sweep against the live `/proc` prober. Called once from
 /// `lib.rs::run()` at daemon startup, before `restore_sessions`.
-pub fn startup_orphan_sweep() {
-    startup_orphan_sweep_with(session_process_alive)
+///
+/// `known_live` is the re-exec handoff's pid+starttime-verified survivor set
+/// (empty on a fresh boot): a uid in it is alive by kernel identity even when
+/// the argv probe can't see it — the bash-engine case, whose spawns carry no
+/// `--mcp-config` marker.
+pub fn startup_orphan_sweep(known_live: &HashSet<String>) {
+    startup_orphan_sweep_with(|uid| known_live.contains(uid) || session_process_alive(uid))
 }
 
 /// Testable core: `alive(uid)` answers "does a kernel process for this
@@ -327,6 +344,25 @@ mod tests {
             assert_eq!(tk.last_run.unwrap().status, RunStatus::Orphaned);
             let log = read_runlog("t-inflight");
             assert_eq!(log[0]["event"], "restart_orphaned");
+        });
+    }
+
+    /// A uid in the re-exec handoff's `known_live` set re-adopts even though
+    /// the argv probe can't see it — the bash-engine survivor case, which a
+    /// seamless deploy would otherwise falsely close on every restart.
+    #[test]
+    fn sweep_readopts_known_live_survivor_invisible_to_argv_probe() {
+        with_temp_home(|| {
+            task::save(&task_with_running_run("t-bash", "ts-bash-5")).unwrap();
+
+            let known_live: HashSet<String> = ["ts-bash-5".to_string()].into();
+            startup_orphan_sweep(&known_live);
+
+            let tk = task::load_one("t-bash").unwrap();
+            assert_eq!(tk.last_run.unwrap().status, RunStatus::Running);
+            let log = read_runlog("t-bash");
+            assert_eq!(log.len(), 1);
+            assert_eq!(log[0]["event"], "readopted");
         });
     }
 

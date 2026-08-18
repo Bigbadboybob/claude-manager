@@ -433,7 +433,26 @@ pub fn run() -> anyhow::Result<()> {
     // session will re-drive a mid-flight run, so an open run whose session
     // process is gone can only wedge its task. Close them attributed as
     // restart orphans (or re-adopt when the process demonstrably survived).
-    continuous::startup_orphan_sweep();
+    // On a re-exec handoff every child survived by construction: hand the
+    // sweep the manifest's pid+starttime-verified uids so survivors the argv
+    // probe can't see (bash-engine runs) are re-adopted, not falsely closed.
+    let handoff_survivors: std::collections::HashSet<String> = reexec_handoff
+        .as_ref()
+        .map(|escrow| {
+            escrow
+                .manifest()
+                .sessions
+                .iter()
+                .filter(|s| {
+                    adopt::proc_starttime(s.child_pid as libc::pid_t)
+                        .map(|st| st == s.child_start_time)
+                        .unwrap_or(false)
+                })
+                .map(|s| s.uid.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    continuous::startup_orphan_sweep(&handoff_survivors);
 
     let path = default_socket_path();
     let listener = match &reexec_handoff {
