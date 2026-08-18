@@ -348,6 +348,417 @@ fn find_codex_file(dir: &Path, transcript_id: &str) -> Option<PathBuf> {
     None
 }
 
+// ============================================================
+// Codex live-rollout observation (DESIGN_SEAMLESS_RESTART phase
+// 4f — codex lineage)
+// ============================================================
+//
+// Claude sessions are resumable-from-birth (H1's spawn-time pin)
+// and never more than one turn stale (the cm Stop hook forwards
+// the live transcript path through `session.turn_ended` every
+// turn). Codex has neither: rollout ids rotate on `/compact`,
+// codex runs no cm hook, and the daemon's detector binds only
+// the FIRST rollout — so every hard-restart path (drain+legacy,
+// machine reboot, re-exec's deliberate-kill terminal fallback)
+// resumed a compacted codex session from PRE-compact history.
+//
+// The fix is daemon-side observation of ground truth: the codex
+// process holds its live rollout file OPEN, so
+// `/proc/<pid>/fd/*` names it. A per-session watch thread
+// (armed for every codex session at the `start_session` spawn
+// funnel) re-reads that on a timer and, on rotation, re-stamps
+// the resume identity through the SAME `set_transcript_path`
+// flow the detector and the TUI use (generation bump on change +
+// `persist_sessions_best_effort`), so a hard restart resumes the
+// post-compact lineage.
+//
+// Why a sibling loop rather than one of the existing cadences:
+//   - `session_watch` is the memory-cap watcher — armed only for
+//     capped sessions, and its loop is signal-capable (wrong
+//     blast radius for an observation-only concern).
+//   - the MCP wait/monitor idle loops are MCP-server-resident
+//     (Python), not daemon-side, and only run while a caller is
+//     watching.
+//   - THIS module's detector retry loop is the model (same
+//     per-session detached-thread shape, same state-lock
+//     discipline, same slow cadence) but it exits at first bind
+//     and is not armed at all for TUI-detected spawns — while
+//     rotation tracking must outlive the bind and cover every
+//     codex session the daemon hosts.
+// So the watch reuses the detector's *pattern* and constants but
+// arms once, at the one spawn funnel all paths share
+// (`control::methods::start_session`). Known gap: the re-exec
+// adoption path (reexec.rs) promotes sessions without passing
+// through `start_session`, so rehydrated codex sessions need the
+// watch re-armed post-commit — phase-4 integration, noted there.
+
+/// Cadence of the codex rollout watch. Shares the detector's
+/// slow-poll rationale ([`SLOW_POLL_INTERVAL`]): a `/proc` fd
+/// readdir is cheap, rotation (a `/compact`) is rare, and the
+/// only cost of a coarser interval is the residual staleness
+/// window documented in DESIGN_SEAMLESS_RESTART's codex section
+/// (a hard stop within one interval of a compact can still
+/// resume pre-compact history).
+pub const ROLLOUT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Bound on how many processes one rollout scan will visit.
+/// The real trees are tiny (see [`ROLLOUT_FD_SCAN_MAX_DEPTH`]);
+/// the cap exists so a pathological child that forks wildly
+/// can't turn the watch into a /proc crawl.
+const ROLLOUT_FD_SCAN_MAX_PIDS: usize = 32;
+
+/// Descendant depth of the /proc walk, from the session's
+/// recorded child pid. How codex sessions are actually spawned
+/// here (`mcp_config::build_args` → `PendingSession::spawn`,
+/// optionally wrapped by `wrap_with_systemd_run`):
+///
+///   - uncapped:  daemon → `codex` (the npm bin is a node JS
+///     launcher that `spawn`s the native binary) → codex-native
+///     — the fd holder is 1 level down;
+///   - capped:    daemon → `systemd-run --user --scope` →
+///     node launcher → codex-native — 2 levels down.
+///
+/// Depth 3 covers both with one level of margin (e.g. a codex
+/// build that adds another wrapper). Never deeper: tool
+/// subprocesses codex forks live below the native binary and
+/// must not be scanned as if they were the session.
+const ROLLOUT_FD_SCAN_MAX_DEPTH: usize = 3;
+
+/// Result of one [`scan_live_codex_rollout`] pass. `rollout` is
+/// the file the process tree holds open right now (`None`:
+/// codex not started yet, exited, mid-rotation, or a codex that
+/// doesn't keep the fd open — in which case the watch degrades
+/// to never re-stamping, exactly the pre-4f behavior).
+/// `permission_denied` surfaces an EACCES on some `/proc/<pid>/fd`
+/// honestly instead of silently reporting "no rollout" — it
+/// shouldn't happen for same-user children, but a child that
+/// execs a setuid/undumpable binary would produce it.
+pub struct LiveRolloutScan {
+    pub rollout: Option<PathBuf>,
+    pub permission_denied: bool,
+}
+
+/// Direct children of `pid`, via `/proc/<pid>/task/<tid>/children`.
+/// All task (thread) entries are read because the kernel files a
+/// child under the THREAD that forked it, not the main thread.
+/// Missing/unreadable entries mean the process raced away — an
+/// empty vec, never an error (normal churn).
+fn direct_children_of(pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let task_dir = PathBuf::from(format!("/proc/{}/task", pid));
+    let Ok(entries) = std::fs::read_dir(&task_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(contents) = std::fs::read_to_string(entry.path().join("children")) else {
+            continue;
+        };
+        for tok in contents.split_ascii_whitespace() {
+            if let Ok(child) = tok.parse::<u32>() {
+                out.push(child);
+            }
+        }
+    }
+    out
+}
+
+/// Does `path` have the codex rollout layout
+/// `…/.codex/sessions/YYYY/MM/DD/<name>.jsonl`? Matched on SHAPE
+/// (trailing components), never on a literal `$HOME` prefix — the
+/// /proc symlink target is the kernel's canonical path, which need
+/// not string-match the daemon's `HOME` (symlinked homes), and
+/// tests point it at a tempdir. The shape gate is also the
+/// self-scope bound on what the watch may stamp (the codex
+/// analogue of `session.turn_ended`'s own-transcript-dir check):
+/// combined with the fact that the path comes from the session's
+/// OWN process tree via /proc — daemon-observed, never
+/// caller-reported — a watch can only ever stamp a codex rollout
+/// file this session itself is writing. A deleted-but-open target
+/// reads as `…jsonl (deleted)` from readlink and fails the
+/// extension check, so it is never stamped.
+pub fn is_codex_rollout_shaped(path: &Path) -> bool {
+    let comps: Vec<&str> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => os.to_str(),
+            _ => None,
+        })
+        .collect();
+    let n = comps.len();
+    if n < 6 {
+        return false;
+    }
+    let (dot_codex, sessions, dates, file) =
+        (comps[n - 6], comps[n - 5], &comps[n - 4..n - 1], comps[n - 1]);
+    dot_codex == ".codex"
+        && sessions == "sessions"
+        && dates
+            .iter()
+            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        && file.len() > ".jsonl".len()
+        && file.ends_with(".jsonl")
+}
+
+/// Resolve the rollout file the codex session rooted at `root_pid`
+/// holds open RIGHT NOW, by walking `/proc/<pid>/fd` symlinks over
+/// the (bounded) descendant tree. Multiple distinct matches — a
+/// brief rotation overlap where old and new rollout are both open —
+/// resolve to the most recently MODIFIED one (the live writer), and
+/// the ambiguity is logged so it's visible if it ever stops being
+/// transient. Processes that vanish mid-scan are skipped silently;
+/// permission errors are reported via
+/// [`LiveRolloutScan::permission_denied`].
+pub fn scan_live_codex_rollout(root_pid: u32) -> LiveRolloutScan {
+    // Bounded BFS over the descendant tree.
+    let mut pids: Vec<u32> = vec![root_pid];
+    let mut frontier: Vec<u32> = vec![root_pid];
+    for _ in 0..ROLLOUT_FD_SCAN_MAX_DEPTH {
+        let mut next: Vec<u32> = Vec::new();
+        for pid in &frontier {
+            for child in direct_children_of(*pid) {
+                if pids.len() >= ROLLOUT_FD_SCAN_MAX_PIDS {
+                    break;
+                }
+                if !pids.contains(&child) {
+                    pids.push(child);
+                    next.push(child);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+
+    let mut permission_denied = false;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for pid in &pids {
+        let fd_dir = PathBuf::from(format!("/proc/{}/fd", pid));
+        match std::fs::read_dir(&fd_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let Ok(target) = std::fs::read_link(entry.path()) else {
+                        continue;
+                    };
+                    if is_codex_rollout_shaped(&target)
+                        && !candidates.contains(&target)
+                    {
+                        candidates.push(target);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                permission_denied = true;
+            }
+            // NotFound et al: the process exited between the child
+            // walk and the fd read — normal churn, keep scanning.
+            Err(_) => {}
+        }
+    }
+
+    let rollout = match candidates.len() {
+        0 => None,
+        1 => candidates.pop(),
+        n => {
+            let newest = candidates
+                .iter()
+                .max_by_key(|p| {
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(UNIX_EPOCH)
+                })
+                .cloned();
+            eprintln!(
+                "cm-daemon: codex rollout scan under pid {} found {} open \
+                 rollout files (rotation overlap?) — picking most recently \
+                 modified: {}",
+                root_pid,
+                n,
+                newest
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            );
+            newest
+        }
+    };
+    LiveRolloutScan {
+        rollout,
+        permission_denied,
+    }
+}
+
+/// Outcome of one [`observe_codex_rollout_once`] pass. Terminal
+/// states (`SessionGone` / `NotCodex`) end the watch loop; the
+/// rest re-poll on the next tick.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RolloutObserveOutcome {
+    /// Session left the registry (exit / kill) — watch exits.
+    SessionGone,
+    /// Session isn't `codex` — defensive terminal state; the arm
+    /// site already gates on type, so reaching this is a bug.
+    NotCodex,
+    /// No open rollout observed (codex not started, exited fds,
+    /// mid-rotation, or the child respawned under this uid
+    /// mid-scan). Current stamp untouched — absence of an open fd
+    /// is never evidence of rotation.
+    NoRollout,
+    /// Live rollout matches the current stamp.
+    Unchanged,
+    /// Rotation observed and re-stamped (ids are the derived
+    /// resume keys; `old` is `None` for a first bind).
+    Stamped {
+        old: Option<String>,
+        new: String,
+    },
+    /// The stamp RPC flow errored non-NotFound (e.g. a transient
+    /// internal error) — logged, retried next tick.
+    StampFailed,
+}
+
+/// One observation pass of the codex rollout watch: resolve the
+/// live rollout for the session's process tree and, if it differs
+/// from the stamped resume identity, re-stamp through
+/// [`crate::control::methods::set_transcript_path`] — deliberately
+/// REUSED (not mirrored) so the bump-generation-on-change +
+/// persist semantics can't drift from the RPC path the TUI uses.
+/// `warned_permission` dedupes the EACCES log to once per watch
+/// lifetime (the condition is stable once present; re-logging at
+/// every 5s tick would be noise).
+pub fn observe_codex_rollout_once(
+    state: &Arc<Mutex<DaemonState>>,
+    session_uid: &str,
+    warned_permission: &mut bool,
+) -> RolloutObserveOutcome {
+    let (pid, current) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(sess) = s.sessions.get(session_uid) else {
+            return RolloutObserveOutcome::SessionGone;
+        };
+        if sess.session_type != "codex" {
+            return RolloutObserveOutcome::NotCodex;
+        }
+        (sess.pid as u32, sess.transcript_path.clone())
+    };
+
+    // /proc IO runs lock-free.
+    let scan = scan_live_codex_rollout(pid);
+    if scan.permission_denied && !*warned_permission {
+        *warned_permission = true;
+        eprintln!(
+            "cm-daemon: codex rollout watch for '{}': permission denied \
+             reading /proc fd tables under pid {} — rotation tracking is \
+             degraded for this session (stale-resume window reopens)",
+            session_uid, pid,
+        );
+    }
+    let Some(live) = scan.rollout else {
+        return RolloutObserveOutcome::NoRollout;
+    };
+    let live_str = live.to_string_lossy().into_owned();
+    if current.as_deref() == Some(live_str.as_str()) {
+        return RolloutObserveOutcome::Unchanged;
+    }
+
+    // Re-check the session still exists at the SAME pid before
+    // stamping: if the uid was revived/respawned mid-scan, the scan
+    // result describes the old child. (A pid reused by an unrelated
+    // codex process inside one 5s tick while the registry entry
+    // still records it is the residual TOCTOU — vanishingly narrow,
+    // and the shape gate still bounds the damage to a real rollout
+    // file of the same user.)
+    {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(sess) = s.sessions.get(session_uid) else {
+            return RolloutObserveOutcome::SessionGone;
+        };
+        if sess.pid as u32 != pid {
+            return RolloutObserveOutcome::NoRollout;
+        }
+    }
+
+    match crate::control::methods::set_transcript_path(
+        state,
+        &serde_json::json!({
+            "session_uid": session_uid,
+            "transcript_path": live_str,
+        }),
+    ) {
+        Ok(_) => {
+            let old_id = current
+                .as_deref()
+                .and_then(crate::session::transcript_id_from_path);
+            let new_id = crate::session::transcript_id_from_path(&live_str)
+                .unwrap_or_else(|| live_str.clone());
+            eprintln!(
+                "cm-daemon: codex rollout rotated for '{}': {} -> {}",
+                session_uid,
+                old_id.as_deref().unwrap_or("(none)"),
+                new_id,
+            );
+            RolloutObserveOutcome::Stamped {
+                old: old_id,
+                new: new_id,
+            }
+        }
+        Err((crate::control::protocol::ErrorCode::NotFound, _)) => {
+            RolloutObserveOutcome::SessionGone
+        }
+        Err((code, msg)) => {
+            eprintln!(
+                "cm-daemon: codex rollout re-stamp for '{}' failed \
+                 ({:?}): {} — retrying next tick",
+                session_uid, code, msg,
+            );
+            RolloutObserveOutcome::StampFailed
+        }
+    }
+}
+
+/// The watch loop body: observe at [`ROLLOUT_WATCH_INTERVAL`] until
+/// the session leaves the registry. Runs for the session's whole
+/// lifetime — rotation can happen at any turn, so unlike the
+/// detector there is no terminal "bound" state to stop at.
+pub fn run_codex_rollout_watch(
+    state: Arc<Mutex<DaemonState>>,
+    session_uid: String,
+) {
+    let mut warned_permission = false;
+    loop {
+        match observe_codex_rollout_once(&state, &session_uid, &mut warned_permission) {
+            RolloutObserveOutcome::SessionGone | RolloutObserveOutcome::NotCodex => {
+                return;
+            }
+            _ => {}
+        }
+        std::thread::sleep(ROLLOUT_WATCH_INTERVAL);
+    }
+}
+
+/// Arm the per-session codex rollout watch (detached thread, like
+/// [`spawn_detector`]). Spawn failure is logged, not fatal: the
+/// watch is a resume-identity hardening — a session without it is
+/// exactly the pre-4f session (stale-on-compact), while failing the
+/// spawn RPC for it would break something that used to work.
+pub fn spawn_codex_rollout_watch(
+    state: Arc<Mutex<DaemonState>>,
+    session_uid: String,
+) {
+    let name = format!("cm-daemon-codex-rollout-{}", session_uid);
+    let uid_for_log = session_uid.clone();
+    if let Err(e) = std::thread::Builder::new().name(name).spawn(move || {
+        run_codex_rollout_watch(state, session_uid);
+    }) {
+        eprintln!(
+            "cm-daemon: could not start codex rollout watch for '{}' ({}); \
+             resume identity will stay at its detector-bound rollout \
+             (stale after a /compact)",
+            uid_for_log, e,
+        );
+    }
+}
+
 /// Engine discriminator for the detector. Mirrors the
 /// `mcp_start_session` `type` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -907,6 +1318,32 @@ mod tests {
         let _release_probe = crate::state::WorktreeSpawnTicket::new(queue.clone(), probe_seq);
         drop(_release_probe);
         state.lock().unwrap().sessions.remove("ts-spawn-fail");
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): the rollout
+    /// shape gate matches on trailing path components, never a
+    /// literal HOME prefix, and refuses everything that isn't a
+    /// `…/.codex/sessions/YYYY/MM/DD/<name>.jsonl` file — it doubles
+    /// as the self-scope bound on what the watch may stamp.
+    #[test]
+    fn codex_rollout_shape_gate_matches_layout_not_home() {
+        let ok = |s: &str| assert!(is_codex_rollout_shaped(Path::new(s)), "{}", s);
+        let no = |s: &str| assert!(!is_codex_rollout_shaped(Path::new(s)), "{}", s);
+        // Any HOME prefix works, including a tempdir.
+        ok("/home/u/.codex/sessions/2026/08/18/rollout-2026-08-18T09-00-00-abc.jsonl");
+        ok("/tmp/xyz123/.codex/sessions/2026/08/18/r.jsonl");
+        // Date components must be numeric.
+        no("/home/u/.codex/sessions/2026/aug/18/r.jsonl");
+        // Must sit under `.codex/sessions`.
+        no("/home/u/.claude/projects/-x/6a1b2c3d.jsonl");
+        no("/home/u/.codex/other/2026/08/18/r.jsonl");
+        // Extension is load-bearing (also excludes readlink's
+        // `… (deleted)` suffix for unlinked-but-open targets).
+        no("/home/u/.codex/sessions/2026/08/18/r.log");
+        no("/home/u/.codex/sessions/2026/08/18/r.jsonl (deleted)");
+        no("/home/u/.codex/sessions/2026/08/18/.jsonl");
+        // Too shallow.
+        no("/.codex/sessions/2026/08/r.jsonl");
     }
 
     #[test]

@@ -1159,20 +1159,61 @@ pub struct DaemonSession {
 }
 
 /// Extract the transcript-file UUID (the resume key) from a stored
-/// `transcript_path`. Both engines name the file `<uuid>.jsonl`
-/// (Claude: `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`; Codex:
-/// `~/.codex/sessions/YYYY/MM/DD/<uuid>.jsonl`), so the file stem IS
-/// the id. The inverse of
+/// `transcript_path`. Claude names the file `<uuid>.jsonl`
+/// (`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`), so the file stem
+/// IS the id. Codex names its rollout files
+/// `~/.codex/sessions/YYYY/MM/DD/rollout-<YYYY-MM-DDThh-mm-ss>-<uuid>.jsonl`
+/// while the resume key (`codex resume <id>`, matching the file's
+/// `payload.id`) is only the trailing uuid — so a rollout-shaped stem
+/// yields its trailing uuid, not the whole stem
+/// (DESIGN_SEAMLESS_RESTART phase 4f, codex lineage: persisting the
+/// full stem made every codex restore/revive hand `codex resume` an id
+/// it doesn't recognize). Plain `<uuid>.jsonl` codex layouts (older
+/// codex, tests) fall through to the stem, which is already the id.
+/// The inverse of
 /// [`crate::transcript_detect::claude_transcript_path`] /
 /// [`codex_transcript_path`](crate::transcript_detect::codex_transcript_path),
 /// which rebuild a path from the id. Returns `None` for a pathless or
 /// extension-less value so the manifest records "no transcript yet"
 /// honestly rather than guessing.
 pub(crate) fn transcript_id_from_path(path: &str) -> Option<String> {
-    std::path::Path::new(path)
+    let stem = std::path::Path::new(path)
         .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
+        .and_then(|s| s.to_str())?;
+    Some(
+        codex_rollout_uuid_from_stem(stem)
+            .unwrap_or_else(|| stem.to_string()),
+    )
+}
+
+/// The trailing session uuid of a codex rollout file stem
+/// (`rollout-<timestamp>-<uuid>` → `<uuid>`), or `None` when `stem`
+/// doesn't have that shape. Shape, not position, is the gate: the
+/// `rollout-` prefix, a `-` separator, and a strict 8-4-4-4-12 hex
+/// uuid tail — claude transcript stems are bare uuids and never
+/// match, so this is safe to apply engine-blind (see
+/// [`transcript_id_from_path`]). Also applied by
+/// `compose_restore_params` to persisted resume ids so legacy
+/// manifest rows that stored the full stem (pre-phase-4f) are
+/// normalized at restore time instead of resuming a phantom id.
+pub(crate) fn codex_rollout_uuid_from_stem(stem: &str) -> Option<String> {
+    let rest = stem.strip_prefix("rollout-")?;
+    if rest.len() < 36 {
+        return None;
+    }
+    let (head, tail) = rest.split_at(rest.len() - 36);
+    // The uuid must be `-`-separated from the timestamp part (or be
+    // the entire remainder) — never a substring bitten out of a
+    // longer token.
+    if !head.is_empty() && !head.ends_with('-') {
+        return None;
+    }
+    let bytes = tail.as_bytes();
+    let uuid_shaped = bytes.iter().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => *b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    });
+    uuid_shaped.then(|| tail.to_string())
 }
 
 impl DaemonSession {
@@ -2890,6 +2931,68 @@ mod tests {
     /// the few multi-thread tests not flake.
     fn recv_with_timeout<T>(rx: &mpsc::Receiver<T>, dur: Duration) -> Option<T> {
         rx.recv_timeout(dur).ok()
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): the resume
+    /// key derived from a REAL codex rollout path must be the trailing
+    /// uuid (`codex resume <payload.id>`), never the full
+    /// `rollout-<ts>-<uuid>` stem; claude stems and plain-`<uuid>`
+    /// codex layouts stay stem-verbatim.
+    #[test]
+    fn transcript_id_from_path_extracts_codex_rollout_uuid() {
+        // Real codex layout: rollout-<timestamp>-<uuid>.jsonl.
+        assert_eq!(
+            transcript_id_from_path(
+                "/home/u/.codex/sessions/2026/08/12/\
+                 rollout-2026-08-12T22-55-11-019ff942-7cd6-7c40-8967-30ad140228ea.jsonl"
+            )
+            .as_deref(),
+            Some("019ff942-7cd6-7c40-8967-30ad140228ea"),
+        );
+        // Claude layout: bare uuid stem, unchanged.
+        assert_eq!(
+            transcript_id_from_path(
+                "/home/u/.claude/projects/-x/6a1b2c3d-1111-2222-3333-444455556666.jsonl"
+            )
+            .as_deref(),
+            Some("6a1b2c3d-1111-2222-3333-444455556666"),
+        );
+        // Old codex layout / test fixtures: plain stem passes through.
+        assert_eq!(
+            transcript_id_from_path("/h/.codex/sessions/2026/01/15/new-codex.jsonl")
+                .as_deref(),
+            Some("new-codex"),
+        );
+        // Rollout-prefixed but NOT uuid-tailed: full stem (never bite a
+        // 36-char substring out of an arbitrary name).
+        assert_eq!(
+            transcript_id_from_path("/x/rollout-2026-06-06T00-00-00-deadbeef.jsonl")
+                .as_deref(),
+            Some("rollout-2026-06-06T00-00-00-deadbeef"),
+        );
+    }
+
+    #[test]
+    fn codex_rollout_uuid_from_stem_requires_shape() {
+        // Separator must precede the uuid tail.
+        assert_eq!(
+            codex_rollout_uuid_from_stem(
+                "rollout-x019ff942-7cd6-7c40-8967-30ad140228ea"
+            ),
+            None,
+        );
+        // Bare `rollout-<uuid>` (no timestamp) still extracts.
+        assert_eq!(
+            codex_rollout_uuid_from_stem("rollout-019ff942-7cd6-7c40-8967-30ad140228ea")
+                .as_deref(),
+            Some("019ff942-7cd6-7c40-8967-30ad140228ea"),
+        );
+        // Non-hex tail refused.
+        assert_eq!(
+            codex_rollout_uuid_from_stem("rollout-2026-08-12T22-55-11-zzzff942-7cd6-7c40-8967-30ad140228ea"),
+            None,
+        );
+        assert_eq!(codex_rollout_uuid_from_stem("no-prefix"), None);
     }
 
     #[test]

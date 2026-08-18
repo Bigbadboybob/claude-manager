@@ -1082,6 +1082,25 @@ pub(crate) fn start_session_with_spawn_fn(
         entry: added_entry,
     });
 
+    // DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): arm the
+    // per-session rollout watch for codex sessions HERE because this
+    // is the one spawn funnel every path shares (mcp_start_session,
+    // create/add_session, workflow roles, continuous fires, restore,
+    // revive) — codex rollout ids rotate on /compact and codex runs
+    // no cm Stop hook, so without daemon-side observation the
+    // persisted resume key goes silently stale and every hard
+    // restart resumes pre-compact history. Detached + non-fatal (see
+    // `spawn_codex_rollout_watch`); the thread self-terminates when
+    // the session leaves the registry. Bash/claude sessions are
+    // never watched (claude's per-turn `session.turn_ended` re-stamp
+    // already covers rotation; bash has no transcript).
+    if p.session_type == "codex" {
+        crate::transcript_detect::spawn_codex_rollout_watch(
+            Arc::clone(state_arc),
+            session_uid.clone(),
+        );
+    }
+
     // Echo VERIFIED cgroup_path back to the TUI (slice
     // 10c-e-3b-fix4a). The path comes from the
     // post-spawn verification arm above — if the scope didn't
@@ -8874,6 +8893,20 @@ fn compose_restore_params(
     // subcommand (codex). `None` → fresh spawn (a session that never bound a
     // transcript falls back to fresh; never blocks — decision 3).
     let resume = e.transcript_id.as_deref();
+    // DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): a codex resume id
+    // persisted by a pre-4f daemon is the FULL rollout stem
+    // (`rollout-<ts>-<uuid>`), which `codex resume` doesn't recognize.
+    // Normalize it to the trailing uuid at restore time; rows persisted
+    // after 4f already carry the uuid (`transcript_id_from_path` extracts
+    // it), for which this is a no-op (`None` → keep as-is).
+    let normalized_codex_resume: Option<String> =
+        match (resume, e.session_type.as_str()) {
+            (Some(id), "codex") => {
+                crate::session::codex_rollout_uuid_from_stem(id)
+            }
+            _ => None,
+        };
+    let resume = normalized_codex_resume.as_deref().or(resume);
     let mut params = compose_daemon_spawn_params(
         state_arc,
         &e.uid,
@@ -18990,6 +19023,54 @@ mod tests {
                 "a phantom transcript must not be resumed: {:?}",
                 argv,
             );
+        });
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): a codex resume id
+    /// persisted by a pre-4f daemon is the FULL rollout stem
+    /// (`rollout-<ts>-<uuid>`) — `codex resume` only accepts the trailing
+    /// uuid, so restore must normalize legacy rows at compose time. Rows
+    /// persisted post-4f already carry the uuid (via
+    /// `transcript_id_from_path`) and pass through untouched.
+    #[test]
+    fn compose_restore_params_normalizes_legacy_codex_rollout_stem() {
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("rwt-codex-legacy");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            let uuid = "019ff942-7cd6-7c40-8967-30ad140228ea";
+            let mut e = me("ts-cccccccccccccccc-0", "codex");
+            e.transcript_id =
+                Some(format!("rollout-2026-08-12T22-55-11-{uuid}"));
+            let params = compose_restore_params(&state, "ws-cl", &wt, &e)
+                .expect("compose ok");
+            let argv: Vec<String> = params["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(argv[1], "resume", "codex resumes via the subcommand");
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some(uuid),
+                "legacy stem-shaped resume id must be normalized to the \
+                 trailing uuid: {:?}",
+                argv,
+            );
+            // A post-4f row (already a uuid) passes through verbatim.
+            let mut e2 = me("ts-cccccccccccccccc-1", "codex");
+            e2.transcript_id = Some(uuid.to_string());
+            let params2 = compose_restore_params(&state, "ws-cl", &wt, &e2)
+                .expect("compose ok");
+            let argv2: Vec<String> = params2["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(argv2.last().map(String::as_str), Some(uuid));
         });
     }
 
