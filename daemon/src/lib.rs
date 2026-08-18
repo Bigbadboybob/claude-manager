@@ -65,6 +65,7 @@ pub mod mcp_config;
 pub mod notify;
 pub mod path;
 pub mod planning_client;
+pub mod reap_gate;
 pub mod reaper;
 pub mod session;
 pub mod session_watch;

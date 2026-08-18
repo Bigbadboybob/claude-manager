@@ -1043,10 +1043,10 @@ pub struct DaemonSession {
     /// but the pid still shows up in logs and `ps` output during
     /// troubleshooting). **Not used for signalling** — that's the
     /// pidfd's job (PID-reuse-safe). **Not used for wait** — that's
-    /// the reaper thread's job, via the kernel's parent-child
-    /// relationship (race-free regardless of PID reuse because the
-    /// kernel keeps the child in the daemon's children list until
-    /// `waitpid` succeeds).
+    /// the reaper thread's job, via a dup of the pidfd
+    /// (`waitid(P_PIDFD, …)`, phase 2a; race-free regardless of PID
+    /// reuse because the kernel resolves the wait target through
+    /// the fd's bound task identity).
     pub pid: libc::pid_t,
     /// File descriptor returned by `pidfd_open(pid, 0)` immediately
     /// after spawn. Bound to *this specific process* by the kernel;
@@ -1097,8 +1097,10 @@ pub struct DaemonSession {
     /// `try_wait` calls return this cached value.
     cached_exit: Option<DaemonExitStatus>,
     /// Receives the typed exit status from the reaper thread. The
-    /// reaper sends exactly once when its `waitpid` returns;
-    /// thereafter the channel is closed. `try_wait` drains it.
+    /// reaper sends exactly once when its gated consumption
+    /// completes (phase 2a — under a restart-coordinator freeze the
+    /// send is deferred, never dropped); thereafter the channel is
+    /// closed. `try_wait` drains it.
     exit_rx: mpsc::Receiver<DaemonExitStatus>,
     /// Reader-thread handle. Owned but not joined on drop — the
     /// thread terminates on its own when the PTY's reader sees EOF
@@ -1107,9 +1109,12 @@ pub struct DaemonSession {
     _reader_handle: JoinHandle<()>,
     /// Reaper-thread handle. The reaper *owns* the
     /// `portable_pty::Child` handle (transferred at spawn time)
-    /// and blocks on `libc::waitpid(pid, ..., 0)` for the typed
-    /// `DaemonExitStatus`. We use raw `waitpid` rather than
-    /// `Child::wait()` because portable-pty's `ExitStatus`
+    /// plus a dup of the pidfd, polls the dup for exit-readiness,
+    /// and consumes the status via `waitid(P_PIDFD, …)` under
+    /// `crate::reap_gate::read_permit()` (restart hardening /
+    /// DESIGN_SEAMLESS_RESTART phase 2a) for the typed
+    /// `DaemonExitStatus`. We use raw `waitid`/`waitpid` rather
+    /// than `Child::wait()` because portable-pty's `ExitStatus`
     /// collapses code and signal into a single `u32` — that
     /// would break the named acceptance criterion "memory-cap
     /// kills indistinguishable from today's signal 9 toast."
@@ -1122,8 +1127,8 @@ pub struct DaemonSession {
     /// underlying device alive.
     _master: Box<dyn portable_pty::MasterPty + Send>,
     /// Most-recently-observed exit info. Written by the reaper
-    /// thread after `waitpid` returns; read by the attach-stream
-    /// End-frame path. See [`SharedLastExit`].
+    /// thread after its gated status consumption; read by the
+    /// attach-stream End-frame path. See [`SharedLastExit`].
     ///
     /// Slice-10c-e-2 review fix #2: prior to this, the End frame
     /// always carried `Value::Null` and the TUI's exit decoder
@@ -1637,8 +1642,17 @@ impl PendingSession {
     /// **Phase 2** of session spawn: spawn the per-session reaper
     /// thread and return a fully-armed [`DaemonSession`].
     ///
-    /// `on_exit` is invoked by the reaper thread after `waitpid`
-    /// returns. `start_session` passes a closure that removes the
+    /// The reaper is a pidfd-poll loop, not a blocking `waitpid`
+    /// (restart hardening / DESIGN_SEAMLESS_RESTART phase 2a, R4):
+    /// it waits for exit-readiness on a dup of the session's pidfd
+    /// and consumes the status via `waitid(P_PIDFD)` only while
+    /// holding `crate::reap_gate::read_permit()`, so the future
+    /// restart coordinator can freeze all consumption during a
+    /// handoff window.
+    ///
+    /// `on_exit` is invoked by the reaper thread after the status
+    /// is consumed (still under the reap permit). `start_session`
+    /// passes a closure that removes the
     /// session from the daemon-state registry. See the
     /// [type docs](PendingSession) for the race-safety
     /// argument — the caller MUST hold the relevant state lock
@@ -1689,23 +1703,74 @@ impl PendingSession {
         ));
         let last_exit_for_reaper = last_exit.clone();
 
+        // Restart hardening / DESIGN_SEAMLESS_RESTART phase 2a (R4):
+        // the reaper thread gets its OWN dup of the pidfd. The
+        // session's original stays on `DaemonSession` for the kill
+        // paths (`kill()`, Drop) exactly as before; the dup is what
+        // the reaper polls for exit-readiness and consumes through
+        // via `waitid(P_PIDFD, …)`. Two independent OwnedFds, no
+        // shared-handle lifetime coupling between reaping and
+        // killing.
+        let reaper_pidfd = match pidfd.try_clone() {
+            Ok(fd) => fd,
+            Err(e) => {
+                // Pre-arm spawn-failure cleanup — direct waitpid,
+                // deliberately NOT routed through the reap gate:
+                // this path only runs while the spawn RPC is still
+                // in flight, and the restart barrier's in-flight-
+                // mutation counter (phase 2d) excludes such windows
+                // from handoffs. See `crate::reap_gate` module docs.
+                let _ = send_sigkill_via_pidfd(&pidfd);
+                let _ = wait_for_child(pid);
+                return Err(anyhow::anyhow!(
+                    "arm_reaper: dup pidfd for reaper: {}",
+                    e
+                ));
+            }
+        };
+
         let (exit_tx, exit_rx) = mpsc::channel::<DaemonExitStatus>();
         let reaper_handle = match std::thread::Builder::new()
             .name(format!("cm-session-{}-reaper", uid))
             .spawn(move || {
-                // Keep `child` in scope until after the waitpid
-                // returns; explicit drop at end documents the
+                // Keep `child` in scope until after the status has
+                // been consumed; explicit drop at end documents the
                 // lifetime even though it's a no-op.
                 let _child = child;
-                let status = wait_for_child(pid);
+
+                // Restart hardening / DESIGN_SEAMLESS_RESTART phase
+                // 2a (R4): detect-then-consume, never blocking-
+                // consume. Pre-2a this thread parked in `waitpid`
+                // and consumed the kernel's one copy of the exit
+                // status the instant the child died — during a
+                // future re-exec handoff, a status consumed
+                // microseconds before the exec is lost between
+                // `waitpid` and persistence. Now:
+                //
+                //   1. Wait for exit-READINESS via non-consuming
+                //      poll(2) on the pidfd (finite timeout per
+                //      iteration keeps the loop responsive).
+                //   2. Acquire the shared reap permit. The restart
+                //      coordinator's exclusive `freeze()` blocks
+                //      right here — the child parks as a zombie,
+                //      fully reconstructible by the new image.
+                //   3. Consume via waitid(P_PIDFD) and run ALL of
+                //      the downstream persistence (exit channel,
+                //      LastExitProbe, on_exit registry callback)
+                //      under that same permit, so a freeze can
+                //      never observe a consumed-but-unpersisted
+                //      status.
+                poll_pidfd_until_exit_ready(&reaper_pidfd);
+                let _reap_permit = crate::reap_gate::read_permit();
+                let status = consume_exit_status(&reaper_pidfd, pid);
                 let _ = exit_tx.send(status.clone());
 
                 // Cache ONLY the kernel-observable exit at
-                // waitpid time. memory_cap_kill gets classified
+                // consumption time. memory_cap_kill gets classified
                 // lazily by `LastExitProbe::snapshot()` at
                 // End-frame emission time — the slice-10c-e-2
                 // review-6 fix that closes the race between the
-                // cgroup-OOM writer and `waitpid`.
+                // cgroup-OOM writer and the status consumption.
                 last_exit_for_reaper.set_kernel(KernelExitStatus {
                     code: status.code,
                     // Slice 10d watcher-fix #1.5: signal is what
@@ -1720,6 +1785,9 @@ impl PendingSession {
                     cb(&status);
                 }
                 drop(_child);
+                // `_reap_permit` drops here — consumption and its
+                // persistence were one indivisible unit under the
+                // gate (R4).
             }) {
             Ok(h) => h,
             Err(e) => {
@@ -1727,6 +1795,12 @@ impl PendingSession {
                 // closure happens before spawn's internal
                 // allocation can fail). pidfd survives in this
                 // scope; use it to kill, then waitpid to reap.
+                //
+                // Direct waitpid is deliberate here (reap-gate
+                // exempt): pre-arm spawn-failure path, excluded
+                // from handoff windows by the restart barrier's
+                // in-flight-mutation counter (phase 2d). See
+                // `crate::reap_gate` module docs.
                 let _ = send_sigkill_via_pidfd(&pidfd);
                 let _ = wait_for_child(pid);
                 return Err(anyhow::anyhow!("arm_reaper: spawn reaper thread: {}", e));
@@ -1796,6 +1870,14 @@ impl Drop for PendingSession {
     /// reader thread terminates naturally when `master` drops
     /// (closes the master fd, reader sees EOF, calls
     /// `fanout.close()`, returns).
+    ///
+    /// Direct `waitpid` here is deliberate — this path is exempt
+    /// from the reap gate (restart hardening /
+    /// DESIGN_SEAMLESS_RESTART phase 2a): it only runs on spawn-
+    /// failure paths while the spawn RPC is still in flight, and
+    /// the restart barrier's in-flight-mutation counter (phase 2d)
+    /// excludes such windows from handoffs. See `crate::reap_gate`
+    /// module docs.
     ///
     /// If `inner` is `None`, `arm_reaper` has already consumed it
     /// — drop is a no-op in that case.
@@ -2178,9 +2260,163 @@ fn send_sigkill_via_pidfd(pidfd: &OwnedFd) -> std::io::Result<()> {
     Err(err)
 }
 
+/// How long each `poll(2)` iteration of the pidfd reaper loop waits
+/// before re-arming. Exit detection itself is NOT delayed by this —
+/// a child's death makes the pidfd readable and wakes the poll
+/// immediately; the timeout only bounds how long the loop can sit
+/// in the kernel per iteration, keeping the thread responsive
+/// rather than parked indefinitely in a single syscall (restart
+/// hardening / DESIGN_SEAMLESS_RESTART phase 2a). The freeze test
+/// in `daemon/tests/reap_gate_freeze.rs` sizes its "no delivery"
+/// window in multiples of this.
+pub const REAPER_POLL_INTERVAL_MS: libc::c_int = 500;
+
+/// Wait for the child behind `pidfd` to become exit-READY without
+/// consuming its wait status. Restart hardening /
+/// DESIGN_SEAMLESS_RESTART phase 2a (R4): this is the non-consuming
+/// half of the reaper's detect-then-consume split — a pidfd polls
+/// readable (`POLLIN`) once the process has exited, and stays
+/// readable after it's reaped, so readiness detection is
+/// level-triggered and side-effect-free. Consumption happens
+/// separately, under `crate::reap_gate::read_permit()`, in
+/// [`consume_exit_status`].
+///
+/// Loops on `poll(2)` with a finite per-iteration timeout
+/// ([`REAPER_POLL_INTERVAL_MS`]) so the thread is never parked in an
+/// unbounded syscall. Returns as soon as the pidfd reports any
+/// event: `POLLIN` is the documented exit-readiness signal;
+/// `POLLERR`/`POLLNVAL` would mean the fd itself is broken (a
+/// program bug — we own the dup and never close it early), in which
+/// case waiting longer can't help and the consuming path resolves
+/// the truth. Transient poll failures (`EINTR`, `ENOMEM`) retry
+/// after one interval.
+fn poll_pidfd_until_exit_ready(pidfd: &OwnedFd) {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, REAPER_POLL_INTERVAL_MS) };
+        if ret > 0 {
+            // Some event is pending (see doc comment) — readiness.
+            return;
+        }
+        if ret == 0 {
+            // Timeout — child still running; re-arm.
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        // ENOMEM or another transient failure: back off one
+        // interval and retry rather than falling through to a
+        // blocking consume — the invariant "never block in a
+        // consuming wait while the child may still be alive, and
+        // never hold the reap permit before readiness" outranks
+        // latency on a path that is unreachable in practice.
+        std::thread::sleep(std::time::Duration::from_millis(
+            REAPER_POLL_INTERVAL_MS as u64,
+        ));
+    }
+}
+
+/// Consume the exited child's wait status via
+/// `waitid(P_PIDFD, pidfd, WEXITED)` and decode it into the same
+/// typed [`DaemonExitStatus`] shape [`wait_for_child`] produces
+/// (`CLD_EXITED` → `code`, `CLD_KILLED`/`CLD_DUMPED` → `signal`).
+///
+/// Restart hardening / DESIGN_SEAMLESS_RESTART phase 2a (R4): this
+/// is the consuming half of the reaper's detect-then-consume split.
+/// **Callers must hold `crate::reap_gate::read_permit()` across
+/// this call and the downstream persistence of its result** — the
+/// gate is what lets the restart coordinator freeze all status
+/// consumption during a handoff window.
+///
+/// Targeting the wait through the pidfd (not the numeric pid) is
+/// PID-reuse-safe for the same reason `pidfd_send_signal` is: the
+/// kernel resolves the target through the fd's bound task identity.
+/// Runtime fallback: `waitid(P_PIDFD, …)` needs Linux 5.4 (pidfds
+/// themselves need 5.3, which spawn already requires); on `EINVAL`
+/// from an older kernel we fall back to plain
+/// [`wait_for_child`]`(pid)` — still under the caller's read
+/// permit, and non-blocking in practice because callers only get
+/// here after [`poll_pidfd_until_exit_ready`] observed the exit.
+fn consume_exit_status(pidfd: &OwnedFd, pid: libc::pid_t) -> DaemonExitStatus {
+    loop {
+        // SAFETY: zeroed siginfo_t is a valid "empty" value for the
+        // kernel to fill; all-zero bit patterns are in-range for its
+        // C layout.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED,
+            )
+        };
+        if ret == 0 {
+            // SAFETY: with WEXITED and a successful return, si_code
+            // is one of the CLD_* child-status values and si_status
+            // is the exit code / terminating signal — the union
+            // read si_status() performs is the defined one for
+            // SIGCHLD-shaped siginfo.
+            let si_status = unsafe { info.si_status() };
+            return match info.si_code {
+                libc::CLD_EXITED => DaemonExitStatus {
+                    code: Some(si_status),
+                    signal: None,
+                },
+                libc::CLD_KILLED | libc::CLD_DUMPED => DaemonExitStatus {
+                    code: None,
+                    signal: Some(si_status),
+                },
+                // CLD_STOPPED / CLD_TRAPPED / CLD_CONTINUED can't
+                // arrive with WEXITED alone; defend like
+                // `wait_for_child` does for its impossible arm.
+                _ => DaemonExitStatus {
+                    code: None,
+                    signal: None,
+                },
+            };
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            // Pre-5.4 kernel: P_PIDFD unsupported. Consume by pid
+            // instead — same permit discipline (the caller holds
+            // it), same status fidelity.
+            Some(libc::EINVAL) => return wait_for_child(pid),
+            // ECHILD: someone else consumed the status (would
+            // require a wait outside this module — a program bug we
+            // don't have). Surface "unknown" cleanly, mirroring
+            // `wait_for_child`'s ECHILD arm.
+            _ => return DaemonExitStatus {
+                code: None,
+                signal: None,
+            },
+        }
+    }
+}
+
 /// Block on `waitpid(pid, 0)` and decode the C-style wait status
-/// into a typed [`DaemonExitStatus`]. Used by the per-session reaper
-/// thread.
+/// into a typed [`DaemonExitStatus`].
+///
+/// Restart hardening / DESIGN_SEAMLESS_RESTART phase 2a (R4): the
+/// per-session reaper thread no longer parks here — it detects
+/// readiness with [`poll_pidfd_until_exit_ready`] and consumes with
+/// [`consume_exit_status`] under the reap gate. Remaining callers:
+///
+/// - the pre-arm spawn-failure cleanups (`PendingSession::Drop`,
+///   `arm_reaper`'s dup/thread-spawn error paths) — kill-then-reap
+///   on paths that only run while a spawn RPC is in flight, which
+///   the restart barrier's in-flight-mutation counter (phase 2d)
+///   excludes from handoff windows, so they're exempt from the
+///   gate by design;
+/// - [`consume_exit_status`]'s pre-5.4-kernel fallback, which runs
+///   under the caller's read permit.
 fn wait_for_child(pid: libc::pid_t) -> DaemonExitStatus {
     let mut status: libc::c_int = 0;
     let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -2212,15 +2448,17 @@ impl Drop for DaemonSession {
     /// Best-effort cleanup: SIGKILL the child if it's still
     /// running, via the pidfd. Two cases:
     ///
-    /// **Case 1: child still alive.** The reaper thread is blocked
-    /// on `waitpid`; our SIGKILL via the pidfd reaches the actual
-    /// child (PID-reuse-safe), the kernel delivers `SIGCHLD`, the
-    /// wait returns, the reaper sends the typed status (best-effort
-    /// — we may have already dropped the receiver), and the reaper
-    /// thread exits. No zombie.
+    /// **Case 1: child still alive.** The reaper thread is parked
+    /// in its pidfd-poll loop (phase 2a); our SIGKILL via the pidfd
+    /// reaches the actual child (PID-reuse-safe), the child's exit
+    /// makes the reaper's dup'd pidfd readable, the reaper consumes
+    /// the status under the reap permit and sends the typed status
+    /// (best-effort — we may have already dropped the receiver),
+    /// and the reaper thread exits. No zombie (a reap-gate freeze
+    /// can defer the consumption, never lose it).
     ///
     /// **Case 2: child already reaped.** The reaper has already
-    /// returned from `waitpid`. The pidfd is bound to a now-gone
+    /// consumed the status. The pidfd is bound to a now-gone
     /// task identity, so `pidfd_send_signal` returns `ESRCH` — we
     /// treat as success. **This is exactly the case the
     /// slice-10c-b reviewer flagged**: under the legacy
@@ -2230,10 +2468,12 @@ impl Drop for DaemonSession {
     /// unrelated user-owned process. The pidfd closes that window.
     ///
     /// We don't join either the reader or reaper thread here.
-    /// Joining could block Drop indefinitely if `read` / `waitpid`
-    /// is slow to return. They terminate naturally:
+    /// Joining could block Drop indefinitely if `read` / the reap
+    /// loop is slow to return. They terminate naturally:
     ///   - reader: when the PTY's read returns 0 / errors.
-    ///   - reaper: when its `waitpid` returns.
+    ///   - reaper: when its poll observes the exit and the gated
+    ///     consumption completes (deferred, not blocked forever,
+    ///     under a restart-coordinator freeze).
     /// Both happen shortly after the kill — within milliseconds
     /// for the kernel-level paths.
     fn drop(&mut self) {
