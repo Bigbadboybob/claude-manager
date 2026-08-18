@@ -432,15 +432,26 @@ tmux new-session -d -s backtest -x 200 -y 50 \
     "bash /root/cm_pipeline.sh; echo \$? > /var/run/cm-pipeline-exit; sleep 3600"
 
 # ---------------------------------------------------------------------------
-# ttyd (observability)
+# ttyd (observability). NOT publicly reachable: :8080 ingress is scoped by the
+# cm-backtest-ttyd firewall rule (operator + cm-manager IPs only, ensured by
+# the dispatcher — dispatch/vm.py::ensure_ttyd_firewall; the old allow-ttyd
+# rule exposed this ROOT terminal to 0.0.0.0/0 and scanners probed it within
+# hours of boot). The ttyd_url on the task keeps working from allowlisted
+# networks; from anywhere else, tunnel instead:
+#   gcloud compute ssh <vm> --project=<project> --zone=<zone> -- -L 8080:localhost:8080
+# then open http://localhost:8080 (exact command logged below).
 # ---------------------------------------------------------------------------
 ttyd -i 0.0.0.0 -p 8080 --writable tmux attach -t backtest &
 
 EXTERNAL_IP=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" \
     -H "Metadata-Flavor: Google" || echo "")
+VM_NAME=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/name" -H "$META_HEADER" || echo "")
+VM_ZONE=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/zone" -H "$META_HEADER" | awk -F/ '{print $NF}' || echo "")
+VM_PROJECT=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/project/project-id" -H "$META_HEADER" || echo "")
 if [ -n "$EXTERNAL_IP" ]; then
     api_update "{\"ttyd_url\": \"http://${EXTERNAL_IP}:8080\"}"
 fi
+echo "[cm-backtest] ttyd: http://${EXTERNAL_IP}:8080 (allowlisted IPs only; from elsewhere: gcloud compute ssh $VM_NAME --project=$VM_PROJECT --zone=$VM_ZONE -- -L 8080:localhost:8080 then open http://localhost:8080)"
 echo "running" > /var/log/cm-worker-state
 
 # ---------------------------------------------------------------------------

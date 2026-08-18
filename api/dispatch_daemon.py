@@ -263,7 +263,22 @@ async def _launch_backtest_worker(pool, task):
 
 def _launch_backtest_vm_sync(task, branch, bt, vm_over, run_key):
     """Synchronous backtest VM launch."""
-    from dispatch.vm import launch_worker, read_worker_script
+    from dispatch.vm import launch_worker, read_worker_script, ensure_ttyd_firewall
+    from dispatch.config import BACKTEST_TTYD_TAG, BACKTEST_TTYD_SOURCE_RANGES
+
+    # Scope the worker's ttyd (ROOT web terminal on :8080) to the operator +
+    # cm-manager before the VM exists. Best-effort: a firewall hiccup must
+    # never stop the backtest — it only leaves ttyd unreachable (fail closed;
+    # the ssh tunnel documented in backtest_startup.sh still works).
+    try:
+        ensure_ttyd_firewall(
+            vm_over["project"], BACKTEST_TTYD_TAG, BACKTEST_TTYD_SOURCE_RANGES,
+        )
+    except Exception:
+        logger.exception(
+            f"ttyd firewall ensure failed for project {vm_over['project']} — "
+            f"worker ttyd may be unreachable (:8080 ingress stays denied)"
+        )
     return launch_worker(
         task_id=str(task["id"]),
         repo_url=task["repo_url"],
@@ -278,6 +293,10 @@ def _launch_backtest_vm_sync(task, branch, bt, vm_over, run_key):
             "secrets-project": BACKTEST_SECRETS_PROJECT,
             "results-bucket": BACKTEST_RESULTS_BUCKET,
         },
+        # Dedicated scoped tag, NOT the legacy allow-ttyd (0.0.0.0/0) tag:
+        # backtest workers carry a repo clone + replica DSN behind a root
+        # web terminal, and scanners probed one within hours of boot.
+        network_tags=["cm-worker", BACKTEST_TTYD_TAG],
     )
 
 
