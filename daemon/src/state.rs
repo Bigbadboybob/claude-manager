@@ -370,6 +370,14 @@ pub struct DaemonState {
     /// spawning sessions. Indexed by the stable session uid that
     /// already lives on `ManifestEntry` / `TerminalSession`.
     pub sessions: HashMap<String, DaemonSession>,
+    /// H3 (restart hardening): drain mode. While true, spawn-shaped
+    /// operations (`mcp_start_session`, `session.revive`) refuse and
+    /// the continuous scheduler's tick no-ops, so an operator can bring
+    /// the daemon to a quiet seam before a restart instead of killing
+    /// sessions mid-flight. Set/cleared by `daemon.drain`; surfaced on
+    /// `daemon.health`. Deliberately NOT persisted — drain precedes a
+    /// restart, and a fresh daemon must never come up refusing spawns.
+    pub draining: bool,
     /// Recently-exited sessions, retained for read-after-exit (the MCP
     /// `read_session_output` / `list_sessions(include_exited)` contract). A
     /// session is moved here from `sessions` on exit (see
@@ -728,6 +736,7 @@ impl Default for DaemonState {
                 crate::workflow::events::WorkflowEventWatcher::new(),
             ),
             config: crate::config::DaemonConfig::default(),
+            draining: false,
         }
     }
 }

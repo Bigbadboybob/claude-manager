@@ -3202,6 +3202,17 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         .values()
         .filter(|s| s.transcript_path.is_some())
         .count();
+    // H3: drain visibility. `sessions_mid_turn` counts sessions whose
+    // semantic-idle signal says a turn is IN FLIGHT (input newer than
+    // the last turn-end self-report). Sessions without the signal
+    // (bash, codex, pre-hook spawns → `semantic_idle() == None`) are
+    // not counted — the drain wait protects hook-reporting claude
+    // sessions, the ones with conversations to lose.
+    let mid_turn = state
+        .sessions
+        .values()
+        .filter(|s| s.semantic_idle() == Some(false))
+        .count();
     Ok(json!({
         "ok": true,
         "mcp_ok": mcp_ok,
@@ -3209,6 +3220,8 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "sessions": total,
         "sessions_with_transcript": with_transcript,
         "workspaces": state.workspaces.len(),
+        "draining": state.draining,
+        "sessions_mid_turn": mid_turn,
     }))
 }
 
@@ -3340,6 +3353,127 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "requires_restart": requires_restart,
         "mcp_preflight": mcp_preflight,
         "workflow_definitions_reloaded": workflow_defs_reloaded,
+    }))
+}
+
+// ============================================================
+// daemon.drain (H3 restart hardening)
+// ============================================================
+//
+// Bring the daemon to a quiet seam before a restart instead of killing
+// sessions mid-flight. While draining: spawn-shaped operations
+// (`mcp_start_session`, `session.revive`) refuse with a Conflict that
+// names the drain, and the continuous scheduler's tick no-ops. Live
+// sessions get a one-line heads-up dropped into their Stop-hook inbox
+// (same file shape as the monitor delivery path in
+// `mcp_server/async_monitor.py::_write_inbox`), which the cm Stop hook
+// injects at their NEXT turn boundary — mid-turn agents learn the
+// restart is coming exactly when they reach a stopping point.
+//
+// Workflow fresh-context respawns are deliberately NOT gated: the
+// engine owns participant lifecycle, and wedging a run mid-transition
+// leaves worse state than letting the transition finish — the drain's
+// purpose is met by `sessions_mid_turn` reaching 0 on `daemon.health`,
+// which counts participants like every other session.
+//
+// **Auth: Operator-only** (dispatch gate).
+
+#[derive(Deserialize)]
+struct DaemonDrainParams {
+    enable: bool,
+}
+
+/// Shared gate for spawn-shaped methods. Conflict (not Unauthorized):
+/// the caller has authority; the DAEMON's state forbids the operation,
+/// and retry-after-undrain is the natural client response.
+fn refuse_if_draining(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    method: &str,
+) -> Result<(), (ErrorCode, String)> {
+    let draining = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.draining
+    };
+    if draining {
+        return Err((
+            ErrorCode::Conflict,
+            format!(
+                "daemon is draining for restart — {} refused (cancel with \
+                 daemon.drain {{\"enable\": false}})",
+                method
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Drop the drain heads-up into one session's Stop-hook inbox. Mirrors
+/// `_write_inbox` in `mcp_server/async_monitor.py` exactly — same
+/// directory (`~/.cm/inbox/<uid>/`), same `<millis>-<tag>.json` name,
+/// same `{"text": ...}` body — so the hook drains it identically to a
+/// monitor fire. Atomic tmp+rename like the Python side.
+fn write_drain_inbox_notice(uid: &str) -> std::io::Result<()> {
+    let inbox = crate::path::dot_cm_dir().join("inbox").join(uid);
+    std::fs::create_dir_all(&inbox)?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = inbox.join(format!("{}-cm-drain.json", millis));
+    let tmp = inbox.join(format!("{}-cm-drain.json.tmp", millis));
+    let body = json!({
+        "text": "[cm-daemon] The daemon is draining for a restart: it will \
+                 restart at the next quiet point, and this session will be \
+                 killed and resumed. Reach a clean stopping point and end \
+                 your turn; do not start long-running foreground work."
+    });
+    std::fs::write(&tmp, serde_json::to_vec(&body)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn daemon_drain(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: DaemonDrainParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("daemon.drain params: {}", e)))?;
+    // Flip the flag and snapshot live uids under one brief lock; inbox
+    // IO runs outside it.
+    let live_uids: Vec<String> = {
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.draining = p.enable;
+        if p.enable {
+            st.sessions.keys().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    };
+    let mut notified = 0usize;
+    if p.enable {
+        for uid in &live_uids {
+            match write_drain_inbox_notice(uid) {
+                Ok(()) => notified += 1,
+                Err(e) => eprintln!(
+                    "cm-daemon: drain: inbox notice for {} failed: {}",
+                    uid, e
+                ),
+            }
+        }
+    }
+    eprintln!(
+        "cm-daemon: drain {} ({} live session(s){})",
+        if p.enable { "ENABLED" } else { "disabled" },
+        live_uids.len(),
+        if p.enable {
+            format!(", {} notified via inbox", notified)
+        } else {
+            String::new()
+        },
+    );
+    Ok(json!({
+        "draining": p.enable,
+        "sessions_notified": notified,
     }))
 }
 
@@ -7127,6 +7261,10 @@ pub fn mcp_start_session(
 ) -> MethodResult {
     let p: McpStartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("mcp_start_session params: {}", e)))?;
+    // H3: drain gate FIRST — while the operator is draining for a
+    // restart, minting new sessions is exactly what must not happen
+    // (they'd be killed moments later, possibly before first turn).
+    refuse_if_draining(state_arc, "mcp_start_session")?;
     // Type validation BEFORE the caller lookup so a bogus type
     // surfaces InvalidParams without needing a live caller.
     if !is_valid_session_type(&p.type_) {
@@ -8942,6 +9080,10 @@ pub fn revive_session(
 ) -> MethodResult {
     let p: ReviveSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+
+    // H3: drain gate — a revive during drain would mint a child the
+    // imminent restart immediately kills (and, pre-H1, could lose).
+    refuse_if_draining(state_arc, "session.revive")?;
 
     // Resolve the revive inputs under one brief lock; the spawn itself runs
     // lock-free inside `restore_one_session` (`start_session` manages its own
@@ -18305,6 +18447,75 @@ mod tests {
                 st.config.auth.mode,
                 crate::config::AuthMode::SshTrust,
                 "auth mode must NOT hot-swap",
+            );
+        });
+    }
+
+    /// H3 (restart hardening): drain refuses the spawn-shaped methods
+    /// with a Conflict naming the drain, surfaces on daemon.health,
+    /// and un-drain restores normal behavior (revive proceeds past the
+    /// gate to its usual NotFound for an unknown uid).
+    #[test]
+    fn drain_refuses_spawns_and_surfaces_on_health() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let on = daemon_drain(&state, &json!({"enable": true})).expect("drain on");
+            assert_eq!(on["draining"], json!(true));
+
+            let (code, msg) =
+                revive_session(&state, &json!({"uid": "ts-x"})).unwrap_err();
+            assert_eq!(code, ErrorCode::Conflict);
+            assert!(msg.contains("draining"), "{}", msg);
+
+            let (code2, msg2) = mcp_start_session(
+                &state,
+                &json!({"type": "bash", "label": "drained"}),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(code2, ErrorCode::Conflict);
+            assert!(msg2.contains("draining"), "{}", msg2);
+
+            let h = daemon_health(&state).expect("health");
+            assert_eq!(h["draining"], json!(true));
+            assert_eq!(h["sessions_mid_turn"], json!(0));
+
+            daemon_drain(&state, &json!({"enable": false})).expect("drain off");
+            let (code3, _) =
+                revive_session(&state, &json!({"uid": "ts-x"})).unwrap_err();
+            assert_eq!(code3, ErrorCode::NotFound, "gate cleared → normal path");
+            let h2 = daemon_health(&state).expect("health");
+            assert_eq!(h2["draining"], json!(false));
+        });
+    }
+
+    /// H3: the drain heads-up lands in the same inbox shape the monitor
+    /// delivery path uses (`~/.cm/inbox/<uid>/<millis>-*.json`,
+    /// `{"text": ...}`), so the cm Stop hook drains it unmodified.
+    #[test]
+    fn drain_inbox_notice_matches_monitor_inbox_shape() {
+        with_temp_home(|| {
+            write_drain_inbox_notice("ts-drainee-1").expect("notice written");
+            let home =
+                std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let inbox = home.join(".cm/inbox/ts-drainee-1");
+            let entries: Vec<_> = std::fs::read_dir(&inbox)
+                .expect("inbox dir exists")
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert_eq!(entries.len(), 1, "exactly one notice: {:?}", entries);
+            let name = entries[0].file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name.ends_with("-cm-drain.json") && !name.ends_with(".tmp"),
+                "atomic final name: {}",
+                name,
+            );
+            let body: Value =
+                serde_json::from_slice(&std::fs::read(&entries[0]).unwrap()).unwrap();
+            assert!(
+                body["text"].as_str().unwrap().contains("draining"),
+                "{:?}",
+                body,
             );
         });
     }

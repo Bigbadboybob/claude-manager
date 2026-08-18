@@ -370,6 +370,7 @@ pub fn dispatch_request(
         "daemon.reload_config" => {
             DispatchOutcome::Done(dispatch_reload_config(state, req))
         }
+        "daemon.drain" => DispatchOutcome::Done(dispatch_daemon_drain(state, req)),
 
         // 10d-1: TUI-pushed session snapshot so the daemon
         // can recognize TUI-minted sessions for the future
@@ -1480,6 +1481,26 @@ fn dispatch_reload_config(
         return resp;
     }
     match methods::reload_config(state) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `daemon.drain` — enter/leave drain mode ahead of a restart (H3; see
+/// `methods::daemon_drain` for what draining refuses and notifies).
+fn dispatch_daemon_drain(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "daemon.drain is Operator-callable only — it suspends spawning \
+         daemon-wide; a Session caller could deny service to every \
+         other session",
+    ) {
+        return resp;
+    }
+    match methods::daemon_drain(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

@@ -327,9 +327,12 @@ impl ContinuousScheduler {
     pub fn tick_once(&self) {
         // Master on/off (read under a brief lock). lib.rs still constructs +
         // starts the thread when disabled; the tick is just a no-op.
+        // H3: drain mode also parks the tick — firing a continuous task
+        // during a pre-restart drain would mint work the restart kills.
+        // Schedules naturally catch up post-restart (due-check on load).
         {
             let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if !s.config.scheduler.enabled {
+            if !s.config.scheduler.enabled || s.draining {
                 return;
             }
         }

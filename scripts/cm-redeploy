@@ -182,12 +182,87 @@ if [ "$DRY" = "1" ]; then
     exit 0
 fi
 
+# Operator RPC helper (same 4-byte-length JSON framing as the smoke test
+# below). Prints the raw JSON response; non-zero exit = socket-level
+# failure (daemon down / predates the method) — callers treat that as
+# "skip gracefully", never as fatal.
+cm_op_call() {
+    python3 - "$HOME/.cm/daemon.sock" "$1" "$2" <<'PY' 2>/dev/null
+import json, os, socket, struct, sys
+sock, method, params = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+body = json.dumps({"id": os.urandom(8).hex(),
+                   "caller": {"token_id": "cm-redeploy"},
+                   "method": method, "params": params}).encode()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5.0)
+s.connect(sock)
+try:
+    s.sendall(struct.pack(">I", len(body)) + body)
+    raw = b""
+    while len(raw) < 4:
+        chunk = s.recv(4 - len(raw))
+        if not chunk:
+            raise OSError("eof")
+        raw += chunk
+    (n,) = struct.unpack(">I", raw)
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise OSError("eof")
+        buf += chunk
+finally:
+    s.close()
+print(buf.decode())
+PY
+}
+
+# H3: drain before killing. Stops new spawns + parks the continuous
+# scheduler, drops a heads-up in every live session's Stop-hook inbox,
+# then waits (bounded) for in-flight turns to reach a boundary so the
+# kill lands on a quiet seam instead of mid-thought. Best-effort: an
+# old daemon without daemon.drain just logs and proceeds — exactly the
+# pre-drain behavior.
+if [ -n "$DAEMON_PID" ]; then
+    step "draining daemon (bounded wait for turn boundaries)"
+    if cm_op_call daemon.drain '{"enable": true}' | grep -q '"ok":true'; then
+        DRAIN_DEADLINE=$(( $(date +%s) + 60 ))
+        DRAINED=0
+        while [ "$(date +%s)" -lt "$DRAIN_DEADLINE" ]; do
+            MID=$(cm_op_call daemon.health '{}' \
+                | python3 -c 'import json,sys; print((json.load(sys.stdin).get("result") or {}).get("sessions_mid_turn", ""))' 2>/dev/null)
+            if [ "$MID" = "0" ]; then
+                DRAINED=1
+                break
+            fi
+            echo "  sessions mid-turn: ${MID:-?} — waiting..."
+            sleep 3
+        done
+        if [ "$DRAINED" = "1" ]; then
+            echo "drained: no sessions mid-turn"
+        else
+            echo "drain wait hit the 60s bound — proceeding anyway (sessions may be mid-turn)"
+        fi
+    else
+        echo "daemon.drain unavailable (old daemon?) — proceeding without drain"
+    fi
+fi
+
 if [ "$YES" != "1" ]; then
     echo
     read -r -p "Proceed with restart? [y/N] " confirm
     case "$confirm" in
         y|Y|yes|YES) ;;
-        *) echo "aborted"; exit 0 ;;
+        *)
+            # Undo the drain — an aborted redeploy must not leave the
+            # daemon refusing spawns.
+            if [ -n "$DAEMON_PID" ]; then
+                cm_op_call daemon.drain '{"enable": false}' >/dev/null || true
+                echo "drain cancelled"
+            fi
+            echo "aborted"
+            exit 0
+            ;;
     esac
 fi
 
