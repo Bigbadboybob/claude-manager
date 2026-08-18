@@ -879,7 +879,17 @@ pub(crate) fn start_session_with_spawn_fn(
     //      watcher has no breach threshold).
     //   3. `kills_dir` is set (populated above when cap was
     //      requested, via `default_kills_dir()`).
-    let watcher_handle: Option<std::thread::JoinHandle<()>> = match (
+    //
+    // Phase 4d (R12): the watcher registers a restart-coordinator
+    // safe point and publishes its policy state for re-exec
+    // checkpointing — hand it the coordinator (Weak, brief lock hold
+    // just to clone the Arc) and stash the returned state cell on
+    // the session below.
+    let restart_coordinator_for_watcher = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::downgrade(&st.restart_coordinator)
+    };
+    let watcher: Option<crate::session_watch::SpawnedWatcher> = match (
         verified_cgroup_path.as_ref(),
         p.memory_cap_bytes,
         kills_dir_for_watcher,
@@ -926,8 +936,10 @@ pub(crate) fn start_session_with_spawn_fn(
                 kills_dir,
                 initial_high,
                 watcher_spawn_fn,
+                Some(restart_coordinator_for_watcher),
+                None, // fresh spawn — no checkpoint to restore
             ) {
-                Ok(h) => Some(h),
+                Ok(w) => Some(w),
                 Err(e) => {
                     // No state lock held, no registry insert
                     // yet. Drop `pending` so its Drop pidfd-
@@ -1016,9 +1028,9 @@ pub(crate) fn start_session_with_spawn_fn(
     // cleanly. The losing thread doesn't strand a child.
     //
     // Slice 10d watcher-fix addendum: also drop the
-    // `watcher_handle` here so the spawned watcher thread can
-    // self-terminate via cgroup-vanish after `pending`'s Drop
-    // SIGKILLs the child. Detach is correct (not join) — the
+    // `watcher` (handle + state cell) here so the spawned watcher
+    // thread can self-terminate via cgroup-vanish after `pending`'s
+    // Drop SIGKILLs the child. Detach is correct (not join) — the
     // watcher's poll loop checks `cgroup_path.exists()` each
     // iteration, exiting promptly once systemd cleans up the
     // scope.
@@ -1030,7 +1042,7 @@ pub(crate) fn start_session_with_spawn_fn(
         // but naming it makes the recovery shape obvious to
         // readers.
         drop(pending);
-        drop(watcher_handle);
+        drop(watcher);
         return Err((
             ErrorCode::Conflict,
             format!(
@@ -1048,7 +1060,12 @@ pub(crate) fn start_session_with_spawn_fn(
     // registry-resident session at the same instant we insert
     // it. The drop-on-detach contract documented on the field
     // means session-removal paths don't need explicit cleanup.
-    session.watcher_handle = watcher_handle;
+    // Phase 4d (R12): the shared policy-state cell rides beside it,
+    // for `reexec::build_manifest`'s checkpoint capture.
+    if let Some(w) = watcher {
+        session.watcher_handle = Some(w.handle);
+        session.watcher_state = Some(w.state);
+    }
     state.sessions.insert(session_uid.clone(), session);
     // P0 session durability (S1): persist the registry now that the
     // new session is live, so a daemon restart can restore it. Covers

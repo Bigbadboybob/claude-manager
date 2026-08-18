@@ -790,6 +790,16 @@ impl LastExitProbe {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The spawn-time kill-log baseline byte offset (see the field
+    /// doc). Read by `reexec::build_manifest` into the watcher
+    /// checkpoint (DESIGN_SEAMLESS_RESTART phase 4d, R12) so the
+    /// re-adopted probe attributes cap kills against the SAME window
+    /// instead of a fresh adopt-time capture that loses any record
+    /// landing exactly in the swap.
+    pub(crate) fn kills_baseline(&self) -> u64 {
+        self.kills_baseline
+    }
+
     /// True once the reaper has populated kernel exit. Used by
     /// `build_end_payload`'s spin loop to bound the wait.
     pub fn kernel_set(&self) -> bool {
@@ -1156,6 +1166,17 @@ pub struct DaemonSession {
     /// `DaemonSession` ever needs to do bounded join in the
     /// future, the handle is here. For now, drop = detach.
     pub watcher_handle: Option<JoinHandle<()>>,
+    /// The watcher's live policy-state cell
+    /// (DESIGN_SEAMLESS_RESTART phase 4d, R12): protected PID set +
+    /// `memory.events high` watermark, published by the watcher
+    /// thread at its safe points and snapshotted by
+    /// `reexec::build_manifest` into the sealed manifest's
+    /// `watcher_checkpoint` slot, so a re-exec'd daemon re-adopts
+    /// the SAME policy instead of recomputing one from the
+    /// post-swap cgroup. `Some` exactly when `watcher_handle` is
+    /// (both stashed together by `start_session` / the rehydrate
+    /// commit). Leaf mutex — see `session_watch::WatcherLiveState`.
+    pub watcher_state: Option<crate::session_watch::SharedWatcherState>,
 }
 
 /// Extract the transcript-file UUID (the resume key) from a stored
@@ -1873,6 +1894,7 @@ impl PendingSession {
             // existence, while `start_session` is where the
             // watcher's lifetime decisions are made.
             watcher_handle: None,
+            watcher_state: None,
         })
     }
 }
@@ -2074,13 +2096,17 @@ pub struct AdoptedSessionMeta {
     /// Kill-log directory for the memory-cap-kill probe, when the
     /// session is capped (the rehydrate side mirrors
     /// `start_session`'s rule: soft-cap present → real kills_dir).
-    /// `build_adopted` captures a FRESH baseline at adopt time via
-    /// [`crate::reaper::capture_baseline_for_spawn`] — the spawn-time
-    /// baseline died with the old image (its R12 checkpoint is still
-    /// future scope), and a fresh one scopes the probe to records
-    /// landing from adoption onward, which is exactly the window
-    /// this image can attribute.
     pub kills_dir: Option<PathBuf>,
+    /// The SPAWN-TIME kill-log baseline byte offset, restored from
+    /// the manifest's watcher checkpoint
+    /// (DESIGN_SEAMLESS_RESTART phase 4d, R12). `Some` re-adopts the
+    /// old image's attribution window — a cap kill whose record
+    /// landed exactly in the swap window is still attributed. `None`
+    /// (no/unparseable checkpoint) degrades to `build_adopted`'s
+    /// FRESH adopt-time capture via
+    /// [`crate::reaper::capture_baseline_for_spawn`] — the pre-4d
+    /// behavior, scoped to records landing from adoption onward.
+    pub kills_baseline: Option<u64>,
 }
 
 /// The BUILD stage's product: a fully-constructed adopted session
@@ -2249,7 +2275,11 @@ impl AdoptedSessionBuild {
             _reaper_handle: reaper_handle,
             _master: Box::new(master),
             last_exit,
+            // Re-armed by the rehydrate commit for capped records
+            // (phase 4d, R12) — mirroring start_session's two-step
+            // stash; `arm` itself stays watcher-agnostic.
             watcher_handle: None,
+            watcher_state: None,
             uid,
         })
     }
@@ -2323,29 +2353,35 @@ impl DaemonSession {
             .try_clone()
             .map_err(|e| anyhow::anyhow!("adopt {}: dup pidfd for reaper: {}", uid, e))?;
 
-        // Memory-cap-kill probe, re-enabled (phase 4b): the v2
-        // record's cap presence wires the real kills_dir, and the
-        // baseline is captured FRESH at adopt time — mirroring
-        // `PendingSession::spawn`'s pre-spawn capture, with the same
-        // best-effort fallback (0 = every record counts, preferring
-        // false positives over a cap kill rendered as a plain
-        // signal-9 exit). The spawn-time baseline died with the old
-        // image; carrying it is the R12 watcher-checkpoint slice.
+        // Memory-cap-kill probe (phase 4b re-enabled it; phase 4d
+        // completes it — R12): the v2 record's cap presence wires the
+        // real kills_dir, and the baseline is the CHECKPOINTED
+        // spawn-time offset when the manifest carried one — the old
+        // image's attribution window survives, so a cap kill whose
+        // record landed exactly in the swap is still attributed. A
+        // missing checkpoint degrades to the 4b behavior: a FRESH
+        // adopt-time capture mirroring `PendingSession::spawn`'s
+        // pre-spawn capture, with the same best-effort fallback
+        // (0 = every record counts, preferring false positives over
+        // a cap kill rendered as a plain signal-9 exit).
         let kills_baseline = match &meta.kills_dir {
-            Some(dir) => {
-                match crate::reaper::capture_baseline_for_spawn(dir, &uid) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!(
-                            "cm-daemon: kills_dir baseline capture failed for \
-                             adopted {}: {} (using 0 — may produce \
-                             stale-record false positives)",
-                            uid, e,
-                        );
-                        0
+            Some(dir) => match meta.kills_baseline {
+                Some(carried) => carried,
+                None => {
+                    match crate::reaper::capture_baseline_for_spawn(dir, &uid) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!(
+                                "cm-daemon: kills_dir baseline capture failed \
+                                 for adopted {}: {} (using 0 — may produce \
+                                 stale-record false positives)",
+                                uid, e,
+                            );
+                            0
+                        }
                     }
                 }
-            }
+            },
             None => 0,
         };
         let last_exit: SharedLastExit = Arc::new(LastExitProbe::new(

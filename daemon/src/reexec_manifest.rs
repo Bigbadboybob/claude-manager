@@ -305,10 +305,18 @@ pub struct SessionRecord {
     pub pidfd: RawFd,
     /// The session's memory-cap cgroup scope prefix, when capped.
     pub cgroup_prefix: Option<String>,
-    /// Memory-cap watcher policy checkpoint (protected PID set,
-    /// breach counters, baselines — R12). PLACEHOLDER: the watcher
-    /// checkpoint slice defines the shape; the manifest just carries
-    /// it opaquely so the framing doesn't churn when it lands.
+    /// Memory-cap watcher policy checkpoint (R12,
+    /// DESIGN_SEAMLESS_RESTART phase 4d): the serialized
+    /// `session_watch::WatcherCheckpoint` — protected PID set,
+    /// `last_high` breach watermark, watched cgroup path, spawn-time
+    /// kill-log baseline. Deliberately kept **opaque at this layer**
+    /// (an untyped `Value` with its OWN `version` field inside), so
+    /// the checkpoint shape can evolve without bumping
+    /// [`MANIFEST_SCHEMA_VERSION`]; the read side
+    /// (`session_watch::parse_watcher_checkpoint`) treats an
+    /// unparseable or version-mismatched value as "no checkpoint" and
+    /// degrades loudly to fresh watcher policy — never a manifest
+    /// validation failure.
     pub watcher_checkpoint: Option<serde_json::Value>,
 }
 

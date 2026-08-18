@@ -47,7 +47,12 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
+use crate::restart_coordinator::RestartCoordinator;
 
 // --- Sanitizer ---------------------------------------------------------
 
@@ -396,6 +401,152 @@ fn argv_sha256_prefix(argv: &[Vec<u8>]) -> String {
     s
 }
 
+// --- Re-exec checkpoint (DESIGN_SEAMLESS_RESTART phase 4d, R12) --------
+
+/// Version of the [`WatcherCheckpoint`] JSON shape. The re-exec
+/// manifest carries the checkpoint **opaquely**
+/// (`SessionRecord.watcher_checkpoint: Option<serde_json::Value>`), so
+/// this version is the checkpoint's OWN compatibility gate — bumping
+/// it never bumps the manifest schema. A checkpoint whose version
+/// isn't this one is treated exactly like an unparseable one: the
+/// re-adopted watcher degrades LOUDLY to fresh policy
+/// (see [`parse_watcher_checkpoint`]), never guesses.
+pub const WATCHER_CHECKPOINT_VERSION: u32 = 1;
+
+/// The watcher's policy state, checkpointed across a re-exec swap
+/// (R12). Everything a freshly-recomputed watcher would get WRONG:
+///
+/// - `protected`: the stabilize+followup-finalized PID set. A fresh
+///   watcher re-snapshots the CURRENT cgroup, newly protecting late
+///   workers the pre-swap policy deliberately left killable. `None`
+///   means the pre-swap watcher had not finished stabilize/followup
+///   when the checkpoint was taken (a capped session spawned seconds
+///   before the restart) — the re-adopted watcher re-runs those
+///   phases, which is exactly what the old watcher would have done.
+/// - `last_high`: the `memory.events` `high` watermark already
+///   accounted for. A fresh watcher re-seeds from the current
+///   counter, silently baselining away a breach that landed
+///   mid-swap.
+/// - `kills_baseline`: the SPAWN-TIME kill-log byte offset
+///   (`LastExitProbe.kills_baseline`, `reaper::capture_baseline_for_spawn`).
+///   Pre-4d the adopted probe captured a FRESH baseline, so a cap
+///   kill whose record landed in the swap window was unattributable
+///   (the state-inventory audit's `last_exit` row).
+/// - `cgroup_path`: the DISCOVERED scope dir the watcher polls (not
+///   the `cgroup_prefix` the manifest record carries — discovery is
+///   `/proc/<pid>/cgroup`-based and need not be repeated when the
+///   old image already did it against this same live child).
+///
+/// The watcher's remaining inputs (uid, soft/hard cap bytes) already
+/// ride the manifest record itself and are deliberately not
+/// duplicated here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatcherCheckpoint {
+    /// [`WATCHER_CHECKPOINT_VERSION`].
+    pub version: u32,
+    /// The watched cgroup scope directory.
+    pub cgroup_path: String,
+    /// Finalized protected PID set (sorted for determinism); `None`
+    /// when stabilize/followup had not completed at checkpoint time.
+    pub protected: Option<Vec<u32>>,
+    /// `memory.events high` watermark already accounted for.
+    pub last_high: u64,
+    /// Spawn-time kill-log baseline byte offset.
+    pub kills_baseline: u64,
+}
+
+/// The watcher's live policy state, shared between the watcher thread
+/// (writer, at its safe points) and `reexec::build_manifest` (reader,
+/// under the state lock while the watcher is parked). A **leaf
+/// mutex**, like the session status cells: the watcher thread locks
+/// it holding nothing else, and no reader takes the state lock or a
+/// gate while holding it — so locking it under the state lock in
+/// `build_manifest` is inversion-free (same argument as the
+/// `cell_age` closure there).
+#[derive(Debug)]
+pub struct WatcherLiveState {
+    /// The watched cgroup scope dir (immutable for the watcher's
+    /// life; carried so the checkpoint composer doesn't need a
+    /// side channel).
+    pub cgroup_path: PathBuf,
+    /// `None` until stabilize+followup finalize the set; `Some`
+    /// thereafter. A RESTORED watcher is born `Some` (the set was
+    /// finalized pre-swap).
+    pub protected: Option<HashSet<u32>>,
+    /// The breach watermark; updated by the watcher before each
+    /// `handle_breach`.
+    pub last_high: u64,
+}
+
+impl WatcherLiveState {
+    /// Compose the serializable checkpoint. `kills_baseline` comes
+    /// from the session's `LastExitProbe` (session-side state the
+    /// watcher never holds — the caller joins the two).
+    pub fn checkpoint(&self, kills_baseline: u64) -> WatcherCheckpoint {
+        let protected = self.protected.as_ref().map(|set| {
+            let mut v: Vec<u32> = set.iter().copied().collect();
+            v.sort_unstable();
+            v
+        });
+        WatcherCheckpoint {
+            version: WATCHER_CHECKPOINT_VERSION,
+            cgroup_path: self.cgroup_path.to_string_lossy().into_owned(),
+            protected,
+            last_high: self.last_high,
+            kills_baseline,
+        }
+    }
+}
+
+/// Shared handle to [`WatcherLiveState`]. `DaemonSession.watcher_state`
+/// holds one clone; the watcher thread holds the other.
+pub type SharedWatcherState = Arc<Mutex<WatcherLiveState>>;
+
+/// What [`spawn_watcher`] returns: the thread handle (stashed on
+/// `DaemonSession.watcher_handle`, drop = detach as before) plus the
+/// shared policy-state cell (stashed on
+/// `DaemonSession.watcher_state` for checkpoint capture).
+#[derive(Debug)]
+pub struct SpawnedWatcher {
+    pub handle: std::thread::JoinHandle<()>,
+    pub state: SharedWatcherState,
+}
+
+/// Parse an opaque manifest `watcher_checkpoint` value back into the
+/// typed checkpoint. Returns `None` — LOUDLY, naming the session and
+/// the reason — for an unparseable value or a version this binary
+/// doesn't understand; the caller then re-adopts with a FRESH watcher
+/// (recomputed policy), which is the honest floor: strictly better
+/// than no watcher, honestly worse than the checkpointed one.
+pub fn parse_watcher_checkpoint(
+    session_uid: &str,
+    value: &serde_json::Value,
+) -> Option<WatcherCheckpoint> {
+    match serde_json::from_value::<WatcherCheckpoint>(value.clone()) {
+        Ok(cp) if cp.version == WATCHER_CHECKPOINT_VERSION => Some(cp),
+        Ok(cp) => {
+            eprintln!(
+                "cm-daemon: session '{}': watcher checkpoint version {} \
+                 (this binary understands {}) — POLICY RESET: re-adopting \
+                 with a fresh watcher (protected set recomputed, breach \
+                 watermark re-anchored)",
+                session_uid, cp.version, WATCHER_CHECKPOINT_VERSION,
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: session '{}': watcher checkpoint failed to \
+                 parse ({}) — POLICY RESET: re-adopting with a fresh \
+                 watcher (protected set recomputed, breach watermark \
+                 re-anchored)",
+                session_uid, e,
+            );
+            None
+        }
+    }
+}
+
 // --- Watcher thread ----------------------------------------------------
 
 const STABILIZE_MS: u64 = 750;
@@ -458,6 +609,26 @@ pub fn default_watcher_spawn_fn() -> WatcherSpawnFn {
 /// dropped (detach), which is correct because the thread self-
 /// terminates and best-effort joining can't add meaningful safety
 /// without blocking the reaper-cleanup path.
+///
+/// Phase 4d (R12) additions:
+///
+/// - `coordinator`: the restart coordinator to register a
+///   [`crate::restart_coordinator::SafePointHandle`] with
+///   (`"memcap-watcher:<uid>"`), so a re-exec quiesce waits for this
+///   watcher to reach an acknowledged NO-SIGNAL safe point before the
+///   exec. `Weak` — the watcher must never keep daemon state alive;
+///   `None` for tests that don't exercise the barrier.
+/// - `restored_protected`: `Some(set)` re-adopts a checkpointed
+///   protected set — stabilize/followup are SKIPPED (recomputing
+///   would newly protect late workers the pre-swap policy left
+///   killable). `None` is the fresh-spawn path (and the honest
+///   restore path for a checkpoint taken mid-stabilize).
+///
+/// The returned [`SpawnedWatcher`] carries the shared
+/// [`WatcherLiveState`] cell the watcher publishes its policy state
+/// into; `reexec::build_manifest` snapshots it into the manifest's
+/// `watcher_checkpoint` slot.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_watcher(
     session_uid: String,
     cgroup_path: PathBuf,
@@ -466,7 +637,20 @@ pub fn spawn_watcher(
     kills_dir: PathBuf,
     initial_high: u64,
     spawn_fn: WatcherSpawnFn,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
+    coordinator: Option<Weak<RestartCoordinator>>,
+    restored_protected: Option<HashSet<u32>>,
+) -> std::io::Result<SpawnedWatcher> {
+    // The cell is created HERE (not in the thread body) so the caller
+    // holds a valid handle from the moment the spawn returns — a
+    // checkpoint taken before the thread was ever scheduled reads the
+    // honest initial state (restored set or not-yet-finalized None,
+    // plus the seed watermark).
+    let state: SharedWatcherState = Arc::new(Mutex::new(WatcherLiveState {
+        cgroup_path: cgroup_path.clone(),
+        protected: restored_protected.clone(),
+        last_high: initial_high,
+    }));
+    let state_for_thread = Arc::clone(&state);
     let thread_name = format!("cm-daemon-watcher-{}", session_uid);
     let body: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
         run_watcher(
@@ -476,11 +660,16 @@ pub fn spawn_watcher(
             hard_cap_bytes,
             kills_dir,
             initial_high,
+            state_for_thread,
+            coordinator,
+            restored_protected,
         );
     });
-    spawn_fn(thread_name, body)
+    let handle = spawn_fn(thread_name, body)?;
+    Ok(SpawnedWatcher { handle, state })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_watcher(
     session_uid: String,
     cgroup_path: PathBuf,
@@ -488,7 +677,46 @@ fn run_watcher(
     hard_cap_bytes: u64,
     kills_dir: PathBuf,
     initial_high: u64,
+    state: SharedWatcherState,
+    coordinator: Option<Weak<RestartCoordinator>>,
+    restored_protected: Option<HashSet<u32>>,
 ) {
+    // Phase 4d (R12): register with the quiescence barrier FIRST,
+    // before any waiting, so a restart that begins during our
+    // stabilize window still fences us (a handle born mid-quiesce
+    // inherits the in-effect pause request — see
+    // `restart_coordinator::register_subsystem`). The handle lives on
+    // this thread's stack and drops with it (registry prunes dead
+    // handles), so an exiting watcher can never wedge a restart.
+    //
+    // Residual window, honestly: a watcher whose thread was spawned
+    // but not yet scheduled when `wait_quiesced` evaluates the
+    // registry is invisible to the barrier — but it cannot reach a
+    // signal for ≥ STABILIZE+FOLLOWUP+POLL (~3.75s of sleeps, each
+    // preceded by a park point), so it can never hold a half-done
+    // kill across the exec; the exec simply destroys it.
+    //
+    // SAFE-POINT PLACEMENT: `park()` is called ONLY at loop tops —
+    // points where no signal has been issued and every completed
+    // policy decision is already published to `state`. It is NEVER
+    // called inside `handle_breach`, whose SIGTERM → 500ms grace →
+    // SIGKILL sequence is the one window where parking (and an exec
+    // landing while parked) would leave a half-killed process — the
+    // exact R12 hazard. `handle_breach` is bounded (~500ms + a few
+    // syscalls), so letting it finish before the next park keeps the
+    // quiesce ack latency well under the 10s barrier timeout
+    // (worst case ≈ poll sleep 1s + grace 0.5s).
+    let safe_point = coordinator.as_ref().and_then(|w| w.upgrade()).map(|c| {
+        RestartCoordinator::register_subsystem(
+            &c,
+            &format!("memcap-watcher:{}", session_uid),
+        )
+    });
+    let park = || {
+        if let Some(h) = &safe_point {
+            h.park_if_requested();
+        }
+    };
     // Wait for the cgroup to actually appear. The daemon's
     // start_session already verifies the cgroup is active
     // (slice 10c-e-3b-fix4a) before we get here, so this is a
@@ -496,6 +724,7 @@ fn run_watcher(
     // there on first read.
     let appear_deadline = Instant::now() + Duration::from_secs(3);
     while !cgroup_path.exists() {
+        park();
         if Instant::now() >= appear_deadline {
             return;
         }
@@ -523,34 +752,59 @@ fn run_watcher(
     // anchored at start_session-cgroup-discovery time, even
     // tighter than #3's watcher-start anchor.
 
-    let started = Instant::now();
-    let stabilize_until = started + Duration::from_millis(STABILIZE_MS);
-    let followup_until = started + Duration::from_millis(FOLLOWUP_MS);
+    // Phase 4d (R12): a RESTORED watcher skips stabilize/followup —
+    // its protected set was finalized by the pre-swap watcher, and
+    // recomputing from the CURRENT cgroup would newly protect late
+    // workers the pre-swap policy deliberately left killable (the
+    // kill-decision divergence the checkpoint exists to prevent). A
+    // checkpoint taken mid-stabilize carries `protected: None` and
+    // lands in the fresh arm below — honest: the pre-swap watcher
+    // hadn't finalized a set either.
+    let protected: HashSet<u32> = match restored_protected {
+        Some(set) => set,
+        None => {
+            let started = Instant::now();
+            let stabilize_until = started + Duration::from_millis(STABILIZE_MS);
+            let followup_until = started + Duration::from_millis(FOLLOWUP_MS);
 
-    while Instant::now() < stabilize_until {
-        if !cgroup_path.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let mut protected: HashSet<u32> = read_cgroup_procs(&cgroup_path).into_iter().collect();
-
-    while Instant::now() < followup_until {
-        std::thread::sleep(Duration::from_millis(100));
-        if !cgroup_path.exists() {
-            return;
-        }
-        let current = read_cgroup_procs(&cgroup_path);
-        for pid in current {
-            if protected.contains(&pid) {
-                continue;
+            while Instant::now() < stabilize_until {
+                park();
+                if !cgroup_path.exists() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            if let Some(ppid) = read_ppid(pid) {
-                if protected.contains(&ppid) {
-                    protected.insert(pid);
+            let mut protected: HashSet<u32> =
+                read_cgroup_procs(&cgroup_path).into_iter().collect();
+
+            while Instant::now() < followup_until {
+                park();
+                std::thread::sleep(Duration::from_millis(100));
+                if !cgroup_path.exists() {
+                    return;
+                }
+                let current = read_cgroup_procs(&cgroup_path);
+                for pid in current {
+                    if protected.contains(&pid) {
+                        continue;
+                    }
+                    if let Some(ppid) = read_ppid(pid) {
+                        if protected.contains(&ppid) {
+                            protected.insert(pid);
+                        }
+                    }
                 }
             }
+            protected
         }
+    };
+    // Publish the FINALIZED set (4d): from here a checkpoint restores
+    // this exact policy. Mid-followup partials are deliberately never
+    // published — a checkpoint that races finalization reads `None`
+    // and the re-adopted watcher re-runs the phases.
+    {
+        let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+        st.protected = Some(protected.clone());
     }
 
     // First post-stabilize poll: if memory.events.high grew
@@ -559,6 +813,9 @@ fn run_watcher(
     // not the post-stabilize one.
     let mut last_high = initial_high;
     loop {
+        // Safe point: no signal in flight, `state` reflects every
+        // completed decision (see the placement note at the top).
+        park();
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         if !cgroup_path.exists() {
             return;
@@ -568,6 +825,13 @@ fn run_watcher(
             continue;
         }
         last_high = current_high;
+        // Publish the watermark BEFORE acting on the breach, so by
+        // the time the barrier's park-ack lets a checkpoint be taken
+        // the cell and the kill log agree.
+        {
+            let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+            st.last_high = last_high;
+        }
         handle_breach(
             &session_uid,
             &cgroup_path,
@@ -774,6 +1038,17 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Fresh live-state cell for driving `run_watcher` directly, the
+    /// way `spawn_watcher` would build it for a fresh (non-restored)
+    /// watcher.
+    fn test_cell(cgroup_path: &Path, initial_high: u64) -> SharedWatcherState {
+        Arc::new(Mutex::new(WatcherLiveState {
+            cgroup_path: cgroup_path.to_path_buf(),
+            protected: None,
+            last_high: initial_high,
+        }))
+    }
+
     #[test]
     fn sanitize_passes_through_safe_ascii() {
         assert_eq!(sanitize(b"hello", 32), "hello");
@@ -919,6 +1194,7 @@ mod tests {
         let kills_dir_path = kills_dir.path().to_path_buf();
         let cgroup_path_thread = cgroup_path.clone();
         let uid_thread = session_uid.clone();
+        let cell = test_cell(&cgroup_path, 0);
         let watcher = std::thread::spawn(move || {
             run_watcher(
                 uid_thread,
@@ -927,6 +1203,9 @@ mod tests {
                 128 * 1024 * 1024,
                 kills_dir_path,
                 0, // initial_high seed (no prior breaches in synthetic cgroup)
+                cell,
+                None, // no restart coordinator in this test
+                None, // fresh spawn — stabilize/followup run
             );
         });
 
@@ -1053,6 +1332,8 @@ mod tests {
             std::path::PathBuf::from("/tmp/not-a-real-kills-dir"),
             0, // initial_high seed
             failing,
+            None, // no restart coordinator
+            None, // fresh spawn
         );
         let err = result.expect_err(
             "spawn_watcher must return Err on spawn-fn failure — not panic",
@@ -1638,6 +1919,7 @@ mod tests {
         // Slice 10d watcher-fix #6: the caller-supplied seed.
         // For this test the seed equals the pre-bump value (5)
         // so the post-bump value (6) reads as a breach.
+        let cell = test_cell(&cgroup_path, 5);
         let watcher = std::thread::spawn(move || {
             run_watcher(
                 uid_thread,
@@ -1646,6 +1928,9 @@ mod tests {
                 0,
                 kills_dir_path,
                 5, // initial_high seed — matches pre-bump value
+                cell,
+                None,
+                None,
             );
         });
 
@@ -1729,6 +2014,7 @@ mod tests {
         let kills_dir_path = kills_dir.path().to_path_buf();
         let cgroup_path_thread = cgroup_path.clone();
         let uid_thread = uid.clone();
+        let cell = test_cell(&cgroup_path, seed_initial_high);
         let watcher = std::thread::spawn(move || {
             run_watcher(
                 uid_thread,
@@ -1737,6 +2023,9 @@ mod tests {
                 0,
                 kills_dir_path,
                 seed_initial_high, // = 5, the pre-bump value
+                cell,
+                None,
+                None,
             );
         });
 
@@ -1903,5 +2192,337 @@ mod tests {
         });
         let (_, memory_cap_kill) = probe.snapshot();
         assert!(memory_cap_kill, "SIGKILL on a capped session with transient breach IS cap-kill");
+    }
+
+    // ============================================================
+    // DESIGN_SEAMLESS_RESTART phase 4d (R12): watcher checkpoints
+    // across the re-exec swap — serde round trip, live-state cell,
+    // park/ack protocol, and restored-policy kill decisions.
+    // ============================================================
+
+    /// The checkpoint round-trips through the manifest's opaque
+    /// `serde_json::Value` slot losslessly, the composer sorts the
+    /// protected set deterministically, and the parse gate refuses
+    /// (loudly → `None`) a wrong version and garbage.
+    #[test]
+    fn watcher_checkpoint_serde_round_trip() {
+        let live = WatcherLiveState {
+            cgroup_path: PathBuf::from("/sys/fs/cgroup/u/cm-sess-x.scope"),
+            protected: Some([31337u32, 42, 7].into_iter().collect()),
+            last_high: 9,
+        };
+        let cp = live.checkpoint(12_345);
+        assert_eq!(cp.version, WATCHER_CHECKPOINT_VERSION);
+        assert_eq!(cp.cgroup_path, "/sys/fs/cgroup/u/cm-sess-x.scope");
+        assert_eq!(
+            cp.protected.as_deref(),
+            Some(&[7u32, 42, 31337][..]),
+            "protected set serializes sorted (deterministic manifests)"
+        );
+        assert_eq!(cp.last_high, 9);
+        assert_eq!(cp.kills_baseline, 12_345);
+
+        // Through the opaque slot and back.
+        let value = serde_json::to_value(&cp).expect("serialize");
+        let back = parse_watcher_checkpoint("ts-cp", &value)
+            .expect("round trip parses");
+        assert_eq!(back, cp);
+
+        // Not-yet-finalized protected set survives as None.
+        let live_unfinalized = WatcherLiveState {
+            cgroup_path: PathBuf::from("/x"),
+            protected: None,
+            last_high: 0,
+        };
+        let cp2 = live_unfinalized.checkpoint(0);
+        assert_eq!(cp2.protected, None);
+        let v2 = serde_json::to_value(&cp2).expect("serialize");
+        assert_eq!(
+            parse_watcher_checkpoint("ts-cp", &v2).unwrap().protected,
+            None
+        );
+
+        // Version gate: a future version is a policy reset, not a guess.
+        let mut wrong = serde_json::to_value(&cp).unwrap();
+        wrong["version"] = serde_json::json!(WATCHER_CHECKPOINT_VERSION + 1);
+        assert!(parse_watcher_checkpoint("ts-cp", &wrong).is_none());
+
+        // Garbage: same.
+        assert!(parse_watcher_checkpoint(
+            "ts-cp",
+            &serde_json::json!({"not": "a checkpoint"})
+        )
+        .is_none());
+        assert!(
+            parse_watcher_checkpoint("ts-cp", &serde_json::json!(17)).is_none()
+        );
+    }
+
+    /// `spawn_watcher` seeds the shared cell BEFORE the thread runs:
+    /// a checkpoint taken the instant the spawn returns reads the
+    /// honest initial state (restored set / not-yet-finalized None,
+    /// plus the seed watermark). Proven with a spawn_fn that never
+    /// runs the body.
+    #[test]
+    fn spawn_watcher_seeds_live_state_cell_at_birth() {
+        let inert: WatcherSpawnFn = Box::new(|name, _body| {
+            std::thread::Builder::new().name(name).spawn(|| {})
+        });
+        let restored: HashSet<u32> = [11u32, 22].into_iter().collect();
+        let spawned = spawn_watcher(
+            "ts-cell-birth".into(),
+            PathBuf::from("/tmp/ts-cell-birth-cgroup"),
+            64 * 1024 * 1024,
+            0,
+            PathBuf::from("/tmp/ts-cell-birth-kills"),
+            4,
+            inert,
+            None,
+            Some(restored.clone()),
+        )
+        .expect("spawn");
+        let st = spawned.state.lock().unwrap();
+        assert_eq!(st.cgroup_path, PathBuf::from("/tmp/ts-cell-birth-cgroup"));
+        assert_eq!(st.protected.as_ref(), Some(&restored));
+        assert_eq!(st.last_high, 4);
+        drop(st);
+        spawned.handle.join().expect("inert body joins");
+
+        // Fresh spawn: protected is None until stabilize/followup
+        // finalize it.
+        let inert: WatcherSpawnFn = Box::new(|name, _body| {
+            std::thread::Builder::new().name(name).spawn(|| {})
+        });
+        let spawned = spawn_watcher(
+            "ts-cell-fresh".into(),
+            PathBuf::from("/tmp/ts-cell-fresh-cgroup"),
+            64 * 1024 * 1024,
+            0,
+            PathBuf::from("/tmp/ts-cell-fresh-kills"),
+            7,
+            inert,
+            None,
+            None,
+        )
+        .expect("spawn");
+        assert!(spawned.state.lock().unwrap().protected.is_none());
+        assert_eq!(spawned.state.lock().unwrap().last_high, 7);
+        spawned.handle.join().expect("inert body joins");
+    }
+
+    /// The park/ack protocol against a REAL running watcher: a
+    /// restored watcher registers `memcap-watcher:<uid>` with the
+    /// coordinator, inherits a pause requested before it was spawned
+    /// (the mid-quiesce registration rule), acks at its main-loop
+    /// safe point, and the quiesce barrier completes; abort resumes
+    /// it and it exits normally when the cgroup vanishes.
+    #[test]
+    fn restored_watcher_registers_parks_and_acks_quiesce() {
+        let cgroup_dir = TempDir::new().unwrap();
+        let kills_dir = TempDir::new().unwrap();
+        std::fs::write(cgroup_dir.path().join("cgroup.procs"), b"").unwrap();
+        std::fs::write(
+            cgroup_dir.path().join("memory.events"),
+            b"high 0\nmax 0\n",
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(crate::state::DaemonState::new()));
+        let coordinator =
+            Arc::clone(&state.lock().unwrap().restart_coordinator);
+
+        // Pause FIRST, then spawn: the watcher's handle is born with
+        // the request set and parks at its first safe point, so the
+        // ack is deterministic (no sleep-length race).
+        let quiesce =
+            crate::restart_coordinator::begin(&state).expect("begin");
+
+        let spawned = spawn_watcher(
+            "ts-park-ack".into(),
+            cgroup_dir.path().to_path_buf(),
+            64 * 1024 * 1024,
+            0,
+            kills_dir.path().to_path_buf(),
+            0,
+            default_watcher_spawn_fn(),
+            Some(Arc::downgrade(&coordinator)),
+            // Restored ⇒ straight to the main loop's park point.
+            Some(HashSet::new()),
+        )
+        .expect("spawn watcher");
+
+        quiesce
+            .wait_quiesced(Duration::from_secs(10))
+            .expect("watcher must ack its safe point (park) for the barrier");
+
+        // Abort resumes the watcher; tearing the cgroup down makes it
+        // exit its loop, proving resume actually released the park.
+        quiesce.abort();
+        drop(cgroup_dir);
+        spawned
+            .handle
+            .join()
+            .expect("resumed watcher exits once the cgroup vanishes");
+    }
+
+    /// Same protocol for a FRESH watcher parked in its stabilize
+    /// window — the barrier must not have to wait out the ~2.75s
+    /// stabilize+followup phases for an ack.
+    #[test]
+    fn fresh_watcher_acks_quiesce_during_stabilize() {
+        let cgroup_dir = TempDir::new().unwrap();
+        let kills_dir = TempDir::new().unwrap();
+        std::fs::write(cgroup_dir.path().join("cgroup.procs"), b"").unwrap();
+        std::fs::write(
+            cgroup_dir.path().join("memory.events"),
+            b"high 0\nmax 0\n",
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(crate::state::DaemonState::new()));
+        let coordinator =
+            Arc::clone(&state.lock().unwrap().restart_coordinator);
+        let quiesce =
+            crate::restart_coordinator::begin(&state).expect("begin");
+
+        let spawned = spawn_watcher(
+            "ts-park-stabilize".into(),
+            cgroup_dir.path().to_path_buf(),
+            64 * 1024 * 1024,
+            0,
+            kills_dir.path().to_path_buf(),
+            0,
+            default_watcher_spawn_fn(),
+            Some(Arc::downgrade(&coordinator)),
+            None, // fresh — parks at the stabilize-loop safe point
+        )
+        .expect("spawn watcher");
+
+        quiesce
+            .wait_quiesced(Duration::from_secs(10))
+            .expect("stabilize-phase watcher must still ack promptly");
+        quiesce.abort();
+        drop(cgroup_dir);
+        spawned
+            .handle
+            .join()
+            .expect("watcher exits once the cgroup vanishes");
+    }
+
+    /// THE R12 regression: a watcher restored from a checkpoint makes
+    /// the PRE-SWAP policy's kill decisions, which DIFFER from a
+    /// recomputed watcher's on both axes:
+    ///
+    /// - **protected set**: the checkpoint protects only the test
+    ///   process; a real `sleep` child sits in the current cgroup and
+    ///   is NOT in the checkpointed set. A recomputed watcher would
+    ///   have snapshot BOTH pids at stabilize time (both were in
+    ///   `cgroup.procs`) and refused to kill anything (`protected`
+    ///   record, no signal). The restored watcher must kill the child.
+    /// - **last_high**: the checkpoint's watermark is 4 while the
+    ///   file already reads 5 — a breach that landed mid-swap. A
+    ///   recomputed watcher re-seeding from the current counter
+    ///   (`read_memory_events_high` → 5) would baseline the breach
+    ///   away and never fire; the restored one fires on its FIRST
+    ///   poll with no post-restore bump at all.
+    ///
+    /// Runtime ~2s (1s poll + 500ms SIGTERM grace + margins) — kept
+    /// in the normal suite because it pins the slice's core behavior.
+    #[test]
+    fn restored_watcher_preserves_protected_set_and_last_high() {
+        let cgroup_dir = TempDir::new().unwrap();
+        let kills_dir = TempDir::new().unwrap();
+        let cgroup_path = cgroup_dir.path().to_path_buf();
+
+        // A real child the restored policy is allowed to kill.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let child_pid = child.id();
+        let own_pid = std::process::id();
+
+        // Current cgroup state at adoption: BOTH pids present, and
+        // the high counter one past the checkpointed watermark (the
+        // mid-swap breach).
+        std::fs::write(
+            cgroup_path.join("cgroup.procs"),
+            format!("{}\n{}\n", own_pid, child_pid).as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(cgroup_path.join("memory.events"), b"high 5\nmax 0\n")
+            .unwrap();
+
+        let restored: HashSet<u32> = [own_pid].into_iter().collect();
+        let spawned = spawn_watcher(
+            "ts-restored-policy".into(),
+            cgroup_path.clone(),
+            64 * 1024 * 1024,
+            128 * 1024 * 1024,
+            kills_dir.path().to_path_buf(),
+            4, // checkpoint.last_high — one BELOW the file's 5
+            default_watcher_spawn_fn(),
+            None,
+            Some(restored),
+        )
+        .expect("spawn watcher");
+
+        // First poll lands ~1s in (no stabilize/followup for a
+        // restored watcher), SIGTERM grace is 500ms; allow 5s slack.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut child_dead = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    child_dead = true;
+                    break;
+                }
+                Ok(None) => continue,
+                Err(_) => break,
+            }
+        }
+        if !child_dead {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            child_dead,
+            "restored watcher must kill the divergent pid {} — it is in \
+             the CURRENT cgroup but NOT in the checkpointed protected \
+             set, and the breach (file high 5 > checkpoint last_high 4) \
+             landed mid-swap with no post-restore bump",
+            child_pid,
+        );
+
+        // The record attributes the restored policy's kill.
+        let log_path =
+            kills_dir.path().join("ts-restored-policy.jsonl");
+        let content =
+            std::fs::read_to_string(&log_path).expect("kill log written");
+        let v: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(v["kill_status"], "killed_by_us");
+        assert_eq!(v["pid"], child_pid as u64);
+        assert_eq!(v["session_uid"], "ts-restored-policy");
+
+        // The cell published the consumed watermark — the NEXT
+        // checkpoint would carry 5, not re-report this breach.
+        assert_eq!(spawned.state.lock().unwrap().last_high, 5);
+        // And the restored protected set was published as finalized.
+        assert_eq!(
+            spawned.state.lock().unwrap().protected.as_ref().map(|s| {
+                let mut v: Vec<u32> = s.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }),
+            Some(vec![own_pid]),
+        );
+
+        drop(cgroup_dir);
+        spawned
+            .handle
+            .join()
+            .expect("watcher exits once the cgroup vanishes");
     }
 }

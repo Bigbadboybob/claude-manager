@@ -67,13 +67,21 @@
 //!   quiescence — that ordering is the R15 point (the dry run races
 //!   live mutations; the handed-off snapshot is the frozen one).
 //!
-//! Deliberately OUT of scope, deferred to later phase-4 slices:
+//! Phase 4d (R12, audit gap 1) landed the watcher half: memory-cap
+//! watchers register `memcap-watcher:<uid>` safe points with the
+//! restart coordinator (parking only at no-signal loop tops — never
+//! between their SIGTERM and delayed SIGKILL), [`build_manifest`]
+//! snapshots each capped session's parked watcher into the manifest's
+//! opaque `watcher_checkpoint` slot
+//! (`session_watch::WatcherCheckpoint`: protected set, `last_high`
+//! watermark, watched cgroup path, spawn-time kill-log baseline —
+//! own version gate, no manifest schema bump), and the rehydrate
+//! commit re-arms watchers seeded FROM the checkpoint
+//! ([`respawn_adopted_watcher`]) with the kill-log baseline restored
+//! into the adopted `LastExitProbe`. A missing/unparseable checkpoint
+//! degrades LOUDLY to a fresh watcher and never fails the adoption.
 //!
-//! - **Watcher checkpoints / full memory-cap watcher re-adoption**
-//!   (R12) — `watcher_checkpoint` is written as `None`. (4b DID
-//!   re-enable the kill-log PROBE for adopted capped sessions — real
-//!   kills_dir + a fresh adopt-time baseline — but the watcher's
-//!   policy state still isn't checkpointed across the swap.)
+//! Deliberately OUT of scope, deferred to later phase-4 slices:
 //! - **Workflow / continuous / TUI-reattach anything** beyond what
 //!   normal startup already rebuilds from disk (phases 4–5).
 //! - **The public `daemon.restart` RPC** (phase 6). The trigger is
@@ -1216,9 +1224,40 @@ fn build_manifest(
                 .cgroup_prefix
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
-            // R12 watcher checkpoints are phase-4 scope; the manifest
-            // carries the slot opaquely so the framing doesn't churn.
-            watcher_checkpoint: None,
+            // Phase 4d (R12): capped sessions checkpoint their
+            // watcher's live policy state (protected set, breach
+            // watermark, watched cgroup path) plus the session-side
+            // spawn-time kill-log baseline. For the REAL build the
+            // watcher is PARKED at its no-signal safe point — the
+            // quiesce barrier completed before exec_stage ran — so
+            // the cell is stable; the dry preflight build reads a
+            // LIVE cell, which is fine (per-snapshot atomic under
+            // the cell mutex, and the dry manifest is discarded).
+            // Lock order: the watcher-state cell is a LEAF mutex
+            // like the status cells above — the watcher thread locks
+            // it holding nothing, and nothing takes the state lock
+            // or a gate while holding it — so locking it under this
+            // state-lock hold is inversion-free. Serialization is
+            // infallible for this shape in practice; a failure rides
+            // as None (logged), degrading the re-adoption to a fresh
+            // watcher rather than failing the restart.
+            watcher_checkpoint: s.watcher_state.as_ref().and_then(|cell| {
+                let ws = cell.lock().unwrap_or_else(|p| p.into_inner());
+                let cp = ws.checkpoint(s.last_exit.kills_baseline());
+                match serde_json::to_value(&cp) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!(
+                            "cm-daemon: session '{}': watcher checkpoint \
+                             failed to serialize ({}) — riding None; the \
+                             new image will re-adopt with a FRESH watcher \
+                             (policy reset)",
+                            uid, e,
+                        );
+                        None
+                    }
+                }
+            }),
         });
     }
     Ok(ReexecManifest {
@@ -1979,9 +2018,17 @@ fn instant_from_age(anchor: Instant, age_s: f64) -> Option<Instant> {
 /// `start_session` uses (soft cap present → real kills_dir), so an
 /// adopted capped session's cap kill is attributed instead of
 /// reading as a plain signal-9 exit.
+///
+/// `watcher_checkpoint` (phase 4d, R12) is the record's PARSED
+/// watcher checkpoint (parsed once per record by the caller — the
+/// commit phase reuses the same parse for the watcher respawn):
+/// its `kills_baseline` restores the spawn-time kill-log offset so
+/// `build_adopted` doesn't recapture a fresh one that would lose a
+/// swap-window cap kill's attribution.
 fn adopted_meta_from_record(
     rec: &SessionRecord,
     anchor: Instant,
+    watcher_checkpoint: Option<&crate::session_watch::WatcherCheckpoint>,
 ) -> AdoptedSessionMeta {
     let cell =
         |age: Option<f64>| age.and_then(|a| instant_from_age(anchor, a));
@@ -2028,6 +2075,146 @@ fn adopted_meta_from_record(
         } else {
             None
         },
+        kills_baseline: watcher_checkpoint.map(|cp| cp.kills_baseline),
+    }
+}
+
+/// Re-arm the memory-cap watcher for an adopted CAPPED session —
+/// DESIGN_SEAMLESS_RESTART phase 4d (R12), closing audit gap 1
+/// (pre-4d, `arm` left `watcher_handle: None` and nothing on the
+/// adoption path called `spawn_watcher`: the cgroup scope survived
+/// the swap but nothing watched `memory.events` — the cap was
+/// silently UNENFORCED).
+///
+/// Two arms, checkpoint-first:
+///
+/// - **Checkpointed** (the normal swap): the watcher is seeded FROM
+///   the checkpoint — watched cgroup path as discovered by the OLD
+///   image, `last_high` watermark (a breach that landed mid-swap
+///   fires on the first poll instead of being re-baselined away),
+///   and the finalized protected set (stabilize/followup SKIPPED —
+///   recomputing from the current cgroup would newly protect late
+///   workers the pre-swap policy left killable). A checkpoint taken
+///   mid-stabilize carries `protected: None`, and the restored
+///   watcher re-runs the phases — what the old one would have done.
+/// - **No checkpoint** (pre-4d manifest, parse failure — already
+///   logged by `parse_watcher_checkpoint` — or a capped session
+///   whose watcher never spawned): degrade LOUDLY to a fresh
+///   watcher — re-discover the cgroup from the live child's
+///   `/proc/<pid>/cgroup` (the same never-trust-a-stored-path rule
+///   as `start_session`) and re-seed the watermark from the current
+///   counter. A policy reset, logged as one; strictly better than
+///   no watcher.
+///
+/// **Never fails the adoption.** Every degradation — no kills dir,
+/// discovery failure, thread-spawn failure — logs the cap as
+/// UNENFORCED and returns `None`: trading a live adopted session (or
+/// the whole transaction) for its watcher would invert the design's
+/// priorities — the cap can be re-imposed; the child cannot. (This
+/// deliberately diverges from `start_session`, which refuses to
+/// RETURN a new capped session without a producer — there the child
+/// is ours to abort; here it predates us.)
+///
+/// Runs under the commit phase's state-lock hold: `spawn_watcher`
+/// only creates the cell and spawns a thread (same weight as `arm`'s
+/// spawns beside it); the watcher registers its safe point on its
+/// OWN thread, so no coordinator lock is taken under the state lock.
+fn respawn_adopted_watcher(
+    rec: &SessionRecord,
+    checkpoint: Option<&crate::session_watch::WatcherCheckpoint>,
+    coordinator: std::sync::Weak<crate::restart_coordinator::RestartCoordinator>,
+) -> Option<crate::session_watch::SpawnedWatcher> {
+    let soft_cap_bytes = rec.memory_cap_soft_bytes?;
+    let hard_cap_bytes = crate::control::methods::resolve_watcher_hard_cap_bytes(
+        rec.memory_cap_hard_bytes,
+    );
+    let Some(kills_dir) = crate::path::default_kills_dir() else {
+        eprintln!(
+            "cm-daemon: adopted capped session '{}': no kills dir resolves \
+             on this host — memory cap UNENFORCED post-swap (no watcher, \
+             no kill-log producer); adoption proceeds",
+            rec.uid,
+        );
+        return None;
+    };
+    let (cgroup_path, initial_high, restored_protected) = match checkpoint {
+        Some(cp) => (
+            PathBuf::from(&cp.cgroup_path),
+            cp.last_high,
+            cp.protected
+                .as_ref()
+                .map(|v| v.iter().copied().collect::<HashSet<u32>>()),
+        ),
+        None => {
+            eprintln!(
+                "cm-daemon: adopted capped session '{}': no usable watcher \
+                 checkpoint — POLICY RESET: fresh watcher (cgroup \
+                 re-discovered from /proc/{}/cgroup, protected set \
+                 recomputed, breach watermark re-anchored at the current \
+                 counter; a breach that landed during the swap is \
+                 unattributable)",
+                rec.uid, rec.child_pid,
+            );
+            let discovered = match crate::path::discover_session_cgroup_path(
+                rec.child_pid as u32,
+                Duration::from_millis(500),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "cm-daemon: adopted capped session '{}': cgroup \
+                         re-discovery failed ({}) — memory cap UNENFORCED \
+                         post-swap; adoption proceeds",
+                        rec.uid, e,
+                    );
+                    return None;
+                }
+            };
+            let high =
+                crate::session_watch::read_memory_events_high(&discovered);
+            (discovered, high, None)
+        }
+    };
+    match crate::session_watch::spawn_watcher(
+        rec.uid.clone(),
+        cgroup_path.clone(),
+        soft_cap_bytes,
+        hard_cap_bytes,
+        kills_dir,
+        initial_high,
+        crate::session_watch::default_watcher_spawn_fn(),
+        Some(coordinator),
+        restored_protected.clone(),
+    ) {
+        Ok(w) => {
+            eprintln!(
+                "cm-daemon: adopted capped session '{}': memory-cap watcher \
+                 re-armed on {} ({}; last_high {}, protected {})",
+                rec.uid,
+                cgroup_path.display(),
+                if checkpoint.is_some() {
+                    "restored from checkpoint"
+                } else {
+                    "fresh policy"
+                },
+                initial_high,
+                match &restored_protected {
+                    Some(set) => format!("{} pid(s) restored", set.len()),
+                    None => "to be computed".to_string(),
+                },
+            );
+            Some(w)
+        }
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: adopted capped session '{}': watcher thread \
+                 spawn failed ({}) — memory cap UNENFORCED post-swap; \
+                 adoption proceeds (never trade a live child for its \
+                 watcher)",
+                rec.uid, e,
+            );
+            None
+        }
     }
 }
 
@@ -2096,8 +2283,9 @@ fn swap_exit_tombstone(
 /// or a bare signal (code None) finishes the run `Done` — matching
 /// the live path's treatment of signal kills, and honest for the swap
 /// window, where a memory-cap kill cannot be attributed anyway (the
-/// old image's kill-log baseline died with it; see
-/// [`swap_exit_tombstone`]'s `memory_cap_kill: false`).
+/// classification needs gap 5's operator-kill flag; see the
+/// `memory_cap_kill` rationale at the tombstone site in the commit
+/// phase).
 fn swap_dead_continuous_close(
     rec: &SessionRecord,
     status: &crate::session::DaemonExitStatus,
@@ -2301,11 +2489,23 @@ fn rehydrate_transaction(
     }
 
     // ---- Build phase (4b): everything fallible, zero threads. ----
-    let mut builds: Vec<(usize, AdoptedSessionBuild)> =
-        Vec::with_capacity(survivors.len());
+    // The watcher checkpoint (phase 4d, R12) is parsed ONCE here per
+    // record — a parse failure logs the policy reset (see
+    // `session_watch::parse_watcher_checkpoint`) and degrades that
+    // record to fresh watcher policy, NEVER failing the transaction —
+    // and the parsed value is threaded to the commit phase's watcher
+    // respawn so the parse (and its logging) never runs twice.
+    let mut builds: Vec<(
+        usize,
+        AdoptedSessionBuild,
+        Option<crate::session_watch::WatcherCheckpoint>,
+    )> = Vec::with_capacity(survivors.len());
     for (i, candidate) in survivors {
         let rec = &manifest.sessions[i];
-        let meta = adopted_meta_from_record(rec, anchor);
+        let checkpoint = rec.watcher_checkpoint.as_ref().and_then(|v| {
+            crate::session_watch::parse_watcher_checkpoint(&rec.uid, v)
+        });
+        let meta = adopted_meta_from_record(rec, anchor, checkpoint.as_ref());
         let build = DaemonSession::build_adopted(candidate.promote(), meta)
             .map_err(|e| {
                 format!(
@@ -2315,7 +2515,7 @@ fn rehydrate_transaction(
                     rec.uid, e,
                 )
             })?;
-        builds.push((i, build));
+        builds.push((i, build, checkpoint));
     }
 
     // ---- Reap phase (4b): consume the swap-dead zombies. ----
@@ -2356,7 +2556,7 @@ fn rehydrate_transaction(
     // starts empty and only this transaction inserts) — a collision
     // means a program bug or a hostile manifest; nothing to disarm
     // because nothing has been inserted yet.
-    for (i, _) in &builds {
+    for (i, _, _) in &builds {
         let uid = &manifest.sessions[*i].uid;
         if st.sessions.contains_key(uid) {
             return Err(format!(
@@ -2385,10 +2585,15 @@ fn rehydrate_transaction(
             .map(|p| p.to_string_lossy().into_owned());
         // Mirror handle_session_exit's workspace-entry mutation so
         // the TUI's manifest view agrees with the tombstone.
-        // `memory_cap_kill: false` is the honest default — the old
-        // image's kill-log baseline died with it (R12 checkpoint is
-        // future scope), so a cap kill landing exactly in the swap
-        // window cannot be attributed.
+        // `memory_cap_kill: false` stays the default for SWAP-DEAD
+        // records even now that 4d carries the kill-log baseline in
+        // the watcher checkpoint: classifying honestly also needs the
+        // operator-kill flag (`is_cap_kill`'s conservative override),
+        // which is exactly gap 5's unserialized in-flight kill
+        // attribution — probing with `operator_kill: false` would
+        // bias an operator kill landing just before the swap into a
+        // false "memory-cap" label, the misattribution watcher-fix
+        // #4/#5 exist to prevent. Wired together with gap 5.
         if let Some(mw) = st.workspaces.get_mut(&rec.workspace_id) {
             if let Some(entry) =
                 mw.sessions.iter_mut().find(|e| e.uid == rec.uid)
@@ -2415,8 +2620,13 @@ fn rehydrate_transaction(
     }
 
     // Arm + insert, all under this one continuous lock hold.
+    // Phase 4d (R12): the coordinator handle for the re-armed
+    // watchers' safe-point registration — the NEW image's coordinator
+    // (born fresh, no pause in effect), downgraded so a watcher can
+    // never keep daemon state alive.
+    let coordinator_weak = Arc::downgrade(&st.restart_coordinator);
     let mut adopted = 0usize;
-    for (i, build) in builds {
+    for (i, build, checkpoint) in builds {
         let rec = &manifest.sessions[i];
         let state_for_cleanup = Arc::clone(state_arc);
         let uid_for_cleanup = rec.uid.clone();
@@ -2427,7 +2637,23 @@ fn rehydrate_transaction(
             crate::control::methods::handle_session_exit(&mut s, &uid_for_cleanup);
         });
         match build.arm(Some(on_exit)) {
-            Ok(sess) => {
+            Ok(mut sess) => {
+                // Phase 4d (R12): re-arm the memory-cap watcher for a
+                // capped record, seeded from the checkpoint (never
+                // recomputed when one exists). Mirrors
+                // `start_session`'s two-step stash. Runs AFTER arm
+                // succeeded and never fails the adoption — see
+                // `respawn_adopted_watcher`.
+                if rec.memory_cap_soft_bytes.is_some() {
+                    if let Some(w) = respawn_adopted_watcher(
+                        rec,
+                        checkpoint.as_ref(),
+                        coordinator_weak.clone(),
+                    ) {
+                        sess.watcher_handle = Some(w.handle);
+                        sess.watcher_state = Some(w.state);
+                    }
+                }
                 st.sessions.insert(rec.uid.clone(), sess);
                 adopted += 1;
                 eprintln!(
@@ -3069,7 +3295,7 @@ mod tests {
             cgroup_prefix: Some("/sys/fs/cgroup/x".into()),
             watcher_checkpoint: None,
         };
-        let meta = adopted_meta_from_record(&rec, anchor);
+        let meta = adopted_meta_from_record(&rec, anchor, None);
         assert_eq!(meta.title, "my worker");
         assert_eq!(meta.session_type, "codex");
         assert_eq!(meta.workspace_id, "ws-9");
@@ -3097,12 +3323,28 @@ mod tests {
             meta.kills_dir.is_some(),
             crate::path::default_kills_dir().is_some()
         );
+        // No checkpoint → no carried baseline: build_adopted captures
+        // a fresh one (the 4b behavior).
+        assert_eq!(meta.kills_baseline, None);
+
+        // With a checkpoint (phase 4d, R12): the spawn-time kill-log
+        // baseline is carried into the meta, so the adopted probe
+        // attributes against the OLD image's window.
+        let cp = crate::session_watch::WatcherCheckpoint {
+            version: crate::session_watch::WATCHER_CHECKPOINT_VERSION,
+            cgroup_path: "/sys/fs/cgroup/x/cm-sess-1.scope".into(),
+            protected: Some(vec![1234]),
+            last_high: 3,
+            kills_baseline: 777,
+        };
+        let meta = adopted_meta_from_record(&rec, anchor, Some(&cp));
+        assert_eq!(meta.kills_baseline, Some(777));
 
         // Uncapped record: no kills_dir, no probe.
         let mut uncapped = rec.clone();
         uncapped.memory_cap_soft_bytes = None;
         uncapped.memory_cap_hard_bytes = None;
-        let meta = adopted_meta_from_record(&uncapped, anchor);
+        let meta = adopted_meta_from_record(&uncapped, anchor, None);
         assert!(meta.kills_dir.is_none());
     }
 
@@ -3572,5 +3814,161 @@ mod tests {
             RunStatus::Stuck,
             "a pre-swap Stuck escalation must survive the flip"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4d (R12, audit gap 1): watcher re-adoption from the
+    // manifest checkpoint
+    // ---------------------------------------------------------------
+
+    /// A crafted CAPPED record for the 4d respawn tests.
+    fn capped_record(
+        uid: &str,
+        child_pid: i32,
+        watcher_checkpoint: Option<serde_json::Value>,
+    ) -> SessionRecord {
+        SessionRecord {
+            uid: uid.into(),
+            generation: 1,
+            transcript_id: None,
+            transcript_path: None,
+            session_type: "claude-code".into(),
+            title: "capped".into(),
+            workspace_id: "ws-4d".into(),
+            task_id: None,
+            managed_by_uid: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: None,
+            global_perms: false,
+            memory_cap_soft_bytes: Some(64 * 1024 * 1024),
+            memory_cap_hard_bytes: Some(128 * 1024 * 1024),
+            last_activity_age_s: None,
+            last_input_age_s: None,
+            last_operator_input_age_s: None,
+            last_turn_end_age_s: None,
+            done_report: None,
+            child_pid,
+            child_start_time: 1,
+            pty_master_fd: 60,
+            pidfd: 61,
+            cgroup_prefix: Some("cm-cap-4d".into()),
+            watcher_checkpoint,
+        }
+    }
+
+    /// The gap-1 regression, seeding half: a capped record with a
+    /// checkpoint gets a watcher whose live state is the CHECKPOINTED
+    /// policy — restored protected set, restored `last_high`
+    /// watermark, the OLD image's discovered cgroup path — never a
+    /// recomputation from the current cgroup. (The kill-decision
+    /// divergence of that policy is pinned end-to-end in
+    /// `session_watch::tests::restored_watcher_preserves_protected_set_and_last_high`.)
+    #[test]
+    fn respawn_adopted_watcher_seeds_from_checkpoint() {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = set_home(dir.path());
+
+        // Synthetic watched cgroup, alive so the watcher enters its
+        // main loop rather than exiting at the appear deadline.
+        let cgroup = dir.path().join("cm-sess-4d.scope");
+        std::fs::create_dir_all(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), b"").unwrap();
+        std::fs::write(cgroup.join("memory.events"), b"high 4\nmax 0\n")
+            .unwrap();
+
+        let cp = crate::session_watch::WatcherCheckpoint {
+            version: crate::session_watch::WATCHER_CHECKPOINT_VERSION,
+            cgroup_path: cgroup.to_string_lossy().into_owned(),
+            protected: Some(vec![41, 42]),
+            last_high: 4,
+            kills_baseline: 99,
+        };
+        let rec = capped_record(
+            "ts-4d-restore",
+            4242,
+            Some(serde_json::to_value(&cp).unwrap()),
+        );
+        let parsed = rec
+            .watcher_checkpoint
+            .as_ref()
+            .and_then(|v| {
+                crate::session_watch::parse_watcher_checkpoint(&rec.uid, v)
+            })
+            .expect("checkpoint parses");
+
+        let spawned = respawn_adopted_watcher(
+            &rec,
+            Some(&parsed),
+            std::sync::Weak::new(), // no coordinator — registration skipped
+        )
+        .expect("capped record with a checkpoint must get a watcher");
+
+        {
+            let st = spawned.state.lock().unwrap();
+            assert_eq!(st.cgroup_path, cgroup, "watches the OLD image's path");
+            assert_eq!(
+                st.protected
+                    .as_ref()
+                    .map(|s| {
+                        let mut v: Vec<u32> = s.iter().copied().collect();
+                        v.sort_unstable();
+                        v
+                    }),
+                Some(vec![41, 42]),
+                "protected set restored, not recomputed"
+            );
+            assert_eq!(st.last_high, 4, "breach watermark restored");
+        }
+
+        // Teardown: cgroup vanishes → the watcher's loop exits.
+        std::fs::remove_dir_all(&cgroup).unwrap();
+        spawned.handle.join().expect("watcher exits");
+    }
+
+    /// The degrade ladder never fails the adoption: a capped record
+    /// with NO checkpoint falls to the fresh path, whose cgroup
+    /// re-discovery (from `/proc/<pid>/cgroup` — the pid here does
+    /// not exist) fails → `None`, loudly, with the caller adopting
+    /// the session anyway (the commit loop just leaves
+    /// `watcher_handle`/`watcher_state` as `None`). Same for a
+    /// checkpoint that fails to parse — `parse_watcher_checkpoint`
+    /// already returned `None` upstream, making the two paths one.
+    #[test]
+    fn respawn_adopted_watcher_degrades_to_none_without_usable_state() {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = set_home(dir.path());
+
+        // A pid that cannot exist → /proc/<pid>/cgroup reads ENOENT
+        // and discovery returns Err immediately (the retry loop only
+        // spins on parse errors, not read errors).
+        let rec = capped_record("ts-4d-fresh-fail", i32::MAX - 1, None);
+        assert!(
+            respawn_adopted_watcher(&rec, None, std::sync::Weak::new())
+                .is_none(),
+            "fresh path with failed discovery degrades to no watcher — \
+             never an Err, never a panic"
+        );
+
+        // Unparseable checkpoint value → the shared parse helper
+        // (exercised via the same route the build phase uses) yields
+        // None, landing in the same fresh-or-nothing ladder.
+        let garbage = capped_record(
+            "ts-4d-garbage",
+            i32::MAX - 1,
+            Some(serde_json::json!({"version": 999, "nonsense": true})),
+        );
+        let parsed = garbage.watcher_checkpoint.as_ref().and_then(|v| {
+            crate::session_watch::parse_watcher_checkpoint(&garbage.uid, v)
+        });
+        assert!(parsed.is_none(), "garbage checkpoint refuses to parse");
+        assert!(respawn_adopted_watcher(
+            &garbage,
+            parsed.as_ref(),
+            std::sync::Weak::new()
+        )
+        .is_none());
     }
 }

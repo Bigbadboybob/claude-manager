@@ -36,11 +36,14 @@
 //!      indistinguishable from before `begin()`.
 //!   5. A **safe-point registration surface**
 //!      ([`RestartCoordinator::register_subsystem`] →
-//!      [`SafePointHandle`]) that later phase-2 slices plug their
-//!      long-running loops into. Nothing registers yet; the protocol is
-//!      implemented (and tested) so the plugs are drop-in:
-//!        - **Delivery writers / memory-cap watchers (R10, R12)**: park
-//!          between writes / at a no-signal point.
+//!      [`SafePointHandle`]) that long-running loops plug into:
+//!        - **Memory-cap watchers (R12)** — the first production
+//!          registrant (phase 4d): each watcher thread registers
+//!          `memcap-watcher:<uid>` and parks only at no-signal loop
+//!          tops, never between its SIGTERM and delayed SIGKILL (see
+//!          `session_watch::run_watcher`'s placement note).
+//!        - **Delivery writers (R10)**: park between writes — still
+//!          pending (audit gap 6, phase-2d completion).
 //!
 //!      The **reapers (2a, R4)** and **PTY readers (2b, R3)** do NOT
 //!      register here: they quiesce through their own exclusive gates
@@ -213,12 +216,13 @@ impl RestartCoordinator {
     /// active quiesce), the new handle is born with the request set —
     /// see [`SubsystemRegistry::pause_requested`].
     ///
-    /// NOTE: nothing registers yet in this slice. The intended callers
-    /// are the delivery writers and memory-cap watchers (R10, R12).
-    /// The reapers (2a) and PTY readers (2b) deliberately do NOT
-    /// register — they quiesce via their own exclusive gate freezes,
-    /// taken by the restart sequence after `wait_quiesced`; see the
-    /// module doc and `crate::reap_gate`.
+    /// Production registrants: the memory-cap watchers
+    /// (`memcap-watcher:<uid>`, phase 4d / R12 — see
+    /// `session_watch::run_watcher`); the delivery writers (R10) are
+    /// still pending (audit gap 6). The reapers (2a) and PTY readers
+    /// (2b) deliberately do NOT register — they quiesce via their own
+    /// exclusive gate freezes, taken by the restart sequence after
+    /// `wait_quiesced`; see the module doc and `crate::reap_gate`.
     pub fn register_subsystem(this: &Arc<Self>, name: &str) -> SafePointHandle {
         let mut reg = this.subsystems.lock().unwrap_or_else(|p| p.into_inner());
         let shared = Arc::new(SafePointShared {
