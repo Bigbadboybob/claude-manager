@@ -3222,6 +3222,17 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "workspaces": state.workspaces.len(),
         "draining": state.draining,
         "sessions_mid_turn": mid_turn,
+        // DESIGN_SEAMLESS_RESTART phase 2e (R14): is the fail-closed
+        // strong-operator gate satisfiable on this daemon? False when
+        // CM_OPERATOR_TOKEN was unset at startup (compat fail-open
+        // world) — in which case the future `daemon.restart` will
+        // refuse to run, regardless of `[auth] mode` (ssh-trust
+        // doesn't count: socket reachability ≠ restart authority).
+        // Surfaced here so a deploy script can check the precondition
+        // BEFORE attempting a restart instead of learning from the
+        // refusal.
+        "strong_operator_auth":
+            crate::control::operator::strong_operator_auth_configured(),
     }))
 }
 
@@ -14776,6 +14787,38 @@ mod tests {
         state.lock().unwrap().mcp_preflight = Some(Ok("41 tools".into()));
         let passed = daemon_health(&state).expect("health ok");
         assert_eq!(passed["mcp_ok"], json!(true));
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 2e (R14): `daemon.health` carries
+    /// `strong_operator_auth` so a deploy script can check the
+    /// fail-closed restart precondition up front — false in the compat
+    /// fail-open world (CM_OPERATOR_TOKEN unset at startup), true only
+    /// when token validation is actually enabled. Both worlds pinned
+    /// via the operator module's scoped test override (the real token
+    /// is a first-set-wins process-global), serialized under
+    /// `env_lock()` like every other process-global in the suite.
+    #[test]
+    fn daemon_health_reports_strong_operator_auth() {
+        let _g = crate::test_support::env_lock();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let _w = crate::control::operator::test_override::set(None);
+            let h = daemon_health(&state).expect("health ok");
+            assert_eq!(
+                h["strong_operator_auth"],
+                json!(false),
+                "compat fail-open world must read as NOT strong",
+            );
+        }
+        {
+            let _w = crate::control::operator::test_override::set(Some("tok"));
+            let h = daemon_health(&state).expect("health ok");
+            assert_eq!(
+                h["strong_operator_auth"],
+                json!(true),
+                "configured token validation must read as strong",
+            );
+        }
     }
 
     #[test]
