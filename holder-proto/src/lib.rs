@@ -29,6 +29,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod channel;
 pub mod reexec_manifest;
 
 #[cfg(test)]

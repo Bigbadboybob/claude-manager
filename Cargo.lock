@@ -384,6 +384,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cm-holder"
+version = "0.1.0"
+dependencies = [
+ "cm-holder-proto",
+ "libc",
+ "portable-pty",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cm-holder-proto"
 version = "0.1.0"
 dependencies = [

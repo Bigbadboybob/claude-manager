@@ -1,0 +1,31 @@
+[package]
+name = "cm-holder"
+version = "0.1.0"
+edition = "2021"
+
+# The tiny, near-frozen PTY-holder process (DESIGN_HOLDER_BRAIN_SPLIT
+# phase 2). Owns fork/exec of session children, the canonical PTY
+# master fds, the spawn-time pidfds, and waitid reaping; speaks the
+# cm-holder-proto channel to the brain. The frozenness contract
+# (design § The holder, "What the holder must never contain") is a
+# review-time rule for THIS crate: no config parsing beyond argv, no
+# control-wire protocol, no auth, no policy, no persistence.
+
+[lib]
+name = "cm_holder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cm-holder"
+path = "src/main.rs"
+
+[dependencies]
+cm-holder-proto = { path = "../holder-proto" }
+# Spawn parity with the daemon's PendingSession::spawn — the exact
+# openpty + spawn_command primitive, so child-side semantics
+# (session leader, controlling tty, fd scrub in pre_exec) are
+# bit-identical (design § The holder, "Spawn parity").
+portable-pty = "0.9"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
