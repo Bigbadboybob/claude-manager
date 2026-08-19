@@ -2512,7 +2512,14 @@ fn swap_dead_continuous_close(
         rec.uid, ct_id, terminal, status.code, status.signal,
     );
     crate::control::methods::close_continuous_run_for_exit(
-        ct_id, &rec.uid, terminal,
+        ct_id,
+        &rec.uid,
+        terminal,
+        format!(
+            "session exited during the re-exec swap (exit code {:?}, signal \
+             {:?}) — run closed by the handoff tombstone path",
+            status.code, status.signal
+        ),
     );
 }
 

@@ -1241,12 +1241,34 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     // breaker must see it, not a false `Done`. A clean exit (code 0) or a bare
     // signal (code None — an operator kill, indistinguishable from a
     // signal-crash and historically treated as Done) finishes the run `Done`.
-    let continuous_terminal_status: Option<crate::continuous::task::RunStatus> =
+    let continuous_terminal_status: Option<(crate::continuous::task::RunStatus, String)> =
         last_exit_opt.as_ref().map(|le| {
-            if le.memory_cap_kill || matches!(le.code, Some(c) if c != 0) {
-                crate::continuous::task::RunStatus::Failed
+            if le.memory_cap_kill {
+                (
+                    crate::continuous::task::RunStatus::Failed,
+                    format!(
+                        "session exited under its memory cap (cap kill; exit \
+                         code {:?}) — run closed failed",
+                        le.code
+                    ),
+                )
+            } else if matches!(le.code, Some(c) if c != 0) {
+                (
+                    crate::continuous::task::RunStatus::Failed,
+                    format!(
+                        "session exited non-zero (code {:?}) — run closed failed",
+                        le.code
+                    ),
+                )
             } else {
-                crate::continuous::task::RunStatus::Done
+                (
+                    crate::continuous::task::RunStatus::Done,
+                    format!(
+                        "session exited (code {:?}, no failure signal) — run \
+                         closed done",
+                        le.code
+                    ),
+                )
             }
         });
     if let (Some(ws_id), Some(last_exit)) =
@@ -1272,10 +1294,10 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     // exiting CLEANLY clears its ACTIVE run. Guards, kill-path analysis, and the
     // lock-safety argument live on [`close_continuous_run_for_exit`] — shared
     // with the re-exec swap-dead tombstone path since phase 4g (audit gap 7).
-    if let (Some(ct_id), Some(terminal_status)) =
+    if let (Some(ct_id), Some((terminal_status, detail))) =
         (continuous_task_id, continuous_terminal_status)
     {
-        close_continuous_run_for_exit(&ct_id, uid, terminal_status);
+        close_continuous_run_for_exit(&ct_id, uid, terminal_status, detail);
     }
     state.sessions.remove(uid);
     // P0 session durability (S1): persist the registry now that the
@@ -1316,20 +1338,58 @@ pub(crate) fn close_continuous_run_for_exit(
     continuous_task_id: &str,
     session_uid: &str,
     terminal_status: crate::continuous::task::RunStatus,
+    detail: String,
 ) {
+    let now = crate::continuous::task::now_unix();
+    let mut flipped: Option<(u64, String)> = None;
     let _ = crate::continuous::task::modify(continuous_task_id, |t| {
         if let Some(run) = t.last_run.as_mut() {
             if run.session_uid.as_deref() == Some(session_uid)
                 && matches!(run.status, crate::continuous::task::RunStatus::Running)
             {
                 run.status = terminal_status;
-                run.finished_at = Some(crate::continuous::task::now_unix());
+                run.finished_at = Some(now);
                 if terminal_status == crate::continuous::task::RunStatus::Done {
                     t.consecutive_wedge_closes = 0;
                 }
+                flipped = Some((run.seq, run.fire_token.clone()));
             }
         }
     });
+    // Wedge-campaign follow-through: the exit-close was the ONE run-closing
+    // path with no runs.jsonl line — state.json flipped but the audit log
+    // showed a run that just vanished (surfaced by the 2026-08-19 F1
+    // acceptance demo, whose cap-killed session closed its run invisibly).
+    // Every consumer of the attributed-close contract (external reaper
+    // forensics, guard_watch, the wedge characterization method) reads this
+    // file, so the flip and the line must travel together.
+    let Some((seq, fire_token)) = flipped else {
+        return;
+    };
+    let status = match terminal_status {
+        crate::continuous::task::RunStatus::Done => "done",
+        crate::continuous::task::RunStatus::Failed => "failed",
+        _ => "failed",
+    };
+    if let Err(e) = crate::continuous::runlog::ContinuousRunLog::append(
+        &crate::continuous::runlog::RunLogLine {
+            seq,
+            ts: now as f64,
+            task_id: continuous_task_id.to_string(),
+            event: "session_exited".to_string(),
+            fire_token: Some(fire_token),
+            session_uid: Some(session_uid.to_string()),
+            run_mode: None,
+            trigger_source: Some("session-exit".to_string()),
+            status: Some(status.to_string()),
+            detail: Some(detail.into()),
+        },
+    ) {
+        eprintln!(
+            "cm-daemon: failed to append session_exited audit line for {}: {}",
+            continuous_task_id, e,
+        );
+    }
 }
 
 /// Sanity-check for a TUI-supplied session uid. Slice 10c-e-3b-fix:
