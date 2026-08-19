@@ -368,6 +368,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "base64",
+ "cm-holder-proto",
  "libc",
  "nix 0.28.0",
  "portable-pty",
@@ -380,6 +381,17 @@ dependencies = [
  "toml",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "cm-holder-proto"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

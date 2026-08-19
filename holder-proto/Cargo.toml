@@ -1,0 +1,40 @@
+[package]
+name = "cm-holder-proto"
+version = "0.1.0"
+edition = "2021"
+
+# The holder/brain compatibility surface (DESIGN_HOLDER_BRAIN_SPLIT
+# phase 1). This crate is shared language between binary GENERATIONS —
+# the monolith image, the future cm-holder image, and every brain build
+# — so everything in it lives under the additive-only discipline the
+# design's "Version-skew testing" section spells out: unknown JSON
+# fields are ignored (`deny_unknown_fields` is banned), schema changes
+# bump versions, and version bumps ride the skew matrix.
+#
+# Phase 1 contents: the sealed re-exec manifest (relocated verbatim
+# from daemon/src/reexec_manifest.rs; the daemon re-exports it so
+# every `cm_daemon::reexec_manifest::*` path compiles unchanged).
+# Later phases add the holder channel frames, verbs, and SCM_RIGHTS
+# helpers here.
+
+[lib]
+name = "cm_holder_proto"
+path = "src/lib.rs"
+
+[dependencies]
+# Same versions the daemon pins — the workspace lockfile keeps the
+# builds identical, which is the point: one serialization of the
+# manifest, however many binaries speak it.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Envelope checksum (SHA-256 over the payload — see the manifest
+# module docs' "Checksum choice" note).
+sha2 = "0.10"
+# memfd_create / seals / pread / pwrite / fstat — the manifest's
+# kernel surface.
+libc = "0.2"
+
+[dev-dependencies]
+# The relocated manifest tests exercise the NotMemfd refusal against
+# real regular-file fds; same version the daemon's dev-deps pin.
+tempfile = "3"

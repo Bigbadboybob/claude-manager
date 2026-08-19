@@ -60,6 +60,12 @@ base64 = "0.22.1"
 # so the producer relocation doesn't introduce cross-crate
 # dependency drift.
 sha2 = "0.10"
+# The holder/brain compatibility surface (DESIGN_HOLDER_BRAIN_SPLIT
+# phase 1): the sealed re-exec manifest relocated there, re-exported
+# at the old path via `daemon/src/reexec_manifest.rs`'s shim so
+# every existing `crate::reexec_manifest::*` consumer compiles
+# unchanged.
+cm-holder-proto = { path = "../holder-proto" }
 # Sub-2b-2 (10d-mcp-surface-2b-2): blocking HTTP client used by
 # `daemon/src/planning_client.rs` to POST to the planning API
 # for `propose_task` (and future planning-API forwards). Same
