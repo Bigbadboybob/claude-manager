@@ -440,6 +440,52 @@ fn default_rows() -> u16 {
 ///   spawned session lives daemon-only at this slice; TUI sidebar
 ///   only learns about it when 10e's `manifest.watch` broadcasts a
 ///   diff.
+/// The spawn-backend seam (DESIGN_HOLDER_BRAIN_SPLIT phase 3): one
+/// fork/exec product, two backends — in-process (the monolith's
+/// `PendingSession`, retained per O3's reverse-migration promise)
+/// or holder-routed (`HolderPending`). Both share every ounce of the
+/// choreography around them: cgroup discovery, watcher spawn, the
+/// lock-held uid-recheck → arm → insert sequence, persistence, and
+/// the `Added` broadcast. Drop semantics match by construction:
+/// `PendingSession::Drop` pidfd-SIGKILLs + reaps; `HolderPending::
+/// Drop` routes `abort_spawn` (the holder kills + reaps, no event).
+enum SpawnedChild {
+    InProcess(PendingSession),
+    Holder(crate::holder_mode::HolderPending),
+}
+
+impl SpawnedChild {
+    fn pid(&self) -> libc::pid_t {
+        match self {
+            SpawnedChild::InProcess(p) => p.pid(),
+            SpawnedChild::Holder(h) => h.pid(),
+        }
+    }
+
+    /// `(uid, incarnation)` when holder-routed — the post-insert
+    /// `arm_reap` needs it (captured here because `arm` consumes).
+    fn holder_binding(&self) -> Option<(String, u64)> {
+        match self {
+            SpawnedChild::InProcess(_) => None,
+            SpawnedChild::Holder(h) => Some((h.uid.clone(), h.incarnation)),
+        }
+    }
+
+    /// The lock-held arm: reaper thread (monolith) or exit observer
+    /// wired to the holder subscription (split). Same discipline
+    /// either way — call ONLY while holding the state lock, insert
+    /// before releasing.
+    fn arm(
+        self,
+        on_exit: Option<crate::session::OnExitCallback>,
+    ) -> anyhow::Result<crate::session::DaemonSession> {
+        match self {
+            SpawnedChild::InProcess(p) => p.arm_reaper(on_exit),
+            SpawnedChild::Holder(h) => h.arm(on_exit),
+        }
+    }
+}
+
 pub fn start_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -798,8 +844,17 @@ pub(crate) fn start_session_with_spawn_fn(
     // against it. `PendingSession` owns the live child via its
     // Box<dyn Child> handle; if anything below fails, dropping
     // the PendingSession SIGKILLs + waitpid'd the child cleanly.
-    let pending = PendingSession::spawn(spawn_params)
-        .map_err(|e| (ErrorCode::Internal, format!("spawn: {}", e)))?;
+    let pending: SpawnedChild = match crate::holder_mode::global() {
+        Some(client) => SpawnedChild::Holder(
+            crate::holder_mode::holder_spawn(client, spawn_params)
+                .map_err(|e| (ErrorCode::Internal, format!("spawn (holder): {}", e)))?,
+        ),
+        None => SpawnedChild::InProcess(
+            PendingSession::spawn(spawn_params)
+                .map_err(|e| (ErrorCode::Internal, format!("spawn: {}", e)))?,
+        ),
+    };
+    let holder_binding = pending.holder_binding();
 
     // Slice 10d watcher-fix #1: cgroup discovery from
     // `/proc/<pid>/cgroup` — never trust a caller-supplied path.
@@ -1092,7 +1147,7 @@ pub(crate) fn start_session_with_spawn_fn(
     }
 
     let mut session = pending
-        .arm_reaper(Some(on_exit))
+        .arm(Some(on_exit))
         .map_err(|e| (ErrorCode::Internal, format!("arm reaper: {}", e)))?;
     // Slice 10d watcher-fix: stash the watcher handle on the
     // registry-resident session at the same instant we insert
@@ -1132,6 +1187,29 @@ pub(crate) fn start_session_with_spawn_fn(
         "task_id": p.task_id,
     });
     drop(state);
+    // Holder-split (S4/C9): authorize reaping + this generation's
+    // event delivery — AFTER the insert above is visible (the
+    // ordering invariant: an exit event can only fire post-arm, and
+    // its on_exit then blocks on the lock until the insert landed;
+    // the doc's "under the lock" is satisfied by insert-before-send).
+    if let Some((h_uid, h_inc)) = &holder_binding {
+        if let Some(client) = crate::holder_mode::global() {
+            if let Err(e) = client.arm_reap(h_uid, *h_inc, verified_cgroup_path.clone()) {
+                // Inserted but unarmed = a session whose exit pipeline
+                // can never fire. Fail honestly: remove + tear down
+                // holder-side (abort_spawn kills + reaps, no event).
+                let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                st.sessions.remove(h_uid);
+                st.persist_sessions_best_effort();
+                drop(st);
+                let _ = client.abort_spawn(h_uid, *h_inc);
+                return Err((
+                    ErrorCode::Internal,
+                    format!("arm_reap for '{}' failed: {}", h_uid, e),
+                ));
+            }
+        }
+    }
     added_watcher.broadcast(crate::manifest::ManifestDiff::Added {
         uid: session_uid.clone(),
         entry: added_entry,
@@ -1223,7 +1301,24 @@ pub(crate) fn start_session_with_spawn_fn(
 /// `session.rs::arm_reaper`), so `build_last_exit` reads a
 /// populated kernel slot.
 pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
-    let exited_at = now_unix_f64();
+    // Holder-split provenance (DESIGN_HOLDER_BRAIN_SPLIT § Exit
+    // provenance): in holder mode the exit observer stashed the
+    // HOLDER's authoritative info — `waitid`-time timestamp and the
+    // attribution echo — before invoking us. Prefer its clock over
+    // ours (fidelity across brain downtime), and fold the echo into
+    // the killed_by merge below (the echo survives brain death; the
+    // design's closure of the re-exec audit's gap 5). `None` on
+    // every monolith-mode session.
+    let holder_exit: Option<crate::session::HolderExit> = state.sessions.get(uid).and_then(|s| {
+        s.holder_exit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    });
+    let exited_at = holder_exit
+        .as_ref()
+        .map(|h| h.exited_at)
+        .unwrap_or_else(now_unix_f64);
     // Capture a read-after-exit tombstone BEFORE the session is removed from
     // the registry, so `resolve_authorized_session` / `list_sessions` can still
     // serve its transcript + final state for a window (the MCP read-after-exit
@@ -1260,14 +1355,20 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
         // `operator_kill_requested` is the broader signal: it is also set by
         // kill paths that don't route through `kill_session`, which may record
         // no attribution. So `killed` can be true with `killed_by` unknown.
+        let holder_echo = holder_exit.as_ref().and_then(|h| h.attribution.as_ref());
         let killed = kill_request.is_some()
+            || holder_echo.is_some()
             || memory_cap_kill
             || sess.last_exit.operator_kill_requested();
-        // Explicit request wins the attribution: an operator A-w on a session
-        // that was ALSO breaching its cap is still an operator kill.
+        // Attribution merge order (O4): explicit request wins (an
+        // operator A-w on a session that was ALSO breaching its cap
+        // is still an operator kill) → the holder's echo (survives a
+        // brain that died between `kill_session` and this exit) →
+        // memory-cap classification.
         let killed_by = kill_request
             .as_ref()
             .map(|k| k.killed_by.clone())
+            .or_else(|| holder_echo.map(|a| a.who.clone()))
             .or_else(|| memory_cap_kill.then(|| MEMORY_CAP_KILLER.to_string()));
         let report = sess.reported_done();
         crate::state::ExitedTombstone {
@@ -1873,9 +1974,16 @@ pub fn kill_session(
         // so a transient `protected`/`no_pids` record past baseline
         // doesn't render as a cap kill on a user-initiated A-w.
         session.last_exit.mark_operator_kill_requested();
-        // SIGKILL via pidfd. Errors are best-effort: ESRCH means the
-        // child already exited (race with the watcher / natural
-        // exit) — reaper will still see the exit and fire on_exit.
+        // Holder-split (O4 routing rule): stamp WHO for the verb-
+        // routed kill, so the holder's attribution echo carries it
+        // even if this brain dies before the exit event lands. A
+        // no-op for monolith sessions (attribution rides
+        // record_kill_request below, as always).
+        session.set_kill_attribution(caller_uid.unwrap_or(OPERATOR_KILLER));
+        // SIGKILL via pidfd (monolith) or the holder `signal` verb
+        // (split). Errors are best-effort: ESRCH / already_exited
+        // means the child already exited (race with the watcher /
+        // natural exit) — the exit pipeline still fires on_exit.
         let _ = session.kill();
     }
     // UX item 3b: stamp WHO asked, for `handle_session_exit` to fold into the
@@ -3460,8 +3568,18 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         .values()
         .filter(|s| s.semantic_idle() == Some(false))
         .count();
+    // DESIGN_HOLDER_BRAIN_SPLIT phase 3 (C14): the minimal split
+    // health surface the cm-redeploy transition guard probes —
+    // shipped WITH the guard, not after it. The full surface
+    // (breaker state, pending events, epoch) is phase 4.
+    let (split, holder_build_id) = match crate::holder_mode::global() {
+        Some(client) => (true, Some(client.holder_build_id.clone())),
+        None => (false, None),
+    };
     Ok(json!({
         "ok": true,
+        "split": split,
+        "holder_build_id": holder_build_id,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
         "sessions": total,
@@ -9669,6 +9787,16 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
         st.daemon_sessions_path.clone().unwrap_or_default()
     };
 
+    // Holder-split: skip sessions the registry already holds — the
+    // adopt-at-boot path inserted them live (respawning a `--resume`
+    // duplicate of a living child is the R13 split-brain class).
+    // Harmless in monolith mode, where the registry is empty at
+    // restore time.
+    let live_uids: std::collections::HashSet<String> = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.sessions.keys().cloned().collect()
+    };
+
     // Collect (workspace_id, worktree, entry) for every in-scope session.
     let mut targets: Vec<(String, std::path::PathBuf, crate::manifest::ManifestEntry)> =
         Vec::new();
@@ -9684,6 +9812,9 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
             continue;
         };
         for e in ws.sessions.iter().filter(|e| restore_in_scope(e)) {
+            if live_uids.contains(&e.uid) {
+                continue; // adopted live via the holder — never respawn
+            }
             // S5: a continuous session is restored only if (a) its task is a
             // supervised-persistent one AND (b) it has a transcript to RESUME.
             // Without a transcript_id a fresh restore would spawn the
@@ -15046,6 +15177,9 @@ fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, kille
     for uid in targets {
         if let Some(sess) = state.sessions.get_mut(&uid) {
             sess.last_exit.mark_operator_kill_requested();
+            // O4 routing: the verb-routed kill carries the sweep's
+            // attribution through the holder echo (no-op monolith).
+            sess.set_kill_attribution(&killer);
             let _ = sess.kill();
         }
         state.record_kill_request(&uid, &killer, swept_at);

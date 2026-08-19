@@ -60,6 +60,7 @@ pub mod config;
 pub mod env_sanitize;
 pub mod continuous;
 pub mod control;
+pub mod holder_mode;
 pub mod host_id;
 pub mod manifest;
 pub mod mcp_config;
@@ -351,6 +352,18 @@ pub fn run() -> anyhow::Result<()> {
         );
     }
 
+    // DESIGN_HOLDER_BRAIN_SPLIT phase 3: holder-mode detection. The
+    // inherited channel fd IS the mode — when present, this call
+    // couples our life to the holder's (PR_SET_PDEATHSIG + channel-
+    // EOF-fatal, C5), performs the hello handshake, and sets the
+    // process-global HolderClient every spawn/kill/exit path routes
+    // through. Runs before ANYTHING can spawn or bind. Adopt-at-boot
+    // happens later (after state exists), deliberately BEFORE the
+    // MCP preflight (O16: kernel PTY buffers are ~64 KiB; adopted
+    // sessions' readers must precede the seconds-long python
+    // subprocess).
+    let holder_active = holder_mode::init_from_env();
+
     // DESIGN_SEAMLESS_RESTART phases 3b + 4a (R13, R5): re-exec
     // handoff detection. Runs HERE — during single-threaded startup,
     // right after the identity scrub, BEFORE `bind_socket` (normal
@@ -588,19 +601,25 @@ pub fn run() -> anyhow::Result<()> {
     // The result is also RETAINED on the state so it can be asked for over
     // the socket (operator `ping`) instead of having to be found by grepping
     // a log — that is what makes a redeploy verifiable.
-    match mcp_config::run_mcp_preflight(server_override) {
-        Ok(summary) => {
-            eprintln!("cm-daemon: MCP preflight OK: {}", summary);
-            initial_state.mcp_preflight = Some(Ok(summary));
-        }
-        Err(msg) => {
-            eprintln!(
-                "cm-daemon: \u{26a0}\u{fe0f}  MCP PREFLIGHT FAILED — every session spawned by \
-                 this daemon will have a dead MCP server AND a dead cm Stop hook, so sessions \
-                 will run but never appear ready in the TUI.\n{}",
-                msg
-            );
-            initial_state.mcp_preflight = Some(Err(msg));
+    // Holder mode defers the preflight until AFTER adopt-at-boot
+    // (O16 — readers before the seconds-long python subprocess); the
+    // deferred run below stores the result through the state Arc.
+    let server_override_owned: Option<String> = server_override.map(|s| s.to_string());
+    if !holder_active {
+        match mcp_config::run_mcp_preflight(server_override) {
+            Ok(summary) => {
+                eprintln!("cm-daemon: MCP preflight OK: {}", summary);
+                initial_state.mcp_preflight = Some(Ok(summary));
+            }
+            Err(msg) => {
+                eprintln!(
+                    "cm-daemon: \u{26a0}\u{fe0f}  MCP PREFLIGHT FAILED — every session spawned by \
+                     this daemon will have a dead MCP server AND a dead cm Stop hook, so sessions \
+                     will run but never appear ready in the TUI.\n{}",
+                    msg
+                );
+                initial_state.mcp_preflight = Some(Err(msg));
+            }
         }
     }
     // The path the TUI dials for a dedicated attach connection.
@@ -826,6 +845,37 @@ pub fn run() -> anyhow::Result<()> {
     //
     // The `None` arm is the design's *Fresh* outcome (no/invalid
     // manifest): today's fresh boot.
+    if holder_active {
+        // DESIGN_HOLDER_BRAIN_SPLIT phase 3, the mandated boot order
+        // (O16): adopt (readers start per record as it lands) → arm →
+        // THEN the slow MCP preflight → legacy restore for persisted
+        // sessions the holder does NOT hold (fresh holder boot after a
+        // reboot: restore spawns them THROUGH the holder via the spawn
+        // seam; adopted uids are registry-skipped).
+        if let Some(client) = holder_mode::global() {
+            holder_mode::adopt_at_boot(&state, client);
+        }
+        let preflight = mcp_config::run_mcp_preflight(server_override_owned.as_deref());
+        {
+            let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+            match preflight {
+                Ok(summary) => {
+                    eprintln!("cm-daemon: MCP preflight OK: {}", summary);
+                    st.mcp_preflight = Some(Ok(summary));
+                }
+                Err(msg) => {
+                    eprintln!(
+                        "cm-daemon: \u{26a0}\u{fe0f}  MCP PREFLIGHT FAILED — every session \
+                         spawned by this daemon will have a dead MCP server AND a dead cm \
+                         Stop hook.\n{}",
+                        msg
+                    );
+                    st.mcp_preflight = Some(Err(msg));
+                }
+            }
+        }
+        control::methods::restore_sessions(&state);
+    } else {
     match reexec_handoff {
         Some(escrow) => {
             match reexec::complete_handoff(&state, escrow, reexec_enabled) {
@@ -869,6 +919,7 @@ pub fn run() -> anyhow::Result<()> {
         }
         None => control::methods::restore_sessions(&state),
     }
+    } // !holder_active
 
     // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver
     // since Phase 4 (the TUI is a pure observer). It fires transitions,

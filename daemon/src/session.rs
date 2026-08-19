@@ -1177,6 +1177,27 @@ pub struct DaemonSession {
     /// (both stashed together by `start_session` / the rehydrate
     /// commit). Leaf mutex — see `session_watch::WatcherLiveState`.
     pub watcher_state: Option<crate::session_watch::SharedWatcherState>,
+    /// Holder-split kill routing (DESIGN_HOLDER_BRAIN_SPLIT § Kill
+    /// authority, S2/O4). `Some` on a HOLDER-OWNED session: `kill()`
+    /// routes SIGKILL through the holder's `signal` verb (with the
+    /// attribution from [`Self::set_kill_attribution`]) so the
+    /// attribution echo survives brain death, and **`Drop` signals
+    /// nothing** — a crashing/unwinding brain must never SIGKILL the
+    /// children the split exists to protect. `None` on monolith-mode
+    /// sessions (today's pidfd semantics, unchanged).
+    holder_kill: Option<HolderKillFn>,
+    /// The `killed_by` who-or-what the next `kill()` should carry
+    /// through the holder `signal` verb — set by the attributed kill
+    /// paths (`kill_session`, the `mark_subtask_done` sweep,
+    /// drain/shutdown) right where they record `killed_by` today.
+    kill_attribution: Arc<Mutex<Option<String>>>,
+    /// The holder's authoritative exit info (exited_at on the
+    /// HOLDER's clock, the attribution echo, the `memory.events`
+    /// snapshot), stashed by the exit observer BEFORE `on_exit` runs
+    /// so `handle_session_exit` can fold it into the tombstone
+    /// (DESIGN_HOLDER_BRAIN_SPLIT § Exit provenance). Always `None`
+    /// for monolith-mode sessions.
+    pub holder_exit: Arc<Mutex<Option<HolderExit>>>,
 }
 
 /// Extract the transcript-file UUID (the resume key) from a stored
@@ -1895,6 +1916,10 @@ impl PendingSession {
             // watcher's lifetime decisions are made.
             watcher_handle: None,
             watcher_state: None,
+            // Monolith spawn path: pidfd kill semantics, no holder.
+            holder_kill: None,
+            kill_attribution: Arc::new(Mutex::new(None)),
+            holder_exit: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -2031,6 +2056,105 @@ fn gated_reaper_body(
     drop(_child);
     // `_reap_permit` drops here — consumption and its persistence
     // were one indivisible unit under the gate (R4).
+}
+
+/// The holder's attribution echo — who asked for the last signal,
+/// as recorded by the HOLDER at `signal`-verb time, so kill
+/// attribution survives brain death (DESIGN_HOLDER_BRAIN_SPLIT
+/// § Exit provenance, the design's closure of the re-exec audit's
+/// gap 5).
+#[derive(Debug, Clone)]
+pub struct HolderAttribution {
+    pub sig: i32,
+    pub who: String,
+    /// Unix seconds, holder clock.
+    pub at: f64,
+}
+
+/// One authoritative exit as delivered by the holder's
+/// `exit_event`: the `waitid` status the brain can no longer
+/// consume itself (parent-only), stamped on the HOLDER's clock.
+#[derive(Debug, Clone)]
+pub struct HolderExit {
+    pub status: DaemonExitStatus,
+    /// Unix seconds at `waitid` time — used for the tombstone's
+    /// `exited_at` (fidelity across brain downtime).
+    pub exited_at: f64,
+    pub attribution: Option<HolderAttribution>,
+    /// Best-effort `memory.events` snapshot (the S6 carve-out).
+    pub memory_events: Option<String>,
+}
+
+/// Kill router for a holder-owned session: `(sig, killed_by)` →
+/// the holder `signal` verb. Boxed so `session.rs` needs no
+/// dependency on the holder client's types.
+pub type HolderKillFn = Box<dyn Fn(i32, &str) -> std::io::Result<()> + Send + Sync>;
+
+/// Where a session's authoritative exit comes from — the split's
+/// central seam (DESIGN_HOLDER_BRAIN_SPLIT § Spawn path).
+pub enum ExitAuthority {
+    /// This process is the child's parent: pidfd-poll + gated
+    /// `waitid` (the monolith reaper, unchanged).
+    Reap,
+    /// Holder mode: the status arrives on `events` from the
+    /// HolderClient's dispatcher (`waitid` here would `ECHILD` — we
+    /// are not the parent). `settle` runs AFTER `on_exit` returned
+    /// (i.e. after `handle_session_exit` persisted the tombstone):
+    /// it acks + forgets holder-side, the C4 durable-commit order.
+    /// `kill` is the session's verb-routed kill (S2: brain-side
+    /// objects never signal a session pidfd directly).
+    Holder {
+        events: mpsc::Receiver<HolderExit>,
+        settle: Box<dyn FnOnce() + Send>,
+        kill: HolderKillFn,
+    },
+}
+
+/// The holder-mode replacement for [`gated_reaper_body`]: block on
+/// the HolderClient's per-session exit channel, then run the same
+/// downstream sequence the reaper runs — stash provenance, cache the
+/// kernel status, wake `try_wait`, fire `on_exit` — plus the
+/// post-persist `settle` (ack_exit + forget). No reap-gate permit:
+/// nothing here consumes a `waitid` (the holder did, under its own
+/// arm authorization), and redelivery-until-ack replaces the gate's
+/// loss-prevention role for brain restarts.
+fn holder_exit_observer_body(
+    events: mpsc::Receiver<HolderExit>,
+    exit_tx: mpsc::Sender<DaemonExitStatus>,
+    last_exit: SharedLastExit,
+    holder_exit_cell: Arc<Mutex<Option<HolderExit>>>,
+    on_exit: Option<OnExitCallback>,
+    settle: Box<dyn FnOnce() + Send>,
+) {
+    match events.recv() {
+        Ok(exit) => {
+            let status = exit.status.clone();
+            // Provenance FIRST, so `handle_session_exit` (invoked
+            // from on_exit below) sees the holder's exited_at /
+            // attribution when it builds the tombstone.
+            *holder_exit_cell
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(exit);
+            last_exit.set_kernel(KernelExitStatus {
+                code: status.code,
+                signal: status.signal,
+            });
+            let _ = exit_tx.send(status.clone());
+            if let Some(cb) = on_exit {
+                cb(&status);
+            }
+            // C4: the ack (inside `settle`) happens only after the
+            // tombstone write above persisted; a crash before this
+            // line leaves the event unacked and the holder
+            // redelivers to the next brain generation.
+            settle();
+        }
+        Err(_) => {
+            // Channel dropped: the HolderClient is gone (brain
+            // shutting down). Nothing to observe — the holder keeps
+            // the authoritative state for the next generation.
+        }
+    }
 }
 
 /// The full session record for [`DaemonSession::build_adopted`] —
@@ -2183,6 +2307,7 @@ impl AdoptedSessionBuild {
     pub fn arm(
         self,
         on_exit: Option<OnExitCallback>,
+        authority: ExitAuthority,
     ) -> anyhow::Result<DaemonSession> {
         let AdoptedSessionBuild {
             uid,
@@ -2217,21 +2342,55 @@ impl AdoptedSessionBuild {
             })?;
 
         let last_exit_for_reaper = last_exit.clone();
-        let reaper_handle = std::thread::Builder::new()
-            .name(format!("cm-session-{}-reaper", uid))
-            .spawn(move || {
-                gated_reaper_body(
-                    None,
-                    reaper_pidfd,
-                    pid,
-                    exit_tx,
-                    last_exit_for_reaper,
-                    on_exit,
-                )
-            })
-            .map_err(|e| {
-                anyhow::anyhow!("adopt {}: spawn reaper thread: {}", uid, e)
-            })?;
+        let holder_exit_cell: Arc<Mutex<Option<HolderExit>>> = Arc::new(Mutex::new(None));
+        let (reaper_handle, holder_kill) = match authority {
+            ExitAuthority::Reap => {
+                let handle = std::thread::Builder::new()
+                    .name(format!("cm-session-{}-reaper", uid))
+                    .spawn(move || {
+                        gated_reaper_body(
+                            None,
+                            reaper_pidfd,
+                            pid,
+                            exit_tx,
+                            last_exit_for_reaper,
+                            on_exit,
+                        )
+                    })
+                    .map_err(|e| {
+                        anyhow::anyhow!("adopt {}: spawn reaper thread: {}", uid, e)
+                    })?;
+                (handle, None)
+            }
+            ExitAuthority::Holder {
+                events,
+                settle,
+                kill,
+            } => {
+                // Holder mode: no waitid here (parent-only —
+                // `reaper_pidfd` is observation-only and its dup
+                // simply drops); the authoritative status arrives on
+                // `events`.
+                drop(reaper_pidfd);
+                let cell = Arc::clone(&holder_exit_cell);
+                let handle = std::thread::Builder::new()
+                    .name(format!("cm-session-{}-exit-observer", uid))
+                    .spawn(move || {
+                        holder_exit_observer_body(
+                            events,
+                            exit_tx,
+                            last_exit_for_reaper,
+                            cell,
+                            on_exit,
+                            settle,
+                        )
+                    })
+                    .map_err(|e| {
+                        anyhow::anyhow!("adopt {}: spawn exit observer: {}", uid, e)
+                    })?;
+                (handle, Some(kill))
+            }
+        };
 
         Ok(DaemonSession {
             title: meta.title,
@@ -2280,6 +2439,9 @@ impl AdoptedSessionBuild {
             // stash; `arm` itself stays watcher-agnostic.
             watcher_handle: None,
             watcher_state: None,
+            holder_kill,
+            kill_attribution: Arc::new(Mutex::new(None)),
+            holder_exit: holder_exit_cell,
             uid,
         })
     }
@@ -2784,7 +2946,36 @@ impl DaemonSession {
     /// outcome — "the child is no longer running" — is achieved
     /// either way).
     pub fn kill(&mut self) -> std::io::Result<()> {
+        // Holder mode (DESIGN_HOLDER_BRAIN_SPLIT § Kill authority,
+        // S2/O4): route through the holder's `signal` verb — the
+        // ONLY brain-side session kill channel — carrying whatever
+        // attribution the caller stamped, so the echo survives brain
+        // death. Fallback attribution "daemon" for unattributed
+        // deliberate teardowns (workflow respawns, revive).
+        if let Some(route) = &self.holder_kill {
+            let who = self
+                .kill_attribution
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .unwrap_or_else(|| "daemon".to_string());
+            return route(libc::SIGKILL, &who);
+        }
         send_sigkill_via_pidfd(&self.pidfd)
+    }
+
+    /// Stamp the `killed_by` who-or-what the next [`Self::kill`]
+    /// should carry through the holder `signal` verb (the O4
+    /// routing rule). Attributed kill paths call this exactly where
+    /// they record `killed_by` today; a no-op observable only in
+    /// holder mode (monolith kills stay pidfd-direct and the
+    /// attribution rides `DaemonState::record_kill_request` as
+    /// always).
+    pub fn set_kill_attribution(&self, who: &str) {
+        *self
+            .kill_attribution
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(who.to_string());
     }
 
     /// Non-blocking exit check. Returns `Some(DaemonExitStatus)`
@@ -3190,6 +3381,14 @@ impl Drop for DaemonSession {
     /// Both happen shortly after the kill — within milliseconds
     /// for the kernel-level paths.
     fn drop(&mut self) {
+        // Holder-owned sessions have NO kill-on-drop (S2): a brain
+        // that adopts the fleet and then fails during its own
+        // startup — or unwinds anywhere — must close fds and nothing
+        // more; the children live on in the holder. Deliberate kills
+        // are verb-only, via explicit `kill()` calls.
+        if self.holder_kill.is_some() {
+            return;
+        }
         let _ = self.kill();
     }
 }

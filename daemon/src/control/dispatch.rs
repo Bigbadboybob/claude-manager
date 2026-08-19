@@ -481,7 +481,25 @@ pub fn dispatch_request(
         // (fire-and-verify — the caller polls daemon.health for
         // build_id / reexec_generation).
         "daemon.restart" => {
-            DispatchOutcome::Done(dispatch_daemon_restart(state, req))
+            // Holder-split (phase 3): the in-place re-exec is a
+            // MONOLITH primitive — in split mode the brain's fds are
+            // dups, its exit pipeline lives in the HolderClient (not
+            // the manifest), and the correct brain-deploy verb is
+            // phase 6's `restart_brain`. Refuse rather than half-
+            // rehydrate.
+            if crate::holder_mode::global().is_some() {
+                DispatchOutcome::Done(Response::err(
+                    req.id.clone(),
+                    ErrorCode::Conflict,
+                    "daemon.restart is a monolith primitive; this daemon runs in \
+                     holder/brain split mode — brain deploys use the holder's \
+                     restart_brain path (DESIGN_HOLDER_BRAIN_SPLIT phase 6, not \
+                     yet implemented)"
+                        .to_string(),
+                ))
+            } else {
+                DispatchOutcome::Done(dispatch_daemon_restart(state, req))
+            }
         }
         // DESIGN_SEAMLESS_RESTART phase 3b: dev-gated re-exec handoff
         // skeleton. Answers unknown-method unless the daemon started

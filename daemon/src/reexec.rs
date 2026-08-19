@@ -2850,7 +2850,7 @@ fn rehydrate_transaction(
                 .unwrap_or_else(|p| p.into_inner());
             crate::control::methods::handle_session_exit(&mut s, &uid_for_cleanup);
         });
-        match build.arm(Some(on_exit)) {
+        match build.arm(Some(on_exit), crate::session::ExitAuthority::Reap) {
             Ok(mut sess) => {
                 // Phase 4d (R12): re-arm the memory-cap watcher for a
                 // capped record, seeded from the checkpoint (never
