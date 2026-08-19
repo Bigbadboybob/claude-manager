@@ -184,6 +184,289 @@ fn locate_cm_holder() -> PathBuf {
     holder_bin
 }
 
+/// A launched split sandbox for the focused tests below (the main
+/// crash test keeps its inline setup + stronger assertions).
+struct Sandbox {
+    guard: SandboxGuard,
+    socket: PathBuf,
+    token: String,
+    holder_pid: i32,
+    home: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn launch_sandbox(tag: &str) -> Sandbox {
+    let daemon_bin = env!("CARGO_BIN_EXE_cm-daemon");
+    let holder_bin = locate_cm_holder();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("mk sandbox HOME");
+    let socket = dir.path().join("daemon.sock");
+    let log_path = dir.path().join("split.log");
+    let token = format!("holder-e2e-{tag}-{}", std::process::id());
+    let log_file = std::fs::File::create(&log_path).expect("create log");
+    let log_for_stderr = log_file.try_clone().expect("clone log handle");
+    let holder = Command::new(&holder_bin)
+        .arg("--brain")
+        .arg(daemon_bin)
+        .env_clear()
+        .env("HOME", &home)
+        .env("CM_DAEMON_SOCKET", &socket)
+        .env("CM_OPERATOR_TOKEN", &token)
+        // The S1 canary: present in the HOLDER's environ (and thus
+        // the brain's), and must never reach a session child.
+        .env("CLAUDE_CODE_SESSION_ID", "64b95f94-e2e-leak-canary")
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        )
+        .current_dir(&home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_for_stderr))
+        .spawn()
+        .expect("spawn sandbox cm-holder");
+    let holder_pid = holder.id() as i32;
+    let guard = SandboxGuard {
+        holder,
+        bash: Vec::new(),
+        log_path,
+    };
+    let sb = Sandbox {
+        guard,
+        socket,
+        token,
+        holder_pid,
+        home,
+        _dir: dir,
+    };
+    wait_for(
+        Instant::now() + Duration::from_secs(45),
+        "daemon.health at sandbox launch",
+        &sb.guard,
+        || {
+            round_trip(
+                &sb.socket,
+                &operator_request(&sb.token, "daemon.health", serde_json::json!({})),
+            )
+            .ok()
+            .filter(|r| r.ok)
+        },
+    );
+    sb
+}
+
+impl Sandbox {
+    fn op(&self, method: &str, params: serde_json::Value) -> Response {
+        round_trip(&self.socket, &operator_request(&self.token, method, params))
+            .expect("operator round trip")
+    }
+
+    fn spawn_bash(&mut self, uid: &str) -> i32 {
+        let start = self.op(
+            "start_session",
+            serde_json::json!({
+                "uid": uid,
+                "workspace_id": "ws-holder-e2e",
+                "worktree_path": self.home.to_string_lossy(),
+                "label": uid,
+                "argv": ["bash", "--norc"],
+                "working_dir": self.home.to_string_lossy(),
+                "session_type": "bash",
+                "cols": 120,
+                "rows": 40,
+                "env": {}
+            }),
+        );
+        assert!(
+            start.ok,
+            "spawn failed: {:?}\n{}",
+            start.error,
+            self.guard.log_tail()
+        );
+        let pid = find_child_by_comm(
+            self.holder_pid,
+            "bash",
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("bash parented to the holder");
+        let started = proc_starttime(pid).expect("starttime");
+        self.guard.bash.push((pid, started));
+        pid
+    }
+
+    fn brain_pid(&self) -> i32 {
+        find_child_by_comm(
+            self.holder_pid,
+            "cm-daemon",
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("brain pid")
+    }
+
+    fn sessions(&self) -> Option<u64> {
+        let r = round_trip(
+            &self.socket,
+            &operator_request(&self.token, "daemon.health", serde_json::json!({})),
+        )
+        .ok()
+        .filter(|r| r.ok)?;
+        r.result?.get("sessions").and_then(|v| v.as_u64())
+    }
+}
+
+/// The S4 seam through the FULL stack: a child that dies instantly
+/// still produces a clean tombstone and never a stuck registry row.
+#[test]
+fn fast_exit_session_tombstones_cleanly() {
+    let sb = launch_sandbox("fastexit");
+    let start = sb.op(
+        "start_session",
+        serde_json::json!({
+            "uid": "ts-fa57-1",
+            "workspace_id": "ws-holder-e2e",
+            "worktree_path": sb.home.to_string_lossy(),
+            "label": "fast-exit",
+            "argv": ["/bin/false"],
+            "working_dir": sb.home.to_string_lossy(),
+            "session_type": "bash",
+            "cols": 80,
+            "rows": 24,
+            "env": {}
+        }),
+    );
+    assert!(start.ok, "{:?}\n{}", start.error, sb.guard.log_tail());
+    wait_for(
+        Instant::now() + Duration::from_secs(20),
+        "fast-exit session to tombstone (sessions == 0)",
+        &sb.guard,
+        || (sb.sessions() == Some(0)).then_some(()),
+    );
+    // The C4 pre-ack gate wrote the tombstone sidecar before acking.
+    let tombs = std::fs::read_to_string(sb.home.join(".cm/daemon-tombstones.json"))
+        .expect("tombstone sidecar written");
+    assert!(tombs.contains("ts-fa57-1"), "{tombs}");
+}
+
+/// The gap-5 closure, live: kill_session then SIGKILL the brain
+/// immediately. Whether brain #1 processed the exit or brain #2 got
+/// the redelivered event with the holder's attribution echo, the
+/// durable tombstone must say killed_by "operator".
+#[test]
+fn kill_attribution_survives_a_brain_crash() {
+    let mut sb = launch_sandbox("attrib");
+    let uid = "ts-a77b-1";
+    sb.spawn_bash(uid);
+    let kill = sb.op("kill_session", serde_json::json!({ "session_uid": uid }));
+    assert!(kill.ok, "{:?}", kill.error);
+    // The crash-class event, racing the exit pipeline on purpose.
+    let brain1 = sb.brain_pid();
+    // SAFETY: our sandbox holder's child.
+    unsafe {
+        libc::kill(brain1, libc::SIGKILL);
+    }
+    let tomb_path = sb.home.join(".cm/daemon-tombstones.json");
+    wait_for(
+        Instant::now() + Duration::from_secs(45),
+        "operator-attributed tombstone after the brain crash",
+        &sb.guard,
+        || {
+            let t = std::fs::read_to_string(&tomb_path).ok()?;
+            (t.contains(uid) && t.contains("\"killed_by\": \"operator\""))
+                .then_some(())
+        },
+    );
+    wait_for(
+        Instant::now() + Duration::from_secs(20),
+        "registry to settle at 0",
+        &sb.guard,
+        || (sb.sessions() == Some(0)).then_some(()),
+    );
+}
+
+/// R11 live: a worker's report_done marker survives a brain crash —
+/// an until="final" watcher must never see a regression to
+/// awaiting_input because the brain restarted.
+#[test]
+fn report_done_survives_a_brain_crash() {
+    let mut sb = launch_sandbox("r11");
+    let uid = "ts-d02e-1";
+    sb.spawn_bash(uid);
+    // The session itself reports done (session-caller RPC).
+    let resp = round_trip(
+        &sb.socket,
+        &Request {
+            id: "r11-report".into(),
+            caller: Caller::session(uid),
+            method: "report_done".into(),
+            params: serde_json::json!({ "reason": "phase-5 e2e proof" }),
+        },
+    )
+    .expect("report_done round trip");
+    assert!(resp.ok, "{:?}", resp.error);
+    // The marker is durable (the phase-4 persist hook).
+    let reg_path = sb.home.join(".cm/daemon-sessions.json");
+    wait_for(
+        Instant::now() + Duration::from_secs(10),
+        "reported_done_at persisted",
+        &sb.guard,
+        || {
+            std::fs::read_to_string(&reg_path)
+                .ok()
+                .filter(|s| s.contains("reported_done_at") && s.contains("phase-5 e2e proof"))
+                .map(|_| ())
+        },
+    );
+    // Crash the brain; the next generation adopts.
+    let brain1 = sb.brain_pid();
+    // SAFETY: our sandbox holder's child.
+    unsafe {
+        libc::kill(brain1, libc::SIGKILL);
+    }
+    wait_for(
+        Instant::now() + Duration::from_secs(45),
+        "brain #2 with the session adopted",
+        &sb.guard,
+        || (sb.sessions() == Some(1)).then_some(()),
+    );
+    // The adopted session still reports done (session-caller view).
+    let resp = round_trip(
+        &sb.socket,
+        &Request {
+            id: "r11-list".into(),
+            caller: Caller::session(uid),
+            method: "list_sessions".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .expect("list_sessions round trip");
+    assert!(resp.ok, "{:?}", resp.error);
+    let rows = resp
+        .result
+        .as_ref()
+        .and_then(|r| r.get("result"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_else(|| {
+            resp.result
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        });
+    let me = rows
+        .iter()
+        .find(|r| r.get("session_uid").and_then(|v| v.as_str()) == Some(uid))
+        .unwrap_or_else(|| panic!("self row missing: {rows:?}"));
+    assert_eq!(
+        me.get("reported_done"),
+        Some(&serde_json::json!(true)),
+        "R11 regression: the adopted session lost its report_done marker: {me}"
+    );
+    let kill = sb.op("kill_session", serde_json::json!({ "session_uid": uid }));
+    assert!(kill.ok);
+}
+
 #[test]
 fn brain_crash_kills_no_session_end_to_end() {
     let daemon_bin = env!("CARGO_BIN_EXE_cm-daemon");
@@ -211,6 +494,8 @@ fn brain_crash_kills_no_session_end_to_end() {
         .env("HOME", &home)
         .env("CM_DAEMON_SOCKET", &socket)
         .env("CM_OPERATOR_TOKEN", &token)
+        // The S1 canary for the spawn-parity assertions below.
+        .env("CLAUDE_CODE_SESSION_ID", "64b95f94-e2e-leak-canary")
         .env(
             "PATH",
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
@@ -336,6 +621,64 @@ fn brain_crash_kills_no_session_end_to_end() {
     .expect("bash child parented to the holder");
     let bash_start = proc_starttime(bash_pid).expect("bash starttime");
     guard.bash.push((bash_pid, bash_start));
+
+    // (3b) Spawn parity (§ The holder, "Spawn parity" + § Environment,
+    // S1): the child's cwd is the requested working_dir; its environ
+    // is the composed SPEC — the brain's SANITIZED environ as the
+    // base (so PATH rides through), which means the scrubbed classes
+    // must be absent: the Claude-identity canary set on the HOLDER
+    // (env_sanitize runs brain-side each generation — the 2026-08-18
+    // leak class stays closed across the holder hop), the channel-fd
+    // pointer, and the operator token. And the requested winsize took
+    // (the PTY was opened at 120x40 — `stty size` reports rows cols).
+    let child_cwd = std::fs::read_link(format!("/proc/{bash_pid}/cwd")).expect("child cwd");
+    assert_eq!(
+        child_cwd.canonicalize().ok(),
+        home.canonicalize().ok(),
+        "child cwd is the requested working_dir"
+    );
+    let environ = std::fs::read(format!("/proc/{bash_pid}/environ")).expect("child environ");
+    let environ = String::from_utf8_lossy(&environ).replace('\0', "\n");
+    assert!(
+        !environ.contains("CLAUDE_CODE_SESSION_ID"),
+        "Claude-identity var leaked into a session across the holder hop: {environ}"
+    );
+    assert!(
+        !environ.contains("CM_HOLDER_CHANNEL_FD"),
+        "channel-fd pointer leaked into a session: {environ}"
+    );
+    assert!(
+        !environ.lines().any(|l| l.starts_with("CM_OPERATOR_TOKEN=") && l.len() > "CM_OPERATOR_TOKEN=".len()),
+        "operator token leaked into a session: {environ}"
+    );
+    assert!(environ.contains("PATH="), "spec env applied: {environ}");
+    let send = round_trip(
+        &socket,
+        &operator_request(
+            &token,
+            "send_input",
+            serde_json::json!({ "session_uid": uid, "text": "stty size", "submit": true }),
+        ),
+    )
+    .expect("send stty");
+    assert!(send.ok);
+    wait_for(
+        Instant::now() + Duration::from_secs(20),
+        "stty to report the requested 40x120 winsize",
+        &guard,
+        || {
+            let resp = round_trip(
+                &socket,
+                &operator_request(
+                    &token,
+                    "read_session_output",
+                    serde_json::json!({ "session_uid": uid }),
+                ),
+            )
+            .ok()?;
+            output_text(&resp).filter(|t| t.contains("40 120"))
+        },
+    );
 
     // (4) Pre-crash markers drain through brain #1's reader.
     let send = round_trip(

@@ -65,6 +65,19 @@ mod guard_tests {
         }
     }
 
+    /// The version-literal cross-check (§ Version-skew testing): a
+    /// PROTO_VERSION bump must be a DELIBERATE act accompanied by a
+    /// skew-matrix update — this pin fails on any bump until the
+    /// bumper (a) re-runs `scripts/holder-skew-matrix` against the
+    /// current baseline, (b) records the compat decision in
+    /// DESIGN_HOLDER_BRAIN_SPLIT.md's § Version-skew testing, and
+    /// (c) updates this literal. Never "fix the test" alone.
+    #[test]
+    fn proto_version_bump_requires_a_matrix_update() {
+        assert_eq!(crate::channel::PROTO_VERSION_MIN, 1);
+        assert_eq!(crate::channel::PROTO_VERSION_MAX, 1);
+    }
+
     /// S10: every SCM_RIGHTS receive passes MSG_CMSG_CLOEXEC — a
     /// received fd must never be inheritable by a concurrently
     /// forked child. One recvmsg call site exists; it must carry the

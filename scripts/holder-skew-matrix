@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# holder-skew-matrix — the version-skew test matrix
+# (DESIGN_HOLDER_BRAIN_SPLIT § Version-skew testing, phase 5).
+#
+# The split's permanent tax is the holder⇄brain compat matrix; this
+# script pays it: it builds cm-holder + cm-daemon at a pinned
+# BASELINE ref and at HEAD, then runs the compat-floor scenario
+# (daemon/tests/holder_skew_e2e.rs) over each pairing:
+#
+#   1. new-brain  × old-holder   <- the steady state FOREVER (the
+#                                    brain deploys weekly, the holder
+#                                    near-never) — the load-bearing cell
+#   2. old-brain  × new-holder   <- the holder-upgrade path (also
+#                                    stands in for the doc's
+#                                    {holder@HEAD × previous-pin brain}
+#                                    cell until pins exist, phase 6)
+#   3. new-brain  × new-holder   <- control (HEAD e2e covers this too,
+#                                    with stronger assertions)
+#
+# BASELINE governance (the doc's rule): the pin advances ONLY with an
+# explicit deprecation note in DESIGN_HOLDER_BRAIN_SPLIT.md. Until a
+# holder ships to a real host, the pin is the first commit where a
+# holder and a brain could interoperate at all (phase 3).
+BASELINE_REF="${CM_SKEW_BASELINE:-924ff6a}"
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+REPO_ROOT="$(pwd)"
+
+step() { printf '\n=== %s ===\n' "$1"; }
+
+# Per-ref build cache OUTSIDE the shared workspace target dir, so
+# matrix runs don't thrash the daily build cache and re-runs are warm.
+CACHE_ROOT="${CM_SKEW_CACHE:-/tmp/cm-skew-cache}"
+mkdir -p "$CACHE_ROOT"
+
+build_ref() { # $1 = ref; echoes the bin dir
+    local ref="$1"
+    local sha
+    sha=$(git rev-parse --short "$ref")
+    local tree="$CACHE_ROOT/tree-$sha"
+    local target="$CACHE_ROOT/target-$sha"
+    if [ ! -d "$tree" ]; then
+        git worktree add --detach "$tree" "$sha" >/dev/null
+    fi
+    (cd "$tree" && CARGO_TARGET_DIR="$target" \
+        cargo build -q -p cm-holder -p cm-daemon --bins)
+    echo "$target/debug"
+}
+
+step "building HEAD binaries"
+cargo build -q -p cm-holder -p cm-daemon --bins
+HEAD_BINS="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug"
+[ -x "$HEAD_BINS/cm-holder" ] || { echo "HEAD cm-holder missing at $HEAD_BINS" >&2; exit 1; }
+
+step "building baseline binaries at $BASELINE_REF"
+BASE_BINS="$(build_ref "$BASELINE_REF")"
+
+run_cell() { # $1 = label, $2 = holder bin, $3 = brain bin
+    step "cell: $1"
+    CM_SKEW_HOLDER_BIN="$2" CM_SKEW_BRAIN_BIN="$3" \
+        cargo test -q -p cm-daemon --test holder_skew_e2e -- --nocapture \
+        || { echo "MATRIX CELL FAILED: $1" >&2; exit 1; }
+}
+
+run_cell "new-brain x old-holder (the steady state)" \
+    "$BASE_BINS/cm-holder" "$HEAD_BINS/cm-daemon"
+run_cell "old-brain x new-holder (the upgrade path)" \
+    "$HEAD_BINS/cm-holder" "$BASE_BINS/cm-daemon"
+run_cell "new x new (control)" \
+    "$HEAD_BINS/cm-holder" "$HEAD_BINS/cm-daemon"
+
+step "matrix green"
+echo "baseline: $BASELINE_REF ($(git rev-parse --short "$BASELINE_REF"))"
+echo "note: worktrees + per-ref targets cached under $CACHE_ROOT"

@@ -1000,3 +1000,130 @@ fn listener_custody_round_trips_across_generations() {
     drop(brain2);
     join2.join().unwrap();
 }
+
+#[test]
+fn unknown_fields_ride_every_verb_without_harm() {
+    // The skew suite's canary (§ Version-skew testing): every
+    // implemented verb, sent with an EXTRA envelope field and an
+    // EXTRA body field, behaves exactly as without them — the
+    // additive-only discipline that makes new-brain × old-holder
+    // the workable steady state.
+    fn send_canaried(
+        brain: &mut Brain,
+        verb: &str,
+        req_id: u64,
+        body: serde_json::Value,
+    ) {
+        let mut body = body;
+        body["skew_canary_body"] = serde_json::json!({"future": true});
+        let mut frame = serde_json::json!({
+            "v": verb,
+            "req_id": req_id,
+            "nfds": 0,
+            "body": body,
+            "skew_canary_envelope": 42,
+        });
+        // Belt and suspenders: also a nested unknown structure.
+        frame["skew_canary_deep"] = serde_json::json!([1, {"x": null}]);
+        let payload = serde_json::to_vec(&frame).unwrap();
+        let mut wire = Vec::with_capacity(4 + payload.len());
+        wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        wire.extend_from_slice(&payload);
+        // SAFETY: plain send on our end of the socketpair.
+        let n = unsafe {
+            libc::send(
+                brain.fd.as_raw_fd(),
+                wire.as_ptr() as *const _,
+                wire.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(n as usize, wire.len());
+    }
+
+    let (join, mut brain) = start(Holder::new(test_config()));
+    // hello with canaries.
+    send_canaried(
+        &mut brain,
+        verbs::HELLO,
+        501,
+        serde_json::json!({
+            "proto_min": ch::PROTO_VERSION_MIN,
+            "proto_max": ch::PROTO_VERSION_MAX,
+            "brain_build_id": "canary-brain",
+        }),
+    );
+    let (f, _) = brain.wait_reply(501);
+    assert_eq!(f.v, verbs::HELLO_REPLY, "{f:?}");
+
+    // spawn with canaries.
+    send_canaried(
+        &mut brain,
+        verbs::SPAWN,
+        502,
+        serde_json::to_value(spawn_body("s-canary", &["/bin/cat"])).unwrap(),
+    );
+    let (f, fds) = brain.wait_reply(502);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    assert_eq!(fds.len(), 2);
+    let ok: ch::SpawnOkBody = f.parse_body().unwrap();
+
+    // arm_reap, status, update_checkpoint, signal, ack, forget —
+    // all canaried.
+    send_canaried(
+        &mut brain,
+        verbs::ARM_REAP,
+        503,
+        serde_json::json!({"uid": "s-canary", "incarnation": ok.incarnation}),
+    );
+    let (f, _) = brain.wait_reply(503);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    send_canaried(&mut brain, verbs::STATUS, 504, serde_json::json!({}));
+    let (f, _) = brain.wait_reply(504);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    send_canaried(
+        &mut brain,
+        verbs::UPDATE_CHECKPOINT,
+        505,
+        serde_json::json!({
+            "uid": "s-canary",
+            "incarnation": ok.incarnation,
+            "watcher_checkpoint": {"v": 2},
+        }),
+    );
+    let (f, _) = brain.wait_reply(505);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    send_canaried(
+        &mut brain,
+        verbs::SIGNAL,
+        506,
+        serde_json::json!({
+            "uid": "s-canary",
+            "incarnation": ok.incarnation,
+            "sig": libc::SIGKILL,
+            "attribution": "canary",
+        }),
+    );
+    let (f, _) = brain.wait_reply(506);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    let ev = brain.wait_exit_event();
+    assert_eq!(ev.last_signal_request.unwrap().attribution, "canary");
+    send_canaried(
+        &mut brain,
+        verbs::ACK_EXIT,
+        507,
+        serde_json::json!({"uid": "s-canary", "incarnation": ok.incarnation}),
+    );
+    let (f, _) = brain.wait_reply(507);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    send_canaried(
+        &mut brain,
+        verbs::FORGET,
+        508,
+        serde_json::json!({"uid": "s-canary", "incarnation": ok.incarnation}),
+    );
+    let (f, _) = brain.wait_reply(508);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    drop(brain);
+    join.join().unwrap();
+}

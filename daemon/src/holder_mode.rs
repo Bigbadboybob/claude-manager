@@ -1397,6 +1397,42 @@ fn orphan_meta(uid: &str) -> AdoptedSessionMeta {
 mod tests {
     use super::*;
 
+    /// The S2/O4 source-scan guard: brain-side code outside
+    /// `session.rs` (the `kill()` primitive + the pre-arm spawn
+    /// cleanups), `session_watch.rs` (the watcher's own re-verified
+    /// victim kills, outside the holder verb set by design), and
+    /// `reexec.rs` (the monolith terminal fallback) must NEVER
+    /// signal a session pidfd directly — holder-owned children are
+    /// killed by VERB only, so the attribution echo can't be
+    /// silently bypassed by a future least-change edit.
+    #[test]
+    fn no_direct_session_pidfd_signaling_outside_the_allowlist() {
+        // Needles assembled at runtime so this test's own source
+        // can't self-match.
+        let needles = [
+            ["SYS_pidfd_", "send_signal"].concat(),
+            ["send_sigkill_", "via_pidfd("].concat(),
+        ];
+        for (name, src) in [
+            ("holder_mode.rs", include_str!("holder_mode.rs")),
+            ("control/methods.rs", include_str!("control/methods.rs")),
+            ("control/dispatch.rs", include_str!("control/dispatch.rs")),
+            ("control/stream.rs", include_str!("control/stream.rs")),
+        ] {
+            for needle in &needles {
+                let hits: Vec<&str> = src
+                    .lines()
+                    .filter(|l| l.contains(needle.as_str()) && !l.trim_start().starts_with("//"))
+                    .collect();
+                assert!(
+                    hits.is_empty(),
+                    "{name} signals a pidfd directly ({needle}): {hits:?} — \
+                     route the holder `signal` verb (S2/O4)"
+                );
+            }
+        }
+    }
+
     fn entry_with(
         reported_done_at: Option<f64>,
         report_reason: Option<String>,
