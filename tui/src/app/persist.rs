@@ -996,6 +996,9 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,

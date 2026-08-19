@@ -2273,6 +2273,9 @@ mod tests {
             start_test_daemon("ws-revive");
         let uid = test_uid();
         let entry = cm_daemon::manifest::ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             uid: uid.clone(),
             managed_by_uid: None,

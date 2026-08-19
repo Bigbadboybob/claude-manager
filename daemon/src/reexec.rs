@@ -2390,6 +2390,8 @@ fn respawn_adopted_watcher(
         crate::session_watch::default_watcher_spawn_fn(),
         Some(coordinator),
         restored_protected.clone(),
+        // Re-exec is a monolith-mode path: no holder to push to.
+        None,
     ) {
         Ok(w) => {
             eprintln!(
@@ -2466,6 +2468,10 @@ fn swap_exit_tombstone(
         killed_by: None,
         reported_done_at: report.map(|r| r.at_unix),
         report_reason: report.and_then(|r| r.reason.clone()),
+        // Monolith-mode swap tombstone: no holder incarnation, and the
+        // status was reconstructed (waitid at commit) — never lost.
+        incarnation: None,
+        status_lost: false,
     }
 }
 

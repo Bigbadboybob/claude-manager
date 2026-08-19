@@ -474,14 +474,26 @@ impl SpawnedChild {
     /// The lock-held arm: reaper thread (monolith) or exit observer
     /// wired to the holder subscription (split). Same discipline
     /// either way — call ONLY while holding the state lock, insert
-    /// before releasing.
+    /// before releasing. `pre_ack` is the split's C4 durable-commit
+    /// gate (tombstone-persist before the holder ack); ignored by
+    /// the in-process backend, whose exit pipeline has no ack.
     fn arm(
         self,
         on_exit: Option<crate::session::OnExitCallback>,
+        pre_ack: Option<crate::holder_mode::PreAckFn>,
     ) -> anyhow::Result<crate::session::DaemonSession> {
         match self {
             SpawnedChild::InProcess(p) => p.arm_reaper(on_exit),
-            SpawnedChild::Holder(h) => h.arm(on_exit),
+            SpawnedChild::Holder(h) => h.arm(on_exit, pre_ack),
+        }
+    }
+
+    /// The watcher's checkpoint-push closure (R12/C11) — holder mode
+    /// only; monolith watchers have no holder to push to.
+    fn checkpoint_push(&self) -> Option<crate::session_watch::CheckpointPushFn> {
+        match self {
+            SpawnedChild::InProcess(_) => None,
+            SpawnedChild::Holder(h) => Some(h.checkpoint_push()),
         }
     }
 }
@@ -1031,6 +1043,10 @@ pub(crate) fn start_session_with_spawn_fn(
                 watcher_spawn_fn,
                 Some(restart_coordinator_for_watcher),
                 None, // fresh spawn — no checkpoint to restore
+                // Holder-split (R12/C11): policy publishes push to
+                // the holder so a respawned brain re-adopts the same
+                // policy. None in monolith mode.
+                pending.checkpoint_push(),
             ) {
                 Ok(w) => Some(w),
                 Err(e) => {
@@ -1146,8 +1162,27 @@ pub(crate) fn start_session_with_spawn_fn(
         ));
     }
 
+    // C4 (split only): the holder ack asserts the tombstone reached
+    // disk — the checked 4c sidecar write, gated here so a failed
+    // write skips the ack and the holder redelivers.
+    let pre_ack: Option<crate::holder_mode::PreAckFn> = holder_binding.as_ref().map(|_| {
+        let state_for_ack = Arc::clone(state_arc);
+        let gate: crate::holder_mode::PreAckFn = Box::new(move || {
+            let st = state_for_ack.lock().unwrap_or_else(|p| p.into_inner());
+            match st.save_daemon_tombstones_checked(
+                &crate::state::default_daemon_tombstones_path(),
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("cm-daemon: checked tombstone persist failed: {e}");
+                    false
+                }
+            }
+        });
+        gate
+    });
     let mut session = pending
-        .arm(Some(on_exit))
+        .arm(Some(on_exit), pre_ack)
         .map_err(|e| (ErrorCode::Internal, format!("arm reaper: {}", e)))?;
     // Slice 10d watcher-fix: stash the watcher handle on the
     // registry-resident session at the same instant we insert
@@ -1389,6 +1424,10 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             killed_by,
             reported_done_at: report.as_ref().map(|r| r.at_unix),
             report_reason: report.and_then(|r| r.reason),
+            // C4: the holder-minted incarnation is the durable
+            // idempotency key a redelivered exit_event matches.
+            incarnation: holder_exit.as_ref().map(|h| h.incarnation),
+            status_lost: false,
         }
     });
     // Continuous Tasks Phase 3b completion signal (b): capture this session's
@@ -3539,6 +3578,17 @@ pub fn register_agent_subtask(
 // parity, pinned by a test). This is Operator-only.
 
 pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
+    // Holder-split (phase 4): the holder status round-trip runs
+    // BEFORE the state lock — a channel wait under the lock would be
+    // a convoy (and a holder that doesn't answer means this brain is
+    // about to die anyway, C5).
+    let holder = crate::holder_mode::global().map(|client| {
+        (
+            client.holder_build_id.clone(),
+            client.epoch,
+            client.status().ok(),
+        )
+    });
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let (mcp_ok, mcp_detail) = match &state.mcp_preflight {
         Some(Ok(summary)) => (true, summary.clone()),
@@ -3568,18 +3618,29 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         .values()
         .filter(|s| s.semantic_idle() == Some(false))
         .count();
-    // DESIGN_HOLDER_BRAIN_SPLIT phase 3 (C14): the minimal split
-    // health surface the cm-redeploy transition guard probes —
-    // shipped WITH the guard, not after it. The full surface
-    // (breaker state, pending events, epoch) is phase 4.
-    let (split, holder_build_id) = match crate::holder_mode::global() {
-        Some(client) => (true, Some(client.holder_build_id.clone())),
-        None => (false, None),
-    };
+    // DESIGN_HOLDER_BRAIN_SPLIT phase 4: the full split health
+    // surface (C14 shipped the `split` bit with the cm-redeploy
+    // guard in phase 3; this adds the holder's own view — epoch,
+    // held sessions, pending exit events — via a `status` round
+    // trip taken before the state lock).
+    let (split, holder_build_id, holder_epoch, holder_sessions, pending_exit_events) =
+        match &holder {
+            Some((build, epoch, status)) => (
+                true,
+                Some(build.clone()),
+                Some(*epoch),
+                status.as_ref().map(|s| s.sessions),
+                status.as_ref().map(|s| s.pending_exit_events),
+            ),
+            None => (false, None, None, None, None),
+        };
     Ok(json!({
         "ok": true,
         "split": split,
         "holder_build_id": holder_build_id,
+        "holder_epoch": holder_epoch,
+        "holder_sessions": holder_sessions,
+        "holder_pending_exit_events": pending_exit_events,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
         "sessions": total,
@@ -10286,6 +10347,9 @@ pub fn revive_session(
                 seeded_from_snapshot: None,
                 last_exit: None,
                 host_id: crate::host_id::HostId::local(),
+                transcript_path: None,
+                reported_done_at: None,
+                report_reason: None,
             },
         };
         // The tombstone snapshots the transcript as a PATH at exit time —
@@ -11483,10 +11547,16 @@ pub fn report_done(
                 ),
             )
         })?;
-        (
+        let out = (
             session.stamp_reported_done(p.reason.clone()),
             session.continuous_task_id.clone(),
-        )
+        );
+        // Holder-split phase 4 (R11): the marker is now part of the
+        // durable registry entry, so a brain restart's adopt-at-boot
+        // restores status="reported" instead of regressing to
+        // awaiting_input and stranding an until="final" monitor.
+        state.persist_sessions_best_effort();
+        out
     };
 
     // Effect 2 — the continuous-run flip, for callers that are a tick.
@@ -18298,6 +18368,9 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-t1").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    transcript_path: None,
+                    reported_done_at: None,
+                    report_reason: None,
                     color: None,
                     memory_cap_soft_bytes: None,
                     memory_cap_hard_bytes: None,
@@ -18546,6 +18619,9 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-cap").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    transcript_path: None,
+                    reported_done_at: None,
+                    report_reason: None,
                     color: None,
                     memory_cap_soft_bytes: None,
                     memory_cap_hard_bytes: None,
@@ -18745,6 +18821,9 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-opkill").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    transcript_path: None,
+                    reported_done_at: None,
+                    report_reason: None,
                     color: None,
                     memory_cap_soft_bytes: None,
                     memory_cap_hard_bytes: None,
@@ -20122,6 +20201,9 @@ mod tests {
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: crate::host_id::HostId::local(),
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
         }
     }
 
@@ -20671,6 +20753,8 @@ mod tests {
             ws.sessions = vec![e];
             s.workspaces.insert("ws-rv".into(), ws);
             s.record_exited(crate::state::ExitedTombstone {
+                incarnation: None,
+                status_lost: false,
                 session_uid: uid.into(),
                 transcript_path: None,
                 generation: 0,
@@ -20803,6 +20887,8 @@ mod tests {
         let wt = std::env::temp_dir();
         let state = make_state_arc();
         state.lock().unwrap().record_exited(crate::state::ExitedTombstone {
+            incarnation: None,
+            status_lost: false,
             session_uid: uid.into(),
             transcript_path: None,
             generation: 0,

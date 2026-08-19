@@ -363,6 +363,15 @@ pub fn run() -> anyhow::Result<()> {
     // sessions' readers must precede the seconds-long python
     // subprocess).
     let holder_active = holder_mode::init_from_env();
+    // Phase 4 (O11): the adopt handshake happens EARLY — before the
+    // listener decision, because the control socket may be
+    // holder-custodied (a brain restart adopts it instead of
+    // rebinding; the socket never unbinds). Session records park in
+    // the returned HolderBoot, untouched, until state exists.
+    let mut holder_boot: Option<holder_mode::HolderBoot> = match holder_mode::global() {
+        Some(client) if holder_active => Some(holder_mode::fetch_boot(client)),
+        _ => None,
+    };
 
     // DESIGN_SEAMLESS_RESTART phases 3b + 4a (R13, R5): re-exec
     // handoff detection. Runs HERE — during single-threaded startup,
@@ -468,7 +477,60 @@ pub fn run() -> anyhow::Result<()> {
     continuous::startup_orphan_sweep(&handoff_survivors);
 
     let path = default_socket_path();
-    let listener = match &reexec_handoff {
+    let listener = if let Some(hb) = holder_boot.as_mut() {
+        // Holder-split custody (O11): brain binds, holder keeps.
+        let client = holder_mode::global().expect("holder mode set the global");
+        match hb.take_listener("unix") {
+            Some((meta, fd)) if meta.meta == path.to_string_lossy() => {
+                // Adopted: same open file description across brain
+                // generations — no unbind window, no stale-probe.
+                // The fd arrived MSG_CMSG_CLOEXEC'd (S10).
+                eprintln!(
+                    "cm-daemon: adopted control listener from holder ({})",
+                    meta.meta
+                );
+                std::os::unix::net::UnixListener::from(fd)
+            }
+            other => {
+                if let Some((meta, _stale)) = other {
+                    // C12's rebind-at-brain-boot: the configured path
+                    // changed; bind fresh, store fresh (the holder
+                    // closes the old custody on store).
+                    eprintln!(
+                        "cm-daemon: custodied listener path '{}' != configured \
+                         '{}' — rebinding",
+                        meta.meta,
+                        path.display()
+                    );
+                }
+                let l = bind_socket(&path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to bind cm-daemon socket at {}: {}",
+                        path.display(),
+                        e
+                    )
+                })?;
+                eprintln!("cm-daemon: listening on {}", path.display());
+                let meta = cm_holder_proto::channel::ListenerMeta {
+                    kind: "unix".into(),
+                    meta: path.to_string_lossy().into_owned(),
+                };
+                match client
+                    .store_listener(meta, std::os::fd::AsRawFd::as_raw_fd(&l))
+                {
+                    Ok(()) => eprintln!(
+                        "cm-daemon: control listener custodied with the holder"
+                    ),
+                    Err(e) => eprintln!(
+                        "cm-daemon: listener custody failed: {e} — the socket \
+                         will rebind (stale-probe) on the next brain start"
+                    ),
+                }
+                l
+            }
+        }
+    } else {
+    match &reexec_handoff {
         // Handoff (phase 3b, R13): adopt the inherited listener
         // instead of binding. The socket never unbound across the
         // exec, so connects during the swap queued in the kernel
@@ -516,6 +578,7 @@ pub fn run() -> anyhow::Result<()> {
             eprintln!("cm-daemon: listening on {}", path.display());
             l
         }
+    }
     };
 
     // Shared mutable daemon state. Per-connection threads lock for
@@ -750,7 +813,52 @@ pub fn run() -> anyhow::Result<()> {
     if let Some(tls_cfg) = state.lock().unwrap().config.tls.clone() {
         let token = std::env::var(control::tls::ENV_VAR)
             .unwrap_or_default();
-        match control::tls::TlsAcceptor::bind(&tls_cfg, token) {
+        // Holder-split custody (O11/C12): adopt the custodied TLS
+        // listener when its address still matches the config; a
+        // mismatch (or fresh start) binds anew and re-custodies —
+        // the rebind-at-brain-boot flow (hot rebind stays out of
+        // scope, matching reload_config's TLS-is-startup-only rule).
+        let acceptor_result = if let Some(hb) = holder_boot.as_mut() {
+            let client = holder_mode::global().expect("holder mode set the global");
+            match hb.take_listener("tls") {
+                Some((meta, fd)) if meta.meta == tls_cfg.listen_addr => {
+                    eprintln!(
+                        "cm-daemon: adopted TLS listener from holder ({})",
+                        meta.meta
+                    );
+                    control::tls::TlsAcceptor::bind_with_listener(
+                        &tls_cfg,
+                        token,
+                        std::net::TcpListener::from(fd),
+                    )
+                }
+                other => {
+                    if let Some((meta, _stale)) = other {
+                        eprintln!(
+                            "cm-daemon: custodied TLS listener addr '{}' != \
+                             configured '{}' — rebinding",
+                            meta.meta, tls_cfg.listen_addr
+                        );
+                    }
+                    let r = control::tls::TlsAcceptor::bind(&tls_cfg, token);
+                    if let Ok(acc) = &r {
+                        let meta = cm_holder_proto::channel::ListenerMeta {
+                            kind: "tls".into(),
+                            meta: tls_cfg.listen_addr.clone(),
+                        };
+                        if let Err(e) =
+                            client.store_listener(meta, acc.listener_raw_fd())
+                        {
+                            eprintln!("cm-daemon: TLS listener custody failed: {e}");
+                        }
+                    }
+                    r
+                }
+            }
+        } else {
+            control::tls::TlsAcceptor::bind(&tls_cfg, token)
+        };
+        match acceptor_result {
             Ok(acceptor) => {
                 let local = acceptor
                     .local_addr()
@@ -853,7 +961,10 @@ pub fn run() -> anyhow::Result<()> {
         // reboot: restore spawns them THROUGH the holder via the spawn
         // seam; adopted uids are registry-skipped).
         if let Some(client) = holder_mode::global() {
-            holder_mode::adopt_at_boot(&state, client);
+            let boot = holder_boot
+                .take()
+                .expect("holder mode fetched the boot handshake at startup");
+            holder_mode::adopt_at_boot(&state, client, boot);
         }
         let preflight = mcp_config::run_mcp_preflight(server_override_owned.as_deref());
         {

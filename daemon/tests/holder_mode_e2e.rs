@@ -420,6 +420,26 @@ fn brain_crash_kills_no_session_end_to_end() {
         "adopt line missing from log.\n--- log tail ---\n{}",
         guard.log_tail()
     );
+    // Listener custody (O11): brain #1 bound + custodied; brain #2
+    // ADOPTED the same open file description instead of rebinding —
+    // which is why the socket answered across the crash at all.
+    assert!(
+        log.contains("control listener custodied with the holder"),
+        "brain #1 never custodied the listener.\n--- log tail ---\n{}",
+        guard.log_tail()
+    );
+    assert!(
+        log.contains("adopted control listener from holder"),
+        "brain #2 rebound instead of adopting the custodied listener.\n--- log tail ---\n{}",
+        guard.log_tail()
+    );
+    // Full split health surface (phase 4): epoch 2 = the second
+    // brain generation of this holder.
+    assert_eq!(
+        health2.get("holder_epoch"),
+        Some(&serde_json::json!(2)),
+        "{health2}"
+    );
 
     // (8) PTY continuity: post-crash markers flow through brain #2's
     // adopted reader.

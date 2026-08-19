@@ -858,3 +858,145 @@ fn watchdog_pings_flow_and_pongs_reset_the_counter() {
     drop(brain);
     join.join().unwrap();
 }
+
+#[test]
+fn checkpoint_updates_round_trip_through_adopt() {
+    // R12/C11: a pushed watcher checkpoint is stored opaquely and
+    // rides the adopt record back out to the next brain generation.
+    let (join, mut brain) = start(Holder::new(test_config()));
+    brain.hello();
+    let (ok, _fds) = spawn_ok(&mut brain, "s-cp", &["/bin/cat"]);
+    let (f, _) = brain.request(
+        verbs::ARM_REAP,
+        ch::ArmReapBody {
+            uid: "s-cp".into(),
+            incarnation: ok.incarnation,
+            cgroup_path: Some("/sys/fs/cgroup/fake/cm-sess-x.scope".into()),
+        },
+    );
+    assert_eq!(f.v, verbs::OK);
+    let cp = serde_json::json!({
+        "version": 2,
+        "cgroup_path": "/sys/fs/cgroup/fake/cm-sess-x.scope",
+        "protected": [[1234, 567890]],
+        "last_high": 3,
+        "kills_baseline": 42,
+    });
+    let (f, _) = brain.request(
+        verbs::UPDATE_CHECKPOINT,
+        ch::UpdateCheckpointBody {
+            uid: "s-cp".into(),
+            incarnation: ok.incarnation,
+            watcher_checkpoint: cp.clone(),
+        },
+    );
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    // Wrong incarnation → not_found (O2 identity discipline).
+    let (f, _) = brain.request(
+        verbs::UPDATE_CHECKPOINT,
+        ch::UpdateCheckpointBody {
+            uid: "s-cp".into(),
+            incarnation: ok.incarnation + 99,
+            watcher_checkpoint: serde_json::json!({}),
+        },
+    );
+    assert_eq!(err_of(&f).code, ch::ERR_NOT_FOUND);
+
+    // Next generation: the adopt record carries the blob verbatim.
+    drop(brain);
+    let (holder, _) = join.join().unwrap();
+    let (join2, mut brain2) = start(holder);
+    brain2.hello();
+    let (records, _done) = brain2.adopt();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0.watcher_checkpoint, Some(cp));
+    // Cleanup: kill via signal + arm + ack + forget.
+    let (f, _) = brain2.request(
+        verbs::ABORT_SPAWN,
+        ch::AbortSpawnBody {
+            uid: "s-cp".into(),
+            incarnation: ok.incarnation,
+        },
+    );
+    assert_eq!(f.v, verbs::OK);
+    drop(brain2);
+    join2.join().unwrap();
+}
+
+#[test]
+fn listener_custody_round_trips_across_generations() {
+    // O11: the brain binds, the holder custodies; the next
+    // generation adopts a WORKING listener (same open file
+    // description — a queued connect made during the gap is
+    // acceptable by the design, but here we just prove accept works
+    // through the adopted dup).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock_path = dir.path().join("custody.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind");
+
+    let (join, mut brain) = start(Holder::new(test_config()));
+    brain.hello();
+    let meta = ch::ListenerMeta {
+        kind: "unix".into(),
+        meta: sock_path.to_string_lossy().into_owned(),
+    };
+    let store = Frame::new(
+        verbs::STORE_LISTENER,
+        Some(900),
+        1,
+        ch::StoreListenerBody {
+            listener: meta.clone(),
+        },
+    );
+    ch::send_frame_blocking(brain.fd.as_fd(), &store, &[listener.as_raw_fd()])
+        .expect("send store_listener");
+    let (f, _) = brain.wait_reply(900);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    // The brain's own copy can close — custody keeps it alive.
+    drop(listener);
+    drop(brain);
+    let (holder, _) = join.join().unwrap();
+
+    let (join2, mut brain2) = start(holder);
+    brain2.hello();
+    let id = brain2.send(verbs::ADOPT, serde_json::json!({}));
+    let mut got: Option<(ch::ListenerMeta, OwnedFd)> = None;
+    loop {
+        let (f, mut fds) = brain2.recv_any();
+        if f.req_id != Some(id) {
+            continue;
+        }
+        match f.v.as_str() {
+            verbs::ADOPT_LISTENERS => {
+                let body: ch::AdoptListenersBody = f.parse_body().unwrap();
+                assert_eq!(body.listeners.len(), 1);
+                assert_eq!(fds.len(), 1);
+                got = Some((body.listeners[0].clone(), fds.pop().unwrap()));
+            }
+            verbs::ADOPT_DONE => break,
+            _ => {}
+        }
+    }
+    let (adopted_meta, adopted_fd) = got.expect("listener adopted");
+    assert_eq!(adopted_meta, meta);
+    // The adopted fd ACCEPTS: connect a client to the path and
+    // accept through the dup.
+    let adopted: std::os::unix::net::UnixListener = adopted_fd.into();
+    adopted
+        .set_nonblocking(true)
+        .expect("nonblocking accept");
+    let _client = std::os::unix::net::UnixStream::connect(&sock_path).expect("connect");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        match adopted.accept() {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "accept never completed");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    }
+    drop(brain2);
+    join2.join().unwrap();
+}

@@ -523,6 +523,19 @@ impl WatcherLiveState {
 /// holds one clone; the watcher thread holds the other.
 pub type SharedWatcherState = Arc<Mutex<WatcherLiveState>>;
 
+/// Holder-split checkpoint push (DESIGN_HOLDER_BRAIN_SPLIT § Watcher
+/// placement, C11): called by the watcher thread at each policy
+/// publish point — the finalized protected set BEFORE enforcement
+/// begins, and each `last_high` bump BEFORE the breach action — with
+/// a checkpoint whose `kills_baseline` is 0 (the closure closes over
+/// the real per-session baseline and fills it in; the watcher never
+/// holds session-side state). The call runs OUTSIDE the leaf state
+/// mutex — the closure may block on a channel round-trip, and
+/// `reexec::build_manifest` reads the cell under the state lock, so
+/// holding the leaf lock across the push would be a convoy. `None`
+/// in monolith mode.
+pub type CheckpointPushFn = Arc<dyn Fn(WatcherCheckpoint) + Send + Sync>;
+
 /// What [`spawn_watcher`] returns: the thread handle (stashed on
 /// `DaemonSession.watcher_handle`, drop = detach as before) plus the
 /// shared policy-state cell (stashed on
@@ -661,6 +674,7 @@ pub fn spawn_watcher(
     spawn_fn: WatcherSpawnFn,
     coordinator: Option<Weak<RestartCoordinator>>,
     restored_protected: Option<HashSet<(u32, u64)>>,
+    checkpoint_push: Option<CheckpointPushFn>,
 ) -> std::io::Result<SpawnedWatcher> {
     // The cell is created HERE (not in the thread body) so the caller
     // holds a valid handle from the moment the spawn returns — a
@@ -685,6 +699,7 @@ pub fn spawn_watcher(
             state_for_thread,
             coordinator,
             restored_protected,
+            checkpoint_push,
         );
     });
     let handle = spawn_fn(thread_name, body)?;
@@ -702,6 +717,7 @@ fn run_watcher(
     state: SharedWatcherState,
     coordinator: Option<Weak<RestartCoordinator>>,
     restored_protected: Option<HashSet<(u32, u64)>>,
+    checkpoint_push: Option<CheckpointPushFn>,
 ) {
     // Phase 4d (R12): register with the quiescence barrier FIRST,
     // before any waiting, so a restart that begins during our
@@ -850,9 +866,18 @@ fn run_watcher(
     // this exact policy. Mid-followup partials are deliberately never
     // published — a checkpoint that races finalization reads `None`
     // and the re-adopted watcher re-runs the phases.
-    {
+    let finalized_cp = {
         let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.protected = Some(protected.clone());
+        st.checkpoint(0)
+    };
+    // Holder-split C11: the finalized set reaches the HOLDER before
+    // enforcement begins — a brain crash can never leave enforcement
+    // having run against a set the holder never saw. Blocking here
+    // (outside the leaf lock) deliberately delays enforcement until
+    // the push lands.
+    if let Some(push) = &checkpoint_push {
+        push(finalized_cp);
     }
 
     // First post-stabilize poll: if memory.events.high grew
@@ -876,9 +901,16 @@ fn run_watcher(
         // Publish the watermark BEFORE acting on the breach, so by
         // the time the barrier's park-ack lets a checkpoint be taken
         // the cell and the kill log agree.
-        {
+        let breach_cp = {
             let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
             st.last_high = last_high;
+            st.checkpoint(0)
+        };
+        // Holder-split C11: the bumped watermark reaches the holder
+        // BEFORE the breach action, so a brain crash mid-breach
+        // re-adopts a watcher that will not replay the breach.
+        if let Some(push) = &checkpoint_push {
+            push(breach_cp);
         }
         handle_breach(
             &session_uid,
@@ -1281,6 +1313,7 @@ mod tests {
                 cell,
                 None, // no restart coordinator in this test
                 None, // fresh spawn — stabilize/followup run
+                None, // no checkpoint push (test)
             );
         });
 
@@ -1409,6 +1442,7 @@ mod tests {
             failing,
             None, // no restart coordinator
             None, // fresh spawn
+            None, // no checkpoint push (test)
         );
         let err = result.expect_err(
             "spawn_watcher must return Err on spawn-fn failure — not panic",
@@ -2011,6 +2045,7 @@ mod tests {
                 cell,
                 None,
                 None,
+                None, // no checkpoint push (test)
             );
         });
 
@@ -2106,6 +2141,7 @@ mod tests {
                 cell,
                 None,
                 None,
+                None, // no checkpoint push (test)
             );
         });
 
@@ -2389,6 +2425,7 @@ mod tests {
             inert,
             None,
             Some(restored.clone()),
+            None, // no checkpoint push (test)
         )
         .expect("spawn");
         let st = spawned.state.lock().unwrap();
@@ -2413,6 +2450,7 @@ mod tests {
             inert,
             None,
             None,
+            None, // no checkpoint push (test)
         )
         .expect("spawn");
         assert!(spawned.state.lock().unwrap().protected.is_none());
@@ -2458,6 +2496,7 @@ mod tests {
             Some(Arc::downgrade(&coordinator)),
             // Restored ⇒ straight to the main loop's park point.
             Some(HashSet::new()),
+            None, // no checkpoint push (test)
         )
         .expect("spawn watcher");
 
@@ -2505,6 +2544,7 @@ mod tests {
             default_watcher_spawn_fn(),
             Some(Arc::downgrade(&coordinator)),
             None, // fresh — parks at the stabilize-loop safe point
+            None, // no checkpoint push (test)
         )
         .expect("spawn watcher");
 
@@ -2603,6 +2643,7 @@ mod tests {
             default_watcher_spawn_fn(),
             None,
             Some(restored.clone()),
+            None, // no checkpoint push (test)
         )
         .expect("spawn watcher");
 

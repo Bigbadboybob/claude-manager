@@ -91,6 +91,8 @@ pub mod verbs {
     pub const ADOPT_DONE: &str = "adopt_done";
     pub const SIGNAL: &str = "signal";
     pub const ABORT_SPAWN: &str = "abort_spawn";
+    pub const UPDATE_CHECKPOINT: &str = "update_checkpoint";
+    pub const STORE_LISTENER: &str = "store_listener";
     pub const FORGET: &str = "forget";
     pub const EXIT_EVENT: &str = "exit_event";
     pub const ACK_EXIT: &str = "ack_exit";
@@ -213,11 +215,11 @@ pub struct AdoptRecordBody {
     pub exit_event_pending: bool,
 }
 
-/// Holder → brain: the custodied listeners (phase 4 — phase 2 always
-/// sends an empty list with 0 fds, keeping the adopt flow's shape).
+/// Holder → brain: the custodied listeners, one fd per entry (the
+/// frame's `nfds` == `listeners.len()`, fds in list order).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdoptListenersBody {
-    pub listeners: Vec<serde_json::Value>,
+    pub listeners: Vec<ListenerMeta>,
 }
 
 /// Holder → brain: end of the adopt stream.
@@ -244,6 +246,39 @@ pub struct LastSignalRequest {
     pub attribution: String,
     /// Unix seconds (holder clock).
     pub at: f64,
+}
+
+/// Brain → holder: overwrite one record's opaque watcher-policy
+/// checkpoint (R12/C11). Sent by the brain-side memory-cap watcher
+/// at its publish points — the finalized protected set BEFORE
+/// enforcement begins, each `last_high` bump BEFORE the breach
+/// action — so a re-adopting brain resumes the same policy instead
+/// of recomputing one from the current cgroup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCheckpointBody {
+    pub uid: String,
+    pub incarnation: u64,
+    pub watcher_checkpoint: serde_json::Value,
+}
+
+/// Metadata for one custodied listener (design § Listeners, O11:
+/// the BRAIN binds — stale-probe, 0600 discipline, `[tls]` config —
+/// and the HOLDER custodies the fd across brain generations).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListenerMeta {
+    /// "unix" (the control socket) or "tls".
+    pub kind: String,
+    /// The socket path (unix) / listen address (tls) — the rebind
+    /// comparison key (C12: a config change rebinds at the next
+    /// brain boot) and the shutdown-unlink target.
+    pub meta: String,
+}
+
+/// Brain → holder: custody one listener fd (carries 1 fd). Replaces
+/// any stored listener of the same kind; the holder closes the old.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreListenerBody {
+    pub listener: ListenerMeta,
 }
 
 /// Brain → holder: abandon a spawn pre-insert (the

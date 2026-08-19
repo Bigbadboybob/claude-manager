@@ -145,6 +145,11 @@ struct OutFrame {
 pub struct Holder {
     cfg: HolderConfig,
     sessions: BTreeMap<String, SessionEntry>,
+    /// Custodied listeners (design § Listeners, O11): the BRAIN
+    /// binds; the holder keeps the fds alive across brain
+    /// generations so the socket never unbinds. At most one per
+    /// kind ("unix"/"tls"); a re-store replaces (the old fd closes).
+    listeners: Vec<(ch::ListenerMeta, OwnedFd)>,
     next_incarnation: u64,
     /// Brain-spawn counter (design § The holder); incremented per
     /// `serve` call — each serve is one brain generation.
@@ -158,6 +163,7 @@ impl Holder {
         Holder {
             cfg,
             sessions: BTreeMap::new(),
+            listeners: Vec::new(),
             next_incarnation: 1,
             epoch: 0,
             ping_seq: 0,
@@ -293,9 +299,7 @@ impl Holder {
                 loop {
                     match reader.next_frame() {
                         Ok(Some((frame, fds))) => {
-                            // Phase-2 verbs carry no brain→holder fds.
-                            drop(fds);
-                            match self.dispatch(frame, &mut hello_done, &mut outbound) {
+                            match self.dispatch(frame, fds, &mut hello_done, &mut outbound) {
                                 Ok(()) => {}
                                 Err(out) => {
                                     // Best-effort: the refusal frame
@@ -362,9 +366,20 @@ impl Holder {
     fn dispatch(
         &mut self,
         frame: Frame,
+        fds: Vec<OwnedFd>,
         hello_done: &mut bool,
         outbound: &mut VecDeque<OutFrame>,
     ) -> Result<(), ServeOutcome> {
+        // The one brain→holder fd-bearing verb; everything else must
+        // arrive fd-free (undeclared fds already violated at the
+        // frame layer — this guards declared-but-wrong-verb).
+        if frame.v != verbs::STORE_LISTENER && !fds.is_empty() {
+            return Err(ServeOutcome::Protocol(format!(
+                "verb '{}' carried {} unexpected fd(s)",
+                frame.v,
+                fds.len()
+            )));
+        }
         // pong is the one req_id-less brain frame (C7's law).
         if frame.v == verbs::PONG {
             self.pings_unanswered = 0;
@@ -435,6 +450,8 @@ impl Holder {
             verbs::ADOPT => self.handle_adopt(req_id, outbound),
             verbs::SIGNAL => self.handle_signal(req_id, &frame, outbound),
             verbs::ABORT_SPAWN => self.handle_abort_spawn(req_id, &frame, outbound),
+            verbs::UPDATE_CHECKPOINT => self.handle_update_checkpoint(req_id, &frame, outbound),
+            verbs::STORE_LISTENER => self.handle_store_listener(req_id, &frame, fds, outbound),
             verbs::FORGET => self.handle_forget(req_id, &frame, outbound),
             verbs::ACK_EXIT => self.handle_ack_exit(req_id, &frame, outbound),
             verbs::STATUS => {
@@ -693,16 +710,41 @@ impl Holder {
                 vec![mdup, pdup],
             );
         }
-        // Phase 4 fills this; the shape ships now (0 listeners, 0 fds).
+        // Custodied listeners ride back out as dups, one fd per
+        // entry, fds in list order (O11).
+        let mut listener_metas = Vec::new();
+        let mut listener_dups = Vec::new();
+        for (meta, fd) in &self.listeners {
+            match reap::dup_cloexec(fd.as_raw_fd()) {
+                Ok(dup) => {
+                    listener_metas.push(meta.clone());
+                    listener_dups.push(dup);
+                }
+                Err(e) => {
+                    push_frame(
+                        outbound,
+                        err_frame(
+                            req_id,
+                            ch::ERR_INVALID,
+                            format!("listener '{}' dup failed during adopt: {e}", meta.kind),
+                        ),
+                        vec![],
+                    );
+                }
+            }
+        }
+        let nfds = listener_dups.len() as u8;
         push_frame(
             outbound,
             Frame::new(
                 verbs::ADOPT_LISTENERS,
                 Some(req_id),
-                0,
-                ch::AdoptListenersBody { listeners: vec![] },
+                nfds,
+                ch::AdoptListenersBody {
+                    listeners: listener_metas,
+                },
             ),
-            vec![],
+            listener_dups,
         );
         push_frame(
             outbound,
@@ -827,6 +869,70 @@ impl Holder {
         // the PendingSession-abort translation (S4/O6).
         let _ = reap::pidfd_send_signal(&e.pidfd, libc::SIGKILL);
         let _ = reap::consume_exit_status(&e.pidfd, e.pid);
+        push_frame(
+            outbound,
+            Frame::new(verbs::OK, Some(req_id), 0, ch::OkBody { detail: None }),
+            vec![],
+        );
+        Ok(())
+    }
+
+    fn handle_update_checkpoint(
+        &mut self,
+        req_id: u64,
+        frame: &Frame,
+        outbound: &mut VecDeque<OutFrame>,
+    ) -> Result<(), ServeOutcome> {
+        let body: ch::UpdateCheckpointBody = match frame.parse_body() {
+            Ok(b) => b,
+            Err(e) => {
+                push_frame(outbound, err_frame(req_id, ch::ERR_INVALID, e), vec![]);
+                return Ok(());
+            }
+        };
+        let reply = match self.sessions.get_mut(&body.uid) {
+            Some(e) if e.incarnation == body.incarnation => {
+                // Opaque by contract (frozenness): stored, never
+                // interpreted; rides the adopt record back out.
+                e.watcher_checkpoint = Some(body.watcher_checkpoint);
+                Frame::new(verbs::OK, Some(req_id), 0, ch::OkBody { detail: None })
+            }
+            _ => err_frame(
+                req_id,
+                ch::ERR_NOT_FOUND,
+                format!("no record for '{}'", body.uid),
+            ),
+        };
+        push_frame(outbound, reply, vec![]);
+        Ok(())
+    }
+
+    fn handle_store_listener(
+        &mut self,
+        req_id: u64,
+        frame: &Frame,
+        mut fds: Vec<OwnedFd>,
+        outbound: &mut VecDeque<OutFrame>,
+    ) -> Result<(), ServeOutcome> {
+        let body: ch::StoreListenerBody = match frame.parse_body() {
+            Ok(b) => b,
+            Err(e) => {
+                push_frame(outbound, err_frame(req_id, ch::ERR_INVALID, e), vec![]);
+                return Ok(());
+            }
+        };
+        if fds.len() != 1 {
+            return Err(ServeOutcome::Protocol(format!(
+                "store_listener carried {} fds, want 1",
+                fds.len()
+            )));
+        }
+        let fd = fds.pop().expect("len checked");
+        // Replace-per-kind: the old custodied fd (if any) closes on
+        // drop — the C12 rebind flow (brain bound a new one because
+        // its config changed; the stale listener must not linger).
+        self.listeners.retain(|(m, _)| m.kind != body.listener.kind);
+        self.listeners.push((body.listener, fd));
         push_frame(
             outbound,
             Frame::new(verbs::OK, Some(req_id), 0, ch::OkBody { detail: None }),

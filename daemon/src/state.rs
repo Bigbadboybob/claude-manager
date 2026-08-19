@@ -105,6 +105,18 @@ pub struct ExitedTombstone {
     /// The `report_done` reason carried onto the tombstone, so a
     /// read-after-exit caller still sees the agent's own summary.
     pub report_reason: Option<String>,
+    /// Holder-split (C4): the holder-minted process incarnation this
+    /// exit belongs to — the durable idempotency key a redelivered
+    /// `exit_event` is matched against. `None` for monolith-mode
+    /// exits (and for pre-split sidecar files, via the default).
+    #[serde(default)]
+    pub incarnation: Option<u64>,
+    /// Holder-split (§ Exit provenance): `true` when the session was
+    /// discovered GONE with no reconstructible status — the honest
+    /// "we don't know how it ended" marker (e.g. a persisted-live
+    /// entry absent from a surviving holder's records).
+    #[serde(default)]
+    pub status_lost: bool,
 }
 
 /// Bound on [`DaemonState::kill_requests`]. A request is normally
@@ -1407,6 +1419,8 @@ mod tests {
 
     fn tomb(uid: &str) -> ExitedTombstone {
         ExitedTombstone {
+            incarnation: None,
+            status_lost: false,
             session_uid: uid.to_string(),
             transcript_path: Some(format!("/tmp/{uid}.jsonl")),
             generation: 0,
@@ -1495,6 +1509,9 @@ mod tests {
 
     fn entry(uid: &str) -> ManifestEntry {
         ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,

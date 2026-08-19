@@ -190,6 +190,46 @@ impl TlsAcceptor {
         })
     }
 
+    /// Holder-split (phase 4, O11/C12): construct over an
+    /// ALREADY-BOUND listener — the holder-custodied fd a brain
+    /// restart adopts instead of rebinding (rebind of a live address
+    /// would fail while the custodied listener holds it). Identical
+    /// cert/key/config path to [`Self::bind`]; only the bind is
+    /// skipped.
+    pub fn bind_with_listener(
+        tls_cfg: &TlsConfig,
+        expected_token: String,
+        listener: TcpListener,
+    ) -> Result<Self, TlsServerError> {
+        if expected_token.is_empty() {
+            return Err(TlsServerError::MissingDaemonToken);
+        }
+        let cert_path = std::path::PathBuf::from(&tls_cfg.cert_path);
+        let key_path = std::path::PathBuf::from(&tls_cfg.key_path);
+        let certs = load_certs(&cert_path)?;
+        let key = load_private_key(&key_path)?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(TlsServerError::Rustls)?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(TlsServerError::Rustls)?;
+        Ok(TlsAcceptor {
+            config: Arc::new(config),
+            listener,
+            expected_token,
+            listen_addr: tls_cfg.listen_addr.clone(),
+        })
+    }
+
+    /// The bound listener's raw fd — custody input only (the holder
+    /// dups it via SCM_RIGHTS; nothing closes through this number).
+    pub fn listener_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.listener.as_raw_fd()
+    }
+
     /// Drive the accept loop. Spawns a per-connection handler
     /// thread for each incoming TCP socket. Returns only when
     /// `listener.incoming()` errors fatally (which on a long-

@@ -422,6 +422,22 @@ pub struct ManifestEntry {
     /// TUI load time (12c).
     #[serde(default = "default_local_host_id")]
     pub host_id: crate::host_id::HostId,
+    /// Holder-split (phase 4): the detected transcript file PATH
+    /// (`transcript_id` above is just the stem). Persisted so a
+    /// brain restart's adopt-at-boot rebinds transcript reads
+    /// immediately instead of waiting for a re-detection that never
+    /// comes for an already-live child. Default `None` for files
+    /// written by older builds (and by the TUI, which never sets it).
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    /// Holder-split (phase 4, R11): the session's `report_done`
+    /// marker, persisted so a brain restart cannot regress a
+    /// reported-done worker to `awaiting_input` and strand an
+    /// `until="final"` monitor. Unix seconds + the agent's reason.
+    #[serde(default)]
+    pub reported_done_at: Option<f64>,
+    #[serde(default)]
+    pub report_reason: Option<String>,
 }
 
 /// 12b: serde-default constructor for `ManifestEntry::host_id`.
@@ -892,6 +908,9 @@ mod tests {
     #[test]
     fn t_g3b_explicit_host_id() {
         let entry = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
@@ -998,6 +1017,9 @@ mod tests {
 
         // A continuous-tagged entry round-trips the id.
         let tagged = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,

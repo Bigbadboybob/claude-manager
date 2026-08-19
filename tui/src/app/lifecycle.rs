@@ -6107,6 +6107,9 @@ mod slice_12e_tests {
         // be skipped + preserved).
         let mut workspaces = HashMap::new();
         let local_entry = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
@@ -6131,6 +6134,9 @@ mod slice_12e_tests {
             host_id: HostId::local(),
         };
         let remote_entry = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,

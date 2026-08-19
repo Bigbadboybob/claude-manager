@@ -1318,6 +1318,14 @@ impl DaemonSession {
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: crate::host_id::HostId::local(),
+            // Holder-split (phase 4): the durable halves of what a
+            // brain restart's adopt-at-boot must not lose — the
+            // transcript binding (reads work immediately post-adopt)
+            // and the report_done marker (an until="final" watcher
+            // must not see a regression to awaiting_input, R11).
+            transcript_path: self.transcript_path.clone(),
+            reported_done_at: self.reported_done().map(|r| r.at_unix),
+            report_reason: self.reported_done().and_then(|r| r.reason),
         }
     }
 
@@ -2077,6 +2085,9 @@ pub struct HolderAttribution {
 #[derive(Debug, Clone)]
 pub struct HolderExit {
     pub status: DaemonExitStatus,
+    /// The holder-minted process identity (O2) — carried onto the
+    /// tombstone as the durable idempotency key (C4).
+    pub incarnation: u64,
     /// Unix seconds at `waitid` time — used for the tombstone's
     /// `exited_at` (fidelity across brain downtime).
     pub exited_at: f64,

@@ -228,6 +228,7 @@ fn exit_observer_stashes_provenance_fires_on_exit_then_settles() {
             code: None,
             signal: Some(libc::SIGKILL),
         },
+        incarnation: 7,
         exited_at: 1_700_000_000.5,
         attribution: Some(HolderAttribution {
             sig: libc::SIGKILL,

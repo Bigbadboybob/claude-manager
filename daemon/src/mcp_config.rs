@@ -898,22 +898,37 @@ fn run_user_scope_probe() -> Result<(), String> {
     // memory-controller delegation the real cap relies on, not just bus
     // connectivity. 256 MiB is comfortably above anything `/bin/true` touches.
     let unit = format!("cm-sess-capprobe-{}", run_nonce());
-    let output = Command::new("systemd-run")
-        .args([
-            "--user",
-            "--scope",
-            "--quiet",
-            &format!("--unit={}", unit),
-            "-p",
-            "MemoryMax=268435456",
-            "-p",
-            "MemorySwapMax=0",
-            "--",
-            "/bin/true",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .output();
+    let mut cmd = Command::new("systemd-run");
+    cmd.args([
+        "--user",
+        "--scope",
+        "--quiet",
+        &format!("--unit={}", unit),
+        "-p",
+        "MemoryMax=268435456",
+        "-p",
+        "MemorySwapMax=0",
+        "--",
+        "/bin/true",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null());
+    // Holder-split S8/C10: run the probe under the SAME env
+    // discipline every real capped spawn uses — `env_clear` + a
+    // fully-specified map. The map here is this process's own
+    // (sanitized) environ, which is exactly the BASE of every spawn
+    // spec's composed env (§ Environment: brain environ + per-session
+    // CM_* deltas, none of which affect user-bus reachability), so
+    // what this probe validates is what the holder-side spawn gets.
+    // In monolith mode the same discipline is a no-op-equivalent
+    // (clear + reapply own environ == inherit).
+    cmd.env_clear();
+    for (k, v) in std::env::vars_os() {
+        if let (Ok(k), Ok(v)) = (k.into_string(), v.into_string()) {
+            cmd.env(k, v);
+        }
+    }
+    let output = cmd.output();
     match output {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {

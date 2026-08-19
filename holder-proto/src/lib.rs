@@ -34,3 +34,54 @@ pub mod reexec_manifest;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod guard_tests {
+    //! Source-scan guards for the crate's protocol law (the skew
+    //! suite's compile-time arm).
+
+    /// The additive-only discipline: `deny_unknown_fields` is BANNED
+    /// on the CHANNEL — an old binary must parse a newer peer's
+    /// frames, ignoring fields it doesn't know. The sealed re-exec
+    /// manifest is deliberately exempt: it is schema-version-GATED
+    /// (`UnsupportedSchemaVersion` refuses a shape it doesn't speak)
+    /// and its strictness is part of its validation posture (R8) —
+    /// cross-version handoffs go through `rollback_schema_version`,
+    /// never through silent field-dropping.
+    #[test]
+    fn no_deny_unknown_fields_on_the_channel() {
+        // Needle assembled at runtime so this test's own source
+        // can't self-match.
+        let needle = ["deny_", "unknown_fields"].concat();
+        for (name, src) in [
+            ("channel.rs", include_str!("channel.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+        ] {
+            let hits = src
+                .lines()
+                .filter(|l| l.contains(&needle) && l.contains("#["))
+                .count();
+            assert_eq!(hits, 0, "{name} carries a {needle} attribute");
+        }
+    }
+
+    /// S10: every SCM_RIGHTS receive passes MSG_CMSG_CLOEXEC — a
+    /// received fd must never be inheritable by a concurrently
+    /// forked child. One recvmsg call site exists; it must carry the
+    /// flag on the same call.
+    #[test]
+    fn recvmsg_always_passes_cmsg_cloexec() {
+        let src = include_str!("channel.rs");
+        let recv_sites: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("libc::recvmsg("))
+            .collect();
+        assert!(!recv_sites.is_empty(), "expected a recvmsg call site");
+        for site in recv_sites {
+            assert!(
+                site.contains("MSG_CMSG_CLOEXEC"),
+                "recvmsg without MSG_CMSG_CLOEXEC: {site}"
+            );
+        }
+    }
+}

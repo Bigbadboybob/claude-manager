@@ -90,7 +90,6 @@ pub(crate) use crate::workflow::run::apply_stop_workflow_status;
 // and `TOMBSTONE_RETENTION_SECS` live in the daemon crate (slice
 // 10a-types of doc/persistent-host-daemon.md). Module-level `use`
 // brings them into scope so existing bare references inside this
-// file (`ManifestEntry { ...     global_perms: false,
 // file (`ManifestEntry { ... }`, `SessionTombstone { ... }` etc.)
 // resolve unchanged.
 //

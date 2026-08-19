@@ -29,3 +29,8 @@ portable-pty = "0.9"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# The listener-custody behavioral test binds a throwaway unix socket
+# in a tempdir; same version the workspace pins.
+tempfile = "3"

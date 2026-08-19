@@ -195,6 +195,9 @@ impl TerminalSession {
     /// between the save path and the reconnect path.
     pub(crate) fn to_manifest_entry(&self) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -601,6 +604,9 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn seeded_from_snapshot_round_trips() {
         let entry = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
@@ -650,6 +656,9 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn none_does_not_serialize() {
         let entry = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
@@ -714,6 +723,9 @@ mod manifest_entry_seeded_from_tests {
         // the round-trip preserves the flag so the toast renders
         // correctly post-restart.
         let entry = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
@@ -780,6 +792,9 @@ mod manifest_entry_seeded_from_tests {
             exited_at: 1_700_000_000.0,
         };
         let initial = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
@@ -828,6 +843,9 @@ mod manifest_entry_seeded_from_tests {
         // the pre-fix `last_exit: None`, the assertion at the end of
         // this test would fail.
         let rebuilt = ManifestEntry {
+            transcript_path: None,
+            reported_done_at: None,
+            report_reason: None,
             color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,

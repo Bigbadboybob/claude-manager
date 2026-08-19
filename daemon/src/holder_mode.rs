@@ -82,6 +82,14 @@ fn internal(msg: impl Into<String>) -> HolderError {
     }
 }
 
+/// Unix seconds (f64) — the tombstone/marker timebase.
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 /// What `signal` did.
 #[derive(Debug, PartialEq)]
 pub enum SignalOutcome {
@@ -266,6 +274,17 @@ impl HolderClient {
         verb: &str,
         body: impl serde::Serialize,
     ) -> Result<(Frame, Vec<OwnedFd>), HolderError> {
+        self.request_with_fds(verb, body, &[])
+    }
+
+    /// One request (carrying `fds` per the SCM_RIGHTS law) → one
+    /// reply.
+    fn request_with_fds(
+        &self,
+        verb: &str,
+        body: impl serde::Serialize,
+        fds: &[RawFd],
+    ) -> Result<(Frame, Vec<OwnedFd>), HolderError> {
         let req_id = self
             .next_req
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -280,8 +299,8 @@ impl HolderClient {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&req_id);
         };
-        let frame = Frame::new(verb, Some(req_id), 0, body);
-        if let Err(e) = self.send_raw(&frame, &[]) {
+        let frame = Frame::new(verb, Some(req_id), fds.len() as u8, body);
+        if let Err(e) = self.send_raw(&frame, fds) {
             cleanup(self);
             return Err(e);
         }
@@ -407,6 +426,58 @@ impl HolderClient {
         )
     }
 
+    /// Push a watcher-policy checkpoint (R12/C11).
+    pub fn update_checkpoint(
+        &self,
+        uid: &str,
+        incarnation: u64,
+        watcher_checkpoint: serde_json::Value,
+    ) -> Result<(), HolderError> {
+        self.expect_ok(
+            verbs::UPDATE_CHECKPOINT,
+            ch::UpdateCheckpointBody {
+                uid: uid.into(),
+                incarnation,
+                watcher_checkpoint,
+            },
+        )
+    }
+
+    /// Custody a listener fd with the holder (O11). The holder dups
+    /// via SCM_RIGHTS; the caller keeps its own fd.
+    pub fn store_listener(
+        &self,
+        meta: ch::ListenerMeta,
+        fd: RawFd,
+    ) -> Result<(), HolderError> {
+        let (f, _) = self.request_with_fds(
+            verbs::STORE_LISTENER,
+            ch::StoreListenerBody { listener: meta },
+            &[fd],
+        )?;
+        if f.v == verbs::OK {
+            return Ok(());
+        }
+        let e: ch::ErrBody = f.parse_body().map_err(internal)?;
+        Err(HolderError {
+            code: e.code,
+            message: e.message,
+        })
+    }
+
+    /// The holder's live status (surfaced on `daemon.health`).
+    pub fn status(&self) -> Result<ch::StatusReplyBody, HolderError> {
+        let (f, _) = self.request(verbs::STATUS, serde_json::json!({}))?;
+        if f.v != verbs::OK {
+            let e: ch::ErrBody = f.parse_body().map_err(internal)?;
+            return Err(HolderError {
+                code: e.code,
+                message: e.message,
+            });
+        }
+        f.parse_body().map_err(internal)
+    }
+
     /// Register for a session's exit event, claiming any parked
     /// redelivery first.
     pub fn subscribe_exit(&self, uid: &str, incarnation: u64) -> mpsc::Receiver<HolderExit> {
@@ -430,12 +501,9 @@ impl HolderClient {
     }
 
     /// The adopt handshake: every holder-resident session record
-    /// with fresh fd dups, then the done marker.
-    #[allow(clippy::type_complexity)]
-    pub fn adopt(
-        &self,
-    ) -> Result<(Vec<(ch::AdoptRecordBody, OwnedFd, OwnedFd)>, ch::AdoptDoneBody), HolderError>
-    {
+    /// with fresh fd dups, the custodied listeners (O11), then the
+    /// done marker.
+    pub fn adopt(&self) -> Result<HolderBoot, HolderError> {
         let req_id = self
             .next_req
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -447,7 +515,8 @@ impl HolderClient {
         let frame = Frame::new(verbs::ADOPT, Some(req_id), 0, serde_json::json!({}));
         self.send_raw(&frame, &[])?;
         let mut records = Vec::new();
-        let done = loop {
+        let mut listeners: Vec<(ch::ListenerMeta, OwnedFd)> = Vec::new();
+        let done: ch::AdoptDoneBody = loop {
             let (f, mut fds) = rx
                 .recv_timeout(REPLY_TIMEOUT)
                 .map_err(|_| internal("adopt stream stalled"))?;
@@ -465,7 +534,21 @@ impl HolderClient {
                     let master = fds.pop().expect("len checked");
                     records.push((body, master, pidfd));
                 }
-                verbs::ADOPT_LISTENERS => { /* phase 4 */ }
+                verbs::ADOPT_LISTENERS => {
+                    let body: ch::AdoptListenersBody = f.parse_body().map_err(internal)?;
+                    if fds.len() != body.listeners.len() {
+                        self.pending
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&req_id);
+                        return Err(internal(format!(
+                            "adopt_listeners: {} metas, {} fds",
+                            body.listeners.len(),
+                            fds.len()
+                        )));
+                    }
+                    listeners = body.listeners.into_iter().zip(fds).collect();
+                }
                 verbs::ADOPT_DONE => break f.parse_body().map_err(internal)?,
                 verbs::ERR => {
                     // A per-record dup failure — logged holder-side;
@@ -483,7 +566,42 @@ impl HolderClient {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&req_id);
-        Ok((records, done))
+        Ok(HolderBoot {
+            records,
+            listeners,
+            exit_events_pending: done.exit_events_pending,
+        })
+    }
+}
+
+/// Everything the adopt handshake returned, fetched EARLY in `run()`
+/// (before the listener decision — the custodied control socket must
+/// be resolvable before `bind_socket` would run) and consumed by
+/// [`adopt_at_boot`] once state exists. Session fds park here in the
+/// interim, untouched.
+pub struct HolderBoot {
+    pub records: Vec<(ch::AdoptRecordBody, OwnedFd, OwnedFd)>,
+    pub listeners: Vec<(ch::ListenerMeta, OwnedFd)>,
+    pub exit_events_pending: usize,
+}
+
+impl HolderBoot {
+    /// Take the custodied listener of `kind`, if the holder held one.
+    pub fn take_listener(&mut self, kind: &str) -> Option<(ch::ListenerMeta, OwnedFd)> {
+        let pos = self.listeners.iter().position(|(m, _)| m.kind == kind)?;
+        Some(self.listeners.remove(pos))
+    }
+}
+
+/// Fetch the adopt handshake or die — a brain that cannot adopt has
+/// nothing to serve; the holder respawns a fresh generation.
+pub fn fetch_boot(client: &Arc<HolderClient>) -> HolderBoot {
+    match client.adopt() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cm-daemon: holder adopt failed: {e} — exiting (holder respawns us)");
+            std::process::exit(70);
+        }
     }
 }
 
@@ -493,6 +611,7 @@ fn holder_exit_from_event(ev: &ch::ExitEventBody) -> HolderExit {
             code: ev.code,
             signal: ev.signal,
         },
+        incarnation: ev.incarnation,
         exited_at: ev.exited_at,
         attribution: ev.last_signal_request.as_ref().map(|l| HolderAttribution {
             sig: l.sig,
@@ -619,27 +738,71 @@ pub struct HolderPending {
     build: Option<crate::session::AdoptedSessionBuild>,
     pub uid: String,
     pub incarnation: u64,
+    /// Spawn-time kill-log baseline (0 when uncapped) — the
+    /// checkpoint composer's session-side half (the watcher's push
+    /// closure fills it into each pushed checkpoint).
+    pub kills_baseline: u64,
     pid: libc::pid_t,
     client: Arc<HolderClient>,
 }
+
+/// Runs between `on_exit` (which recorded the tombstone in memory)
+/// and the holder ack: `true` = the tombstone reached DISK (the 4c
+/// checked write) and the ack may proceed; `false` = the write
+/// failed — skip the ack so the holder redelivers to a brain
+/// generation that can persist (the C4 durable-commit order).
+pub type PreAckFn = Box<dyn FnOnce() -> bool + Send>;
 
 impl HolderPending {
     pub fn pid(&self) -> libc::pid_t {
         self.pid
     }
 
+    /// The watcher's checkpoint-push closure for this session
+    /// (R12/C11): fills in the session-side `kills_baseline` and
+    /// routes `update_checkpoint`, best-effort.
+    pub fn checkpoint_push(&self) -> crate::session_watch::CheckpointPushFn {
+        let client = Arc::clone(&self.client);
+        let (uid, inc, baseline) = (self.uid.clone(), self.incarnation, self.kills_baseline);
+        Arc::new(move |mut cp: crate::session_watch::WatcherCheckpoint| {
+            cp.kills_baseline = baseline;
+            match serde_json::to_value(&cp) {
+                Ok(v) => {
+                    if let Err(e) = client.update_checkpoint(&uid, inc, v) {
+                        eprintln!("cm-daemon: checkpoint push {uid}: {e}");
+                    }
+                }
+                Err(e) => eprintln!("cm-daemon: checkpoint serialize {uid}: {e}"),
+            }
+        })
+    }
+
     /// Arm under the state lock (same discipline as `arm_reaper`):
     /// wires the exit observer to the client's subscription, the
-    /// settle (ack + forget) hook, and the verb-routed kill.
+    /// settle (pre-ack persist gate → ack + forget) hook, and the
+    /// verb-routed kill.
     pub fn arm(
         mut self,
         on_exit: Option<crate::session::OnExitCallback>,
+        pre_ack: Option<PreAckFn>,
     ) -> anyhow::Result<DaemonSession> {
         let build = self.build.take().expect("arm called once");
         let events = self.client.subscribe_exit(&self.uid, self.incarnation);
         let settle_client = Arc::clone(&self.client);
         let (uid_s, inc_s) = (self.uid.clone(), self.incarnation);
         let settle: Box<dyn FnOnce() + Send> = Box::new(move || {
+            // C4: the ack is a statement that the tombstone is
+            // DURABLE. A failed checked write skips the ack — the
+            // event stays holder-pending and redelivers.
+            if let Some(gate) = pre_ack {
+                if !gate() {
+                    eprintln!(
+                        "cm-daemon: tombstone persist for {uid_s} failed — \
+                         NOT acking (the holder redelivers the exit event)"
+                    );
+                    return;
+                }
+            }
             if let Err(e) = settle_client.ack_exit(&uid_s, inc_s) {
                 eprintln!("cm-daemon: ack_exit {uid_s}: {e} (holder will redeliver)");
                 return;
@@ -759,6 +922,7 @@ pub fn holder_spawn(
             build: Some(build),
             uid: params.uid,
             incarnation: ok.incarnation,
+            kills_baseline: kills_baseline.unwrap_or(0),
             pid: ok.pid,
             client: Arc::clone(client),
         }),
@@ -783,22 +947,30 @@ pub fn holder_spawn(
 /// doesn't know are adopted with minimal meta and flagged in the
 /// title (`orphan_adopted` — sessions are user-owned, never
 /// auto-killed).
-pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderClient>) {
-    let (records, done) = match client.adopt() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("cm-daemon: holder adopt failed: {e} — exiting (holder respawns us)");
-            std::process::exit(70);
-        }
-    };
-    if records.is_empty() {
-        eprintln!("cm-daemon: holder adopt: no sessions held");
-        return;
+pub fn adopt_at_boot(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    client: &Arc<HolderClient>,
+    boot: HolderBoot,
+) {
+    let HolderBoot {
+        records,
+        listeners,
+        exit_events_pending,
+    } = boot;
+    // Listeners were claimed by run()'s bind decision; anything left
+    // is a kind this build doesn't know — closed (dropped), logged,
+    // tolerated (additive discipline).
+    for (meta, _fd) in &listeners {
+        eprintln!(
+            "cm-daemon: holder custodies a listener of unknown kind '{}' ({}) — ignored",
+            meta.kind, meta.meta
+        );
     }
+    drop(listeners);
     eprintln!(
         "cm-daemon: holder adopt: {} record(s), {} pending exit event(s)",
         records.len(),
-        done.exit_events_pending
+        exit_events_pending
     );
 
     // Index the persisted registry (also rebuilds workspaces /
@@ -812,6 +984,11 @@ pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderCli
             }
         }
     }
+    let coordinator = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::downgrade(&st.restart_coordinator)
+    };
+    let mut adopted_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (rec, master, pidfd) in records {
         // V2 reconciliation rule 3: reaped, nothing pending — the
@@ -825,7 +1002,16 @@ pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderCli
             let _ = client.forget(&rec.uid, rec.incarnation);
             continue;
         }
-        let meta = match persisted.get(&rec.uid) {
+        let entry = persisted.get(&rec.uid).cloned();
+        // R12: the holder-held policy checkpoint, parsed with the
+        // same loud version-gated parser the re-exec path uses; an
+        // unusable blob degrades to the fresh-policy reset inside
+        // `readopt_watcher`.
+        let checkpoint = rec
+            .watcher_checkpoint
+            .as_ref()
+            .and_then(|v| crate::session_watch::parse_watcher_checkpoint(&rec.uid, v));
+        let mut meta = match &entry {
             Some((ws_id, e)) => adopted_meta_from_manifest_entry(ws_id, e),
             None => {
                 eprintln!(
@@ -835,6 +1021,10 @@ pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderCli
                 orphan_meta(&rec.uid)
             }
         };
+        // The checkpoint's spawn-time kill-log baseline restores the
+        // cap-kill attribution window (R12); no checkpoint → fresh
+        // adopt-time capture inside build_adopted.
+        meta.kills_baseline = checkpoint.as_ref().map(|cp| cp.kills_baseline);
         let candidate = crate::adopt::SessionCandidate::from_raw_parts(
             rec.uid.clone(),
             rec.child_pid,
@@ -842,6 +1032,7 @@ pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderCli
             master,
         );
         let parts = candidate.promote();
+        let session_type = meta.session_type.clone();
         let build = match DaemonSession::build_adopted(parts, meta) {
             Ok(b) => b,
             Err(e) => {
@@ -856,9 +1047,21 @@ pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderCli
             build: Some(build),
             uid: rec.uid.clone(),
             incarnation: rec.incarnation,
+            kills_baseline: checkpoint.as_ref().map(|cp| cp.kills_baseline).unwrap_or(0),
             pid: rec.child_pid,
             client: Arc::clone(client),
         };
+        // Re-arm the memory-cap watcher for capped records, seeded
+        // from the checkpoint (R12) — before the lock, mirroring the
+        // spawn path's ordering. Its policy publishes push back to
+        // the holder (C11).
+        let watcher = readopt_watcher(
+            entry.as_ref().map(|(_, e)| e),
+            &rec,
+            checkpoint.as_ref(),
+            coordinator.clone(),
+            pending.checkpoint_push(),
+        );
         let state_for_cleanup = Arc::clone(state_arc);
         let uid_for_cleanup = rec.uid.clone();
         let on_exit: crate::session::OnExitCallback = Box::new(move |_status| {
@@ -866,6 +1069,20 @@ pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderCli
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             crate::control::methods::handle_session_exit(&mut s, &uid_for_cleanup);
+        });
+        // C4: the holder ack asserts the tombstone reached disk.
+        let state_for_ack = Arc::clone(state_arc);
+        let pre_ack: PreAckFn = Box::new(move || {
+            let st = state_for_ack.lock().unwrap_or_else(|p| p.into_inner());
+            match st.save_daemon_tombstones_checked(
+                &crate::state::default_daemon_tombstones_path(),
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("cm-daemon: checked tombstone persist failed: {e}");
+                    false
+                }
+            }
         });
         // Same lock discipline as the spawn path: arm + insert under
         // one hold, arm_reap after (insert-first is the ordering
@@ -884,8 +1101,12 @@ pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderCli
                 std::mem::forget(pending);
                 continue;
             }
-            match pending.arm(Some(on_exit)) {
-                Ok(sess) => {
+            match pending.arm(Some(on_exit), Some(pre_ack)) {
+                Ok(mut sess) => {
+                    if let Some(w) = watcher {
+                        sess.watcher_handle = Some(w.handle);
+                        sess.watcher_state = Some(w.state);
+                    }
                     st.sessions.insert(rec.uid.clone(), sess);
                 }
                 Err(e) => {
@@ -897,17 +1118,99 @@ pub fn adopt_at_boot(state_arc: &Arc<Mutex<DaemonState>>, client: &Arc<HolderCli
                 }
             }
         }
-        if let Err(e) = client.arm_reap(&rec.uid, rec.incarnation, rec.cgroup_path.clone()) {
+        // Prefer the checkpoint's DISCOVERED scope path for the
+        // holder's memory.events carve-out (V5); the prefix-shaped
+        // rec.cgroup_path is the fallback.
+        let carveout_path = checkpoint
+            .as_ref()
+            .map(|cp| cp.cgroup_path.clone())
+            .or_else(|| rec.cgroup_path.clone());
+        if let Err(e) = client.arm_reap(&rec.uid, rec.incarnation, carveout_path) {
             eprintln!("cm-daemon: arm_reap {}: {e}", rec.uid);
         }
+        // 4f parity with the spawn funnel: adopted codex sessions get
+        // their rollout watch re-armed (rollout ids rotate on
+        // /compact and codex runs no cm hook).
+        if session_type == "codex" {
+            crate::transcript_detect::spawn_codex_rollout_watch(
+                Arc::clone(state_arc),
+                rec.uid.clone(),
+            );
+        }
+        adopted_uids.insert(rec.uid.clone());
         eprintln!(
             "cm-daemon: holder adopt '{}' (pid {}, incarnation {})",
             rec.uid, rec.child_pid, rec.incarnation
         );
     }
+
+    // § Exit provenance, the "no status" residual: a SURVIVING holder
+    // (epoch > 1) that does not hold a session the persisted registry
+    // believes is live means the session is gone with no
+    // reconstructible status — tombstone it `status_lost`, honestly,
+    // instead of letting legacy restore respawn a `--resume` twin of
+    // a conversation whose ending nobody saw. A FRESH holder
+    // (epoch == 1: first boot after a machine restart) holds nothing
+    // by construction — those entries belong to legacy restore.
+    if client.epoch > 1 {
+        let mut lost = 0usize;
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        for (uid, (ws_id, e)) in &persisted {
+            if adopted_uids.contains(uid)
+                || st.sessions.contains_key(uid)
+                || e.last_exit.is_some()
+                || e.workflow_run_id.is_some()
+            {
+                continue;
+            }
+            let exited_at = unix_now();
+            st.record_exited(crate::state::ExitedTombstone {
+                session_uid: uid.clone(),
+                transcript_path: e.transcript_path.clone(),
+                generation: e.generation,
+                session_type: e.session_type.clone(),
+                workspace_id: ws_id.clone(),
+                task_id: e.task_id.clone(),
+                managed_by_uid: e.managed_by_uid.clone(),
+                label: e.label.clone(),
+                workflow_run_id: None,
+                workflow_role: None,
+                worktree_path: None,
+                global_perms: e.global_perms,
+                exited_at,
+                killed: false,
+                killed_by: None,
+                reported_done_at: e.reported_done_at,
+                report_reason: e.report_reason.clone(),
+                incarnation: None,
+                status_lost: true,
+            });
+            eprintln!(
+                "cm-daemon: session '{}' is in the persisted registry but not \
+                 held by the surviving holder — tombstoned status_lost (no \
+                 reconstructible exit status)",
+                uid
+            );
+            lost += 1;
+        }
+        if lost > 0 {
+            // Durable: the status_lost verdict must survive the next
+            // brain restart too.
+            if let Err(e) = st.save_daemon_tombstones_checked(
+                &crate::state::default_daemon_tombstones_path(),
+            ) {
+                eprintln!("cm-daemon: status_lost tombstone persist: {e}");
+            }
+            // Rewriting the registry from the LIVE sessions drops the
+            // lost entries, so the legacy restore pass below cannot
+            // respawn them. Deliberately NOT done at epoch 1, where
+            // the same rewrite would erase legitimately-restorable
+            // entries before restore reads them.
+            st.persist_sessions_best_effort();
+        }
+    }
     let count = {
         let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        st.persist_sessions_best_effort();
         st.sessions.len()
     };
     eprintln!("cm-daemon: holder adopt complete — {count} session(s) live");
@@ -923,11 +1226,11 @@ fn adopted_meta_from_manifest_entry(
         workspace_id: ws_id.to_string(),
         managed_by_uid: e.managed_by_uid.clone(),
         task_id: e.task_id.clone(),
-        // The persisted entry carries the transcript ID, not the
-        // path; the path rebinds via `session.set_transcript_path`
-        // (TUI detection) — a named phase-4 gap, harmless for
-        // control-plane recovery.
-        transcript_path: None,
+        // Phase 4: the persisted entry now carries the PATH (the
+        // phase-3 gap) — transcript reads work immediately
+        // post-adopt. Older files default `None`; the TUI's next
+        // `session.set_transcript_path` heals those.
+        transcript_path: e.transcript_path.clone(),
         memory_cap_soft_bytes: e.memory_cap_soft_bytes,
         memory_cap_hard_bytes: e.memory_cap_hard_bytes,
         cgroup_prefix: e.cgroup_prefix.clone(),
@@ -936,16 +1239,131 @@ fn adopted_meta_from_manifest_entry(
         continuous_task_id: e.continuous_task_id.clone(),
         global_perms: e.global_perms,
         generation: e.generation,
+        // Activity cells reset to adoption time — the state-inventory
+        // delta's accepted reset (afterglow UI restarts; auth and
+        // status logic re-derive from fresh input).
         last_activity_at: None,
         last_input_at: None,
         last_operator_input_at: None,
         last_turn_end_at: None,
-        done_report: None,
+        // R11: the report_done marker survives the brain restart —
+        // an until="final" watcher must keep seeing status="reported".
+        done_report: e.reported_done_at.map(|at| crate::session::ReportedDone {
+            at_unix: at,
+            at_instant: instant_at_unix(at),
+            reason: e.report_reason.clone(),
+        }),
         kills_dir: e
             .memory_cap_soft_bytes
             .map(|_| crate::path::default_kills_dir())
             .flatten(),
         kills_baseline: None,
+    }
+}
+
+/// Reconstruct an `Instant` for a past unix timestamp (the re-exec
+/// age-reconstruction idiom): `now - age`, clamped at now for a
+/// future-dated stamp (clock skew).
+fn instant_at_unix(at_unix: f64) -> std::time::Instant {
+    let now = unix_now();
+    let age = (now - at_unix).max(0.0);
+    std::time::Instant::now()
+        .checked_sub(Duration::from_secs_f64(age))
+        .unwrap_or_else(std::time::Instant::now)
+}
+
+/// Re-arm the memory-cap watcher for an adopted capped record —
+/// the holder-mode sibling of `reexec::respawn_adopted_watcher`:
+/// caps from the persisted entry, policy from the holder-held
+/// checkpoint (R12), fresh-policy reset (loud) without one.
+fn readopt_watcher(
+    entry: Option<&crate::manifest::ManifestEntry>,
+    rec: &ch::AdoptRecordBody,
+    checkpoint: Option<&crate::session_watch::WatcherCheckpoint>,
+    coordinator: std::sync::Weak<crate::restart_coordinator::RestartCoordinator>,
+    push: crate::session_watch::CheckpointPushFn,
+) -> Option<crate::session_watch::SpawnedWatcher> {
+    let entry = entry?;
+    let soft_cap_bytes = entry.memory_cap_soft_bytes?;
+    let hard_cap_bytes = crate::control::methods::resolve_watcher_hard_cap_bytes(
+        entry.memory_cap_hard_bytes,
+    );
+    let Some(kills_dir) = crate::path::default_kills_dir() else {
+        eprintln!(
+            "cm-daemon: adopted capped session '{}': no kills dir resolves — \
+             memory cap UNENFORCED (no watcher); adoption proceeds",
+            rec.uid,
+        );
+        return None;
+    };
+    let (cgroup_path, initial_high, restored_protected) = match checkpoint {
+        Some(cp) => (
+            std::path::PathBuf::from(&cp.cgroup_path),
+            cp.last_high,
+            cp.protected
+                .as_ref()
+                .map(|v| v.iter().copied().collect::<std::collections::HashSet<(u32, u64)>>()),
+        ),
+        None => {
+            eprintln!(
+                "cm-daemon: adopted capped session '{}': no usable watcher \
+                 checkpoint — POLICY RESET: fresh watcher (protected set \
+                 recomputed, breach watermark re-anchored)",
+                rec.uid,
+            );
+            let discovered = match crate::path::discover_session_cgroup_path(
+                rec.child_pid as u32,
+                Duration::from_millis(500),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "cm-daemon: adopted capped session '{}': cgroup \
+                         re-discovery failed ({}) — memory cap UNENFORCED; \
+                         adoption proceeds",
+                        rec.uid, e,
+                    );
+                    return None;
+                }
+            };
+            let high = crate::session_watch::read_memory_events_high(&discovered);
+            (discovered, high, None)
+        }
+    };
+    match crate::session_watch::spawn_watcher(
+        rec.uid.clone(),
+        cgroup_path.clone(),
+        soft_cap_bytes,
+        hard_cap_bytes,
+        kills_dir,
+        initial_high,
+        crate::session_watch::default_watcher_spawn_fn(),
+        Some(coordinator),
+        restored_protected,
+        Some(push),
+    ) {
+        Ok(w) => {
+            eprintln!(
+                "cm-daemon: adopted capped session '{}': memory-cap watcher \
+                 re-armed on {} ({})",
+                rec.uid,
+                cgroup_path.display(),
+                if checkpoint.is_some() {
+                    "checkpoint policy"
+                } else {
+                    "fresh policy"
+                },
+            );
+            Some(w)
+        }
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: adopted capped session '{}': watcher re-arm \
+                 failed ({}) — memory cap UNENFORCED; adoption proceeds",
+                rec.uid, e,
+            );
+            None
+        }
     }
 }
 
@@ -972,5 +1390,84 @@ fn orphan_meta(uid: &str) -> AdoptedSessionMeta {
         done_report: None,
         kills_dir: None,
         kills_baseline: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry_with(
+        reported_done_at: Option<f64>,
+        report_reason: Option<String>,
+        transcript_path: Option<String>,
+    ) -> crate::manifest::ManifestEntry {
+        crate::manifest::ManifestEntry {
+            uid: "ts-abc-1".into(),
+            managed_by_uid: Some("ts-parent-1".into()),
+            generation: 3,
+            label: "worker".into(),
+            session_type: "claude-code".into(),
+            transcript_id: Some("abc".into()),
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: None,
+            task_id: Some("task-1".into()),
+            notify_on_idle: false,
+            color: None,
+            memory_cap_soft_bytes: Some(1024),
+            memory_cap_hard_bytes: Some(2048),
+            cgroup_prefix: None,
+            global_perms: true,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: crate::host_id::HostId::local(),
+            transcript_path,
+            reported_done_at,
+            report_reason,
+        }
+    }
+
+    /// R11: the persisted report_done marker reconstructs onto the
+    /// adopted session — status="reported" survives a brain restart.
+    #[test]
+    fn adopted_meta_restores_done_report_and_transcript_path() {
+        let now = unix_now();
+        let e = entry_with(
+            Some(now - 30.0),
+            Some("all tests green".into()),
+            Some("/tmp/abc.jsonl".into()),
+        );
+        let meta = adopted_meta_from_manifest_entry("ws-1", &e);
+        assert_eq!(meta.workspace_id, "ws-1");
+        assert_eq!(meta.transcript_path.as_deref(), Some("/tmp/abc.jsonl"));
+        assert_eq!(meta.global_perms, true);
+        assert_eq!(meta.memory_cap_soft_bytes, Some(1024));
+        let dr = meta.done_report.expect("marker restored");
+        assert_eq!(dr.at_unix, now - 30.0);
+        assert_eq!(dr.reason.as_deref(), Some("all tests green"));
+        // The reconstructed Instant is ~30s old (the age math), with
+        // slack for test scheduling.
+        let age = dr.at_instant.elapsed().as_secs_f64();
+        assert!((25.0..40.0).contains(&age), "age {age}");
+    }
+
+    #[test]
+    fn adopted_meta_without_marker_stays_unreported() {
+        let e = entry_with(None, None, None);
+        let meta = adopted_meta_from_manifest_entry("ws-1", &e);
+        assert!(meta.done_report.is_none());
+        assert!(meta.transcript_path.is_none());
+    }
+
+    /// A future-dated stamp (clock skew) clamps to now instead of
+    /// panicking on Instant underflow.
+    #[test]
+    fn instant_at_unix_tolerates_future_stamps() {
+        let i = instant_at_unix(unix_now() + 3600.0);
+        assert!(i.elapsed().as_secs() < 5);
     }
 }
