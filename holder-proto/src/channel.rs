@@ -96,6 +96,9 @@ pub mod verbs {
     pub const FORGET: &str = "forget";
     pub const EXIT_EVENT: &str = "exit_event";
     pub const ACK_EXIT: &str = "ack_exit";
+    pub const RESTART_BRAIN: &str = "restart_brain";
+    pub const ROLLBACK_BRAIN: &str = "rollback_brain";
+    pub const CANCEL_PENDING: &str = "cancel_pending";
     pub const STATUS: &str = "status";
     pub const PING: &str = "ping";
     pub const PONG: &str = "pong";
@@ -338,6 +341,10 @@ pub struct StatusReplyBody {
     pub holder_build_id: String,
     /// Consecutive pings the current brain has not answered.
     pub pings_unanswered: u64,
+    /// Whether a previous brain pin exists (`rollback_brain`'s
+    /// precondition). Additive (phase 6); old holders default false.
+    #[serde(default)]
+    pub previous_pin: bool,
 }
 
 /// Watchdog heartbeat (holder → brain / brain → holder). The pong

@@ -47,6 +47,7 @@ fn test_config() -> HolderConfig {
         ping_interval: None,
         outbound_max_frames: 4096,
         holder_build_id: "cm-holder/test".into(),
+        extra_fd: None,
     }
 }
 
@@ -94,6 +95,14 @@ impl Brain {
         if let Some(hit) = self.buffered.pop_front() {
             return hit;
         }
+        self.recv_fresh()
+    }
+
+    /// Read the next frame from the SOCKET, never from the buffer —
+    /// the waiter loops below push non-matching frames INTO the
+    /// buffer, so popping it back here would spin forever on the
+    /// same unsolicited frame (e.g. a ping arriving mid-request).
+    fn recv_fresh(&mut self) -> (Frame, Vec<OwnedFd>) {
         let deadline = Instant::now() + DEADLINE;
         loop {
             if let Some(hit) = self.reader.next_frame().expect("protocol") {
@@ -119,7 +128,7 @@ impl Brain {
             return self.buffered.remove(pos).unwrap();
         }
         loop {
-            let (f, fds) = self.recv_any();
+            let (f, fds) = self.recv_fresh();
             if f.req_id == Some(req_id) {
                 return (f, fds);
             }
@@ -152,7 +161,7 @@ impl Brain {
             return f.parse_body().unwrap();
         }
         loop {
-            let (f, fds) = self.recv_any();
+            let (f, fds) = self.recv_fresh();
             if f.v == verbs::EXIT_EVENT {
                 return f.parse_body().unwrap();
             }
@@ -192,7 +201,7 @@ impl Brain {
         let id = self.send(verbs::ADOPT, serde_json::json!({}));
         let mut records = Vec::new();
         loop {
-            let (f, fds) = self.recv_any();
+            let (f, fds) = self.recv_fresh();
             if f.req_id != Some(id) {
                 self.buffered.push_back((f, fds));
                 continue;
@@ -212,7 +221,7 @@ fn start(holder: Holder) -> (JoinHandle<(Holder, ServeOutcome)>, Brain) {
     let (ours, theirs) = socketpair();
     let handle = std::thread::spawn(move || {
         let mut h = holder;
-        let out = h.serve(ours);
+        let out = h.serve(ours, None);
         (h, out)
     });
     (handle, Brain::new(theirs))
@@ -261,7 +270,7 @@ fn hello_negotiates_and_status_answers() {
     let st: ch::StatusReplyBody = f.parse_body().unwrap();
     assert_eq!(st.sessions, 0);
     assert_eq!(st.epoch, 1);
-    assert_eq!(st.breaker_state, "none");
+    assert_eq!(st.breaker_state, "running");
 
     drop(brain);
     let (_h, out) = join.join().unwrap();
@@ -781,8 +790,8 @@ fn delivered_but_unacked_events_redeliver_and_acks_are_idempotent() {
 fn unknown_verbs_get_a_typed_error_and_the_channel_lives_on() {
     let (join, mut brain) = start(Holder::new(test_config()));
     brain.hello();
-    // A future/phase-6 verb this holder does not speak.
-    let (f, _) = brain.request("restart_brain", serde_json::json!({}));
+    // A future/phase-7 verb this holder does not speak.
+    let (f, _) = brain.request("migrate_split", serde_json::json!({}));
     assert_eq!(err_of(&f).code, ch::ERR_UNSUPPORTED_VERB);
     // Channel still healthy.
     let (f, _) = brain.request(verbs::STATUS, serde_json::json!({}));
@@ -1126,4 +1135,111 @@ fn unknown_fields_ride_every_verb_without_harm() {
     assert_eq!(f.v, verbs::OK, "{f:?}");
     drop(brain);
     join.join().unwrap();
+}
+
+#[test]
+fn missed_pongs_declare_the_brain_wedged() {
+    // § Supervision: pong is lock-free by spec (S9), so a miss is a
+    // real wedge — WEDGE_MISSED_PONGS consecutive misses end the
+    // generation as Wedged (the binary then SIGKILLs + respawns).
+    let mut cfg = test_config();
+    cfg.ping_interval = Some(Duration::from_millis(60));
+    let (join, mut brain) = start(Holder::new(cfg));
+    brain.hello();
+    // Answer NOTHING from here on.
+    let (_h, out) = join.join().unwrap();
+    assert!(
+        matches!(out, ServeOutcome::Wedged(ref r) if r.contains("unanswered")),
+        "{out:?}"
+    );
+    drop(brain);
+}
+
+#[test]
+fn a_slow_but_ponging_brain_is_not_killed() {
+    // S9's counterpart: a brain that answers pings (lock-free) while
+    // doing nothing else is SLOW, not wedged — it must outlive many
+    // ping intervals.
+    let mut cfg = test_config();
+    cfg.ping_interval = Some(Duration::from_millis(50));
+    let (join, mut brain) = start(Holder::new(cfg));
+    brain.hello();
+    let hold_until = Instant::now() + Duration::from_millis(600); // 12 intervals
+    while Instant::now() < hold_until {
+        if let Some((f, _fds)) = brain.try_recv() {
+            if f.v == verbs::PING {
+                let p: ch::PingBody = f.parse_body().unwrap();
+                let pong = Frame::new(verbs::PONG, None, 0, ch::PingBody { seq: p.seq });
+                ch::send_frame_blocking(brain.fd.as_fd(), &pong, &[]).unwrap();
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    // Still alive: a request answers.
+    let (f, _) = brain.request(verbs::STATUS, serde_json::json!({}));
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    drop(brain);
+    let (_h, out) = join.join().unwrap();
+    assert_eq!(out, ServeOutcome::BrainEof, "EOF, never Wedged");
+}
+
+#[test]
+fn deploy_verbs_arm_disarm_and_survive_to_the_supervisor() {
+    use cm_holder::holder::ArmedDeploy;
+    // rollback_brain without a previous pin → not_found.
+    let (join, mut brain) = start(Holder::new(test_config()));
+    brain.hello();
+    let (f, _) = brain.request(verbs::ROLLBACK_BRAIN, serde_json::json!({}));
+    assert_eq!(err_of(&f).code, ch::ERR_NOT_FOUND);
+
+    // restart_brain arms with the pinned fd; cancel_pending disarms.
+    let mut pipefd = [0i32; 2];
+    // SAFETY: valid out-array.
+    assert_eq!(unsafe { libc::pipe(pipefd.as_mut_ptr()) }, 0);
+    // SAFETY: pipe succeeded.
+    let (_pr, pw) = (unsafe { OwnedFd::from_raw_fd(pipefd[0]) }, unsafe {
+        OwnedFd::from_raw_fd(pipefd[1])
+    });
+    let arm = Frame::new(verbs::RESTART_BRAIN, Some(700), 1, serde_json::json!({}));
+    ch::send_frame_blocking(brain.fd.as_fd(), &arm, &[pw.as_raw_fd()]).unwrap();
+    let (f, _) = brain.wait_reply(700);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    let (f, _) = brain.request(verbs::CANCEL_PENDING, serde_json::json!({}));
+    let ok: ch::OkBody = f.parse_body().unwrap();
+    assert_eq!(ok.detail.unwrap()["disarmed"], serde_json::json!(true));
+
+    // Re-arm, then "exit": the supervisor consumes the armed deploy.
+    let arm = Frame::new(verbs::RESTART_BRAIN, Some(701), 1, serde_json::json!({}));
+    ch::send_frame_blocking(brain.fd.as_fd(), &arm, &[pw.as_raw_fd()]).unwrap();
+    let (f, _) = brain.wait_reply(701);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    drop(brain);
+    let (mut h, out) = join.join().unwrap();
+    assert_eq!(out, ServeOutcome::BrainEof);
+    assert!(
+        matches!(h.take_armed_deploy(), Some(ArmedDeploy::NewPin(_))),
+        "the armed pin must survive to the supervisor"
+    );
+    assert!(h.take_armed_deploy().is_none(), "consumed once");
+
+    // With a previous pin published, rollback_brain arms UsePrevious.
+    let (join2, mut brain2) = {
+        h.set_supervisor_status("running", true);
+        let (ours, theirs) = socketpair();
+        let handle = std::thread::spawn(move || {
+            let out = h.serve(ours, None);
+            (h, out)
+        });
+        (handle, Brain::new(theirs))
+    };
+    brain2.hello();
+    let (f, _) = brain2.request(verbs::ROLLBACK_BRAIN, serde_json::json!({}));
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    drop(brain2);
+    let (mut h, _) = join2.join().unwrap();
+    assert!(matches!(
+        h.take_armed_deploy(),
+        Some(ArmedDeploy::UsePrevious)
+    ));
 }

@@ -191,11 +191,36 @@ pub fn ensure_daemon_at_startup_with_timeout(
     ensure_daemon_running(
         &abs_socket,
         move || {
-            let bin = locate_daemon_binary()?;
-            spawn_daemon_binary(&bin, &abs_socket_for_spawn, &token)
+            let (bin, args) = locate_launch_spec()?;
+            spawn_daemon_binary(&bin, &args, &abs_socket_for_spawn, &token)
         },
         timeout,
     )
+}
+
+/// What to launch (DESIGN_HOLDER_BRAIN_SPLIT phase 6, O12): the
+/// holder/brain split is entered ONLY by explicit configuration —
+/// `CM_HOLDER_BINARY` names the cm-holder binary, and the TUI then
+/// launches `cm-holder --brain <cm-daemon>`. NEVER inferred from
+/// sibling-binary presence (merely building the workspace must not
+/// flip a host into the split before its soak). Unset → today's
+/// monolith launch.
+pub(crate) fn locate_launch_spec() -> std::io::Result<(PathBuf, Vec<std::ffi::OsString>)> {
+    if let Some(h) = std::env::var_os("CM_HOLDER_BINARY") {
+        let holder = canonicalize_binary_path(&PathBuf::from(h))?;
+        let daemon = locate_daemon_binary()?;
+        eprintln!(
+            "cm-tui: CM_HOLDER_BINARY set — launching the holder/brain split \
+             ({} --brain {})",
+            holder.display(),
+            daemon.display()
+        );
+        return Ok((
+            holder,
+            vec!["--brain".into(), daemon.into_os_string()],
+        ));
+    }
+    Ok((locate_daemon_binary()?, Vec::new()))
 }
 
 /// Core auto-launch logic, parameterized over the spawner so tests
@@ -285,12 +310,35 @@ fn warn_if_daemon_binary_stale(socket_path: &Path) {
          methods that exist in the current source.",
         pid,
     );
-    eprintln!(
-        "cm-tui:   To pick up the new binary: stop the TUI, run \
-         `pkill cm-daemon`, then relaunch the TUI (it will respawn the \
-         daemon from the on-disk binary). All running sessions will be \
-         killed."
-    );
+    // Holder-split (phase 6, O12): the split changes the ADVICE —
+    // `pkill cm-daemon` would SIGKILL the BRAIN (the holder counts a
+    // crash and respawns the OLD pin: a silent revert). Detect the
+    // split by the peer's parent being cm-holder (SO_PEERCRED names
+    // the listener's binder, whose parent is the holder).
+    let split = std::fs::read_to_string(format!("/proc/{}/stat", pid))
+        .ok()
+        .and_then(|stat| {
+            let rest = &stat[stat.rfind(')')? + 1..];
+            let ppid: i32 = rest.split_whitespace().nth(1)?.parse().ok()?;
+            std::fs::read_to_string(format!("/proc/{}/comm", ppid)).ok()
+        })
+        .is_some_and(|comm| comm.trim() == "cm-holder");
+    if split {
+        eprintln!(
+            "cm-tui:   This daemon runs in holder/brain SPLIT mode: deploy the \
+             new binary with `scripts/cm-redeploy` (daemon.restart → the \
+             holder's restart_brain path) — sessions survive. NEVER `pkill \
+             cm-daemon` here: that kills the brain and the holder reverts to \
+             the OLD pinned binary."
+        );
+    } else {
+        eprintln!(
+            "cm-tui:   To pick up the new binary: stop the TUI, run \
+             `pkill cm-daemon`, then relaunch the TUI (it will respawn the \
+             daemon from the on-disk binary). All running sessions will be \
+             killed."
+        );
+    }
 }
 
 /// Read the peer's PID off a UnixStream connected to
@@ -442,10 +490,14 @@ pub(crate) use cm_daemon::path::absolutize_socket_path;
 /// the production source and does that).
 fn spawn_daemon_binary(
     bin: &Path,
+    args: &[std::ffi::OsString],
     socket_path: &Path,
     operator_token: &str,
 ) -> std::io::Result<()> {
     let mut cmd = prepare_daemon_command(bin, socket_path, operator_token);
+    // Holder-split launch (phase 6): `--brain <cm-daemon>` when
+    // CM_HOLDER_BINARY selected the split; empty otherwise.
+    cmd.args(args);
     apply_detach_pre_exec(&mut cmd);
     let child = cmd.spawn()?;
     // Reap the child if it exits before us. `setsid()` in pre_exec
@@ -809,7 +861,7 @@ mod tests {
         // same /bin/true spawner.
         let result = ensure_daemon_running(
             &path,
-            || spawn_daemon_binary(Path::new("/bin/true"), &path, "test-operator-token"),
+            || spawn_daemon_binary(Path::new("/bin/true"), &[], &path, "test-operator-token"),
             Duration::from_millis(150),
         );
         let err = result.expect_err("daemon binary that doesn't bind must time out");

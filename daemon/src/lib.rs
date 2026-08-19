@@ -334,6 +334,67 @@ extern "C" fn sighup_set_flag(_sig: libc::c_int) {
     SIGHUP_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Holder-split phase 6 (S7): SIGTERM handled gracefully IN HOLDER
+/// MODE — the holder forwards SIGTERM as the stop-everything
+/// sequence's first step; the brain persists its durable state and
+/// exits, and the HOLDER (not PTY teardown) then kills the children.
+/// Monolith mode deliberately keeps today's default-terminate.
+static SIGTERM_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn sigterm_set_flag(_sig: libc::c_int) {
+    SIGTERM_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The brain-deploy preflight (DESIGN_HOLDER_BRAIN_SPLIT phase 6,
+/// `--daemon-preflight`): the CANDIDATE brain binary proving it can
+/// parse this host's config and durable state before the running
+/// brain arms `restart_brain` with it. Verify-only — no socket bind,
+/// no spawn/restore, no writes. Exit 0 = fit to deploy.
+pub fn run_daemon_preflight() -> i32 {
+    let config_path = config::default_config_path();
+    if let Err(e) = config::load_or_default(&config_path) {
+        eprintln!(
+            "cm-daemon --daemon-preflight REFUSED: config at {} does not parse: {e}",
+            config_path.display()
+        );
+        return 1;
+    }
+    let sessions_path = state::default_daemon_sessions_path();
+    if sessions_path.exists() {
+        match std::fs::read_to_string(&sessions_path) {
+            Ok(raw) => {
+                if let Err(e) = serde_json::from_str::<manifest::Manifest>(&raw) {
+                    eprintln!(
+                        "cm-daemon --daemon-preflight REFUSED: {} does not parse \
+                         as this binary's registry schema: {e}",
+                        sessions_path.display()
+                    );
+                    return 1;
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "cm-daemon --daemon-preflight REFUSED: cannot read {}: {e}",
+                    sessions_path.display()
+                );
+                return 1;
+            }
+        }
+    }
+    match state::read_daemon_tombstones(&state::default_daemon_tombstones_path()) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "cm-daemon --daemon-preflight REFUSED: tombstone sidecar does not parse: {e}"
+            );
+            return 1;
+        }
+    }
+    eprintln!("cm-daemon --daemon-preflight OK (config + registry + tombstones parse)");
+    0
+}
+
 pub fn run() -> anyhow::Result<()> {
     // FIRST, before anything reads env or spawns: scrub Claude-session
     // identity vars inherited from a launcher that ran inside a claude
@@ -770,6 +831,18 @@ pub fn run() -> anyhow::Result<()> {
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
     }
+    // Holder-split phase 6 (S7): the brain's graceful SIGTERM —
+    // installed IN HOLDER MODE ONLY (the monolith keeps today's
+    // default-terminate `systemctl stop` semantics). The holder
+    // forwards SIGTERM as step 1 of stop-everything; the brain's job
+    // is persist + exit(0) (exit skips Drops — holder-owned sessions
+    // are inert-Drop anyway — and the HOLDER kills the children).
+    if holder_active {
+        // SAFETY: flag-store-only handler, same shape as SIGHUP's.
+        unsafe {
+            libc::signal(libc::SIGTERM, sigterm_set_flag as libc::sighandler_t);
+        }
+    }
     {
         let state_for_hup = std::sync::Arc::clone(&state);
         // Spawn failure is non-fatal: the RPC path still works, and the
@@ -778,6 +851,21 @@ pub fn run() -> anyhow::Result<()> {
             .name("cm-daemon-sighup".into())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
+                if SIGTERM_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!(
+                        "cm-daemon: SIGTERM (holder stop sequence) — persisting \
+                         durable state and exiting; the holder stops the children"
+                    );
+                    let st = state_for_hup.lock().unwrap_or_else(|p| p.into_inner());
+                    st.persist_sessions_best_effort();
+                    if let Err(e) = st.save_daemon_tombstones_checked(
+                        &state::default_daemon_tombstones_path(),
+                    ) {
+                        eprintln!("cm-daemon: SIGTERM tombstone persist: {e}");
+                    }
+                    drop(st);
+                    std::process::exit(0);
+                }
                 if SIGHUP_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     eprintln!("cm-daemon: SIGHUP — reloading daemon.toml");
                     if let Err((code, msg)) =
@@ -961,6 +1049,9 @@ pub fn run() -> anyhow::Result<()> {
         // reboot: restore spawns them THROUGH the holder via the spawn
         // seam; adopted uids are registry-skipped).
         if let Some(client) = holder_mode::global() {
+            // The dying-brain persist hook (channel EOF / protocol
+            // violation exits — the shutdown sequence's actual path).
+            holder_mode::set_state_for_exit(&state);
             let boot = holder_boot
                 .take()
                 .expect("holder mode fetched the boot handshake at startup");

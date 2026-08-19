@@ -581,22 +581,69 @@ if [ "$HEALTH_OK" != "True" ]; then
     fall_back_to_legacy "daemon.health answered a structured error ($ERR_CODE: $ERR_MSG)"
 fi
 
-# DESIGN_HOLDER_BRAIN_SPLIT phase 3 (O13): a split-mode daemon must never
-# be driven by this script's monolith primitives. The legacy path would
-# pgrep-match the BRAIN (same binary name), SIGKILL it (a breaker strike +
-# a silent revert to the holder's previous pin), then race a fresh
-# monolith against the holder-held listener; the seamless path's
-# daemon.restart is refused daemon-side for the same reason. Refuse both
-# until phase 6's restart_brain deploy path lands.
+# DESIGN_HOLDER_BRAIN_SPLIT phase 6: on a split-mode daemon this script's
+# deploy primitive is the BRAIN deploy — daemon.restart pins + preflights
+# the new binary, quiesces, arms restart_brain, and exits; the HOLDER
+# execs the pin (sessions never die; the socket never unbinds). The O8
+# verify recipe: holder_epoch increments once, then a soak asserts no
+# crash-loop rollback silently reverted the deploy; the DEFINITIVE
+# all-clear is the breaker's 10-minute stability horizon, printed for the
+# operator rather than blocked on.
 SPLIT_MODE=$(resp_field "$HEALTH_RESP" "(d.get('result') or {}).get('split')")
 if [ "$SPLIT_MODE" = "True" ]; then
-    echo "ERROR: this daemon runs in holder/brain SPLIT mode (daemon.health -> split: true)." >&2
-    echo "       cm-redeploy's primitives are monolith-only: the legacy kill path would" >&2
-    echo "       SIGKILL the brain (the holder counts a crash and reverts the deploy)," >&2
-    echo "       and daemon.restart is refused daemon-side in split mode." >&2
-    echo "       Brain deploys use the holder's restart_brain path" >&2
-    echo "       (DESIGN_HOLDER_BRAIN_SPLIT phase 6 — not yet implemented)." >&2
-    exit 2
+    step "split mode: brain deploy via daemon.restart -> restart_brain"
+    OLD_EPOCH=$(resp_field "$HEALTH_RESP" "(d.get('result') or {}).get('holder_epoch')")
+    OLD_SESS=$(resp_field "$HEALTH_RESP" "(d.get('result') or {}).get('sessions')")
+    echo "  holder_epoch: $OLD_EPOCH, sessions: $OLD_SESS"
+    RESTART_RESP=$(cm_op_call daemon.restart '{}' || true)
+    R_OK=$(resp_field "$RESTART_RESP" "d.get('ok')")
+    if [ "$R_OK" != "True" ]; then
+        R_ERR=$(resp_field "$RESTART_RESP" "(d.get('error') or {}).get('message')")
+        echo "ERROR: brain deploy refused: $R_ERR" >&2
+        exit 2
+    fi
+    step "waiting for brain generation $((OLD_EPOCH + 1))"
+    NEW_EPOCH=""
+    for _ in $(seq 1 120); do
+        sleep 1
+        H=$(cm_op_call daemon.health '{}' 2>/dev/null || true)
+        [ -z "$H" ] && continue
+        E=$(resp_field "$H" "(d.get('result') or {}).get('holder_epoch')")
+        if [ -n "$E" ] && [ "$E" != "None" ] && [ "$E" -gt "$OLD_EPOCH" ] 2>/dev/null; then
+            NEW_EPOCH="$E"
+            break
+        fi
+    done
+    if [ -z "$NEW_EPOCH" ]; then
+        echo "ERROR: no new brain generation within 120s — check the holder log" >&2
+        exit 2
+    fi
+    if [ "$NEW_EPOCH" -ne $((OLD_EPOCH + 1)) ]; then
+        echo "ERROR: holder_epoch jumped $OLD_EPOCH -> $NEW_EPOCH (more than one" >&2
+        echo "       generation: the new brain crashed and was respawned/rolled back)" >&2
+        exit 2
+    fi
+    step "soaking 90s (a slow crash-loop would silently roll back past a single poll)"
+    sleep 90
+    H=$(cm_op_call daemon.health '{}' || true)
+    E=$(resp_field "$H" "(d.get('result') or {}).get('holder_epoch')")
+    S=$(resp_field "$H" "(d.get('result') or {}).get('sessions')")
+    MCP=$(resp_field "$H" "(d.get('result') or {}).get('mcp_ok')")
+    if [ "$E" != "$NEW_EPOCH" ]; then
+        echo "ERROR: holder_epoch moved during the soak ($NEW_EPOCH -> $E):" >&2
+        echo "       the deployed brain crashed; the holder rolled back or is respawning." >&2
+        exit 2
+    fi
+    if [ "$MCP" != "True" ]; then
+        echo "ERROR: the deployed brain's MCP preflight failed (mcp_ok=false)." >&2
+        exit 2
+    fi
+    echo
+    echo "brain deploy VERIFIED: epoch $OLD_EPOCH -> $NEW_EPOCH, sessions $OLD_SESS -> $S, mcp_ok"
+    echo "note: the definitive all-clear is the breaker's 10-minute stability horizon;"
+    echo "      a crash after this soak still auto-rolls back to the previous pin"
+    echo "      (watch: cm_op daemon.health -> holder_epoch stays $NEW_EPOCH)."
+    exit 0
 fi
 
 OLD_BUILD_ID=$(resp_field "$HEALTH_RESP" "(d.get('result') or {}).get('build_id')")

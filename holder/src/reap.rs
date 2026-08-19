@@ -161,6 +161,17 @@ pub fn parse_proc_stat_starttime(stat: &str) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// OOM posture (§ Supervision, S11): `oom_score_adj` is INHERITED
+/// across fork/exec, so children of a systemd-protected holder
+/// (`OOMScoreAdjust=-500`) would inherit the protection — inverting
+/// the intent (the biggest consumers most protected). Raise each
+/// spawned process back to 0 (raise-only is unprivileged-legal);
+/// best-effort — locally the holder already runs at 0 and this is a
+/// no-op.
+pub fn oom_score_adj_zero(pid: libc::pid_t) {
+    let _ = std::fs::write(format!("/proc/{pid}/oom_score_adj"), "0");
+}
+
 /// `F_DUPFD_CLOEXEC` a raw fd into an `OwnedFd` — used to mint the
 /// SCM_RIGHTS dups the brain receives.
 pub fn dup_cloexec(raw: RawFd) -> io::Result<OwnedFd> {

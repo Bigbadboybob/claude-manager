@@ -17,3 +17,4 @@
 pub mod holder;
 pub mod reap;
 pub mod spawn;
+pub mod supervisor;

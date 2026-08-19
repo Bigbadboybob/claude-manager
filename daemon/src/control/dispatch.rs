@@ -481,25 +481,23 @@ pub fn dispatch_request(
         // (fire-and-verify — the caller polls daemon.health for
         // build_id / reexec_generation).
         "daemon.restart" => {
-            // Holder-split (phase 3): the in-place re-exec is a
-            // MONOLITH primitive — in split mode the brain's fds are
-            // dups, its exit pipeline lives in the HolderClient (not
-            // the manifest), and the correct brain-deploy verb is
-            // phase 6's `restart_brain`. Refuse rather than half-
-            // rehydrate.
+            // Holder-split (phase 6): in split mode the same RPC is
+            // the BRAIN deploy — pin + preflight the new binary,
+            // reply accepted, then quiesce → checked persist → arm
+            // restart_brain → exit; the holder execs the pin
+            // (§ Brain deploys). Monolith mode keeps the in-place
+            // re-exec.
             if crate::holder_mode::global().is_some() {
-                DispatchOutcome::Done(Response::err(
-                    req.id.clone(),
-                    ErrorCode::Conflict,
-                    "daemon.restart is a monolith primitive; this daemon runs in \
-                     holder/brain split mode — brain deploys use the holder's \
-                     restart_brain path (DESIGN_HOLDER_BRAIN_SPLIT phase 6, not \
-                     yet implemented)"
-                        .to_string(),
-                ))
+                DispatchOutcome::Done(dispatch_daemon_restart_split(state, req))
             } else {
                 DispatchOutcome::Done(dispatch_daemon_restart(state, req))
             }
+        }
+        // Holder-split phase 6 (O9): the operator's answer to a
+        // bad-but-NOT-crashing brain — the breaker only sees exits.
+        // Strong-operator, split-only.
+        "daemon.rollback_brain" => {
+            DispatchOutcome::Done(dispatch_daemon_rollback_brain(state, req))
         }
         // DESIGN_SEAMLESS_RESTART phase 3b: dev-gated re-exec handoff
         // skeleton. Answers unknown-method unless the daemon started
@@ -1679,6 +1677,61 @@ fn dispatch_daemon_drain(
 /// `daemon.health` for `build_id` / `reexec_generation` (step 7);
 /// only failures answer, inline, after `perform_reexec`'s abort path
 /// restored the daemon to its pre-call state.
+/// The split-mode `daemon.restart` (DESIGN_HOLDER_BRAIN_SPLIT phase
+/// 6): same auth posture as the monolith primitive (strong-operator,
+/// no skip_preflight), different mechanism (restart_brain via the
+/// holder). The reply is `accepted` — completion is verify-based
+/// (O8: daemon.health's holder_epoch increments + the soak recipe).
+fn dispatch_daemon_restart_split(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err((code, message)) = operator::require_strong_operator(&req.caller) {
+        return Response::err(req.id.clone(), code, message);
+    }
+    if req.params.get("skip_preflight").is_some() {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::InvalidParams,
+            "daemon.restart does not expose skip_preflight (the \
+             --daemon-preflight step is load-bearing on the split path too)"
+                .to_string(),
+        );
+    }
+    let binary_path = match req.params.get("binary_path") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(other) => {
+            return Response::err(
+                req.id.clone(),
+                ErrorCode::InvalidParams,
+                format!(
+                    "daemon.restart params.binary_path must be a string when \
+                     supplied; got {}",
+                    other,
+                ),
+            );
+        }
+    };
+    match crate::holder_mode::restart_brain_flow(state, binary_path) {
+        Ok(v) => Response::ok(req.id.clone(), v),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_daemon_rollback_brain(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err((code, message)) = operator::require_strong_operator(&req.caller) {
+        return Response::err(req.id.clone(), code, message);
+    }
+    match crate::holder_mode::rollback_brain_flow(state) {
+        Ok(v) => Response::ok(req.id.clone(), v),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 fn dispatch_daemon_restart(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,

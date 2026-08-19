@@ -167,20 +167,23 @@ fn locate_cm_holder() -> PathBuf {
         .parent()
         .expect("bin dir")
         .join("cm-holder");
-    if holder_bin.exists() {
-        return holder_bin;
-    }
+    // ALWAYS build: cm-daemon's test builds don't rebuild the
+    // cm-holder crate, so an existing binary can be stale against
+    // the source under test (bitten once — a fixed holder bug kept
+    // "failing" through a stale sibling). Incremental = cheap;
+    // serialized under a lock file so parallel tests don't race
+    // cargo's own build lock into failures.
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
         .to_path_buf();
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "cm-holder", "--bin", "cm-holder"])
+        .args(["build", "-q", "-p", "cm-holder", "--bin", "cm-holder"])
         .current_dir(&workspace_root)
         .status()
         .expect("run cargo build -p cm-holder");
     assert!(status.success(), "cargo build -p cm-holder failed");
-    assert!(holder_bin.exists(), "cm-holder still missing after build");
+    assert!(holder_bin.exists(), "cm-holder missing after build");
     holder_bin
 }
 
@@ -559,20 +562,26 @@ fn brain_crash_kills_no_session_end_to_end() {
         "holder_build_id: {result}"
     );
 
-    // (2) daemon.restart refuses in split mode (the O13-adjacent
-    // guard: the monolith primitive must not half-rehydrate a brain).
+    // (2) daemon.restart in split mode is the BRAIN deploy (phase 6)
+    // and keeps the monolith primitive's input discipline: a relative
+    // binary_path is refused (pinned-artifact policy) with no side
+    // effect — the deploy mechanism itself has its own test.
     let restart = round_trip(
         &socket,
-        &operator_request(&token, "daemon.restart", serde_json::json!({})),
+        &operator_request(
+            &token,
+            "daemon.restart",
+            serde_json::json!({ "binary_path": "relative/not-allowed" }),
+        ),
     )
     .expect("daemon.restart round trip");
-    assert!(!restart.ok, "daemon.restart must refuse in split mode");
+    assert!(!restart.ok, "relative binary_path must refuse");
     assert!(
         restart
             .error
             .as_ref()
-            .is_some_and(|e| e.message.contains("split mode")),
-        "refusal names the mode: {:?}",
+            .is_some_and(|e| e.message.contains("absolute")),
+        "refusal names the policy: {:?}",
         restart.error
     );
 
@@ -843,5 +852,290 @@ fn brain_crash_kills_no_session_end_to_end() {
             .filter(|r| r.ok)?;
             (r.result?.get("sessions").and_then(|v| v.as_u64()) == Some(0)).then_some(())
         },
+    );
+}
+
+/// Phase 6, the everyday path: `daemon.restart` in split mode =
+/// pin + preflight + quiesce + restart_brain; the holder execs the
+/// pin; the session rides through; downtime is measured.
+#[test]
+fn brain_deploy_via_daemon_restart_rides_sessions_through() {
+    let mut sb = launch_sandbox("deploy");
+    let uid = "ts-de91-1";
+    let bash_pid = sb.spawn_bash(uid);
+    let bash_start = proc_starttime(bash_pid).expect("starttime");
+
+    let h = sb.op("daemon.health", serde_json::json!({}));
+    let old_epoch = h
+        .result
+        .as_ref()
+        .and_then(|r| r.get("holder_epoch"))
+        .and_then(|v| v.as_u64())
+        .expect("holder_epoch");
+
+    // Deploy "the new brain" (same binary — the mechanism under
+    // test, not the code delta).
+    let t0 = Instant::now();
+    let resp = sb.op(
+        "daemon.restart",
+        serde_json::json!({ "binary_path": env!("CARGO_BIN_EXE_cm-daemon") }),
+    );
+    assert!(resp.ok, "{:?}", resp.error);
+    assert_eq!(
+        resp.result.as_ref().and_then(|r| r.get("accepted")),
+        Some(&serde_json::json!(true)),
+        "{resp:?}"
+    );
+
+    // O8: the next generation, exactly one epoch up, session intact.
+    wait_for(
+        Instant::now() + Duration::from_secs(60),
+        "the deployed brain generation",
+        &sb.guard,
+        || {
+            let r = round_trip(
+                &sb.socket,
+                &operator_request(&sb.token, "daemon.health", serde_json::json!({})),
+            )
+            .ok()
+            .filter(|r| r.ok)?;
+            let res = r.result?;
+            (res.get("holder_epoch").and_then(|v| v.as_u64()) == Some(old_epoch + 1)
+                && res.get("sessions").and_then(|v| v.as_u64()) == Some(1))
+            .then_some(())
+        },
+    );
+    let downtime = t0.elapsed();
+    eprintln!("deploy control-plane gap (accepted → healthy new brain): {downtime:?}");
+    assert!(downtime < Duration::from_secs(30), "{downtime:?}");
+    assert_eq!(proc_starttime(bash_pid), Some(bash_start), "session disturbed");
+    assert_eq!(proc_ppid(bash_pid), Some(sb.holder_pid));
+
+    // PTY still works through the deployed brain.
+    let send = sb.op(
+        "send_input",
+        serde_json::json!({ "session_uid": uid, "text": "echo DEPLOYED", "submit": true }),
+    );
+    assert!(send.ok);
+    wait_for(
+        Instant::now() + Duration::from_secs(20),
+        "DEPLOYED marker post-deploy",
+        &sb.guard,
+        || {
+            let resp = round_trip(
+                &sb.socket,
+                &operator_request(
+                    &sb.token,
+                    "read_session_output",
+                    serde_json::json!({ "session_uid": uid }),
+                ),
+            )
+            .ok()?;
+            output_text(&resp).filter(|t| t.contains("DEPLOYED"))
+        },
+    );
+
+    // Phase 6's rollback ladder, live: deploy a binary that PASSES
+    // the preflight but crash-loops → the breaker trips → the holder
+    // discards the bad pin and reverts to the previous (the binary
+    // we just deployed) — sessions still riding.
+    let crasher = sb.home.join("crasher.sh");
+    std::fs::write(
+        &crasher,
+        "#!/bin/bash\nif [ \"$1\" = \"--daemon-preflight\" ]; then exit 0; fi\nexit 1\n",
+    )
+    .expect("write crasher");
+    // SAFETY-free chmod via std.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&crasher, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let resp = sb.op(
+        "daemon.restart",
+        serde_json::json!({ "binary_path": crasher.to_string_lossy() }),
+    );
+    assert!(resp.ok, "crasher passed preflight by construction: {:?}", resp.error);
+
+    // The holder: exec crasher → 3 fast EOFs → BREAKER TRIPPED →
+    // rollback to the previous pin (the real daemon) → healthy again.
+    wait_for(
+        Instant::now() + Duration::from_secs(90),
+        "the breaker rollback to the previous pin",
+        &sb.guard,
+        || {
+            let log = std::fs::read_to_string(&sb.guard.log_path).ok()?;
+            if !log.contains("BREAKER TRIPPED") {
+                return None;
+            }
+            let r = round_trip(
+                &sb.socket,
+                &operator_request(&sb.token, "daemon.health", serde_json::json!({})),
+            )
+            .ok()
+            .filter(|r| r.ok)?;
+            let res = r.result?;
+            (res.get("split") == Some(&serde_json::json!(true))
+                && res.get("sessions").and_then(|v| v.as_u64()) == Some(1))
+            .then_some(())
+        },
+    );
+    assert_eq!(
+        proc_starttime(bash_pid),
+        Some(bash_start),
+        "the session must ride out the crash-loop + rollback untouched"
+    );
+    let log = sb.guard.log_tail();
+    assert!(
+        std::fs::read_to_string(&sb.guard.log_path)
+            .unwrap_or_default()
+            .contains("rolling back to the previous"),
+        "{log}"
+    );
+    let kill = sb.op("kill_session", serde_json::json!({ "session_uid": uid }));
+    assert!(kill.ok);
+}
+
+/// Phase 6: both-pins-fail → HELD_DOWN → fixing the binary ON DISK
+/// self-heals via the path-retry (O1) — no holder restart, no
+/// session loss (none exist here; the property under test is the
+/// recovery input).
+#[test]
+fn held_down_self_heals_when_the_binary_is_fixed_on_disk() {
+    let daemon_bin = env!("CARGO_BIN_EXE_cm-daemon");
+    let holder_bin = locate_cm_holder();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("mk home");
+    let socket = dir.path().join("daemon.sock");
+    let log_path = dir.path().join("split.log");
+    let token = format!("helddown-{}", std::process::id());
+
+    // The brain path starts BROKEN.
+    let brain_script = dir.path().join("brain.sh");
+    std::fs::write(&brain_script, "#!/bin/bash\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&brain_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let log_file = std::fs::File::create(&log_path).expect("create log");
+    let log_for_stderr = log_file.try_clone().expect("clone log");
+    let holder = Command::new(&holder_bin)
+        .arg("--brain")
+        .arg(&brain_script)
+        .env_clear()
+        .env("HOME", &home)
+        .env("CM_DAEMON_SOCKET", &socket)
+        .env("CM_OPERATOR_TOKEN", &token)
+        .env("CM_HOLDER_HELD_DOWN_RETRY_MS", "700")
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        )
+        .current_dir(&home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_for_stderr))
+        .spawn()
+        .expect("spawn holder");
+    let guard = SandboxGuard {
+        holder,
+        bash: Vec::new(),
+        log_path: log_path.clone(),
+    };
+
+    // Three fast crashes, no previous pin → HELD_DOWN.
+    wait_for(
+        Instant::now() + Duration::from_secs(30),
+        "HELD_DOWN after the crash loop",
+        &guard,
+        || {
+            std::fs::read_to_string(&log_path)
+                .ok()
+                .filter(|l| l.contains("HELD_DOWN"))
+                .map(|_| ())
+        },
+    );
+
+    // O1's recovery input: fix the binary ON DISK (same path).
+    std::fs::write(
+        &brain_script,
+        format!("#!/bin/bash\nexec {} \"$@\"\n", daemon_bin),
+    )
+    .unwrap();
+    std::fs::set_permissions(&brain_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The path-retry re-pins and the daemon comes up.
+    wait_for(
+        Instant::now() + Duration::from_secs(45),
+        "self-heal after fixing the binary on disk",
+        &guard,
+        || {
+            round_trip(
+                &socket,
+                &operator_request(&token, "daemon.health", serde_json::json!({})),
+            )
+            .ok()
+            .filter(|r| r.ok)
+            .map(|_| ())
+        },
+    );
+}
+
+/// Phase 6 (S7): SIGTERM to the HOLDER is stop-everything — the
+/// brain persists + exits, the HOLDER kills the children (not PTY
+/// teardown luck), the custodied socket is unlinked.
+#[test]
+fn sigterm_to_the_holder_stops_everything() {
+    let mut sb = launch_sandbox("sigterm");
+    let uid = "ts-516e-1";
+    let bash_pid = sb.spawn_bash(uid);
+    let holder_pid = sb.holder_pid;
+
+    // SAFETY: our sandbox holder.
+    unsafe {
+        libc::kill(holder_pid, libc::SIGTERM);
+    }
+    // The holder exits...
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match sb.guard.holder.try_wait() {
+            Ok(Some(_)) => break,
+            _ if Instant::now() >= deadline => {
+                panic!("holder did not exit on SIGTERM.\n{}", sb.guard.log_tail())
+            }
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    // ...the child is DEAD (killed by the holder, not lingering)...
+    let child_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // SAFETY: existence probe only.
+        if unsafe { libc::kill(bash_pid, 0) } != 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < child_deadline,
+            "bash child outlived the holder shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // ...and the custodied socket is unlinked.
+    assert!(
+        !sb.socket.exists(),
+        "custodied socket not unlinked at shutdown"
+    );
+    let log = std::fs::read_to_string(&sb.guard.log_path).unwrap_or_default();
+    assert!(
+        log.contains("shutdown complete"),
+        "{}",
+        sb.guard.log_tail()
+    );
+    // The brain persisted on its way out — via the channel-EOF path
+    // (which beats the forwarded SIGTERM: the holder's serve loop
+    // drops the channel when it returns) or the SIGTERM handler,
+    // whichever fired.
+    assert!(
+        log.contains("persisting durable state before exit")
+            || log.contains("SIGTERM (holder stop sequence)"),
+        "the brain's shutdown persist did not run:\n{}",
+        sb.guard.log_tail()
     );
 }

@@ -61,6 +61,30 @@ pub struct HolderConfig {
     /// stopped draining ⇒ [`ServeOutcome::Wedged`] (S3).
     pub outbound_max_frames: usize,
     pub holder_build_id: String,
+    /// An extra fd (the binary's signalfd) added to the poll set;
+    /// when readable, the caller's `on_extra` callback runs (see
+    /// [`Holder::serve`]). `None` in tests.
+    pub extra_fd: Option<RawFd>,
+}
+
+/// A point-in-time view for the signal callback (SIGUSR1 status
+/// dumps must not borrow the holder while `serve` holds it).
+#[derive(Debug, Clone)]
+pub struct StatusSnapshot {
+    pub sessions: usize,
+    pub pending_exit_events: usize,
+    pub epoch: u64,
+}
+
+/// What the signal callback wants done.
+#[derive(Debug, PartialEq)]
+pub enum SignalDirective {
+    /// Keep serving this brain generation.
+    Continue,
+    /// Begin the stop-everything sequence ([`ServeOutcome`] returns
+    /// `ShutdownRequested`; the binary forwards SIGTERM to the brain,
+    /// then runs [`Holder::shutdown_kill_all`]).
+    Shutdown,
 }
 
 impl Default for HolderConfig {
@@ -70,6 +94,7 @@ impl Default for HolderConfig {
             ping_interval: Some(Duration::from_secs(30)),
             outbound_max_frames: 4096,
             holder_build_id: format!("cm-holder/{}", env!("CARGO_PKG_VERSION")),
+            extra_fd: None,
         }
     }
 }
@@ -85,15 +110,42 @@ pub enum ServeOutcome {
     /// 3). The caller SIGKILLs + reaps the brain and counts a
     /// failure.
     Protocol(String),
-    /// The brain stopped draining the channel (S3) — same
-    /// consequence as a missed-pong wedge.
-    Wedged,
+    /// The brain is wedged: it stopped draining the channel (S3) or
+    /// missed [`WEDGE_MISSED_PONGS`] consecutive pings (§ Supervision
+    /// — the watchdog consequence). The caller SIGKILLs + reaps the
+    /// brain and counts a breaker strike.
+    Wedged(String),
     /// No hello within the handshake timeout.
     HelloTimeout,
     /// Version ranges did not overlap; a `proto_mismatch` error was
     /// sent best-effort.
     HelloRefused,
+    /// The signal callback asked for the stop-everything sequence
+    /// (SIGTERM/SIGINT via the binary's signalfd).
+    ShutdownRequested,
 }
+
+/// Consecutive unanswered pings that mean the brain is wedged —
+/// pong is lock-free by spec (S9), so a miss is never a state-lock
+/// convoy; three misses at the ping cadence is the doc's 90s horizon
+/// at the default 30s interval.
+pub const WEDGE_MISSED_PONGS: u64 = 3;
+
+/// An armed deploy action (§ Brain deploys, C8's arm-late rule):
+/// stored by `restart_brain`/`rollback_brain` and consumed by the
+/// supervisor when the brain exits. Auto-disarmed if the brain is
+/// still alive [`ARM_AUTO_DISARM`] after arming.
+pub enum ArmedDeploy {
+    /// Exec this pinned fd as the next brain (`restart_brain`).
+    NewPin(OwnedFd),
+    /// Exec the previous pin (`rollback_brain`).
+    UsePrevious,
+}
+
+/// C8's auto-disarm horizon: a brain that armed a deploy and then
+/// did NOT exit within this window forfeits the arm — an unrelated
+/// later crash must not trigger a stale deploy.
+pub const ARM_AUTO_DISARM: Duration = Duration::from_secs(30);
 
 /// A consumed-but-unforgotten exit.
 struct ExitRec {
@@ -150,12 +202,25 @@ pub struct Holder {
     /// generations so the socket never unbinds. At most one per
     /// kind ("unix"/"tls"); a re-store replaces (the old fd closes).
     listeners: Vec<(ch::ListenerMeta, OwnedFd)>,
+    /// An armed deploy (C8's arm-late rule): stored by
+    /// `restart_brain`/`rollback_brain`, consumed by the supervisor
+    /// when the brain exits, auto-disarmed after [`ARM_AUTO_DISARM`]
+    /// if the brain is still alive.
+    armed_deploy: Option<(ArmedDeploy, Instant)>,
+    /// Supervisor-published facts for `status` replies (the breaker
+    /// lives in the binary's supervisor; the holder just reports).
+    breaker_label: String,
+    previous_pin_available: bool,
     next_incarnation: u64,
     /// Brain-spawn counter (design § The holder); incremented per
     /// `serve` call — each serve is one brain generation.
     epoch: u64,
     ping_seq: u64,
     pings_unanswered: u64,
+    /// Whether the CURRENT generation completed hello — the
+    /// breaker's stability input (a long-lived brain that never
+    /// negotiated is not stable).
+    helloed_this_generation: bool,
 }
 
 impl Holder {
@@ -164,15 +229,62 @@ impl Holder {
             cfg,
             sessions: BTreeMap::new(),
             listeners: Vec::new(),
+            armed_deploy: None,
+            breaker_label: "running".into(),
+            previous_pin_available: false,
             next_incarnation: 1,
             epoch: 0,
             ping_seq: 0,
             pings_unanswered: 0,
+            helloed_this_generation: false,
         }
     }
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// The supervisor publishes its state for `status` replies.
+    pub fn set_supervisor_status(&mut self, breaker: &str, previous_pin: bool) {
+        self.breaker_label = breaker.to_string();
+        self.previous_pin_available = previous_pin;
+    }
+
+    /// Consume the armed deploy (called by the supervisor when the
+    /// brain exits): `Some` means the exit was a DEPLOY, not a crash.
+    pub fn take_armed_deploy(&mut self) -> Option<ArmedDeploy> {
+        self.armed_deploy.take().map(|(a, _)| a)
+    }
+
+    /// Whether the current (most recent) generation completed hello
+    /// — the breaker's stability input.
+    pub fn generation_helloed(&self) -> bool {
+        self.helloed_this_generation
+    }
+
+    /// The custodied control socket's path (for shutdown-unlink).
+    pub fn custodied_unix_path(&self) -> Option<String> {
+        self.listeners
+            .iter()
+            .find(|(m, _)| m.kind == "unix")
+            .map(|(m, _)| m.meta.clone())
+    }
+
+    /// The stop-everything executor (§ Supervision, S7): SIGKILL and
+    /// reap every held session child via the canonical pidfds —
+    /// children that ignore the PTY-teardown HUP must not outlive
+    /// the supervisor. Returns how many were signaled.
+    pub fn shutdown_kill_all(&mut self) -> usize {
+        let mut killed = 0usize;
+        for (uid, e) in std::mem::take(&mut self.sessions) {
+            if e.exit.is_none() {
+                let _ = reap::pidfd_send_signal(&e.pidfd, libc::SIGKILL);
+                let _ = reap::consume_exit_status(&e.pidfd, e.pid);
+                killed += 1;
+                eprintln!("cm-holder: shutdown — killed + reaped session '{uid}'");
+            }
+        }
+        killed
     }
 
     fn pending_exit_events(&self) -> usize {
@@ -183,11 +295,19 @@ impl Holder {
     }
 
     /// Serve one brain generation over `channel`. Returns when the
-    /// channel dies; holder state (sessions, queued events) is
-    /// retained for the next generation.
-    pub fn serve(&mut self, channel: OwnedFd) -> ServeOutcome {
+    /// channel dies (or a signal asks for shutdown); holder state
+    /// (sessions, queued events, custody, armed deploys) is retained
+    /// for the next generation. `on_extra` runs when the configured
+    /// `extra_fd` (the binary's signalfd) is readable — it must
+    /// consume the readability itself.
+    pub fn serve(
+        &mut self,
+        channel: OwnedFd,
+        mut on_extra: Option<&mut dyn FnMut(&StatusSnapshot) -> SignalDirective>,
+    ) -> ServeOutcome {
         self.epoch += 1;
         self.pings_unanswered = 0;
+        self.helloed_this_generation = false;
         for e in self.sessions.values_mut() {
             e.delivery_ready = false; // C9: re-armed per generation
         }
@@ -211,7 +331,18 @@ impl Holder {
                 events,
                 revents: 0,
             });
-            // uid per extra pollfd slot, parallel to pfds[1..].
+            // Optional signalfd slot (index 1 when present).
+            let extra_slot = self.cfg.extra_fd.map(|fd| {
+                pfds.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                pfds.len() - 1
+            });
+            let session_base = pfds.len();
+            // uid per session pollfd slot, parallel to
+            // pfds[session_base..].
             let mut slot_uids: Vec<String> = Vec::new();
             for (uid, e) in &self.sessions {
                 if e.exit.is_none() && !e.exit_latched {
@@ -234,6 +365,13 @@ impl Holder {
                 deadline = Some(match deadline {
                     Some(d) => d.min(np),
                     None => np,
+                });
+            }
+            if let Some((_, armed_at)) = &self.armed_deploy {
+                let dis = *armed_at + ARM_AUTO_DISARM;
+                deadline = Some(match deadline {
+                    Some(d) => d.min(dis),
+                    None => dis,
                 });
             }
             let timeout_ms: i32 = match deadline {
@@ -259,10 +397,32 @@ impl Holder {
             if !hello_done && Instant::now() >= handshake_deadline {
                 return ServeOutcome::HelloTimeout;
             }
+            // C8's auto-disarm: an armed deploy whose brain did NOT
+            // exit within the horizon forfeits the arm — a later
+            // unrelated crash must not trigger a stale deploy.
+            if let Some((_, armed_at)) = &self.armed_deploy {
+                if Instant::now() >= *armed_at + ARM_AUTO_DISARM {
+                    eprintln!(
+                        "cm-holder: armed deploy expired after {:?} without a \
+                         brain exit — auto-disarmed (C8)",
+                        ARM_AUTO_DISARM
+                    );
+                    self.armed_deploy = None;
+                }
+            }
             if let Some(np) = next_ping {
                 if hello_done && Instant::now() >= np {
                     self.ping_seq += 1;
                     self.pings_unanswered += 1;
+                    if self.pings_unanswered >= WEDGE_MISSED_PONGS {
+                        // The watchdog consequence (§ Supervision):
+                        // pong is lock-free by spec (S9), so a miss
+                        // is a real wedge, never a state-lock convoy.
+                        return ServeOutcome::Wedged(format!(
+                            "{} consecutive pings unanswered",
+                            self.pings_unanswered
+                        ));
+                    }
                     push_frame(
                         &mut outbound,
                         Frame::new(verbs::PING, None, 0, ch::PingBody { seq: self.ping_seq }),
@@ -272,9 +432,26 @@ impl Holder {
                 }
             }
 
+            // ---- signalfd ----
+            if let Some(slot) = extra_slot {
+                if pfds[slot].revents & libc::POLLIN != 0 {
+                    let snapshot = StatusSnapshot {
+                        sessions: self.sessions.len(),
+                        pending_exit_events: self.pending_exit_events(),
+                        epoch: self.epoch,
+                    };
+                    if let Some(cb) = on_extra.as_deref_mut() {
+                        if cb(&snapshot) == SignalDirective::Shutdown {
+                            best_effort_flush(&channel, &mut outbound);
+                            return ServeOutcome::ShutdownRequested;
+                        }
+                    }
+                }
+            }
+
             // ---- child exits ----
             for (i, uid) in slot_uids.iter().enumerate() {
-                let pfd = &pfds[1 + i];
+                let pfd = &pfds[session_base + i];
                 if pfd.revents & libc::POLLIN == 0 {
                     continue;
                 }
@@ -324,7 +501,10 @@ impl Holder {
                 Err(FlushError::Fatal(msg)) => return ServeOutcome::Protocol(msg),
             }
             if outbound.len() > self.cfg.outbound_max_frames {
-                return ServeOutcome::Wedged;
+                return ServeOutcome::Wedged(format!(
+                    "outbound queue exceeded {} frames — the brain stopped draining (S3)",
+                    self.cfg.outbound_max_frames
+                ));
             }
         }
     }
@@ -370,10 +550,13 @@ impl Holder {
         hello_done: &mut bool,
         outbound: &mut VecDeque<OutFrame>,
     ) -> Result<(), ServeOutcome> {
-        // The one brain→holder fd-bearing verb; everything else must
+        // The brain→holder fd-bearing verbs; everything else must
         // arrive fd-free (undeclared fds already violated at the
         // frame layer — this guards declared-but-wrong-verb).
-        if frame.v != verbs::STORE_LISTENER && !fds.is_empty() {
+        if frame.v != verbs::STORE_LISTENER
+            && frame.v != verbs::RESTART_BRAIN
+            && !fds.is_empty()
+        {
             return Err(ServeOutcome::Protocol(format!(
                 "verb '{}' carried {} unexpected fd(s)",
                 frame.v,
@@ -441,6 +624,7 @@ impl Holder {
                 vec![],
             );
             *hello_done = true;
+            self.helloed_this_generation = true;
             return Ok(());
         }
 
@@ -452,6 +636,65 @@ impl Holder {
             verbs::ABORT_SPAWN => self.handle_abort_spawn(req_id, &frame, outbound),
             verbs::UPDATE_CHECKPOINT => self.handle_update_checkpoint(req_id, &frame, outbound),
             verbs::STORE_LISTENER => self.handle_store_listener(req_id, &frame, fds, outbound),
+            verbs::RESTART_BRAIN => {
+                // C8's arm-late rule is the BRAIN's obligation (send
+                // only after quiesce + checked persistence); the
+                // holder's side: store the pin, reply ok, and expect
+                // an exit within the auto-disarm horizon.
+                if fds.len() != 1 {
+                    return Err(ServeOutcome::Protocol(format!(
+                        "restart_brain carried {} fds, want 1 (the pinned brain binary)",
+                        fds.len()
+                    )));
+                }
+                let pin = fds.into_iter().next().expect("len checked");
+                self.armed_deploy = Some((ArmedDeploy::NewPin(pin), Instant::now()));
+                eprintln!("cm-holder: restart_brain armed (new pinned brain fd)");
+                push_frame(
+                    outbound,
+                    Frame::new(verbs::OK, Some(req_id), 0, ch::OkBody { detail: None }),
+                    vec![],
+                );
+                Ok(())
+            }
+            verbs::ROLLBACK_BRAIN => {
+                if !self.previous_pin_available {
+                    push_frame(
+                        outbound,
+                        err_frame(
+                            req_id,
+                            ch::ERR_NOT_FOUND,
+                            "no previous brain pin to roll back to".into(),
+                        ),
+                        vec![],
+                    );
+                    return Ok(());
+                }
+                self.armed_deploy = Some((ArmedDeploy::UsePrevious, Instant::now()));
+                eprintln!("cm-holder: rollback_brain armed (previous pin)");
+                push_frame(
+                    outbound,
+                    Frame::new(verbs::OK, Some(req_id), 0, ch::OkBody { detail: None }),
+                    vec![],
+                );
+                Ok(())
+            }
+            verbs::CANCEL_PENDING => {
+                let had = self.armed_deploy.take().is_some();
+                push_frame(
+                    outbound,
+                    Frame::new(
+                        verbs::OK,
+                        Some(req_id),
+                        0,
+                        ch::OkBody {
+                            detail: Some(serde_json::json!({ "disarmed": had })),
+                        },
+                    ),
+                    vec![],
+                );
+                Ok(())
+            }
             verbs::FORGET => self.handle_forget(req_id, &frame, outbound),
             verbs::ACK_EXIT => self.handle_ack_exit(req_id, &frame, outbound),
             verbs::STATUS => {
@@ -466,9 +709,10 @@ impl Holder {
                             pending_exit_events: self.pending_exit_events(),
                             epoch: self.epoch,
                             brain_restarts: self.epoch.saturating_sub(1),
-                            breaker_state: "none".into(),
+                            breaker_state: self.breaker_label.clone(),
                             holder_build_id: self.cfg.holder_build_id.clone(),
                             pings_unanswered: self.pings_unanswered,
+                            previous_pin: self.previous_pin_available,
                         },
                     ),
                     vec![],
@@ -533,6 +777,9 @@ impl Holder {
         };
         let incarnation = self.next_incarnation;
         self.next_incarnation += 1;
+        // OOM posture (S11): the child must not inherit a
+        // systemd-protected holder's negative score.
+        reap::oom_score_adj_zero(spawned.pid);
 
         let Some(master_raw) = spawned.master.as_raw_fd() else {
             // Cannot mint dups — tear down (the abort discipline).

@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -59,6 +59,33 @@ static GLOBAL: OnceLock<Arc<HolderClient>> = OnceLock::new();
 /// The process-wide holder client, `Some` exactly in holder mode.
 pub fn global() -> Option<&'static Arc<HolderClient>> {
     GLOBAL.get()
+}
+
+/// State handle for the exit paths (channel EOF / protocol
+/// violation): the dying brain persists its durable registry +
+/// tombstones best-effort before `exit(70)` — the holder's stop
+/// sequence closes the channel BEFORE its SIGTERM can land, so the
+/// EOF path is the one that actually runs at shutdown (S7's persist
+/// belongs to whichever path fires).
+static STATE_FOR_EXIT: OnceLock<std::sync::Weak<Mutex<DaemonState>>> = OnceLock::new();
+
+/// Wire the exit-path persist. Called once from `run()` after the
+/// state Arc exists.
+pub fn set_state_for_exit(state: &Arc<Mutex<DaemonState>>) {
+    let _ = STATE_FOR_EXIT.set(Arc::downgrade(state));
+}
+
+fn persist_before_exit(reason: &str) {
+    if let Some(state) = STATE_FOR_EXIT.get().and_then(|w| w.upgrade()) {
+        eprintln!("cm-daemon: {reason} — persisting durable state before exit");
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        st.persist_sessions_best_effort();
+        if let Err(e) =
+            st.save_daemon_tombstones_checked(&crate::state::default_daemon_tombstones_path())
+        {
+            eprintln!("cm-daemon: exit-path tombstone persist: {e}");
+        }
+    }
 }
 
 /// A typed holder-verb failure.
@@ -187,7 +214,7 @@ impl HolderClient {
                 }
             };
             if fed == FeedStatus::Eof {
-                eprintln!("cm-daemon: holder channel EOF — exiting (the holder is gone or replacing us)");
+                persist_before_exit("holder channel EOF (the holder is gone or replacing us)");
                 std::process::exit(70);
             }
             loop {
@@ -465,6 +492,36 @@ impl HolderClient {
         })
     }
 
+    /// Arm a brain deploy: the holder stores the pinned fd as
+    /// "next" and execs it when THIS brain exits (C8's arm-late
+    /// rule — call only after quiesce + checked persistence).
+    pub fn restart_brain(&self, pinned_fd: RawFd) -> Result<(), HolderError> {
+        let (f, _) = self.request_with_fds(
+            verbs::RESTART_BRAIN,
+            serde_json::json!({}),
+            &[pinned_fd],
+        )?;
+        if f.v == verbs::OK {
+            return Ok(());
+        }
+        let e: ch::ErrBody = f.parse_body().map_err(internal)?;
+        Err(HolderError {
+            code: e.code,
+            message: e.message,
+        })
+    }
+
+    /// Arm the operator rollback: exec the holder's PREVIOUS pin
+    /// when this brain exits (O9).
+    pub fn rollback_brain(&self) -> Result<(), HolderError> {
+        self.expect_ok(verbs::ROLLBACK_BRAIN, serde_json::json!({}))
+    }
+
+    /// Disarm any armed deploy (C8's abort path).
+    pub fn cancel_pending(&self) -> Result<(), HolderError> {
+        self.expect_ok(verbs::CANCEL_PENDING, serde_json::json!({}))
+    }
+
     /// The holder's live status (surfaced on `daemon.health`).
     pub fn status(&self) -> Result<ch::StatusReplyBody, HolderError> {
         let (f, _) = self.request(verbs::STATUS, serde_json::json!({}))?;
@@ -667,6 +724,19 @@ pub fn init_from_env() -> bool {
     // SAFETY: the holder handed us this fd; we own it from here.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
 
+    // The holder execs us via /proc/self/fd/<pin> (R7), which makes
+    // the kernel-derived comm "4" — reclaim the real name so ps,
+    // pgrep, and the e2e's find-by-comm see cm-daemon.
+    // SAFETY: prctl(PR_SET_NAME) with a NUL-terminated ≤15-char name.
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_NAME,
+            b"cm-daemon\0".as_ptr() as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+    }
     // C5: die with the holder. PDEATHSIG first, then the
     // parent-died-before-prctl race check.
     // SAFETY: plain prctl on self.
@@ -933,6 +1003,215 @@ pub fn holder_spawn(
             Err(e)
         }
     }
+}
+
+// ============================================================
+// Brain deploys (§ Brain deploys — daemon.restart / rollback_brain
+// in split mode, phase 6)
+// ============================================================
+
+/// What the detached deploy thread arms after quiescing.
+enum DeployAction {
+    NewPin(OwnedFd),
+    UsePrevious,
+}
+
+/// The split-mode `daemon.restart`: pin + preflight the new brain
+/// binary, reply `accepted` (the caller's contract, O8: refused vs
+/// in-progress; completion is verify-based), then — on a detached
+/// thread, per C8's arm-late rule — quiesce, checked-persist, ARM,
+/// exit. Returns the RPC result value.
+pub fn restart_brain_flow(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    binary_path: Option<&str>,
+) -> Result<serde_json::Value, (crate::control::protocol::ErrorCode, String)> {
+    use crate::control::protocol::ErrorCode;
+    let client = global().ok_or((
+        ErrorCode::Conflict,
+        "not in holder/brain split mode".to_string(),
+    ))?;
+    let target = crate::reexec::resolve_restart_target(binary_path)
+        .map_err(|msg| (ErrorCode::InvalidParams, format!("daemon.restart: {msg}")))?;
+    let pin: OwnedFd = std::fs::File::open(&target.path)
+        .map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("daemon.restart: pin {}: {e}", target.path.display()),
+            )
+        })?
+        .into();
+    brain_deploy_preflight(&pin).map_err(|msg| (ErrorCode::Conflict, msg))?;
+    eprintln!(
+        "cm-daemon: daemon.restart (split) — target {} preflighted; quiescing \
+         then arming restart_brain (this brain exits; the holder execs the pin)",
+        target.path.display()
+    );
+    spawn_deploy_thread(state_arc, client, DeployAction::NewPin(pin));
+    Ok(serde_json::json!({
+        "accepted": true,
+        "mode": "split",
+        "message": "brain deploy accepted: quiescing, persisting, then the \
+                    holder execs the pinned binary. Verify via daemon.health \
+                    (holder_epoch increments; soak per the O8 recipe).",
+    }))
+}
+
+/// The operator rollback (O9): arm `rollback_brain` after quiesce —
+/// the answer to a bad-but-not-crashing brain.
+pub fn rollback_brain_flow(
+    state_arc: &Arc<Mutex<DaemonState>>,
+) -> Result<serde_json::Value, (crate::control::protocol::ErrorCode, String)> {
+    use crate::control::protocol::ErrorCode;
+    let client = global().ok_or((
+        ErrorCode::Conflict,
+        "not in holder/brain split mode".to_string(),
+    ))?;
+    // Pre-check so the caller's `accepted` can't precede an
+    // impossible rollback.
+    match client.status() {
+        Ok(st) if st.previous_pin => {}
+        Ok(_) => {
+            return Err((
+                ErrorCode::Conflict,
+                "the holder has no previous brain pin to roll back to".into(),
+            ))
+        }
+        Err(e) => return Err((ErrorCode::Internal, format!("holder status: {e}"))),
+    }
+    eprintln!(
+        "cm-daemon: daemon.rollback_brain — quiescing then arming rollback \
+         (this brain exits; the holder execs the previous pin)"
+    );
+    spawn_deploy_thread(state_arc, client, DeployAction::UsePrevious);
+    Ok(serde_json::json!({
+        "accepted": true,
+        "mode": "split",
+        "message": "rollback accepted: the holder will exec the previous \
+                    pinned brain. Verify via daemon.health.",
+    }))
+}
+
+/// The candidate brain proves itself: `<pin> --daemon-preflight`
+/// (config + durable-state parse), via /proc/self/fd so the checked
+/// inode is the armed inode.
+fn brain_deploy_preflight(pin: &OwnedFd) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let raw = pin.as_raw_fd();
+    let mut cmd = std::process::Command::new(format!("/proc/self/fd/{raw}"));
+    cmd.arg("--daemon-preflight")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY (pre_exec): clear CLOEXEC on the pin in the CHILD only,
+    // so the exec can resolve /proc/self/fd/<raw> (the reexec
+    // preflight's R9-safe shape).
+    unsafe {
+        cmd.pre_exec(move || {
+            let flags = libc::fcntl(raw, libc::F_GETFD);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("brain preflight spawn failed: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "brain deploy REFUSED — the candidate binary failed \
+             --daemon-preflight ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// C8's ordered tail, detached so the RPC reply reaches the caller
+/// first: quiesce (mutation barrier + writer/reader freezes) →
+/// checked persistence → ARM → exit(0). Any failure disarms
+/// (`cancel_pending`), un-drains, and logs loudly — the caller was
+/// told "accepted", so the failure must be findable.
+fn spawn_deploy_thread(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    client: &'static Arc<HolderClient>,
+    action: DeployAction,
+) {
+    let state = Arc::clone(state_arc);
+    let _ = std::thread::Builder::new()
+        .name("cm-brain-deploy".into())
+        .spawn(move || {
+            // Let the RPC reply flush before the drain flips.
+            std::thread::sleep(Duration::from_millis(300));
+            let guard = match crate::restart_coordinator::begin(&state) {
+                Ok(g) => g,
+                Err(busy) => {
+                    eprintln!("cm-daemon: brain deploy ABORTED: {busy}");
+                    return;
+                }
+            };
+            if let Err(t) = guard.wait_quiesced(Duration::from_secs(10)) {
+                eprintln!("cm-daemon: brain deploy ABORTED: {t}");
+                guard.abort();
+                return;
+            }
+            // Byte + prompt quiescence (the doc's planned-restart
+            // zero-loss guarantee): reader gate (no bytes die on
+            // reader stacks) and writer gate (no half-typed prompts).
+            let writer_pause = crate::writer_gate::request_pause();
+            let _writer_freeze = match crate::writer_gate::freeze(
+                &writer_pause,
+                Duration::from_secs(10),
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("cm-daemon: brain deploy ABORTED (writer gate): {e}");
+                    guard.abort();
+                    return;
+                }
+            };
+            let _reader_freeze = crate::reader_gate::freeze();
+            // Checked persistence — the state the next brain adopts
+            // against.
+            {
+                let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = st.save_daemon_sessions_checked(
+                    &crate::state::default_daemon_sessions_path(),
+                ) {
+                    eprintln!("cm-daemon: brain deploy ABORTED (registry persist): {e}");
+                    drop(st);
+                    guard.abort();
+                    return;
+                }
+                if let Err(e) = st.save_daemon_tombstones_checked(
+                    &crate::state::default_daemon_tombstones_path(),
+                ) {
+                    eprintln!("cm-daemon: brain deploy ABORTED (tombstone persist): {e}");
+                    drop(st);
+                    guard.abort();
+                    return;
+                }
+            }
+            // ARM — nothing fallible between here and exit (C8).
+            let armed = match action {
+                DeployAction::NewPin(pin) => client.restart_brain(pin.as_raw_fd()),
+                DeployAction::UsePrevious => client.rollback_brain(),
+            };
+            if let Err(e) = armed {
+                eprintln!("cm-daemon: brain deploy ABORTED (arm failed): {e}");
+                let _ = client.cancel_pending();
+                guard.abort();
+                return;
+            }
+            eprintln!("cm-daemon: brain deploy armed — exiting for the holder to exec");
+            std::process::exit(0);
+        });
 }
 
 // ============================================================

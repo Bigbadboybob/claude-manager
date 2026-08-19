@@ -30,9 +30,19 @@ fn main() -> anyhow::Result<()> {
     // A missing fd argument falls through to the same path and fails
     // its strict parse with a diagnosis.
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("--verify-handoff") {
-        let fd_arg = args.next().unwrap_or_default();
-        std::process::exit(cm_daemon::reexec::run_verify_handoff(&fd_arg));
+    match args.next().as_deref() {
+        Some("--verify-handoff") => {
+            let fd_arg = args.next().unwrap_or_default();
+            std::process::exit(cm_daemon::reexec::run_verify_handoff(&fd_arg));
+        }
+        // DESIGN_HOLDER_BRAIN_SPLIT phase 6: the BRAIN-deploy
+        // preflight — the candidate binary proving it can parse this
+        // host's config + durable state before `daemon.restart` arms
+        // `restart_brain`. Verify-only: no bind, no spawn, no writes.
+        Some("--daemon-preflight") => {
+            std::process::exit(cm_daemon::run_daemon_preflight());
+        }
+        _ => {}
     }
     cm_daemon::run()
 }
