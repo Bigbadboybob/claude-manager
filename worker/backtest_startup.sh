@@ -269,6 +269,23 @@ summary = _finite(summary)
 summary["partial"] = partial
 summary["gcs_pointer"] = gcs
 summary["run_key"] = os.environ["RUN_KEY"]
+
+# Failure evidence (exported by the pipeline-failed branch): the exit code
+# and the pipeline log's tail ride the artifact, so the reason a run died
+# is readable from get_backtest_result — not only from a VM that the
+# reaper will have deleted by the time anyone looks.
+fail_exit = os.environ.get("CM_FAIL_EXIT_CODE") or ""
+if fail_exit:
+    summary.setdefault("error", "pipeline-failed")
+    summary["exit_code"] = int(fail_exit) if fail_exit.isdigit() else fail_exit
+    log_path = os.environ.get("CM_PIPELINE_LOG") or "/var/log/cm-pipeline.log"
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4000))
+            summary["log_tail"] = f.read().decode("utf-8", "replace")
+    except OSError:
+        pass
 print(json.dumps({
     "kind": "backtest-result",
     "partial": partial,
@@ -447,8 +464,14 @@ EOF
 chmod +x /root/cm_pipeline.sh
 
 rm -f /var/run/cm-pipeline-exit
+# Pipeline output ALSO lands in /var/log/cm-pipeline.log (tee passes it
+# through to the tmux pane, so the ttyd live view is unchanged): a failure's
+# last lines must survive the VM — pre-fix, recovering the failure reason
+# took SSH + tmux capture-pane before the reaper deleted the instance.
+# PIPESTATUS[0] (bash-only, hence the explicit bash -c) keeps the recorded
+# exit code the PIPELINE's, not tee's.
 tmux new-session -d -s backtest -x 200 -y 50 \
-    "bash /root/cm_pipeline.sh; echo \$? > /var/run/cm-pipeline-exit; sleep 3600"
+    "bash -c 'bash /root/cm_pipeline.sh 2>&1 | tee /var/log/cm-pipeline.log; echo \${PIPESTATUS[0]} > /var/run/cm-pipeline-exit; sleep 3600'"
 
 # ---------------------------------------------------------------------------
 # ttyd (observability). NOT publicly reachable: :8080 ingress is scoped by the
@@ -491,6 +514,16 @@ if [ "$EXIT_CODE" = "0" ]; then
     fi
 else
     echo "[cm-backtest] Pipeline FAILED (exit $EXIT_CODE)"
+    # Park the full pipeline log next to the results, then let the artifact
+    # carry the exit code + log tail (build_artifact_json merges them off
+    # CM_FAIL_EXIT_CODE). The VM itself is expendable after this: the
+    # dispatcher's blocked-VM TTL deletes it ~30 min after the PATCH.
+    if gsutil cp /var/log/cm-pipeline.log "$GCS_PREFIX/pipeline.log"; then
+        echo "[cm-backtest] Pipeline log parked at $GCS_PREFIX/pipeline.log"
+    else
+        echo "[cm-backtest] WARNING: could not park pipeline log in GCS"
+    fi
+    export CM_FAIL_EXIT_CODE="$EXIT_CODE"
     post_artifact "$(emit_artifact true)" || true
     api_update '{"status": "blocked"}'
 fi

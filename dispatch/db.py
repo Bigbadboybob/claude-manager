@@ -374,13 +374,33 @@ async def count_dispatchable_backtests(pool: asyncpg.Pool) -> int:
 async def list_active_backtests(pool: asyncpg.Pool) -> list[dict]:
     """Rows the backtest runaway reaper inspects: running backtests, plus
     blocked backtests that still hold a VM (worker PATCHed blocked on
-    failure — the VM is kept briefly for ttyd debugging)."""
+    failure — the VM is kept for a short blocked_at-anchored debugging
+    window, BACKTEST_BLOCKED_VM_TTL_SECS)."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT * FROM tasks
                WHERE kind = 'backtest'
                  AND (status = 'running'
                       OR (status = 'blocked' AND worker_vm IS NOT NULL))""",
+        )
+        return [_serialize(dict(r)) for r in rows]
+
+
+async def list_terminal_backtests_with_artifacts(pool: asyncpg.Pool) -> list[dict]:
+    """Terminal (done/blocked) backtest rows holding at least one result
+    artifact — candidates for the dispatch daemon's auto-archive sweep.
+
+    Rows with NO artifact are excluded on purpose: "terminal but resultless"
+    is an operator signal (artifact POST exhausted, worker died pre-POST)
+    that must stay visible on the board. Rows still holding a VM are
+    returned — the sweep itself skips them until the reaper's teardown
+    clears worker_vm, so grace-period logic lives in one place."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT t.* FROM tasks t
+               WHERE t.kind = 'backtest'
+                 AND t.status IN ('done', 'blocked')
+                 AND EXISTS (SELECT 1 FROM task_artifacts a WHERE a.task_id = t.id)""",
         )
         return [_serialize(dict(r)) for r in rows]
 

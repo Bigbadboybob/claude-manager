@@ -11,6 +11,8 @@ from dispatch.config import (
     GCP_PROJECT, GCP_ZONE, MAX_WORKERS, MANAGER_URL, API_TOKEN,
     MAX_BACKTEST_WORKERS, BACKTEST_VM_DEFAULTS, BACKTEST_SECRETS_PROJECT,
     BACKTEST_RESULTS_BUCKET, BACKTEST_MAX_RUNTIME_SECS,
+    BACKTEST_BLOCKED_VM_TTL_SECS,
+    BACKTEST_ARCHIVE_DONE_SECS, BACKTEST_ARCHIVE_BLOCKED_SECS,
 )
 
 
@@ -61,13 +63,14 @@ async def dispatch_loop(pool, interval: float = DISPATCH_INTERVAL_SECS):
 
         if time.monotonic() - last_reap >= BACKTEST_REAP_INTERVAL_SECS:
             last_reap = time.monotonic()
-            try:
-                await _reap_stuck_backtests(pool)
-            except asyncio.CancelledError:
-                logger.info("Dispatch daemon shutting down")
-                raise
-            except Exception:
-                logger.exception("Backtest reaper error")
+            for sweep_fn in (_reap_stuck_backtests, _archive_finished_backtests):
+                try:
+                    await sweep_fn(pool)
+                except asyncio.CancelledError:
+                    logger.info("Dispatch daemon shutting down")
+                    raise
+                except Exception:
+                    logger.exception(f"Backtest sweep error ({sweep_fn.__name__})")
 
         await asyncio.sleep(interval)
 
@@ -318,11 +321,15 @@ async def _reap_stuck_backtests(pool):
     """Runaway guard for the backtest lane.
 
     Kills backtests running past metadata.vm.max_runtime_secs (default 4h)
-    and sweeps blocked backtests that still hold a VM (worker PATCHed
-    blocked on failure; the VM is intentionally kept for a while for ttyd
-    debugging). Also self-heals the claim-then-crash case: a row stuck in
-    'running' with no VM and no launched_at means the API died mid-launch —
-    requeue it.
+    and sweeps blocked backtests that still hold a VM. The blocked window
+    is anchored on blocked_at with its own short TTL
+    (BACKTEST_BLOCKED_VM_TTL_SECS, default 30m) — NOT on launch time:
+    max_runtime must stay long for long benches, but a run that failed two
+    minutes in must not idle its VM for the rest of that limit. The
+    failure evidence rides the artifact (exit_code + log_tail) and GCS
+    (pipeline.log), so the live-VM window can be short. Also self-heals
+    the claim-then-crash case: a row stuck in 'running' with no VM and no
+    launched_at means the API died mid-launch — requeue it.
 
     Ordering on timeout is latch-first (status/worker_vm cleared, artifact
     row added, THEN the VM delete): a crash mid-sequence leaks at most one
@@ -334,10 +341,28 @@ async def _reap_stuck_backtests(pool):
         meta = t.get("metadata") or {}
         vm_meta = meta.get("vm") or {}
         bt = meta.get("backtest") or {}
-        limit = int(vm_meta.get("max_runtime_secs") or BACKTEST_MAX_RUNTIME_SECS)
-        launched = _parse_iso(bt.get("launched_at")) or t["updated_at"]
+        vm_name = t.get("worker_vm")
+        project = vm_meta.get("project") or BACKTEST_VM_DEFAULTS["project"]
+        zone = vm_meta.get("zone") or BACKTEST_VM_DEFAULTS["zone"]
 
-        if t["status"] == "running" and not t.get("worker_vm") and not bt.get("launched_at"):
+        if t["status"] == "blocked":
+            # Failed run still holding its VM (list_active_backtests only
+            # returns blocked rows with worker_vm set). blocked_at is
+            # stamped by the API PATCH handler and by the timeout path
+            # below; updated_at is the fallback for legacy rows.
+            blocked_at = t.get("blocked_at") or t["updated_at"]
+            if (now - blocked_at).total_seconds() <= BACKTEST_BLOCKED_VM_TTL_SECS:
+                continue
+            logger.info(
+                f"Backtest {t['id']} blocked past "
+                f"{BACKTEST_BLOCKED_VM_TTL_SECS}s; deleting VM {vm_name}"
+            )
+            await db.update_task(pool, str(t["id"]), worker_vm=None, ttyd_url=None)
+            if vm_name:
+                await asyncio.to_thread(_delete_worker_sync, vm_name, project, zone)
+            continue
+
+        if not t.get("worker_vm") and not bt.get("launched_at"):
             # Claimed but never launched (API restart mid-flight) — requeue.
             # Give the normal launch path one interval's grace first.
             if (now - t["updated_at"]).total_seconds() > 5 * DISPATCH_INTERVAL_SECS:
@@ -347,33 +372,66 @@ async def _reap_stuck_backtests(pool):
                 await db.update_task(pool, str(t["id"]), status="backlog")
             continue
 
+        limit = int(vm_meta.get("max_runtime_secs") or BACKTEST_MAX_RUNTIME_SECS)
+        launched = _parse_iso(bt.get("launched_at")) or t["updated_at"]
         if (now - launched).total_seconds() <= limit:
             continue
 
-        vm_name = t.get("worker_vm")
-        project = vm_meta.get("project") or BACKTEST_VM_DEFAULTS["project"]
-        zone = vm_meta.get("zone") or BACKTEST_VM_DEFAULTS["zone"]
-
-        if t["status"] == "running":
-            logger.warning(
-                f"Backtest {t['id']} exceeded {limit}s; reaping VM {vm_name}"
-            )
-            await db.update_task(pool, str(t["id"]), status="blocked",
-                                 worker_vm=None, ttyd_url=None)
-            await db.add_task_artifact(
-                pool, str(t["id"]),
-                summary={"error": "timeout", "max_runtime_secs": limit,
-                         "run_key": bt.get("run_key")},
-                partial=True,
-            )
-        else:  # blocked with a VM still up — debugging window over, tear down
-            logger.info(
-                f"Backtest {t['id']} blocked past {limit}s; deleting VM {vm_name}"
-            )
-            await db.update_task(pool, str(t["id"]), worker_vm=None, ttyd_url=None)
-
+        logger.warning(
+            f"Backtest {t['id']} exceeded {limit}s; reaping VM {vm_name}"
+        )
+        await db.update_task(pool, str(t["id"]), status="blocked",
+                             blocked_at=now, worker_vm=None, ttyd_url=None)
+        await db.add_task_artifact(
+            pool, str(t["id"]),
+            summary={"error": "timeout", "max_runtime_secs": limit,
+                     "run_key": bt.get("run_key")},
+            partial=True,
+        )
         if vm_name:
             await asyncio.to_thread(_delete_worker_sync, vm_name, project, zone)
+
+
+async def _archive_finished_backtests(pool):
+    """Board hygiene for the backtest lane: terminal rows leave the board.
+
+    A backtest row's residual value ends once it is terminal and its result
+    artifact is persisted — the results live in the task_artifacts table and
+    GCS, both read BY ID, so flipping the row to 'archived' hides it from
+    default board/session listings without breaking get_backtest_result
+    (which already treats 'archived' as terminal) or the A-V archived view.
+    Without this, every perf-bench fleet (K repeats x N arms) permanently
+    occupies that many board rows.
+
+    Grace periods keep recent completions visible: successes briefly
+    (BACKTEST_ARCHIVE_DONE_SECS, anchored on updated_at — the worker's final
+    PATCH), failures longer (BACKTEST_ARCHIVE_BLOCKED_SECS, anchored on
+    blocked_at — they carry a signal a human may need to act on). Rows that
+    never landed an artifact are deliberately NOT swept: terminal-but-
+    resultless is an incident, and invisible incidents don't get fixed.
+    Rows still holding a VM are left to the reaper's teardown first, so an
+    archived row can never strand a live VM outside list_active_backtests.
+    Any manual edit bumps updated_at and restarts the done clock — fine:
+    a touched row is being looked at.
+    """
+    rows = await db.list_terminal_backtests_with_artifacts(pool)
+    now = datetime.now(timezone.utc)
+    for t in rows:
+        if t.get("worker_vm"):
+            continue
+        if t["status"] == "done":
+            grace = BACKTEST_ARCHIVE_DONE_SECS
+            anchor = t["updated_at"]
+        else:  # blocked
+            grace = BACKTEST_ARCHIVE_BLOCKED_SECS
+            anchor = t.get("blocked_at") or t["updated_at"]
+        if grace <= 0 or (now - anchor).total_seconds() <= grace:
+            continue
+        logger.info(
+            f"Archiving finished backtest {t['id']} "
+            f"({t['status']} for {int((now - anchor).total_seconds())}s)"
+        )
+        await db.update_task(pool, str(t["id"]), status="archived")
 
 
 async def _maintain_warm_pools(pool):

@@ -41,6 +41,23 @@ BACKTEST_RESULTS_BUCKET = os.getenv(
 )
 BACKTEST_MAX_RUNTIME_SECS = int(os.getenv("CM_BACKTEST_MAX_RUNTIME_SECS", "14400"))  # 4h
 
+# How long a FAILED backtest keeps its VM after the blocked transition
+# (ttyd/ssh debugging window). Anchored on blocked_at, NOT launch time:
+# max_runtime_secs must stay long for long benches, but a run that failed
+# two minutes in must not idle a c2-standard-4 for the rest of that limit
+# (observed 2026-08-19: 9 idle workers hand-deleted). The failure evidence
+# now rides the artifact (exit_code + log_tail) and GCS (pipeline.log), so
+# the live-VM window can be short.
+BACKTEST_BLOCKED_VM_TTL_SECS = int(os.getenv("CM_BACKTEST_BLOCKED_VM_TTL_SECS", "1800"))  # 30m
+
+# Board hygiene: terminal backtest rows auto-archive once their result
+# artifact is persisted (archived rows are hidden from default listings but
+# stay fully readable by id — get_backtest_result / GCS keep working).
+# Failures get a longer grace than successes: they carry an operator signal.
+# <= 0 disables the respective sweep.
+BACKTEST_ARCHIVE_DONE_SECS = int(os.getenv("CM_BACKTEST_ARCHIVE_DONE_SECS", "2700"))  # 45m
+BACKTEST_ARCHIVE_BLOCKED_SECS = int(os.getenv("CM_BACKTEST_ARCHIVE_BLOCKED_SECS", "21600"))  # 6h
+
 BACKTEST_VM_DEFAULTS = {
     "project": BACKTEST_GCP_PROJECT,
     "zone": BACKTEST_GCP_ZONE,

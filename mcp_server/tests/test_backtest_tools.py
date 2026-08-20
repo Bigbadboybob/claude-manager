@@ -232,6 +232,17 @@ class ReadBacktestResultTests(unittest.TestCase):
         self.assertEqual(r["status"], "partial")
         self.assertTrue(r["partial"])
 
+    def test_archived_task_with_artifact_still_reads_complete(self):
+        # The dispatch daemon auto-archives terminal backtest rows (board
+        # hygiene); results must stay fully retrievable afterwards.
+        arts = [{"id": "a1", "kind": "backtest-result", "partial": False,
+                 "summary": {"total_pnl": 5}, "gcs_prefix": "gs://b/1",
+                 "created_at": "2026-07-07T01:00:00Z"}]
+        r = self._compose("archived", arts)
+        self.assertEqual(r["status"], "complete")
+        self.assertEqual(r["summary"], {"total_pnl": 5})
+        self.assertEqual(r["task_status"], "archived")
+
     def test_wait_returns_on_artifact(self):
         from mcp_server import server
 
