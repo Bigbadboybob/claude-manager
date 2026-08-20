@@ -353,6 +353,25 @@ struct StartSessionParams {
     /// and persisted in the manifest. Defaults to `false`.
     #[serde(default)]
     global_perms: bool,
+    /// Launch-reality promotion opt-out (owner ask 2026-08-19). When a
+    /// spawn binds `task_id`, the funnel promotes the planning row's
+    /// status draft/backlog → running (see
+    /// [`spawn_task_status_promotion`]) so the board reflects that the
+    /// task is actually being worked. This flag suppresses that for
+    /// spawn paths that are NOT a launch of new work:
+    ///   - startup-restore / `session.revive` (`compose_restore_params`)
+    ///     re-materialize an EXISTING session — a daemon restart must not
+    ///     silently flip back a task the operator deliberately reset;
+    ///   - continuous fires (`compose_continuous_spawn_params`) — the
+    ///     scheduler owns that lifecycle (the kind-based skip inside the
+    ///     promotion is the second wall);
+    ///   - `mcp_start_session` spawns whose binding is merely INHERITED
+    ///     from the caller — the caller's own launch already promoted
+    ///     its task (mirrors the explicit-only auto-delivery rule).
+    /// Defaults to `false`: TUI operator launches, explicit-task /
+    /// minted MCP spawns, workflow launches, and add_session promote.
+    #[serde(default)]
+    skip_task_status_promotion: bool,
 }
 
 fn default_session_type() -> String {
@@ -1116,6 +1135,32 @@ pub(crate) fn start_session_with_spawn_fn(
             Arc::clone(state_arc),
             session_uid.clone(),
         );
+    }
+
+    // Task-status promotion (owner ask 2026-08-19): a session bound to a
+    // planning task means the task is being worked — flip a row still
+    // sitting at draft/backlog to running so the board reflects launch
+    // reality. Hooked HERE because this funnel is the one spawn seam
+    // every launch entry point shares (TUI operator launch,
+    // mcp_start_session explicit/minted task spawns, workflow launches,
+    // add_session) — no per-caller patching. Runs only after the spawn
+    // committed (insert + broadcast above); a refused/failed spawn never
+    // touches the board. Paths that re-materialize existing sessions
+    // (restore/revive), continuous fires, and inherited MCP bindings
+    // opt out via `skip_task_status_promotion` — see the field's doc.
+    if !p.skip_task_status_promotion {
+        if let Some(task_id) = p.task_id.clone() {
+            let (api_url_cfg, api_token_cfg) = {
+                let st = state_arc.lock().unwrap_or_else(|e| e.into_inner());
+                (st.config.api_url.clone(), st.config.api_token.clone())
+            };
+            spawn_task_status_promotion(
+                task_id,
+                session_uid.clone(),
+                api_url_cfg,
+                api_token_cfg,
+            );
+        }
     }
 
     // Echo VERIFIED cgroup_path back to the TUI (slice
@@ -8272,6 +8317,17 @@ pub fn mcp_start_session(
     }
     if let Some(tid) = task_id_for_spawn.as_deref() {
         full_params.insert("task_id".into(), Value::String(tid.to_string()));
+        // Launch-reality promotion is for EXPLICIT bindings only. A child
+        // that merely INHERITS the caller's task (promptless helper
+        // spawned into the caller's own workspace) is not a launch of
+        // that task — the caller's own launch already promoted it.
+        // Mirrors the explicit-only auto-delivery rule above.
+        if p.task_id.is_none() {
+            full_params.insert(
+                "skip_task_status_promotion".into(),
+                Value::Bool(true),
+            );
+        }
     }
     // Propagate the (guard-approved) global-perms grant to the
     // child. The escalation guard above already verified the caller
@@ -8920,6 +8976,12 @@ fn compose_continuous_spawn_params(
             "continuous_task_id".into(),
             Value::String(continuous_task_id.to_string()),
         );
+        // A continuous fire is a scheduler tick, not a launch of new
+        // work — the run lifecycle lives in ~/.cm/continuous-tasks/, and
+        // the planning row's status is the operator's. Suppress the
+        // funnel's task-status promotion (the kind='continuous' skip in
+        // `promote_task_to_running` is the second wall).
+        m.insert("skip_task_status_promotion".into(), Value::Bool(true));
         // Memory-cap triple — ALL-OR-NOTHING: wrap argv via systemd-run AND set
         // the three wire keys together (start_session rejects a partial triple
         // and SIGKILLs a child whose scope didn't materialize). The argv built by
@@ -9394,6 +9456,12 @@ fn compose_restore_params(
         resume,
     )?;
     if let Value::Object(m) = &mut params {
+        // A restore (and `session.revive`, which rides this composer)
+        // re-materializes an EXISTING session — it is not a launch of new
+        // work. Suppress the funnel's task-status promotion: a daemon
+        // restart must not silently flip back a task the operator
+        // deliberately reset to draft/backlog while its session lived on.
+        m.insert("skip_task_status_promotion".into(), Value::Bool(true));
         if e.global_perms {
             m.insert("global_perms".into(), Value::Bool(true));
         }
@@ -13354,6 +13422,123 @@ fn api_list_projects(creds: &PlanningApiCreds) -> Result<Vec<Value>, PlanningCli
         .map_err(|e| PlanningClientError::Transport(format!("decode list_projects: {}", e)))
 }
 
+/// Outcome of the launch-time task-status promotion, for logging.
+enum TaskStatusPromotion {
+    /// The row was at draft/backlog and is now running.
+    Promoted { from: String },
+    /// The row is already past backlog (running/blocked/done/…) —
+    /// never downgrade. Covers the relaunch/resume-of-a-done-task case.
+    LeftAlone,
+    /// The row's kind has a scheduler-owned lifecycle — not ours to flip.
+    SkippedKind,
+}
+
+/// Launch-reality promotion (owner ask 2026-08-19): a session binding to
+/// `task_id` means the task is actually being worked, so a planning row
+/// still sitting at `draft`/`backlog` is promoted to `running`.
+///
+/// Strictly one-directional. Any other status is left alone, and the
+/// symmetric edge — the bound session exiting WITHOUT `report_done` —
+/// is deliberately unhandled: no auto-revert (that ambiguity belongs to
+/// triage; the existing done/blocked flows own completion).
+///
+/// Kinds with scheduler-owned lifecycles are skipped:
+///   - `backtest`: the dispatch daemon claims these with an atomic
+///     `UPDATE … WHERE status = 'backlog'` (dispatch/db.py). Promoting at
+///     local session-bind time (e.g. the A-w read-only watcher) would
+///     double-handle the flip — and a pre-dispatch flip would STARVE the
+///     lane, since the claim CAS would never match.
+///   - `continuous`: run state lives in `~/.cm/continuous-tasks/`; the
+///     planning row is an umbrella whose status the operator owns.
+///
+/// GET-then-PATCH is not atomic; a concurrent operator status change in
+/// the ~ms window between the two calls can be overwritten. Accepted:
+/// the planning API has no conditional-update primitive, and the window
+/// is invisible at human scale.
+fn promote_task_to_running(
+    creds: &PlanningApiCreds,
+    task_id: &str,
+) -> Result<TaskStatusPromotion, PlanningClientError> {
+    let row = api_get_task(creds, task_id)?;
+    let kind = row.get("kind").and_then(Value::as_str).unwrap_or("oneshot");
+    if kind == "backtest" || kind == "continuous" {
+        return Ok(TaskStatusPromotion::SkippedKind);
+    }
+    let status = row.get("status").and_then(Value::as_str).unwrap_or("");
+    if status != "draft" && status != "backlog" {
+        return Ok(TaskStatusPromotion::LeftAlone);
+    }
+    api_update_task(creds, task_id, &json!({ "status": "running" }))?;
+    Ok(TaskStatusPromotion::Promoted { from: status.to_string() })
+}
+
+/// Fire-and-forget wrapper around [`promote_task_to_running`] for the
+/// `start_session` spawn funnel. Creds resolve on the caller's thread
+/// (cheap, no I/O — and deterministic under the env lock a test may
+/// hold); the HTTP runs on a detached thread so a slow or down planning
+/// API can never delay or fail a spawn. Best-effort by design: every
+/// failure is logged and swallowed.
+fn spawn_task_status_promotion(
+    task_id: String,
+    session_uid: String,
+    api_url_cfg: String,
+    api_token_cfg: String,
+) {
+    // Test hermeticity: parallel tests own CM_API_URL/CM_API_TOKEN under
+    // the crate env lock, which this call site does not hold. A test that
+    // wants the promotion points `state.config.api_url` at its stub; an
+    // empty config must not fall through to env and hit ANOTHER test's
+    // stub. Production keeps the env fallback below (local daemons
+    // inherit the TUI's CM_API_* env and often have no daemon.toml).
+    #[cfg(test)]
+    if api_url_cfg.trim().is_empty() || api_token_cfg.trim().is_empty() {
+        return;
+    }
+    let creds = match PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: task-status promotion for '{}' skipped \
+                 (session {}): {}",
+                task_id,
+                session_uid,
+                e.to_method_err().1,
+            );
+            return;
+        }
+    };
+    let task_id_for_log = task_id.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("task-promote-{}", session_uid))
+        .spawn(move || match promote_task_to_running(&creds, &task_id) {
+            Ok(TaskStatusPromotion::Promoted { from }) => eprintln!(
+                "cm-daemon: task '{}' status {} → running (session {} launched)",
+                task_id, from, session_uid,
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "cm-daemon: task-status promotion for '{}' failed \
+                 (session {}): {}",
+                task_id,
+                session_uid,
+                e.to_method_err().1,
+            ),
+        });
+    match spawned {
+        Ok(_handle) => {
+            // Tests join so request-count assertions against the routed
+            // stub are deterministic; production stays fire-and-forget.
+            #[cfg(test)]
+            let _ = _handle.join();
+        }
+        Err(e) => eprintln!(
+            "cm-daemon: task-status promotion thread for '{}' failed to \
+             spawn: {}",
+            task_id_for_log, e,
+        ),
+    }
+}
+
 /// Generate a 7-hex-char id from nanos + an atomic counter. Ported
 /// verbatim from `tui/src/control/methods.rs::make_request_short_id`.
 /// Used by `create_subtask` for BOTH the slug suffix and the
@@ -15521,6 +15706,186 @@ mod tests {
             }
             other => panic!("expected ManifestDiff::Added, got {:?}", other),
         }
+        kill_all_sessions(&state);
+    }
+
+    // === Launch-reality task-status promotion (owner ask 2026-08-19) ===
+    //
+    // These drive the bare `start_session` RPC — the exact wire the TUI's
+    // operator launch sends (tui/src/client_session.rs stamps `task_id`
+    // into these params), so they double as the TUI-path coverage. The
+    // MCP-path twin is `mcp_start_session_explicit_task_binding_promotes`
+    // below beside the other mcp_start_session tests. Assertions are
+    // deterministic: under cfg(test) `spawn_task_status_promotion` joins
+    // its worker thread before the RPC returns.
+
+    /// Spawning a session bound to a `draft` task flips the planning row
+    /// to `running`: one GET probe, then exactly one
+    /// PATCH {"status":"running"} — nothing else touched.
+    #[test]
+    fn start_session_promotes_draft_task_to_running() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-promote", &dir);
+        let stub = spawn_routed_stub(|m, p, _b| match (m, p) {
+            ("GET", "/tasks/task-launch") => (
+                200,
+                r#"{"id":"task-launch","status":"draft","kind":"oneshot"}"#.to_string(),
+            ),
+            ("PATCH", "/tasks/task-launch") => (200, "{}".to_string()),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "tok".to_string();
+        }
+        let params = json!({
+            "uid": fresh_test_uid(),
+            "workspace_id": "ws-promote",
+            "label": "worker",
+            "argv": ["/bin/sleep", "120"],
+            "working_dir": dir.path().display().to_string(),
+            "task_id": "task-launch",
+        });
+        start_session(&state, &params).expect("spawn ok");
+
+        let reqs = stub.requests.lock().unwrap();
+        assert!(
+            reqs.iter()
+                .any(|r| r.method == "GET" && r.path == "/tasks/task-launch"),
+            "the promotion probes the row before writing: {:?}",
+            *reqs,
+        );
+        let patches: Vec<_> = reqs.iter().filter(|r| r.method == "PATCH").collect();
+        assert_eq!(patches.len(), 1, "exactly one status write: {:?}", *reqs);
+        assert_eq!(patches[0].path, "/tasks/task-launch");
+        assert_eq!(
+            serde_json::from_str::<Value>(&patches[0].body).expect("json body"),
+            json!({"status": "running"}),
+            "draft → running, and ONLY status rides the PATCH",
+        );
+        drop(reqs);
+        kill_all_sessions(&state);
+    }
+
+    /// Never downgrade: relaunching/resuming a session on a task that is
+    /// already past backlog (here: `done`) probes and then leaves the
+    /// status alone. The symmetric edge — exit without report_done — has
+    /// no hook at all (`handle_session_exit` makes no planning calls), so
+    /// there is nothing to pin on that side.
+    #[test]
+    fn start_session_leaves_finished_task_status_alone() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-done", &dir);
+        let stub = spawn_routed_stub(|m, p, _b| match (m, p) {
+            ("GET", "/tasks/task-done") => (
+                200,
+                r#"{"id":"task-done","status":"done","kind":"oneshot"}"#.to_string(),
+            ),
+            _ => (500, r#"{"detail":"no writes allowed"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "tok".to_string();
+        }
+        let params = json!({
+            "uid": fresh_test_uid(),
+            "workspace_id": "ws-done",
+            "label": "relaunch",
+            "argv": ["/bin/sleep", "120"],
+            "working_dir": dir.path().display().to_string(),
+            "task_id": "task-done",
+        });
+        start_session(&state, &params).expect("spawn ok");
+
+        let reqs = stub.requests.lock().unwrap();
+        assert!(
+            reqs.iter()
+                .any(|r| r.method == "GET" && r.path == "/tasks/task-done"),
+            "the probe still runs: {:?}",
+            *reqs,
+        );
+        assert!(
+            reqs.iter().all(|r| r.method == "GET"),
+            "a finished task must never be written back to running: {:?}",
+            *reqs,
+        );
+        drop(reqs);
+        kill_all_sessions(&state);
+    }
+
+    /// `kind=backtest` rows are the dispatch daemon's to flip (atomic
+    /// claim `UPDATE … WHERE status='backlog'` in dispatch/db.py). A
+    /// local session binding to one — e.g. the A-w read-only watcher —
+    /// must not steal the row from the backtest lane by promoting it.
+    #[test]
+    fn start_session_skips_backtest_kind_tasks() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-bt", &dir);
+        let stub = spawn_routed_stub(|m, p, _b| match (m, p) {
+            ("GET", "/tasks/task-bt") => (
+                200,
+                r#"{"id":"task-bt","status":"backlog","kind":"backtest"}"#.to_string(),
+            ),
+            _ => (500, r#"{"detail":"no writes allowed"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "tok".to_string();
+        }
+        let params = json!({
+            "uid": fresh_test_uid(),
+            "workspace_id": "ws-bt",
+            "label": "watcher",
+            "argv": ["/bin/sleep", "120"],
+            "working_dir": dir.path().display().to_string(),
+            "task_id": "task-bt",
+        });
+        start_session(&state, &params).expect("spawn ok");
+
+        let reqs = stub.requests.lock().unwrap();
+        assert!(
+            reqs.iter().all(|r| r.method == "GET"),
+            "a backlog backtest row must stay claimable by the dispatch \
+             lane — no local status write: {:?}",
+            *reqs,
+        );
+        drop(reqs);
+        kill_all_sessions(&state);
+    }
+
+    /// The opt-out flag is honored end-to-end: a spawn carrying
+    /// `skip_task_status_promotion` (restore / revive / continuous fires /
+    /// inherited MCP bindings) makes NO planning call at all.
+    #[test]
+    fn start_session_skip_promotion_flag_suppresses_planning_calls() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-skip", &dir);
+        let stub = spawn_routed_stub(|_m, _p, _b| {
+            (500, r#"{"detail":"must not be called"}"#.to_string())
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "tok".to_string();
+        }
+        let params = json!({
+            "uid": fresh_test_uid(),
+            "workspace_id": "ws-skip",
+            "label": "restored",
+            "argv": ["/bin/sleep", "120"],
+            "working_dir": dir.path().display().to_string(),
+            "task_id": "task-restored",
+            "skip_task_status_promotion": true,
+        });
+        start_session(&state, &params).expect("spawn ok");
+
+        assert!(
+            stub.requests.lock().unwrap().is_empty(),
+            "the skip flag must suppress even the probe",
+        );
         kill_all_sessions(&state);
     }
 
@@ -19658,6 +20023,10 @@ mod tests {
                 "transcript_path points at the resumed file: {}",
                 tp,
             );
+            // A restore re-materializes an existing session — it must not
+            // re-promote the bound task's planning status (owner ask
+            // 2026-08-19).
+            assert_eq!(params["skip_task_status_promotion"], json!(true));
         });
     }
 
@@ -21924,14 +22293,25 @@ mod tests {
     /// ux-5c scope guard: a `bash` session's "prompt" is a COMMAND LINE
     /// the shell executes. Auto-delivering a task's English prompt into
     /// one would run it as a command, so a promptless bash spawn stays
-    /// promptless — and doesn't even make the lookup call.
+    /// promptless.
+    ///
+    /// Since the launch-reality promotion (owner ask 2026-08-19) an
+    /// explicit-task spawn DOES make one planning GET — the status
+    /// probe, indistinguishable on the wire from a delivery lookup — so
+    /// "never delivers" is pinned by `prompt_source` plus the absence of
+    /// any planning WRITE (the row is already running, so the probe
+    /// stays read-only).
     #[test]
     fn mcp_start_session_bash_never_auto_delivers_task_prompt() {
         let _tmp = with_temp_home(|| {
             let state = make_state_arc();
             seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
             let stub = spawn_routed_stub(|_m, _p, _b| {
-                (200, r#"{"id":"task-1","prompt":"rm -rf everything"}"#.to_string())
+                (
+                    200,
+                    r#"{"id":"task-1","status":"running","prompt":"rm -rf everything"}"#
+                        .to_string(),
+                )
             });
             {
                 let mut s = state.lock().unwrap();
@@ -21951,10 +22331,73 @@ mod tests {
             set_spawn_program_override_for_test(None);
 
             assert_eq!(resp["prompt_source"], json!("none"));
+            let reqs = stub.requests.lock().unwrap();
             assert!(
-                stub.requests.lock().unwrap().is_empty(),
-                "a bash spawn must not even look the task prompt up",
+                reqs.iter()
+                    .all(|r| r.method == "GET" && r.path == "/tasks/task-1"),
+                "only the status-promotion probe may touch the planning \
+                 API on a bash spawn — no delivery lookup semantics, no \
+                 writes: {:?}",
+                *reqs,
             );
+            drop(reqs);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// Launch-reality promotion, MCP path (owner ask 2026-08-19): an
+    /// agent's `start_session(task_id=<backlog task>)` — the fan-out
+    /// shape that left the Aug-19 board lying — flips the row to
+    /// running. The TUI-wire twin lives beside the other bare
+    /// `start_session` tests (`start_session_promotes_draft_task_to_running`).
+    #[test]
+    fn mcp_start_session_explicit_task_binding_promotes() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-1") => (
+                    200,
+                    r#"{"id":"task-1","status":"backlog","kind":"oneshot"}"#.to_string(),
+                ),
+                ("PATCH", "/tasks/task-1") => (200, "{}".to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "bash", "label": "worker", "task_id": "task-1" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            set_spawn_program_override_for_test(None);
+
+            assert_eq!(resp["task_id"].as_str(), Some("task-1"));
+            let reqs = stub.requests.lock().unwrap();
+            let status_patches = reqs
+                .iter()
+                .filter(|r| {
+                    r.method == "PATCH"
+                        && r.path == "/tasks/task-1"
+                        && serde_json::from_str::<Value>(&r.body)
+                            .map(|b| b == json!({"status": "running"}))
+                            .unwrap_or(false)
+                })
+                .count();
+            assert_eq!(
+                status_patches, 1,
+                "an explicit-task MCP spawn promotes backlog → running: {:?}",
+                *reqs,
+            );
+            drop(reqs);
             kill_all_sessions(&state);
         });
     }
@@ -26258,6 +26701,9 @@ mod tests {
             assert_eq!(full["continuous_task_id"], json!("ct-compose"));
             assert_eq!(full["session_type"], json!("claude-code"));
             assert_eq!(full["task_id"], json!("ct-compose"));
+            // Scheduler ticks never touch the planning row's status
+            // (owner ask 2026-08-19: promotion is for launches only).
+            assert_eq!(full["skip_task_status_promotion"], json!(true));
             assert_eq!(full["cols"].as_u64(), Some(120));
             // working_dir AND the auto-register worktree hint both pin the tree.
             assert_eq!(full["working_dir"].as_str().unwrap(), wt.to_string_lossy().as_ref());
@@ -28173,6 +28619,7 @@ mod tests {
                     200,
                     format!(
                         r#"{{"id":"task-orphan","name":"Fix the parser","repo_url":"{}",
+                            "status":"backlog",
                             "description":"background","prompt":"instructions"}}"#,
                         name_owned
                     ),
@@ -28220,14 +28667,37 @@ mod tests {
                 resp,
             );
             // ux-5c still holds on the mint path — and reuses the row the
-            // mint already fetched rather than GETting it twice.
+            // mint already fetched rather than GETting it twice. The
+            // launch-reality promotion adds exactly one probe of its own.
             assert_eq!(resp["prompt_source"], json!("task"));
             let reqs = stub.requests.lock().unwrap();
             let gets = reqs
                 .iter()
                 .filter(|r| r.method == "GET" && r.path == "/tasks/task-orphan")
                 .count();
-            assert_eq!(gets, 1, "mint + auto-delivery must share one lookup: {:?}", reqs);
+            assert_eq!(
+                gets, 2,
+                "mint + auto-delivery share one lookup; the status-promotion \
+                 probe is the second: {:?}",
+                reqs,
+            );
+            // The minted (propose_task-shaped) launch flips the backlog row
+            // to running — the owner-ask scenario that motivated this.
+            let status_patches = reqs
+                .iter()
+                .filter(|r| {
+                    r.method == "PATCH"
+                        && r.path == "/tasks/task-orphan"
+                        && serde_json::from_str::<Value>(&r.body)
+                            .map(|b| b == json!({"status": "running"}))
+                            .unwrap_or(false)
+                })
+                .count();
+            assert_eq!(
+                status_patches, 1,
+                "a minted launch promotes the backlog task to running: {:?}",
+                reqs,
+            );
             drop(reqs);
 
             // The task is now bound, with a real workspace behind it.
@@ -28337,10 +28807,11 @@ mod tests {
             let repo = home.join("code/projects").join(name);
             let state = make_state_arc();
             let caller_wt = seed_mint_fixture(&state, &repo, name, "task-orphan");
-            // A stub the handler must NOT call: sharing needs no planning
-            // round trip at all.
+            // Sharing itself needs no planning round trip; the only call
+            // allowed is the launch-reality status probe (which 500s here
+            // — pinning that a failed promotion never fails the spawn).
             let stub = spawn_routed_stub(|_m, _p, _b| {
-                (500, r#"{"detail":"must not be called"}"#.to_string())
+                (500, r#"{"detail":"probe only"}"#.to_string())
             });
             {
                 let mut s = state.lock().unwrap();
@@ -28391,10 +28862,15 @@ mod tests {
                     "sharing binds no workspace to the task",
                 );
             }
+            let reqs = stub.requests.lock().unwrap();
             assert!(
-                stub.requests.lock().unwrap().is_empty(),
-                "the shared path must not touch the planning API",
+                reqs.iter()
+                    .all(|r| r.method == "GET" && r.path == "/tasks/task-orphan"),
+                "the shared path itself must not touch the planning API — \
+                 only the status-promotion probe (a read) may appear: {:?}",
+                *reqs,
             );
+            drop(reqs);
             kill_all_sessions(&state);
         });
     }
