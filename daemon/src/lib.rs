@@ -64,6 +64,7 @@ pub mod holder_mode;
 pub mod host_id;
 pub mod manifest;
 pub mod mcp_config;
+pub mod migrate;
 pub mod notify;
 pub mod path;
 pub mod planning_client;
@@ -396,6 +397,21 @@ pub fn run_daemon_preflight() -> i32 {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    // Deterministic comm regardless of how we were exec'd: a
+    // /proc/self/fd or execveat(AT_EMPTY_PATH) exec (re-exec deploys,
+    // holder spawns, the phase-7 reverse migration) derives comm from
+    // the exec path STRING, which may be a bare fd number.
+    // SAFETY: PR_SET_NAME with a NUL-terminated ≤15-char name.
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_NAME,
+            b"cm-daemon\0".as_ptr() as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+    }
+
     // FIRST, before anything reads env or spawns: scrub Claude-session
     // identity vars inherited from a launcher that ran inside a claude
     // session. Children inherit our env, so a leaked foreign

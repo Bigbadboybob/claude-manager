@@ -57,10 +57,10 @@ HEAD_BINS="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
 step "building baseline binaries at $BASELINE_REF"
 BASE_BINS="$(build_ref "$BASELINE_REF")"
 
-run_cell() { # $1 = label, $2 = holder bin, $3 = brain bin
+run_cell() { # $1 = label, $2 = holder bin, $3 = brain bin, [$4 = filter]
     step "cell: $1"
     CM_SKEW_HOLDER_BIN="$2" CM_SKEW_BRAIN_BIN="$3" \
-        cargo test -q -p cm-daemon --test holder_skew_e2e -- --nocapture \
+        cargo test -q -p cm-daemon --test holder_skew_e2e -- --nocapture ${4:-} \
         || { echo "MATRIX CELL FAILED: $1" >&2; exit 1; }
 }
 
@@ -70,6 +70,20 @@ run_cell "old-brain x new-holder (the upgrade path)" \
     "$HEAD_BINS/cm-holder" "$BASE_BINS/cm-daemon"
 run_cell "new x new (control)" \
     "$HEAD_BINS/cm-holder" "$HEAD_BINS/cm-daemon"
+
+# V9 (phase 7): the prior-schema rollback-manifest emission — HEAD
+# split reverse-migrates INTO the baseline monolith image. Skipped if
+# the baseline predates split_rollback support in the split side
+# (never: the split side here is HEAD) — the cell is gated only on
+# the baseline image being able to BOOT a v3 manifest (it shipped
+# with one).
+step "cell: v9 reverse-migration -> baseline monolith"
+CM_SKEW_HOLDER_BIN="$HEAD_BINS/cm-holder" \
+CM_SKEW_BRAIN_BIN="$HEAD_BINS/cm-daemon" \
+CM_SKEW_MONOLITH_BIN="$BASE_BINS/cm-daemon" \
+    cargo test -q -p cm-daemon --test holder_skew_e2e -- --nocapture \
+        reverse_migration_manifest_boots_the_target_monolith \
+    || { echo "MATRIX CELL FAILED: v9 reverse-migration" >&2; exit 1; }
 
 step "matrix green"
 echo "baseline: $BASELINE_REF ($(git rev-parse --short "$BASELINE_REF"))"

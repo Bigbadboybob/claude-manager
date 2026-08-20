@@ -36,7 +36,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cm_holder_proto::channel::{
     self as ch, verbs, FeedStatus, Frame, FrameReader, ENV_CHANNEL_FD,
@@ -159,6 +159,13 @@ impl HolderClient {
         );
         ch::send_frame_blocking(fd.as_fd(), &hello, &[])
             .map_err(|e| internal(format!("hello send: {e}")))?;
+        // The hello-reply wait is BOUNDED (O14/V8): a parked
+        // migration brain legitimately waits out the monolith's
+        // manifest-build + exec + validation, but a monolith that
+        // hangs (or never becomes the holder) must not leak an
+        // invisible orphan brain — 60s covers the legitimate wait
+        // with margin, then we exit and the operator retries.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut reader = FrameReader::new();
         let reply = loop {
             if let Some((f, _fds)) = reader
@@ -166,6 +173,31 @@ impl HolderClient {
                 .map_err(|v| internal(v.0))?
             {
                 break f;
+            }
+            let remain = deadline.saturating_duration_since(Instant::now());
+            if remain.is_zero() {
+                return Err(internal(
+                    "no hello reply within 60s (parked-brain deadline, O14)",
+                ));
+            }
+            let mut pfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: valid pollfd for the call's duration.
+            let ret = unsafe {
+                libc::poll(&mut pfd, 1, remain.as_millis().min(60_000).max(1) as i32)
+            };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(internal(format!("poll(hello reply): {err}")));
+            }
+            if ret == 0 {
+                continue; // deadline check at loop top
             }
             match reader.feed(fd.as_fd()).map_err(|v| internal(v.0))? {
                 FeedStatus::Eof => return Err(internal("channel EOF during hello")),
@@ -242,6 +274,36 @@ impl HolderClient {
         if frame.v == verbs::EXIT_EVENT {
             if let Ok(ev) = frame.parse_body::<ch::ExitEventBody>() {
                 self.route_exit(ev);
+            }
+            return;
+        }
+        // Post-holder-upgrade re-negotiation (phase 7): the upgraded
+        // holder image opens with an unsolicited `rehello`; we answer
+        // with our HelloBody, req_id echoed — on THIS thread, no lock
+        // (the S9 discipline: a convoyed brain must still negotiate).
+        if frame.v == verbs::REHELLO {
+            if let (Some(req_id), Ok(rh)) =
+                (frame.req_id, frame.parse_body::<ch::RehelloBody>())
+            {
+                eprintln!(
+                    "cm-daemon: holder upgraded under us ({} — epoch {}); \
+                     re-negotiating",
+                    rh.holder_build_id, rh.epoch
+                );
+                let reply = Frame::new(
+                    verbs::HELLO,
+                    Some(req_id),
+                    0,
+                    ch::HelloBody {
+                        proto_min: ch::PROTO_VERSION_MIN,
+                        proto_max: ch::PROTO_VERSION_MAX,
+                        brain_build_id: format!(
+                            "cm-daemon/{}",
+                            env!("CARGO_PKG_VERSION")
+                        ),
+                    },
+                );
+                let _ = self.send_raw(&reply, &[]);
             }
             return;
         }
@@ -520,6 +582,69 @@ impl HolderClient {
     /// Disarm any armed deploy (C8's abort path).
     pub fn cancel_pending(&self) -> Result<(), HolderError> {
         self.expect_ok(verbs::CANCEL_PENDING, serde_json::json!({}))
+    }
+
+    /// Reverse-migration prelude (phase 7, C1): hand the holder one
+    /// opaque standard-schema record blob for a live session.
+    pub fn rollback_record(
+        &self,
+        uid: &str,
+        incarnation: u64,
+        record: serde_json::Value,
+    ) -> Result<(), HolderError> {
+        self.expect_ok(
+            verbs::ROLLBACK_RECORD,
+            ch::RollbackRecordBody {
+                uid: uid.to_string(),
+                incarnation,
+                record,
+            },
+        )
+    }
+
+    /// Reverse migration (phase 7, V4/C2/C8): arm the pinned monolith.
+    /// Arm-late — call only after quiesce + drain + record transfer.
+    pub fn split_rollback(
+        &self,
+        pinned_fd: RawFd,
+        reexec_generation: u64,
+        manifest_schema_version: u32,
+    ) -> Result<(), HolderError> {
+        let (f, _) = self.request_with_fds(
+            verbs::SPLIT_ROLLBACK,
+            ch::SplitRollbackBody {
+                reexec_generation,
+                manifest_schema_version,
+            },
+            &[pinned_fd],
+        )?;
+        if f.v == verbs::OK {
+            return Ok(());
+        }
+        let e: ch::ErrBody = f.parse_body().map_err(internal)?;
+        Err(HolderError {
+            code: e.code,
+            message: e.message,
+        })
+    }
+
+    /// Holder upgrade (phase 7, § Holder upgrades): hand the holder
+    /// its pinned successor image. The holder replies ok, then execs
+    /// itself; we stay up and answer the new image's `rehello`.
+    pub fn reexec_holder(&self, pinned_fd: RawFd) -> Result<(), HolderError> {
+        let (f, _) = self.request_with_fds(
+            verbs::REEXEC_HOLDER,
+            serde_json::json!({}),
+            &[pinned_fd],
+        )?;
+        if f.v == verbs::OK {
+            return Ok(());
+        }
+        let e: ch::ErrBody = f.parse_body().map_err(internal)?;
+        Err(HolderError {
+            code: e.code,
+            message: e.message,
+        })
     }
 
     /// The holder's live status (surfaced on `daemon.health`).
@@ -889,7 +1014,7 @@ impl HolderPending {
                 Err(e) => Err(io::Error::other(e.to_string())),
             }
         });
-        let session = build.arm(
+        let mut session = build.arm(
             on_exit,
             ExitAuthority::Holder {
                 events,
@@ -897,6 +1022,9 @@ impl HolderPending {
                 kill,
             },
         )?;
+        // The holder-minted identity, queryable (phase 7's
+        // rollback_record stream keys on it).
+        session.holder_incarnation = Some(self.incarnation);
         // Armed: defuse Drop's abort.
         std::mem::forget(self);
         Ok(session)
@@ -1014,6 +1142,11 @@ pub fn holder_spawn(
 enum DeployAction {
     NewPin(OwnedFd),
     UsePrevious,
+    /// Reverse migration (phase 7): after persistence, stream one
+    /// `rollback_record` per live session, then arm `split_rollback`
+    /// with the pinned monolith. The holder execs the monolith
+    /// instead of respawning a brain.
+    SplitRollback(OwnedFd),
 }
 
 /// The split-mode `daemon.restart`: pin + preflight the new brain
@@ -1094,12 +1227,24 @@ pub fn rollback_brain_flow(
 /// The candidate brain proves itself: `<pin> --daemon-preflight`
 /// (config + durable-state parse), via /proc/self/fd so the checked
 /// inode is the armed inode.
-fn brain_deploy_preflight(pin: &OwnedFd) -> Result<(), String> {
+pub(crate) fn brain_deploy_preflight(pin: &OwnedFd) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let raw = pin.as_raw_fd();
     let mut cmd = std::process::Command::new(format!("/proc/self/fd/{raw}"));
     cmd.arg("--daemon-preflight")
+        // Side-effect proofing (phase 7, found by the V9 skew cell):
+        // a candidate binary that PREDATES --daemon-preflight ignores
+        // the unknown arg and falls through to a FULL daemon boot —
+        // pointing its bind at a nonexistent directory guarantees
+        // that fallthrough exits at bind_socket instead of running a
+        // second daemon. Binaries that HAVE the flag never bind, so
+        // this is inert for them. The distinctive bind failure is
+        // also how the legacy vintage is recognized below.
+        .env(
+            "CM_DAEMON_SOCKET",
+            "/nonexistent-cm-preflight-dir/preflight.sock",
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -1122,15 +1267,28 @@ fn brain_deploy_preflight(pin: &OwnedFd) -> Result<(), String> {
         .output()
         .map_err(|e| format!("brain preflight spawn failed: {e}"))?;
     if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "brain deploy REFUSED — the candidate binary failed \
-             --daemon-preflight ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The legacy-vintage shape: a binary from before --daemon-preflight
+    // fell through to run() and died at the forced-unbindable socket.
+    // That fallthrough IS a boot-to-bind proof (env sanitize + config
+    // load ran); accept it loudly — a rollback target may legitimately
+    // predate the flag (the V9 skew cell's case).
+    if stderr.contains("failed to bind cm-daemon socket") {
+        eprintln!(
+            "cm-daemon: candidate binary predates --daemon-preflight \
+             (legacy fallthrough detected) — accepting on the boot-to-bind \
+             proof only; full state validation happens at its own startup"
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "brain deploy REFUSED — the candidate binary failed \
+         --daemon-preflight ({}): {}",
+        out.status,
+        stderr.trim()
+    ))
 }
 
 /// C8's ordered tail, detached so the RPC reply reaches the caller
@@ -1198,20 +1356,291 @@ fn spawn_deploy_thread(
                     return;
                 }
             }
+            // Reverse migration only (phase 7): compose + stream one
+            // standard-schema record per live session — the C1 blobs
+            // the holder stitches into the rollback manifest. Fallible,
+            // so it happens BEFORE the arm.
+            if let DeployAction::SplitRollback(_) = &action {
+                let now = std::time::Instant::now();
+                let records: Result<Vec<(String, serde_json::Value)>, String> = {
+                    let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                    st.sessions
+                        .iter()
+                        .map(|(uid, s)| {
+                            let rec = crate::reexec::session_record_for(uid, s, now)
+                                .map_err(|e| format!("session '{uid}': {e}"))?;
+                            let val = serde_json::to_value(&rec)
+                                .map_err(|e| format!("session '{uid}': {e}"))?;
+                            Ok((uid.clone(), val))
+                        })
+                        .collect()
+                };
+                let records = match records {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("cm-daemon: split_rollback ABORTED (record compose): {e}");
+                        guard.abort();
+                        return;
+                    }
+                };
+                for (uid, val) in records {
+                    let incarnation = {
+                        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                        st.sessions.get(&uid).and_then(|s| s.holder_incarnation)
+                    };
+                    let Some(incarnation) = incarnation else {
+                        eprintln!(
+                            "cm-daemon: split_rollback ABORTED: session '{uid}' \
+                             carries no holder incarnation"
+                        );
+                        guard.abort();
+                        return;
+                    };
+                    if let Err(e) = client.rollback_record(&uid, incarnation, val) {
+                        eprintln!(
+                            "cm-daemon: split_rollback ABORTED (rollback_record \
+                             '{uid}'): {e}"
+                        );
+                        guard.abort();
+                        return;
+                    }
+                }
+            }
             // ARM — nothing fallible between here and exit (C8).
-            let armed = match action {
-                DeployAction::NewPin(pin) => client.restart_brain(pin.as_raw_fd()),
-                DeployAction::UsePrevious => client.rollback_brain(),
+            let (armed, what) = match action {
+                DeployAction::NewPin(pin) => {
+                    (client.restart_brain(pin.as_raw_fd()), "brain deploy")
+                }
+                DeployAction::UsePrevious => {
+                    (client.rollback_brain(), "brain rollback")
+                }
+                DeployAction::SplitRollback(pin) => {
+                    let generation = {
+                        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                        st.reexec_generation + 1
+                    };
+                    (
+                        client.split_rollback(
+                            pin.as_raw_fd(),
+                            generation,
+                            cm_holder_proto::reexec_manifest::MANIFEST_SCHEMA_VERSION,
+                        ),
+                        "reverse migration",
+                    )
+                }
             };
             if let Err(e) = armed {
-                eprintln!("cm-daemon: brain deploy ABORTED (arm failed): {e}");
+                eprintln!("cm-daemon: {what} ABORTED (arm failed): {e}");
                 let _ = client.cancel_pending();
                 guard.abort();
                 return;
             }
-            eprintln!("cm-daemon: brain deploy armed — exiting for the holder to exec");
+            eprintln!("cm-daemon: {what} armed — exiting for the holder to exec");
             std::process::exit(0);
         });
+}
+
+/// The reverse migration (phase 7, § Live migration's escape hatch):
+/// `daemon.split_rollback {monolith_path}` — re-pin the monolith
+/// FROM THE PATH at rollback time (O3: a months-old migration pin is
+/// stale against state the current brain wrote), preflight it, drain
+/// the exit pipeline, then run the deploy tail with the
+/// record-streaming step.
+pub fn split_rollback_flow(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    monolith_path: &str,
+) -> Result<serde_json::Value, (crate::control::protocol::ErrorCode, String)> {
+    use crate::control::protocol::ErrorCode;
+    let client = global().ok_or((
+        ErrorCode::Conflict,
+        "not in holder/brain split mode".to_string(),
+    ))?;
+    let path = std::path::Path::new(monolith_path);
+    if !path.is_absolute() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "daemon.split_rollback: monolith_path must be absolute".into(),
+        ));
+    }
+    let pin: OwnedFd = std::fs::File::open(path)
+        .map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("daemon.split_rollback: pin {}: {e}", path.display()),
+            )
+        })?
+        .into();
+    brain_deploy_preflight(&pin).map_err(|msg| (ErrorCode::Conflict, msg))?;
+    // Drain gate (C2, best-effort pre-check — the holder enforces the
+    // real precondition at arm time): every exit event acked, nothing
+    // half-forgotten. Waits briefly for an in-flight pipeline.
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.status() {
+            Ok(st) if st.pending_exit_events == 0 => break,
+            Ok(st) => {
+                if std::time::Instant::now() >= drain_deadline {
+                    return Err((
+                        ErrorCode::Conflict,
+                        format!(
+                            "daemon.split_rollback: {} exit event(s) still \
+                             pending after 10s — the pipeline is wedged; \
+                             resolve before rolling back (C2)",
+                            st.pending_exit_events
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => {
+                return Err((ErrorCode::Internal, format!("holder status: {e}")))
+            }
+        }
+    }
+    eprintln!(
+        "cm-daemon: daemon.split_rollback — monolith {} preflighted; \
+         quiescing, streaming rollback records, then arming (this brain \
+         exits; the holder execs the monolith: single-process again)",
+        path.display()
+    );
+    spawn_deploy_thread(state_arc, client, DeployAction::SplitRollback(pin));
+    Ok(serde_json::json!({
+        "accepted": true,
+        "mode": "split",
+        "message": "reverse migration accepted: after quiesce + record \
+                    transfer the holder execs the pinned monolith. Verify \
+                    via daemon.health (split becomes false; same pid).",
+    }))
+}
+
+/// Holder upgrade (phase 7, § Holder upgrades): pin + preflight the
+/// new holder image, enforce the S15 skew gate, and hand the pin to
+/// the holder via `reexec_holder`. The BRAIN DOES NOT EXIT — the
+/// holder execs itself and re-hellos over the surviving channel.
+pub fn upgrade_holder_flow(
+    holder_path: &str,
+) -> Result<serde_json::Value, (crate::control::protocol::ErrorCode, String)> {
+    use crate::control::protocol::ErrorCode;
+    let client = global().ok_or((
+        ErrorCode::Conflict,
+        "not in holder/brain split mode".to_string(),
+    ))?;
+    let path = std::path::Path::new(holder_path);
+    if !path.is_absolute() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "daemon.upgrade_holder: holder_path must be absolute".into(),
+        ));
+    }
+    let pin: OwnedFd = std::fs::File::open(path)
+        .map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("daemon.upgrade_holder: pin {}: {e}", path.display()),
+            )
+        })?
+        .into();
+    let pf = holder_preflight(&pin).map_err(|msg| (ErrorCode::Conflict, msg))?;
+    // S15's skew gate: "the previous pin by construction overlapped"
+    // is only true against the holder that pinned it — a new holder
+    // whose proto floor moved can strand BOTH brain pins into
+    // proto_mismatch → HELD_DOWN. Every brain this holder lineage
+    // ever pinned negotiated within OUR proto range, so the checkable
+    // gate is: the new holder's range must still cover our range.
+    if pf.proto_min > ch::PROTO_VERSION_MIN || pf.proto_max < ch::PROTO_VERSION_MAX {
+        return Err((
+            ErrorCode::Conflict,
+            format!(
+                "daemon.upgrade_holder REFUSED (S15): the new holder speaks \
+                 {}..={}, which does not cover this lineage's {}..={} — it \
+                 could strand the previous brain pin into proto_mismatch. \
+                 Upgrade the brains first.",
+                pf.proto_min,
+                pf.proto_max,
+                ch::PROTO_VERSION_MIN,
+                ch::PROTO_VERSION_MAX
+            ),
+        ));
+    }
+    client
+        .reexec_holder(pin.as_raw_fd())
+        .map_err(|e| (ErrorCode::Internal, format!("reexec_holder: {e}")))?;
+    eprintln!(
+        "cm-daemon: daemon.upgrade_holder — {} accepted by the holder; it \
+         will re-exec itself and re-hello (brain and sessions untouched)",
+        path.display()
+    );
+    Ok(serde_json::json!({
+        "accepted": true,
+        "mode": "split",
+        "message": "holder upgrade accepted: the holder re-execs itself with \
+                    its sealed state manifest; the brain answers the rehello. \
+                    Verify via daemon.health (holder_build_id changes; \
+                    holder_epoch and session count do not).",
+        "new_holder_build_id": pf.build_id,
+    }))
+}
+
+/// Parsed `--holder-preflight` output.
+pub(crate) struct HolderPreflight {
+    pub proto_min: u32,
+    pub proto_max: u32,
+    pub build_id: String,
+}
+
+/// Run `<pin> --holder-preflight` via /proc/self/fd (the checked
+/// inode is the armed inode) and parse its machine-readable lines.
+pub(crate) fn holder_preflight(pin: &OwnedFd) -> Result<HolderPreflight, String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let raw = pin.as_raw_fd();
+    let mut cmd = std::process::Command::new(format!("/proc/self/fd/{raw}"));
+    cmd.arg("--holder-preflight")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY (pre_exec): clear CLOEXEC on the pin in the CHILD only.
+    unsafe {
+        cmd.pre_exec(move || {
+            let flags = libc::fcntl(raw, libc::F_GETFD);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("holder preflight spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "holder preflight REFUSED — the candidate holder failed \
+             --holder-preflight ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let field = |key: &str| -> Option<String> {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .map(|v| v.trim().to_string())
+    };
+    let proto_min = field("proto_min")
+        .and_then(|v| v.parse().ok())
+        .ok_or("holder preflight output missing proto_min")?;
+    let proto_max = field("proto_max")
+        .and_then(|v| v.parse().ok())
+        .ok_or("holder preflight output missing proto_max")?;
+    Ok(HolderPreflight {
+        proto_min,
+        proto_max,
+        build_id: field("build_id").unwrap_or_default(),
+    })
 }
 
 // ============================================================

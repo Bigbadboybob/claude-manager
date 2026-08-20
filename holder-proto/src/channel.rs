@@ -99,6 +99,10 @@ pub mod verbs {
     pub const RESTART_BRAIN: &str = "restart_brain";
     pub const ROLLBACK_BRAIN: &str = "rollback_brain";
     pub const CANCEL_PENDING: &str = "cancel_pending";
+    pub const REEXEC_HOLDER: &str = "reexec_holder";
+    pub const ROLLBACK_RECORD: &str = "rollback_record";
+    pub const SPLIT_ROLLBACK: &str = "split_rollback";
+    pub const REHELLO: &str = "rehello";
     pub const STATUS: &str = "status";
     pub const PING: &str = "ping";
     pub const PONG: &str = "pong";
@@ -117,6 +121,11 @@ pub const ERR_NOT_EXITED: &str = "not_exited";
 pub const ERR_UNACKED: &str = "unacked";
 pub const ERR_ALREADY_EXITED: &str = "already_exited";
 pub const ERR_INVALID: &str = "invalid";
+/// `split_rollback` precondition failure (C2): a pending exit event,
+/// a reaped-but-unforgotten record, or a live record with no stored
+/// `rollback_record` — a consumed `waitid` status has no standard-
+/// manifest representation and would be lost to the monolith.
+pub const ERR_NOT_DRAINED: &str = "not_drained";
 
 // ============================================================
 // Payload types (all additive-tolerant: no deny_unknown_fields)
@@ -303,7 +312,7 @@ pub struct ForgetBody {
 /// Holder → brain: an authoritative exit. Unsolicited; redelivered
 /// on every brain generation (once the record is armed) until
 /// `ack_exit`. Idempotent brain-side by `(uid, incarnation)` (C4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExitEventBody {
     pub uid: String,
     pub incarnation: u64,
@@ -327,6 +336,51 @@ pub struct ExitEventBody {
 pub struct AckExitBody {
     pub uid: String,
     pub incarnation: u64,
+}
+
+/// Brain → holder: the reverse-migration prelude (phase 7, C1). One
+/// opaque, fully-populated standard-schema `SessionRecord` payload
+/// per live session — composed by the brain, which alone holds the
+/// logic meta (title, engine, bindings, perms, caps, activity,
+/// done-report) the shipped record shape requires. The holder stores
+/// the blob UNPARSED, keyed `(uid, incarnation)`; at rollback-
+/// manifest-write time it fills in exactly the fd-number/pid fields
+/// it owns (`pty_master_fd`, `pidfd`) — mechanical field surgery,
+/// never interpretation (frozenness intact).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackRecordBody {
+    pub uid: String,
+    pub incarnation: u64,
+    /// A `reexec_manifest::SessionRecord` at the schema version the
+    /// accompanying `split_rollback` declares.
+    pub record: serde_json::Value,
+}
+
+/// Brain → holder: reverse migration (phase 7, V4/C2/C8). Carries
+/// one fd — the freshly-pinned monolith binary. Sent only after the
+/// brain's quiesce + drain + record transfer succeeded (arm-late).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitRollbackBody {
+    /// The lineage counter the written manifest carries (the brain's
+    /// own `reexec_generation` + 1 — the holder tracks no lineage).
+    pub reexec_generation: u64,
+    /// The manifest schema version the holder must EMIT for the
+    /// monolith pin (S5's prior-version serialization — the brain
+    /// preflighted the pin, so the brain knows what it reads).
+    pub manifest_schema_version: u32,
+}
+
+/// Holder → brain, post-holder-upgrade (phase 7, § Holder upgrades):
+/// the new holder image's unsolicited re-negotiation — the ONE
+/// exception to brain-sends-first. The brain replies with its own
+/// [`HelloBody`] (req_id echoed); the holder re-checks overlap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RehelloBody {
+    pub holder_build_id: String,
+    pub holder_proto_min: u32,
+    pub holder_proto_max: u32,
+    pub epoch: u64,
+    pub session_count: usize,
 }
 
 /// Holder → brain, the `status` reply.

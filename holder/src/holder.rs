@@ -38,10 +38,11 @@
 //! discovery (the zombie-parking property).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use cm_holder_proto::channel::{self as ch, verbs, FeedStatus, Frame, FrameReader};
+use cm_holder_proto::holder_manifest as hm;
 use portable_pty::MasterPty;
 
 use crate::{reap, spawn};
@@ -102,7 +103,7 @@ impl Default for HolderConfig {
 /// Why [`Holder::serve`] returned. The holder's per-session state
 /// survives the return; the caller (the binary's respawn loop, or a
 /// test) starts the next brain generation and calls `serve` again.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum ServeOutcome {
     /// Orderly channel EOF — the brain exited.
     BrainEof,
@@ -123,6 +124,31 @@ pub enum ServeOutcome {
     /// The signal callback asked for the stop-everything sequence
     /// (SIGTERM/SIGINT via the binary's signalfd).
     ShutdownRequested,
+    /// `reexec_holder` accepted (phase 7, § Holder upgrades): the ok
+    /// reply has been FLUSHED to the brain, and the supervisor must
+    /// now write the holder-upgrade manifest and exec this pinned
+    /// new-holder fd. The brain stays alive across the exec, so the
+    /// CHANNEL rides back out too — dropping it here would EOF the
+    /// brain into its channel-fatal exit.
+    HolderUpgrade { pin: OwnedFd, channel: OwnedFd },
+}
+
+impl PartialEq for ServeOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        use ServeOutcome::*;
+        match (self, other) {
+            (BrainEof, BrainEof)
+            | (HelloTimeout, HelloTimeout)
+            | (HelloRefused, HelloRefused)
+            | (ShutdownRequested, ShutdownRequested) => true,
+            (Protocol(a), Protocol(b)) | (Wedged(a), Wedged(b)) => a == b,
+            (
+                HolderUpgrade { pin: a, .. },
+                HolderUpgrade { pin: b, .. },
+            ) => a.as_raw_fd() == b.as_raw_fd(),
+            _ => false,
+        }
+    }
 }
 
 /// Consecutive unanswered pings that mean the brain is wedged —
@@ -140,6 +166,15 @@ pub enum ArmedDeploy {
     NewPin(OwnedFd),
     /// Exec the previous pin (`rollback_brain`).
     UsePrevious,
+    /// Reverse migration (phase 7, `split_rollback`): on the brain's
+    /// exit, write a fresh standard-schema manifest from the stored
+    /// rollback records + our fd/pid fields and exec the pinned
+    /// monolith INSTEAD of respawning a brain.
+    SplitRollback {
+        pin: OwnedFd,
+        reexec_generation: u64,
+        schema_version: u32,
+    },
 }
 
 /// C8's auto-disarm horizon: a brain that armed a deploy and then
@@ -154,6 +189,26 @@ struct ExitRec {
     pending: Option<ch::ExitEventBody>,
 }
 
+/// The canonical PTY master's owner. Spawned sessions hold the
+/// portable-pty object; sessions adopted from a manifest (migration
+/// or holder upgrade) hold the bare inherited fd — the holder never
+/// writes/resizes/reads (those are not verbs), so keeping the open
+/// file description alive and dup-ing it for spawn/adopt replies is
+/// the whole job, and an `OwnedFd` does it.
+enum MasterHold {
+    Pty(Box<dyn MasterPty + Send>),
+    Raw(OwnedFd),
+}
+
+impl MasterHold {
+    fn raw_fd(&self) -> Option<RawFd> {
+        match self {
+            MasterHold::Pty(m) => m.as_raw_fd(),
+            MasterHold::Raw(fd) => Some(fd.as_raw_fd()),
+        }
+    }
+}
+
 /// One session child, canonically holder-owned.
 struct SessionEntry {
     incarnation: u64,
@@ -162,7 +217,7 @@ struct SessionEntry {
     child_start_time: u64,
     /// Canonical master — its open file description keeps the PTY
     /// alive across brain generations.
-    master: Box<dyn MasterPty + Send>,
+    master: MasterHold,
     /// Canonical pidfd — reaping + signaling identity.
     pidfd: OwnedFd,
     reap_armed: bool,
@@ -176,11 +231,16 @@ struct SessionEntry {
     watcher_checkpoint: Option<serde_json::Value>,
     last_signal_request: Option<ch::LastSignalRequest>,
     exit: Option<ExitRec>,
+    /// Reverse-migration blob (phase 7, C1): the brain-composed
+    /// standard-schema record, stored UNPARSED — the holder patches
+    /// exactly its own fd/pid fields into it at rollback-manifest
+    /// write time, never interprets it.
+    rollback_record: Option<serde_json::Value>,
 }
 
 impl SessionEntry {
     fn master_raw_fd(&self) -> Option<RawFd> {
-        self.master.as_raw_fd()
+        self.master.raw_fd()
     }
 }
 
@@ -221,6 +281,12 @@ pub struct Holder {
     /// breaker's stability input (a long-lived brain that never
     /// negotiated is not stable).
     helloed_this_generation: bool,
+    /// Post-holder-upgrade re-negotiation state (phase 7): `Some(id)`
+    /// while our unsolicited `rehello` awaits the brain's reply.
+    rehello_pending: Option<u64>,
+    /// A `reexec_holder` pin accepted this generation — surfaced as
+    /// [`ServeOutcome::HolderUpgrade`] once the ok reply has flushed.
+    pending_upgrade: Option<OwnedFd>,
 }
 
 impl Holder {
@@ -237,6 +303,8 @@ impl Holder {
             ping_seq: 0,
             pings_unanswered: 0,
             helloed_this_generation: false,
+            rehello_pending: None,
+            pending_upgrade: None,
         }
     }
 
@@ -294,6 +362,241 @@ impl Holder {
             .count()
     }
 
+    // ------------------------------------------------------------
+    // Phase 7: migration adoption, upgrade snapshot/restore, and the
+    // rollback-manifest projection.
+    // ------------------------------------------------------------
+
+    /// Adopt one session from a validated migration manifest record
+    /// (§ Live migration step 8). The monolith owned reaping, so the
+    /// record arrives armed; delivery readiness stays per-brain-
+    /// generation (the parked brain re-arms via ordinary `arm_reap`,
+    /// C9). An already-exited child is discovered by the poll loop
+    /// exactly as a post-spawn exit would be.
+    pub fn adopt_migrated_session(
+        &mut self,
+        rec: &cm_holder_proto::reexec_manifest::SessionRecord,
+        master: OwnedFd,
+        pidfd: OwnedFd,
+    ) {
+        let incarnation = self.next_incarnation;
+        self.next_incarnation += 1;
+        self.sessions.insert(
+            rec.uid.clone(),
+            SessionEntry {
+                incarnation,
+                generation_meta: rec.generation,
+                pid: rec.child_pid as libc::pid_t,
+                child_start_time: rec.child_start_time,
+                master: MasterHold::Raw(master),
+                pidfd,
+                reap_armed: true,
+                delivery_ready: false,
+                exit_latched: false,
+                cgroup_prefix: rec.cgroup_prefix.clone(),
+                cgroup_path: None,
+                watcher_checkpoint: rec.watcher_checkpoint.clone(),
+                last_signal_request: None,
+                exit: None,
+                rollback_record: None,
+            },
+        );
+    }
+
+    /// Store a listener directly (the migration boot's custody
+    /// seeding — the manifest carried the monolith's bound listener;
+    /// no brain sent `store_listener` for it).
+    pub fn store_listener_custody(&mut self, meta: ch::ListenerMeta, fd: OwnedFd) {
+        self.listeners.retain(|(m, _)| m.kind != meta.kind);
+        self.listeners.push((meta, fd));
+    }
+
+    /// Snapshot the holder's full state as the holder-upgrade
+    /// manifest (§ Holder upgrades; V3's incarnation high-water).
+    /// FD fields are the CURRENT raw numbers — the exec path clears
+    /// CLOEXEC on exactly this set.
+    pub fn upgrade_snapshot(
+        &self,
+        brain: Option<hm::BrainRuntime>,
+        brain_pin_fd: Option<RawFd>,
+        brain_pin_previous_fd: Option<RawFd>,
+        breaker_consecutive_failures: u32,
+        brain_path: &str,
+    ) -> hm::HolderUpgradeManifest {
+        hm::HolderUpgradeManifest {
+            schema_version: hm::HOLDER_MANIFEST_SCHEMA_VERSION,
+            epoch: self.epoch,
+            next_incarnation: self.next_incarnation,
+            breaker_consecutive_failures,
+            brain_path: brain_path.to_string(),
+            brain,
+            brain_pin_fd,
+            brain_pin_previous_fd,
+            sessions: self
+                .sessions
+                .iter()
+                .map(|(uid, e)| hm::HolderSessionRecord {
+                    uid: uid.clone(),
+                    incarnation: e.incarnation,
+                    generation_meta: e.generation_meta,
+                    child_pid: e.pid,
+                    child_start_time: e.child_start_time,
+                    master_fd: e.master_raw_fd().unwrap_or(-1),
+                    pidfd: e.pidfd.as_raw_fd(),
+                    reap_armed: e.reap_armed,
+                    delivery_ready: e.delivery_ready,
+                    exit_latched: e.exit_latched,
+                    cgroup_prefix: e.cgroup_prefix.clone(),
+                    cgroup_path: e.cgroup_path.clone(),
+                    watcher_checkpoint: e.watcher_checkpoint.clone(),
+                    last_signal_request: e.last_signal_request.clone(),
+                    exit: e.exit.as_ref().map(|x| hm::ExitCarry {
+                        exited_at: x.exited_at,
+                        pending_event: x.pending.clone(),
+                    }),
+                    rollback_record: e.rollback_record.clone(),
+                })
+                .collect(),
+            listeners: self
+                .listeners
+                .iter()
+                .map(|(m, fd)| hm::ListenerRecord {
+                    kind: m.kind.clone(),
+                    meta: m.clone(),
+                    fd: fd.as_raw_fd(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild from a validated holder-upgrade manifest (the new
+    /// holder image's boot). Takes ownership of every session/
+    /// listener fd the manifest names (SAFETY at the call sites:
+    /// single ownership per the manifest's duplicate-fd validation).
+    pub fn restore_from_upgrade(
+        cfg: HolderConfig,
+        m: &hm::HolderUpgradeManifest,
+    ) -> Holder {
+        let mut h = Holder::new(cfg);
+        h.epoch = m.epoch;
+        h.next_incarnation = m.next_incarnation;
+        for rec in &m.sessions {
+            // SAFETY: validated manifest, single-owner fd numbers.
+            let master = unsafe { OwnedFd::from_raw_fd(rec.master_fd) };
+            let pidfd = unsafe { OwnedFd::from_raw_fd(rec.pidfd) };
+            h.sessions.insert(
+                rec.uid.clone(),
+                SessionEntry {
+                    incarnation: rec.incarnation,
+                    generation_meta: rec.generation_meta,
+                    pid: rec.child_pid as libc::pid_t,
+                    child_start_time: rec.child_start_time,
+                    master: MasterHold::Raw(master),
+                    pidfd,
+                    reap_armed: rec.reap_armed,
+                    delivery_ready: rec.delivery_ready,
+                    exit_latched: rec.exit_latched,
+                    cgroup_prefix: rec.cgroup_prefix.clone(),
+                    cgroup_path: rec.cgroup_path.clone(),
+                    watcher_checkpoint: rec.watcher_checkpoint.clone(),
+                    last_signal_request: rec.last_signal_request.clone(),
+                    exit: rec.exit.as_ref().map(|x| ExitRec {
+                        exited_at: x.exited_at,
+                        pending: x.pending_event.clone(),
+                    }),
+                    rollback_record: rec.rollback_record.clone(),
+                },
+            );
+        }
+        for l in &m.listeners {
+            // SAFETY: as above.
+            let fd = unsafe { OwnedFd::from_raw_fd(l.fd) };
+            h.listeners.push((l.meta.clone(), fd));
+        }
+        h
+    }
+
+    /// Project the reverse-migration manifest (phase 7, § Live
+    /// migration's escape hatch): the stored brain-composed record
+    /// blobs, each patched with OUR canonical fd numbers + pid —
+    /// mechanical field surgery on two keys, never interpretation —
+    /// wrapped in a standard-schema envelope at `schema_version`.
+    /// Precondition (enforced at `split_rollback` arm time): every
+    /// live session has a blob, nothing is pending or half-forgotten.
+    pub fn rollback_manifest(
+        &self,
+        schema_version: u32,
+        reexec_generation: u64,
+        rollback_bin_fd: RawFd,
+    ) -> Result<cm_holder_proto::reexec_manifest::ReexecManifest, String> {
+        use cm_holder_proto::reexec_manifest as rm;
+        let mut sessions: Vec<rm::SessionRecord> = Vec::new();
+        for (uid, e) in &self.sessions {
+            let Some(blob) = &e.rollback_record else {
+                return Err(format!("session '{uid}' has no rollback_record"));
+            };
+            let mut v = blob.clone();
+            let obj = v
+                .as_object_mut()
+                .ok_or_else(|| format!("session '{uid}' blob is not an object"))?;
+            let master = e
+                .master_raw_fd()
+                .ok_or_else(|| format!("session '{uid}' has no master fd"))?;
+            obj.insert("pty_master_fd".into(), serde_json::json!(master));
+            obj.insert(
+                "pidfd".into(),
+                serde_json::json!(e.pidfd.as_raw_fd()),
+            );
+            obj.insert("child_pid".into(), serde_json::json!(e.pid));
+            obj.insert(
+                "child_start_time".into(),
+                serde_json::json!(e.child_start_time),
+            );
+            let rec: rm::SessionRecord = serde_json::from_value(v)
+                .map_err(|err| format!("session '{uid}' blob does not parse as a SessionRecord: {err}"))?;
+            sessions.push(rec);
+        }
+        let listener_fd = self
+            .listeners
+            .iter()
+            .find(|(m, _)| m.kind == "unix")
+            .map(|(_, fd)| fd.as_raw_fd())
+            .ok_or_else(|| "no custodied unix listener".to_string())?;
+        let tls_listener_fd = self
+            .listeners
+            .iter()
+            .find(|(m, _)| m.kind == "tls")
+            .map(|(_, fd)| fd.as_raw_fd());
+        Ok(rm::ReexecManifest {
+            schema_version,
+            attempt: 0,
+            reexec_generation,
+            rollback_bin_fd,
+            sessions,
+            listener_fd,
+            tls_listener_fd,
+            rollback_schema_version: None,
+            split: None,
+        })
+    }
+
+    /// Every fd the holder must carry across a self-exec (upgrade)
+    /// or hand to a rollback exec: session masters + pidfds and
+    /// custodied listeners. Pins/brain/channel are the caller's.
+    pub fn escrow_fds(&self) -> Vec<RawFd> {
+        let mut out = Vec::new();
+        for e in self.sessions.values() {
+            if let Some(fd) = e.master_raw_fd() {
+                out.push(fd);
+            }
+            out.push(e.pidfd.as_raw_fd());
+        }
+        for (_, fd) in &self.listeners {
+            out.push(fd.as_raw_fd());
+        }
+        out
+    }
+
     /// Serve one brain generation over `channel`. Returns when the
     /// channel dies (or a signal asks for shutdown); holder state
     /// (sessions, queued events, custody, armed deploys) is retained
@@ -303,19 +606,67 @@ impl Holder {
     pub fn serve(
         &mut self,
         channel: OwnedFd,
-        mut on_extra: Option<&mut dyn FnMut(&StatusSnapshot) -> SignalDirective>,
+        on_extra: Option<&mut dyn FnMut(&StatusSnapshot) -> SignalDirective>,
     ) -> ServeOutcome {
-        self.epoch += 1;
+        self.serve_inner(channel, on_extra, false)
+    }
+
+    /// Serve the SAME brain generation after a holder self-exec
+    /// (§ Holder upgrades): the epoch does not advance, per-record
+    /// `delivery_ready` is preserved (the brain's registry inserts
+    /// still stand), and instead of awaiting the brain's hello, the
+    /// holder opens with an unsolicited `rehello` — the one exception
+    /// to brain-sends-first — and awaits the brain's [`ch::HelloBody`]
+    /// reply within the handshake timeout.
+    pub fn serve_resumed(
+        &mut self,
+        channel: OwnedFd,
+        on_extra: Option<&mut dyn FnMut(&StatusSnapshot) -> SignalDirective>,
+    ) -> ServeOutcome {
+        self.serve_inner(channel, on_extra, true)
+    }
+
+    fn serve_inner(
+        &mut self,
+        channel: OwnedFd,
+        mut on_extra: Option<&mut dyn FnMut(&StatusSnapshot) -> SignalDirective>,
+        resumed: bool,
+    ) -> ServeOutcome {
         self.pings_unanswered = 0;
-        self.helloed_this_generation = false;
-        for e in self.sessions.values_mut() {
-            e.delivery_ready = false; // C9: re-armed per generation
+        self.rehello_pending = None;
+        self.pending_upgrade = None;
+        if !resumed {
+            self.epoch += 1;
+            self.helloed_this_generation = false;
+            for e in self.sessions.values_mut() {
+                e.delivery_ready = false; // C9: re-armed per generation
+            }
         }
         set_nonblocking(&channel);
 
         let mut reader = FrameReader::new();
         let mut outbound: VecDeque<OutFrame> = VecDeque::new();
-        let mut hello_done = false;
+        let mut hello_done = resumed;
+        if resumed {
+            self.helloed_this_generation = false;
+            self.rehello_pending = Some(1);
+            push_frame(
+                &mut outbound,
+                Frame::new(
+                    verbs::REHELLO,
+                    Some(1),
+                    0,
+                    ch::RehelloBody {
+                        holder_build_id: self.cfg.holder_build_id.clone(),
+                        holder_proto_min: ch::PROTO_VERSION_MIN,
+                        holder_proto_max: ch::PROTO_VERSION_MAX,
+                        epoch: self.epoch,
+                        session_count: self.sessions.len(),
+                    },
+                ),
+                vec![],
+            );
+        }
         let handshake_deadline = Instant::now() + self.cfg.handshake_timeout;
         let mut next_ping = self.cfg.ping_interval.map(|d| Instant::now() + d);
 
@@ -358,7 +709,7 @@ impl Holder {
             // ---- timeout: handshake / ping, else a coarse tick ----
             let now = Instant::now();
             let mut deadline: Option<Instant> = None;
-            if !hello_done {
+            if !hello_done || self.rehello_pending.is_some() {
                 deadline = Some(handshake_deadline);
             }
             if let Some(np) = next_ping {
@@ -394,7 +745,9 @@ impl Holder {
             }
 
             // ---- timers ----
-            if !hello_done && Instant::now() >= handshake_deadline {
+            if (!hello_done || self.rehello_pending.is_some())
+                && Instant::now() >= handshake_deadline
+            {
                 return ServeOutcome::HelloTimeout;
             }
             // C8's auto-disarm: an armed deploy whose brain did NOT
@@ -506,6 +859,14 @@ impl Holder {
                     self.cfg.outbound_max_frames
                 ));
             }
+            // An accepted `reexec_holder` surfaces only after its ok
+            // reply has fully flushed — the brain must not observe a
+            // silent channel while the arm is in flight.
+            if outbound.is_empty() {
+                if let Some(pin) = self.pending_upgrade.take() {
+                    return ServeOutcome::HolderUpgrade { pin, channel };
+                }
+            }
         }
     }
 
@@ -555,6 +916,8 @@ impl Holder {
         // frame layer — this guards declared-but-wrong-verb).
         if frame.v != verbs::STORE_LISTENER
             && frame.v != verbs::RESTART_BRAIN
+            && frame.v != verbs::SPLIT_ROLLBACK
+            && frame.v != verbs::REEXEC_HOLDER
             && !fds.is_empty()
         {
             return Err(ServeOutcome::Protocol(format!(
@@ -628,6 +991,46 @@ impl Holder {
             return Ok(());
         }
 
+        // Post-upgrade re-negotiation (phase 7): the brain answers
+        // our `rehello` with its own HelloBody, req_id echoed.
+        if let Some(pending) = self.rehello_pending {
+            if frame.v == verbs::HELLO && req_id == pending {
+                let hello: ch::HelloBody = match frame.parse_body() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(ServeOutcome::Protocol(format!(
+                            "rehello reply body: {e}"
+                        )))
+                    }
+                };
+                let lo = hello.proto_min.max(ch::PROTO_VERSION_MIN);
+                let hi = hello.proto_max.min(ch::PROTO_VERSION_MAX);
+                if lo > hi {
+                    // The S15 preflight gate exists to prevent this;
+                    // reaching it means the running brain cannot talk
+                    // to the upgraded holder — surface as a protocol
+                    // failure so the supervisor kills + respawns from
+                    // the pins (an ordinary strike, sessions held).
+                    return Err(ServeOutcome::Protocol(format!(
+                        "post-upgrade proto mismatch: brain {}..={}, \
+                         holder {}..={}",
+                        hello.proto_min,
+                        hello.proto_max,
+                        ch::PROTO_VERSION_MIN,
+                        ch::PROTO_VERSION_MAX
+                    )));
+                }
+                eprintln!(
+                    "cm-holder: post-upgrade rehello answered by {} — \
+                     resuming generation {}",
+                    hello.brain_build_id, self.epoch
+                );
+                self.rehello_pending = None;
+                self.helloed_this_generation = true;
+                return Ok(());
+            }
+        }
+
         match frame.v.as_str() {
             verbs::SPAWN => self.handle_spawn(req_id, &frame, outbound),
             verbs::ARM_REAP => self.handle_arm_reap(req_id, &frame, outbound),
@@ -691,6 +1094,177 @@ impl Holder {
                             detail: Some(serde_json::json!({ "disarmed": had })),
                         },
                     ),
+                    vec![],
+                );
+                Ok(())
+            }
+            verbs::ROLLBACK_RECORD => {
+                // Reverse-migration prelude (phase 7, C1): store the
+                // brain-composed standard-schema blob UNPARSED.
+                let body: ch::RollbackRecordBody = match frame.parse_body() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        push_frame(
+                            outbound,
+                            err_frame(req_id, ch::ERR_INVALID, format!("rollback_record body: {e}")),
+                            vec![],
+                        );
+                        return Ok(());
+                    }
+                };
+                let Some(e) = self.sessions.get_mut(&body.uid) else {
+                    push_frame(
+                        outbound,
+                        err_frame(
+                            req_id,
+                            ch::ERR_NOT_FOUND,
+                            format!("no session '{}'", body.uid),
+                        ),
+                        vec![],
+                    );
+                    return Ok(());
+                };
+                if e.incarnation != body.incarnation {
+                    push_frame(
+                        outbound,
+                        err_frame(
+                            req_id,
+                            ch::ERR_NOT_FOUND,
+                            format!(
+                                "session '{}' is incarnation {}, not {}",
+                                body.uid, e.incarnation, body.incarnation
+                            ),
+                        ),
+                        vec![],
+                    );
+                    return Ok(());
+                }
+                e.rollback_record = Some(body.record);
+                push_frame(
+                    outbound,
+                    Frame::new(verbs::OK, Some(req_id), 0, ch::OkBody { detail: None }),
+                    vec![],
+                );
+                Ok(())
+            }
+            verbs::SPLIT_ROLLBACK => {
+                // Reverse migration (phase 7, V4/C2/C8). Same arm-late
+                // contract as restart_brain, plus the drain
+                // preconditions: a consumed waitid status has no
+                // standard-manifest representation, so nothing may be
+                // pending or half-forgotten when the monolith takes
+                // over.
+                if fds.len() != 1 {
+                    return Err(ServeOutcome::Protocol(format!(
+                        "split_rollback carried {} fds, want 1 (the pinned monolith binary)",
+                        fds.len()
+                    )));
+                }
+                let body: ch::SplitRollbackBody = match frame.parse_body() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        push_frame(
+                            outbound,
+                            err_frame(req_id, ch::ERR_INVALID, format!("split_rollback body: {e}")),
+                            vec![],
+                        );
+                        return Ok(());
+                    }
+                };
+                let mut violations: Vec<String> = Vec::new();
+                for (uid, e) in &self.sessions {
+                    match &e.exit {
+                        Some(x) if x.pending.is_some() => violations
+                            .push(format!("'{uid}': exit event pending (unacked)")),
+                        Some(_) => violations.push(format!(
+                            "'{uid}': reaped but unforgotten (its consumed exit \
+                             status is unrepresentable in a standard manifest)"
+                        )),
+                        None => {
+                            if e.rollback_record.is_none() {
+                                violations.push(format!(
+                                    "'{uid}': live with no rollback_record"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if !violations.is_empty() {
+                    push_frame(
+                        outbound,
+                        err_frame_with(
+                            req_id,
+                            ch::ERR_NOT_DRAINED,
+                            format!(
+                                "split_rollback refused — {} precondition \
+                                 violation(s) (C2)",
+                                violations.len()
+                            ),
+                            serde_json::json!({ "violations": violations }),
+                        ),
+                        vec![],
+                    );
+                    return Ok(());
+                }
+                let pin = fds.into_iter().next().expect("len checked");
+                self.armed_deploy = Some((
+                    ArmedDeploy::SplitRollback {
+                        pin,
+                        reexec_generation: body.reexec_generation,
+                        schema_version: body.manifest_schema_version,
+                    },
+                    Instant::now(),
+                ));
+                eprintln!(
+                    "cm-holder: split_rollback armed (monolith pin; manifest \
+                     will be emitted at schema v{})",
+                    body.manifest_schema_version
+                );
+                push_frame(
+                    outbound,
+                    Frame::new(verbs::OK, Some(req_id), 0, ch::OkBody { detail: None }),
+                    vec![],
+                );
+                Ok(())
+            }
+            verbs::REEXEC_HOLDER => {
+                // Holder upgrade (phase 7, § Holder upgrades, V4): the
+                // ok reply flushes first, then the supervisor writes
+                // the holder-upgrade manifest and execs the pin. The
+                // brain survives the exec.
+                if fds.len() != 1 {
+                    return Err(ServeOutcome::Protocol(format!(
+                        "reexec_holder carried {} fds, want 1 (the pinned new holder binary)",
+                        fds.len()
+                    )));
+                }
+                let pin = fds.into_iter().next().expect("len checked");
+                // Shape check only (the brain preflighted the binary;
+                // this catches wrong-fd mixups before we bet the
+                // process image on it).
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: zeroed stat is a valid out-buffer; fstat on
+                // a bad fd errors rather than faulting.
+                let ok = unsafe { libc::fstat(pin.as_raw_fd(), &mut st) } == 0
+                    && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+                    && st.st_mode & 0o111 != 0;
+                if !ok {
+                    push_frame(
+                        outbound,
+                        err_frame(
+                            req_id,
+                            ch::ERR_INVALID,
+                            "reexec_holder pin is not an executable regular file".into(),
+                        ),
+                        vec![],
+                    );
+                    return Ok(());
+                }
+                self.pending_upgrade = Some(pin);
+                eprintln!("cm-holder: reexec_holder accepted — will exec the new holder image once the reply flushes");
+                push_frame(
+                    outbound,
+                    Frame::new(verbs::OK, Some(req_id), 0, ch::OkBody { detail: None }),
                     vec![],
                 );
                 Ok(())
@@ -827,7 +1401,7 @@ impl Holder {
                 generation_meta: spec.generation_meta,
                 pid: spawned.pid,
                 child_start_time: spawned.child_start_time,
-                master: spawned.master,
+                master: MasterHold::Pty(spawned.master),
                 pidfd: spawned.pidfd,
                 reap_armed: false,
                 delivery_ready: false,
@@ -837,6 +1411,7 @@ impl Holder {
                 watcher_checkpoint: None,
                 last_signal_request: None,
                 exit: None,
+                rollback_record: None,
             },
         );
         Ok(())

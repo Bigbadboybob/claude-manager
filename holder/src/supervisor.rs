@@ -66,6 +66,14 @@ impl Breaker {
         self.consecutive_failures
     }
 
+    /// Carry strike state across a holder self-exec (phase 7): the
+    /// upgrade manifest brings the counter back so an upgrade can
+    /// never launder a crash-looping pin's strikes. The stability
+    /// timer re-anchors at the restore — that only DELAYS a reset.
+    pub fn restore_failures(&mut self, n: u32) {
+        self.consecutive_failures = n;
+    }
+
     /// An armed-deploy exit: never a failure; the fresh binary
     /// starts with a clean slate.
     pub fn note_deploy(&mut self) {

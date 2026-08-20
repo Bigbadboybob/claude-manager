@@ -45,6 +45,8 @@ fn minimal_manifest() -> ReexecManifest {
         sessions: vec![],
         listener_fd: 11,
         tls_listener_fd: None,
+        rollback_schema_version: None,
+        split: None,
     }
 }
 

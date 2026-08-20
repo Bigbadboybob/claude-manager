@@ -369,3 +369,194 @@ fn skew_pair_clears_the_compat_floor() {
         },
     );
 }
+
+/// V9 (§ Version-skew testing): the prior-schema rollback-manifest
+/// emission, proven against a REAL older monolith image — the HEAD
+/// holder+brain run split, then `daemon.split_rollback` targets the
+/// binary named by `CM_SKEW_MONOLITH_BIN` (the matrix passes the
+/// BASELINE cm-daemon). The holder's projected standard-schema (v3)
+/// manifest must boot that older image with the session intact.
+///
+/// Skips unless all three CM_SKEW_* vars are set (matrix-driven).
+/// No comm assertions on the rolled-back root: the baseline predates
+/// the run()-side PR_SET_NAME, so its post-execveat comm is
+/// kernel-derived.
+#[test]
+fn reverse_migration_manifest_boots_the_target_monolith() {
+    let (Some(holder_bin), Some(brain_bin), Some(monolith_bin)) = (
+        std::env::var_os("CM_SKEW_HOLDER_BIN"),
+        std::env::var_os("CM_SKEW_BRAIN_BIN"),
+        std::env::var_os("CM_SKEW_MONOLITH_BIN"),
+    ) else {
+        eprintln!(
+            "holder_skew_e2e: CM_SKEW_MONOLITH_BIN (with HOLDER/BRAIN) unset — \
+             skipping the V9 cell (run scripts/holder-skew-matrix)"
+        );
+        return;
+    };
+    for b in [&holder_bin, &brain_bin, &monolith_bin] {
+        assert!(Path::new(b).exists(), "skew binary missing: {b:?}");
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("mk sandbox HOME");
+    let socket = dir.path().join("daemon.sock");
+    let log_path = dir.path().join("skew-v9.log");
+    let token = format!("skew-v9-{}", std::process::id());
+    let log_file = std::fs::File::create(&log_path).expect("create log");
+    let log_for_stderr = log_file.try_clone().expect("clone log handle");
+    let holder = Command::new(&holder_bin)
+        .arg("--brain")
+        .arg(&brain_bin)
+        .env_clear()
+        .env("HOME", &home)
+        .env("CM_DAEMON_SOCKET", &socket)
+        .env("CM_OPERATOR_TOKEN", &token)
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        )
+        .current_dir(&home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_for_stderr))
+        .spawn()
+        .expect("spawn skew cm-holder");
+    let root_pid = holder.id() as i32;
+    let mut guard = SandboxGuard {
+        holder,
+        bash: Vec::new(),
+        log_path,
+    };
+
+    wait_for(
+        Instant::now() + Duration::from_secs(45),
+        "split health at launch",
+        &guard,
+        || {
+            round_trip(
+                &socket,
+                &operator_request(&token, "daemon.health", serde_json::json!({})),
+            )
+            .ok()
+            .filter(|r| r.ok)
+            .filter(|r| {
+                r.result
+                    .as_ref()
+                    .and_then(|v| v.get("split"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            })
+        },
+    );
+
+    // One live bash session through the split.
+    let uid = "ts-5e11-9";
+    let start = round_trip(
+        &socket,
+        &operator_request(
+            &token,
+            "start_session",
+            serde_json::json!({
+                "uid": uid,
+                "workspace_id": "ws-skew-v9",
+                "worktree_path": home.to_string_lossy(),
+                "label": "skew-v9-bash",
+                "argv": ["bash", "--norc"],
+                "working_dir": home.to_string_lossy(),
+                "session_type": "bash",
+                "cols": 100,
+                "rows": 30,
+                "env": {}
+            }),
+        ),
+    )
+    .expect("start_session");
+    assert!(start.ok, "spawn failed: {:?}\n{}", start.error, guard.log_tail());
+    let bash_pid = find_child_by_comm(
+        root_pid,
+        "bash",
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("bash parented to the holder");
+    let bash_start = proc_starttime(bash_pid).expect("bash starttime");
+    guard.bash.push((bash_pid, bash_start));
+
+    // Reverse-migrate INTO the target (baseline) monolith.
+    let resp = round_trip(
+        &socket,
+        &operator_request(
+            &token,
+            "daemon.split_rollback",
+            serde_json::json!({
+                "monolith_path": Path::new(&monolith_bin).to_string_lossy()
+            }),
+        ),
+    )
+    .expect("split_rollback round trip");
+    assert!(
+        resp.ok,
+        "split_rollback refused: {:?}\n{}",
+        resp.error,
+        guard.log_tail()
+    );
+
+    // The older image boots from the v3 manifest with the session.
+    wait_for(
+        Instant::now() + Duration::from_secs(45),
+        "monolith health (split=false) with the session intact",
+        &guard,
+        || {
+            let r = round_trip(
+                &socket,
+                &operator_request(&token, "daemon.health", serde_json::json!({})),
+            )
+            .ok()
+            .filter(|r| r.ok)?;
+            let h = r.result?;
+            let split = h.get("split").and_then(|v| v.as_bool()).unwrap_or(false);
+            (!split && h.get("sessions").and_then(|v| v.as_u64()) == Some(1))
+                .then_some(())
+        },
+    );
+    assert_eq!(
+        proc_starttime(bash_pid),
+        Some(bash_start),
+        "the session child survived the reverse migration into the baseline image"
+    );
+    assert_eq!(proc_ppid(bash_pid), Some(root_pid), "parent unchanged");
+
+    // PTY continuity through the OLD image's adopted reader.
+    let send = round_trip(
+        &socket,
+        &operator_request(
+            &token,
+            "send_input",
+            serde_json::json!({
+                "session_uid": uid,
+                "text": "echo V9-$((40+2))",
+                "submit": true
+            }),
+        ),
+    )
+    .expect("send_input");
+    assert!(send.ok, "send_input failed: {:?}", send.error);
+    wait_for(
+        Instant::now() + Duration::from_secs(20),
+        "V9-42 in the baseline monolith's session output",
+        &guard,
+        || {
+            let resp = round_trip(
+                &socket,
+                &operator_request(
+                    &token,
+                    "read_session_output",
+                    serde_json::json!({ "session_uid": uid }),
+                ),
+            )
+            .ok()?;
+            output_text(&resp).filter(|t| t.contains("V9-42"))
+        },
+    );
+}

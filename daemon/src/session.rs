@@ -903,6 +903,10 @@ impl LastExitProbe {
 pub struct DaemonSession {
     pub uid: String,
     pub title: String,
+    /// Holder-minted process identity when this session is
+    /// holder-owned (split mode) — the key every holder verb and the
+    /// phase-7 `rollback_record` stream use. `None` in monolith mode.
+    pub holder_incarnation: Option<u64>,
     /// Workspace this session was spawned into. Populated from
     /// `StartSessionParams.workspace_id` at spawn time; used by
     /// the slice 10d-mcp-surface Session-caller auth check to
@@ -1872,6 +1876,7 @@ impl PendingSession {
         };
 
         Ok(DaemonSession {
+            holder_incarnation: None,
             uid,
             title,
             workspace_id,
@@ -2404,6 +2409,7 @@ impl AdoptedSessionBuild {
         };
 
         Ok(DaemonSession {
+            holder_incarnation: None,
             title: meta.title,
             // Phase 4b (R11): the full v2 record lands verbatim — no
             // more amnesiac defaults. See `AdoptedSessionMeta`.

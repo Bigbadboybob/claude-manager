@@ -191,6 +191,8 @@ impl RealFds {
             }],
             listener_fd: self.listener.as_raw_fd(),
             tls_listener_fd: None,
+            rollback_schema_version: None,
+            split: None,
         }
     }
 

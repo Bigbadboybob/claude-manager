@@ -220,7 +220,51 @@ pub(crate) fn locate_launch_spec() -> std::io::Result<(PathBuf, Vec<std::ffi::Os
             vec!["--brain".into(), daemon.into_os_string()],
         ));
     }
+    // The DURABLE supervisor flip (phase 7, C6): `~/.cm/holder-binary`
+    // holds the cm-holder path, written by the migration runbook so a
+    // TUI relaunch or machine reboot comes back up SPLIT rather than
+    // silently reverting to a monolith over migrated state. Still an
+    // explicit operator act — never inferred from binary presence.
+    // Env wins over the file (a deliberate one-shot override).
+    let flip = holder_binary_flip_path();
+    match std::fs::read_to_string(&flip) {
+        Ok(s) if !s.trim().is_empty() => {
+            let holder = canonicalize_binary_path(&PathBuf::from(s.trim()))?;
+            let daemon = locate_daemon_binary()?;
+            eprintln!(
+                "cm-tui: {} set — launching the holder/brain split \
+                 ({} --brain {})",
+                flip.display(),
+                holder.display(),
+                daemon.display()
+            );
+            return Ok((
+                holder,
+                vec!["--brain".into(), daemon.into_os_string()],
+            ));
+        }
+        Ok(_) => {} // empty file = no flip
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            // Fail CLOSED on an unreadable flip file: launching a
+            // monolith over a migrated host's state is exactly the
+            // C6 hazard the file exists to prevent.
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "reading the holder-binary flip file {}: {e} — refusing \
+                     to guess the launch topology (remove or fix the file)",
+                    flip.display()
+                ),
+            ));
+        }
+    }
     Ok((locate_daemon_binary()?, Vec::new()))
+}
+
+/// The C6 supervisor-flip file (see [`locate_launch_spec`]).
+pub(crate) fn holder_binary_flip_path() -> PathBuf {
+    cm_daemon::path::dot_cm_dir().join("holder-binary")
 }
 
 /// Core auto-launch logic, parameterized over the spawner so tests

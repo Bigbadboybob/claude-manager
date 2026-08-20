@@ -198,7 +198,7 @@ use crate::{reader_gate, reap_gate, restart_coordinator};
 /// reached must abort the restart, not hang the daemon). 10s is
 /// generous for "every in-flight mutating RPC returns" — spawns are
 /// the slowest at ~1s worst case.
-const QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bound on the writer-gate freeze (phase 4h, R10). Unlike the reap /
 /// reader freezes — whose holds are microsecond consume/push units and
@@ -213,9 +213,9 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// doesn't stall the suite; the e2e exercises the real binary with the
 /// production value.
 #[cfg(not(test))]
-const WRITER_FREEZE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WRITER_FREEZE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const WRITER_FREEZE_TIMEOUT: Duration = Duration::from_millis(400);
+pub(crate) const WRITER_FREEZE_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// Bound on the `--verify-handoff` preflight subprocess (phase 4c).
 /// It parses small state files and runs the MCP selftest (which
@@ -547,7 +547,7 @@ fn exec_stage(
 /// wrong arch), but it fails the obvious wrong-path cases before any
 /// quiesce work happens. Mirrors
 /// `reexec_manifest::validate_fd_roles`'s rollback-fd probe.
-fn open_pinned_executable(target: &Path) -> Result<OwnedFd, anyhow::Error> {
+pub(crate) fn open_pinned_executable(target: &Path) -> Result<OwnedFd, anyhow::Error> {
     let f = File::open(target).map_err(|e| {
         anyhow::anyhow!(
             "open target binary {} read-only: {}",
@@ -927,7 +927,7 @@ fn cap_str(s: &str, cap: usize) -> String {
 ///   checked pass therefore makes the EXISTING bytes durable instead:
 ///   fsync every `state.json`, its containing run/task dir, and the
 ///   tree root.
-fn persist_all_checked(
+pub(crate) fn persist_all_checked(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<(), anyhow::Error> {
     {
@@ -1331,7 +1331,7 @@ fn verify_handoff_impl(fd_arg: &str) -> Result<String, String> {
 /// monotonic-instant cells cannot ride as absolutes; the sub-second
 /// swap skew the age round trip introduces is documented acceptable
 /// in the manifest module.
-fn build_manifest(
+pub(crate) fn build_manifest(
     state: &Arc<Mutex<DaemonState>>,
     rollback_fd: &OwnedFd,
 ) -> Result<ReexecManifest, anyhow::Error> {
@@ -1346,6 +1346,39 @@ fn build_manifest(
     let now = std::time::Instant::now();
     let mut sessions: Vec<SessionRecord> = Vec::with_capacity(st.sessions.len());
     for (uid, s) in &st.sessions {
+        sessions.push(session_record_for(uid, s, now)?);
+    }
+    Ok(ReexecManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        // Written as 0 and read back by the new image; the rollback
+        // attempt state machine that ACTS on it is phase-4 scope.
+        attempt: 0,
+        // Phase 6 (schema v3): the generation this handoff BECOMES if
+        // it commits — our own lineage + 1. Stamped onto the new
+        // image's state by the rehydrate commit; a rollback exec
+        // carries it unchanged (one restart attempt = one generation).
+        reexec_generation: st.reexec_generation + 1,
+        rollback_bin_fd: rollback_fd.as_raw_fd(),
+        sessions,
+        listener_fd,
+        // Skeleton: TLS handoff is out of scope (module docs).
+        tls_listener_fd: None,
+        rollback_schema_version: None,
+        split: None,
+    })
+}
+
+/// One session's full manifest record against a single age anchor.
+/// Extracted from [`build_manifest`] for phase 7's reverse-migration
+/// prelude: the brain composes exactly these records as
+/// `rollback_record` blobs (the holder patches the fd/pid fields it
+/// owns — the numbers emitted here are OUR dups and die with us).
+pub(crate) fn session_record_for(
+    uid: &str,
+    s: &crate::session::DaemonSession,
+    now: std::time::Instant,
+) -> Result<SessionRecord, anyhow::Error> {
+    {
         let (pty_master_fd, pidfd) = s.reexec_handoff_fds().ok_or_else(|| {
             anyhow::anyhow!("session '{}' exposes no raw PTY master fd", uid)
         })?;
@@ -1387,8 +1420,8 @@ fn build_manifest(
                     .as_secs_f64(),
                 reason: r.reason,
             });
-        sessions.push(SessionRecord {
-            uid: uid.clone(),
+        Ok(SessionRecord {
+            uid: uid.to_string(),
             generation: s.generation,
             transcript_id: s
                 .transcript_path
@@ -1453,24 +1486,8 @@ fn build_manifest(
                     }
                 }
             }),
-        });
+        })
     }
-    Ok(ReexecManifest {
-        schema_version: MANIFEST_SCHEMA_VERSION,
-        // Written as 0 and read back by the new image; the rollback
-        // attempt state machine that ACTS on it is phase-4 scope.
-        attempt: 0,
-        // Phase 6 (schema v3): the generation this handoff BECOMES if
-        // it commits — our own lineage + 1. Stamped onto the new
-        // image's state by the rehydrate commit; a rollback exec
-        // carries it unchanged (one restart attempt = one generation).
-        reexec_generation: st.reexec_generation + 1,
-        rollback_bin_fd: rollback_fd.as_raw_fd(),
-        sessions,
-        listener_fd,
-        // Skeleton: TLS handoff is out of scope (module docs).
-        tls_listener_fd: None,
-    })
 }
 
 /// Step (f) helper: `execveat(target_fd, "", argv, envp,
@@ -1489,16 +1506,25 @@ fn do_execveat(
     target: &Path,
     manifest_fd_num: RawFd,
 ) -> anyhow::Error {
+    let mut argv: Vec<std::ffi::OsString> = vec![target.as_os_str().to_owned()];
+    argv.extend(std::env::args_os().skip(1));
+    do_execveat_with_argv(target_fd, &argv, manifest_fd_num)
+}
+
+/// [`do_execveat`] with an EXPLICIT argv (phase 7's migration exec:
+/// the target is `cm-holder`, whose argv — `--brain <path>` — is
+/// nothing like the daemon's own). Same envp discipline.
+pub(crate) fn do_execveat_with_argv(
+    target_fd: &OwnedFd,
+    argv: &[std::ffi::OsString],
+    manifest_fd_num: RawFd,
+) -> anyhow::Error {
     let mut argv_c: Vec<CString> = Vec::new();
-    match CString::new(target.as_os_str().as_bytes()) {
-        Ok(c) => argv_c.push(c),
-        Err(_) => return anyhow::anyhow!("target path contains a NUL byte"),
-    }
-    for arg in std::env::args_os().skip(1) {
-        match CString::new(arg.into_vec()) {
+    for arg in argv {
+        match CString::new(arg.as_os_str().as_bytes()) {
             Ok(c) => argv_c.push(c),
             Err(_) => {
-                return anyhow::anyhow!("own argv element contains a NUL byte")
+                return anyhow::anyhow!("argv element contains a NUL byte")
             }
         }
     }
@@ -1570,7 +1596,7 @@ fn do_execveat(
 /// `/proc/self/fd`. The walk's own readdir fd shows up in the
 /// listing and closes right after — the restore skips vanished fds
 /// (EBADF), so that's harmless.
-fn snapshot_fd_flags() -> io::Result<Vec<(RawFd, libc::c_int)>> {
+pub(crate) fn snapshot_fd_flags() -> io::Result<Vec<(RawFd, libc::c_int)>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir("/proc/self/fd")? {
         let entry = entry?;
@@ -1598,7 +1624,7 @@ fn snapshot_fd_flags() -> io::Result<Vec<(RawFd, libc::c_int)>> {
 /// `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, falling back to a
 /// `/proc/self/fd` walk with per-fd `F_SETFD` when the syscall or
 /// the flag is unavailable (pre-5.11 kernels).
-fn set_all_cloexec() -> io::Result<()> {
+pub(crate) fn set_all_cloexec() -> io::Result<()> {
     // SAFETY: close_range with CLOSE_RANGE_CLOEXEC closes nothing —
     // it only sets the flag across the range.
     let ret = unsafe {
@@ -1625,7 +1651,7 @@ fn set_all_cloexec() -> io::Result<()> {
 }
 
 /// `fcntl(F_SETFD, flags)` on one fd.
-fn set_fd_flags(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
+pub(crate) fn set_fd_flags(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
     // SAFETY: plain fcntl with an int argument.
     let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
     if ret != 0 {
@@ -1637,7 +1663,7 @@ fn set_fd_flags(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
 /// Abort-path restore: put every snapshotted fd's flags back exactly.
 /// Best-effort per fd — an fd that vanished since the snapshot
 /// (EBADF) is skipped; there is nothing to restore on it.
-fn restore_fd_flags(snapshot: &[(RawFd, libc::c_int)]) {
+pub(crate) fn restore_fd_flags(snapshot: &[(RawFd, libc::c_int)]) {
     for &(fd, flags) in snapshot {
         let _ = set_fd_flags(fd, flags);
     }
@@ -1650,7 +1676,7 @@ fn restore_fd_flags(snapshot: &[(RawFd, libc::c_int)]) {
 /// Block SIGHUP and SIGTERM on the calling thread (the exec carrier —
 /// after exec the mask is the new image's initial-thread mask) and
 /// return the previous mask for the abort path.
-fn block_sighup_sigterm() -> Result<libc::sigset_t, anyhow::Error> {
+pub(crate) fn block_sighup_sigterm() -> Result<libc::sigset_t, anyhow::Error> {
     // SAFETY: sigemptyset/sigaddset fill a sigset we own;
     // pthread_sigmask reads it and writes the old mask into memory
     // we own.
@@ -1677,7 +1703,7 @@ fn block_sighup_sigterm() -> Result<libc::sigset_t, anyhow::Error> {
 }
 
 /// Abort-path restore of the pre-block signal mask.
-fn restore_sigmask(old: &libc::sigset_t) {
+pub(crate) fn restore_sigmask(old: &libc::sigset_t) {
     // SAFETY: `old` came from pthread_sigmask's out-parameter.
     unsafe {
         let _ = libc::pthread_sigmask(libc::SIG_SETMASK, old, std::ptr::null_mut());
@@ -3028,6 +3054,8 @@ fn rollback_exec(escrow: &HandoffEscrow, next_attempt: u8) -> anyhow::Error {
         sessions: m.sessions.clone(),
         listener_fd: m.listener_fd,
         tls_listener_fd: m.tls_listener_fd,
+        rollback_schema_version: None,
+        split: None,
     };
     let new_manifest_fd = match reexec_manifest::write_manifest(&new_manifest) {
         Ok(fd) => fd,

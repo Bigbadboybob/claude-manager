@@ -341,6 +341,14 @@ pub(crate) const RESTART_BARRIER_EXEMPT_METHODS: &[&str] = &[
     // the barrier against its own caller, exactly the `daemon.restart`
     // rationale above.
     "daemon.reexec_dev",
+    // Holder-split phase 7: migrate_split RUNS the coordinator inline
+    // (the daemon.restart rationale); split_rollback runs it on the
+    // same detached deploy thread daemon.restart's split path uses;
+    // upgrade_holder never quiesces but is classified with its
+    // siblings (a holder pause must not be barrier-visible).
+    "daemon.migrate_split",
+    "daemon.split_rollback",
+    "daemon.upgrade_holder",
 ];
 
 /// Does dispatching `method` hold the restart barrier's in-flight
@@ -498,6 +506,24 @@ pub fn dispatch_request(
         // Strong-operator, split-only.
         "daemon.rollback_brain" => {
             DispatchOutcome::Done(dispatch_daemon_rollback_brain(state, req))
+        }
+        // Holder-split phase 7 (§ Live migration): monolith → split,
+        // zero session loss. Strong-operator, monolith-only; on
+        // success the connection dies at the exec (fire-and-verify,
+        // like the monolith daemon.restart).
+        "daemon.migrate_split" => {
+            DispatchOutcome::Done(dispatch_daemon_migrate_split(state, req))
+        }
+        // Holder-split phase 7 (§ Live migration's escape hatch):
+        // split → monolith. Strong-operator, split-only.
+        "daemon.split_rollback" => {
+            DispatchOutcome::Done(dispatch_daemon_split_rollback(state, req))
+        }
+        // Holder-split phase 7 (§ Holder upgrades): the holder
+        // re-execs itself; brain + sessions untouched. Strong-
+        // operator, split-only, S15-gated.
+        "daemon.upgrade_holder" => {
+            DispatchOutcome::Done(dispatch_daemon_upgrade_holder(state, req))
         }
         // DESIGN_SEAMLESS_RESTART phase 3b: dev-gated re-exec handoff
         // skeleton. Answers unknown-method unless the daemon started
@@ -1727,6 +1753,99 @@ fn dispatch_daemon_rollback_brain(
         return Response::err(req.id.clone(), code, message);
     }
     match crate::holder_mode::rollback_brain_flow(state) {
+        Ok(v) => Response::ok(req.id.clone(), v),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// Pull one REQUIRED absolute-path string param.
+fn required_abs_path_param(
+    req: &Request,
+    key: &str,
+    method: &str,
+) -> Result<String, Response> {
+    match req.params.get(key) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            if !std::path::Path::new(s).is_absolute() {
+                return Err(Response::err(
+                    req.id.clone(),
+                    ErrorCode::InvalidParams,
+                    format!("{method}: params.{key} must be an absolute path"),
+                ));
+            }
+            Ok(s.clone())
+        }
+        _ => Err(Response::err(
+            req.id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{method}: params.{key} (absolute path string) is required"),
+        )),
+    }
+}
+
+/// Phase 7 (§ Live migration): the monolith→split exec. On success
+/// this never returns a response — the connection dies at the exec
+/// (fire-and-verify: the caller polls daemon.health for split=true +
+/// session-count continuity). Every returned response is a failure
+/// with the daemon restored to its pre-call state.
+fn dispatch_daemon_migrate_split(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err((code, message)) = operator::require_strong_operator(&req.caller) {
+        return Response::err(req.id.clone(), code, message);
+    }
+    let holder_path = match required_abs_path_param(req, "holder_path", "daemon.migrate_split") {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let brain_path = match required_abs_path_param(req, "brain_path", "daemon.migrate_split") {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let err = crate::migrate::perform_migrate_split(
+        state,
+        std::path::Path::new(&holder_path),
+        std::path::Path::new(&brain_path),
+    );
+    Response::err(
+        req.id.clone(),
+        ErrorCode::Internal,
+        format!("daemon.migrate_split failed (nothing migrated): {err}"),
+    )
+}
+
+fn dispatch_daemon_split_rollback(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err((code, message)) = operator::require_strong_operator(&req.caller) {
+        return Response::err(req.id.clone(), code, message);
+    }
+    let monolith_path =
+        match required_abs_path_param(req, "monolith_path", "daemon.split_rollback") {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+    match crate::holder_mode::split_rollback_flow(state, &monolith_path) {
+        Ok(v) => Response::ok(req.id.clone(), v),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_daemon_upgrade_holder(
+    _state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err((code, message)) = operator::require_strong_operator(&req.caller) {
+        return Response::err(req.id.clone(), code, message);
+    }
+    let holder_path =
+        match required_abs_path_param(req, "holder_path", "daemon.upgrade_holder") {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+    match crate::holder_mode::upgrade_holder_flow(&holder_path) {
         Ok(v) => Response::ok(req.id.clone(), v),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

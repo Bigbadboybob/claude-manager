@@ -122,7 +122,28 @@ pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 /// 7). Same singleton discipline: nothing pre-phase-6 ever deployed a
 /// v2 writer, so a v2 manifest is honestly refused rather than
 /// compatibility-shimmed.
+///
+/// v4 (DESIGN_HOLDER_BRAIN_SPLIT phase 7) ended the singleton era:
+/// v3 IS deployed, so v4 is the first ADDITIVE version — this binary
+/// reads {3, 4} ([`MIN_SUPPORTED_SCHEMA_VERSION`]). v4 = v3 plus the
+/// [`SplitRoles`] block (socketpair end, parked-brain pid/pidfd, the
+/// pinned brain binaries) and `rollback_schema_version`; it exists
+/// SOLELY for the monolith→holder migration exec. Every non-split
+/// manifest — ordinary re-exec, the rollback ladder's fresh
+/// manifests, the reverse-migration manifest the holder writes —
+/// stays v3, which keeps the compat surface minimal (the deployed v3
+/// reader can consume everything but the migration manifest itself,
+/// which only the holder image ever reads).
 pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
+
+/// The migration schema (v4): [`MANIFEST_SCHEMA_VERSION`] plus a
+/// REQUIRED [`SplitRoles`] block. See the version-history doc above.
+pub const MANIFEST_SCHEMA_VERSION_SPLIT: u32 = 4;
+
+/// Oldest payload schema this binary reads. Advancing it is a
+/// deprecation event that must be recorded in
+/// DESIGN_HOLDER_BRAIN_SPLIT § Version-skew testing.
+pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 3;
 
 /// Hard cap on the manifest file's TOTAL size (envelope included).
 /// Enforced on both sides: at write time (a coordinator bug fails
@@ -209,6 +230,49 @@ pub struct ReexecManifest {
     /// The TLS-TCP listener when `[tls]` is configured (R13); absent
     /// otherwise.
     pub tls_listener_fd: Option<RawFd>,
+    /// The payload schema version the ROLLBACK PIN can read — what a
+    /// failed handoff's fresh rollback manifest must be emitted at
+    /// (S5's prior-version serialization). Absent (every v3 writer,
+    /// and v4 writers rolling back to a same-vintage binary) means
+    /// "the standard schema", i.e. [`MANIFEST_SCHEMA_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_schema_version: Option<u32>,
+    /// Schema v4 only (REQUIRED there, refused at v3): the split-
+    /// migration roles. See [`SplitRoles`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitRoles>,
+}
+
+/// The migration manifest's split block (schema v4, phase 7 § Live
+/// migration step 6): everything the holder image needs to become
+/// the supervisor of the parked brain the monolith spawned seconds
+/// earlier. All `*_fd` fields are inherited-slot NUMBERS, exactly as
+/// the rest of the manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SplitRoles {
+    /// The holder's end of the brain socketpair (the brain already
+    /// holds the other end). A CONNECTED `AF_UNIX`/`SOCK_STREAM` —
+    /// never a listener; role-validated as such.
+    pub channel_fd: RawFd,
+    /// The parked brain's pid. The brain was forked by the monolith,
+    /// so after the same-PID exec it is the holder's child — `waitid`
+    /// works. Paired with `brain_pidfd` (pid reuse discipline).
+    pub brain_pid: i32,
+    /// pidfd for the parked brain — supervision (poll/kill/reap)
+    /// identity; without it the holder image cannot supervise the
+    /// brain it is about to be parent of.
+    pub brain_pidfd: RawFd,
+    /// The pinned brain binary (the "current" pin the holder's
+    /// PinSet starts with).
+    pub brain_pin_fd: RawFd,
+    /// The previous brain pin, when one exists (never at first
+    /// migration; carried for schema completeness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brain_pin_previous_fd: Option<RawFd>,
+    /// The brain binary's PATH — HELD_DOWN's fix-on-disk re-pin
+    /// target (O1). A pathname for RE-pinning only; nothing execs it
+    /// without a fresh open.
+    pub brain_path: String,
 }
 
 /// One live session's handoff record: identity, the two kernel
@@ -927,11 +991,50 @@ fn pread_exact(fd: RawFd, len: usize) -> Result<Vec<u8>, ManifestError> {
 /// Run by [`read_manifest`] after the envelope verifies and by
 /// [`write_manifest`] before serializing.
 fn validate_structure(m: &ReexecManifest) -> Result<(), ManifestError> {
-    if m.schema_version != MANIFEST_SCHEMA_VERSION {
+    if m.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
+        || m.schema_version > MANIFEST_SCHEMA_VERSION_SPLIT
+    {
         return Err(ManifestError::UnsupportedSchemaVersion {
             found: m.schema_version,
-            supported: MANIFEST_SCHEMA_VERSION,
+            supported: MANIFEST_SCHEMA_VERSION_SPLIT,
         });
+    }
+    // The split block is exactly what v4 IS: required there, refused
+    // below it (a v3 manifest smuggling split roles would reach the
+    // deployed v3 reader as silently-ignored unknown fields — refuse
+    // the incoherent shape at both trust boundaries instead).
+    match (m.schema_version, &m.split) {
+        (MANIFEST_SCHEMA_VERSION_SPLIT, None) => {
+            return Err(ManifestError::Payload {
+                detail: format!(
+                    "schema v{} requires the split block",
+                    MANIFEST_SCHEMA_VERSION_SPLIT
+                ),
+            });
+        }
+        (v, Some(_)) if v != MANIFEST_SCHEMA_VERSION_SPLIT => {
+            return Err(ManifestError::Payload {
+                detail: format!(
+                    "schema v{v} must not carry a split block (that is \
+                     v{} content)",
+                    MANIFEST_SCHEMA_VERSION_SPLIT
+                ),
+            });
+        }
+        _ => {}
+    }
+    if let Some(rv) = m.rollback_schema_version {
+        if !(MIN_SUPPORTED_SCHEMA_VERSION..=MANIFEST_SCHEMA_VERSION_SPLIT)
+            .contains(&rv)
+        {
+            return Err(ManifestError::Payload {
+                detail: format!(
+                    "rollback_schema_version {rv} is outside the supported \
+                     range {}..={}",
+                    MIN_SUPPORTED_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION_SPLIT
+                ),
+            });
+        }
     }
     if m.sessions.len() > MAX_SESSIONS {
         return Err(ManifestError::TooManySessions {
@@ -960,6 +1063,20 @@ fn validate_structure(m: &ReexecManifest) -> Result<(), ManifestError> {
     check_fd("listener_fd", m.listener_fd)?;
     if let Some(fd) = m.tls_listener_fd {
         check_fd("tls_listener_fd", fd)?;
+    }
+    if let Some(split) = &m.split {
+        check_fd("split.channel_fd", split.channel_fd)?;
+        check_fd("split.brain_pidfd", split.brain_pidfd)?;
+        check_fd("split.brain_pin_fd", split.brain_pin_fd)?;
+        if let Some(fd) = split.brain_pin_previous_fd {
+            check_fd("split.brain_pin_previous_fd", fd)?;
+        }
+        if split.brain_pid <= 0 {
+            return Err(ManifestError::BadChildPid {
+                uid: "<parked brain>".into(),
+                pid: split.brain_pid,
+            });
+        }
     }
     for s in &m.sessions {
         check_fd("pty_master_fd", s.pty_master_fd)?;
@@ -1044,14 +1161,22 @@ fn validate_structure(m: &ReexecManifest) -> Result<(), ManifestError> {
 /// its probe with `EBADF`, reported as a role mismatch — honest, if
 /// less specific.
 pub fn validate_fd_roles(m: &ReexecManifest) -> Result<(), ManifestError> {
-    validate_rollback_fd(m.rollback_bin_fd)?;
+    validate_exec_fd("rollback_bin_fd", m.rollback_bin_fd)?;
     validate_listener_fd("listener_fd", m.listener_fd)?;
     if let Some(fd) = m.tls_listener_fd {
         validate_listener_fd("tls_listener_fd", fd)?;
     }
+    if let Some(split) = &m.split {
+        validate_channel_fd("split.channel_fd", split.channel_fd)?;
+        validate_pidfd_role("split.brain_pidfd", split.brain_pidfd)?;
+        validate_exec_fd("split.brain_pin_fd", split.brain_pin_fd)?;
+        if let Some(fd) = split.brain_pin_previous_fd {
+            validate_exec_fd("split.brain_pin_previous_fd", fd)?;
+        }
+    }
     for s in &m.sessions {
         validate_pty_master_fd(s.pty_master_fd)?;
-        validate_pidfd(s.pidfd)?;
+        validate_pidfd_role("pidfd", s.pidfd)?;
     }
     Ok(())
 }
@@ -1107,8 +1232,10 @@ fn validate_pty_master_fd(fd: RawFd) -> Result<(), ManifestError> {
 
 /// pidfd: the `/proc/self/fd` link of a pidfd is the anon-inode
 /// marker `anon_inode:[pidfd]` — nothing else readlinks to that.
-fn validate_pidfd(fd: RawFd) -> Result<(), ManifestError> {
-    let role = "pidfd";
+fn validate_pidfd_role(
+    role: &'static str,
+    fd: RawFd,
+) -> Result<(), ManifestError> {
     let link =
         std::fs::read_link(format!("/proc/self/fd/{}", fd)).map_err(|e| {
             ManifestError::FdRoleMismatch {
@@ -1125,6 +1252,74 @@ fn validate_pidfd(fd: RawFd) -> Result<(), ManifestError> {
                 "/proc/self/fd link is {:?}, expected \"anon_inode:[pidfd]\"",
                 link
             ),
+        });
+    }
+    Ok(())
+}
+
+/// Socketpair channel end (v4 split role): a CONNECTED
+/// `AF_UNIX`/`SOCK_STREAM` — the exact inverse of a listener
+/// (`SO_ACCEPTCONN` must be FALSE). Probes: `SO_DOMAIN` == `AF_UNIX`,
+/// `SO_TYPE` == `SOCK_STREAM`, `SO_ACCEPTCONN` == 0. All read-only
+/// getsockopt queries.
+fn validate_channel_fd(
+    role: &'static str,
+    fd: RawFd,
+) -> Result<(), ManifestError> {
+    let sockopt_int = |level: libc::c_int,
+                       opt: libc::c_int,
+                       name: &str|
+     -> Result<libc::c_int, ManifestError> {
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid out-pointer + length for a c_int option; a
+        // non-socket fd fails with ENOTSOCK rather than faulting.
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                opt,
+                &mut val as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if ret != 0 {
+            return Err(ManifestError::FdRoleMismatch {
+                role,
+                fd,
+                detail: format!(
+                    "getsockopt({name}) failed: {} (not a socket?)",
+                    io::Error::last_os_error()
+                ),
+            });
+        }
+        Ok(val)
+    };
+    let domain = sockopt_int(libc::SOL_SOCKET, libc::SO_DOMAIN, "SO_DOMAIN")?;
+    if domain != libc::AF_UNIX {
+        return Err(ManifestError::FdRoleMismatch {
+            role,
+            fd,
+            detail: format!("socket domain {domain}, expected AF_UNIX"),
+        });
+    }
+    let ty = sockopt_int(libc::SOL_SOCKET, libc::SO_TYPE, "SO_TYPE")?;
+    if ty != libc::SOCK_STREAM {
+        return Err(ManifestError::FdRoleMismatch {
+            role,
+            fd,
+            detail: format!("socket type {ty}, expected SOCK_STREAM"),
+        });
+    }
+    let listening =
+        sockopt_int(libc::SOL_SOCKET, libc::SO_ACCEPTCONN, "SO_ACCEPTCONN")?;
+    if listening != 0 {
+        return Err(ManifestError::FdRoleMismatch {
+            role,
+            fd,
+            detail: "socket is LISTENING — a channel end is a connected \
+                     socketpair half, never a listener"
+                .to_string(),
         });
     }
     Ok(())
@@ -1172,11 +1367,11 @@ fn validate_listener_fd(
     Ok(())
 }
 
-/// Rollback executable: regular file with an execute bit. Shape
-/// only — see [`validate_fd_roles`]; the actual `execveat` (and its
-/// new-inode ≠ rollback-inode assertion) belongs to 3b.
-fn validate_rollback_fd(fd: RawFd) -> Result<(), ManifestError> {
-    let role = "rollback_bin_fd";
+/// Pinned executable (rollback pin, brain pins): regular file with
+/// an execute bit. Shape only — see [`validate_fd_roles`]; the
+/// actual `execveat` (and its new-inode ≠ rollback-inode assertion)
+/// belongs to the exec skeleton.
+fn validate_exec_fd(role: &'static str, fd: RawFd) -> Result<(), ManifestError> {
     let st = role_fstat(role, fd)?;
     if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return Err(ManifestError::FdRoleMismatch {
@@ -1340,6 +1535,8 @@ mod tests {
             ],
             listener_fd: 11,
             tls_listener_fd: Some(12),
+            rollback_schema_version: None,
+            split: None,
         }
     }
 
@@ -1745,10 +1942,10 @@ mod tests {
     #[test]
     fn rejects_unsupported_schema_version() {
         let mut m = sample_manifest();
-        m.schema_version = MANIFEST_SCHEMA_VERSION + 1;
+        m.schema_version = MANIFEST_SCHEMA_VERSION_SPLIT + 1;
         match read_manifest(sealed_memfd_from(&envelope_for(&m)).as_fd()) {
             Err(ManifestError::UnsupportedSchemaVersion { found, .. }) => {
-                assert_eq!(found, MANIFEST_SCHEMA_VERSION + 1)
+                assert_eq!(found, MANIFEST_SCHEMA_VERSION_SPLIT + 1)
             }
             other => {
                 panic!("expected UnsupportedSchemaVersion, got {:?}", other)
@@ -1758,6 +1955,80 @@ mod tests {
             write_manifest(&m).expect_err("write refuses too").kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    fn sample_split_roles() -> SplitRoles {
+        SplitRoles {
+            channel_fd: 30,
+            brain_pid: 5150,
+            brain_pidfd: 31,
+            brain_pin_fd: 32,
+            brain_pin_previous_fd: None,
+            brain_path: "/opt/cm-daemon/cm-daemon".into(),
+        }
+    }
+
+    /// The v4/v3 split-presence law: the split block is exactly what
+    /// v4 IS — required there, refused below it (phase 7).
+    #[test]
+    fn split_block_presence_matches_schema_version() {
+        // v4 without split → refused.
+        let mut m = sample_manifest();
+        m.schema_version = MANIFEST_SCHEMA_VERSION_SPLIT;
+        match read_manifest(sealed_memfd_from(&envelope_for(&m)).as_fd()) {
+            Err(ManifestError::Payload { detail }) => {
+                assert!(detail.contains("requires the split block"), "{detail}")
+            }
+            other => panic!("expected Payload refusal, got {:?}", other),
+        }
+        // v3 with split → refused.
+        let mut m = sample_manifest();
+        m.split = Some(sample_split_roles());
+        match read_manifest(sealed_memfd_from(&envelope_for(&m)).as_fd()) {
+            Err(ManifestError::Payload { detail }) => {
+                assert!(detail.contains("must not carry"), "{detail}")
+            }
+            other => panic!("expected Payload refusal, got {:?}", other),
+        }
+        // v4 with split → round-trips intact.
+        let mut m = sample_manifest();
+        m.schema_version = MANIFEST_SCHEMA_VERSION_SPLIT;
+        m.split = Some(sample_split_roles());
+        m.rollback_schema_version = Some(MANIFEST_SCHEMA_VERSION);
+        let fd = write_manifest(&m).expect("v4 writes");
+        let back = read_manifest(fd.as_fd()).expect("v4 reads");
+        assert_eq!(back, m);
+        assert_eq!(back.split.as_ref().unwrap().brain_pid, 5150);
+    }
+
+    /// v3 emission stays byte-compatible with the DEPLOYED v3 reader:
+    /// the new optional fields must not appear in the serialized JSON
+    /// at all when unset (they'd be tolerated as unknown fields, but
+    /// the compat surface is cleanest when a v3 manifest is exactly a
+    /// v3 manifest).
+    #[test]
+    fn v3_serialization_omits_the_v4_fields() {
+        let m = sample_manifest();
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert!(
+            !json.contains("split") && !json.contains("rollback_schema_version"),
+            "v3 emission leaked v4 keys: {json}"
+        );
+    }
+
+    /// A duplicate fd number across the split block and a session
+    /// slot is caught by the same single-ownership check as v3 slots.
+    #[test]
+    fn split_fds_join_the_duplicate_check() {
+        let mut m = sample_manifest();
+        m.schema_version = MANIFEST_SCHEMA_VERSION_SPLIT;
+        let mut roles = sample_split_roles();
+        roles.channel_fd = m.sessions[0].pty_master_fd;
+        m.split = Some(roles);
+        match read_manifest(sealed_memfd_from(&envelope_for(&m)).as_fd()) {
+            Err(ManifestError::DuplicateFd { .. }) => {}
+            other => panic!("expected DuplicateFd, got {:?}", other),
+        }
     }
 
     /// Size cap: the reader refuses an over-cap file before reading
