@@ -28,6 +28,8 @@ use crate::workflow::observer::{
 };
 use cm_daemon::worktree;
 
+mod backtests;
+use backtests::*;
 mod model;
 use model::*;
 mod nav;
@@ -318,6 +320,20 @@ pub struct App {
     /// manifest as a sidecar (`Manifest::task_colors`). Consumed by the
     /// sidebar `TaskHeader` arm; edited via A-e on a task row.
     pub task_colors: HashMap<String, String>,
+    /// Cloud backtest runs, rendered as the sidebar's `backtests` group
+    /// instead of per-task workspaces (they never hold a local session).
+    /// Rebuilt from the API task list by `reconcile_tasks` →
+    /// [`backtests::update_backtest_rows`]; in-memory only.
+    pub(crate) backtest_rows: Vec<BacktestRow>,
+    /// Whether the `backtests` group is collapsed to its header line.
+    /// Toggled with Space/Enter while the cursor is on the group. Expanded
+    /// by default (the per-run status is the point); in-memory only, like
+    /// planning-view fold state.
+    pub(crate) backtests_folded: bool,
+    /// Fleet stems the user has expanded (fleets default to collapsed —
+    /// a perf-bench round is K×N rows the operator usually wants as one
+    /// line). In-memory only.
+    pub(crate) backtest_unfolded_fleets: HashSet<String>,
     /// Result of the startup memory-cap preflight probe. Cached for
     /// the lifetime of the run; consulted in `spawn_agent_session`
     /// to decide whether to wrap a spawn. See DESIGN_MEMORY_CAP.md
@@ -840,6 +856,9 @@ impl App {
             hide_continuous,
             continuous_column_on,
             task_colors,
+            backtest_rows: Vec::new(),
+            backtests_folded: false,
+            backtest_unfolded_fleets: HashSet::new(),
             memory_cap_status,
             memory_kill_tx,
             memory_kill_rx,
@@ -921,6 +940,7 @@ impl App {
             Cursor::Workspace(wi) => *wi,
             Cursor::Task { ws_idx, .. } => *ws_idx,
             Cursor::Session(wi, _) => *wi,
+            Cursor::Backtest(_) => return None,
         };
         (wi < self.workspaces.len()).then_some(wi)
     }
@@ -938,6 +958,10 @@ impl App {
                 .and_then(|w| w.sessions.get(*si))
                 .and_then(|ts| ts.task_id.clone()),
             Cursor::Workspace(_) => None,
+            // Deliberately None even on a Run row: task-scoped actions
+            // (A-d done, A-x delete) must not act on a backtest task from
+            // the sidebar — the dispatch daemon owns its lifecycle.
+            Cursor::Backtest(_) => None,
         }
     }
 
@@ -970,6 +994,9 @@ impl App {
                     None
                 }
             }
+            // No PTY behind backtest rows — plain keys fall through to the
+            // fold toggle in input.rs instead of a terminal.
+            Cursor::Backtest(_) => None,
         }
     }
 
@@ -1005,6 +1032,7 @@ impl App {
                 }
                 ws.sessions.get_mut(found_idx?)
             }
+            Cursor::Backtest(_) => None,
         }
     }
 
@@ -1160,6 +1188,7 @@ impl App {
 // `find()` scans, mirroring the pre-split file order.
 #[cfg(test)]
 const APP_SRC_FOR_SCAN: &str = concat!(
+    include_str!("app/backtests.rs"),
     include_str!("app/model.rs"),
     include_str!("app/nav.rs"),
     include_str!("app/workflow_ui.rs"),
@@ -1183,6 +1212,7 @@ const APP_SRC_FOR_SCAN: &str = concat!(
 /// `#[cfg(test)]`. No brace tracking: test string literals defeat it.
 #[cfg(test)]
 const APP_SRC_FILES: &[&str] = &[
+    include_str!("app/backtests.rs"),
     include_str!("app/model.rs"),
     include_str!("app/nav.rs"),
     include_str!("app/workflow_ui.rs"),

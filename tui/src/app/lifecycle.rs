@@ -1225,6 +1225,8 @@ impl App {
                 self.needs_redraw = true;
                 return;
             }
+            // Backtest rows have no hidden bit — the group folds instead.
+            Cursor::Backtest(_) => return,
         };
         if let Some(ts) = self
             .workspaces
@@ -1812,6 +1814,12 @@ impl App {
                         self.set_status_msg(&format!("Closed {} session(s)", removed));
                     }
                 }
+            }
+            Cursor::Backtest(_) => {
+                self.set_status_msg(
+                    "Backtest runs have no local session to close — they leave \
+                     the group on their own",
+                );
             }
         }
     }
@@ -3519,6 +3527,8 @@ impl App {
         let cursor_wi = match &self.cursor {
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => *wi,
             Cursor::Task { ws_idx, .. } => *ws_idx,
+            // Not on any workspace — nothing to exempt from the sweep.
+            Cursor::Backtest(_) => usize::MAX,
         };
 
         let mut changed = false;

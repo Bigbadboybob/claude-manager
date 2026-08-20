@@ -2197,13 +2197,34 @@ impl App {
 
     /// Reconcile API tasks with local task entries + auto-provision a
     /// Workspace for each running/blocked task that doesn't have one bound.
+    ///
+    /// Cloud backtest tasks are the exception: they run entirely on
+    /// ephemeral GCP worker VMs, never hold a local session, and are
+    /// therefore modelled as sidebar `backtest_rows` (one collapsible
+    /// group) instead of workspaces — see `app/backtests.rs`.
     fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
+        // Feed the backtests group from the FULL fetch (all statuses):
+        // queued (backlog) rows and grace-lingering terminal rows are part
+        // of the group, while the workspace loop below only looks at
+        // running/blocked.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        update_backtest_rows(
+            &mut self.backtest_rows,
+            &tasks,
+            Instant::now(),
+            now_ms,
+        );
         // Save cursor context for restoration: remember the workspace id and
         // session label the cursor was on.
         let saved_ws_id = match &self.cursor {
             Cursor::Workspace(wi) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Task { ws_idx, .. } => self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
+            // Not workspace-scoped; clamp_cursor re-validates it at the end.
+            Cursor::Backtest(_) => None,
         };
         let saved_session_uid = match &self.cursor {
             Cursor::Session(wi, si) => self
@@ -2284,6 +2305,16 @@ impl App {
                     worktree_mode: parse_worktree_mode(&task.worktree_mode),
                     metadata: task.metadata.clone(),
                 });
+            }
+
+            // Cloud backtest tasks never get a workspace: nothing local ever
+            // runs for them, so a workspace is an empty top-level sidebar row
+            // (a perf-bench fleet minted K×N of them). They render via the
+            // `backtests` group built above instead. Pre-fix manifest
+            // bindings for backtest tasks are deliberately not honored — the
+            // GC below sweeps their leftover workspaces.
+            if task.kind == "backtest" {
+                continue;
             }
 
             // Link (or create) a Workspace for this task if it doesn't already
@@ -2397,18 +2428,38 @@ impl App {
             }
         });
 
-        // Also GC workspaces whose worker_vm-based cloud task is gone.
-        // Keep local workspaces always (they survive task lifecycle).
+        // GC sessionless cloud workspaces whose claim on a sidebar row is
+        // gone. Local workspaces always survive task lifecycle, and a cloud
+        // workspace holding sessions is never dropped (an A-w backtest watch
+        // is a real local PTY the operator is looking at). A sessionless
+        // cloud workspace stays only while a live NON-backtest cloud task
+        // claims it — by worker_vm (the pre-existing rule) or by TaskEntry
+        // binding (a running task the dispatcher hasn't stamped a VM on
+        // yet). Backtest tasks never claim a workspace (see the mint skip
+        // above), so this sweep also clears the empty rows minted for them
+        // by pre-fix builds and persisted in the manifest.
+        let live_bound_ws: std::collections::HashSet<String> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                matches!(t.api_status, TaskStatus::Running | TaskStatus::Blocked)
+            })
+            .filter_map(|t| t.workspace_id.clone())
+            .collect();
         self.workspaces.retain(|w| {
-            if !w.is_cloud {
+            if !w.is_cloud || !w.sessions.is_empty() {
+                return true;
+            }
+            if live_bound_ws.contains(&w.id) {
                 return true;
             }
             let vm = match w.worker_vm.as_deref() {
                 Some(vm) if !vm.is_empty() => vm,
-                _ => return true,
+                _ => return false,
             };
             tasks.iter().any(|t| {
                 t.is_cloud
+                    && t.kind != "backtest"
                     && t.worker_vm.as_deref() == Some(vm)
                     && matches!(t.status.as_str(), "running" | "blocked")
             })
@@ -6522,5 +6573,319 @@ mod manifest_stream_reprime_tests {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+}
+
+/// Cloud-backtest sidebar group (see `app/backtests.rs`): reconcile must
+/// never mint a workspace for a `kind=backtest` task, must sweep the empty
+/// leftovers pre-fix builds persisted, and the sidebar must render the runs
+/// as one collapsible group — fleets folded to a single row — without
+/// disturbing real workspaces/sessions.
+#[cfg(test)]
+mod backtest_group_tests {
+    use super::*;
+
+    fn test_app(home: &std::path::Path) -> App {
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        })
+    }
+
+    /// An API task row as `reconcile_tasks` receives it.
+    fn api_task(
+        id: &str,
+        status: &str,
+        kind: &str,
+        is_cloud: bool,
+        label: &str,
+        worker_vm: Option<&str>,
+    ) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "created_at": "2026-08-20T00:00:00Z",
+            "repo_url": "git@github.com:x/y.git",
+            "repo_branch": "main",
+            "name": if kind == "backtest" {
+                format!("backtest: {} @ main", label)
+            } else {
+                label.to_string()
+            },
+            "prompt": null,
+            "status": status,
+            "worker_vm": worker_vm,
+            "worker_zone": null,
+            "blocked_at": null,
+            "session_id": null,
+            "wip_branch": null,
+            "is_cloud": is_cloud,
+            "kind": kind,
+            "metadata": {"backtest": {"label": label, "run_key": format!("rk-{}", id)}},
+        }))
+        .expect("task json")
+    }
+
+    fn empty_cloud_ws(id: &str, name: &str, worker_vm: Option<&str>) -> Workspace {
+        Workspace {
+            color: None,
+            pinned: false,
+            id: id.into(),
+            name: name.into(),
+            is_closed: false,
+            is_cloud: true,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: worker_vm.map(str::to_string),
+            worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
+            sessions: vec![],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        }
+    }
+
+    fn real_session(label: &str) -> TerminalSession {
+        let session = crate::session::Session::new(
+            "/bin/true",
+            &[],
+            80,
+            24,
+            None,
+            HashMap::new(),
+            None,
+        )
+        .expect("dummy session");
+        make_simple_session(label, "bash", session, None)
+    }
+
+    /// Temp-HOME isolation. `CM_DAEMON_SOCKET` / `CM_TUI_SOCKET` bypass
+    /// HOME resolution, so they are redirected into the temp dir too —
+    /// without this, an App built inside a cm-managed session dials the
+    /// operator's REAL daemon (reconcile pushes task trees at it).
+    fn with_temp_home(f: impl FnOnce(&std::path::Path)) {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = std::env::var_os("HOME");
+        let orig_dsock = std::env::var_os("CM_DAEMON_SOCKET");
+        let orig_tsock = std::env::var_os("CM_TUI_SOCKET");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("CM_DAEMON_SOCKET", tmp.path().join(".cm/daemon.sock"));
+            std::env::set_var("CM_TUI_SOCKET", tmp.path().join(".cm/tui.sock"));
+        }
+        f(tmp.path());
+        let restore = |k: &str, v: Option<std::ffi::OsString>| match v {
+            Some(s) => unsafe { std::env::set_var(k, s) },
+            None => unsafe { std::env::remove_var(k) },
+        };
+        restore("HOME", orig);
+        restore("CM_DAEMON_SOCKET", orig_dsock);
+        restore("CM_TUI_SOCKET", orig_tsock);
+    }
+
+    /// The core owner report: a running cloud backtest must NOT become a
+    /// workspace (empty top-level sidebar row), while a regular cloud task
+    /// still auto-provisions one. Leftover empty backtest workspaces from
+    /// pre-fix builds (with or without a stamped VM) are swept on the same
+    /// reconcile tick.
+    #[test]
+    fn reconcile_mints_no_workspace_for_backtests_and_sweeps_leftovers() {
+        with_temp_home(|home| {
+            let mut app = test_app(home);
+            app.workspaces.clear();
+            // Pre-fix leftovers: one minted before dispatch (no VM), one
+            // whose VM matches the still-RUNNING backtest below.
+            app.workspaces
+                .push(empty_cloud_ws("ws-old1", "backtest: old @ main", None));
+            app.workspaces
+                .push(empty_cloud_ws("ws-old2", "backtest: live @ main", Some("cm-bt-1")));
+
+            app.reconcile_tasks(vec![
+                api_task("bt-run", "running", "backtest", true, "perf-x-1", Some("cm-bt-1")),
+                api_task("bt-q", "backlog", "backtest", true, "perf-x-2", None),
+                api_task("cloud-reg", "running", "oneshot", true, "regular", Some("cm-w-2")),
+            ]);
+
+            assert!(
+                !app.workspaces.iter().any(|w| w.name.starts_with("backtest:")),
+                "no workspace may model a backtest task (leftovers swept too): {:?}",
+                app.workspaces.iter().map(|w| &w.name).collect::<Vec<_>>(),
+            );
+            // The regular cloud task still gets its sidebar workspace…
+            assert_eq!(app.workspaces.len(), 1);
+            assert_eq!(app.workspaces[0].worker_vm.as_deref(), Some("cm-w-2"));
+            // …and the backtest TaskEntry (running rows only) stays unbound.
+            let bt_entry = app
+                .tasks
+                .iter()
+                .find(|t| t.task_id.as_deref() == Some("bt-run"))
+                .expect("running backtest keeps its TaskEntry");
+            assert_eq!(bt_entry.workspace_id, None);
+            // Both backtests (running + queued) landed in the group model.
+            let ids: Vec<&str> =
+                app.backtest_rows.iter().map(|r| r.task_id.as_str()).collect();
+            assert_eq!(ids, vec!["bt-run", "bt-q"]);
+            assert_eq!(
+                app.backtest_rows[0].state,
+                BacktestState::Running { vm: Some("cm-bt-1".into()) },
+            );
+        });
+    }
+
+    /// A cloud workspace HOLDING sessions is never swept — that's the A-w
+    /// backtest-watch shape (a real local gcloud-ssh PTY homed in a
+    /// VM-keyed cloud workspace), which must survive reconcile even when
+    /// its task is terminal / gone from the fetch.
+    #[test]
+    fn reconcile_keeps_cloud_workspaces_that_hold_sessions() {
+        with_temp_home(|home| {
+            let mut app = test_app(home);
+            app.workspaces.clear();
+            let mut ws = empty_cloud_ws("ws-watch", "watch bt", Some("cm-bt-gone"));
+            ws.sessions.push(real_session("watch perf-x-1"));
+            app.workspaces.push(ws);
+
+            app.reconcile_tasks(vec![]);
+
+            assert_eq!(app.workspaces.len(), 1, "watch workspace must survive");
+            assert_eq!(app.workspaces[0].id, "ws-watch");
+        });
+    }
+
+    /// Sidebar shape: the group rides at the bottom of BOTH sub-views; a
+    /// perf-bench fleet (shared label stem) renders as ONE fleet row —
+    /// members hidden until unfolded — while an unrelated run stays flat.
+    /// Folding the group collapses everything to the header.
+    #[test]
+    fn sidebar_renders_backtests_as_one_group_with_folded_fleets() {
+        with_temp_home(|home| {
+            let mut app = test_app(home);
+            app.workspaces.clear();
+            app.reconcile_tasks(vec![
+                api_task("f1", "running", "backtest", true, "perf-bench-hist-k3-p1", Some("vm-1")),
+                api_task("f2", "backlog", "backtest", true, "perf-bench-hist-k3-p2", None),
+                api_task("f3", "backlog", "backtest", true, "perf-bench-hist-k3-p3", None),
+                api_task("solo", "backlog", "backtest", true, "one-off", None),
+            ]);
+
+            for view in [SidebarView::Status, SidebarView::Task] {
+                app.sidebar_view = view;
+                let items = app.visual_items();
+                assert!(
+                    items.iter().any(|v| matches!(v, VisualItem::BacktestHeader)),
+                    "group header present in both sub-views",
+                );
+                assert!(
+                    items
+                        .iter()
+                        .any(|v| matches!(v, VisualItem::BacktestFleet(s) if s == "perf-bench-hist-k3")),
+                    "K runs sharing a stem read as one fleet row",
+                );
+                assert!(
+                    !items
+                        .iter()
+                        .any(|v| matches!(v, VisualItem::BacktestRun { depth: 1, .. })),
+                    "fleet members hidden while the fleet is folded",
+                );
+                assert!(
+                    items
+                        .iter()
+                        .any(|v| matches!(v, VisualItem::BacktestRun { task_id, depth: 0 } if task_id == "solo")),
+                    "singleton renders flat",
+                );
+            }
+
+            // Unfold the fleet → members appear, indented.
+            app.cursor =
+                Cursor::Backtest(BacktestCursor::Fleet("perf-bench-hist-k3".into()));
+            assert!(app.toggle_backtest_fold());
+            let items = app.visual_items();
+            let members: Vec<&str> = items
+                .iter()
+                .filter_map(|v| match v {
+                    VisualItem::BacktestRun { task_id, depth: 1 } => {
+                        Some(task_id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(members, vec!["f1", "f2", "f3"]);
+
+            // Space on a MEMBER folds its fleet and parks the cursor on it.
+            app.cursor = Cursor::Backtest(BacktestCursor::Run("f2".into()));
+            assert!(app.toggle_backtest_fold());
+            assert_eq!(
+                app.cursor,
+                Cursor::Backtest(BacktestCursor::Fleet("perf-bench-hist-k3".into())),
+            );
+            assert!(
+                !app.visual_items()
+                    .iter()
+                    .any(|v| matches!(v, VisualItem::BacktestRun { depth: 1, .. })),
+            );
+
+            // Fold the whole group → header only.
+            app.cursor = Cursor::Backtest(BacktestCursor::Group);
+            assert!(app.toggle_backtest_fold());
+            let items = app.visual_items();
+            assert!(items.iter().any(|v| matches!(v, VisualItem::BacktestHeader)));
+            assert!(!items.iter().any(|v| matches!(
+                v,
+                VisualItem::BacktestFleet(_) | VisualItem::BacktestRun { .. }
+            )));
+        });
+    }
+
+    /// Navigation reaches the group (header, fleet, runs) and wraps back to
+    /// real sessions; a backtest cursor resolves NO active session (so plain
+    /// keys can't leak into any PTY), while session rows keep working
+    /// exactly as before. clamp falls back gracefully when rows vanish.
+    #[test]
+    fn navigation_and_clamp_treat_backtest_rows_as_first_class() {
+        with_temp_home(|home| {
+            let mut app = test_app(home);
+            app.workspaces.clear();
+            let mut ws = empty_cloud_ws("ws-real", "real", None);
+            ws.is_cloud = false;
+            ws.sessions.push(real_session("worker"));
+            app.workspaces.push(ws);
+            app.reconcile_tasks(vec![
+                api_task("solo", "backlog", "backtest", true, "one-off", None),
+            ]);
+            app.sidebar_view = SidebarView::Task;
+
+            app.cursor = Cursor::Session(0, 0);
+            assert!(app.active_session().is_some(), "real session untouched");
+
+            app.navigate(1);
+            assert_eq!(app.cursor, Cursor::Backtest(BacktestCursor::Group));
+            assert!(
+                app.active_session().is_none(),
+                "no PTY behind backtest rows",
+            );
+            app.navigate(1);
+            assert_eq!(
+                app.cursor,
+                Cursor::Backtest(BacktestCursor::Run("solo".into())),
+            );
+            app.navigate(1);
+            assert_eq!(app.cursor, Cursor::Session(0, 0), "wraps back to sessions");
+
+            // Cursor on a row that then leaves the group → clamp steps up to
+            // the header; group emptied entirely → falls back to workspaces.
+            app.cursor = Cursor::Backtest(BacktestCursor::Run("solo".into()));
+            app.reconcile_tasks(vec![api_task(
+                "other", "backlog", "backtest", true, "different", None,
+            )]);
+            assert_eq!(app.cursor, Cursor::Backtest(BacktestCursor::Group));
+            app.reconcile_tasks(vec![]);
+            assert!(app.backtest_rows.is_empty());
+            assert_eq!(app.cursor, Cursor::Workspace(0));
+        });
     }
 }

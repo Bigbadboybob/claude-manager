@@ -299,6 +299,23 @@ pub enum Cursor {
     Task { ws_idx: usize, task_id: String },
     /// Cursor is on a session within a workspace (workspace index, session index).
     Session(usize, usize),
+    /// Cursor is inside the sidebar's `backtests` group (cloud backtest
+    /// runs — no workspace, no sessions; see `app/backtests.rs`).
+    /// Identified structurally (stem / task_id), not by index, so it
+    /// survives rows entering/leaving the group between refreshes.
+    Backtest(BacktestCursor),
+}
+
+/// Which row of the `backtests` group the cursor is on. Space/Enter (which
+/// have no PTY to go to here) toggle the fold of the group / a fleet.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BacktestCursor {
+    /// The `backtests` group header.
+    Group,
+    /// A fleet row (runs sharing this label stem).
+    Fleet(String),
+    /// A single run row, by task id.
+    Run(String),
 }
 
 /// Which sidebar column the cursor is navigating (two-column continuous panel,
@@ -345,6 +362,16 @@ pub(super) enum VisualItem {
     /// group. Non-selectable, like `HostHeader`. See
     /// DESIGN_CONTINUOUS_TASKS.md §12.
     ContinuousHeader,
+    /// Cloud-backtests group header, appended at the bottom of BOTH
+    /// sidebar sub-views when any backtest row is live. SELECTABLE
+    /// (unlike `ContinuousHeader`) so Space/Enter can fold the group.
+    BacktestHeader,
+    /// A fleet row inside the backtests group: ≥2 runs sharing a label
+    /// stem, rendered as one line (collapsed by default). Selectable.
+    BacktestFleet(String),
+    /// One backtest run. `depth` is 1 for fleet members (indented under
+    /// their fleet row), 0 for singletons. Selectable (A-i peeks it).
+    BacktestRun { task_id: String, depth: u8 },
 }
 
 /// One row in the dedicated continuous column (the two-column panel, S2 of
@@ -508,6 +535,9 @@ impl App {
                 None,
                 Some(task_id.clone()),
             ),
+            // Backtest rows live outside the workspace list — the reorder
+            // can't move them, so the cursor needs no re-resolution.
+            Cursor::Backtest(_) => (None, None, None),
         };
         self.workspaces.sort_by_key(|w| !w.pinned);
         if let Some(id) = saved_ws_id {
@@ -533,6 +563,37 @@ impl App {
 
     /// Clamp cursor so it points to a valid item.
     pub(super) fn clamp_cursor(&mut self) {
+        // Backtest cursors are validated against the live rows/groups, not
+        // the workspace list (their group renders even with zero
+        // workspaces). Vanished target → step up: run → its fleet if it
+        // still exists → the group header → first workspace.
+        if let Cursor::Backtest(bc) = &self.cursor {
+            if self.backtest_rows.is_empty() {
+                self.cursor = Cursor::Workspace(0);
+                self.clamp_cursor();
+                return;
+            }
+            // Validate against the group's VISIBLE rows (fold state counts:
+            // a run whose fleet just folded — or formed around it — is no
+            // longer a row the cursor can sit on).
+            let mut rows = Vec::new();
+            self.append_backtest_items(&mut rows);
+            let visible = rows.iter().any(|item| match (bc, item) {
+                (BacktestCursor::Group, VisualItem::BacktestHeader) => true,
+                (BacktestCursor::Fleet(stem), VisualItem::BacktestFleet(s)) => {
+                    stem == s
+                }
+                (
+                    BacktestCursor::Run(tid),
+                    VisualItem::BacktestRun { task_id, .. },
+                ) => tid == task_id,
+                _ => false,
+            });
+            if !visible {
+                self.cursor = Cursor::Backtest(BacktestCursor::Group);
+            }
+            return;
+        }
         if self.workspaces.is_empty() {
             self.cursor = Cursor::Workspace(0);
             return;
@@ -570,15 +631,107 @@ impl App {
                     self.cursor = Cursor::Workspace(wi);
                 }
             }
+            // Fully handled by the early-return at the top of this fn.
+            Cursor::Backtest(_) => {}
         }
     }
 
-    /// Build visual items for the current sidebar view.
+    /// Build visual items for the current sidebar view. The cloud-backtests
+    /// group rides at the bottom of BOTH sub-views (its rows aren't sessions,
+    /// so neither sub-view's own builder can place them).
     pub(super) fn visual_items(&self) -> Vec<VisualItem> {
-        match self.sidebar_view {
+        let mut items = match self.sidebar_view {
             SidebarView::Status => self.visual_items_status(),
             SidebarView::Task => self.visual_items_task(),
+        };
+        self.append_backtest_items(&mut items);
+        items
+    }
+
+    /// Append the `backtests` group: a header (with rollup counts when
+    /// folded), then — expanded — fleet rows (each folding its members)
+    /// and singleton runs. Nothing is appended when no backtest row is
+    /// live, so the sidebar is byte-identical to pre-feature.
+    fn append_backtest_items(&self, items: &mut Vec<VisualItem>) {
+        if self.backtest_rows.is_empty() {
+            return;
         }
+        if !items.is_empty() {
+            items.push(VisualItem::Separator);
+        }
+        items.push(VisualItem::BacktestHeader);
+        if self.backtests_folded {
+            return;
+        }
+        for group in group_backtest_rows(&self.backtest_rows) {
+            match group {
+                BacktestGroupItem::Single(i) => items.push(VisualItem::BacktestRun {
+                    task_id: self.backtest_rows[i].task_id.clone(),
+                    depth: 0,
+                }),
+                BacktestGroupItem::Fleet { stem, members } => {
+                    let unfolded = self.backtest_unfolded_fleets.contains(&stem);
+                    items.push(VisualItem::BacktestFleet(stem));
+                    if unfolded {
+                        for i in members {
+                            items.push(VisualItem::BacktestRun {
+                                task_id: self.backtest_rows[i].task_id.clone(),
+                                depth: 1,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Space/Enter while the cursor is inside the backtests group: fold or
+    /// unfold what the cursor is on (the group header, or a fleet row). A
+    /// run row folds its enclosing fleet — so Space anywhere in an expanded
+    /// fleet collapses it without first navigating up. Returns whether
+    /// anything toggled (the input path uses this to decide consumption).
+    pub(super) fn toggle_backtest_fold(&mut self) -> bool {
+        let cursor = match &self.cursor {
+            Cursor::Backtest(c) => c.clone(),
+            _ => return false,
+        };
+        match cursor {
+            BacktestCursor::Group => {
+                self.backtests_folded = !self.backtests_folded;
+            }
+            BacktestCursor::Fleet(stem) => {
+                if !self.backtest_unfolded_fleets.remove(&stem) {
+                    self.backtest_unfolded_fleets.insert(stem);
+                }
+            }
+            BacktestCursor::Run(task_id) => {
+                let Some(stem) = self
+                    .backtest_rows
+                    .iter()
+                    .find(|r| r.task_id == task_id)
+                    .and_then(|row| {
+                        group_backtest_rows(&self.backtest_rows)
+                            .into_iter()
+                            .find_map(|g| match g {
+                                BacktestGroupItem::Fleet { stem, members }
+                                    if members.iter().any(|&i| {
+                                        self.backtest_rows[i].task_id == row.task_id
+                                    }) =>
+                                {
+                                    Some(stem)
+                                }
+                                _ => None,
+                            })
+                    })
+                else {
+                    return false; // singleton run — nothing to fold
+                };
+                self.backtest_unfolded_fleets.remove(&stem);
+                self.cursor = Cursor::Backtest(BacktestCursor::Fleet(stem));
+            }
+        }
+        self.needs_redraw = true;
+        true
     }
 
     /// Status view: flat list of sessions grouped by status.
@@ -1160,6 +1313,11 @@ impl App {
             // Continuous header is presentation-only, like
             // `HostHeader`; skip it in cursor navigation.
             VisualItem::ContinuousHeader => false,
+            // Backtest rows are all selectable — the header and fleet rows
+            // for the Space/Enter fold toggle, run rows for the A-i peek.
+            VisualItem::BacktestHeader => true,
+            VisualItem::BacktestFleet(_) => true,
+            VisualItem::BacktestRun { .. } => true,
         };
 
         if !items.iter().any(is_selectable) {
@@ -1177,6 +1335,18 @@ impl App {
                     Cursor::Task { ws_idx, task_id },
                     VisualItem::TaskHeader { ws_idx: vwi, task_id: vtid },
                 ) => ws_idx == vwi && task_id == vtid,
+                (
+                    Cursor::Backtest(BacktestCursor::Group),
+                    VisualItem::BacktestHeader,
+                ) => true,
+                (
+                    Cursor::Backtest(BacktestCursor::Fleet(stem)),
+                    VisualItem::BacktestFleet(vstem),
+                ) => stem == vstem,
+                (
+                    Cursor::Backtest(BacktestCursor::Run(tid)),
+                    VisualItem::BacktestRun { task_id: vtid, .. },
+                ) => tid == vtid,
                 _ => false,
             })
             .unwrap_or(0);
@@ -1198,6 +1368,15 @@ impl App {
                     ws_idx: *ws_idx,
                     task_id: task_id.clone(),
                 };
+            }
+            VisualItem::BacktestHeader => {
+                self.cursor = Cursor::Backtest(BacktestCursor::Group);
+            }
+            VisualItem::BacktestFleet(stem) => {
+                self.cursor = Cursor::Backtest(BacktestCursor::Fleet(stem.clone()));
+            }
+            VisualItem::BacktestRun { task_id, .. } => {
+                self.cursor = Cursor::Backtest(BacktestCursor::Run(task_id.clone()));
             }
             _ => {}
         }
@@ -1595,11 +1774,113 @@ impl App {
                     out.extend(self.workspace_peek_lines(ws));
                 }
             }
+            Cursor::Backtest(bc) => out.extend(self.backtest_peek_lines(bc)),
         }
         if out.is_empty() {
             out.push(PeekLine::Text("Nothing focused.".into()));
         }
         out
+    }
+
+    /// A-i peek body for the backtests group: per-run detail on a run row
+    /// (status, VM, runtime, result pointer), a member roster on a fleet
+    /// row, a rollup on the header.
+    fn backtest_peek_lines(&self, bc: &BacktestCursor) -> Vec<PeekLine> {
+        let now = Instant::now();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let state_label = |row: &BacktestRow| -> String {
+            match &row.state {
+                BacktestState::Queued => "queued".into(),
+                BacktestState::Running { vm: Some(vm) } => {
+                    format!("running on {}", vm)
+                }
+                BacktestState::Running { vm: None } => "dispatching".into(),
+                BacktestState::Done => "complete".into(),
+                BacktestState::Failed => "failed".into(),
+            }
+        };
+        let run_lines = |row: &BacktestRow| -> Vec<PeekLine> {
+            let mut out = vec![
+                PeekLine::Title(format!("backtest: {}", row.label)),
+                PeekLine::Field {
+                    label: "Status".into(),
+                    value: state_label(row),
+                },
+                PeekLine::Field {
+                    label: "Branch".into(),
+                    value: row.branch.clone(),
+                },
+                PeekLine::Field {
+                    label: "Task".into(),
+                    value: row.task_id.clone(),
+                },
+            ];
+            if let Some(secs) = runtime_secs(row, now, now_ms) {
+                out.push(PeekLine::Field {
+                    label: "Runtime".into(),
+                    value: fmt_runtime(secs),
+                });
+            }
+            if let Some(rk) = &row.run_key {
+                out.push(PeekLine::Field {
+                    label: "Results".into(),
+                    value: format!(
+                        "get_backtest_result({}) · GCS backtests/{}/",
+                        &row.task_id[..8.min(row.task_id.len())],
+                        rk
+                    ),
+                });
+            }
+            out
+        };
+        match bc {
+            BacktestCursor::Run(tid) => self
+                .backtest_rows
+                .iter()
+                .find(|r| &r.task_id == tid)
+                .map(run_lines)
+                .unwrap_or_default(),
+            BacktestCursor::Fleet(stem) => {
+                let mut out =
+                    vec![PeekLine::Title(format!("backtest fleet: {}", stem))];
+                for row in self
+                    .backtest_rows
+                    .iter()
+                    .filter(|r| fleet_stem(&r.label) == Some(stem.as_str()))
+                {
+                    let runtime = runtime_secs(row, now, now_ms)
+                        .map(|s| format!(" · {}", fmt_runtime(s)))
+                        .unwrap_or_default();
+                    out.push(PeekLine::Field {
+                        label: row.label.clone(),
+                        value: format!("{}{}", state_label(row), runtime),
+                    });
+                }
+                out
+            }
+            BacktestCursor::Group => {
+                let mut out = vec![PeekLine::Title("cloud backtests".into())];
+                for row in &self.backtest_rows {
+                    let runtime = runtime_secs(row, now, now_ms)
+                        .map(|s| format!(" · {}", fmt_runtime(s)))
+                        .unwrap_or_default();
+                    out.push(PeekLine::Field {
+                        label: row.label.clone(),
+                        value: format!("{}{}", state_label(row), runtime),
+                    });
+                }
+                out.push(PeekLine::Blank);
+                out.push(PeekLine::Text(
+                    "Space/Enter folds the group; results stay readable via \
+                     get_backtest_result."
+                        .into(),
+                ));
+                out
+            }
+        }
     }
 }
 

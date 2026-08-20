@@ -207,8 +207,12 @@ fn earliest_timestamp_ms(path: &Path) -> Option<u64> {
 }
 
 /// Parse an ISO-8601 timestamp like `"2026-04-20T04:37:57.085Z"` into unix ms.
-/// Very narrow parser — only the format claude emits.
-fn iso8601_to_ms(s: &str) -> Option<u64> {
+/// Very narrow parser — only the format claude emits. Also accepts the
+/// `+00:00`-suffixed form Python's `datetime.isoformat()` produces (the
+/// offset is ignored, so only UTC inputs parse correctly — which is what
+/// both producers emit). `pub` because the TUI's backtest sidebar group
+/// reuses it for `blocked_at` / `metadata.backtest.launched_at`.
+pub fn iso8601_to_ms(s: &str) -> Option<u64> {
     let bytes = s.as_bytes();
     if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return None;

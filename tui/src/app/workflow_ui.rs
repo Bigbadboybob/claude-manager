@@ -560,6 +560,12 @@ impl App {
                     });
                 (ws_idx, si, Some(task_id))
             }
+            Cursor::Backtest(_) => {
+                self.set_status_msg(
+                    "Workflows run on local sessions — backtest runs are cloud-only",
+                );
+                return;
+            }
         };
         if wi >= self.workspaces.len() {
             self.set_status_msg("No workspace selected");
@@ -951,6 +957,7 @@ impl App {
                 })
             }
             Cursor::Workspace(_) => None,
+            Cursor::Backtest(_) => None,
         }
     }
 }

@@ -1752,6 +1752,173 @@ impl App {
                     )]);
                     items.push(ListItem::new(line));
                 }
+                // Cloud-backtests group header. Selectable (Space/Enter
+                // folds); always carries the per-state rollup so the
+                // group is legible at a glance even collapsed.
+                VisualItem::BacktestHeader => {
+                    let is_selected =
+                        matches!(&self.cursor, Cursor::Backtest(BacktestCursor::Group));
+                    let arrow = if self.backtests_folded { "\u{25b8}" } else { "\u{25be}" };
+                    let name_style = if is_selected {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD)
+                    };
+                    let mut spans = vec![Span::styled(
+                        format!(" {} backtests", arrow),
+                        name_style,
+                    )];
+                    let count_of = |f: &dyn Fn(&BacktestState) -> bool| {
+                        self.backtest_rows.iter().filter(|r| f(&r.state)).count()
+                    };
+                    let running =
+                        count_of(&|s| matches!(s, BacktestState::Running { .. }));
+                    let queued = count_of(&|s| matches!(s, BacktestState::Queued));
+                    let done = count_of(&|s| matches!(s, BacktestState::Done));
+                    let failed = count_of(&|s| matches!(s, BacktestState::Failed));
+                    for (n, glyph, color) in [
+                        (running, spinner, theme::OK),
+                        (queued, "\u{00b7}", theme::DIM),
+                        (done, "\u{2713}", theme::OK),
+                        (failed, "\u{2717}", theme::ERROR),
+                    ] {
+                        if n > 0 {
+                            spans.push(Span::styled(
+                                format!(" {}{}", glyph, n),
+                                Style::default().fg(color),
+                            ));
+                        }
+                    }
+                    items.push(ListItem::new(Line::from(spans)));
+                }
+                // Fleet row: one line for a set of runs sharing a label
+                // stem. Shows the member rollup; `▸` until unfolded.
+                VisualItem::BacktestFleet(stem) => {
+                    let is_selected = matches!(
+                        &self.cursor,
+                        Cursor::Backtest(BacktestCursor::Fleet(s)) if s == stem
+                    );
+                    let unfolded = self.backtest_unfolded_fleets.contains(stem);
+                    let arrow = if unfolded { "\u{25be}" } else { "\u{25b8}" };
+                    let members: Vec<&BacktestRow> = self
+                        .backtest_rows
+                        .iter()
+                        .filter(|r| fleet_stem(&r.label) == Some(stem.as_str()))
+                        .collect();
+                    let name_style = if is_selected {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::MUTED)
+                    };
+                    let name = crate::planning::truncate_with_ellipsis(
+                        stem,
+                        (inner.width as usize).saturating_sub(14),
+                    );
+                    let mut spans = vec![Span::styled(
+                        format!("   {} {}", arrow, name),
+                        name_style,
+                    )];
+                    let count_of = |f: &dyn Fn(&BacktestState) -> bool| {
+                        members.iter().filter(|r| f(&r.state)).count()
+                    };
+                    for (n, glyph, color) in [
+                        (
+                            count_of(&|s| matches!(s, BacktestState::Running { .. })),
+                            spinner,
+                            theme::OK,
+                        ),
+                        (
+                            count_of(&|s| matches!(s, BacktestState::Queued)),
+                            "\u{00b7}",
+                            theme::DIM,
+                        ),
+                        (
+                            count_of(&|s| matches!(s, BacktestState::Done)),
+                            "\u{2713}",
+                            theme::OK,
+                        ),
+                        (
+                            count_of(&|s| matches!(s, BacktestState::Failed)),
+                            "\u{2717}",
+                            theme::ERROR,
+                        ),
+                    ] {
+                        if n > 0 {
+                            spans.push(Span::styled(
+                                format!(" {}{}", glyph, n),
+                                Style::default().fg(color),
+                            ));
+                        }
+                    }
+                    items.push(ListItem::new(Line::from(spans)));
+                }
+                // One backtest run: state glyph + label (fleet members show
+                // just their distinguishing suffix) + runtime + VM tag.
+                VisualItem::BacktestRun { task_id, depth } => {
+                    let Some(row) =
+                        self.backtest_rows.iter().find(|r| &r.task_id == task_id)
+                    else {
+                        continue;
+                    };
+                    let is_selected = matches!(
+                        &self.cursor,
+                        Cursor::Backtest(BacktestCursor::Run(t)) if t == task_id
+                    );
+                    let (glyph, glyph_style) = match &row.state {
+                        BacktestState::Running { .. } => {
+                            (spinner, Style::default().fg(theme::OK))
+                        }
+                        BacktestState::Queued => {
+                            ("\u{00b7}", Style::default().fg(theme::DIM))
+                        }
+                        BacktestState::Done => {
+                            ("\u{2713}", Style::default().fg(theme::OK))
+                        }
+                        BacktestState::Failed => {
+                            ("\u{2717}", Style::default().fg(theme::ERROR))
+                        }
+                    };
+                    let display = if *depth > 0 {
+                        row.label
+                            .rsplit('-')
+                            .next()
+                            .unwrap_or(row.label.as_str())
+                            .to_string()
+                    } else {
+                        row.label.clone()
+                    };
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let mut tags = String::new();
+                    if let Some(secs) = runtime_secs(row, now, now_ms) {
+                        tags.push_str(&format!(" {}", fmt_runtime(secs)));
+                    }
+                    if let BacktestState::Running { vm: Some(vm) } = &row.state {
+                        tags.push_str(&format!(" @{}", vm));
+                    }
+                    let indent = if *depth > 0 { "     " } else { "   " };
+                    let max_name = (inner.width as usize)
+                        .saturating_sub(indent.len() + 2 + tags.chars().count());
+                    let name =
+                        crate::planning::truncate_with_ellipsis(&display, max_name);
+                    let name_style = if is_selected {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::MUTED)
+                    };
+                    let mut spans = vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(glyph.to_string(), glyph_style),
+                        Span::raw(" "),
+                        Span::styled(name, name_style),
+                    ];
+                    if !tags.is_empty() {
+                        spans.push(Span::styled(tags, Style::default().fg(theme::DIM)));
+                    }
+                    items.push(ListItem::new(Line::from(spans)));
+                }
             }
         }
 

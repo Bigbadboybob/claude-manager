@@ -2225,6 +2225,11 @@ impl App {
                     active_field: 0,
                 };
             }
+            Cursor::Backtest(_) => {
+                self.set_status_msg(
+                    "Backtest runs have no settings here — A-i peeks details",
+                );
+            }
         }
     }
 
@@ -2794,6 +2799,23 @@ impl App {
                     // attribute now, DESIGN_REMOVE_GLOBAL_HOST.md.)
                     _ => {}
                 }
+            }
+        }
+
+        // Backtests-group fold toggle. With the cursor inside the group
+        // there is no active session, so plain keys have no PTY to go to —
+        // Space/Enter are free to fold/unfold (matching the planning view's
+        // Space-fold idiom). Guarded on the cursor so a stray Space while a
+        // real session is focused still reaches its terminal below.
+        if let CrosstermEvent::Key(key) = event {
+            if matches!(self.cursor, Cursor::Backtest(_))
+                && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                self.toggle_backtest_fold();
+                return true;
             }
         }
 
