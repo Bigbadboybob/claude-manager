@@ -241,9 +241,15 @@ fn migrate_stage(
         kill_parked(&brain);
         return anyhow::anyhow!("CLOEXEC audit: {e}");
     }
+    // NOTE (P7 review F8): the EXEC TARGET (holder_fd) is deliberately
+    // NOT on this list — execveat consumes the struct file through the
+    // syscall itself, so a CLOEXEC target still execs (ELF; scripts
+    // would not, and no cm binary is a script), and the fd then closes
+    // AT the exec instead of surviving as an unowned, inheritable
+    // stray in the new image. The brain PIN is different: the holder
+    // needs it alive post-exec, and it is manifest-named.
     let mut inherit: Vec<RawFd> = vec![
         manifest_fd.as_raw_fd(),
-        holder_fd.as_raw_fd(),
         manifest.rollback_bin_fd,
         manifest.listener_fd,
         ours.as_raw_fd(),
@@ -353,12 +359,18 @@ fn spawn_parked_brain(
             Ok(())
         });
     }
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
     // SAFETY: pidfd_open on a live child we just spawned.
     let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
     if ret < 0 {
-        return Err(std::io::Error::last_os_error());
+        // P7 review F15: without a pidfd we hold no supervision
+        // handle — kill and REAP the child here (std Child's Drop
+        // does neither), or it lingers as a zombie until daemon exit.
+        let err = std::io::Error::last_os_error();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
     }
     // SAFETY: non-negative return is a fresh fd we own. std Child's
     // Drop neither kills nor waits.

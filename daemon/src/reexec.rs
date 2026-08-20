@@ -1531,7 +1531,15 @@ pub(crate) fn do_execveat_with_argv(
 
     let mut envp_c: Vec<CString> = Vec::new();
     for (k, v) in std::env::vars_os() {
-        if k.as_bytes().starts_with(b"CM_REEXEC_") {
+        if k.as_bytes().starts_with(b"CM_REEXEC_")
+            // P7 review F4: BOTH bootstrap namespaces are scrubbed on
+            // every cross-image exec — a stale numeric
+            // CM_HOLDER_UPGRADE_MANIFEST_FD in the service env would
+            // otherwise WIN the holder's boot-detection precedence
+            // over the valid migration manifest and strand every
+            // session outside holder state.
+            || k.as_bytes().starts_with(b"CM_HOLDER_UPGRADE_")
+        {
             continue;
         }
         let mut kv = k.into_vec();

@@ -628,6 +628,15 @@ impl FrameReader {
         }
     }
 
+    /// No partial frame bytes and no unclaimed SCM_RIGHTS fds are
+    /// buffered in USERSPACE. Phase 7's holder self-exec gate: bytes
+    /// still in the KERNEL socket buffer survive an exec; bytes in
+    /// this reader do not — exec'ing while a frame straddles the two
+    /// desynchronizes the channel irrecoverably (review F2).
+    pub fn is_idle(&self) -> bool {
+        self.buf.is_empty() && self.pending_fds.is_empty()
+    }
+
     /// One `recvmsg` into the buffer. 64 KiB reads: frames are small
     /// (≤ [`MAX_FRAME_BYTES`]); the channel is a control plane.
     pub fn feed(&mut self, fd: BorrowedFd<'_>) -> Result<FeedStatus, ProtocolViolation> {

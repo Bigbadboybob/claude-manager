@@ -98,6 +98,9 @@ rustls-pki-types = "1"
 # here we need the grid solely as a mode sink, with a `VoidListener` and no
 # `EventLoop`.
 alacritty_terminal = "0.25"
+# Phase 7 (review F13): the brain-deploy preflight's per-invocation
+# unbindable sentinel path is a NamedTempFile — promoted from
+# dev-dependencies.
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"

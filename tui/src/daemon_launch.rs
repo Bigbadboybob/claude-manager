@@ -227,39 +227,64 @@ pub(crate) fn locate_launch_spec() -> std::io::Result<(PathBuf, Vec<std::ffi::Os
     // explicit operator act — never inferred from binary presence.
     // Env wins over the file (a deliberate one-shot override).
     let flip = holder_binary_flip_path();
-    match std::fs::read_to_string(&flip) {
-        Ok(s) if !s.trim().is_empty() => {
-            let holder = canonicalize_binary_path(&PathBuf::from(s.trim()))?;
-            let daemon = locate_daemon_binary()?;
-            eprintln!(
-                "cm-tui: {} set — launching the holder/brain split \
-                 ({} --brain {})",
-                flip.display(),
-                holder.display(),
-                daemon.display()
-            );
-            return Ok((
-                holder,
-                vec!["--brain".into(), daemon.into_os_string()],
-            ));
-        }
-        Ok(_) => {} // empty file = no flip
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            // Fail CLOSED on an unreadable flip file: launching a
-            // monolith over a migrated host's state is exactly the
-            // C6 hazard the file exists to prevent.
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!(
-                    "reading the holder-binary flip file {}: {e} — refusing \
-                     to guess the launch topology (remove or fix the file)",
-                    flip.display()
-                ),
-            ));
-        }
+    if let Some(holder_path) =
+        flip_decision(std::fs::read_to_string(&flip), &flip)?
+    {
+        let holder = canonicalize_binary_path(&PathBuf::from(holder_path))?;
+        let daemon = locate_daemon_binary()?;
+        eprintln!(
+            "cm-tui: {} set — launching the holder/brain split \
+             ({} --brain {})",
+            flip.display(),
+            holder.display(),
+            daemon.display()
+        );
+        return Ok((
+            holder,
+            vec!["--brain".into(), daemon.into_os_string()],
+        ));
     }
     Ok((locate_daemon_binary()?, Vec::new()))
+}
+
+/// The C6 flip file's FAIL-CLOSED read policy (P7 review F5): only
+/// `NotFound` means "no flip — monolith launch". A PRESENT file that
+/// is empty (a crash between truncate and write, a partial deploy) or
+/// unreadable REFUSES the launch — silently starting a monolith over
+/// a migrated host's state is the exact C6 hazard the file prevents.
+/// `Ok(Some(path))` = launch split with that holder path.
+fn flip_decision(
+    read: std::io::Result<String>,
+    flip: &Path,
+) -> std::io::Result<Option<String>> {
+    match read {
+        Ok(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "the holder-binary flip file {} exists but is EMPTY \
+                         — refusing to guess the launch topology. Restore \
+                         its cm-holder path (write via temp file + rename), \
+                         or delete it ONLY if this host was reverse-migrated \
+                         back to a monolith.",
+                        flip.display()
+                    ),
+                ));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "reading the holder-binary flip file {}: {e} — refusing \
+                 to guess the launch topology (remove or fix the file)",
+                flip.display()
+            ),
+        )),
+    }
 }
 
 /// The C6 supervisor-flip file (see [`locate_launch_spec`]).
@@ -1504,5 +1529,38 @@ mod tests {
             err.kind(),
             err,
         );
+    }
+
+    /// P7 review F5: the C6 flip file fails CLOSED — only NotFound
+    /// means monolith; an empty or unreadable present file refuses
+    /// the launch rather than silently starting a monolith over a
+    /// migrated host's state.
+    #[test]
+    fn flip_file_fails_closed_on_everything_but_notfound() {
+        let flip = Path::new("/tmp/x/holder-binary");
+        // Absent → monolith.
+        let nf = Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        ));
+        assert_eq!(flip_decision(nf, flip).unwrap(), None);
+        // Present + path → split.
+        assert_eq!(
+            flip_decision(Ok("/opt/cm/cm-holder\n".into()), flip).unwrap(),
+            Some("/opt/cm/cm-holder".to_string())
+        );
+        // Present + EMPTY → refuse (the truncate-crash / partial-deploy
+        // shape).
+        let e = flip_decision(Ok("".into()), flip).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        let e = flip_decision(Ok("   \n".into()), flip).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        // Present + unreadable → refuse.
+        let perm = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        let e = flip_decision(perm, flip).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

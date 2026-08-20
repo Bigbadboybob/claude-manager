@@ -1200,7 +1200,7 @@ fn role_fstat(
 }
 
 /// PTY master: character device + answers `TIOCGWINSZ`.
-fn validate_pty_master_fd(fd: RawFd) -> Result<(), ManifestError> {
+pub(crate) fn validate_pty_master_fd(fd: RawFd) -> Result<(), ManifestError> {
     let role = "pty_master_fd";
     let st = role_fstat(role, fd)?;
     if (st.st_mode & libc::S_IFMT) != libc::S_IFCHR {
@@ -1232,7 +1232,7 @@ fn validate_pty_master_fd(fd: RawFd) -> Result<(), ManifestError> {
 
 /// pidfd: the `/proc/self/fd` link of a pidfd is the anon-inode
 /// marker `anon_inode:[pidfd]` — nothing else readlinks to that.
-fn validate_pidfd_role(
+pub(crate) fn validate_pidfd_role(
     role: &'static str,
     fd: RawFd,
 ) -> Result<(), ManifestError> {
@@ -1262,7 +1262,7 @@ fn validate_pidfd_role(
 /// (`SO_ACCEPTCONN` must be FALSE). Probes: `SO_DOMAIN` == `AF_UNIX`,
 /// `SO_TYPE` == `SOCK_STREAM`, `SO_ACCEPTCONN` == 0. All read-only
 /// getsockopt queries.
-fn validate_channel_fd(
+pub(crate) fn validate_channel_fd(
     role: &'static str,
     fd: RawFd,
 ) -> Result<(), ManifestError> {
@@ -1328,7 +1328,7 @@ fn validate_channel_fd(
 /// Listener: a socket for which `SO_ACCEPTCONN` is true — i.e. one
 /// that `listen(2)` was called on. A connected stream answers false;
 /// a non-socket fails the getsockopt with ENOTSOCK.
-fn validate_listener_fd(
+pub(crate) fn validate_listener_fd(
     role: &'static str,
     fd: RawFd,
 ) -> Result<(), ManifestError> {
@@ -1371,7 +1371,7 @@ fn validate_listener_fd(
 /// an execute bit. Shape only — see [`validate_fd_roles`]; the
 /// actual `execveat` (and its new-inode ≠ rollback-inode assertion)
 /// belongs to the exec skeleton.
-fn validate_exec_fd(role: &'static str, fd: RawFd) -> Result<(), ManifestError> {
+pub(crate) fn validate_exec_fd(role: &'static str, fd: RawFd) -> Result<(), ManifestError> {
     let st = role_fstat(role, fd)?;
     if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return Err(ManifestError::FdRoleMismatch {

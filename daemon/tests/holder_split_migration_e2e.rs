@@ -331,7 +331,16 @@ impl Sandbox {
 fn migrate_split_rides_a_live_session_through() {
     let holder_bin = locate_cm_holder();
     let daemon_bin = env!("CARGO_BIN_EXE_cm-daemon");
-    let mut sb = launch("migrate", false, &[]);
+    // Review F4's canary: a STALE holder-upgrade bootstrap var in the
+    // monolith's service environment must be scrubbed by the
+    // migration exec — unscrubbed, it wins the holder's boot-detection
+    // precedence over the valid migration manifest and the migration
+    // fail-stops with every session outside holder state.
+    let mut sb = launch(
+        "migrate",
+        false,
+        &[("CM_HOLDER_UPGRADE_MANIFEST_FD", "9")],
+    );
     assert_eq!(sb.split_flag(), Some(false), "launched a monolith");
 
     let uid = "ts-a1c0-1";

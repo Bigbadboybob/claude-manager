@@ -137,9 +137,23 @@ pub struct HolderClient {
     /// this brain never registered — the protocol-anomaly park, S4:
     /// never ack-and-drop).
     parked_exits: Mutex<Vec<ch::ExitEventBody>>,
-    /// From the hello reply — surfaced on `daemon.health`.
-    pub holder_build_id: String,
+    /// From the hello reply — surfaced on `daemon.health`. A
+    /// Mutex, not a plain String (review F12): a holder UPGRADE
+    /// replaces the image under the same brain generation, and the
+    /// rehello carries the NEW build id — health must report the
+    /// live value or the runbook's "holder_build_id changed" check
+    /// reads stale until the next brain restart.
+    holder_build_id: Mutex<String>,
     pub epoch: u64,
+    /// The RUNNING holder's advertised proto range, from the hello
+    /// reply (review F3): the S15 upgrade gate keys on THIS — every
+    /// pin this holder lineage ever accepted negotiated inside it, so
+    /// a candidate holder covering it cannot strand any pin. The
+    /// brain's own compiled range is NOT a valid proxy (a holder
+    /// range wider than the brain's would let a narrower candidate
+    /// slip through and strand the previous pin).
+    pub holder_proto_min: u32,
+    pub holder_proto_max: u32,
 }
 
 impl HolderClient {
@@ -223,8 +237,10 @@ impl HolderClient {
             pending: Mutex::new(HashMap::new()),
             exit_subs: Mutex::new(HashMap::new()),
             parked_exits: Mutex::new(Vec::new()),
-            holder_build_id: hr.holder_build_id,
+            holder_build_id: Mutex::new(hr.holder_build_id),
             epoch: hr.epoch,
+            holder_proto_min: hr.holder_proto_min,
+            holder_proto_max: hr.holder_proto_max,
         });
         let for_reader = Arc::clone(&client);
         std::thread::Builder::new()
@@ -232,6 +248,15 @@ impl HolderClient {
             .spawn(move || for_reader.reader_loop(reader))
             .map_err(|e| internal(format!("spawn client reader: {e}")))?;
         Ok(client)
+    }
+
+    /// The RUNNING holder image's build id (live across upgrades —
+    /// updated by every rehello).
+    pub fn holder_build_id(&self) -> String {
+        self.holder_build_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// The inbound dispatcher. Channel death is fatal for the whole
@@ -290,6 +315,10 @@ impl HolderClient {
                      re-negotiating",
                     rh.holder_build_id, rh.epoch
                 );
+                *self
+                    .holder_build_id
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = rh.holder_build_id.clone();
                 let reply = Frame::new(
                     verbs::HELLO,
                     Some(req_id),
@@ -878,7 +907,8 @@ pub fn init_from_env() -> bool {
         Ok(client) => {
             eprintln!(
                 "cm-daemon: HOLDER MODE — connected to holder {} (epoch {})",
-                client.holder_build_id, client.epoch
+                client.holder_build_id(),
+                client.epoch
             );
             let _ = GLOBAL.set(client);
             true
@@ -1231,20 +1261,25 @@ pub(crate) fn brain_deploy_preflight(pin: &OwnedFd) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let raw = pin.as_raw_fd();
+    // Side-effect proofing (phase 7, found by the V9 skew cell;
+    // hardened per review F13): a candidate binary that PREDATES
+    // --daemon-preflight ignores the unknown arg and falls through to
+    // a FULL daemon boot. Its bind is pointed BELOW a per-invocation
+    // temp FILE — a regular file as a path component is ENOTDIR for
+    // every uid, so the fallthrough deterministically dies at
+    // bind_socket instead of ever serving (a fixed "nonexistent" dir
+    // could exist and be writable, root-run services most of all).
+    // The unguessable path doubles as the classification sentinel:
+    // legacy vintage is recognized only by a bind failure NAMING THIS
+    // path, so a genuine modern preflight failure whose message
+    // merely mentions binding can never be misclassified.
+    let sentinel_file = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("preflight sentinel tempfile: {e}"))?;
+    let sentinel_sock =
+        format!("{}/preflight.sock", sentinel_file.path().display());
     let mut cmd = std::process::Command::new(format!("/proc/self/fd/{raw}"));
     cmd.arg("--daemon-preflight")
-        // Side-effect proofing (phase 7, found by the V9 skew cell):
-        // a candidate binary that PREDATES --daemon-preflight ignores
-        // the unknown arg and falls through to a FULL daemon boot —
-        // pointing its bind at a nonexistent directory guarantees
-        // that fallthrough exits at bind_socket instead of running a
-        // second daemon. Binaries that HAVE the flag never bind, so
-        // this is inert for them. The distinctive bind failure is
-        // also how the legacy vintage is recognized below.
-        .env(
-            "CM_DAEMON_SOCKET",
-            "/nonexistent-cm-preflight-dir/preflight.sock",
-        )
+        .env("CM_DAEMON_SOCKET", &sentinel_sock)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -1274,8 +1309,11 @@ pub(crate) fn brain_deploy_preflight(pin: &OwnedFd) -> Result<(), String> {
     // fell through to run() and died at the forced-unbindable socket.
     // That fallthrough IS a boot-to-bind proof (env sanitize + config
     // load ran); accept it loudly — a rollback target may legitimately
-    // predate the flag (the V9 skew cell's case).
-    if stderr.contains("failed to bind cm-daemon socket") {
+    // predate the flag (the V9 skew cell's case). The match requires
+    // the per-invocation sentinel path, not just the generic phrase.
+    if stderr.contains("failed to bind cm-daemon socket")
+        && stderr.contains(&sentinel_sock)
+    {
         eprintln!(
             "cm-daemon: candidate binary predates --daemon-preflight \
              (legacy fallthrough detected) — accepting on the boot-to-bind \
@@ -1361,12 +1399,18 @@ fn spawn_deploy_thread(
             // the holder stitches into the rollback manifest. Fallible,
             // so it happens BEFORE the arm.
             if let DeployAction::SplitRollback(_) = &action {
-                let now = std::time::Instant::now();
                 let records: Result<Vec<(String, serde_json::Value)>, String> = {
                     let st = state.lock().unwrap_or_else(|p| p.into_inner());
                     st.sessions
                         .iter()
                         .map(|(uid, s)| {
+                            // Per-record age anchor (review F11): the
+                            // residual staleness is compose→exec, not
+                            // compose→(whole stream)→exec. Sub-second
+                            // in practice; consumers compare ages
+                            // against multi-second thresholds (the v2
+                            // ages contract).
+                            let now = std::time::Instant::now();
                             let rec = crate::reexec::session_record_for(uid, s, now)
                                 .map_err(|e| format!("session '{uid}': {e}"))?;
                             let val = serde_json::to_value(&rec)
@@ -1435,7 +1479,17 @@ fn spawn_deploy_thread(
                 guard.abort();
                 return;
             }
-            eprintln!("cm-daemon: {what} armed — exiting for the holder to exec");
+            // C8, literally (review F10): nothing FALLIBLE between a
+            // successful arm and the exit — `eprintln!` can PANIC on a
+            // broken stderr, which would unwind this thread and leave
+            // the brain alive under a 30s armed pin that an unrelated
+            // later crash would then fire. Raw best-effort write, then
+            // exit.
+            let msg = b"cm-daemon: deploy armed - exiting for the holder to act\n";
+            // SAFETY: plain write(2) to stderr; the result is ignored.
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             std::process::exit(0);
         });
 }
@@ -1541,26 +1595,19 @@ pub fn upgrade_holder_flow(
         })?
         .into();
     let pf = holder_preflight(&pin).map_err(|msg| (ErrorCode::Conflict, msg))?;
-    // S15's skew gate: "the previous pin by construction overlapped"
-    // is only true against the holder that pinned it — a new holder
-    // whose proto floor moved can strand BOTH brain pins into
-    // proto_mismatch → HELD_DOWN. Every brain this holder lineage
-    // ever pinned negotiated within OUR proto range, so the checkable
-    // gate is: the new holder's range must still cover our range.
-    if pf.proto_min > ch::PROTO_VERSION_MIN || pf.proto_max < ch::PROTO_VERSION_MAX {
-        return Err((
-            ErrorCode::Conflict,
-            format!(
-                "daemon.upgrade_holder REFUSED (S15): the new holder speaks \
-                 {}..={}, which does not cover this lineage's {}..={} — it \
-                 could strand the previous brain pin into proto_mismatch. \
-                 Upgrade the brains first.",
-                pf.proto_min,
-                pf.proto_max,
-                ch::PROTO_VERSION_MIN,
-                ch::PROTO_VERSION_MAX
-            ),
-        ));
+    // S15's skew gate (review F3): a new holder whose proto floor
+    // moved can strand BOTH brain pins into proto_mismatch →
+    // HELD_DOWN. Every pin this holder lineage ever accepted
+    // negotiated within the RUNNING HOLDER's advertised range (from
+    // the hello reply) — so the checkable gate is: the candidate must
+    // cover THAT range. The brain's own compiled range is not a valid
+    // proxy: holder 1..=2 with a current brain 2..=2 would let a
+    // candidate 2..=2 through and strand a previous 1..=1 pin.
+    if let Err(msg) = s15_gate(
+        (pf.proto_min, pf.proto_max),
+        (client.holder_proto_min, client.holder_proto_max),
+    ) {
+        return Err((ErrorCode::Conflict, msg));
     }
     client
         .reexec_holder(pin.as_raw_fd())
@@ -1579,6 +1626,28 @@ pub fn upgrade_holder_flow(
                     holder_epoch and session count do not).",
         "new_holder_build_id": pf.build_id,
     }))
+}
+
+/// The S15 gate as a pure predicate (review F3): the candidate
+/// holder's proto range must COVER the running holder's advertised
+/// range — every brain pin this lineage ever accepted negotiated
+/// inside the latter, so coverage implies no pin can be stranded.
+/// Residual (documented in the design's § Holder upgrades): a lineage
+/// whose holder range ever NARROWS may hold pins older than the
+/// current range; narrowing is a deprecation event that must advance
+/// the oldest-supported note + matrix baseline instead.
+fn s15_gate(candidate: (u32, u32), running_holder: (u32, u32)) -> Result<(), String> {
+    let (c_min, c_max) = candidate;
+    let (h_min, h_max) = running_holder;
+    if c_min > h_min || c_max < h_max {
+        return Err(format!(
+            "daemon.upgrade_holder REFUSED (S15): the new holder speaks \
+             {c_min}..={c_max}, which does not cover the running holder \
+             lineage's {h_min}..={h_max} — it could strand a brain pin \
+             into proto_mismatch → HELD_DOWN. Upgrade the brains first."
+        ));
+    }
+    Ok(())
 }
 
 /// Parsed `--holder-preflight` output.
@@ -2213,5 +2282,19 @@ mod tests {
     fn instant_at_unix_tolerates_future_stamps() {
         let i = instant_at_unix(unix_now() + 3600.0);
         assert!(i.elapsed().as_secs() < 5);
+    }
+
+    /// Review F3's counterexample, pinned: previous pin 1..=1
+    /// negotiated with a running holder 1..=2; a candidate 2..=2
+    /// covers the CURRENT BRAIN's range but not the lineage's — it
+    /// must be refused, or the previous pin strands into
+    /// proto_mismatch → HELD_DOWN after the next brain failure.
+    #[test]
+    fn s15_gate_refuses_a_candidate_that_does_not_cover_the_lineage() {
+        assert!(s15_gate((2, 2), (1, 2)).is_err()); // the counterexample
+        assert!(s15_gate((1, 1), (1, 2)).is_err()); // ceiling narrowed
+        assert!(s15_gate((1, 2), (1, 2)).is_ok()); // exact cover
+        assert!(s15_gate((1, 3), (1, 2)).is_ok()); // widening is fine
+        assert!(s15_gate((1, 1), (1, 1)).is_ok()); // today's identity case
     }
 }

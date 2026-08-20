@@ -3584,7 +3584,7 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
     // about to die anyway, C5).
     let holder = crate::holder_mode::global().map(|client| {
         (
-            client.holder_build_id.clone(),
+            client.holder_build_id(),
             client.epoch,
             client.status().ok(),
         )
@@ -3634,6 +3634,30 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             ),
             None => (false, None, None, None, None),
         };
+    // Phase 7 (review F12): the rollout/redeploy verification surface
+    // — the LIVE holder status fields the O8 recipe and the runbook
+    // key on, plus the brain's own pid (in split mode the brain IS
+    // this process; operators cross-check it is a child of the
+    // holder). `holder_status_error` is set when the status round
+    // trip failed (cached identity fields still reported).
+    let (breaker_state, brain_restarts, pings_unanswered, previous_pin, holder_status_err) =
+        match &holder {
+            Some((_, _, Some(st))) => (
+                Some(st.breaker_state.clone()),
+                Some(st.brain_restarts),
+                Some(st.pings_unanswered),
+                Some(st.previous_pin),
+                None,
+            ),
+            Some((_, _, None)) => (
+                None,
+                None,
+                None,
+                None,
+                Some("holder status round-trip failed".to_string()),
+            ),
+            None => (None, None, None, None, None),
+        };
     Ok(json!({
         "ok": true,
         "split": split,
@@ -3641,6 +3665,12 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "holder_epoch": holder_epoch,
         "holder_sessions": holder_sessions,
         "holder_pending_exit_events": pending_exit_events,
+        "brain_pid": if split { Some(std::process::id()) } else { None },
+        "breaker_state": breaker_state,
+        "brain_restarts": brain_restarts,
+        "holder_pings_unanswered": pings_unanswered,
+        "previous_pin": previous_pin,
+        "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
         "sessions": total,

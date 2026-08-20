@@ -1243,3 +1243,156 @@ fn deploy_verbs_arm_disarm_and_survive_to_the_supervisor() {
         Some(ArmedDeploy::UsePrevious)
     ));
 }
+
+/// Review F1: once `split_rollback` is ARMED, the holder must never
+/// consume an exit status — the standard manifest cannot represent a
+/// consumed `waitid`, so a late exit is LATCHED (zombie parked) and
+/// only re-enters the pipeline when the arm is cancelled.
+#[test]
+fn split_rollback_arm_latches_exits_until_disarm() {
+    let (join, mut brain) = start(Holder::new(test_config()));
+    brain.hello();
+    let (ok, _fds) = spawn_ok(&mut brain, "ts-f1-latch", &["/bin/sleep", "30"]);
+    let (f, _) = brain.request(
+        verbs::ARM_REAP,
+        ch::ArmReapBody {
+            uid: "ts-f1-latch".into(),
+            incarnation: ok.incarnation,
+            cgroup_path: None,
+        },
+    );
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    // C1 prelude + the arm.
+    let (f, _) = brain.request(
+        verbs::ROLLBACK_RECORD,
+        ch::RollbackRecordBody {
+            uid: "ts-f1-latch".into(),
+            incarnation: ok.incarnation,
+            record: serde_json::json!({ "uid": "ts-f1-latch" }),
+        },
+    );
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    let pin: OwnedFd = std::fs::File::open("/bin/true").unwrap().into();
+    let arm = Frame::new(
+        verbs::SPLIT_ROLLBACK,
+        Some(900),
+        1,
+        ch::SplitRollbackBody {
+            reexec_generation: 1,
+            manifest_schema_version: 3,
+        },
+    );
+    ch::send_frame_blocking(brain.fd.as_fd(), &arm, &[pin.as_raw_fd()]).unwrap();
+    let (f, _) = brain.wait_reply(900);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+
+    // The child dies while the rollback is armed: NO exit event may
+    // flow (a consumed status would be lost to the monolith).
+    // SAFETY: the sandbox child we just spawned.
+    unsafe {
+        libc::kill(ok.pid, libc::SIGKILL);
+    }
+    brain.assert_no_exit_event_for(Duration::from_millis(400));
+
+    // Disarm → the sweep consumes the parked zombie and the event
+    // flows through the ordinary pipeline.
+    let (f, _) = brain.request(verbs::CANCEL_PENDING, serde_json::json!({}));
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    let ev = brain.wait_exit_event();
+    assert_eq!(ev.uid, "ts-f1-latch");
+    assert_eq!(ev.signal, Some(libc::SIGKILL));
+    drop(brain);
+    let _ = join.join().unwrap();
+}
+
+/// Review F2: at most one armed deploy at a time — silent replacement
+/// would fire the WRONG deploy on the next exit — and a holder
+/// upgrade is refused while anything is armed (the snapshot would
+/// lose the arm).
+#[test]
+fn deploy_arming_is_mutually_exclusive() {
+    let (join, mut brain) = start(Holder::new(test_config()));
+    brain.hello();
+    let pin: OwnedFd = std::fs::File::open("/bin/true").unwrap().into();
+
+    let arm = Frame::new(verbs::RESTART_BRAIN, Some(910), 1, serde_json::json!({}));
+    ch::send_frame_blocking(brain.fd.as_fd(), &arm, &[pin.as_raw_fd()]).unwrap();
+    let (f, _) = brain.wait_reply(910);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+
+    // Second arm of any kind → refused, never replaced.
+    let again = Frame::new(verbs::RESTART_BRAIN, Some(911), 1, serde_json::json!({}));
+    ch::send_frame_blocking(brain.fd.as_fd(), &again, &[pin.as_raw_fd()]).unwrap();
+    let (f, _) = brain.wait_reply(911);
+    assert_eq!(err_of(&f).code, ch::ERR_INVALID, "{f:?}");
+    let (f, _) = brain.request(verbs::ROLLBACK_BRAIN, serde_json::json!({}));
+    assert_eq!(err_of(&f).code, ch::ERR_INVALID, "{f:?}");
+
+    // Upgrade while armed → refused (the snapshot would lose the arm).
+    let up = Frame::new(verbs::REEXEC_HOLDER, Some(912), 1, serde_json::json!({}));
+    ch::send_frame_blocking(brain.fd.as_fd(), &up, &[pin.as_raw_fd()]).unwrap();
+    let (f, _) = brain.wait_reply(912);
+    assert_eq!(err_of(&f).code, ch::ERR_INVALID, "{f:?}");
+
+    // Disarm → upgrade proceeds, and serve returns the upgrade WITH
+    // the channel (the brain must never see a dropped channel).
+    let (f, _) = brain.request(verbs::CANCEL_PENDING, serde_json::json!({}));
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    let up = Frame::new(verbs::REEXEC_HOLDER, Some(913), 1, serde_json::json!({}));
+    ch::send_frame_blocking(brain.fd.as_fd(), &up, &[pin.as_raw_fd()]).unwrap();
+    let (f, _) = brain.wait_reply(913);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    let (_h, out) = join.join().unwrap();
+    assert!(
+        matches!(out, ServeOutcome::HolderUpgrade { .. }),
+        "{out:?}"
+    );
+    drop(brain);
+}
+
+/// Review F2's reader gate: an accepted `reexec_holder` must not
+/// surface while a PARTIAL frame sits in the holder's userspace
+/// reader — those bytes die at exec and would desynchronize the
+/// channel. The upgrade waits for the frame to complete (and its
+/// reply to flush), then surfaces.
+#[test]
+fn reexec_holder_defers_until_the_reader_is_idle() {
+    let (join, mut brain) = start(Holder::new(test_config()));
+    brain.hello();
+    let pin: OwnedFd = std::fs::File::open("/bin/true").unwrap().into();
+
+    // One sendmsg: the full reexec_holder frame (fd on its first
+    // byte) plus the FIRST 5 BYTES of a status frame.
+    let up = Frame::new(verbs::REEXEC_HOLDER, Some(920), 1, serde_json::json!({}));
+    let status = Frame::new(verbs::STATUS, Some(921), 0, serde_json::json!({}));
+    let mut bytes = up.to_wire();
+    let status_wire = status.to_wire();
+    bytes.extend_from_slice(&status_wire[..5]);
+    let mut off = ch::send_first(brain.fd.as_fd(), &bytes, &[pin.as_raw_fd()]).unwrap();
+    while off < bytes.len() {
+        off += ch::send_rest(brain.fd.as_fd(), &bytes[off..]).unwrap();
+    }
+    let (f, _) = brain.wait_reply(920);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        !join.is_finished(),
+        "serve returned HolderUpgrade with a partial frame buffered"
+    );
+
+    // Complete the straddling frame: it must be answered, THEN the
+    // upgrade surfaces.
+    let mut off = 0;
+    let rest = &status_wire[5..];
+    while off < rest.len() {
+        off += ch::send_rest(brain.fd.as_fd(), &rest[off..]).unwrap();
+    }
+    let (f, _) = brain.wait_reply(921);
+    assert_eq!(f.v, verbs::OK, "{f:?}");
+    let (_h, out) = join.join().unwrap();
+    assert!(
+        matches!(out, ServeOutcome::HolderUpgrade { .. }),
+        "{out:?}"
+    );
+    drop(brain);
+}

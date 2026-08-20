@@ -346,6 +346,42 @@ pub fn read_holder_manifest(
     Ok(m)
 }
 
+/// Per-role kernel-object validation for every fd the holder-upgrade
+/// manifest names (review F9): sealing prevents post-write mutation,
+/// not a writer bug that put the wrong fd number in a slot. Probes
+/// are the shared read-only ones from `reexec_manifest` — the same
+/// no-side-effect contract, and the FIRST escrow-touching call, kept
+/// separate from [`read_holder_manifest`] so the caller sequences the
+/// trust boundary explicitly.
+pub fn validate_holder_fd_roles(
+    m: &HolderUpgradeManifest,
+) -> Result<(), HolderManifestError> {
+    use crate::reexec_manifest as probes;
+    let wrap = |r: Result<(), crate::reexec_manifest::ManifestError>| {
+        r.map_err(|e| HolderManifestError::Structure {
+            detail: e.to_string(),
+        })
+    };
+    if let Some(b) = &m.brain {
+        wrap(probes::validate_pidfd_role("brain.pidfd", b.pidfd))?;
+        wrap(probes::validate_channel_fd("brain.channel_fd", b.channel_fd))?;
+    }
+    if let Some(fd) = m.brain_pin_fd {
+        wrap(probes::validate_exec_fd("brain_pin_fd", fd))?;
+    }
+    if let Some(fd) = m.brain_pin_previous_fd {
+        wrap(probes::validate_exec_fd("brain_pin_previous_fd", fd))?;
+    }
+    for s in &m.sessions {
+        wrap(probes::validate_pty_master_fd(s.master_fd))?;
+        wrap(probes::validate_pidfd_role("pidfd", s.pidfd))?;
+    }
+    for l in &m.listeners {
+        wrap(probes::validate_listener_fd("listener_fd", l.fd))?;
+    }
+    Ok(())
+}
+
 fn validate_structure(
     m: &HolderUpgradeManifest,
 ) -> Result<(), HolderManifestError> {

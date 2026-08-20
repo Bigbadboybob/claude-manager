@@ -362,6 +362,47 @@ impl Holder {
             .count()
     }
 
+    /// Deploy-operation serialization (review F2): at most ONE armed
+    /// deploy or in-flight holder upgrade at a time. Silently
+    /// REPLACING an armed pin would let a later exit fire the wrong
+    /// deploy; snapshotting around an armed pin would lose it across
+    /// a holder exec.
+    fn deploy_conflict(&self) -> Option<&'static str> {
+        if self.armed_deploy.is_some() {
+            return Some(
+                "a deploy is already armed — cancel_pending first (one \
+                 armed deploy at a time)",
+            );
+        }
+        if self.pending_upgrade.is_some() {
+            return Some("a holder upgrade is in flight");
+        }
+        None
+    }
+
+    /// Consume exits that were LATCHED while a split_rollback was
+    /// armed (review F1). Called on every disarm path — cancel, the
+    /// 30s auto-disarm, and a failed rollback exec — so parked
+    /// zombies re-enter the ordinary exit pipeline. Immediate
+    /// delivery uses `outbound` when the channel is alive; otherwise
+    /// the pending event redelivers at the next `arm_reap`, the
+    /// standard redelivery contract.
+    fn sweep_latched_exits_into(&mut self, outbound: &mut VecDeque<OutFrame>) {
+        for (uid, e) in self.sessions.iter_mut() {
+            if e.exit_latched && e.reap_armed && e.exit.is_none() {
+                Self::consume_exit(uid, e, outbound);
+            }
+        }
+    }
+
+    /// Post-EOF sweep (no live channel): events queue as pending and
+    /// redeliver to the next brain generation on its `arm_reap`.
+    pub fn sweep_latched_exits(&mut self) {
+        let mut scratch: VecDeque<OutFrame> = VecDeque::new();
+        self.sweep_latched_exits_into(&mut scratch);
+        // scratch drops: nothing was deliverable without a channel.
+    }
+
     // ------------------------------------------------------------
     // Phase 7: migration adoption, upgrade snapshot/restore, and the
     // rollback-manifest projection.
@@ -542,6 +583,12 @@ impl Holder {
             let master = e
                 .master_raw_fd()
                 .ok_or_else(|| format!("session '{uid}' has no master fd"))?;
+            // Identity is HOLDER-owned (review F11): the blob's own
+            // uid is untrusted — a skew/logic bug that stored A's
+            // envelope with blob-uid B would otherwise attach A's
+            // PTY/pidfd to B in the projected manifest. Patching from
+            // the map key also guarantees uid uniqueness.
+            obj.insert("uid".into(), serde_json::json!(uid));
             obj.insert("pty_master_fd".into(), serde_json::json!(master));
             obj.insert(
                 "pidfd".into(),
@@ -761,6 +808,7 @@ impl Holder {
                         ARM_AUTO_DISARM
                     );
                     self.armed_deploy = None;
+                    self.sweep_latched_exits_into(&mut outbound);
                 }
             }
             if let Some(np) = next_ping {
@@ -803,6 +851,16 @@ impl Holder {
             }
 
             // ---- child exits ----
+            // Review F1: while a split_rollback is ARMED, consuming a
+            // waitid status would strand it — the standard manifest
+            // cannot represent it and the monolith could never reap
+            // the child. Latch instead (zombie parked); the monolith
+            // is the same PID and reaps it at rehydrate, or the sweep
+            // consumes it if the arm is cancelled/expires.
+            let split_rollback_armed = matches!(
+                self.armed_deploy,
+                Some((ArmedDeploy::SplitRollback { .. }, _))
+            );
             for (i, uid) in slot_uids.iter().enumerate() {
                 let pfd = &pfds[session_base + i];
                 if pfd.revents & libc::POLLIN == 0 {
@@ -811,7 +869,7 @@ impl Holder {
                 let Some(e) = self.sessions.get_mut(uid) else {
                     continue;
                 };
-                if e.reap_armed {
+                if e.reap_armed && !split_rollback_armed {
                     Self::consume_exit(uid, e, &mut outbound);
                 } else {
                     // V7: latch + mask; zombie parked for /proc reads.
@@ -859,13 +917,20 @@ impl Holder {
                     self.cfg.outbound_max_frames
                 ));
             }
-            // An accepted `reexec_holder` surfaces only after its ok
-            // reply has fully flushed — the brain must not observe a
-            // silent channel while the arm is in flight.
-            if outbound.is_empty() {
-                if let Some(pin) = self.pending_upgrade.take() {
-                    return ServeOutcome::HolderUpgrade { pin, channel };
-                }
+            // An accepted `reexec_holder` surfaces only after (a) its
+            // ok reply has fully flushed AND (b) the frame reader is
+            // IDLE — no partial request bytes or unclaimed SCM_RIGHTS
+            // fds in userspace (review F2: kernel-buffered bytes
+            // survive the exec; reader-buffered bytes die, and a
+            // frame straddling the two desynchronizes the channel
+            // irrecoverably). A pipelining brain finishes its
+            // in-flight frame within a poll cycle, so this converges.
+            if outbound.is_empty()
+                && reader.is_idle()
+                && self.pending_upgrade.is_some()
+            {
+                let pin = self.pending_upgrade.take().expect("checked");
+                return ServeOutcome::HolderUpgrade { pin, channel };
             }
         }
     }
@@ -1044,6 +1109,10 @@ impl Holder {
                 // only after quiesce + checked persistence); the
                 // holder's side: store the pin, reply ok, and expect
                 // an exit within the auto-disarm horizon.
+                if let Some(why) = self.deploy_conflict() {
+                    push_frame(outbound, err_frame(req_id, ch::ERR_INVALID, why.into()), vec![]);
+                    return Ok(());
+                }
                 if fds.len() != 1 {
                     return Err(ServeOutcome::Protocol(format!(
                         "restart_brain carried {} fds, want 1 (the pinned brain binary)",
@@ -1061,6 +1130,10 @@ impl Holder {
                 Ok(())
             }
             verbs::ROLLBACK_BRAIN => {
+                if let Some(why) = self.deploy_conflict() {
+                    push_frame(outbound, err_frame(req_id, ch::ERR_INVALID, why.into()), vec![]);
+                    return Ok(());
+                }
                 if !self.previous_pin_available {
                     push_frame(
                         outbound,
@@ -1084,6 +1157,9 @@ impl Holder {
             }
             verbs::CANCEL_PENDING => {
                 let had = self.armed_deploy.take().is_some();
+                // Review F1: exits latched under an armed
+                // split_rollback re-enter the pipeline on disarm.
+                self.sweep_latched_exits_into(outbound);
                 push_frame(
                     outbound,
                     Frame::new(
@@ -1159,6 +1235,10 @@ impl Holder {
                         "split_rollback carried {} fds, want 1 (the pinned monolith binary)",
                         fds.len()
                     )));
+                }
+                if let Some(why) = self.deploy_conflict() {
+                    push_frame(outbound, err_frame(req_id, ch::ERR_INVALID, why.into()), vec![]);
+                    return Ok(());
                 }
                 let body: ch::SplitRollbackBody = match frame.parse_body() {
                     Ok(b) => b,
@@ -1237,6 +1317,13 @@ impl Holder {
                         "reexec_holder carried {} fds, want 1 (the pinned new holder binary)",
                         fds.len()
                     )));
+                }
+                // Review F2: an upgrade while a deploy is ARMED would
+                // snapshot without the arm — the brain then exits for
+                // a deploy the upgraded holder never performs.
+                if let Some(why) = self.deploy_conflict() {
+                    push_frame(outbound, err_frame(req_id, ch::ERR_INVALID, why.into()), vec![]);
+                    return Ok(());
                 }
                 let pin = fds.into_iter().next().expect("len checked");
                 // Shape check only (the brain preflighted the binary;

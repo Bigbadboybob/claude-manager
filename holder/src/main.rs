@@ -166,14 +166,26 @@ fn main() {
                 live = brain;
             }
             Err(e) => {
+                // FAIL-STOP, not fresh-boot (P7 review F7): the exec
+                // deliberately made the escrow inheritable, and we do
+                // not own any of it — continuing in this process would
+                // leave the old brain alive on the still-open channel
+                // (no PDEATHSIG fired: the holder PID never died) while
+                // a "fresh" holder spawns a second brain blind to the
+                // sessions and listener. Exiting closes every fd at the
+                // kernel and PDEATHSIG reaps the brain; the supervisor
+                // relaunches a genuinely fresh split. Sessions are lost
+                // either way — that is this failure class's named
+                // concession — but authority is never split.
                 eprintln!(
                     "cm-holder: {}={} present but the holder-upgrade manifest \
-                     FAILED validation: {e} — booting FRESH, touching no \
-                     escrow fd (corrupt-manifest rule; this is the holder-\
-                     upgrade crash-class residual: sessions lost)",
+                     FAILED validation: {e} — FAIL-STOP (corrupt-manifest \
+                     rule: no escrow fd touched; exiting so no \
+                     half-authority process survives; the holder-upgrade \
+                     crash-class residual: sessions lost)",
                     hm::ENV_HOLDER_MANIFEST_FD, fd,
                 );
-                holder = Holder::new(cfg.clone());
+                std::process::exit(71);
             }
         }
     } else if let Some(fd) = rm::consume_env() {
@@ -191,15 +203,24 @@ fn main() {
                 live = Some((brain, channel, false));
             }
             Err(MigrationBootError::Corrupt(e)) => {
+                // FAIL-STOP (P7 review F7): the escrow arrived
+                // inheritable and unowned — a fresh boot in THIS
+                // process would keep the old listener bound (blocking
+                // the fresh brain's bind) and leak session fds into
+                // everything we spawn. Exit instead: the kernel closes
+                // all of it, the parked brain exits on its 60s adopt
+                // deadline (channel EOF backstop), and the supervisor
+                // relaunches genuinely fresh. Sessions are lost either
+                // way — the named crash-class residual of the
+                // migration exec.
                 eprintln!(
                     "cm-holder: {}={} present but the migration manifest \
-                     FAILED validation: {e} — booting FRESH, touching no \
-                     escrow fd (corrupt-manifest rule; the named crash-class \
-                     residual of the migration exec: sessions lost). The \
-                     parked brain exits on its 60s adopt deadline.",
+                     FAILED validation: {e} — FAIL-STOP (corrupt-manifest \
+                     rule: no escrow fd touched; exiting so no \
+                     half-authority process survives; sessions lost)",
                     rm::ENV_MANIFEST_FD, fd,
                 );
-                holder = Holder::new(cfg.clone());
+                std::process::exit(71);
             }
             Err(MigrationBootError::InitFailed { detail, rollback }) => {
                 eprintln!(
@@ -373,6 +394,11 @@ fn main() {
                                  — staying split; respawning a brain from the \
                                  current pin (sessions held)"
                             );
+                            // Review F1: exits latched while the
+                            // rollback was armed re-enter the
+                            // pipeline (pending events redeliver to
+                            // the next brain's arm_reap).
+                            holder.sweep_latched_exits();
                         }
                     }
                     continue; // immediate respawn / post-failure respawn
@@ -485,11 +511,12 @@ fn migration_boot(
     // the manifest verifies.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let manifest = rm::read_manifest(borrowed)
-        .and_then(|m| {
-            rm::validate_fd_roles(&m)?;
-            Ok(m)
-        })
         .map_err(|e| MigrationBootError::Corrupt(e.to_string()))?;
+    // Schema gate BEFORE any escrow probe (P7 review F9): a valid v3
+    // manifest exec'd at cm-holder is operator error, and the
+    // no-escrow-touch-before-complete-validation rule means we must
+    // decide that from the payload alone — validate_fd_roles is the
+    // first escrow-touching call and comes after.
     if manifest.schema_version != rm::MANIFEST_SCHEMA_VERSION_SPLIT {
         return Err(MigrationBootError::Corrupt(format!(
             "cm-holder was exec'd with a schema v{} manifest — only the \
@@ -498,6 +525,8 @@ fn migration_boot(
             rm::MANIFEST_SCHEMA_VERSION_SPLIT
         )));
     }
+    rm::validate_fd_roles(&manifest)
+        .map_err(|e| MigrationBootError::Corrupt(e.to_string()))?;
     let split = manifest.split.clone().expect("v4 validated ⇒ split present");
 
     // Ownership transfer (single-owner per the duplicate-fd check).
@@ -731,6 +760,30 @@ fn upgrade_boot(
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let manifest =
         hm::read_holder_manifest(borrowed).map_err(|e| e.to_string())?;
+    // Role probes BEFORE ownership (review F9): sealing can't catch a
+    // writer bug that put the wrong fd in a slot; these are the same
+    // read-only kernel-object probes the migration manifest gets.
+    hm::validate_holder_fd_roles(&manifest).map_err(|e| e.to_string())?;
+    // Identity cross-checks (R6's discipline): a live session record
+    // must name a process whose starttime matches — anything else is
+    // pid reuse, and adopting it would hand kill authority over a
+    // stranger. An exit-ready pidfd is fine (exited mid-exec; the
+    // ordinary pipeline handles it).
+    for s in &manifest.sessions {
+        if pidfd_ready_raw(s.pidfd) {
+            continue;
+        }
+        match reap::read_proc_starttime(s.child_pid as libc::pid_t) {
+            Ok(st) if st == s.child_start_time => {}
+            other => {
+                return Err(format!(
+                    "session '{}' identity mismatch at upgrade boot: \
+                     manifest starttime {}, /proc says {:?}",
+                    s.uid, s.child_start_time, other
+                ))
+            }
+        }
+    }
     // SAFETY: single-owner numbers from the validated manifest.
     let manifest_fd = unsafe { OwnedFd::from_raw_fd(fd) };
     drop(manifest_fd);
@@ -802,9 +855,12 @@ fn holder_upgrade_exec(
         Ok(fd) => fd,
         Err(e) => return format!("write holder-upgrade manifest: {e}"),
     };
+    // The exec target (pin) stays CLOEXEC — see split_rollback_exec's
+    // note (P7 review F8): a CLOEXEC target still execveats (ELF), and
+    // the fd then dies AT the exec instead of leaking into the new
+    // holder image unowned.
     let mut inherit: Vec<RawFd> = holder.escrow_fds();
     inherit.push(manifest_fd.as_raw_fd());
-    inherit.push(pin.as_raw_fd());
     inherit.push(channel.as_raw_fd());
     inherit.push(brain.pidfd.as_raw_fd());
     if let Some(p) = &pins.current {
@@ -877,9 +933,13 @@ fn split_rollback_exec(
         Ok(fd) => fd,
         Err(e) => return format!("write rollback manifest: {e}"),
     };
+    // The exec target (pin) stays CLOEXEC (P7 review F8): execveat
+    // holds the struct file through the syscall, so a CLOEXEC ELF
+    // target still execs and its fd dies AT the exec rather than
+    // surviving unowned in the monolith. The rollback slot must
+    // cross, hence the separate manifest-named rollback_dup.
     let mut inherit: Vec<RawFd> = holder.escrow_fds();
     inherit.push(manifest_fd.as_raw_fd());
-    inherit.push(pin.as_raw_fd());
     inherit.push(rollback_dup.as_raw_fd());
     for fd in &inherit {
         clear_cloexec(*fd);
@@ -928,6 +988,18 @@ fn run_holder_preflight() -> i32 {
 // ============================================================
 // Exec + fd-flag helpers
 // ============================================================
+
+/// Zero-timeout readability poll on a RAW pidfd number — the
+/// pre-ownership identity probe (readable pidfd = exited child).
+fn pidfd_ready_raw(fd: RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: valid pollfd; zero timeout.
+    unsafe { libc::poll(&mut pfd, 1, 0) > 0 && pfd.revents & libc::POLLIN != 0 }
+}
 
 fn set_own_comm(name: &str) {
     let c = CString::new(name).expect("no NUL");
