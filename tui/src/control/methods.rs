@@ -972,23 +972,37 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     // `cm_daemon::worktree::mint_task_worktree`, so the branch name and
     // cut point can't drift), with `allow_shared_workspace=true` as the
     // explicit opt-in to co-tenancy.
-    let (target_wi, shared_with_caller) = match task_id_for_new.as_deref() {
+    let (target_wi, shared_with_caller, mut worktree_report) = match task_id_for_new.as_deref() {
         Some(tid) if Some(tid) != caller.task_id.as_deref() => {
             match resolve_target_workspace(
                 workspace_index_for_task(app, tid),
                 caller_wi,
                 p.allow_shared_workspace,
             ) {
-                TargetWorkspace::Existing(wi) => (wi, false),
-                TargetWorkspace::Shared(wi) => (wi, true),
-                TargetWorkspace::Mint => (
-                    mint_workspace_for_task(app, tid, caller_wi, caller.task_id.as_deref())?,
-                    false,
-                ),
+                TargetWorkspace::Existing(wi) => (wi, false, WorktreeReport::default()),
+                TargetWorkspace::Shared(wi) => (wi, true, WorktreeReport::default()),
+                TargetWorkspace::Mint => {
+                    let (wi, report) =
+                        mint_workspace_for_task(app, tid, caller_wi, caller.task_id.as_deref())?;
+                    (wi, false, report)
+                }
             }
         }
-        _ => (caller_wi, false),
+        _ => (caller_wi, false, WorktreeReport::default()),
     };
+
+    // The bound checkout must EXIST before anything is spawned into it.
+    // A reaped worktree is re-created from the task's branch (provisioned
+    // like a first-time one); an unrecoverable one fails the call here
+    // with the path and reason. Daemon twin: `ensure_ready_worktree`.
+    // Pre-fix a `start_session(task_id=<task whose worktree was reaped>)`
+    // returned success with a `worktree_path` absent on disk and the
+    // agent sat `awaiting_input` with an empty transcript.
+    if worktree_report.recreated.is_none() {
+        let heal = ensure_target_worktree(app, target_wi, task_id_for_new.as_deref())?;
+        worktree_report.recreated = heal.recreated;
+        worktree_report.warnings.extend(heal.warnings);
+    }
 
     // ux-5c: caller prompt wins; a blank/absent one falls back to the
     // bound task's stored prompt. Mirrors the daemon's
@@ -1048,6 +1062,20 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     if let Some(tid) = task_id_for_response.as_deref() {
         resp["task_id"] = Value::String(tid.to_string());
     }
+    // Reaped-worktree heal report (daemon twin: `WorktreeCheckReport::
+    // decorate`). Nothing is written on the healthy path.
+    if let Some(r) = worktree_report.recreated.as_ref() {
+        resp["worktree_recreated"] = json!({
+            "branch": r.branch,
+            "branch_source": r.branch_source,
+            "head_sha": r.head_sha,
+            "commits_ahead": r.commits_ahead,
+            "summary": r.summary(),
+        });
+    }
+    if !worktree_report.warnings.is_empty() {
+        resp["worktree_warning"] = Value::String(worktree_report.warnings.join(" | "));
+    }
     // ux-1a/1b co-tenancy guard (daemon twin: same three fields). The
     // opt-in is honored but never silent — the response names the shared
     // checkout and every other live session already in it.
@@ -1103,9 +1131,138 @@ fn resolve_target_workspace(
     }
 }
 
+/// What the pre-spawn worktree check found (TUI twin of the daemon's
+/// `WorktreeCheckReport`). Empty on the ordinary healthy path.
+#[derive(Debug, Default)]
+struct WorktreeReport {
+    recreated: Option<cm_daemon::worktree::RecreatedWorktree>,
+    warnings: Vec<String>,
+}
+
+impl WorktreeReport {
+    fn from_health(health: cm_daemon::worktree::WorktreeHealth) -> Self {
+        use cm_daemon::worktree::WorktreeHealth::*;
+        match health {
+            Present => Self::default(),
+            PresentUnmanaged(w) => Self { recreated: None, warnings: vec![w] },
+            Recreated(r) => {
+                let warnings = r.warnings.clone();
+                Self { recreated: Some(r), warnings }
+            }
+        }
+    }
+}
+
+/// Verify `app.workspaces[wi]`'s worktree exists on disk and is a git
+/// working tree; re-create a reaped one from the task's branch; fail
+/// loudly when that's impossible. See `start_session` for why.
+fn ensure_target_worktree(
+    app: &App,
+    wi: usize,
+    task_id: Option<&str>,
+) -> Result<WorktreeReport, (ErrorCode, String)> {
+    let ws = &app.workspaces[wi];
+    let Some(worktree_path) = ws.worktree_path.clone() else {
+        // No local checkout to verify (cloud workspace); the spawn path
+        // reports its own "workspace has no worktree" error.
+        return Ok(WorktreeReport::default());
+    };
+    if worktree_path.is_dir() && cm_daemon::worktree::is_git_worktree_root(&worktree_path) {
+        return Ok(WorktreeReport::default());
+    }
+    let main_repo = ws
+        .main_repo_path
+        .clone()
+        .filter(|p| p.is_dir())
+        .or_else(|| {
+            ws.repo_url
+                .as_deref()
+                .and_then(cm_daemon::worktree::find_local_repo)
+        })
+        .or_else(|| {
+            // Any known main repo that still lists the path as a
+            // (prunable) worktree owns it.
+            app.workspaces
+                .iter()
+                .filter_map(|w| w.main_repo_path.clone())
+                .filter(|p| p.is_dir())
+                .find(|r| {
+                    cm_daemon::worktree::registered_branch_for_path(r, &worktree_path).is_some()
+                })
+        })
+        ;
+    let Some(main_repo) = main_repo else {
+        if worktree_path.is_dir() {
+            // A real directory not tied to any known repo: a usable cwd.
+            return Ok(WorktreeReport {
+                recreated: None,
+                warnings: vec![format!(
+                    "worktree {} exists but is not a git working tree and no main repo \
+                     is known for workspace '{}'; spawning there as-is",
+                    worktree_path.display(),
+                    ws.id,
+                )],
+            });
+        }
+        return Err((
+            ErrorCode::Conflict,
+            format!(
+                "worktree {} for workspace '{}' does not exist on disk and cannot be \
+                 re-created: no main repo is known for it (main_repo_path={:?}, \
+                 repo_url={:?}) — refusing to spawn a session into a nonexistent cwd",
+                worktree_path.display(),
+                ws.id,
+                ws.main_repo_path,
+                ws.repo_url,
+            ),
+        ));
+    };
+    let wip_branch_hint: Option<String> = task_id.and_then(|tid| {
+        app.tasks
+            .iter()
+            .find(|t| t.task_id.as_deref() == Some(tid))
+            .and_then(|t| t.wip_branch.clone())
+            .filter(|b| !b.trim().is_empty())
+    });
+    let health = cm_daemon::worktree::ensure_worktree_materialized(
+        &main_repo,
+        &worktree_path,
+        wip_branch_hint.as_deref(),
+    )
+    .map_err(|e| {
+        (
+            ErrorCode::Conflict,
+            format!(
+                "cannot spawn into workspace '{}': {} — refusing to return a worktree_path \
+                 that is not usable on disk",
+                ws.id, e,
+            ),
+        )
+    })?;
+    let report = WorktreeReport::from_health(health);
+    if let Some(r) = report.recreated.as_ref() {
+        eprintln!(
+            "cm-tui: start_session re-created reaped worktree {} for workspace {}: {}",
+            worktree_path.display(),
+            ws.id,
+            r.summary(),
+        );
+    }
+    for w in &report.warnings {
+        eprintln!(
+            "cm-tui: start_session worktree {} (workspace {}): {}",
+            worktree_path.display(),
+            ws.id,
+            w,
+        );
+    }
+    Ok(report)
+}
+
 /// ux-1a (TUI twin of the daemon's `mint_task_workspace`): give a
 /// workspace-less task its OWN checkout, register it as a workspace, bind
-/// the task to it, and return the new workspace's index.
+/// the task to it, and return the new workspace's index plus what the
+/// mint had to do to the checkout (re-created a reaped directory, etc.).
 ///
 /// The git half is `cm_daemon::worktree::mint_task_worktree` — the same
 /// call the daemon route makes — so both routes produce the identical
@@ -1122,7 +1279,7 @@ fn mint_workspace_for_task(
     task_id: &str,
     caller_wi: usize,
     caller_task_id: Option<&str>,
-) -> Result<usize, (ErrorCode, String)> {
+) -> Result<(usize, WorktreeReport), (ErrorCode, String)> {
     const OVERRIDE_HINT: &str =
         "; pass allow_shared_workspace=true to spawn the worker as a co-tenant in your \
          own checkout instead";
@@ -1176,7 +1333,16 @@ fn mint_workspace_for_task(
     // The cut. `mint_task_worktree` resolves the project's trunk to a
     // concrete sha FIRST, so an unresolvable main errors here with
     // nothing on disk and nothing registered.
-    let minted = cm_daemon::worktree::mint_task_worktree(&main_repo, task_id, &task.name)
+    // The task's recorded `wip_branch` rides along as a hint: a
+    // "workspace-less" task whose branch already exists locally had a
+    // checkout that was reaped — re-attach it instead of cutting a fresh
+    // zero-commit decoy over the pointer to the real work.
+    let minted = cm_daemon::worktree::mint_task_worktree(
+        &main_repo,
+        task_id,
+        &task.name,
+        task.wip_branch.as_deref(),
+    )
         .map_err(|e| {
             (
                 ErrorCode::Conflict,
@@ -1269,7 +1435,10 @@ fn mint_workspace_for_task(
         }
     }
 
-    Ok(target_wi)
+    Ok((
+        target_wi,
+        WorktreeReport { recreated: minted.recreated, warnings: minted.warnings },
+    ))
 }
 
 /// Look up the workspace index for a task by its FK (`workspace_id`).
@@ -3338,6 +3507,90 @@ mod tests {
         std::mem::forget(tmp);
     }
 
+    /// TUI twin of the daemon's reaped-worktree heal: a task bound to a
+    /// workspace whose worktree directory is gone is re-created from its
+    /// branch (with the `.venv` link) before any spawn; a missing branch
+    /// fails the call naming the path. Pre-fix `start_session` handed the
+    /// absent path straight to the spawn.
+    #[test]
+    fn start_session_target_worktree_self_heals_or_refuses() {
+        with_app_and_repo("tuihealrepo", |app, repo| {
+            std::fs::create_dir_all(repo.join(".venv")).unwrap();
+            let branch = "cm-sub/fix-the-parser-rand1234";
+            let wt = cm_daemon::worktree::create_subtask_worktree(
+                repo,
+                branch,
+                cm_daemon::worktree::SubtaskStart::ParentBranch("main"),
+            )
+            .expect("subtask worktree");
+            let git = |dir: &std::path::Path, args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .expect("git");
+                assert!(out.status.success(), "{:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+            };
+            git(&wt, &["config", "user.email", "t@example.com"]);
+            git(&wt, &["config", "user.name", "t"]);
+            std::fs::write(wt.join("fix.txt"), "fix").unwrap();
+            git(&wt, &["add", "-A"]);
+            git(&wt, &["commit", "-q", "-m", "fix"]);
+            app.workspaces.push(Workspace {
+                color: None,
+                pinned: false,
+                id: "ws-sub".into(),
+                name: "sub".into(),
+                is_closed: false,
+                is_cloud: false,
+                repo_url: Some("tuihealrepo".into()),
+                worktree_path: Some(wt.clone()),
+                main_repo_path: Some(repo.to_path_buf()),
+                worker_vm: None,
+                worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
+                sessions: vec![],
+                tombstones: vec![],
+                is_pushing: false,
+            });
+            let mut task = task_with_parent("task-sub", Some("task-parent"), "Fix the parser");
+            task.workspace_id = Some("ws-sub".into());
+            // The decoy pointer the planning row really carries.
+            task.wip_branch = Some("cm-sub/fix-the-parser-tasksub".into());
+            git(repo, &["branch", "cm-sub/fix-the-parser-tasksub", "main"]);
+            app.tasks.push(task);
+            let wi = app.workspaces.len() - 1;
+
+            // Healthy: nothing to report.
+            let ok = ensure_target_worktree(app, wi, Some("task-sub")).expect("present");
+            assert!(ok.recreated.is_none() && ok.warnings.is_empty());
+
+            // Reaped: re-created on the branch WITH the work, .venv linked,
+            // decoy wip_branch surfaced.
+            std::fs::remove_dir_all(&wt).unwrap();
+            let healed = ensure_target_worktree(app, wi, Some("task-sub")).expect("heal");
+            let r = healed.recreated.expect("re-created");
+            assert_eq!(r.branch, branch);
+            assert!(wt.is_dir() && cm_daemon::worktree::is_git_worktree_root(&wt));
+            assert!(wt.join("fix.txt").exists());
+            assert_eq!(std::fs::read_link(wt.join(".venv")).unwrap(), repo.join(".venv"));
+            let joined = healed.warnings.join("\n");
+            assert!(joined.contains("zero-commit decoy"), "{}", joined);
+
+            // Unrecoverable: branch gone → refuse, naming the path.
+            git(repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            git(repo, &["worktree", "prune"]);
+            git(repo, &["branch", "-D", branch]);
+            git(repo, &["branch", "-D", "cm-sub/fix-the-parser-tasksub"]);
+            let err = ensure_target_worktree(app, wi, Some("task-sub")).expect_err("refuse");
+            assert_eq!(err.0, ErrorCode::Conflict);
+            assert!(err.1.contains(&wt.display().to_string()), "{}", err.1);
+            assert!(err.1.contains("cannot be re-created"), "{}", err.1);
+            assert!(!wt.exists());
+        });
+    }
+
     /// TUI twin of the daemon's mint: a workspace-less task gets its OWN
     /// checkout, cut from the project's main and OUTSIDE the caller's
     /// worktree — the placement that would have prevented the ux note's
@@ -3350,9 +3603,11 @@ mod tests {
             task.repo_url = Some("tuimintrepo".into());
             app.tasks.push(task);
 
-            let wi = mint_workspace_for_task(app, "task-orphan", 0, Some("task-parent"))
+            let (wi, report) = mint_workspace_for_task(app, "task-orphan", 0, Some("task-parent"))
                 .expect("mint");
 
+            assert!(report.recreated.is_none(), "a fresh cut re-creates nothing");
+            assert!(report.warnings.is_empty(), "a fresh cut warns about nothing: {:?}", report.warnings);
             assert_ne!(wi, 0, "the minted workspace is a NEW one, not the caller's");
             let minted = app.workspaces[wi]
                 .worktree_path

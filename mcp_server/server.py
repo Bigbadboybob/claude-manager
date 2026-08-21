@@ -914,6 +914,19 @@ async def start_session(
             `[{session_uid, label}]` for the other live sessions there.
             Treat these as a pre-flight collision warning: if you didn't
             mean to share a tree, kill the worker before it edits.
+          - `worktree_recreated` — present ONLY when the task's worktree
+            had been reaped and the server re-created it from the task's
+            branch before spawning (`{branch, branch_source, head_sha,
+            commits_ahead, summary}`). `worktree_path` is guaranteed to
+            exist on disk on every success; a worktree that cannot be
+            re-created (branch gone, path collision) FAILS the call with
+            the path and reason instead.
+          - `worktree_warning` — present when something about the
+            checkout deserves a look before building on it: the branch
+            has no commits beyond trunk (a likely zero-commit decoy — the
+            task's real work may be on a same-slug sibling branch, which
+            the message names), or the task's recorded `wip_branch`
+            disagreed with the branch actually checked out.
 
         - wait=false: {"session_uid": "<uid>"} for the freshly-spawned
           session, plus `monitor` when one was auto-registered (see
@@ -1042,6 +1055,8 @@ async def start_session(
                 "shared_workspace",
                 "warning",
                 "workspace_shared_with",
+                "worktree_recreated",
+                "worktree_warning",
             ):
                 if spawn.get(key) is not None and d.get(key) is None:
                     d[key] = spawn[key]

@@ -100,6 +100,19 @@ A task can be spawn-authorized while having no workspace at all. The canonical c
 - Cut point: `main`, `origin/main`, `master`, `origin/master` in that order, all resolved locally first; only a total miss spends a `git fetch`. Local-first for the same reason `create_subtask(base=…)` is local-first — the operator's own commits are usually the point.
 - The workspace is registered and bound (`task_workspaces` + `bindings`) only **after** the checkout exists on disk, so a failed mint leaves nothing half-made. The next `start_session` on the task resolves through the ordinary binding and joins that same checkout.
 - The task row gets `wip_branch` + `worktree_mode="branch"` recorded, best-effort — a PATCH failure costs recovery metadata, not the spawn.
+- **Re-mint defensiveness.** "Workspace-less" is also what a task looks like after its worktree was reaped and the binding dropped with it. Cutting fresh in that state manufactured **zero-commit decoys** — a `cm-sub/<slug>-<task-id-prefix>` branch off trunk with none of the task's commits, which then overwrote the row's `wip_branch`. So the mint first checks whether the row's `wip_branch` names a CM-managed branch that exists locally (the task HAD a checkout → re-attach it, re-creating the directory), then whether the mint branch itself already exists (a prior mint whose directory was reaped → re-attach rather than fail on `-b`'s "branch already exists"), and only then cuts fresh. Whatever is attached, a branch with no commits beyond trunk comes back flagged in `worktree_warning`, naming any same-slug sibling branch that does carry commits.
+
+### Reaped worktrees: `start_session` self-heals (2026-08-21)
+
+The bound-workspace path has the mirror-image hazard: daemon state outlives the directory. `start_session(task_id=<subtask that ran before>)` used to take the workspace's `worktree_path` on faith and return a clean success whose path **did not exist on disk** — `DaemonSession::spawn` forks before the child's `chdir` fails, so the daemon registered a live-looking session that wrote an empty transcript and sat `awaiting_input`, indistinguishable from a worker that works purely through tool calls. Two bug-triage subtasks cost a full dispatch round this way.
+
+Both routes now run `cm_daemon::worktree::ensure_worktree_materialized` on the target before spawning:
+
+1. The path exists and is a git working tree rooted there → spawn (one `git rev-parse`, no lock, no network).
+2. The path is missing (or an empty leftover) → **re-create it** with `git worktree add <path> <branch>` and provision it exactly like a first-time branch-mode subtask (`setup_worktree`: the repo's `setup_worktree.sh`, plus a `.venv` → `<main_repo>/.venv` symlink fallback so mypy/ruff/async tests work even in a repo with no script). The branch is resolved from, in order, git's own worktree registry (a reaped-but-unpruned entry still names the branch), the CM directory-naming scheme (`cm-sub-…` ↔ `cm-sub/…`, `<repo>-<slug>` ↔ `cm/<slug>`), and last the task's `wip_branch` — which ranks last because on real hosts it is sometimes a zero-commit decoy. Among candidates that exist, the first with commits beyond trunk wins. The response carries `worktree_recreated: {branch, branch_source, head_sha, commits_ahead, summary}`.
+3. Re-creation impossible (branch gone, the branch checked out elsewhere, a non-empty non-git directory with a `.git` git rejects, no main repo known) → the call **fails** with the path and the reason; nothing is spawned, nothing half-made is left on disk.
+
+Under every route sits a backstop in the spawn core: `start_session` refuses a `working_dir` that isn't a directory, naming it — so a revive or startup-restore of a session whose worktree is gone logs a clear skip instead of resurrecting a ghost.
 
 Before this, the daemon route silently fell back to the **caller's** workspace whenever it had minted the task itself, and the TUI route answered a flat `NotFound` — two routes, two answers. The daemon's fallback caused a live incident: three `propose_task` workers spawned into the proposer's own worktree, followed their "branch off main" instructions by rewriting HEAD under a live session, and left uncommitted edits behind.
 
@@ -513,7 +526,16 @@ list_sessions(task_id?, include_exited=false)
 start_session(task_id?, type: "claude-code"|"codex", label, prompt?,
               allow_shared_workspace=false)
    -> {session_uid, worktree_path, task_id?, prompt_source,
-       shared_workspace?, warning?, workspace_shared_with?}
+       shared_workspace?, warning?, workspace_shared_with?,
+       worktree_recreated?, worktree_warning?}
+   # worktree_path is GUARANTEED to exist on disk on every success: a
+   #   reaped worktree is re-created from the task's branch first
+   #   (worktree_recreated says so), and one that can't be is a failed
+   #   call naming the path — see "Reaped worktrees" below.
+   # worktree_warning = read before building on the checkout: a branch
+   #   with no commits beyond trunk (likely a zero-commit decoy; the
+   #   message names same-slug siblings that DO have work), or a
+   #   wip_branch that disagreed with what was checked out.
    # task_id omitted = "spawn in caller's workspace, no task binding"
    #   (the only valid form for a taskless caller).
    # task_id provided = bind the new session to that task; only allowed

@@ -460,7 +460,9 @@ pub fn task_worktree_branch(task_id: &str, task_name: &str) -> String {
 pub struct MintedTaskWorktree {
     pub branch: String,
     pub worktree_path: PathBuf,
-    /// The trunk ref the cut came from (`main`, `origin/master`, …).
+    /// The trunk ref the cut came from (`main`, `origin/master`, …) for a
+    /// fresh cut; `"existing branch"` when the mint re-attached a branch
+    /// the task already had (see [`mint_task_worktree`]).
     pub base_ref: String,
     /// The commit the checkout actually sits on. Equals the trunk tip for
     /// a fresh mint; for a RE-mint that found the directory already there
@@ -468,6 +470,14 @@ pub struct MintedTaskWorktree {
     /// moved to, which is the honest answer to "what am I working on top
     /// of".
     pub base_sha: String,
+    /// `Some` when the mint found the task's branch but NOT its directory
+    /// (a reaped worktree whose binding was lost too) and re-created the
+    /// checkout instead of cutting a fresh zero-commit branch.
+    pub recreated: Option<RecreatedWorktree>,
+    /// Non-fatal observations for the caller's return value (a
+    /// zero-commit decoy, a `wip_branch` that named a branch with no
+    /// work, …). Empty for an ordinary fresh cut.
+    pub warnings: Vec<String>,
 }
 
 /// Mint the checkout a workspace-less task's first session runs in: a
@@ -481,17 +491,112 @@ pub struct MintedTaskWorktree {
 /// unresolvable trunk fails with the "does not resolve to a commit"
 /// message BEFORE any git state is touched and the caller is never left
 /// registering a workspace for a checkout that doesn't exist.
+///
+/// **Re-mint defensiveness.** "Workspace-less" means the daemon has no
+/// binding for the task — which is ALSO what a task looks like after its
+/// worktree was reaped and the binding dropped with it. Cutting a fresh
+/// branch from trunk in that state manufactures a zero-commit decoy
+/// (`cm-sub/<slug>-<task-id-prefix>`, an unrelated NOTES.md, none of the
+/// task's commits) and overwrites the planning row's `wip_branch` with
+/// it — the exact pointer rot the bug-triage orchestrator hit. So before
+/// cutting anything:
+///   1. if the task's `wip_branch_hint` names a CM-managed branch that
+///      exists locally, the task HAD a checkout: re-attach that branch
+///      (re-creating its directory if reaped) and return it;
+///   2. else if the mint branch itself already exists (a prior mint whose
+///      directory was reaped), re-attach it rather than failing on
+///      `-b`'s "branch already exists";
+///   3. else cut fresh from trunk, as before.
+/// Whatever is attached, a branch with no commits beyond trunk is
+/// reported in `warnings` rather than silently checked out.
 pub fn mint_task_worktree(
     main_repo: &Path,
     task_id: &str,
     task_name: &str,
+    wip_branch_hint: Option<&str>,
 ) -> anyhow::Result<MintedTaskWorktree> {
-    let (base_ref, trunk_sha) = resolve_project_main(main_repo)?;
     let branch = task_worktree_branch(task_id, task_name);
+
+    // (1) The task already has a branch on record → re-attach it.
+    let hint = wip_branch_hint.map(str::trim).filter(|h| !h.is_empty());
+    if let Some(h) = hint {
+        if h != branch && local_branch_exists(main_repo, h) {
+            if let Some(path) = worktree_dir_for_branch(main_repo, h) {
+                return reattach_task_branch(main_repo, h, &path, Some(h));
+            }
+        }
+    }
+    // (2) A prior mint's branch survives its directory → re-attach it.
+    if local_branch_exists(main_repo, &branch) {
+        let path = worktree_dir_for_branch(main_repo, &branch)
+            .expect("task_worktree_branch always yields a cm-sub/ branch");
+        return reattach_task_branch(main_repo, &branch, &path, hint);
+    }
+
+    // (3) Fresh cut from trunk.
+    let (base_ref, trunk_sha) = resolve_project_main(main_repo)?;
     let worktree_path = create_subtask_worktree(main_repo, &branch, SubtaskStart::Base(&trunk_sha))?;
     setup_worktree(main_repo, &worktree_path);
     let base_sha = worktree_head_sha(&worktree_path).unwrap_or(trunk_sha);
-    Ok(MintedTaskWorktree { branch, worktree_path, base_ref, base_sha })
+    Ok(MintedTaskWorktree {
+        branch,
+        worktree_path,
+        base_ref,
+        base_sha,
+        recreated: None,
+        warnings: Vec::new(),
+    })
+}
+
+/// `mint_task_worktree`'s re-attach arm: the task's branch exists; make
+/// sure its directory does too (re-creating it when reaped), provisioned
+/// like a first-time worktree, and report what was found.
+fn reattach_task_branch(
+    main_repo: &Path,
+    branch: &str,
+    worktree_path: &Path,
+    wip_branch_hint: Option<&str>,
+) -> anyhow::Result<MintedTaskWorktree> {
+    let health = ensure_worktree_materialized(main_repo, worktree_path, wip_branch_hint)?;
+    let (recreated, mut warnings) = match health {
+        WorktreeHealth::Recreated(r) => {
+            let w = r.warnings.clone();
+            (Some(r), w)
+        }
+        WorktreeHealth::Present => {
+            // Directory intact, only the binding was lost. Still say so
+            // if what's there is a zero-commit branch.
+            let trunk = resolve_local_trunk(main_repo);
+            let ahead = trunk.as_deref().and_then(|t| commits_ahead_of(main_repo, t, branch));
+            (None, branch_warnings(main_repo, branch, trunk.as_deref(), ahead))
+        }
+        WorktreeHealth::PresentUnmanaged(w) => (None, vec![w]),
+    };
+    let base_sha = worktree_head_sha(worktree_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "worktree {} for branch '{}' has no resolvable HEAD",
+            worktree_path.display(),
+            branch
+        )
+    })?;
+    if let Some(actual) = worktree_current_branch(worktree_path) {
+        if actual != branch {
+            warnings.push(format!(
+                "worktree {} is checked out on '{}', not the task's branch '{}'",
+                worktree_path.display(),
+                actual,
+                branch
+            ));
+        }
+    }
+    Ok(MintedTaskWorktree {
+        branch: branch.to_string(),
+        worktree_path: worktree_path.to_path_buf(),
+        base_ref: "existing branch".to_string(),
+        base_sha,
+        recreated,
+        warnings,
+    })
 }
 
 /// Create a worktree for a subtask. Differs from `create_worktree` in:
@@ -642,6 +747,524 @@ pub fn recover_worktree_path(repo_url: &str, branch: &str) -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
+// ───── worktree materialization (reaped-worktree self-heal) ─────
+
+/// Outcome of [`ensure_worktree_materialized`].
+#[derive(Debug)]
+pub enum WorktreeHealth {
+    /// On disk and a git working tree rooted at the path; nothing done.
+    Present,
+    /// On disk but NOT a git working tree (a plain directory with no
+    /// `.git`), and no branch could be found to re-check out into it.
+    /// The path is still a real cwd, so a spawn may proceed — the
+    /// string is a warning for the caller's return value.
+    PresentUnmanaged(String),
+    /// The directory was missing (or an empty leftover) and has been
+    /// re-created from the branch named inside.
+    Recreated(RecreatedWorktree),
+}
+
+/// A worktree [`ensure_worktree_materialized`] had to re-create.
+#[derive(Debug, Clone)]
+pub struct RecreatedWorktree {
+    /// The branch checked out into the re-created directory.
+    pub branch: String,
+    /// Where `branch` came from: `"git-registration"` (git still listed
+    /// the path as a prunable worktree on that branch), `"dir-name"`
+    /// (the `cm-sub-…` / `<repo>-<slug>` directory name mapped back to
+    /// its `cm-sub/…` / `cm/…` branch), or `"wip-branch"` (the task's
+    /// planning-row pointer).
+    pub branch_source: &'static str,
+    /// HEAD of the re-created checkout.
+    pub head_sha: Option<String>,
+    /// Commits on `branch` beyond the project's trunk; `None` when no
+    /// local trunk ref resolved to count against.
+    pub commits_ahead: Option<u64>,
+    /// Anything the caller should relay rather than swallow: a
+    /// zero-commit decoy, a `wip_branch` that disagreed with the
+    /// directory, a sibling branch that looks like the real work.
+    pub warnings: Vec<String>,
+}
+
+impl RecreatedWorktree {
+    /// One line for logs / a response field.
+    pub fn summary(&self) -> String {
+        format!(
+            "re-created from branch '{}' (via {}) at {}{}",
+            self.branch,
+            self.branch_source,
+            self.head_sha.as_deref().unwrap_or("?"),
+            match self.commits_ahead {
+                Some(n) => format!(", {} commit(s) ahead of trunk", n),
+                None => String::new(),
+            },
+        )
+    }
+}
+
+/// Is `path` a git working tree whose TOPLEVEL is `path` itself (not a
+/// subdirectory of some other checkout)? False for a missing path, a
+/// plain directory, or a worktree whose admin record has been pruned
+/// (its `.git` file then points at a gitdir that no longer exists and
+/// `rev-parse` fails).
+pub fn is_git_worktree_root(path: &Path) -> bool {
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let top = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    };
+    same(&top, path)
+}
+
+/// `git rev-parse --verify --quiet refs/heads/<branch>` — does the
+/// branch exist LOCALLY in `repo`?
+pub fn local_branch_exists(repo: &Path, branch: &str) -> bool {
+    rev_parse_commit(repo, &format!("refs/heads/{}", branch)).is_some()
+}
+
+/// The branch git's own worktree registry says `worktree_path` is on,
+/// if git still has an entry for that path (a reaped directory that was
+/// never `worktree prune`d stays listed, flagged `prunable`, with its
+/// branch intact — the most authoritative answer to "what was checked
+/// out here").
+pub fn registered_branch_for_path(main_repo: &Path, worktree_path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(main_repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let wanted = worktree_path.canonicalize().unwrap_or_else(|_| worktree_path.to_path_buf());
+    let mut current_matches = false;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            let listed = PathBuf::from(p);
+            let listed_c = listed.canonicalize().unwrap_or_else(|_| listed.clone());
+            current_matches = listed == worktree_path || listed_c == wanted;
+        } else if current_matches {
+            if let Some(r) = line.strip_prefix("branch ") {
+                return Some(r.strip_prefix("refs/heads/").unwrap_or(r).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Inverse of the dir-naming in `create_worktree` /
+/// `create_subtask_worktree` (see `recover_worktree_path`): the branch a
+/// `~/.cm/worktrees/<dir>` directory was cut for.
+///   - `cm-sub-<rest>`        → `cm-sub/<rest>`
+///   - `<repo-name>-<slug>`   → `cm/<slug>`
+/// `None` for anything else (not a CM-managed layout).
+pub fn branch_for_worktree_dir(main_repo: &Path, worktree_path: &Path) -> Option<String> {
+    let dir = worktree_path.file_name()?.to_str()?;
+    if let Some(rest) = dir.strip_prefix("cm-sub-") {
+        if !rest.is_empty() {
+            return Some(format!("cm-sub/{}", rest));
+        }
+        return None;
+    }
+    let repo = main_repo.file_name()?.to_str()?;
+    let slug = dir.strip_prefix(repo)?.strip_prefix('-')?;
+    if slug.is_empty() {
+        return None;
+    }
+    Some(format!("cm/{}", slug))
+}
+
+/// The directory a CM-managed branch's worktree lives in (the forward
+/// map of [`branch_for_worktree_dir`]). `None` for a branch outside the
+/// `cm/` / `cm-sub/` namespaces.
+pub fn worktree_dir_for_branch(main_repo: &Path, branch: &str) -> Option<PathBuf> {
+    let base = worktree_base();
+    if let Some(slug) = branch.strip_prefix("cm/") {
+        let repo = main_repo.file_name()?.to_str()?;
+        return Some(base.join(format!("{}-{}", repo, slug)));
+    }
+    if branch.starts_with("cm-sub/") {
+        return Some(base.join(branch.replace('/', "-")));
+    }
+    None
+}
+
+/// The project's trunk, LOCAL refs only (`main`, `origin/main`,
+/// `master`, `origin/master`) — never a fetch. Used to count how far a
+/// branch has moved; a heal must not spend network on a warning.
+fn resolve_local_trunk(repo: &Path) -> Option<String> {
+    for cand in PROJECT_MAIN_CANDIDATES {
+        if rev_parse_commit(repo, cand).is_some() {
+            return Some(cand.to_string());
+        }
+        let remote = format!("origin/{}", cand);
+        if rev_parse_commit(repo, &remote).is_some() {
+            return Some(remote);
+        }
+    }
+    None
+}
+
+/// `git rev-list --count <trunk>..<branch>`.
+pub fn commits_ahead_of(repo: &Path, trunk: &str, branch: &str) -> Option<u64> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", "--count"])
+        .arg(format!("{}..{}", trunk, branch))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// CM-managed branches (other than `exclude`) whose name carries `slug`
+/// and which have commits beyond `trunk` — the "differently-suffixed
+/// branch where the real work lives" a zero-commit decoy hides. Capped
+/// at a handful; this feeds a warning, not a decision.
+fn sibling_branches_with_work(
+    repo: &Path,
+    slug: &str,
+    exclude: &str,
+    trunk: &str,
+) -> Vec<(String, u64)> {
+    if slug.is_empty() {
+        return Vec::new();
+    }
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/cm/",
+            "refs/heads/cm-sub/",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut found = Vec::new();
+    for name in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if name == exclude || !name.contains(slug) {
+            continue;
+        }
+        if let Some(n) = commits_ahead_of(repo, trunk, name).filter(|n| *n > 0) {
+            found.push((name.to_string(), n));
+            if found.len() >= 3 {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// The slug portion of a CM-managed branch name, for sibling matching:
+/// `cm/<slug>` → `<slug>`; `cm-sub/<slug>-<7-char suffix>` → `<slug>`.
+fn branch_slug(branch: &str) -> &str {
+    if let Some(s) = branch.strip_prefix("cm/") {
+        return s;
+    }
+    let s = branch.strip_prefix("cm-sub/").unwrap_or(branch);
+    // Strip the trailing `-<suffix>` (random short id or task-id prefix).
+    match s.rfind('-') {
+        Some(i) if i > 0 => &s[..i],
+        _ => s,
+    }
+}
+
+/// Non-fatal observations about the branch a heal (or re-mint) is about
+/// to check out. A zero-commit branch is the decoy signature the
+/// bug-triage orchestrator hit: the planning row's `wip_branch` pointed
+/// at a branch cut from trunk that nothing was ever committed to, while
+/// the task's real commits sat on a differently-suffixed sibling. We
+/// surface that loudly rather than silently checking the decoy out.
+fn branch_warnings(
+    repo: &Path,
+    branch: &str,
+    trunk: Option<&str>,
+    commits_ahead: Option<u64>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let (Some(trunk), Some(0)) = (trunk, commits_ahead) else {
+        return warnings;
+    };
+    let siblings = sibling_branches_with_work(repo, branch_slug(branch), branch, trunk);
+    let mut msg = format!(
+        "branch '{}' has no commits beyond {} — it may be a zero-commit decoy rather \
+         than the branch this task's work is on",
+        branch, trunk,
+    );
+    if !siblings.is_empty() {
+        let list: Vec<String> = siblings
+            .iter()
+            .map(|(b, n)| format!("'{}' ({} commit(s))", b, n))
+            .collect();
+        msg.push_str(&format!(
+            "; sibling branch(es) with the same slug DO carry work: {}. Check which one \
+             the task's commits are on before building on this checkout",
+            list.join(", "),
+        ));
+    }
+    warnings.push(msg);
+    warnings
+}
+
+/// Verify that a workspace's worktree is usable as a session cwd — it
+/// exists on disk AND is a git working tree — and if it has been reaped,
+/// re-create it from the task's branch and provision it the way a
+/// first-time branch-mode subtask is provisioned ([`setup_worktree`]).
+///
+/// This is the guard behind every "re-spawn into an existing task" path.
+/// Pre-fix `start_session(task_id=<task whose worktree was reaped>)`
+/// returned success with a `worktree_path` that did not exist: the agent
+/// was spawned into a nonexistent cwd, wrote an empty transcript, and
+/// sat `awaiting_input` — indistinguishable from a healthy worker that
+/// works only through tool calls, so the failure cost a full dispatch
+/// round before anyone noticed. Re-spawning into an existing task is a
+/// supported flow; a reaped worktree must self-heal, and when it can't
+/// (branch gone, path collision, git error) the caller must FAIL with a
+/// message naming the path and the reason — never hand out a cwd that
+/// isn't there.
+///
+/// Branch resolution for a missing directory, most- to least-
+/// authoritative, all LOCAL refs only:
+///   1. git's own worktree registry — a reaped-but-unpruned entry still
+///      names the branch that was checked out at exactly this path.
+///   2. the directory name, mapped back through the CM naming scheme
+///      (`cm-sub-…` → `cm-sub/…`, `<repo>-<slug>` → `cm/<slug>`).
+///   3. `wip_branch_hint` — the task's planning-row pointer, which on a
+///      real host is sometimes a zero-commit decoy, so it ranks last.
+/// Among the candidates that exist, the first one with commits beyond
+/// trunk wins; if none has any, the first candidate is used and a
+/// zero-commit warning is attached (see [`branch_warnings`]).
+///
+/// An existing directory is never overwritten: a git working tree rooted
+/// there is `Present`; an EMPTY plain directory is treated as missing
+/// (`git worktree add` accepts it); a non-empty plain directory with no
+/// `.git` is `PresentUnmanaged` (a real cwd, warned about, not failed);
+/// a directory with a `.git` that git rejects (pruned admin record) is
+/// an error — spawning an agent into a checkout where git doesn't work
+/// is the same invisible failure in a different coat.
+pub fn ensure_worktree_materialized(
+    main_repo: &Path,
+    worktree_path: &Path,
+    wip_branch_hint: Option<&str>,
+) -> anyhow::Result<WorktreeHealth> {
+    let mut pre_existing_empty_dir = false;
+    if worktree_path.is_dir() {
+        if is_git_worktree_root(worktree_path) {
+            return Ok(WorktreeHealth::Present);
+        }
+        let dot_git = worktree_path.join(".git");
+        if dot_git.symlink_metadata().is_ok() {
+            let stderr = Command::new("git")
+                .arg("-C")
+                .arg(worktree_path)
+                .args(["rev-parse", "--show-toplevel"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                .unwrap_or_default();
+            anyhow::bail!(
+                "worktree {} exists and has a .git entry, but git does not recognise it \
+                 as a working tree ({}); its registration in {} was probably pruned — \
+                 refusing to spawn into a checkout where git does not work, and refusing \
+                 to overwrite it (move it aside, then re-spawn to re-create it from its \
+                 branch)",
+                worktree_path.display(),
+                if stderr.is_empty() { "no detail from git" } else { &stderr },
+                main_repo.display(),
+            );
+        }
+        let entries = std::fs::read_dir(worktree_path)
+            .map(|rd| rd.count())
+            .unwrap_or(usize::MAX);
+        if entries > 0 {
+            return Ok(WorktreeHealth::PresentUnmanaged(format!(
+                "worktree {} exists but is not a git working tree ({} entr{}, no .git); \
+                 spawning there as-is",
+                worktree_path.display(),
+                entries,
+                if entries == 1 { "y" } else { "ies" },
+            )));
+        }
+        pre_existing_empty_dir = true;
+    } else if worktree_path.symlink_metadata().is_ok() {
+        anyhow::bail!(
+            "worktree path {} exists but is not a directory; refusing to spawn into it \
+             or replace it",
+            worktree_path.display(),
+        );
+    }
+
+    // ── Missing (or an empty leftover): find the branch to re-create from. ──
+    if !main_repo.is_dir() {
+        anyhow::bail!(
+            "worktree {} is missing and cannot be re-created: its main repo {} is not \
+             a directory on this host",
+            worktree_path.display(),
+            main_repo.display(),
+        );
+    }
+    let registered = registered_branch_for_path(main_repo, worktree_path);
+    let from_dir = branch_for_worktree_dir(main_repo, worktree_path);
+    let hint = wip_branch_hint.map(str::trim).filter(|h| !h.is_empty()).map(str::to_string);
+
+    let mut tried: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, &'static str)> = Vec::new();
+    for (cand, source) in [
+        (registered.clone(), "git-registration"),
+        (from_dir.clone(), "dir-name"),
+        (hint.clone(), "wip-branch"),
+    ] {
+        let Some(b) = cand else { continue };
+        tried.push(format!("{} '{}'", source, b));
+        if candidates.iter().any(|(c, _)| *c == b) {
+            continue;
+        }
+        if local_branch_exists(main_repo, &b) {
+            candidates.push((b, source));
+        }
+    }
+    if candidates.is_empty() {
+        if pre_existing_empty_dir {
+            return Ok(WorktreeHealth::PresentUnmanaged(format!(
+                "worktree {} is an empty directory that is not a git working tree, and \
+                 no branch exists to check out into it ({}); spawning there as-is",
+                worktree_path.display(),
+                if tried.is_empty() {
+                    "no candidate branch could even be derived".to_string()
+                } else {
+                    format!("tried {}", tried.join(", "))
+                },
+            )));
+        }
+        anyhow::bail!(
+            "worktree {} does not exist and cannot be re-created: no local branch to \
+             check out was found in {} ({})",
+            worktree_path.display(),
+            main_repo.display(),
+            if tried.is_empty() {
+                "the directory name is not a CM-managed layout and the task has no \
+                 wip_branch"
+                    .to_string()
+            } else {
+                format!("tried {}", tried.join(", "))
+            },
+        );
+    }
+
+    let trunk = resolve_local_trunk(main_repo);
+    let scored: Vec<((String, &'static str), Option<u64>)> = candidates
+        .into_iter()
+        .map(|c| {
+            let ahead = trunk.as_deref().and_then(|t| commits_ahead_of(main_repo, t, &c.0));
+            (c, ahead)
+        })
+        .collect();
+    let pick = scored
+        .iter()
+        .position(|(_, ahead)| ahead.map(|n| n > 0).unwrap_or(false))
+        .unwrap_or(0);
+    let ((branch, branch_source), commits_ahead) = scored[pick].clone();
+
+    let mut warnings = branch_warnings(main_repo, &branch, trunk.as_deref(), commits_ahead);
+    // A wip_branch that exists but lost to a better candidate (or is a
+    // zero-commit decoy) is worth saying out loud: the planning row is
+    // pointing somewhere other than where the work is.
+    if let Some(h) = hint.as_deref() {
+        if h != branch {
+            let detail = match (local_branch_exists(main_repo, h), trunk.as_deref()) {
+                (false, _) => "does not exist locally".to_string(),
+                (true, Some(t)) => match commits_ahead_of(main_repo, t, h) {
+                    Some(0) => format!("has no commits beyond {} (a zero-commit decoy)", t),
+                    Some(n) => format!("has {} commit(s) beyond {}", n, t),
+                    None => "could not be compared to trunk".to_string(),
+                },
+                (true, None) => "exists (no trunk to compare against)".to_string(),
+            };
+            warnings.push(format!(
+                "the task's wip_branch '{}' {}; re-created from '{}' (via {}) instead",
+                h, detail, branch, branch_source,
+            ));
+        }
+    }
+
+    // ── Re-create. Prune first: git refuses to `add` over a path it still
+    // lists as a (prunable) worktree. ──
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(main_repo)
+        .args(["worktree", "prune"])
+        .output();
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(main_repo)
+        .args(["worktree", "add"])
+        .arg(worktree_path)
+        .arg(&branch)
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // Don't leave a half-made directory behind for the next attempt to
+        // trip over — but never touch one we didn't create.
+        if !pre_existing_empty_dir && worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(worktree_path);
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(main_repo)
+                .args(["worktree", "prune"])
+                .output();
+        }
+        let reason = if stderr.contains("already checked out") || stderr.contains("is already used by worktree") {
+            format!(
+                "branch '{}' is already checked out in another worktree ({})",
+                branch, stderr
+            )
+        } else {
+            format!("`git worktree add {} {}` failed: {}", worktree_path.display(), branch, stderr)
+        };
+        anyhow::bail!(
+            "worktree {} does not exist and could not be re-created: {}",
+            worktree_path.display(),
+            reason,
+        );
+    }
+    if !is_git_worktree_root(worktree_path) {
+        anyhow::bail!(
+            "worktree {} could not be re-created: `git worktree add` reported success \
+             but the path is not a git working tree afterwards",
+            worktree_path.display(),
+        );
+    }
+
+    // Same provisioning a first-time branch-mode subtask gets.
+    setup_worktree(main_repo, worktree_path);
+
+    let head_sha = worktree_head_sha(worktree_path);
+    Ok(WorktreeHealth::Recreated(RecreatedWorktree {
+        branch,
+        branch_source,
+        head_sha,
+        commits_ahead,
+        warnings,
+    }))
+}
+
 /// Read the current branch of a worktree via `git rev-parse --abbrev-ref HEAD`.
 /// Returns `None` for detached HEAD or any git failure. Used by
 /// `create_subtask` as the fallback start ref when the parent task's
@@ -666,21 +1289,71 @@ pub fn worktree_current_branch(worktree_path: &Path) -> Option<String> {
     Some(name)
 }
 
-/// Run setup_worktree.sh if it exists in the main repo, otherwise do nothing.
+/// Provision a freshly created (or re-created) worktree.
 ///
-/// The script receives MAIN_REPO and WORKTREE as environment variables.
+/// Runs the repo's `setup_worktree.sh` if it exists in the main repo
+/// (the script receives MAIN_REPO and WORKTREE as environment variables),
+/// then — whether or not a script ran — makes sure the worktree has a
+/// `.venv` pointing at the main repo's shared env ([`ensure_venv_symlink`]).
+///
+/// This is the ONE provisioning step every worktree-creating path shares
+/// (A-n, `create_subtask` branch mode, `mint_task_worktree`, and the
+/// reaped-worktree heal in [`ensure_worktree_materialized`]), so a
+/// re-created worktree is provisioned exactly like a first-time one.
+/// Idempotent: safe to run again on an already-provisioned tree.
 pub fn setup_worktree(main_repo: &Path, worktree_path: &Path) {
     let script = main_repo.join("setup_worktree.sh");
-    if !script.exists() {
-        return;
+    if script.exists() {
+        let _ = Command::new("bash")
+            .arg(&script)
+            .env("MAIN_REPO", main_repo)
+            .env("WORKTREE", worktree_path)
+            .current_dir(worktree_path)
+            .output();
     }
+    ensure_venv_symlink(main_repo, worktree_path);
+}
 
-    let _ = Command::new("bash")
-        .arg(&script)
-        .env("MAIN_REPO", main_repo)
-        .env("WORKTREE", worktree_path)
-        .current_dir(worktree_path)
-        .output();
+/// Symlink `<worktree>/.venv` → `<main_repo>/.venv` when the main repo has
+/// one and the worktree has nothing at `.venv` yet. Returns whether a link
+/// was created by THIS call.
+///
+/// Every healthy worktree on a Python-project host carries this link
+/// (normally via the repo's `setup_worktree.sh`); without it `mypy` and
+/// `ruff` fail to spawn and async tests FAIL rather than skip — which
+/// looks exactly like the branch being broken. The fallback exists so a
+/// repo without a setup script, or a hand-made worktree, gets the minimum
+/// provisioning regardless. Never overwrites: an existing `.venv` (real
+/// dir, or a link the script already made) is left alone. No-op for an
+/// in-place workspace (`worktree_path == main_repo`).
+pub fn ensure_venv_symlink(main_repo: &Path, worktree_path: &Path) -> bool {
+    let same = match (main_repo.canonicalize(), worktree_path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => main_repo == worktree_path,
+    };
+    if same {
+        return false;
+    }
+    let src = main_repo.join(".venv");
+    if !src.exists() {
+        return false;
+    }
+    let dst = worktree_path.join(".venv");
+    if dst.symlink_metadata().is_ok() {
+        return false;
+    }
+    match std::os::unix::fs::symlink(&src, &dst) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "cm: could not symlink {} -> {}: {}",
+                dst.display(),
+                src.display(),
+                e
+            );
+            false
+        }
+    }
 }
 
 /// Remove a git worktree. Returns `Ok(())` on success, `Err` with
@@ -1566,7 +2239,7 @@ mod tests {
             // trunk rather than the current checkout.
             git(&repo, &["checkout", "-q", "-b", "sidetrack", &first]);
 
-            let minted = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing")
+            let minted = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing", None)
                 .expect("mint");
 
             assert_eq!(minted.base_ref, "main");
@@ -1590,13 +2263,13 @@ mod tests {
         with_home(|_home| {
             let (_tmp, repo, _first, _second) = repo_with_history();
 
-            let a = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing").unwrap();
-            let b = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing").unwrap();
+            let a = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing", None).unwrap();
+            let b = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing", None).unwrap();
 
             assert_eq!(a.branch, b.branch);
             assert_eq!(a.worktree_path, b.worktree_path);
             // A DIFFERENT task with the same name gets its own checkout.
-            let c = mint_task_worktree(&repo, "99999999-dead-beef", "Fix the thing").unwrap();
+            let c = mint_task_worktree(&repo, "99999999-dead-beef", "Fix the thing", None).unwrap();
             assert_ne!(a.worktree_path, c.worktree_path);
         });
     }
@@ -1648,7 +2321,7 @@ mod tests {
                 "unexpected error: {}",
                 err
             );
-            let err = mint_task_worktree(&repo, "abc1234", "no trunk")
+            let err = mint_task_worktree(&repo, "abc1234", "no trunk", None)
                 .expect_err("mint must refuse")
                 .to_string();
             assert!(err.contains("cannot resolve the project's main branch"), "{}", err);
@@ -1760,6 +2433,410 @@ mod tests {
                 "guard disarmed: {}",
                 err,
             );
+        });
+    }
+
+    // === reaped-worktree self-heal (`ensure_worktree_materialized`) ===
+
+    /// A subtask worktree with one commit of its own on top of `main`,
+    /// under `$HOME/.cm/worktrees/` (so `with_home` must wrap it).
+    /// Returns `(worktree_path, branch, work_sha)`.
+    fn subtask_worktree_with_work(repo: &Path, branch: &str) -> (PathBuf, String) {
+        let wt = create_subtask_worktree(repo, branch, SubtaskStart::ParentBranch("main"))
+            .expect("create subtask worktree");
+        git(&wt, &["config", "user.email", "t@t"]);
+        git(&wt, &["config", "user.name", "t"]);
+        let sha = commit_file(&wt, "work.txt", "real work");
+        (wt, sha)
+    }
+
+    fn assert_is_live_worktree(path: &Path, branch: &str, head: &str) {
+        assert!(path.is_dir(), "worktree dir must exist: {}", path.display());
+        assert!(is_git_worktree_root(path), "must be a git worktree root: {}", path.display());
+        assert_eq!(worktree_current_branch(path).as_deref(), Some(branch));
+        assert_eq!(worktree_head_sha(path).as_deref(), Some(head));
+        assert!(path.join("work.txt").exists(), "the branch's work is checked out");
+    }
+
+    /// A healthy worktree is left alone — no git mutation, `Present`.
+    #[test]
+    fn materialize_present_worktree_is_a_noop() {
+        with_home(|_home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            let (wt, sha) = subtask_worktree_with_work(&repo, "cm-sub/fix-it-abc1234");
+            let health = ensure_worktree_materialized(&repo, &wt, None).unwrap();
+            assert!(matches!(health, WorktreeHealth::Present), "{:?}", health);
+            assert_is_live_worktree(&wt, "cm-sub/fix-it-abc1234", &sha);
+        });
+    }
+
+    /// THE incident: the directory was `rm -rf`'d (never pruned), the
+    /// branch is intact. git still lists the path as a prunable worktree
+    /// on that branch, which is the most authoritative source — the heal
+    /// re-creates the checkout there, at the branch's tip.
+    #[test]
+    fn materialize_recreates_reaped_worktree_from_git_registration() {
+        with_home(|_home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            let (wt, sha) = subtask_worktree_with_work(&repo, "cm-sub/fix-it-abc1234");
+            std::fs::remove_dir_all(&wt).unwrap();
+            assert!(!wt.exists());
+
+            let health = ensure_worktree_materialized(&repo, &wt, None).unwrap();
+            let WorktreeHealth::Recreated(r) = health else {
+                panic!("expected Recreated, got {:?}", health);
+            };
+            assert_eq!(r.branch, "cm-sub/fix-it-abc1234");
+            assert_eq!(r.branch_source, "git-registration");
+            assert_eq!(r.head_sha.as_deref(), Some(sha.as_str()));
+            assert_eq!(r.commits_ahead, Some(1));
+            assert!(r.warnings.is_empty(), "a branch with work warns about nothing: {:?}", r.warnings);
+            assert_is_live_worktree(&wt, "cm-sub/fix-it-abc1234", &sha);
+            // And a second check is now a plain Present.
+            assert!(matches!(
+                ensure_worktree_materialized(&repo, &wt, None).unwrap(),
+                WorktreeHealth::Present
+            ));
+        });
+    }
+
+    /// Reaped AND pruned (`git worktree remove` / a prune sweep): git has
+    /// forgotten the path, but the CM directory-naming scheme maps the
+    /// dir name straight back to its branch.
+    #[test]
+    fn materialize_recreates_from_dir_name_after_prune() {
+        with_home(|_home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            let (wt, sha) = subtask_worktree_with_work(&repo, "cm-sub/fix-it-abc1234");
+            git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            git(&repo, &["worktree", "prune"]);
+            assert!(!wt.exists());
+            assert!(registered_branch_for_path(&repo, &wt).is_none(), "git forgot the path");
+
+            let WorktreeHealth::Recreated(r) =
+                ensure_worktree_materialized(&repo, &wt, None).unwrap()
+            else {
+                panic!("expected Recreated");
+            };
+            assert_eq!(r.branch_source, "dir-name");
+            assert_is_live_worktree(&wt, "cm-sub/fix-it-abc1234", &sha);
+
+            // The `<repo>-<slug>` → `cm/<slug>` layout maps back too.
+            let (wt2, created) = create_worktree(&repo, "launch-slug", None).unwrap();
+            assert!(created);
+            git(&wt2, &["config", "user.email", "t@t"]);
+            git(&wt2, &["config", "user.name", "t"]);
+            let sha2 = commit_file(&wt2, "work.txt", "w");
+            git(&repo, &["worktree", "remove", "--force", wt2.to_str().unwrap()]);
+            git(&repo, &["worktree", "prune"]);
+            let WorktreeHealth::Recreated(r2) =
+                ensure_worktree_materialized(&repo, &wt2, None).unwrap()
+            else {
+                panic!("expected Recreated");
+            };
+            assert_eq!(r2.branch, "cm/launch-slug");
+            assert_eq!(r2.branch_source, "dir-name");
+            assert_is_live_worktree(&wt2, "cm/launch-slug", &sha2);
+        });
+    }
+
+    /// A directory whose name isn't a CM layout and which git has
+    /// forgotten: the task's `wip_branch` is the only pointer left, and it
+    /// is honored when it exists.
+    #[test]
+    fn materialize_falls_back_to_wip_branch_hint() {
+        with_home(|home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            git(&repo, &["branch", "feature/real-work"]);
+            let odd = home.join(".cm/worktrees/something-else-entirely");
+            let WorktreeHealth::Recreated(r) =
+                ensure_worktree_materialized(&repo, &odd, Some("feature/real-work")).unwrap()
+            else {
+                panic!("expected Recreated");
+            };
+            assert_eq!(r.branch, "feature/real-work");
+            assert_eq!(r.branch_source, "wip-branch");
+            assert!(is_git_worktree_root(&odd));
+            assert_eq!(worktree_current_branch(&odd).as_deref(), Some("feature/real-work"));
+        });
+    }
+
+    /// Unrecoverable: the branch is gone too. The call FAILS — naming the
+    /// path, the repo, and every candidate it tried — and leaves nothing
+    /// on disk. Returning a success payload here is the core defect.
+    #[test]
+    fn materialize_fails_loudly_when_no_branch_can_be_found() {
+        with_home(|_home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            let (wt, _sha) = subtask_worktree_with_work(&repo, "cm-sub/fix-it-abc1234");
+            git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            git(&repo, &["worktree", "prune"]);
+            git(&repo, &["branch", "-D", "cm-sub/fix-it-abc1234"]);
+
+            let err = ensure_worktree_materialized(&repo, &wt, Some("cm-sub/also-gone-1234567"))
+                .expect_err("no branch → must fail")
+                .to_string();
+            assert!(err.contains(&wt.display().to_string()), "names the path: {}", err);
+            assert!(err.contains("does not exist and cannot be re-created"), "{}", err);
+            assert!(err.contains("dir-name 'cm-sub/fix-it-abc1234'"), "lists what it tried: {}", err);
+            assert!(err.contains("wip-branch 'cm-sub/also-gone-1234567'"), "{}", err);
+            assert!(!wt.exists(), "a failed heal leaves nothing behind");
+        });
+    }
+
+    /// The existing-directory cases, one by one:
+    ///   - an EMPTY leftover dir is re-used by `git worktree add`;
+    ///   - a non-empty dir with no `.git` is a real cwd → `PresentUnmanaged`
+    ///     (warned, never overwritten);
+    ///   - a dir whose `.git` git rejects (pruned admin record) is an error;
+    ///   - a branch already checked out elsewhere is an error naming it.
+    #[test]
+    fn materialize_existing_dir_and_collision_cases() {
+        with_home(|home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            let (wt, sha) = subtask_worktree_with_work(&repo, "cm-sub/fix-it-abc1234");
+
+            // Empty leftover.
+            std::fs::remove_dir_all(&wt).unwrap();
+            std::fs::create_dir_all(&wt).unwrap();
+            let WorktreeHealth::Recreated(r) =
+                ensure_worktree_materialized(&repo, &wt, None).unwrap()
+            else {
+                panic!("an empty dir is re-usable");
+            };
+            assert_eq!(r.branch_source, "git-registration");
+            assert_is_live_worktree(&wt, "cm-sub/fix-it-abc1234", &sha);
+
+            // Plain non-empty dir, no .git.
+            let plain = home.join(".cm/worktrees/plain");
+            std::fs::create_dir_all(&plain).unwrap();
+            std::fs::write(plain.join("notes.txt"), "x").unwrap();
+            match ensure_worktree_materialized(&repo, &plain, None).unwrap() {
+                WorktreeHealth::PresentUnmanaged(w) => {
+                    assert!(w.contains("not a git working tree"), "{}", w);
+                }
+                other => panic!("expected PresentUnmanaged, got {:?}", other),
+            }
+            assert!(plain.join("notes.txt").exists(), "never overwritten");
+
+            // `.git` present but rejected by git (pruned admin record).
+            let pruned = wt.clone();
+            std::fs::remove_dir_all(repo.join(".git/worktrees")).unwrap();
+            let err = ensure_worktree_materialized(&repo, &pruned, None)
+                .expect_err("git rejects the checkout")
+                .to_string();
+            assert!(err.contains("has a .git entry"), "{}", err);
+            assert!(err.contains(&pruned.display().to_string()), "{}", err);
+            assert!(pruned.join("work.txt").exists(), "never overwritten");
+            std::fs::remove_dir_all(&pruned).unwrap();
+            git(&repo, &["worktree", "prune"]);
+
+            // Branch already checked out in another worktree.
+            let other = home.join(".cm/worktrees/elsewhere");
+            git(&repo, &["worktree", "add", other.to_str().unwrap(), "cm-sub/fix-it-abc1234"]);
+            let err = ensure_worktree_materialized(&repo, &wt, None)
+                .expect_err("branch busy")
+                .to_string();
+            assert!(err.contains("already checked out"), "{}", err);
+            assert!(err.contains("cm-sub/fix-it-abc1234"), "{}", err);
+            assert!(!wt.exists(), "a failed add leaves no half-made dir");
+        });
+    }
+
+    /// Requirement 2: a re-created worktree gets the same provisioning a
+    /// first-time branch-mode subtask gets — at minimum `.venv` →
+    /// `<main_repo>/.venv`. Pinned for BOTH the first-time path and the
+    /// heal path, so they can't drift.
+    #[test]
+    fn materialize_provisions_venv_symlink_like_first_time_create() {
+        with_home(|_home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            std::fs::create_dir_all(repo.join(".venv/bin")).unwrap();
+            std::fs::write(repo.join(".venv/bin/python"), "").unwrap();
+
+            // First-time create (no setup_worktree.sh in this repo): the
+            // fallback alone provides the link.
+            let wt = create_subtask_worktree(&repo, "cm-sub/venv-abc1234", SubtaskStart::ParentBranch("main"))
+                .unwrap();
+            setup_worktree(&repo, &wt);
+            let link = wt.join(".venv");
+            assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read_link(&link).unwrap(), repo.join(".venv"));
+
+            // Reap (rm -rf takes the symlink with it) and heal.
+            std::fs::remove_dir_all(&wt).unwrap();
+            let WorktreeHealth::Recreated(_) =
+                ensure_worktree_materialized(&repo, &wt, None).unwrap()
+            else {
+                panic!("expected Recreated");
+            };
+            assert!(
+                link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "the healed worktree must carry the .venv link"
+            );
+            assert_eq!(std::fs::read_link(&link).unwrap(), repo.join(".venv"));
+            assert!(link.join("bin/python").exists(), "link resolves to the shared env");
+
+            // Idempotent + never overwrites an existing .venv.
+            assert!(!ensure_venv_symlink(&repo, &wt));
+            // In-place (worktree == main repo): nothing to do.
+            assert!(!ensure_venv_symlink(&repo, &repo));
+            assert!(!repo.join(".venv").symlink_metadata().unwrap().file_type().is_symlink());
+        });
+    }
+
+    /// The decoy defense. The task's `wip_branch` names a branch with ZERO
+    /// commits beyond trunk while the directory's own branch carries the
+    /// work: the heal checks out the branch with work and SAYS that the
+    /// wip_branch was a zero-commit decoy.
+    #[test]
+    fn materialize_prefers_branch_with_work_and_reports_zero_commit_hint() {
+        with_home(|_home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            let (wt, sha) = subtask_worktree_with_work(&repo, "cm-sub/bug-048-rand1234");
+            // The decoy: same slug, task-id-prefix suffix, cut from main,
+            // nothing committed.
+            git(&repo, &["branch", "cm-sub/bug-048-50ae24e", "main"]);
+            git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            git(&repo, &["worktree", "prune"]);
+
+            let WorktreeHealth::Recreated(r) =
+                ensure_worktree_materialized(&repo, &wt, Some("cm-sub/bug-048-50ae24e")).unwrap()
+            else {
+                panic!("expected Recreated");
+            };
+            assert_eq!(r.branch, "cm-sub/bug-048-rand1234", "the branch WITH work wins");
+            assert_eq!(r.commits_ahead, Some(1));
+            assert_is_live_worktree(&wt, "cm-sub/bug-048-rand1234", &sha);
+            let joined = r.warnings.join("\n");
+            assert!(joined.contains("wip_branch 'cm-sub/bug-048-50ae24e'"), "{}", joined);
+            assert!(joined.contains("zero-commit decoy"), "{}", joined);
+        });
+    }
+
+    /// When the ONLY candidate is a zero-commit branch it is still checked
+    /// out (it may simply be a task nobody has committed on yet) — but the
+    /// result carries a warning, and names any same-slug sibling branch
+    /// that DOES carry commits, rather than silently proceeding.
+    #[test]
+    fn materialize_warns_on_zero_commit_branch_and_names_working_sibling() {
+        with_home(|home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            // The sibling with the real work (a different random suffix).
+            let (_real, _sha) = subtask_worktree_with_work(&repo, "cm-sub/bug-048-rand1234");
+            // The decoy, never materialized.
+            git(&repo, &["branch", "cm-sub/bug-048-50ae24e", "main"]);
+            let decoy_wt = home.join(".cm/worktrees/cm-sub-bug-048-50ae24e");
+
+            let WorktreeHealth::Recreated(r) =
+                ensure_worktree_materialized(&repo, &decoy_wt, None).unwrap()
+            else {
+                panic!("expected Recreated");
+            };
+            assert_eq!(r.branch, "cm-sub/bug-048-50ae24e");
+            assert_eq!(r.commits_ahead, Some(0));
+            let joined = r.warnings.join("\n");
+            assert!(joined.contains("has no commits beyond main"), "{}", joined);
+            assert!(joined.contains("'cm-sub/bug-048-rand1234' (1 commit(s))"), "names the sibling: {}", joined);
+        });
+    }
+
+    /// Re-mint after a reap. Pre-fix the second mint hit `git worktree add
+    /// -b <branch>` with the branch already present and FAILED ("branch
+    /// already exists") — so a task whose minted worktree was reaped could
+    /// never be spawned on again. Now it re-attaches the branch.
+    #[test]
+    fn mint_task_worktree_reattaches_reaped_mint_branch() {
+        with_home(|_home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            let a = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing", None).unwrap();
+            git(&a.worktree_path, &["config", "user.email", "t@t"]);
+            git(&a.worktree_path, &["config", "user.name", "t"]);
+            let sha = commit_file(&a.worktree_path, "work.txt", "w");
+            std::fs::remove_dir_all(&a.worktree_path).unwrap();
+
+            let b = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing", None)
+                .expect("re-mint must re-attach, not fail");
+            assert_eq!(b.branch, a.branch);
+            assert_eq!(b.worktree_path, a.worktree_path);
+            assert_eq!(b.base_sha, sha, "lands on the branch's tip, not trunk");
+            assert_eq!(b.base_ref, "existing branch");
+            let r = b.recreated.expect("the directory was re-created");
+            assert_eq!(r.branch_source, "git-registration");
+            assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+            assert_is_live_worktree(&b.worktree_path, &a.branch, &sha);
+        });
+    }
+
+    /// The decoy's origin, closed: a task whose binding was lost but whose
+    /// `wip_branch` (a `create_subtask` branch with real commits) still
+    /// exists is RE-ATTACHED to that branch — not handed a fresh
+    /// `cm-sub/<slug>-<task-id-prefix>` cut from trunk with none of its
+    /// work, which is how the zero-commit decoys were being manufactured.
+    #[test]
+    fn mint_task_worktree_reattaches_wip_branch_instead_of_cutting_decoy() {
+        with_home(|home| {
+            let (_tmp, repo, _f, _s) = repo_with_history();
+            let (real_wt, sha) = subtask_worktree_with_work(&repo, "cm-sub/fix-the-thing-rand1234");
+            std::fs::remove_dir_all(&real_wt).unwrap();
+
+            let m = mint_task_worktree(
+                &repo,
+                "abc12345-dead-beef",
+                "Fix the thing",
+                Some("cm-sub/fix-the-thing-rand1234"),
+            )
+            .unwrap();
+            assert_eq!(m.branch, "cm-sub/fix-the-thing-rand1234");
+            assert_eq!(m.worktree_path, real_wt);
+            assert_eq!(m.base_sha, sha);
+            assert!(m.recreated.is_some());
+            assert_is_live_worktree(&real_wt, "cm-sub/fix-the-thing-rand1234", &sha);
+            assert!(
+                !local_branch_exists(&repo, "cm-sub/fix-the-thing-abc1234"),
+                "no decoy branch is cut"
+            );
+            assert!(!home.join(".cm/worktrees/cm-sub-fix-the-thing-abc1234").exists());
+
+            // A hint naming a branch that does NOT exist falls through to
+            // the ordinary fresh cut.
+            let fresh = mint_task_worktree(
+                &repo,
+                "99999999-dead-beef",
+                "Other thing",
+                Some("cm-sub/never-existed-0000000"),
+            )
+            .unwrap();
+            assert_eq!(fresh.branch, "cm-sub/other-thing-9999999");
+            assert!(fresh.recreated.is_none());
+            assert_eq!(fresh.base_ref, "main");
+        });
+    }
+
+    #[test]
+    fn branch_dir_mapping_round_trips() {
+        with_home(|home| {
+            let repo = home.join("code/projects/myrepo");
+            let base = home.join(".cm/worktrees");
+            assert_eq!(
+                branch_for_worktree_dir(&repo, &base.join("cm-sub-a-b-c-1234567")).as_deref(),
+                Some("cm-sub/a-b-c-1234567")
+            );
+            assert_eq!(
+                branch_for_worktree_dir(&repo, &base.join("myrepo-fix-bug")).as_deref(),
+                Some("cm/fix-bug")
+            );
+            assert_eq!(branch_for_worktree_dir(&repo, &base.join("otherrepo-fix-bug")), None);
+            assert_eq!(branch_for_worktree_dir(&repo, &base.join("cm-sub-")), None);
+            assert_eq!(
+                worktree_dir_for_branch(&repo, "cm-sub/a-b-c-1234567"),
+                Some(base.join("cm-sub-a-b-c-1234567"))
+            );
+            assert_eq!(
+                worktree_dir_for_branch(&repo, "cm/fix-bug"),
+                Some(base.join("myrepo-fix-bug"))
+            );
+            assert_eq!(worktree_dir_for_branch(&repo, "feature/x"), None);
         });
     }
 }
