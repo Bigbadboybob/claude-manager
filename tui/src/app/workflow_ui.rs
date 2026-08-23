@@ -246,6 +246,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         Some(role),
         &ts.host_id,
         pre_spawn_transcript.as_deref(),
+        false, // global_perms
     ) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {

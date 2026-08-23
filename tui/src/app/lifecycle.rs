@@ -116,6 +116,9 @@ pub(crate) fn try_attach_via_daemon_with_deps(
         transcript_path,
         workflow_run_id,
         workflow_role,
+        // Attach-only: the live daemon session already holds its
+        // grant; nothing is spawned here so the field is inert.
+        global_perms: false,
     };
     let session = crate::session::Session::new_attached_existing(cs_config)?;
     // Kick a resize so a session whose daemon PTY was spawned at a different
@@ -355,6 +358,10 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
     // the daemon's `resolve_authorized_session` flips ready
     // immediately and MCP `read_session_output` can serve.
     transcript_path: Option<&str>,
+    // Global-permissions grant applied at spawn — see
+    // `ClientSessionConfig::global_perms` for the contract and the
+    // respawn-at-same-uid incident it closes.
+    global_perms: bool,
 ) -> Option<anyhow::Result<Session>> {
     // 10f: daemon-eligibility is now driven solely by
     // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
@@ -508,6 +515,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
         transcript_path,
         workflow_run_id,
         workflow_role,
+        global_perms,
     };
     Some(crate::session::Session::new_attached(cs_config))
 }
@@ -586,6 +594,13 @@ impl App {
         // path for resume/restore flows. Fresh A-n / A-s
         // spawns pass `None`.
         transcript_path: Option<&str>,
+        // Global-permissions grant applied AT SPAWN (see
+        // `ClientSessionConfig::global_perms`). Restore / revive
+        // pass the manifest entry's grant so a respawn-at-same-uid
+        // keeps it; `spawn_managed_session` passes the (already
+        // escalation-checked) agent request; fresh A-n / A-s
+        // spawns pass `false`.
+        global_perms: bool,
     ) -> Option<anyhow::Result<Session>> {
         // migrate-tui-local: thin wrapper around the free
         // `try_spawn_via_daemon_with_deps` helper so workflow
@@ -609,6 +624,7 @@ impl App {
             workflow_role,
             host_id,
             transcript_path,
+            global_perms,
         )
     }
 
@@ -933,6 +949,7 @@ impl App {
                         None,
                         &active_host,
                         pre_spawn_transcript.as_deref(),
+                        false, // global_perms
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => {
@@ -1159,6 +1176,7 @@ impl App {
                 None,
                 &active_host,
                 pre_spawn_transcript.as_deref(),
+                false, // global_perms
             ) {
                 Some(Ok(s)) => {
                     let mut ts = make_simple_session_with_uid(
@@ -2039,6 +2057,7 @@ impl App {
             None,
             &active_host,
             pre_spawn_transcript.as_deref(),
+            false, // global_perms
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -2678,6 +2697,7 @@ impl App {
                     // attach_active is a fresh spawn — post-spawn
                     // detector will discover the transcript path.
                     None,
+                    false, // global_perms
                 ) {
                     Some(Ok(s)) => Some(make_simple_session_with_uid(
                         session_uid,
@@ -3034,6 +3054,7 @@ impl App {
             None,
             &spawn_host,
             pre_spawn_transcript.as_deref(),
+            false, // global_perms
         ) {
             Some(Ok(s)) => Ok(s),
             Some(Err(e)) => {
@@ -3291,6 +3312,7 @@ impl App {
             None,
             &host_snapshot,
             pre_spawn_transcript.as_deref(),
+            false, // global_perms
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -3991,6 +4013,7 @@ impl App {
             // launch_from_plan is a fresh spawn — post-spawn
             // detector will discover the transcript path.
             None,
+            false, // global_perms
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -4216,6 +4239,7 @@ impl App {
             // launch_into_workspace is a fresh spawn — post-
             // spawn detector handles the transcript path.
             None,
+            false, // global_perms
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -7783,6 +7807,142 @@ mod migrate_tui_local_tests {
     /// pin counts both arms separately so a future refactor
     /// that collapses them into the bare `result.ok()?` form
     /// trips this test.
+    /// Grant-not-honored-after-restart fix (the 2026-08-21 planning-
+    /// session incident). Four structural pins on the TUI side:
+    ///
+    /// 1. `spawn_restored_session` — the one-slot respawn both the
+    ///    startup restore and the `A-R` revive/forced-restart ride —
+    ///    passes the manifest entry's grant (`entry.global_perms`) to
+    ///    BOTH `self.try_spawn_via_daemon(` arms, so a respawn at the
+    ///    same uid re-registers the session WITH its grant. Pre-fix the
+    ///    spawn had no grant parameter at all: the daemon registered
+    ///    the new incarnation ungranted while the TUI row kept `true`.
+    /// 2. `spawn_managed_session` passes the (escalation-checked) agent
+    ///    grant AT SPAWN — no post-spawn `rpc_set_global_perms` window.
+    /// 3. The A-e `SaveSessionSettings` arm pushes the form's grant to
+    ///    the daemon on EVERY save (`perms_push`), never gating the
+    ///    RPC on the TUI's own cached `ts.global_perms` — that gate is
+    ///    what made the operator's re-grant a silent no-op once the two
+    ///    views had drifted.
+    /// 4. `set_session_global_perms` treats a not-live host socket as
+    ///    an error, never as a local-only "success".
+    #[test]
+    fn global_perms_grant_rides_respawn_and_every_settings_save() {
+        let src = crate::app::APP_SRC_FOR_SCAN;
+        let fn_body = |sig: &str| -> &str {
+            let start = src.find(sig).unwrap_or_else(|| panic!("must find {sig}"));
+            let rest = &src[start..];
+            let end = rest[1..]
+                .find("\n    fn ")
+                .into_iter()
+                .chain(rest[1..].find("\n    pub fn "))
+                .chain(rest[1..].find("\n    pub(crate) fn "))
+                .chain(rest[1..].find("\n    pub(super) fn "))
+                .chain(rest[1..].find("\n#[cfg(test)]"))
+                .min()
+                .map(|i| 1 + i)
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+
+        // (1) restore / revive respawn carries the persisted grant.
+        let restore = fn_body("fn spawn_restored_session(");
+        assert_eq!(
+            restore.matches("self.try_spawn_via_daemon(").count(),
+            2,
+            "spawn_restored_session has two spawn arms (attach-raced + not-live)",
+        );
+        assert_eq!(
+            restore.matches("entry.global_perms, // global_perms").count(),
+            2,
+            "BOTH spawn arms of spawn_restored_session must pass \
+             `entry.global_perms` as the spawn's global_perms argument — a \
+             respawn-at-same-uid must re-register the session WITH the \
+             operator's grant; body:\n{restore}",
+        );
+        // The A-R path rides spawn_restored_session (so it inherits the
+        // pin above) — keep it that way.
+        let revive = fn_body("fn revive_active_session(");
+        assert!(
+            revive.contains("self.spawn_restored_session(&entry, ws, (cols, rows), &live_uids)"),
+            "revive_active_session must respawn through spawn_restored_session; body:\n{revive}",
+        );
+
+        // (2) agent-requested grant rides the spawn, not a second RPC.
+        let managed = fn_body("fn spawn_managed_session(");
+        let spawn_idx = managed
+            .find("self.try_spawn_via_daemon(")
+            .expect("spawn_managed_session spawns via try_spawn_via_daemon");
+        let call_end = managed[spawn_idx..]
+            .find(") {")
+            .map(|i| spawn_idx + i)
+            .unwrap_or(managed.len());
+        let call_args = &managed[spawn_idx..call_end];
+        assert!(
+            call_args.contains("global_perms,"),
+            "spawn_managed_session must pass `global_perms` INTO the spawn; args:\n{call_args}",
+        );
+        assert!(
+            !managed.contains("rpc_set_global_perms("),
+            "spawn_managed_session must not need a post-spawn grant RPC any more",
+        );
+
+        // (3) the A-e save pushes unconditionally.
+        // The MATCH ARM destructures (`ws_index,`); the constructor site
+        // earlier in input.rs uses `ws_index:` — pick the arm.
+        let arm_start = src
+            .match_indices("SubmitAction::SaveSessionSettings {")
+            .map(|(i, _)| i)
+            .find(|&i| {
+                src[i..].trim_start_matches("SubmitAction::SaveSessionSettings {")
+                    .trim_start()
+                    .starts_with("ws_index,")
+            })
+            .expect("SaveSessionSettings match arm");
+        let arm_end = src[arm_start..]
+            .find("SubmitAction::SaveWorkspaceSettings {")
+            .map(|i| arm_start + i)
+            .expect("SaveWorkspaceSettings arm follows");
+        let arm = &src[arm_start..arm_end];
+        assert!(
+            arm.contains("perms_push = Some((ts.uid.clone(), global_perms, local_changed))"),
+            "the settings save must ALWAYS queue the daemon push (perms_push), \
+             not only when ts.global_perms differs; arm:\n{arm}",
+        );
+        assert!(
+            !arm.contains("perms_change"),
+            "the pre-fix diff-gated `perms_change` path must be gone; arm:\n{arm}",
+        );
+        assert!(
+            arm.contains("self.set_session_global_perms(&uid, value)"),
+            "the settings save must call set_session_global_perms; arm:\n{arm}",
+        );
+
+        // (4) no silent local-only success when the host isn't live.
+        let setter = fn_body("fn set_session_global_perms(");
+        assert!(
+            !setter.contains("if let Some(socket) = self.host_pool.live_socket_path("),
+            "set_session_global_perms must not silently skip the daemon when the \
+             socket isn't live; body:\n{setter}",
+        );
+        assert!(
+            setter.contains("self.host_pool.live_socket_path(&host).ok_or_else("),
+            "a not-live host socket must be an error; body:\n{setter}",
+        );
+        // And the push precedes the local mutation (a failed RPC must
+        // not leave the TUI's view diverged from the daemon's).
+        let push_idx = setter
+            .find("rpc_set_global_perms(")
+            .expect("setter pushes to the daemon");
+        let local_idx = setter
+            .find(".global_perms = value;")
+            .expect("setter updates the local row");
+        assert!(
+            push_idx < local_idx,
+            "daemon push must precede the local row update",
+        );
+    }
+
     #[test]
     fn t_migrate_attach_failure_falls_back_to_spawn() {
         let src = crate::app::APP_SRC_FOR_SCAN;

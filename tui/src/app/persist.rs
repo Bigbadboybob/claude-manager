@@ -1302,6 +1302,7 @@ impl App {
                         entry.workflow_role.as_deref(),
                         &entry.host_id,
                         pre_spawn_transcript.as_deref(),
+                        entry.global_perms, // global_perms
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),
@@ -1331,6 +1332,7 @@ impl App {
                         entry.workflow_role.as_deref(),
                         &entry.host_id,
                         pre_spawn_transcript.as_deref(),
+                        entry.global_perms, // global_perms
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),

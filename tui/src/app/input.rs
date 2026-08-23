@@ -3409,11 +3409,18 @@ impl App {
                 color,
             } => {
                 // Apply the plain fields in place, and capture the uid +
-                // whether the global-perms grant changed — the grant has
-                // to round-trip to the daemon (its Session-caller auth
-                // keys off the DaemonSession flag), so it can't be set by
-                // a local field assignment alone.
-                let mut perms_change: Option<(String, bool)> = None;
+                // the grant the operator asked for. The grant has to
+                // round-trip to the daemon (its Session-caller auth keys
+                // off the DaemonSession flag), so it can't be set by a
+                // local field assignment alone — and it is pushed on
+                // EVERY save, not only when it differs from the TUI's
+                // own cached flag: the TUI row and the daemon registry
+                // can drift (the A-R respawn dropped the daemon-side
+                // grant while the row kept `true`), and gating on the
+                // stale local value made the operator's re-grant a
+                // silent no-op (the 2026-08-21 planning-session
+                // incident). The RPC is idempotent.
+                let mut perms_push: Option<(String, bool, bool)> = None;
                 if let Some(ws) = self.workspaces.get_mut(ws_index) {
                     if let Some(ts) = ws.sessions.get_mut(session_index) {
                         if !name.trim().is_empty() {
@@ -3424,21 +3431,34 @@ impl App {
                         ts.hidden = hidden;
                         ts.notify_on_idle = notify_on_idle;
                         ts.color = color;
-                        if ts.global_perms != global_perms {
-                            perms_change = Some((ts.uid.clone(), global_perms));
-                        }
+                        let local_changed = ts.global_perms != global_perms;
+                        perms_push = Some((ts.uid.clone(), global_perms, local_changed));
                     }
                 }
                 self.save_session_manifest();
-                match perms_change {
-                    Some((uid, value)) => {
+                match perms_push {
+                    Some((uid, value, local_changed)) => {
                         match self.set_session_global_perms(&uid, value) {
-                            Ok(true) => self.set_status_msg(
-                                "Settings saved — global permissions GRANTED",
-                            ),
-                            Ok(false) => self.set_status_msg(
-                                "Settings saved — global permissions revoked",
-                            ),
+                            Ok(ack) => {
+                                // `changed` = the DAEMON moved; a re-assert
+                                // that converged a drifted daemon reads as
+                                // a grant/revoke too, so the operator sees
+                                // it took effect.
+                                let daemon_moved = ack.changed.unwrap_or(local_changed);
+                                let msg = match (value, daemon_moved || local_changed) {
+                                    (true, true) => {
+                                        "Settings saved — global permissions GRANTED"
+                                    }
+                                    (false, true) => {
+                                        "Settings saved — global permissions revoked"
+                                    }
+                                    (true, false) => {
+                                        "Settings saved — global permissions re-asserted (already granted)"
+                                    }
+                                    (false, false) => "Settings saved",
+                                };
+                                self.set_status_msg(msg);
+                            }
                             Err(e) => self.set_status_msg(&format!(
                                 "Settings saved, but global-perms change failed: {}",
                                 e,

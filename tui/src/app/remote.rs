@@ -3226,6 +3226,7 @@ mod remote_reconnect_tests {
                 transcript_path: None,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             }
         }
         let argv = vec!["/bin/cat".to_string()];

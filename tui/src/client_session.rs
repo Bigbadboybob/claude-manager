@@ -220,6 +220,22 @@ pub struct ClientSessionConfig<'a> {
     /// already-spawned session uses `rpc_set_workflow_context`.
     pub workflow_run_id: Option<&'a str>,
     pub workflow_role: Option<&'a str>,
+    /// Global-permissions grant for the spawned session, applied by
+    /// the daemon AT SPAWN (`start_session`'s `global_perms` param —
+    /// operator-trusted; the agent-side escalation guard lives in
+    /// `mcp_start_session`). `false` for fresh A-n/A-s spawns.
+    ///
+    /// Restore / revive callers pass the manifest entry's grant so a
+    /// respawn-at-same-uid keeps the operator's grant. Pre-fix this
+    /// field didn't exist: the TUI's `A-R` forced restart (and the
+    /// startup restore of a session the daemon no longer held)
+    /// re-registered the uid WITHOUT the grant while the TUI's own
+    /// row kept `global_perms: true` — the daemon's Session-caller
+    /// auth (the only thing the MCP tools consult) saw a revoked
+    /// session, the sidebar showed a granted one, and the A-e
+    /// re-grant compared against the TUI's stale `true` and never
+    /// fired (the 2026-08-21 planning-session incident).
+    pub global_perms: bool,
 }
 
 /// Daemon-attached terminal session. Field shape mirrors
@@ -777,6 +793,11 @@ pub(crate) fn rpc_start_session_full(
     }
     if let Some(role) = config.workflow_role {
         params["workflow_role"] = serde_json::Value::String(role.to_string());
+    }
+    // Global-perms grant at spawn time (see the field doc). Sent only
+    // when set so the wire shape of an ungranted spawn is unchanged.
+    if config.global_perms {
+        params["global_perms"] = serde_json::Value::Bool(true);
     }
     // Slice 10d watcher-fix #1: `cgroup_path` is NO LONGER
     // sent on the wire. The daemon discovers the actual cgroup
@@ -1433,17 +1454,40 @@ pub fn rpc_set_workflow_context(
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
 
+/// What the daemon answered to `session.set_global_perms`. Every
+/// field is optional because a pre-fix daemon answers only
+/// `{ ok, daemon_owned }` — `global_perms` / `changed` arrived with
+/// the grant-not-honored-after-restart fix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlobalPermsAck {
+    /// The daemon holds this uid live (the flip landed on its
+    /// registry). `false` = no-op success for a uid it doesn't own.
+    pub daemon_owned: Option<bool>,
+    /// The grant the daemon's registry holds after the call.
+    pub global_perms: Option<bool>,
+    /// Whether this call actually flipped the daemon's value
+    /// (`false` = the daemon already agreed — a re-assert).
+    pub changed: Option<bool>,
+}
+
 /// `session.set_global_perms` RPC (global-perms feature). The TUI
 /// grants/revokes a live daemon-owned session's global-permissions
 /// flag so the daemon's Session-caller auth honors the change
 /// immediately. Operator-only on the daemon side — see
 /// `methods::set_global_perms` for why a Session caller is refused.
+///
+/// Idempotent by contract: the TUI re-asserts the operator's
+/// intent on every A-e save (not only when its OWN cached flag
+/// differs), because the TUI's row and the daemon's registry can
+/// drift — the daemon is the auth authority the MCP tools consult,
+/// and a drifted TUI that never re-sends leaves a "granted" row the
+/// daemon treats as revoked.
 pub fn rpc_set_global_perms(
     daemon_socket: &Path,
     operator_token_id: &str,
     uid: &str,
     global_perms: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<GlobalPermsAck> {
     let req = Request {
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
@@ -1453,7 +1497,13 @@ pub fn rpc_set_global_perms(
             "global_perms": global_perms,
         }),
     };
-    rpc_round_trip(daemon_socket, &req).map(|_| ())
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let result = resp.result.unwrap_or(serde_json::Value::Null);
+    Ok(GlobalPermsAck {
+        daemon_owned: result.get("daemon_owned").and_then(|v| v.as_bool()),
+        global_perms: result.get("global_perms").and_then(|v| v.as_bool()),
+        changed: result.get("changed").and_then(|v| v.as_bool()),
+    })
 }
 
 /// `session.revive` RPC (A-R) — ask a host daemon to re-spawn an EXITED
@@ -2171,6 +2221,7 @@ mod tests {
             // spawn build ClientSessionConfig directly.
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         }
     }
 
@@ -3979,6 +4030,144 @@ mod tests {
     /// `cgroup_path` field is now informational (daemon-
     /// authoritative) — we test the round-trip by having the
     /// fake daemon echo a fabricated discovered path.
+    /// Grant-not-honored-after-restart fix: `ClientSessionConfig::
+    /// global_perms` rides the `start_session` wire as
+    /// `global_perms: true` (the daemon's operator-trusted spawn
+    /// param), so a respawn-at-same-uid (restore / A-R revive) keeps
+    /// the operator's grant from the child's first instruction. An
+    /// ungranted spawn leaves the key OFF the wire — byte-for-byte
+    /// the pre-fix request shape.
+    #[test]
+    fn start_session_wire_carries_global_perms_only_when_granted() {
+        use cm_daemon::control::wire as wire_local;
+        use std::os::unix::net::UnixListener;
+
+        for granted in [true, false] {
+            let socket_path = std::path::PathBuf::from(format!(
+                "/tmp/cm-gp-wire-test-{}-{}.sock",
+                std::process::id(),
+                granted,
+            ));
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).expect("bind");
+            let spy = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let req = wire_local::read_request(&mut stream)
+                    .expect("read req")
+                    .expect("frame");
+                let resp = cm_daemon::control::protocol::Response::ok(
+                    req.id.clone(),
+                    serde_json::json!({
+                        "session_uid": req.params["uid"].as_str().unwrap(),
+                    }),
+                );
+                wire_local::write_response(&mut stream, &resp).expect("write");
+                req
+            });
+
+            let argv = vec!["/bin/bash".to_string()];
+            let uid = test_uid();
+            let config = ClientSessionConfig {
+                daemon_socket: &socket_path,
+                operator_token_id: "op-gp",
+                uid: &uid,
+                workspace_id: "ws-gp",
+                label: "planning",
+                session_type: "claude-code",
+                argv: &argv,
+                working_dir: std::path::Path::new("/tmp"),
+                env: std::collections::BTreeMap::new(),
+                cols: 80,
+                rows: 24,
+                memory_cap_bytes: None,
+                memory_cap_hard_bytes: None,
+                cgroup_prefix: None,
+                cgroup_path: None,
+                worktree_path: None,
+                task_id: Some("task-planning"),
+                transcript_path: None,
+                workflow_run_id: None,
+                workflow_role: None,
+                global_perms: granted,
+            };
+            rpc_start_session_full(&config).expect("rpc ok");
+            let req = spy.join().expect("spy joined");
+            let _ = std::fs::remove_file(&socket_path);
+            assert_eq!(req.method, "start_session");
+            if granted {
+                assert_eq!(
+                    req.params["global_perms"],
+                    serde_json::json!(true),
+                    "a granted spawn must carry global_perms=true on the wire",
+                );
+            } else {
+                assert!(
+                    req.params.get("global_perms").is_none(),
+                    "an ungranted spawn keeps the pre-fix wire shape (no key); \
+                     observed: {:?}",
+                    req.params["global_perms"],
+                );
+            }
+        }
+    }
+
+    /// `rpc_set_global_perms` surfaces the daemon's ack (`daemon_owned`
+    /// / `global_perms` / `changed`) so the A-e status line can tell a
+    /// real flip from a converging re-assert — and tolerates a pre-fix
+    /// daemon that answers only `{ ok, daemon_owned }`.
+    #[test]
+    fn rpc_set_global_perms_parses_ack_and_tolerates_old_daemons() {
+        use cm_daemon::control::wire as wire_local;
+        use std::os::unix::net::UnixListener;
+
+        for (reply, expect) in [
+            (
+                serde_json::json!({
+                    "ok": true, "daemon_owned": true, "global_perms": true, "changed": true
+                }),
+                GlobalPermsAck {
+                    daemon_owned: Some(true),
+                    global_perms: Some(true),
+                    changed: Some(true),
+                },
+            ),
+            (
+                serde_json::json!({ "ok": true, "daemon_owned": true }),
+                GlobalPermsAck {
+                    daemon_owned: Some(true),
+                    global_perms: None,
+                    changed: None,
+                },
+            ),
+        ] {
+            let socket_path = std::path::PathBuf::from(format!(
+                "/tmp/cm-gp-ack-test-{}-{}.sock",
+                std::process::id(),
+                reply["changed"].is_boolean(),
+            ));
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).expect("bind");
+            let spy = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let req = wire_local::read_request(&mut stream)
+                    .expect("read req")
+                    .expect("frame");
+                let resp =
+                    cm_daemon::control::protocol::Response::ok(req.id.clone(), reply);
+                wire_local::write_response(&mut stream, &resp).expect("write");
+                req
+            });
+            let ack = rpc_set_global_perms(&socket_path, "op-gp", "ts-planning", true)
+                .expect("rpc ok");
+            let req = spy.join().expect("spy joined");
+            let _ = std::fs::remove_file(&socket_path);
+            assert_eq!(req.method, "session.set_global_perms");
+            assert_eq!(req.params["uid"], serde_json::json!("ts-planning"));
+            assert_eq!(req.params["global_perms"], serde_json::json!(true));
+            assert_eq!(ack, expect);
+        }
+    }
+
     #[test]
     fn memory_cap_bytes_travels_on_wire_but_caller_cgroup_path_is_dropped() {
         use cm_daemon::control::wire as wire_local;
@@ -4047,6 +4236,7 @@ mod tests {
             transcript_path: None,
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         };
         let result = rpc_start_session_full(&config).expect("rpc ok");
 
@@ -4135,6 +4325,7 @@ mod tests {
             transcript_path: None,
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         };
         let session = ClientSession::new(config).expect("spawn cat session");
         let uid = session.session_uid.clone();

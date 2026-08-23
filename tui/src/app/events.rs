@@ -1432,6 +1432,10 @@ impl App {
             // MCP-driven spawn is always fresh — post-spawn
             // detector handles transcript path discovery.
             None,
+            // Grant at spawn time (escalation-checked upstream in
+            // `control::methods::start_session`) — no window where
+            // the child runs ungranted, no second RPC to lose.
+            global_perms,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -1509,58 +1513,62 @@ impl App {
             host_id: caller_host.clone(),
         };
         self.workspaces[ws_index].sessions.push(ts);
-        // Mirror the grant onto the daemon-owned session so the
-        // daemon's Session-caller auth honors it (the TerminalSession
-        // flag above only covers TUI-routed methods like send_input).
-        // The escalation guard ran in `control::methods::start_session`
-        // before this call, so the grant here is already authorized.
-        if global_perms {
-            if let Some(socket) = self.host_pool.live_socket_path(&caller_host) {
-                if let Err(e) = crate::client_session::rpc_set_global_perms(
-                    &socket,
-                    crate::daemon_launch::operator_token(),
-                    &session_uid,
-                    true,
-                ) {
-                    self.set_status_msg(&format!(
-                        "spawned {} but failed to set global perms on the daemon: {}",
-                        session_uid, e,
-                    ));
-                }
-            }
-        }
+        // The grant rode the `start_session` spawn itself (the
+        // `global_perms` arg to `try_spawn_via_daemon` above), so the
+        // daemon's Session-caller auth holds it from the child's
+        // first instruction — no post-spawn `session.set_global_perms`
+        // round-trip to lose. The escalation guard ran in
+        // `control::methods::start_session` before this call.
         self.save_session_manifest();
         Ok(session_uid)
     }
 
     /// Grant or revoke a live session's global-permissions flag (the
-    /// operator path: A-e session settings). Updates the in-memory
-    /// `TerminalSession`, pushes the change to the session's host
-    /// daemon so its Session-caller auth honors it immediately, and
-    /// persists the manifest. Returns the new value, or an error
+    /// operator path: A-e session settings). Pushes the value to the
+    /// session's host daemon so its Session-caller auth honors it
+    /// immediately, then updates the in-memory `TerminalSession` and
+    /// persists the manifest. Returns the daemon's ack, or an error
     /// string for the status line.
+    ///
+    /// Always pushes — even when the TUI's own row already shows
+    /// `value`. The TUI row and the daemon registry are persisted
+    /// independently and can drift (a respawn-at-same-uid that
+    /// dropped the grant daemon-side while the TUI row kept it —
+    /// the 2026-08-21 planning-session incident); the daemon is the
+    /// authority the MCP tools consult, so the operator's save must
+    /// reach it unconditionally. The RPC is idempotent, and its
+    /// `changed` bit tells the status line whether anything moved.
+    ///
+    /// A host whose socket isn't live right now is an ERROR, not a
+    /// silent local-only update: claiming "granted" while the daemon
+    /// never heard it is exactly the divergence this guards against.
     pub fn set_session_global_perms(
         &mut self,
         uid: &str,
         value: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<crate::client_session::GlobalPermsAck, String> {
         let (wi, si) = crate::control::methods::find_live_session(&self.workspaces, uid)
             .ok_or_else(|| format!("session {} not found", uid))?;
         let host = self.workspaces[wi].sessions[si].host_id.clone();
         // Push to the daemon first so a failed RPC doesn't leave the
         // TUI's view diverged from the daemon's auth state.
-        if let Some(socket) = self.host_pool.live_socket_path(&host) {
-            crate::client_session::rpc_set_global_perms(
-                &socket,
-                crate::daemon_launch::operator_token(),
-                uid,
-                value,
+        let socket = self.host_pool.live_socket_path(&host).ok_or_else(|| {
+            format!(
+                "host `{}` socket not live — grant NOT applied (daemon never heard it); \
+                 retry once the host reconnects",
+                host.as_str(),
             )
-            .map_err(|e| format!("daemon rejected global-perms change: {}", e))?;
-        }
+        })?;
+        let ack = crate::client_session::rpc_set_global_perms(
+            &socket,
+            crate::daemon_launch::operator_token(),
+            uid,
+            value,
+        )
+        .map_err(|e| format!("daemon rejected global-perms change: {}", e))?;
         self.workspaces[wi].sessions[si].global_perms = value;
         self.save_session_manifest();
-        Ok(value)
+        Ok(ack)
     }
 
     /// Process planning editor events (non-blocking).
@@ -1945,6 +1953,15 @@ impl App {
             }
             ManifestDiff::Added { uid, entry }
             | ManifestDiff::Updated { uid, entry } => {
+                // Global-perms convergence: the daemon is the auth
+                // authority, and `session.set_global_perms` broadcasts
+                // the grant it now holds. Mirror it onto an
+                // already-tracked row so the sidebar / A-e form show
+                // the daemon's truth (another client's grant, or a
+                // re-assert that healed a drifted row). Entries that
+                // don't carry the field (workflow-binding `Updated`s,
+                // `Added`s) are left alone.
+                self.apply_global_perms_from_diff(&uid, &entry);
                 // Option B (criterion #4): adopt daemon-launched WORKFLOW
                 // PARTICIPANTS into the sidebar from broadcasts. The helper is
                 // deliberately scoped to entries carrying `workflow_run_id` —
@@ -1961,6 +1978,31 @@ impl App {
                 // attach-stream teardown); tombstone is a no-op here.
             }
         }
+    }
+
+    /// Mirror a broadcast `global_perms` onto the tracked row for `uid`
+    /// (see the `Added`/`Updated` arm of `apply_manifest_diff`). Returns
+    /// whether a row changed. No-op when the entry lacks the field or
+    /// the uid isn't tracked; persists the manifest on a real change so
+    /// the TUI's own durable view stops disagreeing with the daemon's.
+    pub(crate) fn apply_global_perms_from_diff(
+        &mut self,
+        uid: &str,
+        entry: &serde_json::Value,
+    ) -> bool {
+        let Some(gp) = entry.get("global_perms").and_then(|v| v.as_bool()) else {
+            return false;
+        };
+        let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid)
+        else {
+            return false;
+        };
+        if self.workspaces[wi].sessions[si].global_perms == gp {
+            return false;
+        }
+        self.workspaces[wi].sessions[si].global_perms = gp;
+        self.save_session_manifest();
+        true
     }
 
     /// Option B (criterion #4): adopt a daemon-launched workflow PARTICIPANT
@@ -2136,6 +2178,8 @@ impl App {
             // these on the attach path either way.
             workflow_run_id: run_id.as_deref(),
             workflow_role: role.as_deref(),
+            // Attach-only: the daemon's live session owns its grant.
+            global_perms: false,
         };
         let session = match crate::session::Session::new_attached_existing(config) {
             Ok(s) => s,
@@ -3059,6 +3103,50 @@ mod apply_manifest_diff_tests {
         });
         assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
         assert!(!app.needs_redraw);
+    }
+
+    /// Grant-not-honored-after-restart fix: a manifest `Updated` that
+    /// carries `global_perms` (the daemon's `session.set_global_perms`
+    /// broadcast) is mirrored onto the tracked row, so the sidebar /
+    /// A-e form show the daemon's truth. Entries without the field
+    /// (workflow-binding `Updated`s, `Added`s) and unknown uids leave
+    /// everything untouched.
+    #[test]
+    fn apply_updated_diff_mirrors_global_perms_onto_tracked_row() {
+        let mut app = build_app_with_session("ts-gp-row");
+        assert!(!app.workspaces[0].sessions[0].global_perms);
+
+        // Grant arrives from the daemon → row flips.
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-gp-row".into(),
+            entry: serde_json::json!({ "uid": "ts-gp-row", "global_perms": true }),
+        });
+        assert!(
+            app.workspaces[0].sessions[0].global_perms,
+            "an Updated carrying global_perms=true must flip the tracked row",
+        );
+
+        // An Updated WITHOUT the field (the workflow-binding shape) is
+        // not a revoke.
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-gp-row".into(),
+            entry: serde_json::json!({ "uid": "ts-gp-row", "workflow_role": "worker" }),
+        });
+        assert!(app.workspaces[0].sessions[0].global_perms, "field absent → untouched");
+
+        // Unknown uid: silent no-op.
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-someone-else".into(),
+            entry: serde_json::json!({ "global_perms": false }),
+        });
+        assert!(app.workspaces[0].sessions[0].global_perms);
+
+        // Revoke mirrors too.
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-gp-row".into(),
+            entry: serde_json::json!({ "global_perms": false }),
+        });
+        assert!(!app.workspaces[0].sessions[0].global_perms, "revoke mirrored");
     }
 
     /// T22 (10e-c r1 F1) — `apply_manifest_snapshot` adopts the
@@ -4323,6 +4411,7 @@ pub(super) mod pending_workflow_events_tests {
             transcript_path: None,
             workflow_run_id: Some("wf_e2e"),
             workflow_role: Some("reviewer"),
+            global_perms: false,
         };
         crate::client_session::rpc_start_session_full(&cfg).expect("daemon spawns participant");
 
@@ -4777,6 +4866,7 @@ pub(super) mod pending_workflow_events_tests {
             transcript_path: None,
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         };
         crate::client_session::rpc_start_session_full(&cfg)
             .expect("manager daemon spawns session");
@@ -4954,6 +5044,7 @@ pub(super) mod pending_workflow_events_tests {
             transcript_path: None,
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         };
         crate::client_session::rpc_start_session_full(&cfg)
             .expect("manager daemon spawns session");
@@ -5155,6 +5246,7 @@ pub(super) mod pending_workflow_events_tests {
             transcript_path: None,
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         };
         crate::client_session::rpc_start_session_full(&cfg).expect("spawn");
 
@@ -5353,6 +5445,7 @@ pub(super) mod pending_workflow_events_tests {
             transcript_path: None,
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         };
         crate::client_session::rpc_start_session_full(&cfg).expect("spawn live");
 
@@ -5902,6 +5995,7 @@ pub(super) mod pending_workflow_events_tests {
             transcript_path: None,
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         };
         crate::client_session::rpc_start_session_full(&cfg)
             .expect("manager daemon spawns the live session");

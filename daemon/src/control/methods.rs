@@ -3012,11 +3012,31 @@ pub fn set_workflow_context(
 // escalation-guarded spawn param (caller must already be global).
 //
 // Wire shape:   { uid: <session_uid>, global_perms: <bool> }
-// Response:     { ok: true, daemon_owned: bool }
+// Response:     { ok: true, daemon_owned: bool, global_perms: bool,
+//                 changed: bool }
 //
 // `daemon_owned: false` mirrors `set_workflow_context`: a no-op
 // success for a uid the daemon doesn't own (e.g. a TUI-local
 // session), so the TUI can fire this without branching.
+// `global_perms` echoes the grant the registry now holds (the
+// caller's own value for a daemon-owned uid; `false` otherwise) and
+// `changed` says whether this call actually flipped it — a caller
+// re-asserting a grant it believes is already in place (the TUI's
+// A-e save after a daemon/TUI divergence) can tell "converged"
+// from "was already there".
+//
+// **Durability + convergence (grant-not-honored-after-restart
+// fix).** The flip is persisted (`persist_sessions_best_effort`)
+// and broadcast as a manifest `Updated` diff. Pre-fix it mutated
+// the live registry ONLY: `daemon-sessions.json` — the source the
+// holder-mode brain re-adopts each session's `global_perms` from,
+// and the legacy restore's spawn identity — was rewritten only by
+// the next unrelated lifecycle hook, so a grant followed by a
+// crash restart (or a holder brain restart before any spawn/exit)
+// came back revoked. And no watcher learned of the flip, so a
+// TUI whose own row had drifted from the daemon (the A-R respawn
+// case — see `tui::client_session::ClientSessionConfig::global_perms`)
+// kept rendering a grant the daemon no longer held.
 
 #[derive(Deserialize)]
 struct SetGlobalPermsParams {
@@ -3042,13 +3062,55 @@ pub fn set_global_perms(
         ));
     }
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    match state.sessions.get_mut(&p.uid) {
+    let (changed, entry) = match state.sessions.get_mut(&p.uid) {
         Some(s) => {
+            let changed = s.global_perms != p.global_perms;
             s.global_perms = p.global_perms;
-            Ok(json!({ "ok": true, "daemon_owned": true }))
+            // The `Updated` payload carries the same identity fields
+            // the `Added` broadcast does plus the grant itself, so a
+            // consumer can both locate the row and apply the flip.
+            let entry = json!({
+                "uid": s.uid,
+                "workspace_id": s.workspace_id,
+                "label": s.title,
+                "session_type": s.session_type,
+                "workflow_run_id": s.workflow_run_id,
+                "workflow_role": s.workflow_role,
+                "continuous_task_id": s.continuous_task_id,
+                "task_id": s.task_id,
+                "global_perms": s.global_perms,
+            });
+            (changed, entry)
         }
-        None => Ok(json!({ "ok": true, "daemon_owned": false })),
+        None => {
+            return Ok(json!({
+                "ok": true,
+                "daemon_owned": false,
+                "global_perms": false,
+                "changed": false,
+            }));
+        }
+    };
+    if changed {
+        // Durable: the grant must survive a restart that rebuilds
+        // identity from the persisted registry (holder-mode adopt,
+        // legacy restore, `session.revive`).
+        state.persist_sessions_best_effort();
     }
+    let watcher = Arc::clone(&state.manifest_watcher);
+    drop(state);
+    // Always broadcast — even a no-op re-assert lets a diverged
+    // watcher converge on the daemon's truth.
+    watcher.broadcast(crate::manifest::ManifestDiff::Updated {
+        uid: p.uid.clone(),
+        entry,
+    });
+    Ok(json!({
+        "ok": true,
+        "daemon_owned": true,
+        "global_perms": p.global_perms,
+        "changed": changed,
+    }))
 }
 
 /// Map daemon-side `session_type` (`"claude-code"` / `"codex"` /
@@ -22315,6 +22377,207 @@ mod tests {
             )
             .expect("unknown uid no-ops");
             assert_eq!(resp["daemon_owned"], json!(false));
+            assert_eq!(resp["global_perms"], json!(false));
+            assert_eq!(resp["changed"], json!(false));
+        });
+    }
+
+    /// Grant-not-honored-after-restart fix, durability half: a grant
+    /// issued while the daemon runs is PERSISTED to the durable
+    /// registry at once (pre-fix only the next unrelated lifecycle
+    /// hook rewrote the file, so a crash restart rebuilt the session
+    /// revoked) and BROADCAST as a manifest `Updated` carrying the
+    /// grant, so a diverged watcher converges. A no-op re-assert
+    /// reports `changed: false` but still broadcasts.
+    #[test]
+    fn set_global_perms_persists_grant_and_broadcasts_updated() {
+        let _tmp = with_temp_home(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("daemon-sessions.json");
+            let state = make_state_arc();
+            state.lock().unwrap().daemon_sessions_path = Some(path.clone());
+            let wt = std::env::temp_dir();
+            // Spawn through the real funnel — the same path the TUI's
+            // respawn-at-same-uid takes — with NO grant.
+            start_session(
+                &state,
+                &json!({
+                    "uid": "ts-1a2b3c4d5e6f0021-0",
+                    "session_type": "bash",
+                    "workspace_id": "ws-gp",
+                    "working_dir": wt.to_str().unwrap(),
+                    "worktree_path": wt.to_str().unwrap(),
+                    "label": "planning",
+                    "argv": ["/bin/sleep", "120"],
+                }),
+            )
+            .expect("start_session ok");
+            let read_persisted = || -> bool {
+                let m: crate::manifest::Manifest = serde_json::from_str(
+                    &std::fs::read_to_string(&path).unwrap(),
+                )
+                .unwrap();
+                m.workspaces["ws-gp"]
+                    .sessions
+                    .iter()
+                    .find(|e| e.uid == "ts-1a2b3c4d5e6f0021-0")
+                    .expect("session persisted")
+                    .global_perms
+            };
+            assert!(!read_persisted(), "spawned without a grant");
+
+            let (rx, _guard) = {
+                let s = state.lock().unwrap();
+                s.manifest_watcher.subscribe()
+            };
+            let resp = set_global_perms(
+                &state,
+                &json!({ "uid": "ts-1a2b3c4d5e6f0021-0", "global_perms": true }),
+            )
+            .expect("grant ok");
+            assert_eq!(resp["daemon_owned"], json!(true));
+            assert_eq!(resp["global_perms"], json!(true));
+            assert_eq!(resp["changed"], json!(true));
+            assert!(
+                read_persisted(),
+                "the grant must reach daemon-sessions.json immediately — it is \
+                 what a restart rebuilds the session's identity from",
+            );
+            match rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("grant must broadcast a manifest Updated")
+            {
+                crate::manifest::ManifestDiff::Updated { uid, entry } => {
+                    assert_eq!(uid, "ts-1a2b3c4d5e6f0021-0");
+                    assert_eq!(entry["global_perms"], json!(true));
+                    assert_eq!(entry["workspace_id"], json!("ws-gp"));
+                    assert_eq!(entry["label"], json!("planning"));
+                }
+                other => panic!("expected ManifestDiff::Updated, got {:?}", other),
+            }
+
+            // Re-asserting the same grant: no flip, but the watcher
+            // still hears the daemon's truth.
+            let resp = set_global_perms(
+                &state,
+                &json!({ "uid": "ts-1a2b3c4d5e6f0021-0", "global_perms": true }),
+            )
+            .expect("re-assert ok");
+            assert_eq!(resp["changed"], json!(false));
+            assert_eq!(resp["global_perms"], json!(true));
+            match rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("re-assert must still broadcast")
+            {
+                crate::manifest::ManifestDiff::Updated { entry, .. } => {
+                    assert_eq!(entry["global_perms"], json!(true));
+                }
+                other => panic!("expected ManifestDiff::Updated, got {:?}", other),
+            }
+
+            // Revoke persists too.
+            set_global_perms(
+                &state,
+                &json!({ "uid": "ts-1a2b3c4d5e6f0021-0", "global_perms": false }),
+            )
+            .expect("revoke ok");
+            assert!(!read_persisted(), "revoke persisted");
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// Grant-after-daemon-restart regression (the planning-session
+    /// incident, 2026-08-21): a session registered WITHOUT a grant
+    /// (the TUI's respawn-at-same-uid shape), then granted by the
+    /// operator while live, must come back from a daemon restart
+    /// STILL global — and the restored session's auth must reach an
+    /// unrelated target without anyone re-granting. Exercises the
+    /// real persisted-registry → `restore_sessions` rebuild, the same
+    /// file the holder-mode brain re-adopts identity from.
+    #[test]
+    fn global_perms_grant_survives_daemon_restart() {
+        let _tmp = with_temp_home(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("daemon-sessions.json");
+            let wt = std::env::temp_dir();
+
+            // Generation 1: spawn ungranted, grant while live.
+            let gen1 = make_state_arc();
+            gen1.lock().unwrap().daemon_sessions_path = Some(path.clone());
+            for (uid, ws) in [
+                ("ts-1a2b3c4d5e6f0031-0", "ws-planning"),
+                ("ts-1a2b3c4d5e6f0032-0", "ws-other"),
+            ] {
+                start_session(
+                    &gen1,
+                    &json!({
+                        "uid": uid,
+                        "session_type": "bash",
+                        "workspace_id": ws,
+                        "working_dir": wt.to_str().unwrap(),
+                        "worktree_path": wt.to_str().unwrap(),
+                        "label": uid,
+                        "argv": ["/bin/sleep", "120"],
+                    }),
+                )
+                .expect("start_session ok");
+            }
+            {
+                let st = gen1.lock().unwrap();
+                assert_eq!(
+                    crate::control::auth::check_session_caller(
+                        &st,
+                        "ts-1a2b3c4d5e6f0031-0",
+                        "ts-1a2b3c4d5e6f0032-0",
+                    ),
+                    crate::control::auth::AuthDecision::OutOfScope,
+                    "ungranted: the other workspace is out of scope",
+                );
+            }
+            set_global_perms(
+                &gen1,
+                &json!({ "uid": "ts-1a2b3c4d5e6f0031-0", "global_perms": true }),
+            )
+            .expect("grant ok");
+            // "Restart": generation 1 dies WITHOUT any further lifecycle
+            // event (no spawn/exit to incidentally re-persist). Snapshot
+            // the registry as it stood at the grant and pin it back
+            // after the kill, so the teardown's own exit hooks can't
+            // rewrite the file this test is about.
+            let at_grant = std::fs::read_to_string(&path).unwrap();
+            kill_all_sessions(&gen1);
+            drop(gen1);
+            std::fs::write(&path, &at_grant).unwrap();
+
+            // Generation 2: rebuild from the durable registry alone.
+            let gen2 = make_state_arc();
+            gen2.lock().unwrap().daemon_sessions_path = Some(path.clone());
+            restore_sessions(&gen2);
+            let st = gen2.lock().unwrap();
+            let restored = st
+                .sessions
+                .get("ts-1a2b3c4d5e6f0031-0")
+                .expect("granted session restored at its same uid");
+            assert!(
+                restored.global_perms,
+                "a grant issued while the daemon ran must survive its restart",
+            );
+            assert!(
+                st.sessions.contains_key("ts-1a2b3c4d5e6f0032-0"),
+                "target restored too",
+            );
+            assert_eq!(
+                crate::control::auth::check_session_caller(
+                    &st,
+                    "ts-1a2b3c4d5e6f0031-0",
+                    "ts-1a2b3c4d5e6f0032-0",
+                ),
+                crate::control::auth::AuthDecision::Allow,
+                "the restored grant must authorize cross-workspace reach with \
+                 no re-grant",
+            );
+            drop(st);
+            kill_all_sessions(&gen2);
         });
     }
 
