@@ -36,7 +36,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::continuous::runlog::{ContinuousRunLog, RunLogLine};
-use crate::continuous::task::{self, ContinuousTask, RunStatus, Schedule};
+use crate::continuous::task::{
+    self, AccountBlockKind, AccountBlockRecord, ContinuousTask, RunStatus, Schedule,
+};
 use crate::control::protocol::Caller;
 use crate::state::DaemonState;
 use crate::workflow::poller::PanicRecord;
@@ -113,6 +115,13 @@ const AUTH_REALERT_SECS: u64 = 6 * 3600;
 /// `~/.claude/.credentials.json`.
 const CREDS_CHECK_INTERVAL_SECS: u64 = 60;
 
+/// Short not-before floor after an account recovery. `kill_session` signals the
+/// poisoned process synchronously but its reaper removes the registry entry
+/// asynchronously; this keeps a due fire from racing prompt delivery into the
+/// dying PTY. Persistent supervision can still respawn as soon as death is
+/// observed.
+const ACCOUNT_RECOVERY_SETTLE_SECS: u64 = 5;
+
 /// Post-compact settle spacing (seconds). A compact-only fire delivers
 /// `/compact`, whose summarization turn is async and can outlast a few
 /// minutes; a prompt pasted into the PTY mid-summarization is DROPPED by the
@@ -175,10 +184,10 @@ pub struct ContinuousScheduler {
     /// due-check between API polls ([`QUEUE_DEPTH_CACHE_TTL_SECS`]). In-memory
     /// only — a restart just re-polls.
     queue_depths: Mutex<HashMap<String, (u64, u64)>>,
-    /// Auth/wedge transcript-probe throttle: `task_id -> last probe ts`
+    /// Account-block/wedge transcript-probe throttle: `task_id -> last probe ts`
     /// ([`TAIL_PROBE_INTERVAL_SECS`]). In-memory only.
     probe_at: Mutex<HashMap<String, u64>>,
-    /// Auth-expiry alert cooldown latch: `task_id -> last alert ts`
+    /// Account-block alert cooldown latch: `task_id -> last alert ts`
     /// ([`AUTH_REALERT_SECS`]); cleared when the task's transcript shows a
     /// healthy (non-auth-error) tail again. In-memory only — a restart
     /// re-alerts a still-dead session once, which is the desired behavior.
@@ -391,14 +400,14 @@ impl ContinuousScheduler {
         // (no auto-act); off unless `persistent_max_stall_secs` is configured.
         self.persistent_stall_pass(&tasks, now);
 
-        // (c.3b) AUTH-EXPIRY + CONSUMER-WEDGE — transcript-tail ground truth
+        // (c.3b) ACCOUNT-BLOCK + CONSUMER-WEDGE — transcript-tail ground truth
         // for the two failure shapes the 2026-08-03 incident proved invisible:
-        // an auth-dead session (every fire guaranteed dead → push-alert, run
-        // deliberately left Running) and a Consumer run whose session ended
+        // an auth/usage-dead session (every fire guaranteed dead → hold until a
+        // newer end-to-end probe proves recovery) and a Consumer run whose session ended
         // its turn without report_done (auto-close so the due-gate refires,
         // bounded by the wedge-close limit). A closed run is picked up by the
         // NEXT tick's disk load — this tick's `tasks` snapshot predates it.
-        self.auth_wedge_pass(&tasks, now);
+        acted.extend(self.auth_wedge_pass(&tasks, now));
 
         // (c.3c) CREDENTIALS PREFLIGHT — a truncated/invalid
         // ~/.claude/.credentials.json makes every claude fire dead before any
@@ -816,15 +825,15 @@ impl ContinuousScheduler {
     ///
     /// Per task with a `Running` run on a LIVE claude session:
     ///
-    ///   1. **Auth expiry** (any schedule / run mode): the newest assistant
-    ///      record is a synthetic `authentication_failed` message → runlog
-    ///      `"auth_expired"` + operator push alert (per-task
-    ///      [`AUTH_REALERT_SECS`] cooldown; healthy tail clears it). The run
-    ///      is deliberately LEFT `Running`: every subsequent fire is
-    ///      guaranteed dead, and for a Consumer the run-active due-gate is
-    ///      the only thing preventing fires from claiming+acking queue items
-    ///      into a dead session. Recovery is the operator's `/login` +
-    ///      `continuous.force_done` (the alert says exactly that).
+    ///   1. **Account blocker** (any schedule / run mode): the newest assistant
+    ///      record is either synthetic `authentication_failed` or Claude's
+    ///      first-person weekly/usage-limit banner → durable `account_blocked`
+    ///      marker + attributed runlog + operator push alert. The run is
+    ///      deliberately LEFT `Running`: every subsequent fire is guaranteed
+    ///      dead, and for a Consumer the run-active due-gate is the only thing
+    ///      preventing fires from claiming+acking queue items into a dead
+    ///      session. After `/login`, a newer successful end-to-end usage probe
+    ///      automatically retires the poisoned run/session and reopens fires.
     ///   2. **Run wedge** (EVERY schedule, both run modes — wedge campaign
     ///      F2; Consumer-only before 2026-08): the tail shows a COMPLETED
     ///      turn (or a delivered-but-unanswered prompt) and NOTHING has
@@ -847,7 +856,7 @@ impl ContinuousScheduler {
     /// A `MidTurn` tail (newest record is a healthy assistant record, e.g. a
     /// long blocking tool call) is never touched. LOCK DISCIPLINE: brief
     /// probes only; `task::modify` / notify spawns run lock-free.
-    fn auth_wedge_pass(&self, tasks: &[ContinuousTask], now: u64) {
+    fn auth_wedge_pass(&self, tasks: &[ContinuousTask], now: u64) -> HashSet<String> {
         use crate::continuous::probe::{self, TailShape};
 
         let (grace, wedge_limit, notify_cmd) = {
@@ -859,6 +868,7 @@ impl ContinuousScheduler {
             )
         };
 
+        let mut held = HashSet::new();
         for tk in tasks {
             // Claude-only: the tail shapes (turn_duration records, the
             // authentication_failed marker) are claude-code transcript vocab.
@@ -874,11 +884,6 @@ impl ContinuousScheduler {
             let Some(uid) = run.session_uid.as_deref() else {
                 continue;
             };
-            // A DEAD session's run is handle_session_exit / reconcile_orphans
-            // territory.
-            if self.session_is_dead(uid) {
-                continue;
-            }
             // Per-task probe throttle.
             {
                 let mut probes = self.probe_at.lock().unwrap_or_else(|p| p.into_inner());
@@ -887,6 +892,42 @@ impl ContinuousScheduler {
                     continue;
                 }
                 probes.insert(tk.task_id.clone(), now);
+            }
+
+            // A durable account block survives daemon re-exec and remains the
+            // authority even if `/login` bookkeeping has changed the newest
+            // transcript tail. Do not infer recovery from structurally-valid
+            // credentials: the old, limited account's token is valid too. A
+            // later end-to-end probe must complete successfully.
+            if let Some(block) = active_account_block(tk) {
+                held.insert(tk.task_id.clone());
+                if self.account_recovery_proven(block) {
+                    self.recover_account_block(
+                        tk,
+                        run.seq,
+                        uid,
+                        block,
+                        notify_cmd.as_deref(),
+                        now,
+                    );
+                } else {
+                    self.surface_account_block(
+                        tk,
+                        run.seq,
+                        uid,
+                        block.kind,
+                        &block.detail,
+                        notify_cmd.as_deref(),
+                        now,
+                    );
+                }
+                continue;
+            }
+
+            // Without a durable marker, a DEAD session's run is
+            // handle_session_exit / reconcile_orphans territory.
+            if self.session_is_dead(uid) {
+                continue;
             }
             // No transcript bound yet / unreadable → can't judge, skip.
             let Some(path) = self.session_transcript_path(uid) else {
@@ -899,9 +940,52 @@ impl ContinuousScheduler {
                 continue;
             };
 
-            // --- 1. auth expiry (any schedule) ---
-            if let Some(banner) = tail.auth_error.as_deref() {
-                self.surface_auth_expiry(tk, run.seq, uid, banner, notify_cmd.as_deref(), now);
+            // --- 1. account blocker (any schedule) ---
+            let blocker = tail
+                .auth_error
+                .as_deref()
+                .map(|banner| (AccountBlockKind::AuthExpired, banner))
+                .or_else(|| {
+                    tail.usage_limit
+                        .as_deref()
+                        .map(|banner| (AccountBlockKind::UsageLimited, banner))
+                });
+            if let Some((kind, banner)) = blocker {
+                held.insert(tk.task_id.clone());
+                let block = AccountBlockRecord {
+                    run_seq: run.seq,
+                    session_uid: uid.to_string(),
+                    detected_at: now,
+                    kind,
+                    detail: banner.to_string(),
+                };
+                let mut recorded = false;
+                if let Err(e) = task::modify(&tk.task_id, |t| {
+                    if t.last_run.as_ref().is_some_and(|current| {
+                        current.seq == run.seq
+                            && current.status == RunStatus::Running
+                            && current.session_uid.as_deref() == Some(uid)
+                    }) {
+                        t.account_blocked = Some(block.clone());
+                        recorded = true;
+                    }
+                }) {
+                    eprintln!(
+                        "cm-daemon: failed to persist account blocker for {}: {}",
+                        tk.task_id, e,
+                    );
+                }
+                if recorded {
+                    self.surface_account_block(
+                        tk,
+                        run.seq,
+                        uid,
+                        kind,
+                        banner,
+                        notify_cmd.as_deref(),
+                        now,
+                    );
+                }
                 // NEVER fall through to the wedge close: the blocked due-gate
                 // is protecting queue items from dead fires.
                 continue;
@@ -945,15 +1029,17 @@ impl ContinuousScheduler {
                 self.close_wedged_run(tk, run.seq, uid, quiet_secs, wedge_limit, notify_cmd.as_deref(), now);
             }
         }
+        held
     }
 
-    /// Auth-expiry surfacing: runlog `"auth_expired"` + push alert, at most
-    /// once per [`AUTH_REALERT_SECS`] per task while the condition persists.
-    fn surface_auth_expiry(
+    /// Account-block surfacing: attributed runlog + push alert, at most once per
+    /// [`AUTH_REALERT_SECS`] per task while the condition persists.
+    fn surface_account_block(
         &self,
         tk: &ContinuousTask,
         seq: u64,
         uid: &str,
+        kind: AccountBlockKind,
         banner: &str,
         notify_cmd: Option<&str>,
         now: u64,
@@ -966,22 +1052,27 @@ impl ContinuousScheduler {
             }
             latch.insert(tk.task_id.clone(), now);
         }
+        let (kind_label, event) = match kind {
+            AccountBlockKind::AuthExpired => ("AUTH EXPIRED", "auth_expired"),
+            AccountBlockKind::UsageLimited => ("USAGE LIMITED", "usage_limited"),
+        };
         crate::notify::notify_operator(
             notify_cmd,
-            "auth-expired",
+            "account-blocked",
             &format!(
-                "claude auth EXPIRED: continuous task '{}' (session {}) ended its turn \
-                 with \"{}\". Every scheduled fire is dead until /login is re-run on the \
-                 daemon host. Run seq {} is left Running to block further fires; after \
-                 re-login, close it with continuous.force_done(task_id=\"{}\", seq={}).",
-                tk.task_id, uid, banner, seq, tk.task_id, seq,
+                "claude account {}: continuous task '{}' (session {}) ended its turn \
+                 with \"{}\". Run seq {} is left Running to block further fires and \
+                 protect queued work. After /login, recovery is automatic once \
+                 ~/.cm/claude-probe-state.json records a newer successful check \
+                 (continuous.force_done remains the break-glass fallback).",
+                kind_label, tk.task_id, uid, banner, seq,
             ),
         );
         if let Err(e) = ContinuousRunLog::append(&RunLogLine {
             seq,
             ts: now as f64,
             task_id: tk.task_id.clone(),
-            event: "auth_expired".to_string(),
+            event: event.to_string(),
             fire_token: tk.last_run.as_ref().map(|r| r.fire_token.clone()),
             session_uid: Some(uid.to_string()),
             run_mode: None,
@@ -990,10 +1081,224 @@ impl ContinuousScheduler {
             detail: Some(banner.to_string().into()),
         }) {
             eprintln!(
-                "cm-daemon: failed to append \"auth_expired\" audit line for {}: {}",
+                "cm-daemon: failed to append {:?} account-block audit line for {}: {}",
+                kind, tk.task_id, e,
+            );
+        }
+    }
+
+    /// Positive recovery proof comes from the host's end-to-end
+    /// `claude-usage-probe`, not from credential-file shape. The latter cannot
+    /// distinguish a fresh account from a perfectly-valid exhausted account.
+    fn account_recovery_proven(&self, block: &AccountBlockRecord) -> bool {
+        let path = crate::path::dot_cm_dir().join("claude-probe-state.json");
+        crate::continuous::probe::usage_probe_ok_after(&path, block.detected_at)
+    }
+
+    /// Retire the poisoned run and kill its old session after a later probe has
+    /// actually completed a Claude request. The seq/uid/status/block guards make
+    /// a concurrent report_done or newer fire win. The scheduler skips this task
+    /// for the rest of the current tick; persistent supervision respawns it once
+    /// the kill is observed, while Fresh schedules become eligible normally.
+    fn recover_account_block(
+        &self,
+        tk: &ContinuousTask,
+        seq: u64,
+        uid: &str,
+        block: &AccountBlockRecord,
+        notify_cmd: Option<&str>,
+        now: u64,
+    ) {
+        // Consumer items were acked when the poisoned prompt was delivered.
+        // Re-enqueue the staged batch BEFORE releasing the run hold; retries
+        // are idempotent through the original (or synthesized) dedupe key.
+        let replayed = match self.replay_account_blocked_consumer_batch(tk, seq) {
+            Ok(replayed) => replayed,
+            Err(e) => {
+                eprintln!(
+                    "cm-daemon: account healthy but recovery for {} seq {} is \
+                     deferred because its staged Consumer batch could not be \
+                     replayed: {}",
+                    tk.task_id, seq, e,
+                );
+                return;
+            }
+        };
+        let mut recovered = false;
+        let updated = task::modify(&tk.task_id, |t| {
+            let block_matches = t.account_blocked.as_ref().is_some_and(|current| {
+                current.run_seq == seq && current.session_uid == uid
+            });
+            if block_matches {
+                if let Some(run) = t.last_run.as_mut() {
+                    if run.seq == seq
+                        && run.status == RunStatus::Running
+                        && run.session_uid.as_deref() == Some(uid)
+                    {
+                        run.status = RunStatus::Failed;
+                        run.finished_at = Some(now);
+                        t.account_blocked = None;
+                        t.consecutive_wedge_closes = 0;
+                        t.next_fire_at = t
+                            .next_fire_at
+                            .max(now.saturating_add(ACCOUNT_RECOVERY_SETTLE_SECS));
+                        recovered = true;
+                    }
+                }
+            }
+        });
+        let Ok(updated) = updated else {
+            eprintln!(
+                "cm-daemon: failed to persist account recovery for {} seq {}",
+                tk.task_id, seq,
+            );
+            return;
+        };
+        if !recovered {
+            return;
+        }
+
+        // Best-effort. A concurrent/natural exit is already sufficient; the
+        // terminal run flip above prevents its reaper from overwriting Failed.
+        let _ = crate::control::methods::kill_session(
+            &self.state,
+            &serde_json::json!({ "session_uid": uid }),
+            None,
+        );
+        self.auth_alerts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&tk.task_id);
+
+        crate::notify::notify_operator(
+            notify_cmd,
+            "account-recovered",
+            &format!(
+                "claude account RECOVERED: end-to-end probe succeeded after {:?} \
+                 blocked continuous task '{}' run seq {}. Retired poisoned session {} \
+                 and marked the run Failed; replayed {} staged Consumer item(s); {}.",
+                block.kind,
+                tk.task_id,
+                seq,
+                uid,
+                replayed,
+                if tk.run_mode == task::RunMode::Persistent && tk.supervise {
+                    "supervision will respawn and re-fire it automatically"
+                } else {
+                    "the schedule may fire a clean run after the 5s settle window"
+                },
+            ),
+        );
+        if let Err(e) = ContinuousRunLog::append(&RunLogLine {
+            seq,
+            ts: now as f64,
+            task_id: tk.task_id.clone(),
+            event: "account_recovered".to_string(),
+            fire_token: updated.last_run.as_ref().map(|r| r.fire_token.clone()),
+            session_uid: Some(uid.to_string()),
+            run_mode: Some(match tk.run_mode {
+                task::RunMode::Fresh => "fresh".to_string(),
+                task::RunMode::Persistent => "persistent".to_string(),
+            }),
+            trigger_source: Some(SCHEDULER_CALLER_TOKEN.to_string()),
+            status: Some("failed".to_string()),
+            detail: Some(
+                format!(
+                    "newer end-to-end Claude probe succeeded after {:?}; replayed {} \
+                     staged Consumer item(s); poisoned run retired and session killed",
+                    block.kind, replayed,
+                )
+                .into(),
+            ),
+        }) {
+            eprintln!(
+                "cm-daemon: failed to append account_recovered audit line for {}: {}",
                 tk.task_id, e,
             );
         }
+    }
+
+    /// Re-enqueue the batch whose prompt received an auth/usage turn-ender.
+    /// Consumer v1 acknowledges on delivery, so by the time the blocker is
+    /// visible these rows are already `consumed`; the API's claimed→pending
+    /// `requeue` endpoint cannot recover them. The staged file is therefore the
+    /// durable recovery source. Original dedupe keys are preserved; an item
+    /// without one gets a stable key derived from its original UUID so a
+    /// partial replay can retry without duplication.
+    fn replay_account_blocked_consumer_batch(
+        &self,
+        tk: &ContinuousTask,
+        seq: u64,
+    ) -> Result<usize, String> {
+        let Schedule::Consumer { queue, .. } = &tk.schedule else {
+            return Ok(0);
+        };
+        let path = std::path::Path::new(&tk.worktree_path)
+            .join(".queue")
+            .join(format!("batch-{}.json", seq));
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("read staged batch {}: {}", path.display(), e))?;
+        let doc: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("parse staged batch {}: {}", path.display(), e))?;
+        if doc.get("queue").and_then(|v| v.as_str()) != Some(queue.as_str())
+            || doc.get("task_id").and_then(|v| v.as_str()) != Some(tk.task_id.as_str())
+            || doc.get("seq").and_then(|v| v.as_u64()) != Some(seq)
+        {
+            return Err(format!(
+                "staged batch {} identity does not match task={} queue={} seq={}",
+                path.display(),
+                tk.task_id,
+                queue,
+                seq,
+            ));
+        }
+        let items: Vec<crate::continuous::queue::QueueItem> = serde_json::from_value(
+            doc.get("items")
+                .cloned()
+                .ok_or_else(|| format!("staged batch {} has no items", path.display()))?,
+        )
+        .map_err(|e| format!("decode staged batch {} items: {}", path.display(), e))?;
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let (api_url, api_token) = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            (s.config.api_url.clone(), s.config.api_token.clone())
+        };
+        let client = crate::continuous::queue::QueueClient::from_overrides(
+            Some(&api_url),
+            Some(&api_token),
+        )
+        .map_err(|e| e.to_method_err().1)?;
+        for item in &items {
+            let stable_dedupe = item
+                .dedupe_key
+                .clone()
+                .unwrap_or_else(|| format!("cm-account-replay:{}:{}", tk.task_id, item.id));
+            let result = client
+                .enqueue(
+                    queue,
+                    &item.payload,
+                    Some(&stable_dedupe),
+                    item.source.as_deref(),
+                )
+                .map_err(|e| e.to_method_err().1)?;
+            let accepted = result
+                .get("enqueued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || result
+                    .get("deduped")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            if !accepted {
+                return Err(format!(
+                    "queue replay for original item {} returned neither enqueued nor deduped: {}",
+                    item.id, result,
+                ));
+            }
+        }
+        Ok(items.len())
     }
 
     /// Wedge auto-close: `Running → Failed` (guarded on seq/uid/status so a
@@ -1020,6 +1325,7 @@ impl ContinuousScheduler {
                     run.status = RunStatus::Failed;
                     run.finished_at = Some(now);
                     t.consecutive_wedge_closes = t.consecutive_wedge_closes.saturating_add(1);
+                    t.account_blocked = None;
                     closes = t.consecutive_wedge_closes;
                     closed = true;
                 }
@@ -1267,6 +1573,7 @@ impl ContinuousScheduler {
                         lr.finished_at = Some(now);
                     }
                 }
+                t.account_blocked = None;
                 t.in_flight = None;
             });
             if let Err(e) = ContinuousRunLog::append(&RunLogLine {
@@ -1536,17 +1843,31 @@ impl ContinuousScheduler {
     }
 }
 
+/// A durable account block is active only while it still names the current
+/// `Running` run. Stale markers from an older terminal run are inert and the
+/// next successful fire clears them.
+fn active_account_block(tk: &ContinuousTask) -> Option<&AccountBlockRecord> {
+    let run = tk.last_run.as_ref()?;
+    let block = tk.account_blocked.as_ref()?;
+    (run.status == RunStatus::Running
+        && block.run_seq == run.seq
+        && run.session_uid.as_deref() == Some(block.session_uid.as_str()))
+    .then_some(block)
+}
+
 /// Phase (c) predicate: a supervision candidate is an enabled, un-paused,
-/// supervised `Persistent` task with no in-flight fire. (Liveness of its pinned
-/// session is probed separately by the caller.) A task with no
-/// `current_session_uid` has never fired — supervision restarts a session that
-/// died, it does not bootstrap one, so the caller also requires a uid.
+/// supervised `Persistent` task with no in-flight fire or active account hold.
+/// (Liveness of its pinned session is probed separately by the caller.) A task
+/// with no `current_session_uid` has never fired — supervision restarts a
+/// session that died, it does not bootstrap one, so the caller also requires a
+/// uid.
 fn should_supervise(tk: &ContinuousTask) -> bool {
     tk.run_mode == task::RunMode::Persistent
         && tk.supervise
         && tk.enabled
         && !tk.paused
         && tk.in_flight.is_none()
+        && active_account_block(tk).is_none()
 }
 
 /// Phase 3b DUE-SKIP-ACTIVE predicate: a FRESH task whose most recent run is
@@ -1572,6 +1893,9 @@ fn fresh_run_active(tk: &ContinuousTask) -> bool {
 /// tasks keep the Phase-3b fresh-only semantics. `pub(crate)` so the trigger
 /// compact-boundary regression tests can assert the gate directly.
 pub(crate) fn run_active_blocks_fire(tk: &ContinuousTask) -> bool {
+    if active_account_block(tk).is_some() {
+        return true;
+    }
     if matches!(tk.schedule, Schedule::Consumer { .. }) {
         return tk
             .last_run
@@ -2800,6 +3124,7 @@ mod tests {
     const T_TOOL_USE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#;
     const T_TURN_END: &str = r#"{"type":"system","subtype":"turn_duration","durationMs":10}"#;
     const T_AUTH_401: &str = r#"{"type":"assistant","error":"authentication_failed","isApiErrorMessage":true,"message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Login expired · Please run /login"}]}}"#;
+    const T_WEEKLY_LIMIT: &str = r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your weekly limit · resets Aug 25, 3pm (UTC)"}]}}"#;
 
     /// Live session + transcript with the given lines; binds the transcript to
     /// the session and returns the file's real mtime (unix secs) — test `now`
@@ -2894,6 +3219,136 @@ mod tests {
             sched.auth_wedge_pass(&task::load_all(), now + AUTH_REALERT_SECS + 1);
             let runs3 = std::fs::read_to_string(task::runs_log_path("authdead")).unwrap();
             assert_eq!(runs3.matches("\"auth_expired\"").count(), 2, "{}", runs3);
+        });
+    }
+
+    /// The 2026-08-22 incident shape was NOT `authentication_failed`: Claude
+    /// emitted an ordinary assistant weekly-limit banner. It must create a
+    /// durable account hold immediately, block both due-fire and persistent
+    /// supervision, and remain held while the end-to-end probe is limited.
+    /// Once a later probe records OK (the fresh-account `/login` path), the
+    /// poisoned run/session are retired automatically and scheduling reopens.
+    #[test]
+    fn weekly_limit_holds_until_newer_probe_ok_then_recovers() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let uid = "ts-weekly-limited-0";
+            let mtime = bind_transcript(
+                &state,
+                uid,
+                "weekly.jsonl",
+                &[T_USER, T_WEEKLY_LIMIT, T_TURN_END],
+            );
+            let detected_at = mtime + 10;
+            let mut t = running_consumer("weekly", uid, RunMode::Persistent, 12, mtime);
+            t.supervise = true;
+            let worktree = std::path::Path::new(&std::env::var("HOME").unwrap()).join("worktree");
+            t.worktree_path = worktree.to_string_lossy().into_owned();
+            let batch_dir = worktree.join(".queue");
+            std::fs::create_dir_all(&batch_dir).unwrap();
+            std::fs::write(
+                batch_dir.join("batch-12.json"),
+                r#"{
+                    "queue":"q",
+                    "task_id":"weekly",
+                    "seq":12,
+                    "items":[{
+                        "id":"11111111-1111-1111-1111-111111111111",
+                        "payload":{"event":"must-not-be-lost"},
+                        "dedupe_key":"event-1",
+                        "source":"producer",
+                        "enqueued_at":"2026-08-22T00:00:00+00:00"
+                    }]
+                }"#,
+            )
+            .unwrap();
+            task::save(&t).expect("save");
+
+            let held = sched.auth_wedge_pass(&task::load_all(), detected_at);
+            assert!(held.contains("weekly"), "same-tick fire must be suppressed");
+            let blocked = task::load_one("weekly").unwrap();
+            assert_eq!(
+                blocked.last_run.as_ref().unwrap().status,
+                RunStatus::Running,
+                "limited run remains Running to protect the queue",
+            );
+            let block = blocked.account_blocked.as_ref().expect("durable hold");
+            assert_eq!(block.kind, AccountBlockKind::UsageLimited);
+            assert_eq!(block.detected_at, detected_at);
+            assert!(run_active_blocks_fire(&blocked));
+            assert!(!should_supervise(&blocked));
+            let runs = std::fs::read_to_string(task::runs_log_path("weekly")).unwrap();
+            assert_eq!(runs.matches("\"usage_limited\"").count(), 1, "{}", runs);
+
+            let probe_state = crate::path::dot_cm_dir().join("claude-probe-state.json");
+            std::fs::create_dir_all(probe_state.parent().unwrap()).unwrap();
+            std::fs::write(
+                &probe_state,
+                format!(
+                    r#"{{"status":"USAGE_LIMITED","checked_at":{}}}"#,
+                    detected_at + 1,
+                ),
+            )
+            .unwrap();
+            sched.auth_wedge_pass(
+                &task::load_all(),
+                detected_at + TAIL_PROBE_INTERVAL_SECS + 1,
+            );
+            assert_eq!(
+                task::load_one("weekly").unwrap().last_run.unwrap().status,
+                RunStatus::Running,
+                "a newer but still-limited probe is not recovery proof",
+            );
+
+            let recovered_at = detected_at + 2 * TAIL_PROBE_INTERVAL_SECS + 2;
+            let (port, replay_request) = crate::planning_client::spawn_stub_api_for_test(
+                200,
+                r#"{"enqueued":true,"deduped":false,"id":"replay-1","depth":1}"#,
+            );
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", port);
+                s.config.api_token = "replay-token".to_string();
+            }
+            std::fs::write(
+                &probe_state,
+                format!(
+                    r#"{{"status":"OK","checked_at":{}}}"#,
+                    recovered_at,
+                ),
+            )
+            .unwrap();
+            let held = sched.auth_wedge_pass(&task::load_all(), recovered_at);
+            assert!(held.contains("weekly"), "recovery tick also suppresses due-fire");
+
+            let recovered = task::load_one("weekly").unwrap();
+            assert_eq!(recovered.last_run.as_ref().unwrap().status, RunStatus::Failed);
+            assert_eq!(
+                recovered.last_run.as_ref().unwrap().finished_at,
+                Some(recovered_at),
+            );
+            assert!(recovered.account_blocked.is_none());
+            assert!(!run_active_blocks_fire(&recovered));
+            assert!(should_supervise(&recovered));
+            assert!(
+                recovered.next_fire_at >= recovered_at + ACCOUNT_RECOVERY_SETTLE_SECS,
+                "old PTY gets a kill/reap settle window",
+            );
+            let runs = std::fs::read_to_string(task::runs_log_path("weekly")).unwrap();
+            assert_eq!(runs.matches("\"account_recovered\"").count(), 1, "{}", runs);
+            assert!(runs.contains("replayed 1 staged Consumer item"), "{}", runs);
+            let request = replay_request.lock().unwrap();
+            let (method, path) = request.method_and_path();
+            assert_eq!(method, "POST");
+            assert_eq!(path, "/queues/q/items");
+            assert_eq!(request.auth_header().as_deref(), Some("Bearer replay-token"));
+            let body: serde_json::Value = serde_json::from_str(
+                request.raw.split("\r\n\r\n").nth(1).unwrap_or("{}"),
+            )
+            .unwrap();
+            assert_eq!(body["payload"]["event"], "must-not-be-lost");
+            assert_eq!(body["dedupe_key"], "event-1");
         });
     }
 

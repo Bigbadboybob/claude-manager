@@ -1416,6 +1416,7 @@ pub(crate) fn close_continuous_run_for_exit(
                 if terminal_status == crate::continuous::task::RunStatus::Done {
                     t.consecutive_wedge_closes = 0;
                 }
+                t.account_blocked = None;
                 flipped = Some((run.seq, run.fire_token.clone()));
             }
         }
@@ -11086,6 +11087,10 @@ pub fn trigger(
         t.run_count = t.run_count.saturating_add(1);
         t.last_fired_at = started_at;
         t.in_flight = None;
+        // A new run supersedes any durable auth/usage hold attached to the
+        // prior run. Normally the scheduler clears it before refiring; this is
+        // defense-in-depth for operator/manual fires and stale old state.
+        t.account_blocked = None;
         // Phase 3b: every new FRESH fire starts a clean stuck-story. The
         // watchdog's cap counter and any prior investigator binding belong to
         // the run that just ended, not this one — reset them here (the single
@@ -11387,6 +11392,7 @@ pub fn report_done(
                 // A clean completion ends any wedge streak — the scheduler's
                 // consumer-wedge close limit counts CONSECUTIVE wedges only.
                 t.consecutive_wedge_closes = 0;
+                t.account_blocked = None;
                 marked = true;
             }
         }
@@ -11503,6 +11509,7 @@ pub fn continuous_force_done(
                 // Operator intervention resets the scheduler's consumer-wedge
                 // streak (same as a clean report_done).
                 t.consecutive_wedge_closes = 0;
+                t.account_blocked = None;
                 marked = true;
             }
         }
@@ -12692,7 +12699,7 @@ pub fn continuous_update(
 ///
 /// Returns `{ tasks: [ { task_id, label, project, host_id, engine, run_mode,
 /// schedule, enabled, paused, run_count, current_session_uid, in_flight,
-/// next_fire_at, last_fired_at, last_outcome, last_run, review_kind,
+/// next_fire_at, last_fired_at, last_outcome, last_run, account_blocked, review_kind,
 /// review_surface }, … ] }`.
 pub fn continuous_list(
     _state_arc: &Arc<Mutex<DaemonState>>,
@@ -12721,6 +12728,10 @@ pub fn continuous_list(
                 // (`Running`/`Done`/`Failed`/…); `null` before the first fire.
                 "last_outcome": t.last_run.as_ref().map(|r| r.status),
                 "last_run": t.last_run,
+                // Durable Claude auth/usage hold on the active run, including
+                // the exact seq/uid and when positive recovery proof must be
+                // newer than. `null` outside an account-block episode.
+                "account_blocked": t.account_blocked,
                 // Config-driven review discovery: which tasks `/triage-review`
                 // handles, and fix-first vs investigate-first. `null` = not
                 // reviewable via triage-review.
@@ -28539,6 +28550,7 @@ mod tests {
             assert_eq!(t["run_count"], json!(0));
             assert_eq!(t["in_flight"], json!(false));
             assert_eq!(t["last_outcome"], Value::Null, "no run yet");
+            assert_eq!(t["account_blocked"], Value::Null, "no account hold");
             // schedule defaults to on_demand (internally-tagged on `kind`).
             assert_eq!(t["schedule"]["kind"], json!("on_demand"));
         });

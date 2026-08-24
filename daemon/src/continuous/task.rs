@@ -139,6 +139,30 @@ pub struct RunRecord {
     pub trigger_source: String,
 }
 
+/// Why a Claude continuous run is being held instead of re-fired. Account
+/// blockers are host-global: retrying the same account cannot make progress,
+/// and a Consumer retry would claim + acknowledge another queue batch before
+/// the agent reaches any task code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountBlockKind {
+    AuthExpired,
+    UsageLimited,
+}
+
+/// Durable account-block episode attached to the currently `Running` run.
+/// The scheduler keeps this across daemon re-execs so a successful `/login`
+/// can be proved by a *later* end-to-end usage-probe check before the poisoned
+/// session/run is retired.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountBlockRecord {
+    pub run_seq: u64,
+    pub session_uid: String,
+    pub detected_at: u64,
+    pub kind: AccountBlockKind,
+    pub detail: String,
+}
+
 /// Retention policy. `keep_sessions = None` means keep-all (Phase 2 default;
 /// the prune is a later, default-off addition).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -260,6 +284,13 @@ pub struct ContinuousTask {
     /// session exit, and an operator `continuous.force_done`.
     #[serde(default)]
     pub consecutive_wedge_closes: u32,
+    /// A transcript-proven Claude auth/usage blocker on the active run. While
+    /// this record matches `last_run`, supervision and scheduled fires stay
+    /// blocked. The scheduler clears it only after the host usage probe proves
+    /// a healthy Claude request completed after `detected_at` (or when another
+    /// lifecycle path supersedes the run).
+    #[serde(default)]
+    pub account_blocked: Option<AccountBlockRecord>,
     /// Per-task override of the run-wedge close grace (seconds of post-turn
     /// silence before a `Running` run is judged wedged and auto-closed by
     /// `scheduler::auth_wedge_pass`). `None` (default) falls back to
@@ -351,6 +382,7 @@ impl ContinuousTask {
             consecutive_failures: 0,
             investigation_count: 0,
             consecutive_wedge_closes: 0,
+            account_blocked: None,
             wedge_grace_secs: None,
             investigator_uid: None,
             investigator_started_at: None,
