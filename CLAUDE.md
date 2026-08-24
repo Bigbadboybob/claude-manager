@@ -11,6 +11,8 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
   **Both daemons run the holder/brain SPLIT** (DESIGN_HOLDER_BRAIN_SPLIT — local migrated live 2026-08-20 and re-migrated 2026-08-24 after the merge to main; cm-manager migrated live 2026-08-24 at its systemd MainPID, `ExecStart=/opt/cm-daemon/cm-holder --brain /opt/cm-daemon/cm-daemon`, token via the `operator-token.env` drop-in): a tiny near-frozen `cm-holder` supervisor owns every session child, PTY master, and pidfd, and the `cm-daemon` **brain** (all the logic) is its child — brain crashes and deploys never touch sessions. The TUI launches the split via the `~/.cm/holder-binary` flip file (present = split, and it FAILS CLOSED: an empty/unreadable file refuses launch; delete it only after a reverse migration).
 
+  Operator guide: **`HOWTO_HOLDER_BRAIN_SPLIT.md`** (health surface, deploys per host, failure playbook, rare ops, the shared-target rule) with `scripts/cm-op [--ssh cm-manager] <method> [json]` as the RPC helper.
+
   **Restarting the daemon** (decision table, DESIGN_HOLDER_BRAIN_SPLIT § Operator decision table — pick the weakest primitive that covers the change):
 
   | Change | Primitive | Sessions |
