@@ -82,6 +82,9 @@ class SubmitBacktestLaptopTests(unittest.TestCase):
         self.assertEqual(vm["zone"], "us-east4-a")
         self.assertEqual(vm["machine_type"], "c2-standard-4")
         self.assertEqual(vm["image_family"], "cm-backtest-worker")
+        # No disk_type pinned on a default submission — the dispatcher's own
+        # CM_BACKTEST_DISK_TYPE default must stay in force.
+        self.assertNotIn("disk_type", vm)
 
         # run_key surfaced from the (server-minted) created row.
         self.assertEqual(result["run_key"], "20260707-smoke-abcd1234")
@@ -97,6 +100,40 @@ class SubmitBacktestLaptopTests(unittest.TestCase):
         self.assertEqual(vm["zone"], "us-east4-b")
         # Non-overridden defaults survive.
         self.assertEqual(vm["project"], "prediction-market-scalper")
+
+    def test_explicit_disk_type_lands_on_the_row(self):
+        fake = _FakePlanningClient()
+        self._submit(fake, disk_type="hyperdisk-balanced")
+        self.assertEqual(
+            fake.created["metadata"]["vm"]["disk_type"], "hyperdisk-balanced")
+
+    def test_c3_machine_type_auto_defaults_to_pd_balanced(self):
+        """A bare `machine_type="c3-standard-16"` must just work.
+
+        The dispatch lane's boot-disk default is pd-standard, which the C3
+        family cannot boot from — GCE rejects the insert outright, and the
+        failed claim used to retry at the head of its priority band forever
+        (cm bug 24e3d6ff). The submission carries a compatible disk instead.
+        """
+        for machine_type in ("c3-standard-16", "C3D-standard-8",
+                             "n4-standard-4", "h3-standard-88"):
+            with self.subTest(machine_type=machine_type):
+                fake = _FakePlanningClient()
+                self._submit(fake, machine_type=machine_type)
+                self.assertEqual(
+                    fake.created["metadata"]["vm"]["disk_type"], "pd-balanced")
+
+    def test_explicit_disk_type_wins_over_auto_compat(self):
+        fake = _FakePlanningClient()
+        self._submit(fake, machine_type="c3-standard-16", disk_type="pd-ssd")
+        self.assertEqual(fake.created["metadata"]["vm"]["disk_type"], "pd-ssd")
+
+    def test_pd_standard_capable_machine_types_stay_unpinned(self):
+        for machine_type in ("c2-standard-8", "e2-medium", "n2-highmem-4", ""):
+            with self.subTest(machine_type=machine_type):
+                fake = _FakePlanningClient()
+                self._submit(fake, machine_type=machine_type)
+                self.assertNotIn("disk_type", fake.created["metadata"]["vm"])
 
     def test_unknown_project_requires_repo_url(self):
         fake = _FakePlanningClient()
@@ -179,7 +216,29 @@ class SubmitBacktestHeadlessTests(unittest.TestCase):
         self.assertEqual(p["parent_task_id"], "parent-9")
         self.assertEqual(p["project"], "predictionTrading")
         self.assertNotIn("repo_url", p)  # omitted -> daemon resolves default
+        self.assertNotIn("disk_type", p)  # omitted -> daemon/dispatcher default
         self.assertEqual(result["run_key"], "20260707-smoke-deadbeef")
+
+    def test_disk_type_forwarded_to_daemon(self):
+        from mcp_server import server, control_client
+
+        captured: dict = {}
+
+        def fake_call(method, params, **kw):
+            captured["params"] = params
+            return {"task_id": "t-1", "run_key": "rk", "status": "backlog"}
+
+        with mock.patch.object(
+            server, "PlanningClient", side_effect=_raise_planning_unavailable
+        ), mock.patch.object(server, "_caller_task_id", return_value=None), \
+             mock.patch.object(control_client, "call", side_effect=fake_call):
+            server.submit_backtest(
+                branch="cm/feat", config="c.yaml",
+                machine_type="c3-standard-16", disk_type="pd-ssd",
+            )
+
+        self.assertEqual(captured["params"]["machine_type"], "c3-standard-16")
+        self.assertEqual(captured["params"]["disk_type"], "pd-ssd")
 
 
 class ReadBacktestResultTests(unittest.TestCase):

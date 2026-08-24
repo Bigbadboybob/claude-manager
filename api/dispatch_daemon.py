@@ -220,10 +220,44 @@ async def _launch_backtest_worker(pool, task):
     here are in-memory merges of the row we hold (PATCH replaces the
     whole JSONB object); the worker never writes metadata on the happy
     path, so there is no concurrent-writer hazard.
+
+    Two guards live on this path:
+      - boot-disk AUTO-COMPAT. The lane default is pd-standard, which the
+        c3/n4/h3-class families cannot boot from; a submission that named
+        only `machine_type` gets pd-balanced instead (an EXPLICIT
+        metadata.vm.disk_type is never rewritten). See
+        `dispatch.vm.resolve_disk_type`.
+      - deterministic launch failures BLOCK instead of requeueing. A
+        requeued row returns to the head of its priority band and retries
+        forever, starving the lane behind it (cm bug 24e3d6ff); capacity
+        failures still requeue. See `dispatch.vm.classify_launch_error`.
     """
+    from dispatch.vm import classify_launch_error, resolve_disk_type
+
     meta = dict(task.get("metadata") or {})
     bt = dict(meta.get("backtest") or {})
-    vm_over = {**BACKTEST_VM_DEFAULTS, **(meta.get("vm") or {})}
+    vm_meta = meta.get("vm") or {}
+    vm_over = {**BACKTEST_VM_DEFAULTS, **vm_meta}
+
+    merged_disk_type = vm_over.get("disk_type")
+    vm_over["disk_type"] = resolve_disk_type(
+        vm_over.get("machine_type") or "",
+        merged_disk_type,
+        # Only a value the SUBMITTER put on the row counts as explicit; the
+        # config default must stay auto-correctable.
+        explicit=bool(vm_meta.get("disk_type")),
+    )
+    if vm_over["disk_type"] != merged_disk_type:
+        reason = (
+            f"machine family cannot boot {merged_disk_type}"
+            if merged_disk_type else "no boot disk configured"
+        )
+        logger.info(
+            f"Backtest {task['id']}: boot disk {merged_disk_type!r} -> "
+            f"{vm_over['disk_type']!r} for machine_type "
+            f"{vm_over.get('machine_type')!r} ({reason}; pass an explicit "
+            f"disk_type on the submission to override)"
+        )
 
     # Preempt-requeue relaunch: the previous SPOT instance was STOPped, not
     # deleted (instance_termination_action="STOP"), and still exists. Names
@@ -248,6 +282,9 @@ async def _launch_backtest_worker(pool, task):
         bt["launched_at"] = datetime.now(timezone.utc).isoformat()
         meta["backtest"] = bt
         meta["vm"] = vm_over
+        # A retry that succeeds (operator fixed the machine/disk and
+        # requeued) must not keep advertising the old rejection.
+        meta.pop("launch_error", None)
         await db.update_task(
             pool, str(task["id"]),
             worker_vm=vm_name,
@@ -259,9 +296,61 @@ async def _launch_backtest_worker(pool, task):
             f"Backtest task {task['id']} -> VM {vm_name} ({external_ip}) "
             f"run_key={run_key}"
         )
-    except Exception:
-        logger.exception(f"Failed to launch backtest VM for task {task['id']}")
-        await db.update_task(pool, str(task["id"]), status="backlog")
+    except Exception as exc:
+        if classify_launch_error(exc) != "spec":
+            # Capacity/transient (quota, stockout, throttling, backend
+            # hiccup): unchanged behaviour — back to the queue, retry later.
+            logger.exception(
+                f"Failed to launch backtest VM for task {task['id']} "
+                f"(transient/capacity — requeueing)"
+            )
+            await db.update_task(pool, str(task["id"]), status="backlog")
+            return
+
+        # Deterministic spec rejection: the instance resource is invalid for
+        # this machine type / disk type / image. Requeueing puts the row
+        # straight back at the head of its priority band, where it fails
+        # identically every tick and blocks every backtest behind it
+        # (cm bug 24e3d6ff). Block it with the evidence instead.
+        now = datetime.now(timezone.utc)
+        logger.error(
+            f"Backtest {task['id']} VM spec rejected "
+            f"(machine_type={vm_over.get('machine_type')}, "
+            f"disk_type={vm_over.get('disk_type')}, zone={vm_over.get('zone')}): "
+            f"{exc} — blocking (a retry would fail identically and hold the "
+            f"head of the backtest queue)"
+        )
+        launch_error = {
+            "class": "spec",
+            "message": str(exc)[:2000],
+            "machine_type": vm_over.get("machine_type"),
+            "disk_type": vm_over.get("disk_type"),
+            "zone": vm_over.get("zone"),
+            "at": now.isoformat(),
+        }
+        meta["backtest"] = bt
+        meta["vm"] = vm_over
+        meta["launch_error"] = launch_error
+        await db.update_task(
+            pool, str(task["id"]),
+            status="blocked", blocked_at=now, metadata=meta,
+        )
+        # Same shape as the reaper's timeout artifact: gives
+        # get_backtest_result something to return instead of "no_result",
+        # and lets the auto-archive sweep eventually clear the row (it only
+        # sweeps terminal rows that HAVE an artifact).
+        try:
+            await db.add_task_artifact(
+                pool, str(task["id"]),
+                summary={"error": "vm-spec-rejected", "run_key": run_key,
+                         **launch_error},
+                partial=True,
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to record spec-rejection artifact for backtest "
+                f"{task['id']} (row is still blocked with metadata.launch_error)"
+            )
 
 
 def _launch_backtest_vm_sync(task, branch, bt, vm_over, run_key):

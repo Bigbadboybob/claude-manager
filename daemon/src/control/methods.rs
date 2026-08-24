@@ -14702,6 +14702,33 @@ fn default_backtest_project() -> String {
 /// `_BACKTEST_CONFIG_MAX_BYTES` in mcp_server/server.py.
 const BACKTEST_CONFIG_MAX_BYTES: usize = 32 * 1024;
 
+/// Machine families whose instances cannot boot from a `pd-standard` disk
+/// (GCE rejects the insert with a 400). The backtest lane's default boot
+/// disk IS pd-standard, so a submission that names only `machine_type`
+/// gets `pd-balanced` stamped on it here — a bare `machine_type:
+/// "c3-standard-16"` must just work.
+///
+/// Mirrors `dispatch/vm.py::NO_PD_STANDARD_FAMILIES` (authoritative, it is
+/// the last gate before the insert) and
+/// `mcp_server/server.py::_NO_PD_STANDARD_FAMILIES`. Keep the three in sync.
+const NO_PD_STANDARD_FAMILIES: &[&str] = &[
+    "c3", "c3d", "c4", "c4a", "c4d", "n4", "h3", "z3", "m4", "x4", "a3", "a4", "g2",
+];
+const PD_STANDARD_FALLBACK_DISK_TYPE: &str = "pd-balanced";
+
+/// Whether a machine type's family can boot a pd-standard disk. An
+/// unknown/empty family is assumed compatible: a stale list must never
+/// silently rewrite a working submission's disk type.
+fn machine_supports_pd_standard(machine_type: &str) -> bool {
+    let family = machine_type
+        .trim()
+        .split('-')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    !NO_PD_STANDARD_FAMILIES.contains(&family.as_str())
+}
+
 #[derive(Deserialize)]
 struct BacktestSubmitParams {
     branch: String,
@@ -14724,6 +14751,8 @@ struct BacktestSubmitParams {
     machine_type: Option<String>,
     #[serde(default)]
     zone: Option<String>,
+    #[serde(default)]
+    disk_type: Option<String>,
     #[serde(default)]
     parent_task_id: Option<String>,
 }
@@ -14809,13 +14838,32 @@ pub fn backtest_submit(
     // (and BACKTEST_VM_DEFAULTS in dispatch/config.py — the dispatcher
     // re-merges over its own defaults at launch, so these are the
     // submission-time record of intent).
-    let vm = json!({
+    let machine_type = p
+        .machine_type
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("c2-standard-4");
+    let mut vm = json!({
         "project": "prediction-market-scalper",
         "zone": p.zone.as_deref().filter(|s| !s.is_empty()).unwrap_or("us-east4-a"),
-        "machine_type": p.machine_type.as_deref().filter(|s| !s.is_empty()).unwrap_or("c2-standard-4"),
+        "machine_type": machine_type,
         "image_family": "cm-backtest-worker",
         "image_project": "prediction-market-scalper",
     });
+    // No `disk_type` key unless one is warranted: omitting it lets the
+    // dispatcher's own default (CM_BACKTEST_DISK_TYPE, pd-standard) apply.
+    // An explicit value wins; otherwise a family that cannot boot
+    // pd-standard gets the compatible fallback stamped here (the dispatcher
+    // applies the same correction as a backstop, and logs it).
+    match p.disk_type.as_deref().filter(|s| !s.is_empty()) {
+        Some(dt) => {
+            vm["disk_type"] = json!(dt);
+        }
+        None if !machine_supports_pd_standard(machine_type) => {
+            vm["disk_type"] = json!(PD_STANDARD_FALLBACK_DISK_TYPE);
+        }
+        None => {}
+    }
     let metadata = json!({
         "backtest": {
             "branch": p.branch,

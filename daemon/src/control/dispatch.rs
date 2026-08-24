@@ -9029,8 +9029,91 @@ mod tests {
         assert_eq!(vm["zone"], "us-east4-a");
         assert_eq!(vm["machine_type"], "c2-standard-4");
         assert_eq!(vm["image_family"], "cm-backtest-worker");
+        // No disk_type on a default submission: the dispatcher's own
+        // CM_BACKTEST_DISK_TYPE default must stay in force.
+        assert!(
+            vm.get("disk_type").is_none(),
+            "default submission must not pin a disk_type: {:?}",
+            vm.get("disk_type"),
+        );
         // Operator caller carries no session → no parent.
         assert!(body.get("parent_task_id").is_none());
+    }
+
+    /// Submit with only `machine_type` on a family that cannot boot a
+    /// pd-standard disk: the compatible boot disk is stamped for us, so a
+    /// bare `machine_type: "c3-standard-16"` reaches a VM that GCE accepts.
+    #[test]
+    fn backtest_submit_c3_machine_type_auto_defaults_disk_type() {
+        let _g = crate::planning_client::test_env_lock();
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+        let (port, captured) =
+            crate::planning_client::spawn_stub_api_for_test(200, BT_CREATED_ROW);
+        let state = make_state();
+        set_stub_api_config(&state, port);
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "backtest.submit",
+                serde_json::json!({
+                    "branch": "cm/perf",
+                    "config": "analysis/backtests/configs/t2.yaml",
+                    "machine_type": "c3-standard-16",
+                    "repo_url": "https://github.com/x/pt",
+                }),
+            ),
+        )
+        .into_response();
+        assert!(resp.ok, "backtest.submit should succeed: {:?}", resp.error);
+        let cap = captured.lock().unwrap();
+        let body_raw = cap.raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        let body: serde_json::Value =
+            serde_json::from_str(body_raw).expect("POST body is JSON");
+        let vm = &body["metadata"]["vm"];
+        assert_eq!(vm["machine_type"], "c3-standard-16");
+        assert_eq!(
+            vm["disk_type"], "pd-balanced",
+            "c3 cannot boot pd-standard — the submission must carry a \
+             compatible disk type",
+        );
+    }
+
+    /// An explicit `disk_type` wins over both the lane default and the
+    /// auto-compat fallback (operator overrides are never rewritten).
+    #[test]
+    fn backtest_submit_explicit_disk_type_passes_through() {
+        let _g = crate::planning_client::test_env_lock();
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+        let (port, captured) =
+            crate::planning_client::spawn_stub_api_for_test(200, BT_CREATED_ROW);
+        let state = make_state();
+        set_stub_api_config(&state, port);
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "backtest.submit",
+                serde_json::json!({
+                    "branch": "cm/perf",
+                    "config": "analysis/backtests/configs/t2.yaml",
+                    "machine_type": "c3-standard-16",
+                    "disk_type": "hyperdisk-balanced",
+                    "repo_url": "https://github.com/x/pt",
+                }),
+            ),
+        )
+        .into_response();
+        assert!(resp.ok, "backtest.submit should succeed: {:?}", resp.error);
+        let cap = captured.lock().unwrap();
+        let body_raw = cap.raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        let body: serde_json::Value =
+            serde_json::from_str(body_raw).expect("POST body is JSON");
+        assert_eq!(body["metadata"]["vm"]["disk_type"], "hyperdisk-balanced");
     }
 
     /// A bound Session caller's own task becomes the submission's parent

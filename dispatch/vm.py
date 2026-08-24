@@ -15,6 +15,126 @@ logger = logging.getLogger("cm.dispatch")
 # letting the insert fail opaquely.
 _METADATA_VALUE_MAX_BYTES = 250_000
 
+# ---------------------------------------------------------------------------
+# Machine-type / boot-disk compatibility
+# ---------------------------------------------------------------------------
+# Machine families whose instances CANNOT boot from a pd-standard disk: GCE
+# rejects the insert outright (400, "Invalid value for field
+# '...initializeParams.diskType'" / UNSUPPORTED_OPERATION). The backtest lane
+# defaults to pd-standard (SSD_TOTAL_GB quota pressure in the PMS region —
+# see BACKTEST_VM_DEFAULTS), so a bare `machine_type="c3-standard-16"`
+# submission would fail VM creation forever without the auto-correction in
+# `resolve_disk_type`.
+#
+# Deliberately mirrored, NOT imported, in two places that ship without the
+# `dispatch` package: `mcp_server/server.py::_NO_PD_STANDARD_FAMILIES`
+# (deployed standalone to /opt/cm-daemon/mcp_server) and
+# `daemon/src/control/methods.rs::NO_PD_STANDARD_FAMILIES` (Rust). Keep the
+# three in sync; this one is authoritative because it is the last gate before
+# the insert.
+NO_PD_STANDARD_FAMILIES = frozenset({
+    "c3", "c3d", "c4", "c4a", "c4d", "n4", "h3", "z3", "m4", "x4",
+    "a3", "a4", "g2",
+})
+# What a pd-standard request degrades to on those families. pd-balanced is
+# the cheapest universally-supported alternative — note it draws on
+# SSD_TOTAL_GB quota, which pd-standard does not.
+PD_STANDARD_FALLBACK_DISK_TYPE = "pd-balanced"
+DEFAULT_DISK_TYPE = "pd-balanced"
+
+
+def machine_family(machine_type: str) -> str:
+    """The GCE machine FAMILY of a machine type ('c3-standard-16' -> 'c3')."""
+    return (machine_type or "").strip().split("-", 1)[0].lower()
+
+
+def supports_pd_standard(machine_type: str) -> bool:
+    """Whether `machine_type`'s family can boot from a pd-standard disk.
+
+    Unknown/empty families are assumed compatible: a stale allow-list must
+    never silently rewrite a working submission's disk type.
+    """
+    return machine_family(machine_type) not in NO_PD_STANDARD_FAMILIES
+
+
+def resolve_disk_type(machine_type: str, disk_type: str | None, *,
+                      explicit: bool = False) -> str:
+    """Boot-disk type for `machine_type`, auto-corrected for pd-standard gaps.
+
+    `disk_type` is the value the caller's merge produced (config default +
+    per-task metadata.vm); `explicit=True` means the SUBMITTER named it, and
+    it is then returned untouched — an operator override is never silently
+    rewritten. An explicit unsupported pair still fails the insert, but that
+    failure is now a deterministic spec error (see `classify_launch_error`)
+    which the dispatcher blocks on instead of retrying forever.
+
+    Only pd-standard is corrected: it is the one lane default that some
+    families reject. pd-ssd / pd-balanced / hyperdisk-* pass through.
+    """
+    resolved = (disk_type or "").strip() or DEFAULT_DISK_TYPE
+    if explicit or resolved != "pd-standard":
+        return resolved
+    if supports_pd_standard(machine_type):
+        return resolved
+    return PD_STANDARD_FALLBACK_DISK_TYPE
+
+
+# Substrings that mark a TRANSIENT / capacity failure — quota, stockout,
+# throttling, backend hiccups. These keep the historical retry behaviour
+# (requeue to backlog): the same request may well succeed later.
+_CAPACITY_ERROR_MARKERS = (
+    "quota", "exhaust", "stockout", "does not have enough resources",
+    "resource pool", "try a different zone", "rate limit", "ratelimitexceeded",
+    "backend error", "internal error", "try again", "unavailable",
+    "deadline exceeded", "timeout", "timed out", "connection reset",
+    "service_unavailable", "resource_availability",
+)
+# Substrings that mark a DETERMINISTIC spec rejection — the request is
+# malformed for this machine type / disk type / image and will fail
+# identically on every retry.
+_SPEC_ERROR_MARKERS = (
+    "not supported", "unsupported", "does not support",
+    "invalid value for field", "unknown disk type", "invalid machine type",
+    "was not found", "no such object", "invalid resource usage",
+    "must be a valid",
+)
+
+
+def classify_launch_error(exc: BaseException) -> str:
+    """Classify a VM-creation failure as ``"spec"`` or ``"capacity"``.
+
+    ``"spec"`` = deterministic: the instance resource is invalid for the
+    requested machine type / disk type / image, so retrying re-fails
+    identically. The backtest lane BLOCKS such a task instead of requeueing
+    it (a requeued row lands back at the head of its priority band and
+    head-of-line-blocks the whole lane — cm bug 24e3d6ff, first hit by a
+    c3 machine type against the pd-standard boot-disk default).
+
+    ``"capacity"`` = everything else, including anything unrecognised. The
+    default is deliberately the historical behaviour (requeue + retry): a
+    misfiled capacity error only costs a retry, while a misfiled spec error
+    would silently kill a runnable submission.
+    """
+    # Local payload/programming errors raised before we ever reach GCE
+    # (e.g. the metadata-size guard above) are deterministic by definition.
+    if isinstance(exc, (ValueError, TypeError, KeyError)):
+        return "spec"
+
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if any(marker in text for marker in _CAPACITY_ERROR_MARKERS):
+        return "capacity"
+
+    # google-api-core maps the compute LRO's http_error_status_code through
+    # from_http_status, so a rejected insert arrives as BadRequest(400) /
+    # InvalidArgument(400) / NotFound(404).
+    if isinstance(exc, (gax.BadRequest, gax.InvalidArgument, gax.NotFound)):
+        return "spec"
+    if getattr(exc, "code", None) in (400, 404):
+        return "spec"
+    if any(marker in text for marker in _SPEC_ERROR_MARKERS):
+        return "spec"
+    return "capacity"
+
 
 def read_worker_script(filename: str = "startup.sh") -> str:
     """Read a worker VM startup script from worker/ by filename."""
@@ -31,8 +151,13 @@ def launch_worker(task_id: str, repo_url: str, repo_branch: str,
 
     `overrides` may carry per-task VM settings (metadata.vm on backtest
     tasks): project, zone, machine_type, image_family, image_project,
-    service_account, disk_size_gb. Anything absent falls back to the
-    process-global config values, so existing callers are unchanged.
+    service_account, disk_size_gb, disk_type. Anything absent falls back to
+    the process-global config values, so existing callers are unchanged.
+
+    `disk_type` is passed through VERBATIM — machine-type compatibility is
+    the caller's call (see `resolve_disk_type`, applied by the backtest lane
+    before it gets here), because only the caller knows whether the value was
+    an operator override or a lane default.
 
     `network_tags` replaces the default tag set. The default keeps the
     legacy `allow-ttyd` tag for the general worker lane; the backtest lane
@@ -54,7 +179,7 @@ def launch_worker(task_id: str, repo_url: str, repo_branch: str,
     image_project = o.get("image_project") or VM_IMAGE_PROJECT
     sa_email = o.get("service_account") or "default"
     disk_size_gb = int(o.get("disk_size_gb") or 50)
-    disk_type = o.get("disk_type") or "pd-balanced"
+    disk_type = o.get("disk_type") or DEFAULT_DISK_TYPE
 
     instance_name = f"cm-worker-{task_id[:8]}-{uuid.uuid4().hex[:6]}"
 

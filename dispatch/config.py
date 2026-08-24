@@ -70,6 +70,11 @@ BACKTEST_VM_DEFAULTS = {
     # while DISKS_TOTAL_GB has ~39TB free. pd-standard throughput scales
     # with size, hence 200GB (~24MB/s sustained — the one-shot ~2GB window
     # load takes ~90s and then lives in the 16GB page cache).
+    # NB: the c3/c4/n4/h3-class machine families cannot boot pd-standard at
+    # all. This default is auto-corrected to pd-balanced for them at launch
+    # (dispatch/vm.py::resolve_disk_type) unless metadata.vm names a
+    # disk_type explicitly — pd-balanced DOES draw on SSD_TOTAL_GB, so a
+    # wide c3 fleet may need a smaller disk_size_gb or a quota bump.
     "disk_type": os.getenv("CM_BACKTEST_DISK_TYPE", "pd-standard"),
     "disk_size_gb": int(os.getenv("CM_BACKTEST_DISK_SIZE_GB", "200")),
 }

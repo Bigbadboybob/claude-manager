@@ -2916,7 +2916,30 @@ _BACKTEST_VM_DEFAULTS = {
     "machine_type": "c2-standard-4",
     "image_family": "cm-backtest-worker",
     "image_project": "prediction-market-scalper",
+    # NOTE: no "disk_type" — omitting it lets the dispatcher's own default
+    # (CM_BACKTEST_DISK_TYPE, pd-standard) apply. A disk_type only lands in
+    # metadata.vm when the submitter names one, or when the auto-compat
+    # below rewrites it for a family that cannot boot pd-standard.
 }
+
+# Machine families that cannot boot from a pd-standard disk (GCE rejects the
+# insert with a 400). Mirrors dispatch/vm.py::NO_PD_STANDARD_FAMILIES — this
+# copy exists because the MCP server deploys standalone to
+# /opt/cm-daemon/mcp_server/ without the `dispatch` package. Keep in sync
+# (third copy: daemon/src/control/methods.rs::NO_PD_STANDARD_FAMILIES).
+_NO_PD_STANDARD_FAMILIES = frozenset({
+    "c3", "c3d", "c4", "c4a", "c4d", "n4", "h3", "z3", "m4", "x4",
+    "a3", "a4", "g2",
+})
+_PD_STANDARD_FALLBACK_DISK_TYPE = "pd-balanced"
+
+
+def _supports_pd_standard(machine_type: str) -> bool:
+    """Whether a machine type's family can boot pd-standard (unknown = yes)."""
+    family = (machine_type or "").strip().split("-", 1)[0].lower()
+    return family not in _NO_PD_STANDARD_FAMILIES
+
+
 # GCE instance metadata caps values at 256KB; the whole backtest payload rides
 # one metadata attribute, so keep inline configs well under that.
 _BACKTEST_CONFIG_MAX_BYTES = 32 * 1024
@@ -2954,6 +2977,7 @@ def submit_backtest(
     project: str = "predictionTrading",
     machine_type: str = "",
     zone: str = "",
+    disk_type: str = "",
 ) -> dict:
     """Submit a backtest to run on an ephemeral cloud spot VM.
 
@@ -2985,8 +3009,15 @@ def submit_backtest(
         repo_url: Repo to clone. Defaults to the `project`'s repo URL.
         project: Planning project the task files under (board visibility;
             also the repo-URL lookup key). Must be non-empty.
-        machine_type: Override the default c2-standard-4.
+        machine_type: Override the default c2-standard-4 (e.g.
+            "c3-standard-16" for a wide-parallelism arm).
         zone: Override the default us-east4-a.
+        disk_type: Override the lane's boot-disk type (default
+            pd-standard — cheap, and the PMS region's SSD quota is tight).
+            Leave empty unless you know you need something else: a
+            machine_type whose family cannot boot pd-standard (c3/c4/n4/h3/
+            …) automatically gets pd-balanced, so a bare
+            machine_type="c3-standard-16" just works.
 
     Returns: {task_id, run_key, status} — run_key is minted server-side
         and keys the GCS results prefix (backtests/<run_key>/).
@@ -3029,6 +3060,8 @@ def submit_backtest(
             params["machine_type"] = machine_type
         if zone:
             params["zone"] = zone
+        if disk_type:
+            params["disk_type"] = disk_type
         if parent_task_id:
             params["parent_task_id"] = parent_task_id
         return control_client.call("backtest.submit", params)
@@ -3047,6 +3080,15 @@ def submit_backtest(
         vm["machine_type"] = machine_type
     if zone:
         vm["zone"] = zone
+    if disk_type:
+        vm["disk_type"] = disk_type
+    elif not _supports_pd_standard(vm["machine_type"]):
+        # The dispatch lane's boot-disk default is pd-standard, which this
+        # machine family cannot boot from — GCE would reject the insert
+        # outright. Record the compatible disk on the row so the submission
+        # is self-describing (the dispatcher applies the same correction as
+        # a backstop, and logs it).
+        vm["disk_type"] = _PD_STANDARD_FALLBACK_DISK_TYPE
     backtest_meta = {
         "branch": branch,
         "config": config,
