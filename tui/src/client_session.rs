@@ -1245,7 +1245,7 @@ pub fn spawn_session_pollers(
             .spawn(move || loop {
                 if let Some(socket) = pool.live_socket_path(&host_id) {
                     if let Ok(summaries) =
-                        rpc_list_daemon_sessions(&socket, crate::daemon_launch::operator_token())
+                        rpc_list_daemon_sessions(&socket, &pool.operator_token_for(&host_id))
                     {
                         // App dropped the receiver → shut the thread down.
                         if tx.send((host_id.clone(), summaries)).is_err() {
@@ -1345,7 +1345,7 @@ pub fn spawn_dispatch_pending_pollers(
                 if let Some(socket) = pool.live_socket_path(&host_id) {
                     if let Ok(map) = rpc_continuous_dispatch_pending(
                         &socket,
-                        crate::daemon_launch::operator_token(),
+                        &pool.operator_token_for(&host_id),
                     ) {
                         // App dropped the receiver → shut the thread down.
                         if tx.send((host_id.clone(), map)).is_err() {

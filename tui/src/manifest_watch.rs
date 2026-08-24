@@ -67,13 +67,18 @@ use cm_daemon::manifest::{LastExit, ManifestDiff};
 /// `last_exit` (`None` if the daemon doesn't have one for it).
 ///
 /// Why this shape vs. the raw daemon snapshot JSON: the TUI's
-/// `apply_manifest_snapshot` only consumes per-uid `last_exit` —
-/// the rest of the daemon's snapshot (workspaces, bindings) is
-/// loaded from disk at TUI startup and isn't reconciled here.
-/// Flattening to a (uid, last_exit) list keeps the App-side
-/// apply loop simple.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// `apply_manifest_snapshot` consumes per-uid `last_exit` (the F1
+/// conservative merge) AND the set of uids the daemon still lists,
+/// against which agent-spawned rows are reconciled (pruned when the
+/// host no longer holds them — the catch-up for exit diffs missed
+/// while the stream was down). The rest of the daemon's snapshot
+/// (workspaces, bindings) is loaded from disk at TUI startup and
+/// isn't reconciled here. Flattening keeps the App-side apply simple.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ManifestSnapshotPayload {
+    /// Host whose `manifest.watch` stream produced this snapshot. The
+    /// App-side reconcile only touches rows tagged with this host.
+    pub host: HostId,
     /// `(uid, last_exit)` pairs extracted from the daemon's
     /// snapshot's `workspaces[*].sessions[*]`. Order is
     /// daemon-iteration order (HashMap of workspaces × Vec of
@@ -81,6 +86,19 @@ pub struct ManifestSnapshotPayload {
     /// `preserved_last_exit` conservatively per the F1 merge
     /// rule (only when local is None).
     pub session_last_exits: Vec<(String, Option<LastExit>)>,
+    /// EVERY session uid the snapshot lists (a superset of
+    /// `session_last_exits`' uids — an entry whose `last_exit` failed to
+    /// parse is skipped there but still counts as "listed" here). The
+    /// reconcile in `App::apply_manifest_snapshot` prunes agent-spawned
+    /// rows on `host` that are NOT in this set: the daemon no longer
+    /// holds them, so every exit diff we missed while the stream was
+    /// down (tunnel drop, daemon re-exec, token rejection) is caught up
+    /// in one pass.
+    pub listed_uids: Vec<String>,
+    /// When the consumer thread read the frame. Rows created locally
+    /// after (or just before) this instant may be newer than the
+    /// daemon's capture and are exempt from the reconcile prune.
+    pub received_at: std::time::Instant,
 }
 
 /// 10e-c r1 F1: typed event the consumer sends to the main loop.
@@ -128,11 +146,11 @@ pub enum ManifestEvent {
     Diff { host: HostId, diff: ManifestDiff },
 }
 
-// Operator-caller token is loaded at TUI startup and shared with the
-// daemon via `CM_OPERATOR_TOKEN`. We resolve it lazily through
-// `crate::daemon_launch::operator_token()` so this module doesn't
-// take a dependency on App and the worker thread can read the
-// already-cached value.
+// Operator-caller token is resolved PER HOST through a
+// `crate::host_pool::TokenProvider` (the local daemon's token for
+// `local`; a remote daemon's own token, fetched over ssh, for an
+// ssh-unix host — see `HostPool::operator_token_for`). Re-read on every
+// (re)connect attempt so the consumer never pins a stale value.
 
 /// Reconnect backoff base (first dial-failure sleep before retry).
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -217,7 +235,12 @@ pub fn spawn(
     let thread = std::thread::Builder::new()
         .name("cm-tui-manifest-watch".to_string())
         .spawn(move || {
-            run_consumer_with_provider(&path_provider, HostId::local(), event_tx)
+            run_consumer_with_provider(
+                &path_provider,
+                &crate::host_pool::local_token_provider(),
+                HostId::local(),
+                event_tx,
+            )
         })
         .expect("spawn manifest.watch consumer thread");
     ManifestWatchConsumer {
@@ -263,12 +286,20 @@ pub fn spawn_per_host(
             host_pool,
             host.id.clone(),
         );
+        // Per-host operator token (a remote daemon validates against ITS
+        // token, not the local one — see `HostPool::operator_token_for`).
+        let token_provider = crate::host_pool::token_provider_for_host(
+            host_pool,
+            host.id.clone(),
+        );
         let tx = event_tx.clone();
         let host_id = host.id.clone();
         let host_name = host.id.as_str().to_string();
         let thread = std::thread::Builder::new()
             .name(format!("cm-tui-manifest-watch-{}", host_name))
-            .spawn(move || run_consumer_with_provider(&provider, host_id, tx))
+            .spawn(move || {
+                run_consumer_with_provider(&provider, &token_provider, host_id, tx)
+            })
             .expect("spawn manifest.watch consumer thread");
         threads.push(thread);
     }
@@ -296,6 +327,7 @@ pub fn spawn_per_host(
 /// a tunnel respawn.
 pub(crate) fn run_consumer_with_provider(
     path_provider: &crate::host_pool::SocketPathProvider,
+    token_provider: &crate::host_pool::TokenProvider,
     host: HostId,
     event_tx: mpsc::Sender<ManifestEvent>,
 ) {
@@ -314,7 +346,10 @@ pub(crate) fn run_consumer_with_provider(
             backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
             continue;
         };
-        match connect_and_subscribe(&socket_path) {
+        // Re-resolved per attempt: a remote token that wasn't fetchable
+        // at the previous attempt (host down) is picked up on retry.
+        let token = token_provider();
+        match connect_and_subscribe(&socket_path, &token) {
             Ok(stream) => {
                 // Reset backoff on each successful subscription.
                 // A flaky daemon that goes down/up shouldn't
@@ -376,7 +411,12 @@ pub(crate) fn run_consumer(
         let p = socket_path.to_path_buf();
         std::sync::Arc::new(move || Some(p.clone()))
     };
-    run_consumer_with_provider(&provider, HostId::local(), event_tx);
+    run_consumer_with_provider(
+        &provider,
+        &crate::host_pool::local_token_provider(),
+        HostId::local(),
+        event_tx,
+    );
 }
 
 /// Why the inner stream loop ended. Drives the outer loop's
@@ -394,7 +434,7 @@ enum DriveOutcome {
 /// Dial + send `manifest.watch` RPC + verify OK response.
 /// Returns the live socket on success (now in streaming mode);
 /// the caller reads frames off it via [`drive_stream`].
-fn connect_and_subscribe(socket_path: &Path) -> std::io::Result<UnixStream> {
+fn connect_and_subscribe(socket_path: &Path, token: &str) -> std::io::Result<UnixStream> {
     let mut stream = UnixStream::connect(socket_path)?;
     let req = Request {
         id: format!(
@@ -406,7 +446,7 @@ fn connect_and_subscribe(socket_path: &Path) -> std::io::Result<UnixStream> {
                 .unwrap_or(0),
         ),
         caller: Caller::Operator(CallerOperator {
-            token_id: crate::daemon_launch::operator_token().to_string(),
+            token_id: token.to_string(),
         }),
         method: "manifest.watch".to_string(),
         params: serde_json::json!({}),
@@ -449,7 +489,7 @@ fn drive_stream(
                     // it's None (daemon's snapshot is
                     // authoritative for sessions whose last_exit
                     // we don't yet know).
-                    match parse_snapshot_payload(&frame.payload) {
+                    match parse_snapshot_payload(&frame.payload, host) {
                         Ok(payload) => {
                             if event_tx
                                 .send(ManifestEvent::Snapshot(payload))
@@ -538,6 +578,7 @@ fn drive_stream(
 /// normal wire shape parses cleanly.
 fn parse_snapshot_payload(
     payload: &serde_json::Value,
+    host: &HostId,
 ) -> Result<ManifestSnapshotPayload, String> {
     let workspaces = payload
         .get("workspaces")
@@ -545,6 +586,7 @@ fn parse_snapshot_payload(
         .as_object()
         .ok_or_else(|| "snapshot 'workspaces' is not an object".to_string())?;
     let mut session_last_exits: Vec<(String, Option<LastExit>)> = Vec::new();
+    let mut listed_uids: Vec<String> = Vec::new();
     for (_ws_id, ws_value) in workspaces {
         let sessions = match ws_value.get("sessions").and_then(|v| v.as_array()) {
             Some(s) => s,
@@ -555,6 +597,7 @@ fn parse_snapshot_payload(
                 Some(u) => u.to_string(),
                 None => continue,
             };
+            listed_uids.push(uid.clone());
             // `last_exit` is `#[serde(skip_serializing_if = "Option::is_none")]`
             // on ManifestEntry — so a session with no exit
             // simply omits the field entirely, not Null.
@@ -571,7 +614,10 @@ fn parse_snapshot_payload(
         }
     }
     Ok(ManifestSnapshotPayload {
+        host: host.clone(),
         session_last_exits,
+        listed_uids,
+        received_at: std::time::Instant::now(),
     })
 }
 
@@ -647,7 +693,10 @@ mod tests {
         let consumer = std::thread::spawn(move || {
             // Use connect_and_subscribe only — we don't want to
             // enter drive_stream and block on read.
-            let _ = connect_and_subscribe(&sock_clone);
+            let _ = connect_and_subscribe(
+                &sock_clone,
+                crate::daemon_launch::operator_token(),
+            );
         });
 
         // Accept + read the request.
@@ -1172,7 +1221,12 @@ mod tests {
         let provider = fixed_path_provider(sock.clone());
         let host_for_thread = host.clone();
         let _consumer = std::thread::spawn(move || {
-            run_consumer_with_provider(&provider, host_for_thread, event_tx);
+            run_consumer_with_provider(
+                &provider,
+                &crate::host_pool::local_token_provider(),
+                host_for_thread,
+                event_tx,
+            );
         });
 
         // One subscribe, then a diff and a heartbeat on the SAME

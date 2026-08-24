@@ -783,7 +783,7 @@ impl App {
         };
         match crate::client_session::rpc_start_workflow(
             &daemon_socket,
-            crate::daemon_launch::operator_token(),
+            &self.host_pool.operator_token_for(&host_id),
             workflow_name,
             &worktree,
             &workspace_id,

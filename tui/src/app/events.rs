@@ -3,6 +3,12 @@
 use super::*;
 
 /// Interval between filesystem checks for session_id detection.
+/// A row must be at least this old (relative to the snapshot frame's
+/// receipt) before `prune_rows_absent_from_snapshot` may drop it — see
+/// `App::apply_manifest_snapshot`.
+pub(crate) const SNAPSHOT_PRUNE_MIN_AGE: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 const SESSION_ID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Wall-clock budget for a single `drain_terminal_events` pass. The PTY
@@ -474,6 +480,16 @@ impl App {
         // into `pending_remote_reattach`, which can't happen inside
         // the `&mut self.workspaces` iteration.
         let mut remote_reconnect_requeue: Vec<(usize, usize)> = Vec::new();
+        // Agent-spawned, non-workflow rows whose attach stream delivered a
+        // genuine exit this pass: `(ws_idx, uid)`. Pruned after the loop
+        // (same gate + removal as the `ManifestDiff::Exited` consumer in
+        // `apply_manifest_diff_from_host`). Pre-fix ONLY that diff path
+        // pruned, so an orchestrator's spawn-and-kill worker whose exit
+        // reached us through the attach stream but whose `manifest.watch`
+        // stream was down (e.g. the remote daemon rejecting our operator
+        // token) stayed put as a `●` row in its own `agent: <label>`
+        // workspace — 30+ dead `detective-*` rows at a time.
+        let mut agent_exit_prunes: Vec<(usize, String)> = Vec::new();
         // Bound how long this pass spends draining PTY events so a flooding
         // session can't starve the rest of the main loop (control queue, UI).
         // See `TERMINAL_DRAIN_BUDGET`. Once the deadline passes, sessions not
@@ -607,6 +623,11 @@ impl App {
                                 remote_reconnect_requeue.push((wi, si));
                             } else {
                                 ts.session.exited = true;
+                                if ts.managed_by_uid.is_some()
+                                    && ts.workflow_run_id.is_none()
+                                {
+                                    agent_exit_prunes.push((wi, ts.uid.clone()));
+                                }
                             }
                         }
                         TermEvent::Title(title) => {
@@ -1060,6 +1081,27 @@ impl App {
             for (wi, si) in remote_reconnect_requeue {
                 self.requeue_remote_reconnect(wi, si, "transport EOF");
             }
+            self.needs_redraw = true;
+        }
+
+        // Prune agent-spawned rows that exited on the attach stream (see
+        // `agent_exit_prunes`). An A-R force-restart's own kill is skipped:
+        // the slot already holds the revived incarnation under the same
+        // uid (`restart_suppressed_exit_uids`, consumed by the diff path).
+        if !agent_exit_prunes.is_empty() {
+            for (wi, uid) in agent_exit_prunes {
+                if self.restart_suppressed_exit_uids.contains(&uid) {
+                    continue;
+                }
+                eprintln!(
+                    "cm-tui: agent-spawned session {} exited (attach stream) — \
+                     pruning its sidebar row",
+                    uid,
+                );
+                let target = uid.clone();
+                self.tombstone_and_remove(wi, |ts| ts.uid == target);
+            }
+            self.clamp_cursor();
             self.needs_redraw = true;
         }
 
@@ -1561,7 +1603,7 @@ impl App {
         })?;
         let ack = crate::client_session::rpc_set_global_perms(
             &socket,
-            crate::daemon_launch::operator_token(),
+            &self.host_pool.operator_token_for(&host),
             uid,
             value,
         )
@@ -1761,6 +1803,19 @@ impl App {
         &mut self,
         snapshot: crate::manifest_watch::ManifestSnapshotPayload,
     ) {
+        // Reconcile FIRST (borrows the payload; the merge below consumes
+        // it): agent-spawned, non-workflow rows on the snapshot's host
+        // that the daemon no longer lists — or lists as exited — are
+        // pruned, exactly as an `Exited` diff would have done. This is
+        // the catch-up for every exit diff missed while the stream was
+        // down: a tunnel drop, a daemon re-exec, or (the momentum-
+        // detective pile-up) a remote daemon rejecting the TUI's
+        // operator token for weeks. Rows younger than
+        // `SNAPSHOT_PRUNE_MIN_AGE` are exempt — a session adopted from
+        // the 5s `session.list` poll moments before this frame was
+        // applied may post-date the daemon's capture, and an A-R
+        // force-restart's own kill is skipped like the diff path does.
+        self.prune_rows_absent_from_snapshot(&snapshot);
         // 10e-d: collect uids we adopted with memory_cap_kill=true
         // so we can fire toasts AFTER the workspaces-iteration
         // is done — avoids the &mut self contention from calling
@@ -1800,6 +1855,67 @@ impl App {
         for uid in adopted_cap_kills {
             self.try_emit_cap_kill_toast(&uid);
         }
+    }
+
+    /// The reconcile half of [`Self::apply_manifest_snapshot`] — see the
+    /// comment there. Pure decision + the same `tombstone_and_remove`
+    /// removal the `Exited` diff path uses. Returns how many rows went.
+    pub(crate) fn prune_rows_absent_from_snapshot(
+        &mut self,
+        snapshot: &crate::manifest_watch::ManifestSnapshotPayload,
+    ) -> usize {
+        use std::collections::HashSet;
+        let listed: HashSet<&str> =
+            snapshot.listed_uids.iter().map(|u| u.as_str()).collect();
+        let exited: HashSet<&str> = snapshot
+            .session_last_exits
+            .iter()
+            .filter(|(_, le)| le.is_some())
+            .map(|(u, _)| u.as_str())
+            .collect();
+        let mut prunes: Vec<(usize, String)> = Vec::new();
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed {
+                continue;
+            }
+            for ts in &ws.sessions {
+                if ts.host_id != snapshot.host
+                    || ts.managed_by_uid.is_none()
+                    || ts.workflow_run_id.is_some()
+                    || self.restart_suppressed_exit_uids.contains(&ts.uid)
+                {
+                    continue;
+                }
+                if snapshot
+                    .received_at
+                    .saturating_duration_since(ts.created_at)
+                    < SNAPSHOT_PRUNE_MIN_AGE
+                {
+                    continue;
+                }
+                let uid = ts.uid.as_str();
+                if !listed.contains(uid) || exited.contains(uid) {
+                    prunes.push((wi, ts.uid.clone()));
+                }
+            }
+        }
+        let n = prunes.len();
+        if n == 0 {
+            return 0;
+        }
+        eprintln!(
+            "cm-tui: manifest snapshot from host {} no longer lists {} \
+             agent-spawned session(s) tracked here — pruning their rows",
+            snapshot.host.as_str(),
+            n,
+        );
+        for (wi, uid) in prunes {
+            let target = uid.clone();
+            self.tombstone_and_remove(wi, |ts| ts.uid == target);
+        }
+        self.clamp_cursor();
+        self.needs_redraw = true;
+        n
     }
 
     /// 10e-c: apply a single `ManifestDiff` to in-memory state.
@@ -2154,9 +2270,10 @@ impl App {
         let worktree = self.workspaces[ws_idx].worktree_path.clone();
         let working_dir: &Path = worktree.as_deref().unwrap_or_else(|| Path::new("/"));
 
+        let op_token = self.host_pool.operator_token_for(&host_id);
         let config = crate::client_session::ClientSessionConfig {
             daemon_socket: &socket,
-            operator_token_id: crate::daemon_launch::operator_token(),
+            operator_token_id: &op_token,
             uid,
             workspace_id: &ws_id,
             label: &label,
@@ -2955,6 +3072,192 @@ mod apply_manifest_diff_tests {
         );
     }
 
+    /// Replace a row's attach event channel with one we control and
+    /// queue a genuine (non-transport) exit on it — the `End`-frame
+    /// shape a daemon-side kill delivers to an attached TUI.
+    fn inject_attach_exit(app: &mut App, wi: usize, si: usize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.workspaces[wi].sessions[si].session.event_rx = rx;
+        tx.send(TermEvent::Exit).expect("queue exit");
+        // Keep the sender alive until drained: the drain loop's
+        // `try_recv` only needs the queued event, so dropping here is
+        // fine too — but be explicit.
+        std::mem::forget(tx);
+    }
+
+    /// An agent-spawned, non-workflow row whose exit arrives on the
+    /// ATTACH stream (no `manifest.watch` diff — e.g. the remote daemon
+    /// rejecting our operator token kept that stream down) is pruned,
+    /// exactly like the diff path. Pre-fix it stayed as a dead `●` row
+    /// in its own `agent: <label>` workspace forever.
+    #[test]
+    fn attach_exit_prunes_agent_managed_session() {
+        let mut app = build_app_with_session("ts-attach-agent");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        inject_attach_exit(&mut app, 0, 0);
+        app.drain_terminal_events();
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "an agent-managed session must be pruned when its attach \
+             stream reports a genuine exit",
+        );
+        assert_eq!(
+            app.workspaces[0].tombstones.len(),
+            1,
+            "the prune records a tombstone (read-after-exit still served)",
+        );
+    }
+
+    /// User-owned rows keep the old behavior: marked exited, left in
+    /// place for A-w.
+    #[test]
+    fn attach_exit_keeps_user_session_as_ghost() {
+        let mut app = build_app_with_session("ts-attach-user");
+        inject_attach_exit(&mut app, 0, 0);
+        app.drain_terminal_events();
+        assert_eq!(app.workspaces[0].sessions.len(), 1);
+        assert!(app.workspaces[0].sessions[0].session.exited);
+    }
+
+    /// Workflow participants survive (fresh-context respawn reuses the
+    /// slot) and an A-R force-restart's own kill is not a prune.
+    #[test]
+    fn attach_exit_keeps_workflow_participant_and_restart_suppressed() {
+        let mut app = build_app_with_session("ts-attach-wf");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.workspaces[0].sessions[0].workflow_run_id = Some("run-1".into());
+        inject_attach_exit(&mut app, 0, 0);
+        app.drain_terminal_events();
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "workflow slot survives");
+
+        let mut app = build_app_with_session("ts-attach-ar");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.restart_suppressed_exit_uids.insert("ts-attach-ar".into());
+        inject_attach_exit(&mut app, 0, 0);
+        app.drain_terminal_events();
+        assert_eq!(
+            app.workspaces[0].sessions.len(),
+            1,
+            "an A-R restart's own kill must not prune the revived slot",
+        );
+    }
+
+    // ── snapshot reconcile (`prune_rows_absent_from_snapshot`) ──
+
+    fn snapshot_payload(
+        host: cm_daemon::host_id::HostId,
+        listed: &[&str],
+        exited: &[&str],
+    ) -> crate::manifest_watch::ManifestSnapshotPayload {
+        crate::manifest_watch::ManifestSnapshotPayload {
+            host,
+            listed_uids: listed.iter().map(|u| u.to_string()).collect(),
+            session_last_exits: listed
+                .iter()
+                .map(|u| {
+                    let le = exited.contains(u).then(|| LastExit {
+                        code: Some(0),
+                        memory_cap_kill: false,
+                        kills_file_offset: None,
+                        exited_at: 1.0,
+                    });
+                    (u.to_string(), le)
+                })
+                .collect(),
+            received_at: Instant::now(),
+        }
+    }
+
+    /// Make a row look long-established (older than the reconcile's
+    /// minimum age) on `host`, agent-spawned.
+    fn age_agent_row(app: &mut App, wi: usize, si: usize, host: cm_daemon::host_id::HostId) {
+        let ts = &mut app.workspaces[wi].sessions[si];
+        ts.managed_by_uid = Some("orch".into());
+        ts.host_id = host;
+        ts.created_at = Instant::now()
+            .checked_sub(SNAPSHOT_PRUNE_MIN_AGE * 6)
+            .expect("backdate");
+    }
+
+    /// The catch-up: a (re)connected host's snapshot no longer lists an
+    /// agent-spawned row → pruned (the exit diff was missed while the
+    /// stream was down). Listed-as-exited counts as gone too.
+    #[test]
+    fn snapshot_prunes_agent_rows_the_host_no_longer_lists() {
+        let remote = cm_daemon::host_id::HostId::new("manager");
+        let mut app = build_app_with_session("ts-snap-gone");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        let n = app.prune_rows_absent_from_snapshot(&snapshot_payload(remote.clone(), &[], &[]));
+        assert_eq!(n, 1);
+        assert!(app.workspaces[0].sessions.is_empty(), "absent from snapshot → pruned");
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+
+        let mut app = build_app_with_session("ts-snap-exited");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.apply_manifest_snapshot(snapshot_payload(
+            remote,
+            &["ts-snap-exited"],
+            &["ts-snap-exited"],
+        ));
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "listed with last_exit → pruned via apply_manifest_snapshot",
+        );
+    }
+
+    /// Rows the snapshot still lists as live stay; so do rows on OTHER
+    /// hosts (a local snapshot says nothing about cm-manager's sessions).
+    #[test]
+    fn snapshot_keeps_live_rows_and_ignores_other_hosts() {
+        let remote = cm_daemon::host_id::HostId::new("manager");
+        let mut app = build_app_with_session("ts-snap-live");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.apply_manifest_snapshot(snapshot_payload(remote.clone(), &["ts-snap-live"], &[]));
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "listed live → kept");
+
+        let mut app = build_app_with_session("ts-snap-other");
+        age_agent_row(&mut app, 0, 0, remote);
+        app.apply_manifest_snapshot(snapshot_payload(
+            cm_daemon::host_id::HostId::local(),
+            &[],
+            &[],
+        ));
+        assert_eq!(
+            app.workspaces[0].sessions.len(),
+            1,
+            "a snapshot from another host must not prune this host's rows",
+        );
+    }
+
+    /// Exemptions: user-owned rows, workflow participants, rows younger
+    /// than the minimum age (may post-date the daemon's capture), and an
+    /// A-R restart's suppressed uid.
+    #[test]
+    fn snapshot_prune_exemptions() {
+        let remote = cm_daemon::host_id::HostId::new("manager");
+        let empty = |h: &cm_daemon::host_id::HostId| snapshot_payload(h.clone(), &[], &[]);
+
+        let mut app = build_app_with_session("ts-snap-user");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.workspaces[0].sessions[0].managed_by_uid = None;
+        assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "user row kept");
+
+        let mut app = build_app_with_session("ts-snap-wf");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.workspaces[0].sessions[0].workflow_run_id = Some("run".into());
+        assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "workflow row kept");
+
+        let mut app = build_app_with_session("ts-snap-young");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.workspaces[0].sessions[0].created_at = Instant::now();
+        assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "young row kept");
+
+        let mut app = build_app_with_session("ts-snap-ar");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.restart_suppressed_exit_uids.insert("ts-snap-ar".into());
+        assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "A-R uid kept");
+    }
+
     /// Cursor safety: when the cursor sits on the pruned row, the apply
     /// path's `clamp_cursor` demotes it to the workspace rather than
     /// leaving a dangling `Session(wi, si)` that later indexing (e.g.
@@ -3168,6 +3471,9 @@ mod apply_manifest_diff_tests {
             exited_at: 1.0,
         };
         let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            host: cm_daemon::host_id::HostId::local(),
+            listed_uids: Vec::new(),
+            received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t22".into(),
                 Some(last_exit.clone()),
@@ -3206,6 +3512,9 @@ mod apply_manifest_diff_tests {
             exited_at: 1.0,
         };
         let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            host: cm_daemon::host_id::HostId::local(),
+            listed_uids: Vec::new(),
+            received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t23".into(),
                 Some(snapshot_exit),
@@ -3361,6 +3670,9 @@ mod apply_manifest_diff_tests {
             .is_none());
 
         let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            host: cm_daemon::host_id::HostId::local(),
+            listed_uids: Vec::new(),
+            received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t27".into(),
                 Some(LastExit {
@@ -3397,6 +3709,9 @@ mod apply_manifest_diff_tests {
         assert!(app.cap_kill_toasted.is_empty());
 
         let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            host: cm_daemon::host_id::HostId::local(),
+            listed_uids: Vec::new(),
+            received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t28".into(),
                 Some(LastExit {
@@ -4829,11 +5144,15 @@ pub(super) mod pending_workflow_events_tests {
                     id: cm_daemon::host_id::HostId::local(),
                     transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: cm_daemon::host_id::HostId::new("manager"),
                     transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -5126,11 +5445,15 @@ pub(super) mod pending_workflow_events_tests {
                     id: cm_daemon::host_id::HostId::local(),
                     transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: cm_daemon::host_id::HostId::new("manager"),
                     transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -5326,11 +5649,15 @@ pub(super) mod pending_workflow_events_tests {
                     id: cm_daemon::host_id::HostId::local(),
                     transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: cm_daemon::host_id::HostId::new("manager"),
                     transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -5524,11 +5851,15 @@ pub(super) mod pending_workflow_events_tests {
                     id: cm_daemon::host_id::HostId::local(),
                     transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: cm_daemon::host_id::HostId::new("manager"),
                     transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -5804,6 +6135,8 @@ pub(super) mod pending_workflow_events_tests {
                         socket: local_sock.clone(),
                     },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: cm_daemon::host_id::HostId::new("manager"),
@@ -5813,6 +6146,8 @@ pub(super) mod pending_workflow_events_tests {
                         remote_socket: PathBuf::from("/remote/daemon.sock"),
                     },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -6022,6 +6357,8 @@ pub(super) mod pending_workflow_events_tests {
                         socket: local_sock.clone(),
                     },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: cm_daemon::host_id::HostId::new("manager"),
@@ -6029,6 +6366,8 @@ pub(super) mod pending_workflow_events_tests {
                         socket: mgr_sock.clone(),
                     },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -6167,11 +6506,15 @@ pub(super) mod pending_workflow_events_tests {
                     id: cm_daemon::host_id::HostId::local(),
                     transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: cm_daemon::host_id::HostId::new("manager"),
                     transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };

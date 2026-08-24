@@ -166,6 +166,26 @@ pub struct HostConfig {
     /// the whole file.
     #[serde(default)]
     pub default: bool,
+    /// Operator token the TUI presents to THIS host's daemon on every
+    /// `Caller::Operator` RPC (`manifest.watch`, `events.subscribe`,
+    /// `task.update_tree`, `session.kill`, …), inline. Each daemon
+    /// validates against the `CM_OPERATOR_TOKEN` it was started with,
+    /// and a remote daemon's token is NOT the local one: cm-manager's
+    /// `cm-redeploy` mints its own `~/.cm/operator-token` and hands it
+    /// to `cm-daemon.service` via an `EnvironmentFile` drop-in, so a
+    /// TUI that presented its local token got `operator token does not
+    /// match` on every gated RPC — the watch stream never connected and
+    /// remote kills never pruned their rows. Resolution order (see
+    /// `HostPool::operator_token_for`): this field → `operator_token_file`
+    /// → (ssh-unix only) the remote `<dirname(remote_socket)>/operator-token`
+    /// fetched once over the same ssh alias → the local token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_token: Option<String>,
+    /// Local file holding the token for this host (one line, whitespace
+    /// trimmed). `~` is expanded at load time. Mutually usable with
+    /// `operator_token`; the inline value wins when both are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_token_file: Option<PathBuf>,
 }
 
 /// Parsed `hosts.toml`. Use `HostsConfig::load(path)` to obtain
@@ -217,6 +237,9 @@ impl HostsConfig {
             if let HostTransport::Unix { socket } = &mut h.transport {
                 *socket = expand_tilde(socket);
             }
+            if let Some(f) = &h.operator_token_file {
+                h.operator_token_file = Some(expand_tilde(f));
+            }
         }
         let cfg = HostsConfig { hosts };
         cfg.validate()?;
@@ -244,6 +267,8 @@ impl HostsConfig {
                     socket: cm_daemon::default_socket_path(),
                 },
                 default: true,
+                operator_token: None,
+                operator_token_file: None,
             }],
         }
     }
@@ -893,6 +918,62 @@ default = true
         );
         std::fs::write(&path, content).expect("write hosts.toml");
         HostsConfig::load(&path)
+    }
+
+    /// `operator_token` (inline) and `operator_token_file` (local path,
+    /// tilde-expanded) parse per `[[host]]`; both are optional and absent
+    /// entries read back as `None` so existing files keep working.
+    #[test]
+    fn operator_token_fields_parse_per_host() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let path = tmp.path().join("hosts.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[host]]
+name = "local"
+transport = "unix"
+socket = "/tmp/local.sock"
+default = true
+
+[[host]]
+name = "manager"
+transport = "ssh-unix"
+ssh_host = "cm-manager"
+remote_socket = "/home/lucas/.cm/daemon.sock"
+operator_token = "inline-tok"
+
+[[host]]
+name = "other"
+transport = "ssh-unix"
+ssh_host = "cm-other"
+remote_socket = "/home/lucas/.cm/daemon.sock"
+operator_token_file = "~/secrets/other-token"
+"#,
+        )
+        .expect("write hosts.toml");
+        let cfg = HostsConfig::load(&path).expect("load");
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let local = cfg.find(&HostId::local()).expect("local");
+        assert!(local.operator_token.is_none() && local.operator_token_file.is_none());
+        let manager = cfg.find(&HostId::new("manager")).expect("manager");
+        assert_eq!(manager.operator_token.as_deref(), Some("inline-tok"));
+        assert!(manager.operator_token_file.is_none());
+        let other = cfg.find(&HostId::new("other")).expect("other");
+        assert!(other.operator_token.is_none());
+        assert_eq!(
+            other.operator_token_file.as_deref(),
+            Some(tmp.path().join("secrets/other-token").as_path()),
+            "operator_token_file must be tilde-expanded at load",
+        );
     }
 
     /// Round 3 F3: host names with path separators (`/`, `\`)

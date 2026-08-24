@@ -102,7 +102,13 @@ pub fn spawn(
     let (event_tx, event_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("cm-tui-workflow-watch".to_string())
-        .spawn(move || run_consumer_with_provider(&path_provider, event_tx))
+        .spawn(move || {
+            run_consumer_with_provider(
+                &path_provider,
+                &crate::host_pool::local_token_provider(),
+                event_tx,
+            )
+        })
         .expect("spawn events.subscribe consumer thread");
     WorkflowWatchConsumer {
         event_rx,
@@ -114,6 +120,7 @@ pub fn spawn(
 /// `manifest_watch::run_consumer_with_provider`.
 pub(crate) fn run_consumer_with_provider(
     path_provider: &crate::host_pool::SocketPathProvider,
+    token_provider: &crate::host_pool::TokenProvider,
     event_tx: mpsc::Sender<WorkflowWatchEvent>,
 ) {
     let mut backoff = RECONNECT_BACKOFF_BASE;
@@ -128,7 +135,8 @@ pub(crate) fn run_consumer_with_provider(
             backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
             continue;
         };
-        match connect_and_subscribe(&socket_path) {
+        let token = token_provider();
+        match connect_and_subscribe(&socket_path, &token) {
             Ok(stream) => {
                 backoff = RECONNECT_BACKOFF_BASE;
                 match drive_stream(stream, &event_tx) {
@@ -161,7 +169,11 @@ pub(crate) fn run_consumer(
         let p = socket_path.to_path_buf();
         std::sync::Arc::new(move || Some(p.clone()))
     };
-    run_consumer_with_provider(&provider, event_tx);
+    run_consumer_with_provider(
+        &provider,
+        &crate::host_pool::local_token_provider(),
+        event_tx,
+    );
 }
 
 /// Test helper: wrap a static path as a `SocketPathProvider`.
@@ -192,11 +204,15 @@ pub fn spawn_per_host(
             host_pool,
             host.id.clone(),
         );
+        let token_provider = crate::host_pool::token_provider_for_host(
+            host_pool,
+            host.id.clone(),
+        );
         let tx = event_tx.clone();
         let host_name = host.id.as_str().to_string();
         let thread = std::thread::Builder::new()
             .name(format!("cm-tui-workflow-watch-{}", host_name))
-            .spawn(move || run_consumer_with_provider(&provider, tx))
+            .spawn(move || run_consumer_with_provider(&provider, &token_provider, tx))
             .expect("spawn events.subscribe consumer thread");
         threads.push(thread);
     }
@@ -209,7 +225,7 @@ enum DriveOutcome {
     StreamEnded,
 }
 
-fn connect_and_subscribe(socket_path: &Path) -> std::io::Result<UnixStream> {
+fn connect_and_subscribe(socket_path: &Path, token: &str) -> std::io::Result<UnixStream> {
     let mut stream = UnixStream::connect(socket_path)?;
     let req = Request {
         id: format!(
@@ -221,7 +237,7 @@ fn connect_and_subscribe(socket_path: &Path) -> std::io::Result<UnixStream> {
                 .unwrap_or(0),
         ),
         caller: Caller::Operator(CallerOperator {
-            token_id: crate::daemon_launch::operator_token().to_string(),
+            token_id: token.to_string(),
         }),
         method: "events.subscribe".to_string(),
         params: serde_json::json!({}),
@@ -394,7 +410,10 @@ mod tests {
         let (sock, listener, _dir) = spawn_test_listener();
         let sock_clone = sock.clone();
         let consumer = std::thread::spawn(move || {
-            let _ = connect_and_subscribe(&sock_clone);
+            let _ = connect_and_subscribe(
+                &sock_clone,
+                crate::daemon_launch::operator_token(),
+            );
         });
 
         let (mut stream, _) = listener.accept().expect("accept");

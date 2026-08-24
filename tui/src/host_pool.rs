@@ -978,6 +978,185 @@ pub struct HostPool {
     /// Mutated by `mark_push_success` / `mark_push_failure`; read
     /// by `should_skip_for_push`. Only tracked hosts have entries.
     reachability: ReachabilityCache,
+    /// Per-host operator-token source (see [`HostToken`] and
+    /// [`HostPool::operator_token_for`]). Hosts with no entry fall
+    /// back to the local token.
+    tokens: HashMap<HostId, HostToken>,
+}
+
+/// Where a host's operator token comes from. Built once per host in
+/// `HostPool::from_config`; the remote fetch (ssh-unix only) is lazy
+/// and cached in `cache`.
+///
+/// Why per-host at all: every daemon validates `Caller::Operator`
+/// frames against the `CM_OPERATOR_TOKEN` it was started with, and a
+/// remote daemon's token is unrelated to the local `~/.cm/operator-token`
+/// — cm-manager's `cm-redeploy` mints its own and feeds it to
+/// `cm-daemon.service` through an `EnvironmentFile`. Pre-fix the TUI
+/// presented the LOCAL token to every host, so each gated RPC to the
+/// remote (`manifest.watch`, `events.subscribe`,
+/// `session.set_workflow_context`, `task.update_tree`, …) answered
+/// `operator token does not match the daemon's configured token`; the
+/// ungated ones (`session.list`, `attach.open`) kept working, so remote
+/// agent sessions still APPEARED but their exit diffs never arrived and
+/// killed workers piled up as stale `agent: <label>` rows.
+pub struct HostToken {
+    /// From `hosts.toml` (`operator_token` inline, or the contents of
+    /// `operator_token_file`). Always wins when set.
+    explicit: Option<String>,
+    /// ssh-unix hosts: how to read the daemon host's own token file
+    /// over the same ssh alias the tunnel uses.
+    remote: Option<RemoteTokenSpec>,
+    cache: Mutex<TokenCache>,
+}
+
+/// `ssh [user@]host cat <path>` recipe for the lazy remote fetch.
+#[derive(Clone, Debug)]
+pub struct RemoteTokenSpec {
+    pub ssh_host: String,
+    pub ssh_user: Option<String>,
+    /// Remote path of the daemon host's token file — derived as
+    /// `<dirname(remote_socket)>/operator-token`, the file the TUI /
+    /// `cm-redeploy` write next to the daemon socket on every host.
+    pub remote_path: PathBuf,
+    /// Executable to run. Production `ssh`; tests substitute a script.
+    pub command: PathBuf,
+}
+
+impl std::fmt::Debug for HostToken {
+    /// Never prints the secret — just where it comes from.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostToken")
+            .field("explicit", &self.explicit.as_ref().map(|_| "<redacted>"))
+            .field("remote", &self.remote)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+struct TokenCache {
+    value: Option<String>,
+    /// Last FAILED fetch — throttles retries so an unreachable host
+    /// doesn't cost an ssh exec per RPC.
+    last_failure: Option<Instant>,
+}
+
+/// Minimum spacing between remote token fetch attempts after a failure.
+const REMOTE_TOKEN_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+impl HostToken {
+    fn explicit(token: String) -> Self {
+        Self {
+            explicit: Some(token),
+            remote: None,
+            cache: Mutex::new(TokenCache::default()),
+        }
+    }
+
+    fn remote(spec: RemoteTokenSpec) -> Self {
+        Self {
+            explicit: None,
+            remote: Some(spec),
+            cache: Mutex::new(TokenCache::default()),
+        }
+    }
+
+    /// Resolve this host's token, or `None` to mean "use the local
+    /// token". Explicit config short-circuits; otherwise the cached
+    /// remote fetch, else one fetch attempt (throttled after failure).
+    fn resolve(&self) -> Option<String> {
+        if let Some(t) = &self.explicit {
+            return Some(t.clone());
+        }
+        let spec = self.remote.as_ref()?;
+        let mut cache = match self.cache.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(v) = &cache.value {
+            return Some(v.clone());
+        }
+        if let Some(t) = cache.last_failure {
+            if t.elapsed() < REMOTE_TOKEN_RETRY_INTERVAL {
+                return None;
+            }
+        }
+        match fetch_remote_token(spec) {
+            Ok(v) => {
+                cache.value = Some(v.clone());
+                cache.last_failure = None;
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: could not read the operator token at {}:{} ({}) — \
+                     presenting the LOCAL token to that host instead; if its daemon \
+                     validates tokens, Operator RPCs to it will be rejected until the \
+                     fetch succeeds (retry in {}s) or `operator_token` / \
+                     `operator_token_file` is set on that [[host]] in hosts.toml",
+                    spec.ssh_host,
+                    spec.remote_path.display(),
+                    e,
+                    REMOTE_TOKEN_RETRY_INTERVAL.as_secs(),
+                );
+                cache.last_failure = Some(Instant::now());
+                None
+            }
+        }
+    }
+}
+
+/// One-shot `ssh [user@]host cat <path>`. Batch mode + a short connect
+/// timeout so an unreachable host fails fast instead of hanging the
+/// caller (this can run on the UI thread, like the tunnel spawn).
+fn fetch_remote_token(spec: &RemoteTokenSpec) -> io::Result<String> {
+    let dest = match &spec.ssh_user {
+        Some(u) => format!("{}@{}", u, spec.ssh_host),
+        None => spec.ssh_host.clone(),
+    };
+    let out = std::process::Command::new(&spec.command)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg(&dest)
+        .arg("cat")
+        .arg(&spec.remote_path)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(io::Error::other(format!(
+            "{} exited {}: {}",
+            spec.command.display(),
+            out.status,
+            stderr.trim(),
+        )));
+    }
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if token.is_empty() {
+        return Err(io::Error::other("token file is empty"));
+    }
+    Ok(token)
+}
+
+/// Closure returning the CURRENT operator token for one host. Same
+/// shape/rationale as [`SocketPathProvider`]: the watch-consumer threads
+/// (`manifest_watch` / `workflow_watch`) re-resolve it on every
+/// reconnect so a token that only became fetchable later (host was
+/// down at TUI start) is picked up without a restart.
+pub type TokenProvider = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// Build a [`TokenProvider`] for `host_id` over `pool`.
+pub fn token_provider_for_host(pool: &Arc<HostPool>, host_id: HostId) -> TokenProvider {
+    let pool = Arc::clone(pool);
+    Arc::new(move || pool.operator_token_for(&host_id))
+}
+
+/// A [`TokenProvider`] that always yields the local token — for the
+/// test seams that drive a consumer against a synthetic local listener.
+pub(crate) fn local_token_provider() -> TokenProvider {
+    Arc::new(|| crate::daemon_launch::operator_token().to_string())
 }
 
 /// 12e (F2 fix): a closure that returns the *current* socket
@@ -1022,8 +1201,12 @@ impl HostPool {
             HashMap::new();
         let mut tracked_hosts: HashSet<HostId> = HashSet::new();
         let mut default_host_id: Option<HostId> = None;
+        let mut tokens: HashMap<HostId, HostToken> = HashMap::new();
         for host in &cfg.hosts {
             let handle = build_handle(host)?;
+            if let Some(tok) = build_host_token(host)? {
+                tokens.insert(host.id.clone(), tok);
+            }
             // 12e-perf: classify which hosts get reachability
             // tracking. Local-Unix is loopback — there's no
             // network failure mode worth amortizing, and the
@@ -1050,7 +1233,30 @@ impl HostPool {
             default_host_id,
             tracked_hosts,
             reachability: ReachabilityCache::new(BackoffConfig::prod()),
+            tokens,
         })
+    }
+
+    /// The operator token to present to `host_id`'s daemon. Resolution:
+    /// `operator_token` / `operator_token_file` from `hosts.toml`, else
+    /// (ssh-unix) the remote `<dirname(remote_socket)>/operator-token`
+    /// fetched lazily over ssh and cached, else the local token
+    /// (`daemon_launch::operator_token()` — right for the local daemon
+    /// the TUI launched, and accepted by any daemon whose validation is
+    /// disabled). Never fails: an unreachable remote degrades to the
+    /// local token with a logged warning. See [`HostToken`].
+    pub fn operator_token_for(&self, host_id: &HostId) -> String {
+        self.tokens
+            .get(host_id)
+            .and_then(|t| t.resolve())
+            .unwrap_or_else(|| crate::daemon_launch::operator_token().to_string())
+    }
+
+    /// Test seam: install a token source for `host_id` (e.g. a remote
+    /// fetch spec whose `command` is a stub script).
+    #[cfg(test)]
+    pub(crate) fn set_host_token_for_test(&mut self, host_id: HostId, token: HostToken) {
+        self.tokens.insert(host_id, token);
     }
 
     /// Lookup by host_id. Errors carry the spawn diagnostic
@@ -1310,6 +1516,63 @@ impl HostPool {
     }
 }
 
+/// Token source for one `[[host]]` entry (see [`HostToken`]). `None`
+/// means "local token" — the Unix/TcpTls case with nothing configured.
+/// An `operator_token_file` that can't be read is a config error
+/// surfaced at pool construction (host name in the message), not a
+/// silent fallback that would strand the host on Unauthorized.
+fn build_host_token(host: &HostConfig) -> io::Result<Option<HostToken>> {
+    if let Some(t) = &host.operator_token {
+        let t = t.trim();
+        if !t.is_empty() {
+            return Ok(Some(HostToken::explicit(t.to_string())));
+        }
+    }
+    if let Some(path) = &host.operator_token_file {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "host `{}` operator_token_file {}: {}",
+                    host.id.as_str(),
+                    path.display(),
+                    e,
+                ),
+            )
+        })?;
+        let t = raw.trim();
+        if t.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "host `{}` operator_token_file {} is empty",
+                    host.id.as_str(),
+                    path.display(),
+                ),
+            ));
+        }
+        return Ok(Some(HostToken::explicit(t.to_string())));
+    }
+    Ok(match &host.transport {
+        HostTransport::SshUnix {
+            ssh_host,
+            ssh_user,
+            remote_socket,
+        } => Some(HostToken::remote(RemoteTokenSpec {
+            ssh_host: ssh_host.clone(),
+            ssh_user: ssh_user.clone(),
+            remote_path: remote_socket
+                .parent()
+                .map(|d| d.join(crate::daemon_launch::OPERATOR_TOKEN_FILENAME))
+                .unwrap_or_else(|| {
+                    PathBuf::from(crate::daemon_launch::OPERATOR_TOKEN_FILENAME)
+                }),
+            command: PathBuf::from("ssh"),
+        })),
+        HostTransport::Unix { .. } | HostTransport::TcpTls { .. } => None,
+    })
+}
+
 fn build_handle(host: &HostConfig) -> io::Result<ConnectionHandle> {
     Ok(match &host.transport {
         HostTransport::Unix { socket } => {
@@ -1386,6 +1649,185 @@ mod tests {
     use crate::hosts::HostsConfig;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    // ── per-host operator token (`HostPool::operator_token_for`) ──
+
+    fn local_only_pool() -> HostPool {
+        let cfg = HostsConfig {
+            hosts: vec![HostConfig {
+                id: HostId::local(),
+                transport: HostTransport::Unix {
+                    socket: PathBuf::from("/tmp/irrelevant.sock"),
+                },
+                default: true,
+                operator_token: None,
+                operator_token_file: None,
+            }],
+        };
+        HostPool::from_config(&cfg).expect("pool")
+    }
+
+    /// Write an executable stub standing in for `ssh`.
+    fn stub_ssh(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fake-ssh.sh");
+        std::fs::write(&p, format!("#!/bin/sh\n{}\n", body)).expect("write stub");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        p
+    }
+
+    /// Hosts with no token source (the local Unix daemon) present the
+    /// local token — the pre-fix behavior, still right for that daemon.
+    #[test]
+    fn operator_token_for_unconfigured_host_is_local_token() {
+        let pool = local_only_pool();
+        assert_eq!(
+            pool.operator_token_for(&HostId::local()),
+            crate::daemon_launch::operator_token(),
+        );
+        // Unknown host id → also the local token (never an error).
+        assert_eq!(
+            pool.operator_token_for(&HostId::new("nope")),
+            crate::daemon_launch::operator_token(),
+        );
+    }
+
+    /// `build_host_token`: inline wins over file; file contents are
+    /// trimmed; an unreadable or empty file is a construction error
+    /// (not a silent fallback that would strand the host on
+    /// Unauthorized); an ssh-unix host with nothing configured gets a
+    /// remote fetch spec pointed at `<dirname(remote_socket)>/operator-token`.
+    #[test]
+    fn build_host_token_precedence_and_remote_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("tok");
+        std::fs::write(&file, "  from-file \n").expect("write");
+        let mut host = HostConfig {
+            id: HostId::new("manager"),
+            transport: HostTransport::SshUnix {
+                ssh_host: "cm-manager".into(),
+                ssh_user: Some("lucas".into()),
+                remote_socket: PathBuf::from("/home/lucas/.cm/daemon.sock"),
+            },
+            default: false,
+            operator_token: Some("inline".into()),
+            operator_token_file: Some(file.clone()),
+        };
+        let t = build_host_token(&host).expect("ok").expect("some");
+        assert_eq!(t.resolve().as_deref(), Some("inline"), "inline wins");
+
+        host.operator_token = None;
+        let t = build_host_token(&host).expect("ok").expect("some");
+        assert_eq!(t.resolve().as_deref(), Some("from-file"), "file value is trimmed");
+
+        std::fs::write(&file, "   \n").expect("write empty");
+        assert!(build_host_token(&host).is_err(), "empty token file is a config error");
+        host.operator_token_file = Some(tmp.path().join("missing"));
+        let err = build_host_token(&host).expect_err("missing file is a config error");
+        assert!(
+            err.to_string().contains("manager"),
+            "error names the host: {err}",
+        );
+
+        host.operator_token_file = None;
+        let t = build_host_token(&host).expect("ok").expect("some");
+        let spec = t.remote.as_ref().expect("ssh-unix host gets a remote fetch spec");
+        assert_eq!(spec.remote_path, PathBuf::from("/home/lucas/.cm/operator-token"));
+        assert_eq!(spec.ssh_host, "cm-manager");
+        assert_eq!(spec.ssh_user.as_deref(), Some("lucas"));
+        assert_eq!(spec.command, PathBuf::from("ssh"));
+
+        let unix = HostConfig {
+            id: HostId::local(),
+            transport: HostTransport::Unix {
+                socket: PathBuf::from("/tmp/x.sock"),
+            },
+            default: true,
+            operator_token: None,
+            operator_token_file: None,
+        };
+        assert!(
+            build_host_token(&unix).expect("ok").is_none(),
+            "a Unix host with nothing configured has no token source (local token)",
+        );
+    }
+
+    /// The remote fetch runs `ssh -o BatchMode=yes -o ConnectTimeout=5
+    /// [user@]host cat <path>`, trims the output, and CACHES it — later
+    /// calls never re-exec.
+    #[test]
+    fn operator_token_for_fetches_remote_token_once_and_caches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let argv_log = tmp.path().join("argv");
+        let counter = tmp.path().join("count");
+        let stub = stub_ssh(
+            tmp.path(),
+            &format!(
+                "echo \"$@\" >> {argv}\necho x >> {count}\necho '  remote-tok-123  '",
+                argv = argv_log.display(),
+                count = counter.display(),
+            ),
+        );
+        let mut pool = local_only_pool();
+        let manager = HostId::new("manager");
+        pool.set_host_token_for_test(
+            manager.clone(),
+            HostToken::remote(RemoteTokenSpec {
+                ssh_host: "cm-manager".into(),
+                ssh_user: Some("lucas".into()),
+                remote_path: PathBuf::from("/home/lucas/.cm/operator-token"),
+                command: stub,
+            }),
+        );
+        assert_eq!(pool.operator_token_for(&manager), "remote-tok-123");
+        assert_eq!(pool.operator_token_for(&manager), "remote-tok-123");
+        let argv = std::fs::read_to_string(&argv_log).expect("argv log");
+        assert_eq!(
+            argv.trim(),
+            "-o BatchMode=yes -o ConnectTimeout=5 lucas@cm-manager cat /home/lucas/.cm/operator-token",
+        );
+        let n = std::fs::read_to_string(&counter).expect("count").lines().count();
+        assert_eq!(n, 1, "the remote fetch must run exactly once (cached)");
+        // The local host is untouched by the manager's token.
+        assert_eq!(
+            pool.operator_token_for(&HostId::local()),
+            crate::daemon_launch::operator_token(),
+        );
+    }
+
+    /// A failed fetch degrades to the LOCAL token (never an error) and is
+    /// throttled: the next call inside the retry interval doesn't re-exec.
+    #[test]
+    fn operator_token_for_falls_back_to_local_and_throttles_after_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let counter = tmp.path().join("count");
+        let stub = stub_ssh(
+            tmp.path(),
+            &format!("echo x >> {}\necho 'cat: no such file' >&2\nexit 1", counter.display()),
+        );
+        let mut pool = local_only_pool();
+        let manager = HostId::new("manager");
+        pool.set_host_token_for_test(
+            manager.clone(),
+            HostToken::remote(RemoteTokenSpec {
+                ssh_host: "cm-manager".into(),
+                ssh_user: None,
+                remote_path: PathBuf::from("/home/lucas/.cm/operator-token"),
+                command: stub,
+            }),
+        );
+        assert_eq!(
+            pool.operator_token_for(&manager),
+            crate::daemon_launch::operator_token(),
+            "fetch failure → local token",
+        );
+        assert_eq!(
+            pool.operator_token_for(&manager),
+            crate::daemon_launch::operator_token(),
+        );
+        let n = std::fs::read_to_string(&counter).expect("count").lines().count();
+        assert_eq!(n, 1, "a failed fetch must not be retried within the throttle window");
+    }
 
     // --- S3: tunnel-generation counter (half-open detection) -------------
 
@@ -2332,6 +2774,7 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
             default_host_id: HostId::local(),
             tracked_hosts: tracked,
             reachability: ReachabilityCache::new(BackoffConfig::prod()),
+            tokens: HashMap::new(),
         };
 
         let result = pool.for_host(&host_id);
@@ -2756,6 +3199,7 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
             default_host_id: HostId::local(),
             tracked_hosts: tracked,
             reachability: ReachabilityCache::new(BackoffConfig::prod()),
+            tokens: HashMap::new(),
         };
         (pool, host_id)
     }
@@ -3064,6 +3508,8 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
                         socket: PathBuf::from("/tmp/local-probe.sock"),
                     },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 HostConfig {
                     id: HostId::new("manager"),
@@ -3073,6 +3519,8 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
                         remote_socket: PathBuf::from("/remote/daemon.sock"),
                     },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -3168,6 +3616,8 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
                         socket: PathBuf::from("/tmp/local-deadchild.sock"),
                     },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 HostConfig {
                     id: HostId::new("manager"),
@@ -3177,6 +3627,8 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
                         remote_socket: PathBuf::from("/remote/daemon.sock"),
                     },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };

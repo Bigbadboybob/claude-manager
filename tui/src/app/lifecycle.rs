@@ -95,9 +95,12 @@ pub(crate) fn try_attach_via_daemon_with_deps(
     let argv: Vec<String> = Vec::new();
     let env: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+    // Per-host token: the daemon behind `host_id` validates against
+    // ITS `CM_OPERATOR_TOKEN` (a remote one is unrelated to ours).
+    let operator_token_id = host_pool.operator_token_for(host_id);
     let cs_config = crate::client_session::ClientSessionConfig {
         daemon_socket: &daemon_socket,
-        operator_token_id: crate::daemon_launch::operator_token(),
+        operator_token_id: &operator_token_id,
         uid: session_uid,
         workspace_id,
         label,
@@ -149,7 +152,7 @@ pub(crate) fn try_attach_via_daemon_with_deps(
     // `task_id` field is whatever it was set to at the original
     // `start_session` time (preserved across TUI restart since
     // the daemon owns it).
-    let operator_token_id = crate::daemon_launch::operator_token();
+    let operator_token_id = operator_token_id.as_str();
     if let Some(tp) = transcript_path {
         if let Err(e) = crate::client_session::rpc_set_transcript_path(
             &daemon_socket,
@@ -488,9 +491,10 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
         "bash" => "bash",
         other => other,
     };
+    let operator_token_id = host_pool.operator_token_for(host_id);
     let cs_config = crate::client_session::ClientSessionConfig {
         daemon_socket: &daemon_socket,
-        operator_token_id: crate::daemon_launch::operator_token(),
+        operator_token_id: &operator_token_id,
         uid: session_uid,
         workspace_id,
         label,
@@ -1361,7 +1365,7 @@ impl App {
             };
             if let Err(e) = crate::client_session::rpc_kill_session(
                 &socket,
-                crate::daemon_launch::operator_token(),
+                &host_pool.operator_token_for(&ts.host_id),
                 uid,
             ) {
                 eprintln!(
@@ -1445,7 +1449,7 @@ impl App {
         };
         if let Err(e) = crate::client_session::rpc_set_transcript_path(
             &socket,
-            crate::daemon_launch::operator_token(),
+            &host_pool.operator_token_for(&ts.host_id),
             daemon_uid,
             &path_str,
         ) {
@@ -1668,7 +1672,7 @@ impl App {
             })?;
         crate::client_session::rpc_register_agent_subtask(
             &daemon_socket,
-            crate::daemon_launch::operator_token(),
+            &self.host_pool.operator_token_for(host_id),
             task_id,
             parent_task_id,
             workspace_id,
@@ -2229,7 +2233,8 @@ impl App {
         // the worktree it creates.
         let session_uid = new_session_uid();
         let workspace_id_pre = new_workspace_id();
-        let op_token = crate::daemon_launch::operator_token();
+        let op_token_owned = self.host_pool.operator_token_for(host);
+        let op_token = op_token_owned.as_str();
 
         // create_session: daemon resolves repo → worktree → argv/env. Engine
         // travels in the daemon's WIRE vocabulary ("claude-code"). A-n is
@@ -2447,7 +2452,7 @@ impl App {
             };
             if let Err(e) = crate::client_session::rpc_session_revive(
                 &socket,
-                crate::daemon_launch::operator_token(),
+                &self.host_pool.operator_token_for(&host_id),
                 &entry,
                 &ws_id,
                 &wt_path.to_string_lossy(),
@@ -2564,7 +2569,8 @@ impl App {
             ));
             return false;
         };
-        let token = crate::daemon_launch::operator_token();
+        let token_owned = self.host_pool.operator_token_for(&host_id);
+        let token = token_owned.as_str();
         if let Err(e) = crate::client_session::rpc_kill_session(
             &socket,
             token,
@@ -3177,7 +3183,8 @@ impl App {
         let (cols, rows) = self.last_term_size;
         let workspace_id = self.workspaces[ws_index].id.clone();
         let session_uid = new_session_uid();
-        let op_token = crate::daemon_launch::operator_token();
+        let op_token_owned = self.host_pool.operator_token_for(host);
+        let op_token = op_token_owned.as_str();
         // Daemon WIRE engine ("claude" → "claude-code").
         let wire_engine = match session_type {
             "claude" => "claude-code",
@@ -5160,6 +5167,7 @@ mod slice_12e_tests {
                 .spawn(move || {
                     crate::manifest_watch::run_consumer_with_provider(
                         &provider_for_thread,
+                        &crate::host_pool::local_token_provider(),
                         cm_daemon::host_id::HostId::local(),
                         event_tx,
                     );
@@ -8778,6 +8786,8 @@ mod revive_session_tests {
                             .join("cm-revive-test-nonexistent-local.sock"),
                     },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: ghost,
@@ -8786,6 +8796,8 @@ mod revive_session_tests {
                             .join("cm-revive-test-nonexistent-ghost.sock"),
                     },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };

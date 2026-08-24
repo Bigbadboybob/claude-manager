@@ -319,7 +319,7 @@ fn push_task_tree(
     };
     match crate::client_session::rpc_task_update_tree(
         &daemon_socket,
-        crate::daemon_launch::operator_token(),
+        &host_pool.operator_token_for(host_id),
         tasks,
         workspaces,
     ) {
@@ -390,7 +390,7 @@ fn push_tui_sessions(
         .collect();
     match crate::client_session::rpc_tui_update_sessions_snapshot(
         &daemon_socket,
-        crate::daemon_launch::operator_token(),
+        &host_pool.operator_token_for(host_id),
         &borrowed,
     ) {
         Ok(()) => {
@@ -445,7 +445,7 @@ fn push_workflow_defs(
     };
     match crate::client_session::rpc_workflow_update_definitions(
         &daemon_socket,
-        crate::daemon_launch::operator_token(),
+        &host_pool.operator_token_for(host_id),
         workflows,
     ) {
         Ok(()) => {
@@ -554,6 +554,8 @@ mod tests {
                     socket: socket.to_path_buf(),
                 },
                 default: true,
+                operator_token: None,
+                operator_token_file: None,
             }],
         };
         Arc::new(HostPool::from_config(&hosts).expect("pool"))

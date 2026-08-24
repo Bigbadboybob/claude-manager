@@ -1026,7 +1026,15 @@ impl App {
     /// CURRENT orchestrator session) OR by task-tree parent
     /// (`parent_task_id == orchestrator.task_id`, which survives a respawn that
     /// minted a new session uid — the latter is why BUG-007/008, spawned by a
-    /// prior orchestrator instance, still group under the live orchestrator).
+    /// prior orchestrator instance, still group under the live orchestrator)
+    /// OR an agent-spawned session bound to the orchestrator's OWN task
+    /// (`managed_by_uid.is_some() && task_id == orchestrator.task_id` — the
+    /// momentum-detective shape: ephemeral workers spawned with no subtask,
+    /// so they share the orchestrator's task and worktree). Without that
+    /// third rule a worker spawned by a PRIOR orchestrator instance fell
+    /// out of the column into the main sidebar the moment the scheduler
+    /// respawned its parent (its `managed_by_uid` now names a dead uid,
+    /// and there is no `parent_task_id` to fall back on).
     ///
     /// These render ONLY in the dedicated continuous column (when it's on) or
     /// nowhere (when it's off) — the main sidebar builders exclude them, so a
@@ -1064,7 +1072,13 @@ impl App {
                     .as_deref()
                     .and_then(|t| parent_of.get(t).copied())
                     .is_some_and(|p| orch_tasks.contains(p));
-                if ts.continuous_task_id.is_some() || by_uid || by_task {
+                let by_same_task = ts.managed_by_uid.is_some()
+                    && ts.continuous_task_id.is_none()
+                    && ts
+                        .task_id
+                        .as_deref()
+                        .is_some_and(|t| orch_tasks.contains(t));
+                if ts.continuous_task_id.is_some() || by_uid || by_task || by_same_task {
                     keys.insert((wi, si));
                 }
             }
@@ -1077,7 +1091,9 @@ impl App {
     /// at `depth 0`, followed by its subtasks nested at `depth 1`. A subtask
     /// nests under an orchestrator when its `managed_by_uid` is that
     /// orchestrator's uid OR its task's `parent_task_id` is the orchestrator's
-    /// task_id (the respawn-robust link — see `continuous_members`).
+    /// task_id (the respawn-robust link — see `continuous_members`) OR it is
+    /// agent-spawned onto the orchestrator's own task (same-task workers —
+    /// each its own depth-1 row, never merged into one task group).
     /// Orchestrators ordered by label (then uid); subtasks by label under each.
     /// Closed workspaces skipped. Pure read — the render + cursor consume this;
     /// it's only drawn/navigated when the column is on.
@@ -1132,11 +1148,22 @@ impl App {
                             .as_deref()
                             .and_then(|t| parent_of.get(t).copied())
                             == otask;
-                    if by_uid || by_task {
+                    let by_same_task = otask.is_some()
+                        && ts.managed_by_uid.is_some()
+                        && ts.task_id.as_deref() == otask;
+                    if by_uid || by_task || by_same_task {
+                        // Same-task workers carry the ORCHESTRATOR's task_id;
+                        // grouping them by it would fold every worker under
+                        // one anchor. Treat them as taskless (own group).
+                        let group_task = if by_same_task && !by_task {
+                            None
+                        } else {
+                            ts.task_id.as_deref()
+                        };
                         members.push((
                             wi,
                             si,
-                            ts.task_id.as_deref(),
+                            group_task,
                             ts.session_type == "bash",
                             ts.label.as_str(),
                         ));

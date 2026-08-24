@@ -1069,6 +1069,8 @@ mod remote_reconnect_tests {
                         socket: local_sock.to_path_buf(),
                     },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: manager_host(),
@@ -1078,6 +1080,8 @@ mod remote_reconnect_tests {
                         remote_socket: PathBuf::from("/remote/daemon.sock"),
                     },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -1557,6 +1561,98 @@ mod remote_reconnect_tests {
         assert!(
             app.continuous_members().contains(&(0, 1)),
             "the orphaned subtask must be classified as a continuous member",
+        );
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Same-task workers (the momentum-detective shape): agent-spawned
+    /// sessions bound to the orchestrator's OWN task (no subtask) nest
+    /// under the live orchestrator — including one whose `managed_by_uid`
+    /// names a dead PRIOR orchestrator instance, which pre-fix fell out of
+    /// the column into the main sidebar on every scheduler respawn. Each
+    /// worker is its own depth-1 row (never folded into one task group),
+    /// and a USER session on the same task is not a member.
+    #[test]
+    fn visual_items_continuous_nests_same_task_workers_across_respawn() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+
+        let mk = |uid: &str,
+                  cont: Option<&str>,
+                  mgr: Option<&str>,
+                  task: Option<&str>,
+                  label: &str| {
+            let (mut ts, _tx, _teof) =
+                session_with_injected_exit(uid, manager_host(), false);
+            ts.continuous_task_id = cont.map(String::from);
+            ts.managed_by_uid = mgr.map(String::from);
+            ts.task_id = task.map(String::from);
+            ts.label = label.into();
+            ts
+        };
+        let mut ws = workspace_with(mk(
+            "orch-NEW",
+            Some("momentum-detective"),
+            None,
+            Some("orch-task"),
+            "Momentum Detective Orchestrator",
+        ));
+        ws.sessions.push(mk("w-old", None, Some("orch-OLD"), Some("orch-task"), "detective-0915b19b"));
+        ws.sessions.push(mk("w-new", None, Some("orch-NEW"), Some("orch-task"), "detective-6b7c40cc"));
+        ws.sessions.push(mk("user-bash", None, None, Some("orch-task"), "operator shell"));
+        app.workspaces.push(ws);
+        app.tasks.push(TaskEntry {
+            task_id: Some("orch-task".into()),
+            name: "orch-task".into(),
+            api_status: TaskStatus::Running,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            is_continuous: true,
+            workspace_id: None,
+            project: None,
+            parent_task_id: None,
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        });
+
+        let rows = app.visual_items_continuous();
+        let resolved: Vec<(&str, u8)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    r.depth,
+                )
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![("orch-NEW", 0), ("w-old", 1), ("w-new", 1)],
+            "same-task workers nest under the live orchestrator (prior-instance \
+             spawn included), one depth-1 row each; the user's shell is not a member",
+        );
+        let members = app.continuous_members();
+        assert!(members.contains(&(0, 1)) && members.contains(&(0, 2)));
+        assert!(
+            !members.contains(&(0, 3)),
+            "a user-created session on the orchestrator's task stays in the main sidebar",
         );
 
         match orig {
@@ -2469,6 +2565,8 @@ mod remote_reconnect_tests {
                         socket: cm_dir.join("daemon.sock"),
                     },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: ghost.clone(),
@@ -2476,6 +2574,8 @@ mod remote_reconnect_tests {
                         socket: cm_dir.join("ghost-nonexistent.sock"),
                     },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
@@ -2510,6 +2610,8 @@ mod remote_reconnect_tests {
                         socket: cm_dir.join("daemon.sock"),
                     },
                     default: true,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
                 crate::hosts::HostConfig {
                     id: ghost.clone(),
@@ -2517,6 +2619,8 @@ mod remote_reconnect_tests {
                         socket: daemon_sock.to_path_buf(),
                     },
                     default: false,
+                    operator_token: None,
+                    operator_token_file: None,
                 },
             ],
         };
