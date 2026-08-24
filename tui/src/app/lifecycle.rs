@@ -3528,15 +3528,14 @@ impl App {
     /// preserved — only A-x (`delete_active`) force-removes those.
     /// Idempotent and cheap; persists the manifest only when something
     /// actually flipped.
-    pub(super) fn reap_spent_workspaces(&mut self) {
-        // Attach-pending exemption: a workspace whose session(s) are merely
-        // unreachable — queued for deferred remote reattach, in-flight on
-        // the attach worker, or preserved as raw manifest entries for an
-        // offline host — LOOKS sessionless but isn't spent. Closing one
-        // would also clear its sessions from the next manifest save (closed
-        // workspaces restore with sessions dropped), turning a down tunnel
-        // into data loss. Owned strings so the borrow ends before the
-        // mutation loop below.
+    /// Workspace ids with a session that is merely UNREACHABLE right now —
+    /// queued for deferred remote reattach, in-flight on the attach worker,
+    /// or preserved as a raw manifest entry for an offline host. Such a
+    /// workspace LOOKS sessionless but isn't spent: closing it would also
+    /// clear its sessions from the next manifest save (closed workspaces
+    /// restore with sessions dropped), turning a down tunnel into data
+    /// loss. Shared by the spent sweep and the kill-time marker close.
+    fn attach_pending_ws_ids(&self) -> std::collections::HashSet<String> {
         let mut attach_pending: std::collections::HashSet<String> =
             self.skipped_manifest_entries.keys().cloned().collect();
         attach_pending.extend(
@@ -3546,6 +3545,57 @@ impl App {
         );
         attach_pending
             .extend(self.attaching.values().map(|p| p.ws_id().to_string()));
+        attach_pending
+    }
+
+    /// Kill-time close for an adoption-minted `agent: <label>` marker: the
+    /// moment its LAST agent-spawned session is removed (killed by its
+    /// orchestrator, exited, gone on the daemon), soft-close the marker —
+    /// don't wait for the ~5s `reap_spent_workspaces` sweep, and don't
+    /// let that sweep's task-liveness gate hold it open. A marker exists
+    /// only to hold a daemon session the TUI didn't create; once that
+    /// session is gone it renders nothing but an empty header (tombstones
+    /// aren't rows) while the subtask itself stays on the planning board
+    /// and the tombstone still serves `read_session_output`. Pre-fix a
+    /// killed perf-triage subtask session left its `agent: PERF-096 …`
+    /// header on the sidebar until the subtask flipped Done.
+    ///
+    /// Scoped by construction: only the `agent:` prefix (minted solely by
+    /// `resolve_adopt_workspace`; an A-e rename claims the workspace and
+    /// opts out), never cloud workspaces, never a marker that still has a
+    /// live row, never one with an attach still pending (see
+    /// `attach_pending_ws_ids`). User-created workspaces — including
+    /// deliberately empty local ones — are untouched. Returns true when
+    /// it closed the marker.
+    pub(super) fn close_agent_marker_if_empty(&mut self, wi: usize) -> bool {
+        let pending = self.attach_pending_ws_ids();
+        let Some(ws) = self.workspaces.get(wi) else {
+            return false;
+        };
+        if ws.is_closed
+            || ws.is_cloud
+            || !ws.name.starts_with("agent: ")
+            || !ws.sessions.is_empty()
+            || pending.contains(ws.id.as_str())
+        {
+            return false;
+        }
+        eprintln!(
+            "cm-tui: closing agent marker workspace `{}` — its last agent \
+             session is gone",
+            ws.name,
+        );
+        self.workspaces[wi].is_closed = true;
+        self.save_session_manifest();
+        self.clamp_cursor();
+        self.needs_redraw = true;
+        true
+    }
+
+    pub(super) fn reap_spent_workspaces(&mut self) {
+        // Attach-pending exemption — see `attach_pending_ws_ids`. Owned
+        // strings so the borrow ends before the mutation loop below.
+        let attach_pending = self.attach_pending_ws_ids();
 
         // Focus exemption: never sweep the workspace the operator has the
         // cursor on. An A-O reopen of a spent workspace parks the cursor

@@ -1100,6 +1100,7 @@ impl App {
                 );
                 let target = uid.clone();
                 self.tombstone_and_remove(wi, |ts| ts.uid == target);
+                self.close_agent_marker_if_empty(wi);
             }
             self.clamp_cursor();
             self.needs_redraw = true;
@@ -1912,6 +1913,7 @@ impl App {
         for (wi, uid) in prunes {
             let target = uid.clone();
             self.tombstone_and_remove(wi, |ts| ts.uid == target);
+            self.close_agent_marker_if_empty(wi);
         }
         self.clamp_cursor();
         self.needs_redraw = true;
@@ -2054,11 +2056,11 @@ impl App {
                     let target = uid.clone();
                     self.tombstone_and_remove(wi, |ts| ts.uid == target);
                     self.clamp_cursor();
-                    // Workspace cleanup is NOT a per-site call anymore: the
-                    // `reap_spent_workspaces` sweep at the `reconcile_tasks`
-                    // tail (~5s cadence) soft-closes this workspace once its
-                    // task reads terminal — same cleanup, one hoisted site
-                    // covering every session-end path instead of this one.
+                    // Kill-time close of an adoption-minted `agent:` marker
+                    // that just lost its last session (user workspaces are
+                    // left to the `reap_spent_workspaces` sweep, whose
+                    // task-liveness gates still apply to them).
+                    self.close_agent_marker_if_empty(wi);
                 }
                 // R5: untracked uid — `found` stays false; silent
                 // no-op. The diff referenced a session the TUI
@@ -3256,6 +3258,134 @@ mod apply_manifest_diff_tests {
         age_agent_row(&mut app, 0, 0, remote.clone());
         app.restart_suppressed_exit_uids.insert("ts-snap-ar".into());
         assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "A-R uid kept");
+    }
+
+    // ── kill-time close of adoption-minted `agent:` markers ──
+
+    fn exit_diff(uid: &str) -> ManifestDiff {
+        ManifestDiff::Exited {
+            uid: uid.into(),
+            last_exit: LastExit {
+                code: Some(0),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        }
+    }
+
+    /// The moment an `agent:` marker's last agent-spawned session is
+    /// pruned on an `Exited` diff, the marker itself is soft-closed —
+    /// no waiting for the sweep, and the subtask's still-running status
+    /// does NOT hold it open (that gate is for user workspaces).
+    #[test]
+    fn exited_diff_closes_agent_marker_at_kill_time() {
+        let mut app = build_app_with_session("ts-km1");
+        app.workspaces[0].name = "agent: PERF-096 rebase + reconcile".into();
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.workspaces[0].sessions[0].task_id = Some("t-perf-096".into());
+        // A live, non-continuous task bound to the marker — the sweep's
+        // liveness gate would keep it open; kill-time close must not.
+        app.tasks.push(TaskEntry {
+            task_id: Some("t-perf-096".into()),
+            name: "PERF-096".into(),
+            api_status: TaskStatus::Running,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            is_continuous: false,
+            workspace_id: Some(app.workspaces[0].id.clone()),
+            project: None,
+            parent_task_id: None,
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        });
+        app.apply_manifest_diff(exit_diff("ts-km1"));
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert!(
+            app.workspaces[0].is_closed,
+            "an emptied `agent:` marker closes at kill time even under a \
+             running oneshot task",
+        );
+        assert_eq!(app.workspaces[0].tombstones.len(), 1, "history kept");
+    }
+
+    /// User-created workspaces are NOT closed by the kill-time path —
+    /// the user owns their lifecycle (and empty local workspaces are a
+    /// deliberate thing). Only the `agent:` prefix opts a workspace in.
+    #[test]
+    fn exited_diff_leaves_user_workspace_open() {
+        let mut app = build_app_with_session("ts-km2");
+        assert!(!app.workspaces[0].name.starts_with("agent: "));
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.apply_manifest_diff(exit_diff("ts-km2"));
+        assert!(app.workspaces[0].sessions.is_empty(), "row pruned");
+        assert!(
+            !app.workspaces[0].is_closed,
+            "a non-marker workspace is left for the user / the sweep",
+        );
+    }
+
+    /// Same kill-time close from the ATTACH-stream exit path and the
+    /// snapshot reconcile path.
+    #[test]
+    fn attach_exit_and_snapshot_prune_close_agent_marker() {
+        let mut app = build_app_with_session("ts-km3");
+        app.workspaces[0].name = "agent: detective-km3".into();
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        inject_attach_exit(&mut app, 0, 0);
+        app.drain_terminal_events();
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert!(app.workspaces[0].is_closed, "attach-exit prune closes the marker");
+
+        let remote = cm_daemon::host_id::HostId::new("manager");
+        let mut app = build_app_with_session("ts-km4");
+        app.workspaces[0].name = "agent: detective-km4".into();
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.apply_manifest_snapshot(snapshot_payload(remote, &[], &[]));
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert!(app.workspaces[0].is_closed, "snapshot prune closes the marker");
+    }
+
+    /// Guards on the close itself: a marker with a live row left, one
+    /// with an attach still pending, a cloud workspace, and a plain
+    /// workspace all stay open.
+    #[test]
+    fn close_agent_marker_if_empty_guards() {
+        // Live row left → not closed.
+        let mut app = build_app_with_session("ts-km5");
+        app.workspaces[0].name = "agent: busy".into();
+        assert!(!app.close_agent_marker_if_empty(0));
+        assert!(!app.workspaces[0].is_closed);
+
+        // Empty but attach-pending (restore-deferred entry preserved) → not closed.
+        let entry = app.workspaces[0].sessions[0].to_manifest_entry();
+        app.workspaces[0].sessions.clear();
+        let ws_id = app.workspaces[0].id.clone();
+        app.skipped_manifest_entries.insert(ws_id.clone(), vec![entry]);
+        assert!(!app.close_agent_marker_if_empty(0));
+        assert!(!app.workspaces[0].is_closed);
+
+        // Pending cleared → closes.
+        app.skipped_manifest_entries.remove(&ws_id);
+        assert!(app.close_agent_marker_if_empty(0));
+        assert!(app.workspaces[0].is_closed);
+        // Idempotent on an already-closed marker.
+        assert!(!app.close_agent_marker_if_empty(0));
+
+        // Plain (user) workspace, empty → not closed. Cloud → not closed.
+        let mut app = build_app_with_session("ts-km6");
+        app.workspaces[0].sessions.clear();
+        assert!(!app.close_agent_marker_if_empty(0));
+        app.workspaces[0].name = "agent: cloudy".into();
+        app.workspaces[0].is_cloud = true;
+        assert!(!app.close_agent_marker_if_empty(0));
+        assert!(!app.workspaces[0].is_closed);
+        // Out-of-range index is a no-op.
+        assert!(!app.close_agent_marker_if_empty(99));
     }
 
     /// Cursor safety: when the cursor sits on the pruned row, the apply

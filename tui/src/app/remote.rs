@@ -919,11 +919,15 @@ impl App {
         self.reconnecting_sessions.remove(&uid);
         eprintln!(
             "cm-tui: agent-spawned session {} ({}) on host {} is gone on the \
-             daemon — tombstoned; its workspace is now reapable",
+             daemon — tombstoned",
             uid,
             entry.label,
             entry.host_id.as_str(),
         );
+        // Kill-time close of the marker (the give-up entry was the last
+        // thing pinning it; the caller drops the pending item, and this
+        // entry is already out of `skipped_manifest_entries`).
+        self.close_agent_marker_if_empty(ws_idx);
         true
     }
 
@@ -3345,12 +3349,14 @@ mod remote_reconnect_tests {
             "a user-owned entry keeps the preserve-in-skipped behavior",
         );
         assert!(app.workspaces[1].tombstones.is_empty());
-
-        app.reap_spent_workspaces();
         assert!(
             app.workspaces[0].is_closed,
-            "with its entry settled, the empty `agent:` marker is reaped",
+            "the empty `agent:` marker is closed AT SETTLE TIME (kill-time \
+             close), not left for the sweep",
         );
+
+        app.reap_spent_workspaces();
+        assert!(app.workspaces[0].is_closed);
         assert!(
             !app.workspaces[1].is_closed,
             "the user-owned marker stays attach-pending-exempt (unchanged)",
