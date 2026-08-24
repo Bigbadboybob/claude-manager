@@ -1,5 +1,5 @@
 //! Transcript-tail probe — the ground-truth read behind the scheduler's
-//! auth-expiry + consumer-wedge detection (`auth_wedge_pass`).
+//! account-block + consumer-wedge detection (`auth_wedge_pass`).
 //!
 //! ## Why a tail probe and not the Stop hook
 //!
@@ -22,6 +22,11 @@
 //!       "isApiErrorMessage":true,"message":{"model":"<synthetic>","content":
 //!       [{"type":"text","text":"Login expired · Please run /login"}]}}`
 //!     followed by `{"type":"system","subtype":"turn_duration"}`.
+//!   - **Usage exhaustion** — Claude currently emits an otherwise ordinary
+//!     assistant text record such as `You've hit your weekly limit · resets
+//!     Aug 25, 3pm (UTC)`, also followed by `turn_duration`. It has no
+//!     `authentication_failed` tag, so it needs its own high-specificity banner
+//!     matcher.
 //!   - **Completed turn** — the file ends (modulo bookkeeping records) with
 //!     `{"type":"system","subtype":"turn_duration"}`.
 //!   - **Delivered-but-unanswered prompt** — the last substantive record is a
@@ -76,6 +81,12 @@ pub struct TailProbe {
     /// has been revoked."`. Auth-error turns DO end (a `turn_duration`
     /// follows), so this composes with `shape == TurnComplete`.
     pub auth_error: Option<String>,
+    /// `Some(banner text)` when the newest assistant record is Claude's
+    /// subscription-usage exhaustion banner. This is deliberately limited to
+    /// first-person product banners such as "You've hit your weekly limit";
+    /// ordinary agent prose that merely discusses a weekly limit must not
+    /// freeze an orchestrator.
+    pub usage_limit: Option<String>,
 }
 
 /// Classify the transcript's tail. `None` when the file can't be read, is
@@ -88,6 +99,7 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
     // the read started at offset 0.
     let mut shape: Option<TailShape> = None;
     let mut auth_error: Option<String> = None;
+    let mut usage_limit: Option<String> = None;
     for line in text.lines().rev().take(MAX_SCAN_LINES) {
         let line = line.trim();
         if line.is_empty() {
@@ -108,8 +120,11 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
                 }
             }
             Some("assistant") => {
+                let text = assistant_text(&v);
                 if v.get("error").and_then(|e| e.as_str()) == Some("authentication_failed") {
-                    auth_error = Some(assistant_text(&v));
+                    auth_error = Some(text.clone());
+                } else if is_usage_limit_banner(&text) {
+                    usage_limit = Some(text);
                 }
                 if shape.is_none() {
                     shape = Some(TailShape::MidTurn);
@@ -127,7 +142,29 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
             _ => {}
         }
     }
-    shape.map(|shape| TailProbe { shape, auth_error })
+    shape.map(|shape| TailProbe {
+        shape,
+        auth_error,
+        usage_limit,
+    })
+}
+
+/// Match only Claude's first-person limit turn-enders. A loose search for
+/// "weekly limit" would classify a healthy coding agent explaining this very
+/// incident as account-blocked.
+fn is_usage_limit_banner(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    [
+        "you've hit your weekly limit",
+        "you’ve hit your weekly limit",
+        "you've reached your weekly limit",
+        "you’ve reached your weekly limit",
+        "you've reached your usage limit",
+        "you’ve reached your usage limit",
+        "you have reached your usage limit",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
 }
 
 /// First text block of an assistant record's message content, for the alert
@@ -209,6 +246,40 @@ pub fn credentials_file_problem(path: &Path) -> Option<String> {
     }
 }
 
+/// Whether the host-global end-to-end Claude usage probe proved the account
+/// healthy *after* an account blocker was detected. The probe writer stores a
+/// numeric `checked_at` in current versions; the file mtime is the compatibility
+/// clock for already-installed probes that predate that field. A missing,
+/// malformed, non-OK, or not-newer state is never recovery proof.
+pub fn usage_probe_ok_after(path: &Path, blocked_at: u64) -> bool {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let state: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(state) => state,
+        Err(_) => return false,
+    };
+    if state.get("status").and_then(|v| v.as_str()) != Some("OK") {
+        return false;
+    }
+    let checked_at = state
+        .get("checked_at")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v as u64)
+        .or_else(|| {
+            std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        });
+    checked_at.is_some_and(|checked_at| checked_at > blocked_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +302,7 @@ mod tests {
     const USER_LINE: &str = r#"{"type":"user","message":{"role":"user","content":"go"}}"#;
     const ASSISTANT_TEXT_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done."}],"stop_reason":"end_turn"}}"#;
     const ASSISTANT_TOOL_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#;
+    const WEEKLY_LIMIT_LINE: &str = r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your weekly limit · resets Aug 25, 3pm (UTC)"}]}}"#;
 
     /// The incident's exact wedge shape: user prompt → synthetic 401 assistant
     /// → turn_duration → snapshot. Turn complete AND auth error.
@@ -261,6 +333,7 @@ mod tests {
         let p = probe_transcript_tail(&path).expect("probe");
         assert_eq!(p.shape, TailShape::TurnComplete);
         assert!(p.auth_error.is_none());
+        assert!(p.usage_limit.is_none());
     }
 
     /// A trailing tool_use assistant record = mid-turn (long tool call), never
@@ -272,6 +345,32 @@ mod tests {
         let p = probe_transcript_tail(&path).expect("probe");
         assert_eq!(p.shape, TailShape::MidTurn);
         assert!(p.auth_error.is_none());
+        assert!(p.usage_limit.is_none());
+    }
+
+    #[test]
+    fn weekly_limit_turn_is_complete_with_usage_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(
+            &dir,
+            &[USER_LINE, WEEKLY_LIMIT_LINE, TURN_DURATION_LINE, SNAPSHOT_LINE],
+        );
+        let p = probe_transcript_tail(&path).expect("probe");
+        assert_eq!(p.shape, TailShape::TurnComplete);
+        assert!(p.auth_error.is_none());
+        assert_eq!(
+            p.usage_limit.as_deref(),
+            Some("You've hit your weekly limit · resets Aug 25, 3pm (UTC)"),
+        );
+    }
+
+    #[test]
+    fn ordinary_agent_discussion_of_weekly_limit_is_not_a_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let discussion = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The weekly limit detector should recover after login."}]}}"#;
+        let path = write_lines(&dir, &[USER_LINE, discussion, TURN_DURATION_LINE]);
+        let p = probe_transcript_tail(&path).expect("probe");
+        assert!(p.usage_limit.is_none());
     }
 
     /// A trailing user record = delivered prompt with no response.
@@ -304,6 +403,7 @@ mod tests {
         let p = probe_transcript_tail(&path).expect("probe");
         assert_eq!(p.shape, TailShape::TurnComplete);
         assert!(p.auth_error.is_none(), "old 401 must not re-alert");
+        assert!(p.usage_limit.is_none());
     }
 
     /// Unreadable / empty / no-substantive-records files are "can't judge".
@@ -357,5 +457,22 @@ mod tests {
         let path = dir.path().join("creds.json");
         std::fs::write(&path, r#"{"someFutureShape":true}"#).unwrap();
         assert!(credentials_file_problem(&path).is_none());
+    }
+
+    #[test]
+    fn usage_probe_requires_a_newer_successful_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-probe-state.json");
+        std::fs::write(&path, r#"{"status":"USAGE_LIMITED","checked_at":200}"#).unwrap();
+        assert!(!usage_probe_ok_after(&path, 100));
+
+        std::fs::write(&path, r#"{"status":"OK","checked_at":100}"#).unwrap();
+        assert!(!usage_probe_ok_after(&path, 100), "same-time OK is stale");
+
+        std::fs::write(&path, r#"{"status":"OK","checked_at":101}"#).unwrap();
+        assert!(usage_probe_ok_after(&path, 100));
+
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(!usage_probe_ok_after(&path, 100));
     }
 }

@@ -131,6 +131,7 @@ pub fn startup_orphan_sweep_with(alive: impl Fn(&str) -> bool) {
                     if run.finished_at.is_none() {
                         run.finished_at = Some(now);
                     }
+                    t.account_blocked = None;
                     closed = true;
                 }
             }
