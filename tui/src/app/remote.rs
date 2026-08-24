@@ -392,11 +392,16 @@ impl App {
                             // Bound reached → stop retrying (both a reconnecting
                             // slot AND a restore-deferred fresh attach — pre-fix
                             // a fresh attach re-queued FOREVER, spinning on a
-                            // genuinely-gone session). A reconnecting slot settles
-                            // to `exited`; a fresh entry has no slot — drop it from
-                            // the queue, leaving the raw entry preserved in
-                            // `skipped_manifest_entries` (rides on disk).
-                            if reconnecting {
+                            // genuinely-gone session). An agent-spawned entry is
+                            // SETTLED (tombstoned, unpinned — see
+                            // `settle_gone_agent_entry`). Otherwise a
+                            // reconnecting slot settles to `exited`; a fresh entry
+                            // has no slot — drop it from the queue, leaving the
+                            // raw entry preserved in `skipped_manifest_entries`
+                            // (rides on disk).
+                            if self.settle_gone_agent_entry(&p.ws_id, &p.entry) {
+                                self.clamp_cursor();
+                            } else if reconnecting {
                                 if let Some(ws_idx) =
                                     self.workspaces.iter().position(|w| w.id == p.ws_id)
                                 {
@@ -732,6 +737,11 @@ impl App {
                             // via A-r).
                             let attempts = p.attempts + 1;
                             if attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
+                                if self.settle_gone_agent_entry(&p.ws_id, &p.entry) {
+                                    self.clamp_cursor();
+                                    reattached_any = true;
+                                    continue;
+                                }
                                 {
                                     let slot = &mut self.workspaces[ws_idx]
                                         .sessions[existing_idx];
@@ -814,6 +824,11 @@ impl App {
                     // preserved in `skipped_manifest_entries`, rides on disk).
                     let attempts = p.attempts + 1;
                     if attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
+                        if self.settle_gone_agent_entry(&p.ws_id, &p.entry) {
+                            self.clamp_cursor();
+                            reattached_any = true;
+                            continue;
+                        }
                         eprintln!(
                             "cm-tui: deferred remote reattach of session {} ({}) \
                              on host {} gave up after {} attempts (session gone; \
@@ -847,6 +862,71 @@ impl App {
     /// empties. Used by `drain_deferred_remote_reattach` once an entry is
     /// reattached into live state, so the save path doesn't double-write it
     /// (once from `ws.sessions`, once from the skipped list).
+    /// A daemon-confirmed-gone entry at the give-up cap. For an
+    /// AGENT-SPAWNED, non-workflow entry the daemon's `NotFound` is the
+    /// final word (its owner killed it; the 5s adopt poll would re-adopt
+    /// it if it ever came back), so settle it: tombstone it onto its
+    /// workspace (any live slot removed, `read_session_output` still
+    /// served), drop it from `skipped_manifest_entries`, and forget its
+    /// reconnect bookkeeping. That unpins the `agent: <label>` marker
+    /// from `reap_spent_workspaces`'s attach-pending exemption — pre-fix
+    /// a given-up entry stayed "preserved in skipped" forever, so every
+    /// killed momentum-detective worker left an EMPTY `agent: detective-*`
+    /// header on the sidebar after a TUI restart (the daemon had long
+    /// dropped it; nothing could ever reattach). User-owned and workflow
+    /// entries keep the preserve behavior (offline-host data-loss guard).
+    /// Returns true when the entry was settled.
+    fn settle_gone_agent_entry(
+        &mut self,
+        ws_id: &str,
+        entry: &cm_daemon::manifest::ManifestEntry,
+    ) -> bool {
+        if entry.managed_by_uid.is_none() || entry.workflow_run_id.is_some() {
+            return false;
+        }
+        let Some(ws_idx) = self.workspaces.iter().position(|w| w.id == ws_id) else {
+            return false;
+        };
+        let uid = entry.uid.clone();
+        let had_slot = self.workspaces[ws_idx]
+            .sessions
+            .iter()
+            .any(|s| s.uid == uid);
+        if had_slot {
+            // Live (reconnecting) slot: the shared removal helper tombstones
+            // from the slot itself and clears reconnect state.
+            let target = uid.clone();
+            self.tombstone_and_remove(ws_idx, |ts| ts.uid == target);
+        } else {
+            let ws = &mut self.workspaces[ws_idx];
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            ws.tombstones.push(cm_daemon::manifest::SessionTombstone {
+                uid: uid.clone(),
+                managed_by_uid: entry.managed_by_uid.clone(),
+                label: entry.label.clone(),
+                session_type: entry.session_type.clone(),
+                task_id: entry.task_id.clone(),
+                last_transcript_id: entry.transcript_id.clone(),
+                worktree_path: ws.worktree_path.clone(),
+                generation: entry.generation,
+                exited_at: now,
+            });
+        }
+        self.remove_skipped_entry(ws_id, &uid);
+        self.reconnecting_sessions.remove(&uid);
+        eprintln!(
+            "cm-tui: agent-spawned session {} ({}) on host {} is gone on the \
+             daemon — tombstoned; its workspace is now reapable",
+            uid,
+            entry.label,
+            entry.host_id.as_str(),
+        );
+        true
+    }
+
     fn remove_skipped_entry(&mut self, ws_id: &str, uid: &str) {
         if let Some(v) = self.skipped_manifest_entries.get_mut(ws_id) {
             v.retain(|e| e.uid != uid);
@@ -3165,6 +3245,115 @@ mod remote_reconnect_tests {
         assert!(
             app.skipped_manifest_entries.contains_key("ws-remote"),
             "giving up PRESERVES the raw entry in skipped (no data loss)",
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// The empty-`agent:`-header leak: a restore-deferred AGENT-SPAWNED
+    /// entry whose reachable daemon says `NotFound` is, at the give-up cap,
+    /// tombstoned + dropped from `skipped_manifest_entries` (instead of
+    /// "preserved in skipped" forever), so `reap_spent_workspaces` closes
+    /// its `agent: <label>` marker. A user-owned entry in the same spot
+    /// keeps the preserve behavior.
+    #[test]
+    fn fresh_deferred_reattach_gone_agent_entry_is_settled_and_workspace_reaped() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        // A live in-proc daemon with NO sessions → any attach returns NotFound.
+        let mgr_sock = cm_dir.join("manager.sock");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            cm_daemon::state::DaemonState::new(),
+        ));
+        let (stop, dhandle) =
+            crate::app::events::pending_workflow_events_tests::spawn_inproc_daemon(mgr_sock.clone(), state);
+
+        let (mut app, ghost) = app_with_daemon_host(&cm_dir, &mgr_sock);
+        // Two adoption-minted markers, no live slots: one holds an
+        // agent-spawned entry, the other a user-owned one. A third
+        // workspace parks the cursor so neither is focus-exempt from reaping.
+        let mk_ws = |id: &str, name: &str| {
+            let (seed, _tx, _teof) =
+                session_with_injected_exit("seed", ghost.clone(), false);
+            let mut ws = workspace_with(seed);
+            ws.id = id.into();
+            ws.name = name.into();
+            ws.worktree_path = Some(wt.clone());
+            ws.sessions.clear();
+            ws
+        };
+        app.workspaces.push(mk_ws("ws-agent", "agent: detective-18818228"));
+        app.workspaces.push(mk_ws("ws-user", "agent: user-owned"));
+        let (parked, _p_tx, _p_t) =
+            session_with_injected_exit("parked", ghost.clone(), false);
+        app.workspaces.push(workspace_with(parked));
+        app.cursor = Cursor::Workspace(2);
+
+        let (agent_ts, _t1, _e1) =
+            session_with_injected_exit("uid-agent", ghost.clone(), false);
+        let mut agent_entry = agent_ts.to_manifest_entry();
+        agent_entry.managed_by_uid = Some("orch-OLD".into());
+        agent_entry.label = "detective-18818228".into();
+        let (user_ts, _t2, _e2) =
+            session_with_injected_exit("uid-user", ghost.clone(), false);
+        let user_entry = user_ts.to_manifest_entry();
+        assert!(user_entry.managed_by_uid.is_none());
+        app.skipped_manifest_entries
+            .insert("ws-agent".into(), vec![agent_entry.clone()]);
+        app.skipped_manifest_entries
+            .insert("ws-user".into(), vec![user_entry.clone()]);
+        for (ws, e) in [("ws-agent", agent_entry), ("ws-user", user_entry)] {
+            let mut item = PendingRemoteReattach::new(ws.into(), e);
+            item.attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
+            app.pending_remote_reattach.push(item);
+        }
+        app.sessions_restored = false;
+
+        // One attach per drain tick → two drains hit both caps.
+        app.drain_deferred_remote_reattach();
+        app.drain_deferred_remote_reattach();
+        assert!(app.pending_remote_reattach.is_empty(), "both gave up");
+
+        assert!(
+            !app.skipped_manifest_entries.contains_key("ws-agent"),
+            "the gone agent entry must be DROPPED from skipped (it was pinning \
+             the marker open)",
+        );
+        assert_eq!(
+            app.workspaces[0].tombstones.len(),
+            1,
+            "…and recorded as a tombstone (read-after-exit still served)",
+        );
+        assert_eq!(app.workspaces[0].tombstones[0].uid, "uid-agent");
+        assert!(
+            app.skipped_manifest_entries.contains_key("ws-user"),
+            "a user-owned entry keeps the preserve-in-skipped behavior",
+        );
+        assert!(app.workspaces[1].tombstones.is_empty());
+
+        app.reap_spent_workspaces();
+        assert!(
+            app.workspaces[0].is_closed,
+            "with its entry settled, the empty `agent:` marker is reaped",
+        );
+        assert!(
+            !app.workspaces[1].is_closed,
+            "the user-owned marker stays attach-pending-exempt (unchanged)",
         );
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
