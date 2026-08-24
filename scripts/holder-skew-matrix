@@ -41,6 +41,9 @@ build_ref() { # $1 = ref; echoes the bin dir
     local tree="$CACHE_ROOT/tree-$sha"
     local target="$CACHE_ROOT/target-$sha"
     if [ ! -d "$tree" ]; then
+        # A reboot wipes /tmp but leaves the worktree REGISTERED
+        # (prunable); `worktree add` refuses the path until it's pruned.
+        git worktree prune
         git worktree add --detach "$tree" "$sha" >/dev/null
     fi
     (cd "$tree" && CARGO_TARGET_DIR="$target" \
