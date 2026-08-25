@@ -61,6 +61,29 @@ class TaskUpdate(BaseModel):
     metadata: dict | None = None
 
 
+class BacktestPhaseUpdate(BaseModel):
+    """Live pipeline-phase heartbeat POSTed by a backtest worker mid-run.
+
+    The worker's ``backtest_startup.sh`` relays a marker file the PT pipeline writes
+    (``phase_report.py``) into ``POST /tasks/{id}/backtest-phase``, which merges these
+    fields into ``metadata.backtest`` server-side (no clobber of run_key/launched_at/…)
+    and stamps ``phase_updated_at``. The portal mirrors them onto the backtest_runs row so
+    the ``/backtests`` panel can show ``Setup - download 40%`` during the pre-replay download
+    instead of a blank Progress/ETA.
+
+    ``phase`` is setup|replay|finalize; ``phase_step`` is the sub-step (e.g. download_events);
+    ``phase_progress`` is a 0..1 fraction for the active phase; ``emitted_at`` is the worker's
+    own clock for the marker (stored as-is; the server-authoritative freshness stamp is
+    ``phase_updated_at``, set on write).
+    """
+    phase: str
+    phase_step: str | None = None
+    phase_progress: float | None = None
+    phase_started_at: datetime | None = None
+    phase_detail: str | None = None
+    emitted_at: datetime | None = None
+
+
 class ArtifactCreate(BaseModel):
     """Structured result artifact POSTed by a worker (cloud auto-backtest).
 

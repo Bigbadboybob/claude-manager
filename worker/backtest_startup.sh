@@ -33,6 +33,11 @@ curl -sf "$META_URL/backtest-payload" -H "$META_HEADER" > /root/backtest-payload
 
 GCS_PREFIX="$RESULTS_BUCKET/backtests/$RUN_KEY"
 RESULTS_DIR=/workspace/results
+# Live pipeline-phase marker. The PT pipeline (phase_report.py + the coarse stage markers
+# below) writes it; the completion-watcher poll loop relays it to the CM phase endpoint so the
+# /backtests panel can show "Setup - download 40%" during the pre-replay download instead of a
+# blank Progress/ETA. Exported so the tmux pipeline + its python see the same path.
+export CM_BT_PHASE_FILE=/var/run/cm-bt-phase.json
 
 echo "[cm-backtest] Task: $TASK_ID"
 echo "[cm-backtest] Repo: $REPO_URL (branch: $REPO_BRANCH)"
@@ -48,6 +53,36 @@ api_update() {
             -H "Authorization: Bearer $API_TOKEN" \
             -d "$1" || echo "[cm-backtest] WARNING: API callback failed"
     fi
+}
+
+# Relay a phase marker (the JSON body written by phase_report.py / phase_marker below) to the
+# dedicated merge endpoint. Merges into metadata.backtest server-side (no clobber) and stamps
+# phase_updated_at. Best-effort — a failed heartbeat must never affect the run.
+api_phase() {
+    if [ -n "$MANAGER_URL" ] && [ -n "$API_TOKEN" ] && [ -n "${1//[[:space:]]/}" ]; then
+        curl -sf -X POST "$MANAGER_URL/tasks/$TASK_ID/backtest-phase" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -d "$1" >/dev/null 2>&1 || echo "[cm-backtest] WARNING: phase callback failed"
+    fi
+}
+
+# Build a coarse phase marker JSON on stdout (stdlib-only python3, so it works before uv sync).
+# Used for stage boundaries the PT python doesn't emit itself (uv_sync, finalize); the finer
+# download/replay markers come from phase_report.py inside the pipeline.
+phase_marker() {   # $1=phase  $2=step  $3=detail
+    CM_PHASE="$1" CM_STEP="$2" CM_DETAIL="$3" python3 - <<'PY' 2>/dev/null || true
+import datetime, json, os
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+print(json.dumps({
+    "phase": os.environ.get("CM_PHASE"),
+    "phase_step": os.environ.get("CM_STEP") or None,
+    "phase_progress": None,
+    "phase_started_at": now,
+    "phase_detail": os.environ.get("CM_DETAIL") or None,
+    "emitted_at": now,
+}))
+PY
 }
 
 # Backoff schedule between artifact POST attempts: 10 attempts (9 sleeps)
@@ -138,6 +173,10 @@ lines = {
     "BT_REGRESSION": "1" if bt.get("regression") else "",
     "BT_CONFIG": config_path,
     "BT_CONFIG_INLINE": "1" if "\n" in config else "",
+    # So the tmux pipeline + its python (phase_report.py) write phase markers to the same
+    # path the startup script relays. Sourced explicitly here in case the tmux server's env
+    # predates the outer export.
+    "CM_BT_PHASE_FILE": os.environ.get("CM_BT_PHASE_FILE", ""),
 }
 with open("/root/cm-bt.env", "w") as f:
     for k, v in lines.items():
@@ -442,6 +481,15 @@ PY
     exit 0
 fi
 
+# SETUP phase begins (portal /backtests Progress). download_events.py + run_submission.py emit
+# the finer download/replay markers via phase_report.py; this coarse one covers `uv sync`, which
+# runs before the repo's python is usable. Atomic write (tmp + mv), best-effort.
+if [ -n "${CM_BT_PHASE_FILE:-}" ]; then
+    _NOW=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
+    printf '{"phase":"setup","phase_step":"uv_sync","phase_progress":null,"phase_started_at":"%s","phase_detail":"installing dependencies","emitted_at":"%s"}' "$_NOW" "$_NOW" \
+        > "$CM_BT_PHASE_FILE.tmp" 2>/dev/null && mv "$CM_BT_PHASE_FILE.tmp" "$CM_BT_PHASE_FILE" 2>/dev/null || true
+fi
+
 echo "[cm-pipeline] uv sync"
 uv sync || exit 10
 
@@ -497,13 +545,28 @@ echo "[cm-backtest] ttyd: http://${EXTERNAL_IP}:8080 (allowlisted IPs only; from
 echo "running" > /var/log/cm-worker-state
 
 # ---------------------------------------------------------------------------
-# Completion watcher (SIGTERM-interruptible poll)
+# Completion watcher (SIGTERM-interruptible poll) — also relays the live phase
+# marker the pipeline writes ($CM_BT_PHASE_FILE) to the CM phase endpoint whenever
+# it changes, so the /backtests panel tracks SETUP -> REPLAY in flight. Relaying
+# only on change keeps a truly stalled download visible: no new marker -> no PATCH
+# -> phase_updated_at freezes -> the panel's "stalled?" hint fires.
 # ---------------------------------------------------------------------------
+LAST_PHASE_MARKER=""
 while [ ! -f /var/run/cm-pipeline-exit ]; do
+    if [ -f "$CM_BT_PHASE_FILE" ]; then
+        CUR_PHASE_MARKER=$(cat "$CM_BT_PHASE_FILE" 2>/dev/null || echo "")
+        if [ -n "$CUR_PHASE_MARKER" ] && [ "$CUR_PHASE_MARKER" != "$LAST_PHASE_MARKER" ]; then
+            api_phase "$CUR_PHASE_MARKER" && LAST_PHASE_MARKER="$CUR_PHASE_MARKER"
+        fi
+    fi
     sleep 5
 done
 EXIT_CODE=$(cat /var/run/cm-pipeline-exit)
 echo "[cm-backtest] Pipeline finished (exit $EXIT_CODE)"
+
+# FINALIZE phase: publishing results + POSTing the artifact happens below (outside the
+# tmux pipeline, so phase_report.py can't emit it). The run goes terminal moments later.
+api_phase "$(phase_marker finalize '' 'publishing results')"
 
 if [ "$EXIT_CODE" = "0" ]; then
     if post_artifact "$(emit_artifact false)"; then
