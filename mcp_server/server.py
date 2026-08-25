@@ -2913,7 +2913,7 @@ def resolve_stuck(
 _BACKTEST_VM_DEFAULTS = {
     "project": "prediction-market-scalper",
     "zone": "us-east4-a",
-    "machine_type": "c2-standard-4",
+    "machine_type": os.getenv("CM_BACKTEST_MACHINE_TYPE", "n2-standard-4"),  # 2026-08-24: n2 measured 18 % faster than c2 on identical t2 content (perf round 2) and sits under the 200-vCPU N2 quota vs C2's 100; env override mirrors dispatch/config.py
     "image_family": "cm-backtest-worker",
     "image_project": "prediction-market-scalper",
 }
@@ -2985,7 +2985,7 @@ def submit_backtest(
         repo_url: Repo to clone. Defaults to the `project`'s repo URL.
         project: Planning project the task files under (board visibility;
             also the repo-URL lookup key). Must be non-empty.
-        machine_type: Override the default c2-standard-4.
+        machine_type: Override the default (n2-standard-4 unless CM_BACKTEST_MACHINE_TYPE is set).
         zone: Override the default us-east4-a.
 
     Returns: {task_id, run_key, status} — run_key is minted server-side
