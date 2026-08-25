@@ -190,6 +190,45 @@ async def update_task(pool: asyncpg.Pool, task_id: str, **fields) -> dict | None
         return _serialize(dict(row)) if row else None
 
 
+async def merge_task_metadata_backtest(
+    pool: asyncpg.Pool, task_id: str, fields: dict
+) -> dict | None:
+    """Merge ``fields`` into ``metadata->'backtest'`` atomically, server-side.
+
+    Used by the live backtest-phase heartbeat: a plain PATCH replaces the whole
+    ``metadata`` JSONB (``update_task`` above), which would clobber run_key /
+    launched_at / etc., so a naive read-modify-write from the worker races the
+    dispatcher's own metadata writes. This does the merge in one statement —
+    ``metadata->'backtest'`` (or ``{}``) concatenated with ``fields`` (a shallow
+    ``||`` merge, so each key in ``fields`` overwrites its prior value and every
+    other backtest key is preserved). ``updated_at`` is bumped like any update;
+    that is safe because phase heartbeats only arrive while the task is
+    ``running`` — the RUNNING-run reaper anchors on ``metadata.backtest.launched_at``
+    and the done/blocked archive sweep only touches terminal rows.
+    """
+    async with pool.acquire() as conn:
+        # $2 is passed as a Python dict; the per-connection jsonb codec encodes it, and the `||`
+        # (jsonb || jsonb) operand types it as jsonb — the same dict->jsonb pattern update_task uses
+        # for `metadata = $N`. No `::jsonb` cast on the param (that idiom would type it as text and
+        # bypass the codec).
+        row = await conn.fetchrow(
+            """
+            UPDATE tasks
+            SET metadata = jsonb_set(
+                    COALESCE(metadata, '{}'::jsonb),
+                    '{backtest}',
+                    COALESCE(metadata->'backtest', '{}'::jsonb) || $2,
+                    true
+                ),
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *
+            """,
+            task_id, fields,
+        )
+        return _serialize(dict(row)) if row else None
+
+
 # ---------------------------------------------------------------------------
 # Warm pools
 # ---------------------------------------------------------------------------

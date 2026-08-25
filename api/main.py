@@ -16,6 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from api.auth import verify_token
 from api.models import (
     TaskCreate, TaskUpdate, TaskResponse, ArtifactCreate, ArtifactResponse,
+    BacktestPhaseUpdate,
 )
 from api.dispatch_daemon import dispatch_loop, warm_pool_loop
 from dispatch import db
@@ -479,6 +480,35 @@ async def list_task_artifacts(task_id: str, pool=Depends(get_pool)):
     """All artifacts for a task, newest first."""
     await _get_task_or_400(pool, task_id)
     return await db.list_task_artifacts(pool, task_id)
+
+
+@app.post("/tasks/{task_id}/backtest-phase", response_model=TaskResponse,
+          dependencies=[Depends(verify_token)])
+async def update_backtest_phase(task_id: str, body: BacktestPhaseUpdate,
+                                pool=Depends(get_pool)):
+    """Live pipeline-phase heartbeat from a backtest worker (SETUP/REPLAY/FINALIZE).
+
+    Merges the phase fields into ``metadata.backtest`` server-side (a shallow ``||`` merge,
+    so run_key / launched_at / etc. are preserved) and stamps ``phase_updated_at`` = now — a
+    single, race-free write, unlike the whole-object-replace ``PATCH /tasks/{id}``. The portal's
+    backtest_sync mirrors ``metadata.backtest.phase*`` onto the run row so the panel can show
+    ``Setup - download 40%`` during the pre-replay download instead of a blank Progress/ETA.
+    """
+    await _get_task_or_400(pool, task_id)
+    fields: dict = {
+        "phase": body.phase,
+        "phase_step": body.phase_step,
+        "phase_progress": body.phase_progress,
+        "phase_detail": body.phase_detail,
+        "phase_started_at": body.phase_started_at.isoformat() if body.phase_started_at else None,
+        "phase_emitted_at": body.emitted_at.isoformat() if body.emitted_at else None,
+        # Server-authoritative freshness stamp — what the portal's "stalled?" hint measures against.
+        "phase_updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    updated = await db.merge_task_metadata_backtest(pool, task_id, fields)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return updated
 
 
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
