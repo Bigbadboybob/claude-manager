@@ -150,7 +150,7 @@ post_artifact() {
 # Parse the submission payload -> /root/cm-bt.env (sourced by the pipeline)
 # ---------------------------------------------------------------------------
 python3 - <<'PYEOF'
-import json, shlex
+import json, os, shlex
 
 with open("/root/backtest-payload.json") as f:
     bt = json.load(f)
