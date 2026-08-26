@@ -56,6 +56,7 @@
 pub mod adopt;
 pub mod attach;
 pub mod claude_trust;
+pub mod codex_trust;
 pub mod config;
 pub mod env_sanitize;
 pub mod continuous;
@@ -520,6 +521,44 @@ pub fn run() -> anyhow::Result<()> {
             ));
         }
     };
+
+    // Honor `log_path` from daemon.toml by dup2-ing an append-mode fd onto
+    // stdout + stderr. The field was parsed but consumed NOWHERE, and the
+    // TUI launches the daemon (holder split included) with stdio →
+    // /dev/null — so on a TUI-launched host every eprintln! diagnostic
+    // (agent-prompt delivery outcomes, watchdog warnings, spawn errors)
+    // vanished: the local daemon ran dark from the 2026-08-24 split
+    // re-migration until this. Best-effort: an unopenable path logs to the
+    // current stderr and keeps it. Runs AFTER config load (the path comes
+    // from it) and before anything spawns.
+    if !daemon_config.log_path.is_empty() {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&daemon_config.log_path)
+        {
+            Ok(f) => {
+                use std::os::fd::AsRawFd;
+                // SAFETY: duplicating an owned, open fd onto our own
+                // stdio slots; `f` closing afterwards leaves the dups
+                // intact.
+                unsafe {
+                    libc::dup2(f.as_raw_fd(), 1);
+                    libc::dup2(f.as_raw_fd(), 2);
+                }
+                eprintln!(
+                    "cm-daemon: stdout/stderr → {} (daemon.toml log_path)",
+                    daemon_config.log_path,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "cm-daemon: could not open log_path {}: {} — keeping current stderr",
+                    daemon_config.log_path, e,
+                );
+            }
+        }
+    }
 
     // Arm the worktree disk guard (`[scheduler] max_worktrees`). Enforcement
     // lives at worktree creation (worktree.rs); this is the only wiring point,

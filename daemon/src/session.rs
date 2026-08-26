@@ -1562,6 +1562,18 @@ impl PendingSession {
             &params.args,
             params.working_dir.as_deref(),
         );
+        // The codex twin (2026-08-25): codex 0.149 keys directory trust off
+        // `~/.codex/config.toml` `[projects."…"] trust_level`, its bypass
+        // flag does NOT skip the trust dialog, and a headless prompt
+        // delivery into that dialog is swallowed — the body eaten, the
+        // Enter ANSWERING the dialog, and the dismiss-repaint fooling the
+        // delivery's quiet-based submit verification into `submitted=true`.
+        // Same choke point, same best-effort contract; gated to `codex`.
+        crate::codex_trust::maybe_pretrust_for_spawn(
+            &params.shell,
+            &params.args,
+            params.working_dir.as_deref(),
+        );
 
         // Capture the memory-kill-log baseline BEFORE the child
         // starts. Order matters (slice-10c-e-2 review-4 fix): if

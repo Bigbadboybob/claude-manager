@@ -1857,7 +1857,7 @@ pub fn send_input(
         // Input was delivered NOW — flip idle false synchronously even though
         // the PTY write is deferred to the delivery thread (which stamps too).
         handle.stamp_activity();
-        spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false);
+        spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false, None);
         Ok(json!({ "ok": true, "delivery": "agent-kitty-async" }))
     } else {
         let mut payload = p.text.into_bytes();
@@ -7357,12 +7357,188 @@ fn spawn_agent_prompt_delivery(
     session_uid: String,
     prompt: String,
     fresh_spawn: bool,
+    confirm_state: Option<Arc<Mutex<DaemonState>>>,
 ) {
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
-            deliver_agent_body(&handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
+            let wrote =
+                deliver_agent_body(&handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
+            // Ground-truth confirmation for FRESH codex spawns (2026-08-25):
+            // the delivery's PTY-quiet submit verification is fooled by any
+            // startup modal (directory-trust dialog, the shared-account
+            // rate-limit menu) — the Enter answers the MODAL, the dismissal
+            // repaint reads as "the agent reacted", and the prompt sits in
+            // the composer unsubmitted while the log says submitted=true.
+            // codex gives us real ground truth: its rollout file stays EMPTY
+            // until a turn actually starts, so poll that and re-drive when
+            // the submit demonstrably never happened. Fresh spawns only (a
+            // live target has no startup modal), codex only (claude has no
+            // equivalent stays-empty transcript signal, and no observed
+            // failures).
+            if wrote && fresh_spawn {
+                if let Some(state) = confirm_state {
+                    confirm_codex_prompt_delivery(&state, &handle, &session_uid, &prompt);
+                }
+            }
         });
+}
+
+/// How long the codex confirm loop waits, total, from delivery return.
+const CODEX_CONFIRM_MAX: std::time::Duration = std::time::Duration::from_secs(75);
+/// Re-send Enter at these offsets while the rollout is still empty. The
+/// first covers a dropped/eaten Enter with the body still in the composer
+/// (an extra Enter on an EMPTY composer is a no-op, so this can never
+/// double-submit); the second covers one more modal layer.
+const CODEX_CONFIRM_ENTER_RETRIES: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(18),
+];
+/// Full re-drive (Ctrl+C → body → gap → Enter) at this offset. Ctrl+C
+/// first so a body still sitting in the composer is cleared rather than
+/// doubled — verified against codex 0.149.1: C-c clears a non-empty
+/// composer without killing the process (a paste-A / C-c / paste-B /
+/// Enter sequence submits exactly B; Esc, by contrast, clears NOTHING —
+/// the same probe submitted A+B concatenated). On an empty composer one
+/// C-c just arms the quit hint, which the immediately following paste
+/// disarms.
+const CODEX_CONFIRM_REDELIVER_AT: std::time::Duration = std::time::Duration::from_secs(32);
+
+/// True when `uid`'s codex rollout shows a started turn: a bound
+/// `transcript_path` whose file is non-empty. codex creates the rollout
+/// only when the first turn starts (verified on 0.149.1 — the file, named
+/// for session start, appears with session_meta + the user message at
+/// FIRST SUBMIT), so "non-empty rollout" == "the prompt actually went
+/// through". `None` = the session left the registry (exited/killed): stop.
+fn codex_turn_started(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<bool> {
+    let (session_type, path) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        let sess = st.sessions.get(uid)?;
+        (sess.session_type.clone(), sess.transcript_path.clone())
+    };
+    if session_type != "codex" {
+        // Not codex (claude spawns share this delivery path): report
+        // "started" so the confirm loop ends immediately as a no-op.
+        return Some(true);
+    }
+    Some(
+        path.map(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false),
+    )
+}
+
+/// Post-delivery ground-truth confirmation + bounded re-drive for a fresh
+/// codex spawn's prompt. Runs on the (already detached) delivery thread.
+/// See the call-site comment for the failure class this closes.
+fn confirm_codex_prompt_delivery(
+    state: &Arc<Mutex<DaemonState>>,
+    handle: &crate::session::InputHandle,
+    session_uid: &str,
+    body_text: &str,
+) {
+    use std::time::Instant;
+    let started = Instant::now();
+    let mut enter_retries_sent = 0usize;
+    let mut redelivered = false;
+    loop {
+        match codex_turn_started(state, session_uid) {
+            None => {
+                // Session gone (exited or killed) — nothing to confirm.
+                return;
+            }
+            Some(true) => {
+                // Turn started — the prompt went through. Only worth a log
+                // line when we had to intervene.
+                if enter_retries_sent > 0 || redelivered {
+                    eprintln!(
+                        "cm-daemon: codex prompt for {} CONFIRMED via rollout after \
+                         recovery ({} extra Enter(s), redelivered={}) at +{}s",
+                        session_uid,
+                        enter_retries_sent,
+                        redelivered,
+                        started.elapsed().as_secs(),
+                    );
+                }
+                return;
+            }
+            Some(false) => {}
+        }
+        // A restart quiesce wants writers parked, and this loop is pure
+        // robustness — end it rather than contend (the un-submitted case
+        // will be visible in the rollout's absence after the restart).
+        if crate::writer_gate::pause_requested() {
+            eprintln!(
+                "cm-daemon: codex prompt confirmation for {} ended early — \
+                 restart quiesce in progress (rollout still empty at +{}s)",
+                session_uid,
+                started.elapsed().as_secs(),
+            );
+            return;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= CODEX_CONFIRM_MAX {
+            eprintln!(
+                "cm-daemon: WARNING codex prompt for {} UNCONFIRMED — rollout \
+                 still empty {}s after delivery, through {} extra Enter(s) and \
+                 redelivered={}; the agent likely booted into a startup modal \
+                 (trust dialog / rate-limit menu) and is sitting promptless",
+                session_uid,
+                elapsed.as_secs(),
+                enter_retries_sent,
+                redelivered,
+            );
+            return;
+        }
+        if enter_retries_sent < CODEX_CONFIRM_ENTER_RETRIES.len()
+            && elapsed >= CODEX_CONFIRM_ENTER_RETRIES[enter_retries_sent]
+        {
+            enter_retries_sent += 1;
+            eprintln!(
+                "cm-daemon: codex prompt for {} unconfirmed at +{}s — re-sending \
+                 Enter ({}/{})",
+                session_uid,
+                elapsed.as_secs(),
+                enter_retries_sent,
+                CODEX_CONFIRM_ENTER_RETRIES.len(),
+            );
+            if handle.write_and_stamp(AGENT_KITTY_ENTER).is_err() {
+                return;
+            }
+        } else if !redelivered && elapsed >= CODEX_CONFIRM_REDELIVER_AT {
+            redelivered = true;
+            // Final pre-check right before the destructive-ish step: a turn
+            // that started in the last poll interval must not be Esc'd.
+            if codex_turn_started(state, session_uid) != Some(false) {
+                continue;
+            }
+            eprintln!(
+                "cm-daemon: codex prompt for {} unconfirmed at +{}s — full \
+                 re-drive (Ctrl+C clear, re-paste body, Enter)",
+                session_uid,
+                elapsed.as_secs(),
+            );
+            // One indivisible unit, mirroring the primary delivery's
+            // body→gap→Enter contract under the writer gate.
+            let _unit = crate::writer_gate::unit_permit();
+            if handle.write_and_stamp(b"\x03").is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let body = body_text.trim_end_matches(['\r', '\n']);
+            if handle.write_and_stamp(&agent_paste_payload(body)).is_err() {
+                return;
+            }
+            std::thread::sleep(AGENT_ENTER_GAP);
+            if handle.write_and_stamp(AGENT_KITTY_ENTER).is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 /// Deliver one body + Enter to a kitty-TUI agent's PTY, synchronously, on
@@ -8984,6 +9160,7 @@ pub fn mcp_start_session(
                     session_uid.clone(),
                     prompt.to_string(),
                     true,
+                    Some(Arc::clone(state_arc)),
                 );
             } else {
                 // claude-code / bash: body + newline, synchronous, with
@@ -11278,6 +11455,7 @@ pub fn trigger(
                     session_uid.clone(),
                     resolved_prompt.clone(),
                     true,
+                    Some(Arc::clone(state_arc)),
                 );
             }
         }
@@ -12399,7 +12577,14 @@ pub(crate) fn spawn_investigator(
         .map(|s| (s.input_handle(), s.fanout.clone()))
     };
     if let Some((handle, fanout)) = handle_opt {
-        spawn_agent_prompt_delivery(handle, fanout, uid.clone(), prompt, true);
+        spawn_agent_prompt_delivery(
+            handle,
+            fanout,
+            uid.clone(),
+            prompt,
+            true,
+            Some(Arc::clone(state_arc)),
+        );
     }
 
     // Record the investigation: bind investigator_uid + its spawn time (the
