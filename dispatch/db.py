@@ -5,6 +5,39 @@ import asyncpg
 from dispatch.config import DB_DSN
 
 
+class InvalidTaskId(ValueError):
+    """A task lookup was attempted with anything but a full UUID.
+
+    Task IDs are UUID primary keys.  PostgreSQL/asyncpg otherwise rejects a
+    short prefix while binding ``WHERE id = $1`` and that driver exception used
+    to escape as an opaque HTTP 500.  Keep the validation next to the queries so
+    every API lookup has the same contract, including future endpoints.
+    """
+
+
+def normalize_task_id(task_id: str) -> str:
+    """Return a canonical task UUID or raise ``InvalidTaskId``.
+
+    Short-id prefixes are display-only.  Resolving them at the HTTP layer would
+    disagree with daemon task-tree authorization, which is keyed by exact UUID,
+    and would add an ambiguity case once two tasks share a prefix.
+    """
+    try:
+        parsed = uuid.UUID(task_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise InvalidTaskId(
+            "task_id must be a full UUID (for example "
+            "123e4567-e89b-12d3-a456-426614174000); short prefixes are not accepted"
+        ) from exc
+    canonical = str(parsed)
+    if task_id.lower() != canonical:
+        raise InvalidTaskId(
+            "task_id must be a full hyphenated UUID (36 characters); "
+            "short prefixes are not accepted"
+        )
+    return canonical
+
+
 def _serialize(row: dict) -> dict:
     """Convert UUID and other non-JSON types to strings."""
     return {k: str(v) if isinstance(v, uuid.UUID) else v for k, v in row.items()}
@@ -170,6 +203,7 @@ async def list_subtasks(pool: asyncpg.Pool, parent_task_id: str) -> list[dict]:
 
 
 async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
+    task_id = normalize_task_id(task_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM tasks WHERE id = $1", task_id,
@@ -178,6 +212,7 @@ async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
 
 
 async def update_task(pool: asyncpg.Pool, task_id: str, **fields) -> dict | None:
+    task_id = normalize_task_id(task_id)
     if not fields:
         return await get_task(pool, task_id)
     sets = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(fields))

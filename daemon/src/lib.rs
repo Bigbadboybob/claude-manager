@@ -1340,7 +1340,7 @@ fn handle_connection_with_timeouts(
     let outcome = control::dispatch::dispatch_request(&state, &req);
     match outcome {
         control::dispatch::DispatchOutcome::Done(response) => {
-            if let Err(e) = control::wire::write_response(stream, &response) {
+            if let Err(e) = control::wire::write_response_or_error(stream, &response) {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     eprintln!(
                         "cm-daemon: write stalled past {:?}, dropping",

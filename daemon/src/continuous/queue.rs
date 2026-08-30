@@ -95,6 +95,7 @@ impl QueueClient {
         ureq::Agent::new_with_config(
             ureq::config::Config::builder()
                 .timeout_global(Some(Duration::from_secs(10)))
+                .http_status_as_error(false)
                 .build(),
         )
     }
@@ -111,46 +112,28 @@ impl QueueClient {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, PlanningClientError> {
         let endpoint = format!("{}{}", self.api_url, path);
-        let mut response = match Self::agent()
+        let response = match Self::agent()
             .post(&endpoint)
             .header("Authorization", &self.auth())
             .send_json(body)
         {
             Ok(r) => r,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Err(PlanningClientError::ApiError {
-                    status,
-                    body: String::new(),
-                });
-            }
             Err(e) => return Err(PlanningClientError::Transport(e.to_string())),
         };
-        response
-            .body_mut()
-            .read_json::<serde_json::Value>()
-            .map_err(|e| PlanningClientError::Transport(format!("decode response: {}", e)))
+        crate::planning_client::decode_json_response(response, "queue POST response")
     }
 
     fn get_json(&self, path: &str) -> Result<serde_json::Value, PlanningClientError> {
         let endpoint = format!("{}{}", self.api_url, path);
-        let mut response = match Self::agent()
+        let response = match Self::agent()
             .get(&endpoint)
             .header("Authorization", &self.auth())
             .call()
         {
             Ok(r) => r,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Err(PlanningClientError::ApiError {
-                    status,
-                    body: String::new(),
-                });
-            }
             Err(e) => return Err(PlanningClientError::Transport(e.to_string())),
         };
-        response
-            .body_mut()
-            .read_json::<serde_json::Value>()
-            .map_err(|e| PlanningClientError::Transport(format!("decode response: {}", e)))
+        crate::planning_client::decode_json_response(response, "queue GET response")
     }
 
     /// `POST /queues/{queue}/items` — returns the API's

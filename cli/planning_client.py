@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+from typing import Any
 
 from cli.api_client import CMClient
 
@@ -15,6 +16,28 @@ def _detect_repo_url() -> str:
     if result.returncode != 0:
         raise RuntimeError("Could not detect repo URL from git remote")
     return result.stdout.strip()
+
+
+def _response_json(response) -> Any:
+    """Decode a planning response and retain the API's structured error text."""
+    if not response.is_success:
+        detail = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                detail = payload.get("detail") or payload.get("message") or ""
+                if not detail and isinstance(payload.get("error"), str):
+                    detail = payload["error"]
+        except (TypeError, ValueError):
+            detail = response.text.strip()
+        if not isinstance(detail, str):
+            detail = str(detail)
+        if not detail:
+            detail = response.reason_phrase or "response body was empty"
+        raise RuntimeError(
+            f"planning API returned {response.status_code}: {detail}"
+        )
+    return response.json()
 
 
 class PlanningClient:
@@ -72,14 +95,12 @@ class PlanningClient:
             body["depends"] = depends
 
         r = self._client.client.post("/tasks", json=body)
-        r.raise_for_status()
-        return r.json()
+        return _response_json(r)
 
     def list_projects(self) -> list[dict]:
         """Return list of {name, repo_url} dicts."""
         r = self._client.client.get("/projects")
-        r.raise_for_status()
-        return r.json()
+        return _response_json(r)
 
     def list_tasks(self, project: str | None = None,
                    status: str | None = None) -> list[dict]:
@@ -89,18 +110,15 @@ class PlanningClient:
         if status:
             params["status"] = status
         r = self._client.client.get("/tasks", params=params)
-        r.raise_for_status()
-        return r.json()
+        return _response_json(r)
 
     def get_task(self, task_id: str) -> dict:
         r = self._client.client.get(f"/tasks/{task_id}")
-        r.raise_for_status()
-        return r.json()
+        return _response_json(r)
 
     def update_task(self, task_id: str, **fields) -> dict:
         r = self._client.client.patch(f"/tasks/{task_id}", json=fields)
-        r.raise_for_status()
-        return r.json()
+        return _response_json(r)
 
     def create_task(self, body: dict) -> dict:
         """Generic POST /tasks with a caller-assembled body.
@@ -108,11 +126,9 @@ class PlanningClient:
         Used by `submit_backtest`, which needs fields propose_task's fixed
         body doesn't carry (kind, metadata, parent_task_id, status)."""
         r = self._client.client.post("/tasks", json=body)
-        r.raise_for_status()
-        return r.json()
+        return _response_json(r)
 
     def get_task_artifacts(self, task_id: str) -> list[dict]:
         """Artifact rows for a task, newest first (cloud auto-backtest)."""
         r = self._client.client.get(f"/tasks/{task_id}/artifacts")
-        r.raise_for_status()
-        return r.json()
+        return _response_json(r)

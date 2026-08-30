@@ -93,6 +93,34 @@ pub fn write_response<W: Write>(
     Ok(())
 }
 
+/// Write a normal one-shot response, replacing a pre-write serialization/size
+/// failure with a small structured error frame.
+///
+/// `write_response` deliberately rejects bodies above 4 MiB before writing any
+/// bytes.  The old connection handler then closed the socket, so Python saw
+/// only `unexpected EOF at byte 0 of 4`.  Preserve the cap, but make that
+/// failure observable as an ordinary control error with the request id.
+pub fn write_response_or_error<W: Write>(
+    writer: &mut W,
+    resp: &Response,
+) -> std::io::Result<()> {
+    match write_response(writer, resp) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            let fallback = Response::err(
+                resp.id.clone(),
+                crate::control::protocol::ErrorCode::Internal,
+                format!(
+                    "daemon could not frame the response: {}. Narrow list filters or inspect server logs",
+                    e
+                ),
+            );
+            write_response(writer, &fallback)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Write a length-prefixed JSON `Request` to `writer`. The client-
 /// side mirror of [`read_request`]. Slice 10c-e-2 introduces this
 /// for `tui/src/client_session.rs::ClientSession::new` to drive the
@@ -378,5 +406,24 @@ mod tests {
         let parsed: Response = serde_json::from_slice(body).unwrap();
         assert!(parsed.ok);
         assert_eq!(parsed.result.unwrap()["pong"], true);
+    }
+
+    #[test]
+    fn oversized_response_is_replaced_by_structured_error_frame() {
+        let resp = Response::ok(
+            "too-big".into(),
+            serde_json::json!({"blob": "x".repeat(MAX_REQUEST_BYTES as usize)}),
+        );
+        let mut sink = Vec::new();
+        write_response_or_error(&mut sink, &resp).expect("fallback frame must be written");
+
+        let len = u32::from_be_bytes(sink[..4].try_into().unwrap()) as usize;
+        let parsed: Response = serde_json::from_slice(&sink[4..4 + len]).unwrap();
+        assert_eq!(parsed.id, "too-big");
+        assert!(!parsed.ok);
+        let error = parsed.error.expect("structured error");
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.message.contains("response body length"));
+        assert!(error.message.contains("Narrow list filters"));
     }
 }

@@ -716,9 +716,10 @@ pub fn dispatch_request(
 
         // Headless planning READS: a daemon-spawned agent (no cli-routed
         // PlanningClient) gets these served by the daemon, which holds the
-        // planning-API creds. Read-only (Operator + Session); return RAW api
-        // rows — the MCP server shapes/filters. (`get_current_task` is composed
-        // MCP-side from `ping` + `get_task`, so it needs no method here.)
+        // planning-API creds. Read-only (Operator + Session); filters are
+        // forwarded to HTTP and rows are brief-projected before daemon framing.
+        // (`get_current_task` is composed MCP-side from `ping` + `get_task`, so
+        // it needs no method here.)
         "list_tasks" => DispatchOutcome::Done(dispatch_list_tasks(state, req)),
         "get_task" => DispatchOutcome::Done(dispatch_get_task(state, req)),
 
@@ -954,7 +955,7 @@ fn dispatch_list_subtasks(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
 }
 
 fn dispatch_list_tasks(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
-    match methods::list_tasks(state) {
+    match methods::list_tasks(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

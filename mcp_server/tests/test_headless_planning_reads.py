@@ -21,7 +21,7 @@ def _daemon_route():
 
 
 class HeadlessPlanningReadsTests(unittest.TestCase):
-    def test_list_tasks_routes_to_daemon_and_filters_client_side(self):
+    def test_list_tasks_routes_to_daemon_with_server_side_filters(self):
         from mcp_server import control_client, server
 
         rows = [
@@ -33,8 +33,9 @@ class HeadlessPlanningReadsTests(unittest.TestCase):
 
         def fake_call(method, params, **kw):
             captured["method"] = method
+            captured["params"] = params
             captured["socket"] = kw.get("socket_path")
-            return rows
+            return [rows[0]]
 
         with mock.patch.object(
             control_client, "resolve_socket_route", return_value=_daemon_route()
@@ -42,9 +43,11 @@ class HeadlessPlanningReadsTests(unittest.TestCase):
             out = server.list_tasks(project="p1", status="running", source="claude")
 
         self.assertEqual(captured["method"], "list_tasks")
+        self.assertEqual(
+            captured["params"], {"project": "p1", "status": "running"}
+        )
         self.assertIsNotNone(captured["socket"], "must pass explicit socket_path")
-        # The daemon returns ALL rows; project+status+source filters apply
-        # client-side → only row "a".
+        # Project/status were applied by the HTTP API; source remains local.
         self.assertEqual([t["id"] for t in out], ["a"])
 
     def test_get_task_routes_to_daemon(self):

@@ -9947,7 +9947,7 @@ pub fn rehydrate_derived_state(
     let tree_edges: Vec<(String, String)> =
         PlanningApiCreds::from_config(&api_url, &api_token)
             .ok()
-            .and_then(|creds| api_list_tasks(&creds).ok())
+            .and_then(|creds| api_list_tasks(&creds, None, None).ok())
             .map(|rows| {
                 rows.iter()
                     .filter_map(|row| {
@@ -14034,6 +14034,7 @@ impl PlanningApiCreds {
         ureq::Agent::new_with_config(
             ureq::config::Config::builder()
                 .timeout_global(Some(std::time::Duration::from_secs(10)))
+                .http_status_as_error(false)
                 .build(),
         )
     }
@@ -14075,17 +14076,8 @@ fn resolve_planning_api_token(override_val: &str) -> Result<String, PlanningClie
     Ok(t)
 }
 
-/// ureq v3 surfaces a non-2xx response as `Error::StatusCode(u16)` (no
-/// body handle in that arm); everything else is transport. Map to the
-/// same `PlanningClientError` shape `propose_task` uses so 4xx → caller
-/// error, 5xx / transport / missing-config → Internal.
 fn map_ureq_err(e: ureq::Error) -> PlanningClientError {
-    match e {
-        ureq::Error::StatusCode(status) => {
-            PlanningClientError::ApiError { status, body: String::new() }
-        }
-        other => PlanningClientError::Transport(other.to_string()),
-    }
+    PlanningClientError::Transport(e.to_string())
 }
 
 /// GET /tasks/{id} — the full task row.
@@ -14094,29 +14086,35 @@ fn api_get_task(
     task_id: &str,
 ) -> Result<Value, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
-    let mut resp = agent
+    let resp = agent
         .get(&creds.url(&format!("/tasks/{}", task_id)))
         .header("Authorization", &creds.auth())
         .call()
         .map_err(map_ureq_err)?;
-    resp.body_mut()
-        .read_json::<Value>()
-        .map_err(|e| PlanningClientError::Transport(format!("decode get_task: {}", e)))
+    crate::planning_client::decode_json_response(resp, "get_task")
 }
 
-/// GET /tasks — the full task universe. The planning API has no
-/// `parent_task_id` query filter (only status / project), so
-/// `list_subtasks` fetches everything and filters client-side.
-fn api_list_tasks(creds: &PlanningApiCreds) -> Result<Vec<Value>, PlanningClientError> {
+/// GET /tasks with optional project/status filters. The planning API has no
+/// `parent_task_id` query filter, so `list_subtasks` passes no filters and
+/// performs that one relation check client-side.
+fn api_list_tasks(
+    creds: &PlanningApiCreds,
+    project: Option<&str>,
+    status: Option<&str>,
+) -> Result<Vec<Value>, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
-    let mut resp = agent
-        .get(&creds.url("/tasks"))
+    let mut request = agent.get(&creds.url("/tasks"));
+    if let Some(project) = project {
+        request = request.query("project", project);
+    }
+    if let Some(status) = status {
+        request = request.query("status", status);
+    }
+    let resp = request
         .header("Authorization", &creds.auth())
         .call()
         .map_err(map_ureq_err)?;
-    resp.body_mut()
-        .read_json::<Vec<Value>>()
-        .map_err(|e| PlanningClientError::Transport(format!("decode list_tasks: {}", e)))
+    crate::planning_client::decode_json_response(resp, "list_tasks")
 }
 
 /// POST /tasks — create a task row; returns the created row (incl. the
@@ -14126,14 +14124,12 @@ fn api_create_task(
     body: &Value,
 ) -> Result<Value, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
-    let mut resp = agent
+    let resp = agent
         .post(&creds.url("/tasks"))
         .header("Authorization", &creds.auth())
         .send_json(body)
         .map_err(map_ureq_err)?;
-    resp.body_mut()
-        .read_json::<Value>()
-        .map_err(|e| PlanningClientError::Transport(format!("decode create_task: {}", e)))
+    crate::planning_client::decode_json_response(resp, "create_task")
 }
 
 /// PATCH /tasks/{id} — partial update (e.g. `{"status":"done"}`).
@@ -14143,12 +14139,12 @@ fn api_update_task(
     fields: &Value,
 ) -> Result<(), PlanningClientError> {
     let agent = PlanningApiCreds::agent();
-    agent
+    let resp = agent
         .patch(&creds.url(&format!("/tasks/{}", task_id)))
         .header("Authorization", &creds.auth())
         .send_json(fields)
         .map_err(map_ureq_err)?;
-    Ok(())
+    crate::planning_client::require_success_response(resp)
 }
 
 /// DELETE /tasks/{id} — create-rollback for a worktree failure.
@@ -14157,12 +14153,12 @@ fn api_delete_task(
     task_id: &str,
 ) -> Result<(), PlanningClientError> {
     let agent = PlanningApiCreds::agent();
-    agent
+    let resp = agent
         .delete(&creds.url(&format!("/tasks/{}", task_id)))
         .header("Authorization", &creds.auth())
         .call()
         .map_err(map_ureq_err)?;
-    Ok(())
+    crate::planning_client::require_success_response(resp)
 }
 
 /// GET /tasks/{id}/artifacts — structured result artifact rows, newest
@@ -14172,28 +14168,24 @@ fn api_get_task_artifacts(
     task_id: &str,
 ) -> Result<Vec<Value>, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
-    let mut resp = agent
+    let resp = agent
         .get(&creds.url(&format!("/tasks/{}/artifacts", task_id)))
         .header("Authorization", &creds.auth())
         .call()
         .map_err(map_ureq_err)?;
-    resp.body_mut()
-        .read_json::<Vec<Value>>()
-        .map_err(|e| PlanningClientError::Transport(format!("decode get_task_artifacts: {}", e)))
+    crate::planning_client::decode_json_response(resp, "get_task_artifacts")
 }
 
 /// GET /projects — [{name, repo_url}] (repo-URL default resolution for
 /// `backtest.submit`).
 fn api_list_projects(creds: &PlanningApiCreds) -> Result<Vec<Value>, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
-    let mut resp = agent
+    let resp = agent
         .get(&creds.url("/projects"))
         .header("Authorization", &creds.auth())
         .call()
         .map_err(map_ureq_err)?;
-    resp.body_mut()
-        .read_json::<Vec<Value>>()
-        .map_err(|e| PlanningClientError::Transport(format!("decode list_projects: {}", e)))
+    crate::planning_client::decode_json_response(resp, "list_projects")
 }
 
 /// Outcome of the launch-time task-status promotion, for logging.
@@ -14910,7 +14902,7 @@ pub fn list_subtasks(
 
     let creds =
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
-    let all = api_list_tasks(&creds).map_err(|e| e.to_method_err())?;
+    let all = api_list_tasks(&creds, None, None).map_err(|e| e.to_method_err())?;
 
     let mut out: Vec<Value> = Vec::new();
     for task in &all {
@@ -15151,15 +15143,63 @@ fn planning_creds(
     PlanningApiCreds::from_config(&api_url, &api_token).map_err(|e| e.to_method_err())
 }
 
-/// Daemon-routed `list_tasks` (headless planning read). Returns the RAW
-/// planning-API task rows (`GET /tasks`); the MCP server applies the
-/// project/status/source filters + `_shape_task` shaping client-side, exactly
-/// as it does for the cli-routed path. Read-only → Operator + Session callable
-/// (a board read isn't task-scoped).
-pub fn list_tasks(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListTasksParams {
+    project: Option<String>,
+    status: Option<String>,
+}
+
+// Keep aligned with `mcp_server/server.py::_BRIEF_FIELDS`: daemon-routed and
+// laptop-local list_tasks must expose the same shape.
+const MCP_BRIEF_TASK_FIELDS: &[&str] = &[
+    "id",
+    "slug",
+    "project",
+    "name",
+    "status",
+    "source",
+    "priority",
+    "difficulty",
+    "is_cloud",
+    "kind",
+];
+
+/// Daemon-routed `list_tasks` (headless planning read). Project/status filters
+/// are forwarded to the planning API before the result crosses the daemon's
+/// 4 MiB framed-socket boundary, then each row is reduced to the same brief
+/// projection the MCP tool returns. The projection also keeps an unfiltered
+/// board read below the frame cap; `get_task` remains the full-row operation.
+/// `source` remains an MCP-side filter because the HTTP API does not expose it.
+/// Read-only → Operator + Session callable.
+pub fn list_tasks(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let filters: ListTasksParams = if params.is_null() {
+        ListTasksParams::default()
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| (ErrorCode::InvalidParams, format!("list_tasks params: {}", e)))?
+    };
     let creds = planning_creds(state_arc)?;
-    let tasks = api_list_tasks(&creds).map_err(|e| e.to_method_err())?;
-    Ok(Value::Array(tasks))
+    let tasks = api_list_tasks(
+        &creds,
+        filters.project.as_deref(),
+        filters.status.as_deref(),
+    )
+    .map_err(|e| e.to_method_err())?;
+    let brief = tasks
+        .into_iter()
+        .map(|task| {
+            let mut row = serde_json::Map::new();
+            for field in MCP_BRIEF_TASK_FIELDS {
+                row.insert(
+                    (*field).to_string(),
+                    task.get(*field).cloned().unwrap_or(Value::Null),
+                );
+            }
+            Value::Object(row)
+        })
+        .collect();
+    Ok(Value::Array(brief))
 }
 
 /// Daemon-routed `get_task` — `GET /tasks/{id}`, raw row (MCP shapes it).
@@ -29581,6 +29621,146 @@ mod tests {
             assert!(bad_status.1.contains("status"), "mentions status: {}", bad_status.1);
 
             kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// Filtered board reads must put project/status on the HTTP request before
+    /// the response crosses the daemon's 4 MiB control frame.  A realistic
+    /// task mix can have large prompts; fetching the full board and filtering
+    /// in Python made the daemon reject the oversized response and close before
+    /// writing a length prefix (`unexpected EOF at byte 0 of 4`).
+    #[test]
+    fn list_tasks_forwards_project_and_status_to_planning_api() {
+        with_home_and_repo("listrepo", |_home, _name| {
+            let state = make_state_arc();
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET"
+                    && path == "/tasks?project=predictionTrading&status=running"
+                {
+                    (
+                        200,
+                        r#"[
+                            {"id":"123e4567-e89b-12d3-a456-426614174000",
+                             "project":"predictionTrading","status":"running",
+                             "name":"live backtest","prompt":"large realistic prompt"},
+                            {"id":"123e4567-e89b-12d3-a456-426614174001",
+                             "project":"predictionTrading","status":"running",
+                             "name":"live investigation","prompt":"another prompt"}
+                        ]"#
+                            .to_string(),
+                    )
+                } else {
+                    (400, format!(r#"{{"detail":"unexpected request: {} {}"}}"#, method, path))
+                }
+            });
+            set_api_env(stub.port);
+
+            let rows = list_tasks(
+                &state,
+                &json!({"project": "predictionTrading", "status": "running"}),
+            )
+            .expect("filtered list succeeds");
+            assert_eq!(rows.as_array().map(Vec::len), Some(2));
+            assert!(
+                rows[0].get("prompt").is_none(),
+                "list response is projected before daemon framing: {}",
+                rows[0]
+            );
+
+            let requests = stub.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(
+                requests[0].path,
+                "/tasks?project=predictionTrading&status=running"
+            );
+            drop(requests);
+            clear_api_env();
+        });
+    }
+
+    /// Even the unfiltered/default MCP call remains usable on a prompt-heavy
+    /// board: HTTP may return more than the control-frame cap, but only the
+    /// brief list projection is framed back to the MCP process.
+    #[test]
+    fn list_tasks_projects_oversized_http_board_before_daemon_frame() {
+        with_home_and_repo("biglistrepo", |_home, _name| {
+            let state = make_state_arc();
+            let api_rows: Vec<Value> = (0..180)
+                .map(|n| {
+                    json!({
+                        "id": format!("task-{n}"),
+                        "slug": format!("task-{n}"),
+                        "project": "predictionTrading",
+                        "name": format!("Task {n}"),
+                        "status": if n % 3 == 0 { "running" } else { "done" },
+                        "source": if n % 2 == 0 { "claude" } else { "user" },
+                        "priority": n,
+                        "difficulty": 4,
+                        "is_cloud": false,
+                        "kind": "oneshot",
+                        "prompt": "p".repeat(30_000),
+                        "description": "d".repeat(1_000),
+                    })
+                })
+                .collect();
+            let full_http_body = serde_json::to_string(&api_rows).unwrap();
+            assert!(
+                full_http_body.len() > crate::control::wire::MAX_REQUEST_BYTES as usize,
+                "fixture must reproduce the over-cap HTTP board"
+            );
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks" {
+                    (200, full_http_body.clone())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            let rows = list_tasks(&state, &json!({})).expect("unfiltered list succeeds");
+            assert_eq!(rows.as_array().map(Vec::len), Some(180));
+            assert!(rows[0].get("prompt").is_none());
+
+            let response = crate::control::protocol::Response::ok("list-big".into(), rows);
+            let mut framed = Vec::new();
+            crate::control::wire::write_response(&mut framed, &response)
+                .expect("brief projection fits the daemon frame");
+            assert!(framed.len() < crate::control::wire::MAX_REQUEST_BYTES as usize);
+
+            clear_api_env();
+        });
+    }
+
+    /// FastAPI returns a structured detail for invalid/short UUIDs.  The
+    /// daemon must retain that body when translating the HTTP failure into a
+    /// control error; the pre-fix ureq default discarded it and surfaced only
+    /// `planning API returned 500:`.
+    #[test]
+    fn get_task_preserves_planning_api_error_body() {
+        with_home_and_repo("geterrrepo", |_home, _name| {
+            let state = make_state_arc();
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks/b95e6607" {
+                    (
+                        400,
+                        r#"{"detail":"task_id must be a full UUID; short prefixes are not accepted"}"#
+                            .to_string(),
+                    )
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            let err = get_task(&state, &json!({"task_id": "b95e6607"}))
+                .expect_err("short id must be rejected");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+            assert!(err.1.contains("planning API returned 400"), "{}", err.1);
+            assert!(err.1.contains("full UUID"), "{}", err.1);
+            assert!(err.1.contains("short prefixes are not accepted"), "{}", err.1);
+
             clear_api_env();
         });
     }

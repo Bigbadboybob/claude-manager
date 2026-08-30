@@ -11,7 +11,8 @@ import asyncpg
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
+from fastapi.responses import JSONResponse
 
 from api.auth import verify_token
 from api.models import (
@@ -128,6 +129,43 @@ async def _log_request_validation_error(request: Request, exc: RequestValidation
     return await request_validation_exception_handler(request, exc)
 
 
+@app.exception_handler(ResponseValidationError)
+async def _structured_response_validation_error(
+    request: Request, exc: ResponseValidationError
+):
+    """Never turn a bad task row into a bare/truncated HTTP 500.
+
+    Response-model validation happens after the endpoint returns, so without an
+    explicit handler Starlette emits a generic ``Internal Server Error`` body.
+    Log the row-level diagnostics server-side and give clients a stable JSON
+    error with a useful message.
+    """
+    logger.exception(
+        "Response serialization failed for %s %s: %s",
+        request.method, request.url.path, exc.errors(),
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "response_serialization_failed",
+            "detail": "Planning API could not serialize its response; see server logs",
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def _structured_unhandled_error(request: Request, exc: Exception):
+    """Last-resort JSON envelope for unexpected planning API failures."""
+    logger.exception("Unhandled error for %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_error",
+            "detail": "Planning API request failed unexpectedly; see server logs",
+        },
+    )
+
+
 def get_pool():
     return app.state.pool
 
@@ -230,10 +268,7 @@ async def list_tasks(
 
 @app.get("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def get_task(task_id: str, pool=Depends(get_pool)):
-    task = await db.get_task(pool, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return task
+    return await _get_task_or_error(pool, task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -440,12 +475,15 @@ async def requeue_queue_batch(queue: str, body: dict | None = None, pool=Depends
 _ARTIFACT_SUMMARY_MAX_BYTES = 64 * 1024
 
 
-async def _get_task_or_400(pool, task_id: str) -> dict:
+async def _get_task_or_error(pool, task_id: str) -> dict:
     try:
         task = await db.get_task(pool, task_id)
-    except asyncpg.DataError:
-        # Malformed UUID — a client bug, not a server error.
-        raise HTTPException(status_code=400, detail="task_id must be a UUID")
+    except (db.InvalidTaskId, asyncpg.DataError) as exc:
+        # InvalidTaskId is the expected path. Keep DataError as a defensive
+        # backstop for deployments with an older DB helper or a driver-specific
+        # UUID bind failure.
+        detail = str(exc) or "task_id must be a full UUID; short prefixes are not accepted"
+        raise HTTPException(status_code=400, detail=detail) from exc
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
@@ -461,7 +499,8 @@ async def create_task_artifact(task_id: str, body: ArtifactCreate,
     summary shape convention is {total_pnl, realized_pnl, fill_count,
     taker_pct, partial, grid_rows[], baseline_delta?, gcs_pointer}.
     """
-    await _get_task_or_400(pool, task_id)
+    task = await _get_task_or_error(pool, task_id)
+    task_id = str(task["id"])
     if len(json.dumps(body.summary)) > _ARTIFACT_SUMMARY_MAX_BYTES:
         raise HTTPException(
             status_code=413,
@@ -478,7 +517,8 @@ async def create_task_artifact(task_id: str, body: ArtifactCreate,
          dependencies=[Depends(verify_token)])
 async def list_task_artifacts(task_id: str, pool=Depends(get_pool)):
     """All artifacts for a task, newest first."""
-    await _get_task_or_400(pool, task_id)
+    task = await _get_task_or_error(pool, task_id)
+    task_id = str(task["id"])
     return await db.list_task_artifacts(pool, task_id)
 
 
@@ -494,7 +534,8 @@ async def update_backtest_phase(task_id: str, body: BacktestPhaseUpdate,
     backtest_sync mirrors ``metadata.backtest.phase*`` onto the run row so the panel can show
     ``Setup - download 40%`` during the pre-replay download instead of a blank Progress/ETA.
     """
-    await _get_task_or_400(pool, task_id)
+    task = await _get_task_or_error(pool, task_id)
+    task_id = str(task["id"])
     fields: dict = {
         "phase": body.phase,
         "phase_step": body.phase_step,
@@ -513,9 +554,8 @@ async def update_backtest_phase(task_id: str, body: BacktestPhaseUpdate,
 
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
-    task = await db.get_task(pool, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_task_or_error(pool, task_id)
+    task_id = str(task["id"])
 
     # Use model_fields_set so explicit JSON nulls (clear-the-field intent)
     # are kept and omitted fields are dropped. exclude_none=True collapsed
@@ -562,9 +602,8 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
 
 @app.delete("/tasks/{task_id}", dependencies=[Depends(verify_token)])
 async def delete_task(task_id: str, pool=Depends(get_pool)):
-    task = await db.get_task(pool, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_task_or_error(pool, task_id)
+    task_id = str(task["id"])
 
     if task["worker_vm"]:
         _spawn_vm_deletion(task["worker_vm"], *_vm_location(task))

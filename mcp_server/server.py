@@ -316,13 +316,14 @@ def list_tasks(
     route = control_client.resolve_socket_route()
     if route.chose_daemon:
         # Headless host: the daemon serves the read (it holds the planning-API
-        # creds). It returns ALL raw rows — the API `GET /tasks` has no
-        # project/status query — so filter client-side here.
-        tasks = control_client.call("list_tasks", {}, socket_path=route.path)
-        if project:
-            tasks = [t for t in tasks if t.get("project") == project]
-        if status:
-            tasks = [t for t in tasks if t.get("status") == status]
+        # creds). Push the HTTP-supported filters through the daemon so a
+        # large unfiltered board never has to cross the 4 MiB framed socket.
+        filters = {
+            key: value
+            for key, value in {"project": project, "status": status}.items()
+            if value is not None
+        }
+        tasks = control_client.call("list_tasks", filters, socket_path=route.path)
     else:
         client = PlanningClient()
         tasks = client.list_tasks(project=project, status=status)

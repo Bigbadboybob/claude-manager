@@ -156,11 +156,70 @@ impl PlanningClientError {
                 };
                 (
                     code,
-                    format!("planning API returned {}: {}", status, body),
+                    format!(
+                        "planning API returned {}: {}",
+                        status,
+                        api_error_message(body),
+                    ),
                 )
             }
         }
     }
+}
+
+fn api_error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "response body was empty".to_string();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        for key in ["detail", "message", "error"] {
+            if let Some(message) = value.get(key).and_then(|v| v.as_str()) {
+                return message.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Decode one planning-API JSON response while preserving non-2xx bodies.
+///
+/// ureq's default `http_status_as_error=true` reduces a 4xx/5xx response to a
+/// status code and discards the response handle.  Planning errors are meant to
+/// cross the daemon RPC boundary, so callers need the body (especially the
+/// FastAPI `detail` message) rather than `planning API returned 500:`.
+pub(crate) fn decode_json_response<T: serde::de::DeserializeOwned>(
+    mut response: ureq::http::Response<ureq::Body>,
+    context: &str,
+) -> Result<T, PlanningClientError> {
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|e| format!("could not read error response body: {}", e));
+        return Err(PlanningClientError::ApiError { status, body });
+    }
+    response
+        .body_mut()
+        .read_json::<T>()
+        .map_err(|e| PlanningClientError::Transport(format!("decode {}: {}", context, e)))
+}
+
+/// Validate a planning-API response whose success body is intentionally
+/// ignored (PATCH/DELETE), still retaining any error body.
+pub(crate) fn require_success_response(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<(), PlanningClientError> {
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .unwrap_or_else(|e| format!("could not read error response body: {}", e));
+    Err(PlanningClientError::ApiError { status, body })
 }
 
 /// Resolve `CM_API_URL` from the config override (when set
@@ -219,6 +278,7 @@ fn build_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::config::Config::builder()
             .timeout_global(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
             .build(),
     )
 }
@@ -262,30 +322,15 @@ pub fn propose_task(
     };
     let agent = build_agent();
     let auth = format!("Bearer {}", api_token);
-    let mut response = match agent
+    let response = match agent
         .post(&endpoint)
         .header("Authorization", &auth)
         .send_json(&body)
     {
         Ok(r) => r,
-        Err(ureq::Error::StatusCode(status)) => {
-            // ureq v3 surfaces non-2xx as `StatusCode(u16)`.
-            // We don't have the body here in this arm (no
-            // response handle); a follow-up if we want
-            // structured API error JSON would use
-            // `http_status_as_error: false` on the agent
-            // builder. For now, surface the status alone.
-            return Err(PlanningClientError::ApiError {
-                status,
-                body: String::new(),
-            });
-        }
         Err(e) => return Err(PlanningClientError::Transport(e.to_string())),
     };
-    response
-        .body_mut()
-        .read_json::<serde_json::Value>()
-        .map_err(|e| PlanningClientError::Transport(format!("decode response: {}", e)))
+    decode_json_response(response, "propose_task response")
 }
 
 /// Process-wide lock around env vars CM_API_URL / CM_API_TOKEN.
@@ -649,12 +694,16 @@ mod tests {
         set_env(&format!("http://127.0.0.1:{}", port), "tok");
         let req = make_req("ghost", "n", "u");
         let err = propose_task(&req, None, None).expect_err("must reject");
-        match err {
-            PlanningClientError::ApiError { status, .. } => assert_eq!(status, 404),
+        match &err {
+            PlanningClientError::ApiError { status, body } => {
+                assert_eq!(*status, 404);
+                assert!(body.contains("project not found"), "body: {}", body);
+            }
             other => panic!("expected ApiError, got {:?}", other),
         }
-        let (code, _) = err.to_method_err();
+        let (code, message) = err.to_method_err();
         assert_eq!(code, ErrorCode::InvalidParams);
+        assert!(message.contains("project not found"), "{}", message);
         clear_env();
     }
 
