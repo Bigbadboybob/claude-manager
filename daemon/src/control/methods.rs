@@ -7312,13 +7312,16 @@ mod delivery_quiesce_tests {
 }
 
 /// Wrap a prompt body in bracketed-paste markers (`\x1b[200~ … \x1b[201~`)
-/// when it spans multiple lines — matches the TUI's
-/// `format_body_for_delivery`. Without this, the agent submits at the first
-/// newline, mangling a multi-line prompt. Single-line bodies go raw. codex
-/// and claude-code always enable BRACKETED_PASTE, so (unlike the TUI) we
-/// don't gate on a live terminal mode the daemon can't read.
+/// when [`body_needs_bracketing`] says it must — matches the TUI's
+/// `format_body_for_delivery`. Without this a multi-line body submits at its
+/// first newline, and a single-line body over
+/// [`pty_tracker::RAW_SINGLE_LINE_MAX`] is torn at codex's 1024-byte PTY read
+/// boundary and never submits at all. Short single-line bodies (slash
+/// commands) go raw. codex and claude-code always enable BRACKETED_PASTE, so
+/// (unlike the TUI) we don't gate on a live terminal mode the daemon can't
+/// read.
 fn agent_paste_payload(body: &str) -> Vec<u8> {
-    if body.contains('\n') {
+    if crate::workflow::pty_tracker::body_needs_bracketing(body) {
         let mut out = Vec::with_capacity(body.len() + 12);
         out.extend_from_slice(b"\x1b[200~");
         out.extend_from_slice(body.as_bytes());
@@ -15707,7 +15710,8 @@ mod tests {
 
     /// Multi-line agent prompt bodies must be wrapped in bracketed-paste
     /// markers — otherwise the agent (codex / claude-code) submits at the
-    /// first newline and mangles the prompt. Single-line bodies go raw.
+    /// first newline and mangles the prompt. SHORT single-line bodies go raw
+    /// so slash commands still register as typed commands.
     #[test]
     fn agent_paste_payload_wraps_multiline_only() {
         let multi = agent_paste_payload("line one\nline two");
@@ -15715,6 +15719,28 @@ mod tests {
 
         let single = agent_paste_payload("just one line");
         assert_eq!(single, b"just one line");
+    }
+
+    /// This no-mode-observed fallback must apply the SAME length bound as
+    /// the observed-mode path: a long single-line body sent raw is torn at
+    /// codex's 1024-byte read boundary and its Enter is swallowed, so the
+    /// prompt sits in the composer unsent. Pre-fix this branch keyed on the
+    /// newline alone and shipped exactly that.
+    #[test]
+    fn agent_paste_payload_wraps_long_single_line_body() {
+        use crate::workflow::pty_tracker::RAW_SINGLE_LINE_MAX;
+        let body = "x".repeat(RAW_SINGLE_LINE_MAX + 1);
+        let out = agent_paste_payload(&body);
+        assert_eq!(
+            out,
+            format!("\x1b[200~{}\x1b[201~", body).as_bytes(),
+            "a single-line body over the raw bound must be bracketed here too",
+        );
+        // At the bound it is still treated as typed input.
+        assert_eq!(
+            agent_paste_payload(&"x".repeat(RAW_SINGLE_LINE_MAX)),
+            "x".repeat(RAW_SINGLE_LINE_MAX).as_bytes(),
+        );
     }
 
     /// The agent submit keystroke is the kitty-encoded Enter (CSI 13 u),

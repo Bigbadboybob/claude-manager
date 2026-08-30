@@ -94,12 +94,49 @@ pub fn enter_bytes_for_mode(mode: TermMode) -> &'static [u8] {
     }
 }
 
+/// The longest SINGLE-LINE body we are willing to deliver raw (unbracketed).
+///
+/// Raw delivery exists for slash commands (`/compact`, `/clear`): the agent
+/// only runs them as commands when they arrive as TYPED input, so wrapping
+/// them in paste markers would drop them into the composer as pasted text.
+/// Those are tiny, and this bound keeps them on the raw path.
+///
+/// Above the bound raw delivery is UNSAFE. codex reads its PTY in 1024-byte
+/// chunks; a raw body crossing that boundary is torn in two — the first 1024
+/// bytes land as a `[Pasted Content N chars]` chip, the remainder types in
+/// behind it, and the trailing Enter is absorbed by the paste state instead
+/// of submitting. The prompt then sits in the composer forever while the
+/// delivery's quiet-window verification reads the repaint as `submitted=true`.
+///
+/// Measured against codex 0.150.1 (single-line body, kitty Enter after the
+/// standard 1.5s gap): raw ≤1024B submits, ≥1025B never does, with the split
+/// landing at exactly 1024 bytes; the same body wrapped in bracketed paste
+/// submits at every size tested (to 12KB). 512 keeps a 2x margin under the
+/// boundary and is orders of magnitude above any slash command.
+///
+/// The pre-fix predicate was "multi-line" alone, on the reasoning that real
+/// activation prompts always span several lines. Agent-composed prompts do
+/// not: a one-paragraph charter written by an orchestrator is a single line,
+/// and every one of them over 1024 bytes wedged. That is the "codex randomly
+/// doesn't get its Enter pressed" bug — deterministic, but only on prompts
+/// that happen to carry no newline.
+pub const RAW_SINGLE_LINE_MAX: usize = 512;
+
+/// Whether a delivery body has to be framed as a bracketed paste (given a
+/// program that supports one). Multi-line bodies always do — otherwise the
+/// agent submits at the first newline. Long single-line bodies do too, per
+/// [`RAW_SINGLE_LINE_MAX`].
+pub fn body_needs_bracketing(body: &str) -> bool {
+    body.contains('\n') || body.len() > RAW_SINGLE_LINE_MAX
+}
+
 /// Frame a delivery body for the inner program's current mode. Mirror of
-/// `tui/src/app.rs::format_body_for_delivery`: wrap in bracketed-paste markers
-/// iff the body is multi-line AND the program enabled bracketed paste; single-
-/// line bodies (slash commands) stay raw so they're recognised as typed input.
+/// `tui/src/app/events.rs::format_body_for_delivery`: wrap in bracketed-paste
+/// markers iff [`body_needs_bracketing`] AND the program enabled bracketed
+/// paste; short single-line bodies (slash commands) stay raw so they're
+/// recognised as typed input.
 pub fn format_body_for_delivery(body: &str, mode: TermMode) -> Vec<u8> {
-    if body.contains('\n') && mode.contains(TermMode::BRACKETED_PASTE) {
+    if body_needs_bracketing(body) && mode.contains(TermMode::BRACKETED_PASTE) {
         let mut out = Vec::with_capacity(body.len() + 12);
         out.extend_from_slice(b"\x1b[200~");
         out.extend_from_slice(body.as_bytes());
@@ -395,5 +432,56 @@ mod tests {
         t.feed(b"", base);
         assert!(t.wakeups().is_empty());
         assert!(t.quiet_for(Duration::from_secs(1), base));
+    }
+
+    /// The bound must stay clear of codex's 1024-byte PTY read chunk: a raw
+    /// single-line body that crosses it is split (first 1024 bytes become a
+    /// paste chip) and its trailing Enter is swallowed. Measured on codex
+    /// 0.150.1 — raw 1024B submits, raw 1025B does not.
+    #[test]
+    fn raw_single_line_max_stays_under_the_codex_read_boundary() {
+        assert!(
+            RAW_SINGLE_LINE_MAX < 1024,
+            "a raw single-line body must not be able to reach codex's \
+             1024-byte read boundary (got {})",
+            RAW_SINGLE_LINE_MAX,
+        );
+    }
+
+    /// Slash commands are why the raw path exists — they only run as
+    /// commands when the agent sees them as TYPED input.
+    #[test]
+    fn short_single_line_body_stays_raw() {
+        assert!(!body_needs_bracketing("/compact"));
+        assert!(!body_needs_bracketing("/clear"));
+        assert!(!body_needs_bracketing("yes, go ahead with option B"));
+        let mode = TermMode::BRACKETED_PASTE;
+        assert_eq!(format_body_for_delivery("/compact", mode), b"/compact");
+    }
+
+    /// The regression this bound exists for: an agent-composed one-paragraph
+    /// prompt carries no newline, so the pre-fix multi-line-only predicate
+    /// sent it raw and codex never submitted it.
+    #[test]
+    fn long_single_line_body_is_bracketed() {
+        let body = "x".repeat(RAW_SINGLE_LINE_MAX + 1);
+        assert!(
+            body_needs_bracketing(&body),
+            "a single-line body over the raw bound must be bracketed",
+        );
+        let out = format_body_for_delivery(&body, TermMode::BRACKETED_PASTE);
+        assert!(out.starts_with(b"\x1b[200~") && out.ends_with(b"\x1b[201~"));
+        assert_eq!(out, format!("\x1b[200~{}\x1b[201~", body).as_bytes());
+        // Exactly at the bound it is still a "typed" body.
+        assert!(!body_needs_bracketing(&"x".repeat(RAW_SINGLE_LINE_MAX)));
+    }
+
+    /// A body the agent can't accept as a paste still goes raw — we must
+    /// never emit literal `[200~` into a composer.
+    #[test]
+    fn long_single_line_body_raw_when_bracketed_paste_disabled() {
+        let body = "x".repeat(RAW_SINGLE_LINE_MAX + 1);
+        let out = format_body_for_delivery(&body, TermMode::DISAMBIGUATE_ESC_CODES);
+        assert_eq!(out, body.as_bytes());
     }
 }

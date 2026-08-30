@@ -276,12 +276,18 @@ pub(super) fn encode_mouse_for_pty(
 /// in a state where the trailing Enter is ignored — the symptom that
 /// motivated this helper (see `wf_69fd318f1ad8c4d0` tick.log).
 ///
-/// Single-line bodies stay raw so slash commands like `/clear` aren't
+/// SHORT single-line bodies stay raw so slash commands like `/clear` aren't
 /// rendered as pasted text — the agent needs to recognise them as typed
-/// commands. The newline test is conservative: real activation prompts
-/// always span multiple lines.
+/// commands. A LONG single-line body is bracketed anyway: codex tears a raw
+/// body at its 1024-byte PTY read boundary and then swallows the trailing
+/// Enter, so the prompt sits in the composer unsent. See
+/// [`cm_daemon::workflow::pty_tracker::RAW_SINGLE_LINE_MAX`] for the
+/// measurements behind the bound; `body_needs_bracketing` is the shared
+/// predicate so this helper and its two daemon-side twins can't drift.
 fn format_body_for_delivery(body: &str, term_mode: TermMode) -> Vec<u8> {
-    if body.contains('\n') && term_mode.contains(TermMode::BRACKETED_PASTE) {
+    if cm_daemon::workflow::pty_tracker::body_needs_bracketing(body)
+        && term_mode.contains(TermMode::BRACKETED_PASTE)
+    {
         let mut out = Vec::with_capacity(body.len() + 12);
         out.extend_from_slice(b"\x1b[200~");
         out.extend_from_slice(body.as_bytes());
@@ -4068,14 +4074,29 @@ mod body_delivery_tests {
 
     #[test]
     fn single_line_body_stays_raw_even_with_bracketed_paste() {
-        // Slash commands (`/clear`, `/compact`, etc.) are always single-line.
-        // Wrapping them in paste markers risks the agent treating them as
-        // pasted text instead of a typed command. Newline absence is the
-        // signal: real activation prompts always span multiple lines.
+        // Slash commands (`/clear`, `/compact`, etc.) are always single-line
+        // and short. Wrapping them in paste markers risks the agent treating
+        // them as pasted text instead of a typed command.
         let mode = TermMode::BRACKETED_PASTE;
         let body = "/clear";
         let out = format_body_for_delivery(body, mode);
         assert_eq!(out, body.as_bytes());
+    }
+
+    /// Newline absence is NOT sufficient reason to go raw. An agent-composed
+    /// prompt is often one long paragraph with no newline at all, and codex
+    /// tears a raw body at its 1024-byte PTY read boundary — the first 1024
+    /// bytes become a `[Pasted Content N chars]` chip, the rest types in
+    /// behind it, and the trailing Enter is absorbed rather than submitting.
+    /// That is the "codex randomly doesn't get its Enter pressed" bug.
+    #[test]
+    fn long_single_line_body_wrapped_when_bracketed_paste_enabled() {
+        let mode = TermMode::BRACKETED_PASTE;
+        let body = "x".repeat(
+            cm_daemon::workflow::pty_tracker::RAW_SINGLE_LINE_MAX + 1,
+        );
+        let out = format_body_for_delivery(&body, mode);
+        assert_eq!(out, format!("\x1b[200~{}\x1b[201~", body).as_bytes());
     }
 
     #[test]
