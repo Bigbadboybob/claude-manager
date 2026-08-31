@@ -15234,6 +15234,74 @@ fn default_backtest_project() -> String {
 /// `_BACKTEST_CONFIG_MAX_BYTES` in mcp_server/server.py.
 const BACKTEST_CONFIG_MAX_BYTES: usize = 32 * 1024;
 
+fn normalize_backtest_filer_agent(session_type: &str) -> &'static str {
+    match session_type {
+        "claude" | "claude-code" => "claude",
+        "codex" => "codex",
+        "bash" => "bash",
+        _ => "unknown",
+    }
+}
+
+fn local_machine_hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// Build the persisted `metadata.filer` object from daemon-owned caller
+/// identity. No filer identity is accepted from request params: session,
+/// task, workspace, workflow, and continuous-task ids are authoritative
+/// snapshots of the caller that authenticated the RPC.
+fn backtest_filer_metadata(
+    state: &DaemonState,
+    caller_uid: Option<&str>,
+    machine: Option<&str>,
+) -> Value {
+    let mut filer = serde_json::Map::new();
+    filer.insert("schema_version".into(), json!(1));
+    filer.insert("submitted_via".into(), json!("mcp.submit_backtest"));
+
+    let mut agent = if caller_uid.is_some() { "unknown" } else { "operator" };
+    if let Some(uid) = caller_uid {
+        filer.insert("session_id".into(), json!(uid));
+        if let Some(session) = state.sessions.get(uid) {
+            agent = normalize_backtest_filer_agent(&session.session_type);
+            let mut put = |key: &str, value: Option<&str>| {
+                if let Some(value) = value.filter(|s| !s.is_empty()) {
+                    filer.insert(key.to_string(), json!(value));
+                }
+            };
+            put("task_id", session.task_id.as_deref());
+            put("workspace_id", Some(&session.workspace_id));
+            put("continuous_task_id", session.continuous_task_id.as_deref());
+            put("workflow_run_id", session.workflow_run_id.as_deref());
+            put("workflow_role", session.workflow_role.as_deref());
+            put("managed_by_session_id", session.managed_by_uid.as_deref());
+            put(
+                "worktree_path",
+                state
+                    .workspaces
+                    .get(&session.workspace_id)
+                    .and_then(|w| w.worktree_path.as_ref())
+                    .and_then(|p| p.to_str()),
+            );
+        }
+    }
+    filer.insert("agent".into(), json!(agent));
+    if let Some(machine) = machine.filter(|s| !s.is_empty()) {
+        filer.insert("machine".into(), json!(machine));
+    }
+    Value::Object(filer)
+}
+
 #[derive(Deserialize)]
 struct BacktestSubmitParams {
     branch: String,
@@ -15301,13 +15369,21 @@ pub fn backtest_submit(
 
     // Snapshot under the lock, then drop before any HTTP (lock discipline:
     // the DaemonState mutex is never held across a planning-API call).
-    let (caller_task_id, api_url_cfg, api_token_cfg): (Option<String>, String, String) = {
+    let machine = local_machine_hostname();
+    let (caller_task_id, filer, api_url_cfg, api_token_cfg): (
+        Option<String>,
+        Value,
+        String,
+        String,
+    ) = {
         let state = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let caller_task = caller_uid
             .and_then(|u| state.sessions.get(u))
             .and_then(|s| s.task_id.clone());
+        let filer = backtest_filer_metadata(&state, caller_uid, machine.as_deref());
         (
             caller_task,
+            filer,
             state.config.api_url.clone(),
             state.config.api_token.clone(),
         )
@@ -15359,6 +15435,7 @@ pub fn backtest_submit(
             "regression": p.regression,
         },
         "vm": vm,
+        "filer": filer,
     });
     let short_name = p
         .script
@@ -15382,6 +15459,8 @@ pub fn backtest_submit(
         "name": name,
         "project": p.project,
         "prompt": prompt,
+        // Planning `source` is the agent-vs-user category and its DB check
+        // constraint is user|claude. The exact engine is filer.agent.
         "source": "claude",
         "is_cloud": true,
         "kind": "backtest",

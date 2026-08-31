@@ -14,7 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::api::Task;
+use crate::api::{FilerMetadata, Task};
 
 /// How long a `done` run stays in the group after the TUI first observes the
 /// terminal status. Short: success needs no action, and the row's residual
@@ -49,6 +49,8 @@ pub(crate) struct BacktestRow {
     pub state: BacktestState,
     /// Keys the GCS results prefix (`backtests/<run_key>/`).
     pub run_key: Option<String>,
+    /// Agent/session/task/workspace provenance from `metadata.filer`.
+    pub filer: Option<FilerMetadata>,
     /// `metadata.backtest.launched_at` (unix ms) — runtime anchor.
     pub launched_ms: Option<u64>,
     /// `blocked_at` (unix ms) — absolute grace anchor for failures.
@@ -154,6 +156,7 @@ pub(crate) fn update_backtest_rows(
             branch,
             state,
             run_key: meta_str("run_key"),
+            filer: FilerMetadata::from_metadata(&task.metadata),
             launched_ms,
             blocked_ms,
             first_seen_terminal,
@@ -337,6 +340,27 @@ mod tests {
     }
 
     #[test]
+    fn filer_metadata_rides_into_sidebar_rows_for_info_peek() {
+        let mut filed = task("t1", "backlog", "a-1");
+        filed.metadata.as_mut().unwrap()["filer"] = serde_json::json!({
+            "schema_version": 1,
+            "agent": "codex",
+            "session_id": "session-1",
+            "task_id": "parent-1",
+            "workspace_id": "workspace-1",
+            "machine": "host-1"
+        });
+        let mut rows = Vec::new();
+        update(&mut rows, &[filed], Instant::now(), 0);
+        let filer = rows[0].filer.as_ref().expect("parsed filer");
+        assert_eq!(filer.agent.as_deref(), Some("codex"));
+        assert_eq!(filer.session_id.as_deref(), Some("session-1"));
+        assert_eq!(filer.task_id.as_deref(), Some("parent-1"));
+        assert_eq!(filer.workspace_id.as_deref(), Some("workspace-1"));
+        assert_eq!(filer.machine.as_deref(), Some("host-1"));
+    }
+
+    #[test]
     fn done_rows_expire_after_done_grace_only() {
         let t0 = Instant::now();
         let mut rows = Vec::new();
@@ -451,6 +475,7 @@ mod tests {
             branch: "main".into(),
             state: BacktestState::Running { vm: None },
             run_key: None,
+            filer: None,
             launched_ms: Some(now_ms - 90_000),
             blocked_ms: None,
             first_seen_terminal: None,

@@ -57,6 +57,93 @@ pub struct Task {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Provenance stamped on agent-filed backtests at `metadata.filer`.
+///
+/// Every field is optional so the TUI remains compatible with older rows and
+/// partially-known callers. New submitters currently write schema version 1.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilerMetadata {
+    pub schema_version: Option<u64>,
+    pub agent: Option<String>,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub worktree_path: Option<String>,
+    pub machine: Option<String>,
+    pub continuous_task_id: Option<String>,
+    pub workflow_run_id: Option<String>,
+    pub workflow_role: Option<String>,
+    pub managed_by_session_id: Option<String>,
+    pub submitted_via: Option<String>,
+}
+
+impl FilerMetadata {
+    pub fn from_metadata(metadata: &Option<serde_json::Value>) -> Option<Self> {
+        let filer = metadata.as_ref()?.get("filer")?.as_object()?;
+        let text = |key: &str| {
+            filer
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Some(Self {
+            schema_version: filer.get("schema_version").and_then(|v| v.as_u64()),
+            agent: text("agent"),
+            session_id: text("session_id"),
+            task_id: text("task_id"),
+            workspace_id: text("workspace_id"),
+            worktree_path: text("worktree_path"),
+            machine: text("machine"),
+            continuous_task_id: text("continuous_task_id"),
+            workflow_run_id: text("workflow_run_id"),
+            workflow_role: text("workflow_role"),
+            managed_by_session_id: text("managed_by_session_id"),
+            submitted_via: text("submitted_via"),
+        })
+    }
+
+    /// Consistent label/value rows shared by planning detail and A-i peek.
+    pub fn display_fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = Vec::new();
+        fields.push((
+            "Filed by",
+            self.agent.clone().unwrap_or_else(|| "unknown".into()),
+        ));
+        for (label, value) in [
+            ("Filer session", &self.session_id),
+            ("Filer task", &self.task_id),
+            ("Workspace", &self.workspace_id),
+            ("Machine", &self.machine),
+            ("Worktree", &self.worktree_path),
+            ("Continuous task", &self.continuous_task_id),
+        ] {
+            if let Some(value) = value {
+                fields.push((label, value.clone()));
+            }
+        }
+        if let Some(run) = &self.workflow_run_id {
+            let value = match &self.workflow_role {
+                Some(role) => format!("{} ({})", run, role),
+                None => run.clone(),
+            };
+            fields.push(("Workflow", value));
+        } else if let Some(role) = &self.workflow_role {
+            fields.push(("Workflow role", role.clone()));
+        }
+        for (label, value) in [
+            ("Managed by", &self.managed_by_session_id),
+            ("Filed via", &self.submitted_via),
+        ] {
+            if let Some(value) = value {
+                fields.push((label, value.clone()));
+            }
+        }
+        fields
+    }
+}
+
 fn default_worktree_mode() -> String {
     "inherit".to_string()
 }
@@ -259,6 +346,49 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn filer_metadata_parses_and_formats_all_v1_identifiers() {
+        let metadata = Some(serde_json::json!({
+            "filer": {
+                "schema_version": 1,
+                "agent": "codex",
+                "session_id": "session-1",
+                "task_id": "task-1",
+                "workspace_id": "workspace-1",
+                "worktree_path": "/repo/worktree",
+                "machine": "host-1",
+                "continuous_task_id": "continuous-1",
+                "workflow_run_id": "workflow-1",
+                "workflow_role": "worker",
+                "managed_by_session_id": "manager-1",
+                "submitted_via": "mcp.submit_backtest"
+            }
+        }));
+        let filer = FilerMetadata::from_metadata(&metadata).expect("filer");
+        assert_eq!(filer.schema_version, Some(1));
+        assert_eq!(filer.agent.as_deref(), Some("codex"));
+        let fields = filer.display_fields();
+        assert!(fields.contains(&("Filed by", "codex".into())));
+        assert!(fields.contains(&("Filer session", "session-1".into())));
+        assert!(fields.contains(&("Filer task", "task-1".into())));
+        assert!(fields.contains(&("Workspace", "workspace-1".into())));
+        assert!(fields.contains(&("Machine", "host-1".into())));
+        assert!(fields.contains(&("Worktree", "/repo/worktree".into())));
+        assert!(fields.contains(&("Continuous task", "continuous-1".into())));
+        assert!(fields.contains(&("Workflow", "workflow-1 (worker)".into())));
+        assert!(fields.contains(&("Managed by", "manager-1".into())));
+        assert!(fields.contains(&("Filed via", "mcp.submit_backtest".into())));
+    }
+
+    #[test]
+    fn filer_metadata_is_absent_on_legacy_tasks() {
+        assert!(FilerMetadata::from_metadata(&None).is_none());
+        assert!(FilerMetadata::from_metadata(&Some(serde_json::json!({
+            "backtest": {"label": "legacy"}
+        })))
+        .is_none());
+    }
 
     /// Per-connection behavior for the stub API server.
     enum Stub {

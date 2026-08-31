@@ -1845,6 +1845,15 @@ impl App {
                     value: row.task_id.clone(),
                 },
             ];
+            if let Some(filer) = &row.filer {
+                out.push(PeekLine::Blank);
+                for (label, value) in filer.display_fields() {
+                    out.push(PeekLine::Field {
+                        label: label.into(),
+                        value,
+                    });
+                }
+            }
             if let Some(secs) = runtime_secs(row, now, now_ms) {
                 out.push(PeekLine::Field {
                     label: "Runtime".into(),

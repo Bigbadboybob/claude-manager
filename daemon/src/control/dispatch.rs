@@ -2517,14 +2517,37 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             // round-trip. An unknown uid (e.g. post-restart) still
             // pongs, with `global_perms=false` and null scope.
             let st = state.lock().unwrap_or_else(|p| p.into_inner());
-            let (global_perms, task_id, workspace_id) =
+            let (
+                global_perms,
+                task_id,
+                workspace_id,
+                session_type,
+                continuous_task_id,
+                workflow_run_id,
+                workflow_role,
+                managed_by_session_id,
+                worktree_path,
+            ) =
                 match st.sessions.get(&s.session_uid) {
-                    Some(sess) => (
-                        sess.global_perms,
-                        sess.task_id.clone(),
-                        Some(sess.workspace_id.clone()),
-                    ),
-                    None => (false, None, None),
+                    Some(sess) => {
+                        let worktree_path = st
+                            .workspaces
+                            .get(&sess.workspace_id)
+                            .and_then(|w| w.worktree_path.as_ref())
+                            .map(|p| p.display().to_string());
+                        (
+                            sess.global_perms,
+                            sess.task_id.clone(),
+                            Some(sess.workspace_id.clone()),
+                            Some(sess.session_type.clone()),
+                            sess.continuous_task_id.clone(),
+                            sess.workflow_run_id.clone(),
+                            sess.workflow_role.clone(),
+                            sess.managed_by_uid.clone(),
+                            worktree_path,
+                        )
+                    }
+                    None => (false, None, None, None, None, None, None, None, None),
                 };
             Response::ok(
                 req.id.clone(),
@@ -2535,6 +2558,12 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     "global_perms": global_perms,
                     "task_id": task_id,
                     "workspace_id": workspace_id,
+                    "session_type": session_type,
+                    "continuous_task_id": continuous_task_id,
+                    "workflow_run_id": workflow_run_id,
+                    "workflow_role": workflow_role,
+                    "managed_by_session_id": managed_by_session_id,
+                    "worktree_path": worktree_path,
                 }),
             )
         }
@@ -3161,10 +3190,16 @@ mod tests {
         assert_eq!(result["global_perms"], false);
         assert_eq!(result["task_id"], serde_json::Value::Null);
         assert_eq!(result["workspace_id"], serde_json::Value::Null);
+        assert_eq!(result["session_type"], serde_json::Value::Null);
+        assert_eq!(result["continuous_task_id"], serde_json::Value::Null);
+        assert_eq!(result["workflow_run_id"], serde_json::Value::Null);
+        assert_eq!(result["workflow_role"], serde_json::Value::Null);
+        assert_eq!(result["managed_by_session_id"], serde_json::Value::Null);
+        assert_eq!(result["worktree_path"], serde_json::Value::Null);
         assert_eq!(
             result.as_object().map(|o| o.len()),
-            Some(6),
-            "keys: pong, uid, caller_kind, global_perms, task_id, workspace_id. \
+            Some(12),
+            "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context. \
              Any other key drift would be a client-visible change.",
         );
     }
@@ -3199,6 +3234,7 @@ mod tests {
         let pr = ping.result.expect("ping result");
         assert_eq!(pr["global_perms"], true);
         assert_eq!(pr["workspace_id"], "ws-1");
+        assert_eq!(pr["session_type"], "claude-code");
 
         // list_sessions returns the cross-workspace target for the global caller.
         let list = dispatch_request(
@@ -9220,6 +9256,11 @@ mod tests {
         assert_eq!(vm["zone"], "us-east4-a");
         assert_eq!(vm["machine_type"], "c2-standard-4");
         assert_eq!(vm["image_family"], "cm-backtest-worker");
+        let filer = &body["metadata"]["filer"];
+        assert_eq!(filer["schema_version"], 1);
+        assert_eq!(filer["agent"], "operator");
+        assert_eq!(filer["submitted_via"], "mcp.submit_backtest");
+        assert!(filer.get("session_id").is_none());
         // Operator caller carries no session → no parent.
         assert!(body.get("parent_task_id").is_none());
     }
@@ -9237,13 +9278,24 @@ mod tests {
             crate::planning_client::spawn_stub_api_for_test(200, BT_CREATED_ROW);
         let state = state_with_session_in_workspace("ts-bt", "ws-1");
         set_stub_api_config(&state, port);
-        state
-            .lock()
-            .unwrap()
-            .sessions
-            .get_mut("ts-bt")
-            .unwrap()
-            .task_id = Some("parent-task-9".into());
+        {
+            let mut st = state.lock().unwrap();
+            let session = st.sessions.get_mut("ts-bt").unwrap();
+            session.task_id = Some("parent-task-9".into());
+            session.session_type = "codex".into();
+            session.continuous_task_id = Some("continuous-7".into());
+            session.workflow_run_id = Some("workflow-3".into());
+            session.workflow_role = Some("worker".into());
+            session.managed_by_uid = Some("orchestrator-2".into());
+            st.workspaces.insert(
+                "ws-1".into(),
+                crate::manifest::ManifestWorkspace {
+                    id: "ws-1".into(),
+                    worktree_path: Some(std::path::PathBuf::from("/worktrees/feature")),
+                    ..Default::default()
+                },
+            );
+        }
         let resp = dispatch_request(
             &state,
             &session_request(
@@ -9263,6 +9315,20 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(body_raw).expect("POST body is JSON");
         assert_eq!(body["parent_task_id"], "parent-task-9");
+        assert_eq!(body["source"], "claude");
+        let filer = &body["metadata"]["filer"];
+        assert_eq!(filer["schema_version"], 1);
+        assert_eq!(filer["agent"], "codex");
+        assert_eq!(filer["session_id"], "ts-bt");
+        assert_eq!(filer["task_id"], "parent-task-9");
+        assert_eq!(filer["workspace_id"], "ws-1");
+        assert_eq!(filer["worktree_path"], "/worktrees/feature");
+        assert_eq!(filer["continuous_task_id"], "continuous-7");
+        assert_eq!(filer["workflow_run_id"], "workflow-3");
+        assert_eq!(filer["workflow_role"], "worker");
+        assert_eq!(filer["managed_by_session_id"], "orchestrator-2");
+        assert_eq!(filer["submitted_via"], "mcp.submit_backtest");
+        assert!(filer["machine"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     /// Validation failures are rejected BEFORE any HTTP: with no valid

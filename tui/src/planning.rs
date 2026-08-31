@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::api::Task;
+use crate::api::{FilerMetadata, Task};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::theme;
@@ -118,6 +118,8 @@ pub struct PlanTask {
     /// Backtest label (`metadata.backtest.label`) — preferred over
     /// `run_key` for the watch session title when present.
     pub bt_label: Option<String>,
+    /// Agent/session/task/workspace provenance (`metadata.filer`).
+    pub filer: Option<FilerMetadata>,
 }
 
 /// Pull a `"vm"` / `"backtest"` string field out of a task's free-form
@@ -129,6 +131,13 @@ fn meta_str(metadata: &Option<serde_json::Value>, group: &str, key: &str) -> Opt
         .and_then(|g| g.get(key))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
+    task.filer
+        .as_ref()
+        .map(FilerMetadata::display_fields)
+        .unwrap_or_default()
 }
 
 impl PlanTask {
@@ -157,6 +166,7 @@ impl PlanTask {
                 .or_else(|| task.worker_zone.clone().filter(|s| !s.is_empty())),
             run_key: meta_str(&task.metadata, "backtest", "run_key"),
             bt_label: meta_str(&task.metadata, "backtest", "label"),
+            filer: FilerMetadata::from_metadata(&task.metadata),
         }
     }
 }
@@ -1423,6 +1433,7 @@ impl PlanningView {
                 task.source = api_task.source.clone();
                 task.is_cloud = api_task.is_cloud;
                 task.parent_task_id = api_task.parent_task_id.clone();
+                task.filer = FilerMetadata::from_metadata(&api_task.metadata);
                 self.recompute_conflicts();
                 self.needs_redraw = true;
                 return;
@@ -4331,6 +4342,15 @@ impl PlanningView {
                     Span::styled(created.as_str(), Style::default().fg(theme::TEXT)),
                 ]));
             }
+            for (label, value) in plan_filer_fields(task) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {}: ", label),
+                        Style::default().fg(theme::DIM),
+                    ),
+                    Span::styled(value, Style::default().fg(theme::TEXT)),
+                ]));
+            }
             if task.source == "claude" {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
@@ -4779,6 +4799,7 @@ mod tests {
             vm_zone: None,
             run_key: None,
             bt_label: None,
+            filer: None,
         }
     }
 
@@ -5077,6 +5098,33 @@ mod tests {
     }
 
     #[test]
+    fn planning_detail_exposes_backtest_filer_metadata() {
+        let mut api = api_task("bt-1", "predictionTrading", "git@example.com:pt.git");
+        api.kind = "backtest".into();
+        api.source = "codex".into();
+        api.metadata = Some(serde_json::json!({
+            "filer": {
+                "schema_version": 1,
+                "agent": "codex",
+                "session_id": "session-1",
+                "task_id": "parent-1",
+                "workspace_id": "workspace-1",
+                "machine": "host-1",
+                "continuous_task_id": "continuous-1"
+            }
+        }));
+
+        let task = PlanTask::from_api(&api);
+        let fields = plan_filer_fields(&task);
+        assert!(fields.contains(&("Filed by", "codex".into())));
+        assert!(fields.contains(&("Filer session", "session-1".into())));
+        assert!(fields.contains(&("Filer task", "parent-1".into())));
+        assert!(fields.contains(&("Workspace", "workspace-1".into())));
+        assert!(fields.contains(&("Machine", "host-1".into())));
+        assert!(fields.contains(&("Continuous task", "continuous-1".into())));
+    }
+
+    #[test]
     fn update_from_api_preserves_previously_hydrated_repo_url() {
         // A project hydrated earlier with a good URL must not lose it
         // when a later API refresh returns no tasks for it AND there
@@ -5200,6 +5248,7 @@ mod tests {
             vm_zone: None,
             run_key: None,
             bt_label: None,
+            filer: None,
         });
         view.project_data.push(pd);
         view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
@@ -5251,6 +5300,7 @@ mod tests {
             vm_zone: None,
             run_key: None,
             bt_label: None,
+            filer: None,
         });
         view.project_data.push(pd);
         view.projects = view
@@ -5310,6 +5360,7 @@ mod tests {
             vm_zone: None,
             run_key: None,
             bt_label: None,
+            filer: None,
         });
         view.project_data.push(pd);
         view.projects = view
@@ -5368,6 +5419,7 @@ mod tests {
                 vm_zone: None,
                 run_key: None,
                 bt_label: None,
+                filer: None,
             });
             view.project_data.push(pd);
             view.projects = view
@@ -5438,6 +5490,7 @@ mod tests {
             vm_zone: None,
             run_key: None,
             bt_label: None,
+            filer: None,
         });
         view.project_data.push(pd);
         view.projects = view
@@ -5606,6 +5659,7 @@ mod tests {
             vm_zone: None,
             run_key: None,
             bt_label: None,
+            filer: None,
         }
     }
 
@@ -6448,4 +6502,3 @@ mod tests {
         assert_eq!(view.search_matches, vec!["a", "b"], "stale ID must drop out");
     }
 }
-

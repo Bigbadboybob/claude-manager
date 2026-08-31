@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import socket
 import sys
 import time
 
@@ -2925,21 +2926,68 @@ _BACKTEST_TERMINAL_STATUSES = ("done", "blocked", "archived")
 _BACKTEST_DEFAULT_SCRIPT = "analysis.backtests.backtest_actrader_grid"
 
 
-def _caller_task_id() -> str | None:
-    """The caller's bound task UUID, or None (unbound / unreachable).
+def _normalize_filer_agent(session_type: str | None) -> str:
+    """Map CM's wire session types to the short filer vocabulary."""
+    return {
+        "claude": "claude",
+        "claude-code": "claude",
+        "codex": "codex",
+        "bash": "bash",
+    }.get((session_type or "").strip().lower(), "unknown")
 
-    Mirrors get_current_task's two branches. Failure to resolve identity
-    must NOT block a backtest submission — the row just lands top-level.
+
+def _caller_filer_context() -> dict:
+    """Best-effort, control-plane-derived provenance for a backtest filer.
+
+    Missing identity must never block submission. Local process facts supply
+    the physical hostname and working directory; session/task/workflow facts
+    come from the daemon so agents do not have to repeat their own identity.
     """
+    context: dict = {
+        "schema_version": 1,
+        "submitted_via": "mcp.submit_backtest",
+    }
+    session_id = os.environ.get("CM_TUI_SESSION_ID", "").strip()
+    if session_id:
+        context["session_id"] = session_id
+    try:
+        hostname = socket.gethostname().strip()
+        if hostname:
+            context["machine"] = hostname
+    except OSError:
+        pass
+    try:
+        context["worktree_path"] = os.getcwd()
+    except OSError:
+        pass
+
     try:
         route = control_client.resolve_socket_route()
         if route.chose_daemon:
             pong = control_client.call("ping", {}, socket_path=route.path)
-            return pong.get("task_id") or None
-        ctx = control_client.call("get_caller_task")
-        return ctx.get("task_id") or None
+            for key in (
+                "task_id",
+                "workspace_id",
+                "continuous_task_id",
+                "workflow_run_id",
+                "workflow_role",
+                "managed_by_session_id",
+                "worktree_path",
+            ):
+                value = pong.get(key)
+                if isinstance(value, str) and value.strip():
+                    context[key] = value
+            context["agent"] = _normalize_filer_agent(pong.get("session_type"))
+            return context
+        caller = control_client.call("get_caller_task")
+        for key in ("task_id", "workspace_id"):
+            value = caller.get(key)
+            if isinstance(value, str) and value.strip():
+                context[key] = value
     except Exception:
-        return None
+        pass
+    context.setdefault("agent", "unknown")
+    return context
 
 
 @mcp.tool()
@@ -3006,7 +3054,8 @@ def submit_backtest(
     _check_parameter_confusion("label", label)
     _check_parameter_confusion("config", config)
 
-    parent_task_id = _caller_task_id()
+    filer = _caller_filer_context()
+    parent_task_id = filer.get("task_id")
 
     try:
         client = PlanningClient()
@@ -3067,11 +3116,14 @@ def submit_backtest(
         "name": name,
         "project": project,
         "prompt": prompt,
+        # `source` is the planning provenance category (agent vs user), whose
+        # DB vocabulary is still user|claude. The specific engine lives in
+        # metadata.filer.agent.
         "source": "claude",
         "is_cloud": True,
         "kind": "backtest",
         "status": "backlog",
-        "metadata": {"backtest": backtest_meta, "vm": vm},
+        "metadata": {"backtest": backtest_meta, "vm": vm, "filer": filer},
     }
     if parent_task_id:
         body["parent_task_id"] = parent_task_id

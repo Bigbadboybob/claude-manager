@@ -56,7 +56,20 @@ class SubmitBacktestLaptopTests(unittest.TestCase):
         from mcp_server import server
 
         with mock.patch.object(server, "PlanningClient", return_value=fake), \
-             mock.patch.object(server, "_caller_task_id", return_value="parent-1"):
+             mock.patch.object(server, "_caller_filer_context", return_value={
+                 "schema_version": 1,
+                 "agent": "codex",
+                 "session_id": "session-1",
+                 "task_id": "parent-1",
+                 "workspace_id": "workspace-1",
+                 "worktree_path": "/worktrees/feature",
+                 "machine": "laptop-1",
+                 "continuous_task_id": "continuous-1",
+                 "workflow_run_id": "workflow-1",
+                 "workflow_role": "worker",
+                 "managed_by_session_id": "orchestrator-1",
+                 "submitted_via": "mcp.submit_backtest",
+             }):
             defaults = dict(branch="main", config="configs/smoke.yaml", label="smoke")
             defaults.update(kwargs)
             return server.submit_backtest(**defaults)
@@ -80,8 +93,21 @@ class SubmitBacktestLaptopTests(unittest.TestCase):
         vm = body["metadata"]["vm"]
         self.assertEqual(vm["project"], "prediction-market-scalper")
         self.assertEqual(vm["zone"], "us-east4-a")
-        self.assertEqual(vm["machine_type"], "c2-standard-4")
+        self.assertEqual(vm["machine_type"], "n2-standard-4")
         self.assertEqual(vm["image_family"], "cm-backtest-worker")
+        filer = body["metadata"]["filer"]
+        self.assertEqual(filer["schema_version"], 1)
+        self.assertEqual(filer["agent"], "codex")
+        self.assertEqual(filer["session_id"], "session-1")
+        self.assertEqual(filer["task_id"], "parent-1")
+        self.assertEqual(filer["workspace_id"], "workspace-1")
+        self.assertEqual(filer["worktree_path"], "/worktrees/feature")
+        self.assertEqual(filer["machine"], "laptop-1")
+        self.assertEqual(filer["continuous_task_id"], "continuous-1")
+        self.assertEqual(filer["workflow_run_id"], "workflow-1")
+        self.assertEqual(filer["workflow_role"], "worker")
+        self.assertEqual(filer["managed_by_session_id"], "orchestrator-1")
+        self.assertEqual(filer["submitted_via"], "mcp.submit_backtest")
 
         # run_key surfaced from the (server-minted) created row.
         self.assertEqual(result["run_key"], "20260707-smoke-abcd1234")
@@ -115,7 +141,9 @@ class SubmitBacktestLaptopTests(unittest.TestCase):
 
         fake = _FakePlanningClient()
         with mock.patch.object(server, "PlanningClient", return_value=fake), \
-             mock.patch.object(server, "_caller_task_id", return_value=None):
+             mock.patch.object(server, "_caller_filer_context", return_value={
+                 "schema_version": 1, "agent": "unknown",
+             }):
             with self.assertRaisesRegex(ValueError, "exceeds"):
                 server.submit_backtest(
                     branch="main", config="x" * (32 * 1024 + 1)
@@ -125,7 +153,9 @@ class SubmitBacktestLaptopTests(unittest.TestCase):
     def test_empty_required_fields_rejected(self):
         from mcp_server import server
 
-        with mock.patch.object(server, "_caller_task_id", return_value=None):
+        with mock.patch.object(server, "_caller_filer_context", return_value={
+            "schema_version": 1, "agent": "unknown",
+        }):
             with self.assertRaises(ValueError):
                 server.submit_backtest(branch="", config="c.yaml")
             with self.assertRaises(ValueError):
@@ -138,7 +168,9 @@ class SubmitBacktestLaptopTests(unittest.TestCase):
         from mcp_server import server
 
         with mock.patch.object(server, "PlanningClient", return_value=fake), \
-             mock.patch.object(server, "_caller_task_id", return_value=None):
+             mock.patch.object(server, "_caller_filer_context", return_value={
+                 "schema_version": 1, "agent": "unknown",
+             }):
             result = server.submit_backtest(branch="main", config="c.yaml")
         self.assertNotIn("parent_task_id", fake.created)
         self.assertEqual(result["status"], "backlog")
@@ -163,7 +195,11 @@ class SubmitBacktestHeadlessTests(unittest.TestCase):
 
         with mock.patch.object(
             server, "PlanningClient", side_effect=_raise_planning_unavailable
-        ), mock.patch.object(server, "_caller_task_id", return_value="parent-9"), \
+        ), mock.patch.object(server, "_caller_filer_context", return_value={
+            "schema_version": 1,
+            "agent": "codex",
+            "task_id": "parent-9",
+        }), \
              mock.patch.object(control_client, "call", side_effect=fake_call):
             result = server.submit_backtest(
                 branch="cm/feat", config="configs/t1.yaml", label="t1",
@@ -180,6 +216,57 @@ class SubmitBacktestHeadlessTests(unittest.TestCase):
         self.assertEqual(p["project"], "predictionTrading")
         self.assertNotIn("repo_url", p)  # omitted -> daemon resolves default
         self.assertEqual(result["run_key"], "20260707-smoke-deadbeef")
+
+
+class BacktestFilerContextTests(unittest.TestCase):
+    """Caller provenance is derived from daemon identity, best-effort."""
+
+    def test_daemon_context_normalizes_agent_and_keeps_all_identifiers(self):
+        from mcp_server import server, control_client
+
+        route = mock.Mock(chose_daemon=True, path="/tmp/daemon.sock")
+        pong = {
+            "session_type": "claude-code",
+            "task_id": "task-1",
+            "workspace_id": "workspace-1",
+            "continuous_task_id": "continuous-1",
+            "workflow_run_id": "workflow-1",
+            "workflow_role": "reviewer",
+            "managed_by_session_id": "manager-1",
+            "worktree_path": "/repo/worktree",
+        }
+        with mock.patch.object(control_client, "resolve_socket_route", return_value=route), \
+             mock.patch.object(control_client, "call", return_value=pong), \
+             mock.patch.object(server.socket, "gethostname", return_value="host-1"), \
+             mock.patch.object(server.os, "getcwd", return_value="/fallback/cwd"), \
+             mock.patch.dict(server.os.environ, {"CM_TUI_SESSION_ID": "session-1"}):
+            filer = server._caller_filer_context()
+
+        self.assertEqual(filer["agent"], "claude")
+        self.assertEqual(filer["session_id"], "session-1")
+        self.assertEqual(filer["task_id"], "task-1")
+        self.assertEqual(filer["workspace_id"], "workspace-1")
+        self.assertEqual(filer["continuous_task_id"], "continuous-1")
+        self.assertEqual(filer["workflow_run_id"], "workflow-1")
+        self.assertEqual(filer["workflow_role"], "reviewer")
+        self.assertEqual(filer["managed_by_session_id"], "manager-1")
+        self.assertEqual(filer["worktree_path"], "/repo/worktree")
+        self.assertEqual(filer["machine"], "host-1")
+
+    def test_unreachable_control_plane_still_returns_local_provenance(self):
+        from mcp_server import server, control_client
+
+        with mock.patch.object(
+            control_client, "resolve_socket_route", side_effect=OSError("down")
+        ), mock.patch.object(server.socket, "gethostname", return_value="host-2"), \
+             mock.patch.object(server.os, "getcwd", return_value="/repo"), \
+             mock.patch.dict(server.os.environ, {}, clear=True):
+            filer = server._caller_filer_context()
+
+        self.assertEqual(filer["agent"], "unknown")
+        self.assertEqual(filer["machine"], "host-2")
+        self.assertEqual(filer["worktree_path"], "/repo")
+        self.assertNotIn("session_id", filer)
 
 
 class ReadBacktestResultTests(unittest.TestCase):
