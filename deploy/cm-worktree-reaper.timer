@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily safe claude-manager worktree reaping
+
+[Timer]
+OnCalendar=*-*-* 12:55:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+Unit=cm-worktree-reaper.service
+
+[Install]
+WantedBy=timers.target

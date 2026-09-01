@@ -30,12 +30,20 @@ pub fn set_max_worktrees(limit: Option<u32>) {
     MAX_WORKTREES.store(limit.unwrap_or(0), Ordering::SeqCst);
 }
 
-/// Number of live worktree directories under `~/.cm/worktrees`.
+/// Number of Git checkout directories under `~/.cm/worktrees`.
+///
+/// A plain directory is not a worktree and must not consume the scheduler's
+/// capacity budget.  In particular, tooling can leave root-level cache
+/// directories here (the 2026-09-01 disk audit found `.pytest_cache`), and the
+/// old directory-only count treated those as live worktrees forever.
 pub fn count_worktrees() -> usize {
     std::fs::read_dir(worktree_base())
         .map(|rd| {
             rd.flatten()
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .filter(|e| {
+                    e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                        && e.path().join(".git").symlink_metadata().is_ok()
+                })
                 .count()
         })
         .unwrap_or(0)
@@ -2382,10 +2390,15 @@ mod tests {
         with_home(|home| {
             let _reset = GuardReset;
             let base = home.join(".cm/worktrees");
-            std::fs::create_dir_all(base.join("existing-one")).unwrap();
+            std::fs::create_dir_all(base.join("existing-one/.git")).unwrap();
+            std::fs::create_dir_all(base.join(".pytest_cache")).unwrap();
 
             set_max_worktrees(Some(1));
-            assert_eq!(count_worktrees(), 1);
+            assert_eq!(
+                count_worktrees(),
+                1,
+                "plain cache directories do not consume worktree capacity",
+            );
 
             // NEW subtask mint at capacity: refused BEFORE any git state is
             // touched (the repo path here doesn't even exist).
