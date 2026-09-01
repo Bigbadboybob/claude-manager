@@ -9,15 +9,16 @@ Policy:
 * hard-protect live sessions/process references, pinned workspaces, and
   continuous tasks;
 * require every associated planning task to be ``done`` or ``archived``;
-* require seven days without task, session, transcript, checkout, reflog, or
-  commit activity;
-* alternatively, reap an unowned checkout only when it is clean, at least 30
-  days inactive, and its changes are provably represented in ``origin/main``;
-* preserve ordinary tracked/untracked changes in a local WIP commit before
-  removing the checkout, while refusing conflicts, likely secrets, oversized
-  untracked files, and meaningful ignored artifacts;
-* preserve every branch ref.  A detached checkout gets a named rescue branch
-  before its WIP commit, so removing the checkout cannot orphan its HEAD.
+* require seven days without checkout-specific session, transcript, reflog, or
+  changed-file activity; task status timestamps and directory mtimes do not
+  count;
+* apply the same seven-day branch-preserving policy to unowned checkouts;
+* discover Claude-native worktrees and inherit terminal-task state through the
+  exact subagent metadata link to their manager parent;
+* preserve ordinary tracked/untracked changes in a local WIP commit and move
+  meaningful ignored outputs into a mode-700 artifact vault;
+* preserve every branch ref. A detached checkout gets a rescue branch, and a
+  standalone clone under the managed root gets a verified Git bundle.
 
 Every apply decision is re-evaluated immediately before removal, serialized
 with a host-local flock, and appended to an audit ledger.
@@ -29,9 +30,11 @@ import argparse
 import dataclasses
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -42,9 +45,9 @@ import tomllib
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Sequence
-
+from typing import Any
 
 DAY = 24 * 60 * 60
 TERMINAL_TASK_STATUSES = {"done", "archived"}
@@ -68,6 +71,14 @@ SAFE_IGNORED_FILES = {
     ".claude/settings.local.json",
     ".coverage",
 }
+DISPOSABLE_IGNORED_PARTS = {
+    ".scratch",
+    "cache",
+    "logs",
+    "scratch",
+}
+DISPOSABLE_IGNORED_SUFFIXES = {".log"}
+PUBLIC_ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template"}
 SENSITIVE_UNTRACKED_NAMES = {
     ".env",
     "credentials",
@@ -122,14 +133,42 @@ class GitFacts:
     origin_url: str | None
     head: str
     branch: str | None
+    standalone_repo: bool
     preserving_refs: tuple[str, ...]
     dirty_entries: tuple[str, ...]
     untracked_entries: tuple[str, ...]
     unmerged_entries: tuple[str, ...]
     unsafe_untracked: tuple[str, ...]
     ignored_entries: tuple[str, ...]
-    meaningful_ignored: tuple[str, ...]
+    ignored_archive: tuple[str, ...]
+    ignored_discard: tuple[str, ...]
+    ignored_blocked: tuple[str, ...]
+    ignored_archive_bytes: int
+    ignored_discard_bytes: int
     activity_at: tuple[float, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeParentLink:
+    parent_worktree: Path
+    metadata_paths: tuple[Path, ...]
+    activity_at: tuple[float, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class ArtifactGcCandidate:
+    path: Path
+    age_days: float
+    size_bytes: int
+    artifact_kind: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "age_days": round(self.age_days, 3),
+            "size_bytes": self.size_bytes,
+            "artifact_kind": self.artifact_kind,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -155,6 +194,14 @@ class Decision:
     workspace_ids: tuple[str, ...] = ()
     task_ids: tuple[str, ...] = ()
     details: tuple[str, ...] = ()
+    worktree_kind: str = "manager"
+    parent_worktree: Path | None = None
+    archive_paths: tuple[str, ...] = ()
+    discard_paths: tuple[str, ...] = ()
+    archive_bytes: int = 0
+    discard_bytes: int = 0
+    size_bytes: int | None = None
+    standalone_repo: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +219,18 @@ class Decision:
             "workspace_ids": list(self.workspace_ids),
             "task_ids": list(self.task_ids),
             "details": list(self.details),
+            "worktree_kind": self.worktree_kind,
+            "parent_worktree": str(self.parent_worktree) if self.parent_worktree else None,
+            "archive_paths": list(self.archive_paths[:100]),
+            "archive_path_count": len(self.archive_paths),
+            "archive_paths_truncated": len(self.archive_paths) > 100,
+            "discard_paths": list(self.discard_paths[:100]),
+            "discard_path_count": len(self.discard_paths),
+            "discard_paths_truncated": len(self.discard_paths) > 100,
+            "archive_bytes": self.archive_bytes,
+            "discard_bytes": self.discard_bytes,
+            "size_bytes": self.size_bytes,
+            "standalone_repo": self.standalone_repo,
         }
 
 
@@ -192,6 +251,10 @@ class ScanContext:
     task_state_available: bool
     session_state_available: bool
     fetch: bool
+    artifact_root: Path = Path("~/.cm/worktree-artifacts")
+    worktree_kind: str = "manager"
+    native_parents: dict[Path, NativeParentLink] = dataclasses.field(default_factory=dict)
+    external_activity: dict[Path, tuple[float, ...]] = dataclasses.field(default_factory=dict)
     fetched_repos: dict[Path, bool] = dataclasses.field(default_factory=dict)
     landed_cache: dict[tuple[Path, str], LandedProof] = dataclasses.field(default_factory=dict)
 
@@ -243,7 +306,7 @@ def parse_timestamp(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = dt.datetime.fromisoformat(value)
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -291,7 +354,9 @@ def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, Workspace
                 if isinstance(task_id, str):
                     current.task_ids.add(task_id)
                 current.continuous = current.continuous or bool(record.get("continuous_task_id"))
-                for key in ("exited_at", "reported_done_at", "created_at", "last_input_at"):
+                # Closure/report timestamps are bookkeeping and are often bulk-updated.
+                # Only timestamps tied to the checkout's actual use belong in its clock.
+                for key in ("created_at", "last_input_at"):
                     stamp = parse_timestamp(record.get(key))
                     if stamp is not None:
                         current.manifest_activity.append(stamp)
@@ -318,7 +383,7 @@ def load_tasks(config_path: Path) -> tuple[dict[str, TaskFacts], bool, str | Non
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.load(response)
         if not isinstance(payload, list):
-            raise RuntimeError("planning API returned a non-list task payload")
+            raise TypeError("planning API returned a non-list task payload")
         tasks: dict[str, TaskFacts] = {}
         for item in payload:
             if not isinstance(item, dict) or not isinstance(item.get("id"), str):
@@ -333,7 +398,7 @@ def load_tasks(config_path: Path) -> tuple[dict[str, TaskFacts], bool, str | Non
                 updated_at=parse_timestamp(item.get("updated_at")),
             )
         return tasks, True, None
-    except Exception as exc:  # fail closed; the caller reports the exact cause
+    except Exception as exc:  # noqa: BLE001 - fail closed and report the exact cause
         return {}, False, f"{type(exc).__name__}: {exc}"
 
 
@@ -369,13 +434,9 @@ def load_live_paths(cm_home: Path) -> tuple[set[Path], bool, str | None]:
         if not response.get("ok"):
             raise RuntimeError(str(response.get("error") or "daemon list_sessions failed"))
         rows = response.get("result") or []
-        paths = {
-            Path(row["worktree_path"]).resolve(strict=False)
-            for row in rows
-            if isinstance(row, dict) and isinstance(row.get("worktree_path"), str)
-        }
+        paths = {Path(row["worktree_path"]).resolve(strict=False) for row in rows if isinstance(row, dict) and isinstance(row.get("worktree_path"), str)}
         return paths, True, None
-    except Exception as exc:  # fail closed; the caller reports the exact cause
+    except Exception as exc:  # noqa: BLE001 - fail closed and report the exact cause
         return set(), False, f"{type(exc).__name__}: {exc}"
 
 
@@ -397,8 +458,7 @@ def process_references(root: Path) -> dict[Path, set[int]]:
                 target = os.readlink(link)
             except OSError:
                 continue
-            if target.endswith(" (deleted)"):
-                target = target[: -len(" (deleted)")]
+            target = target.removesuffix(" (deleted)")
             if not target.startswith(root_text):
                 continue
             relative = target[len(root_text) :]
@@ -427,32 +487,179 @@ def split_nul_paths(output: bytes, *, statuses: set[str] | None = None) -> tuple
     return tuple(entries)
 
 
-def is_safe_ignored(worktree: Path, main_repo: Path, path: str) -> bool:
+def path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def secret_like_path(path: str) -> bool:
+    pure = PurePosixPath(path.rstrip("/"))
+    lowered_parts = tuple(part.lower() for part in pure.parts)
+    name = lowered_parts[-1] if lowered_parts else ""
+    if name in PUBLIC_ENV_TEMPLATE_NAMES:
+        return False
+    return (
+        name in SENSITIVE_UNTRACKED_NAMES
+        or name.startswith(".env.")
+        or any(part in {".ssh", "secrets", "credentials"} for part in lowered_parts)
+        or any(name.endswith(suffix) for suffix in SENSITIVE_UNTRACKED_SUFFIXES)
+    )
+
+
+def path_has_payload(path: Path) -> bool:
+    """Return whether an ignored path owns anything beyond empty directories."""
+    if path.is_symlink() or path.is_file():
+        return True
+    if not path.is_dir():
+        return False
+    try:
+        for current, dirnames, filenames in os.walk(path, followlinks=False):
+            if filenames:
+                return True
+            current_path = Path(current)
+            if any((current_path / dirname).is_symlink() for dirname in dirnames):
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def newest_payload_mtime(path: Path) -> float | None:
+    if path.is_symlink() or path.is_file():
+        try:
+            return path.lstat().st_mtime
+        except OSError:
+            return None
+    newest: float | None = None
+    try:
+        for current, dirnames, filenames in os.walk(path, followlinks=False):
+            current_path = Path(current)
+            for name in filenames:
+                try:
+                    stamp = (current_path / name).lstat().st_mtime
+                except OSError:
+                    continue
+                newest = stamp if newest is None else max(newest, stamp)
+            for name in dirnames:
+                candidate = current_path / name
+                if not candidate.is_symlink():
+                    continue
+                try:
+                    stamp = candidate.lstat().st_mtime
+                except OSError:
+                    continue
+                newest = stamp if newest is None else max(newest, stamp)
+    except OSError:
+        return newest
+    return newest
+
+
+def ignored_path_bytes(path: Path) -> int:
+    result = run(("du", "-sx", "--block-size=1", path), timeout=300)
+    if result.returncode:
+        return 0
+    try:
+        return int(result.text.split()[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+def is_disposable_ignored(path: str) -> bool:
     normalized = path.rstrip("/")
     if normalized in SAFE_IGNORED_FILES:
         return True
-    candidate = worktree / normalized
-    expected_target = main_repo / normalized
-    if candidate.is_symlink():
-        try:
-            return candidate.resolve(strict=False) == expected_target.resolve(strict=False)
-        except OSError:
-            return False
-    parts = PurePosixPath(normalized).parts
+    parts = tuple(part.lower() for part in PurePosixPath(normalized).parts)
     if any(part in SAFE_IGNORED_DIRS for part in parts):
         return True
-    return any(part.endswith(".egg-info") for part in parts)
+    if any(part in DISPOSABLE_IGNORED_PARTS for part in parts):
+        return True
+    name = parts[-1] if parts else ""
+    return any(part.endswith(".egg-info") for part in parts) or any(name.endswith(suffix) for suffix in DISPOSABLE_IGNORED_SUFFIXES)
+
+
+def files_identical(left: Path, right: Path) -> bool:
+    try:
+        if not left.is_file() or not right.is_file() or left.stat().st_size != right.stat().st_size:
+            return False
+        with left.open("rb") as left_handle, right.open("rb") as right_handle:
+            while True:
+                left_chunk = left_handle.read(1024 * 1024)
+                right_chunk = right_handle.read(1024 * 1024)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def classify_ignored(
+    worktree: Path,
+    main_repo: Path,
+    paths: Iterable[str],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], int, int, tuple[float, ...]]:
+    archive: list[str] = []
+    discard: list[str] = []
+    blocked: list[str] = []
+    archive_bytes = 0
+    discard_bytes = 0
+    activity: list[float] = []
+    for raw_path in paths:
+        normalized = raw_path.rstrip("/")
+        pure = PurePosixPath(normalized)
+        if not normalized or pure.is_absolute() or ".." in pure.parts:
+            blocked.append(f"{raw_path} (unsafe ignored path)")
+            continue
+        candidate = worktree.joinpath(*pure.parts)
+        if candidate.is_symlink():
+            try:
+                target = candidate.resolve(strict=False)
+            except OSError:
+                blocked.append(f"{raw_path} (unreadable symlink)")
+                continue
+            if not path_is_within(target, worktree):
+                discard.append(raw_path)
+                continue
+            blocked.append(f"{raw_path} (symlink targets this worktree)")
+            continue
+        if not candidate.exists():
+            blocked.append(f"{raw_path} (ignored path disappeared or is unreadable)")
+            continue
+        if secret_like_path(normalized):
+            canonical = main_repo.joinpath(*pure.parts)
+            if files_identical(candidate, canonical):
+                discard.append(raw_path)
+                continue
+            archive.append(raw_path)
+            archive_bytes += ignored_path_bytes(candidate)
+            stamp = newest_payload_mtime(candidate)
+            if stamp is not None:
+                activity.append(stamp)
+            continue
+        if not path_has_payload(candidate) or is_disposable_ignored(normalized):
+            discard.append(raw_path)
+            continue
+        archive.append(raw_path)
+        archive_bytes += ignored_path_bytes(candidate)
+        stamp = newest_payload_mtime(candidate)
+        if stamp is not None:
+            activity.append(stamp)
+    return (
+        tuple(archive),
+        tuple(discard),
+        tuple(blocked),
+        archive_bytes,
+        discard_bytes,
+        tuple(activity),
+    )
 
 
 def unsafe_untracked_paths(worktree: Path, paths: Iterable[str]) -> tuple[str, ...]:
     unsafe: list[str] = []
     for relative in paths:
-        pure = PurePosixPath(relative)
-        lowered_parts = tuple(part.lower() for part in pure.parts)
-        name = lowered_parts[-1] if lowered_parts else ""
-        sensitive_name = name in SENSITIVE_UNTRACKED_NAMES or name.startswith(".env.")
-        sensitive_path = any(part in {".ssh", "secrets", "credentials"} for part in lowered_parts)
-        sensitive_suffix = any(name.endswith(suffix) for suffix in SENSITIVE_UNTRACKED_SUFFIXES)
         oversized = False
         try:
             candidate = worktree / relative
@@ -460,7 +667,7 @@ def unsafe_untracked_paths(worktree: Path, paths: Iterable[str]) -> tuple[str, .
         except OSError:
             unsafe.append(f"{relative} (unreadable)")
             continue
-        if sensitive_name or sensitive_path or sensitive_suffix:
+        if secret_like_path(relative):
             unsafe.append(f"{relative} (secret-like untracked path)")
         elif oversized:
             unsafe.append(f"{relative} (>50MiB untracked file)")
@@ -492,7 +699,10 @@ def newest_claude_transcript_mtime(path: Path) -> float | None:
     encoded = str(path).replace("/", "-").replace(".", "-")
     transcript_dir = Path.home() / ".claude" / "projects" / encoded
     try:
-        return max((entry.stat().st_mtime for entry in transcript_dir.glob("*.jsonl")), default=None)
+        return max(
+            (entry.stat().st_mtime for entry in transcript_dir.glob("*.jsonl")),
+            default=None,
+        )
     except OSError:
         return None
 
@@ -517,8 +727,7 @@ def inspect_git(path: Path, *, include_worktree_state: bool = True) -> tuple[Git
     if common_path.name != ".git":
         return None, f"unexpected Git common directory {common_path}"
     main_repo = common_path.parent
-    if main_repo.resolve(strict=False) == path.resolve(strict=False):
-        return None, "path is the main checkout"
+    standalone_repo = main_repo.resolve(strict=False) == path.resolve(strict=False)
 
     branch_result = git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
     branch = branch_result.text if branch_result.returncode == 0 and branch_result.text else None
@@ -539,7 +748,12 @@ def inspect_git(path: Path, *, include_worktree_state: bool = True) -> tuple[Git
     unmerged_entries: tuple[str, ...] = ()
     unsafe_untracked: tuple[str, ...] = ()
     ignored_entries: tuple[str, ...] = ()
-    meaningful_ignored: tuple[str, ...] = ()
+    ignored_archive: tuple[str, ...] = ()
+    ignored_discard: tuple[str, ...] = ()
+    ignored_blocked: tuple[str, ...] = ()
+    ignored_archive_bytes = 0
+    ignored_discard_bytes = 0
+    ignored_activity: tuple[float, ...] = ()
     if include_worktree_state:
         dirty_result = git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all")
         untracked_result = git(path, "ls-files", "--others", "--exclude-standard", "-z")
@@ -555,35 +769,40 @@ def inspect_git(path: Path, *, include_worktree_state: bool = True) -> tuple[Git
         if dirty_result.returncode or ignored_result.returncode or untracked_result.returncode or unmerged_result.returncode:
             errors = b"\n".join(
                 result.stderr
-                for result in (dirty_result, ignored_result, untracked_result, unmerged_result)
+                for result in (
+                    dirty_result,
+                    ignored_result,
+                    untracked_result,
+                    unmerged_result,
+                )
                 if result.returncode and result.stderr
             )
             suffix = errors.decode(errors="replace").strip()
-            return None, f"git status failed: {suffix}" if suffix else "git status failed"
+            return (
+                None,
+                f"git status failed: {suffix}" if suffix else "git status failed",
+            )
         dirty_entries = split_nul_paths(dirty_result.stdout)
-        untracked_entries = tuple(
-            raw.decode(errors="replace") for raw in untracked_result.stdout.split(b"\0") if raw
-        )
-        unmerged_entries = tuple(
-            raw.decode(errors="replace") for raw in unmerged_result.stdout.split(b"\0") if raw
-        )
+        untracked_entries = tuple(raw.decode(errors="replace") for raw in untracked_result.stdout.split(b"\0") if raw)
+        unmerged_entries = tuple(raw.decode(errors="replace") for raw in unmerged_result.stdout.split(b"\0") if raw)
         unsafe_untracked = unsafe_untracked_paths(path, untracked_entries)
         ignored_entries = split_nul_paths(ignored_result.stdout, statuses={"!!"})
-        meaningful_ignored = tuple(
-            ignored_path
-            for ignored_path in ignored_entries
-            if not is_safe_ignored(path, main_repo, ignored_path)
+        (
+            ignored_archive,
+            ignored_discard,
+            ignored_blocked,
+            ignored_archive_bytes,
+            ignored_discard_bytes,
+            ignored_activity,
+        ) = classify_ignored(
+            path,
+            main_repo,
+            ignored_entries,
         )
 
     activity: list[float] = []
-    for candidate in (path, path / ".git"):
-        try:
-            activity.append(candidate.stat().st_mtime)
-        except OSError:
-            pass
-    commit_time = git(path, "show", "-s", "--format=%ct", "HEAD")
-    if commit_time.returncode == 0 and commit_time.text.isdigit():
-        activity.append(float(commit_time.text))
+    # Root/.git mtimes are changed by inventory jobs, and HEAD's commit time may
+    # merely be inherited from trunk. Neither proves use of this checkout.
     reflog_time = parse_reflog_epoch(path)
     if reflog_time is not None:
         activity.append(reflog_time)
@@ -594,6 +813,7 @@ def inspect_git(path: Path, *, include_worktree_state: bool = True) -> tuple[Git
         changed_time = worktree_entry_mtime(path, changed_path)
         if changed_time is not None:
             activity.append(changed_time)
+    activity.extend(ignored_activity)
 
     return (
         GitFacts(
@@ -601,13 +821,18 @@ def inspect_git(path: Path, *, include_worktree_state: bool = True) -> tuple[Git
             origin_url=origin_url,
             head=head_result.text,
             branch=branch,
+            standalone_repo=standalone_repo,
             preserving_refs=preserving_refs,
             dirty_entries=dirty_entries,
             untracked_entries=untracked_entries,
             unmerged_entries=unmerged_entries,
             unsafe_untracked=unsafe_untracked,
             ignored_entries=ignored_entries,
-            meaningful_ignored=meaningful_ignored,
+            ignored_archive=ignored_archive,
+            ignored_discard=ignored_discard,
+            ignored_blocked=ignored_blocked,
+            ignored_archive_bytes=ignored_archive_bytes,
+            ignored_discard_bytes=ignored_discard_bytes,
             activity_at=tuple(activity),
         ),
         None,
@@ -706,8 +931,7 @@ def canonical_repo_url(value: str | None) -> str | None:
     if not value:
         return None
     cleaned = value.strip().rstrip("/")
-    if cleaned.endswith(".git"):
-        cleaned = cleaned[:-4]
+    cleaned = cleaned.removesuffix(".git")
     scp_match = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", cleaned)
     if scp_match and "://" not in cleaned:
         return f"{scp_match.group(1).lower()}/{scp_match.group(2).lstrip('/')}"
@@ -735,6 +959,81 @@ def task_facts_for(git_facts: GitFacts, workspace: WorkspaceFacts, ctx: ScanCont
     return list(result.values())
 
 
+def encode_claude_project_path(path: Path) -> str:
+    return str(path.resolve(strict=False)).replace("/", "-").replace(".", "-")
+
+
+def load_native_parent_links(
+    claude_projects: Path,
+    parent_candidates: Iterable[Path],
+) -> tuple[dict[Path, NativeParentLink], set[Path], list[str]]:
+    encoded_candidates: dict[str, list[Path]] = defaultdict(list)
+    for candidate in parent_candidates:
+        resolved = candidate.resolve(strict=False)
+        encoded_candidates[encode_claude_project_path(resolved)].append(resolved)
+    links_by_child: dict[Path, list[tuple[Path, Path, tuple[float, ...]]]] = defaultdict(list)
+    native_roots: set[Path] = set()
+    warnings: list[str] = []
+    try:
+        metadata_paths = claude_projects.glob("*/*/subagents/*.meta.json")
+        for metadata_path in metadata_paths:
+            try:
+                payload = json.loads(metadata_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            raw_child = payload.get("worktreePath")
+            if not payload.get("spawnedWithWorktree") or not isinstance(raw_child, str) or not raw_child:
+                continue
+            child = Path(raw_child).expanduser().resolve(strict=False)
+            native_roots.add(child.parent)
+            project_name = metadata_path.relative_to(claude_projects).parts[0]
+            parents = encoded_candidates.get(project_name, [])
+            if len(parents) != 1:
+                if len(parents) > 1:
+                    warnings.append(f"ambiguous Claude project encoding {project_name}")
+                continue
+            activity: list[float] = []
+            transcript = metadata_path.with_name(metadata_path.name.removesuffix(".meta.json") + ".jsonl")
+            for evidence in (metadata_path, transcript):
+                try:
+                    activity.append(evidence.stat().st_mtime)
+                except OSError:
+                    pass
+            links_by_child[child].append((parents[0], metadata_path, tuple(activity)))
+    except OSError as exc:
+        warnings.append(f"could not scan Claude subagent metadata: {exc}")
+
+    links: dict[Path, NativeParentLink] = {}
+    for child, candidates in links_by_child.items():
+        candidates.sort(key=lambda item: max(item[2], default=0.0), reverse=True)
+        parent = candidates[0][0]
+        matching = [candidate for candidate in candidates if candidate[0] == parent]
+        links[child] = NativeParentLink(
+            parent_worktree=parent,
+            metadata_paths=tuple(candidate[1] for candidate in matching),
+            activity_at=tuple(stamp for candidate in matching for stamp in candidate[2]),
+        )
+    return links, native_roots, warnings
+
+
+def workspace_facts_for_native(
+    manager_workspaces: dict[Path, WorkspaceFacts],
+    links: dict[Path, NativeParentLink],
+) -> dict[Path, WorkspaceFacts]:
+    result = dict(manager_workspaces)
+    for child, link in links.items():
+        parent = manager_workspaces.get(link.parent_worktree, WorkspaceFacts())
+        result[child] = WorkspaceFacts(
+            workspace_ids=set(parent.workspace_ids),
+            task_ids=set(parent.task_ids),
+            pinned=parent.pinned,
+            continuous=parent.continuous,
+            open_workspace=parent.open_workspace,
+            manifest_activity=list(link.activity_at),
+        )
+    return result
+
+
 def decision(
     path: Path,
     ctx: ScanContext,
@@ -746,14 +1045,23 @@ def decision(
     try:
         resolved.relative_to(root)
     except ValueError:
-        return Decision(path, "block", "path_escape", False, details=("outside configured worktree root",))
+        return Decision(
+            path,
+            "block",
+            "path_escape",
+            False,
+            details=("outside configured worktree root",),
+        )
     if path.is_symlink() or not path.is_dir():
         return Decision(path, "block", "unsafe_path", False, details=("not a real directory",))
 
     workspace = ctx.workspaces.get(resolved, WorkspaceFacts())
-    common = {
+    parent_link = ctx.native_parents.get(resolved)
+    common: dict[str, Any] = {
         "workspace_ids": tuple(sorted(workspace.workspace_ids)),
         "task_ids": tuple(sorted(workspace.task_ids)),
+        "worktree_kind": ctx.worktree_kind,
+        "parent_worktree": parent_link.parent_worktree if parent_link else None,
     }
     if workspace.pinned:
         return Decision(path, "protect", "pinned_workspace", False, **common)
@@ -764,48 +1072,45 @@ def decision(
     process_paths = process_references(ctx.root) if refresh_processes else ctx.process_paths
     if resolved in process_paths:
         pids = ",".join(str(pid) for pid in sorted(process_paths[resolved])[:12])
-        return Decision(path, "protect", "live_process_reference", False, details=(f"pids={pids}",), **common)
+        return Decision(
+            path,
+            "protect",
+            "live_process_reference",
+            False,
+            details=(f"pids={pids}",),
+            **common,
+        )
     if not ctx.task_state_available:
         return Decision(path, "protect", "task_state_unavailable", False, **common)
     if not ctx.session_state_available:
         return Decision(path, "protect", "session_state_unavailable", False, **common)
 
     manifest_tasks = [ctx.tasks[task_id] for task_id in workspace.task_ids if task_id in ctx.tasks]
-    missing_task_ids = sorted(task_id for task_id in workspace.task_ids if task_id not in ctx.tasks)
-    if missing_task_ids:
-        return Decision(path, "protect", "associated_task_missing", False, details=tuple(missing_task_ids[:12]), **common)
+    # A deleted planning row must not pin a checkout forever. Keep its id in
+    # provenance and let the branch-preserving unowned policy decide normally.
     if any(task.kind == "continuous" for task in manifest_tasks):
-        detail = tuple(
-            f"{task.task_id}:{task.status}:{task.kind}" for task in manifest_tasks if task.kind == "continuous"
-        )
+        detail = tuple(f"{task.task_id}:{task.status}:{task.kind}" for task in manifest_tasks if task.kind == "continuous")
         return Decision(path, "protect", "continuous_task", False, details=detail, **common)
     nonterminal_manifest_tasks = [task for task in manifest_tasks if task.status not in TERMINAL_TASK_STATUSES]
     if nonterminal_manifest_tasks:
         detail = tuple(f"{task.task_id}:{task.status}:{task.kind}" for task in nonterminal_manifest_tasks)
         return Decision(path, "protect", "task_not_terminal", False, details=detail, **common)
-    known_activity = list(workspace.manifest_activity)
-    known_activity.extend(task.updated_at for task in manifest_tasks if task.updated_at is not None)
-    if manifest_tasks and known_activity:
-        known_age_days = max(0.0, (ctx.now - max(known_activity)) / DAY)
-        if known_age_days < ctx.retention_days:
-            return Decision(
-                path,
-                "wait",
-                "below_retention",
-                False,
-                age_days=known_age_days,
-                threshold_days=ctx.retention_days,
-                **common,
-            )
-
     git_facts, error = inspect_git(path, include_worktree_state=False)
     if git_facts is None:
-        return Decision(path, "block", "git_state_ambiguous", False, details=(error or "unknown Git error",), **common)
+        return Decision(
+            path,
+            "block",
+            "git_state_ambiguous",
+            False,
+            details=(error or "unknown Git error",),
+            **common,
+        )
     common.update(
         {
             "main_repo": git_facts.main_repo,
             "branch": git_facts.branch,
             "head": git_facts.head,
+            "standalone_repo": git_facts.standalone_repo,
         }
     )
     tasks = task_facts_for(git_facts, workspace, ctx)
@@ -823,7 +1128,7 @@ def decision(
             return Decision(path, "protect", "task_not_terminal", False, details=detail, **common)
     activity = list(git_facts.activity_at)
     activity.extend(workspace.manifest_activity)
-    activity.extend(task.updated_at for task in tasks if task.updated_at is not None)
+    activity.extend(ctx.external_activity.get(resolved, ()))
     if not activity:
         return Decision(path, "block", "activity_unknown", False, **common)
     last_activity = max(activity)
@@ -841,41 +1146,99 @@ def decision(
 
     full_git_facts, full_error = inspect_git(path)
     if full_git_facts is None:
-        return Decision(path, "block", "git_state_ambiguous", False, details=(full_error or "unknown Git error",), **common)
+        return Decision(
+            path,
+            "block",
+            "git_state_ambiguous",
+            False,
+            details=(full_error or "unknown Git error",),
+            **common,
+        )
     if (
         full_git_facts.head != git_facts.head
         or full_git_facts.branch != git_facts.branch
         or full_git_facts.main_repo != git_facts.main_repo
+        or full_git_facts.standalone_repo != git_facts.standalone_repo
     ):
         return Decision(path, "protect", "git_state_changed_during_scan", False, **common)
     git_facts = full_git_facts
     full_activity = list(git_facts.activity_at)
     full_activity.extend(workspace.manifest_activity)
-    full_activity.extend(task.updated_at for task in tasks if task.updated_at is not None)
+    full_activity.extend(ctx.external_activity.get(resolved, ()))
     full_age_days = max(0.0, (ctx.now - max(full_activity)) / DAY)
     common["age_days"] = full_age_days
     if full_age_days < threshold:
         return Decision(path, "wait", below_retention_reason, False, **common)
-    if git_facts.meaningful_ignored:
-        return Decision(path, "block", "meaningful_ignored", False, details=git_facts.meaningful_ignored[:12], **common)
+    common.update(
+        {
+            "archive_paths": git_facts.ignored_archive,
+            "discard_paths": git_facts.ignored_discard,
+            "archive_bytes": git_facts.ignored_archive_bytes,
+            "discard_bytes": git_facts.ignored_discard_bytes,
+        }
+    )
+    if git_facts.ignored_blocked:
+        return Decision(
+            path,
+            "block",
+            "unsafe_ignored",
+            False,
+            details=git_facts.ignored_blocked[:12],
+            **common,
+        )
     if git_facts.unmerged_entries:
-        return Decision(path, "block", "unmerged_changes", False, details=git_facts.unmerged_entries[:12], **common)
+        return Decision(
+            path,
+            "block",
+            "unmerged_changes",
+            False,
+            details=git_facts.unmerged_entries[:12],
+            **common,
+        )
     if git_facts.unsafe_untracked:
-        return Decision(path, "block", "unsafe_untracked", False, details=git_facts.unsafe_untracked[:12], **common)
+        return Decision(
+            path,
+            "block",
+            "unsafe_untracked",
+            False,
+            details=git_facts.unsafe_untracked[:12],
+            **common,
+        )
 
     rescue_detail = ("will create rescue branch for detached HEAD",) if git_facts.branch is None else ()
-    if unowned and git_facts.dirty_entries:
-        return Decision(path, "protect", "unowned_dirty", False, details=git_facts.dirty_entries[:12], **common)
+    standalone_detail = ("will preserve standalone repository refs in a verified Git bundle",) if git_facts.standalone_repo else ()
+    archive_detail = (f"will archive {len(git_facts.ignored_archive)} ignored path(s) ({human_bytes(git_facts.ignored_archive_bytes)})",) if git_facts.ignored_archive else ()
+    discard_detail = (f"will discard {len(git_facts.ignored_discard)} regenerable/empty ignored path(s)",) if git_facts.ignored_discard else ()
     proof = landed_proof(ctx, git_facts)
     commit_detail = ("will create WIP commit before removal",) if git_facts.dirty_entries else ()
     common.update({"main_ref": proof.main_ref, "landed_reason": proof.reason})
-    if unowned and not proof.landed:
-        return Decision(path, "protect", "unowned_not_landed", False, **common)
     if unowned:
-        return Decision(path, "reap", "unowned_landed_and_inactive", True, details=rescue_detail, **common)
+        reason = "unowned_inactive_auto_commit" if git_facts.dirty_entries else "unowned_inactive"
+        return Decision(
+            path,
+            "reap",
+            reason,
+            True,
+            details=commit_detail + archive_detail + discard_detail + rescue_detail + standalone_detail,
+            **common,
+        )
     if git_facts.dirty_entries:
-        return Decision(path, "reap", "terminal_inactive_auto_commit", True, details=commit_detail + rescue_detail, **common)
-    return Decision(path, "reap", "terminal_and_inactive", True, details=rescue_detail, **common)
+        return Decision(
+            path,
+            "reap",
+            "terminal_inactive_auto_commit",
+            True,
+            details=commit_detail + archive_detail + discard_detail + rescue_detail + standalone_detail,
+            **common,
+        )
+    return Decision(
+        path,
+        "reap",
+        "terminal_and_inactive",
+        True,
+        details=archive_detail + discard_detail + rescue_detail + standalone_detail,
+        **common,
+    )
 
 
 def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
@@ -900,7 +1263,7 @@ def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
             cm_home=cm_home,
             config_path=args.config.expanduser().resolve(strict=False),
             manifest_paths=manifests,
-            now=args.now if args.now is not None else dt.datetime.now(dt.timezone.utc).timestamp(),
+            now=args.now if args.now is not None else dt.datetime.now(dt.UTC).timestamp(),
             retention_days=args.retention_days,
             unowned_retention_days=args.unowned_retention_days,
             workspaces=workspace_facts,
@@ -911,21 +1274,48 @@ def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
             task_state_available=task_ok,
             session_state_available=sessions_ok,
             fetch=not args.no_fetch,
+            artifact_root=args.artifact_root.expanduser().resolve(strict=False),
         ),
         warnings,
     )
 
 
+def build_scan_contexts(
+    args: argparse.Namespace,
+) -> tuple[list[ScanContext], list[str]]:
+    manager, warnings = build_context(args)
+    manager_paths = worktree_paths(manager.root)
+    parent_candidates = set(manager_paths) | set(manager.workspaces)
+    native_links, discovered_roots, native_warnings = load_native_parent_links(
+        args.claude_projects.expanduser().resolve(strict=False),
+        parent_candidates,
+    )
+    warnings.extend(native_warnings)
+    requested_roots = {path.expanduser().resolve(strict=False) for path in (args.native_root or [])}
+    native_roots = requested_roots | discovered_roots
+    contexts = [manager]
+    native_workspaces = workspace_facts_for_native(manager.workspaces, native_links)
+    for native_root in sorted(native_roots):
+        if native_root == manager.root or not native_root.is_dir():
+            continue
+        contexts.append(
+            dataclasses.replace(
+                manager,
+                root=native_root,
+                workspaces=dict(native_workspaces),
+                process_paths=process_references(native_root),
+                worktree_kind="native",
+                native_parents=dict(native_links),
+                external_activity={child: link.activity_at for child, link in native_links.items()},
+            )
+        )
+    return contexts, warnings
+
+
 def worktree_paths(root: Path) -> list[Path]:
     try:
         return sorted(
-            (
-                entry
-                for entry in root.iterdir()
-                if entry.is_dir()
-                and not entry.is_symlink()
-                and (entry / ".git").exists()
-            ),
+            (entry for entry in root.iterdir() if entry.is_dir() and not entry.is_symlink() and (entry / ".git").exists()),
             key=lambda path: path.name,
         )
     except OSError:
@@ -940,6 +1330,102 @@ def directory_size(path: Path) -> int | None:
         return int(result.text.split()[0])
     except (IndexError, ValueError):
         return None
+
+
+def directory_sizes(paths: Iterable[Path]) -> dict[Path, int]:
+    requested = [path.resolve(strict=False) for path in paths]
+    if not requested:
+        return {}
+    result = run(("du", "-sxl", "--block-size=1", "--", *requested), timeout=1200)
+    if result.returncode:
+        return {}
+    sizes: dict[Path, int] = {}
+    for line in result.text.splitlines():
+        try:
+            raw_size, raw_path = line.split("\t", 1)
+            sizes[Path(raw_path).resolve(strict=False)] = int(raw_size)
+        except (ValueError, OSError):
+            continue
+    return sizes
+
+
+def artifact_gc_candidates(
+    artifact_root: Path,
+    now: float,
+    retention_days: int,
+) -> list[ArtifactGcCandidate]:
+    root = artifact_root.expanduser().resolve(strict=False)
+    if not root.is_dir():
+        return []
+    raw_candidates: list[tuple[Path, float, str]] = []
+    for manifest in root.glob("*/*/*/manifest.json"):
+        archive = manifest.parent
+        if (archive / ".keep").exists():
+            continue
+        stamp: float | None = None
+        try:
+            payload = json.loads(manifest.read_text())
+            stamp = parse_timestamp(payload.get("archived_at"))
+        except (OSError, json.JSONDecodeError):
+            pass
+        if stamp is None:
+            try:
+                stamp = archive.stat().st_mtime
+            except OSError:
+                continue
+        raw_candidates.append((archive, stamp, "ignored_outputs"))
+    for bundle in root.glob("standalone-repositories/*/*.bundle"):
+        if (bundle.parent / f"{bundle.name}.keep").exists():
+            continue
+        try:
+            stamp = bundle.stat().st_mtime
+        except OSError:
+            continue
+        raw_candidates.append((bundle, stamp, "standalone_bundle"))
+    result: list[ArtifactGcCandidate] = []
+    for path, stamp, artifact_kind in raw_candidates:
+        age_days = max(0.0, (now - stamp) / DAY)
+        if age_days < retention_days:
+            continue
+        size = directory_size(path) or 0
+        result.append(ArtifactGcCandidate(path, age_days, size, artifact_kind))
+    return sorted(result, key=lambda item: item.size_bytes, reverse=True)
+
+
+def remove_artifact_candidate(
+    candidate: ArtifactGcCandidate,
+    artifact_root: Path,
+    ledger: Path,
+) -> tuple[bool, str]:
+    root = artifact_root.expanduser().resolve(strict=False)
+    path = candidate.path.resolve(strict=False)
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False, "artifact path escaped configured root"
+    if path == root or path.is_symlink():
+        return False, "refusing broad or symlink artifact target"
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.is_file():
+            path.unlink()
+        else:
+            return False, "artifact target disappeared"
+    except OSError as exc:
+        return False, str(exc)
+    append_ledger(
+        ledger,
+        {
+            "event": "artifact_gc",
+            "path": str(path),
+            "artifact_kind": candidate.artifact_kind,
+            "age_days": candidate.age_days,
+            "bytes_before": candidate.size_bytes,
+            "reaped_at": dt.datetime.now(dt.UTC).isoformat(),
+        },
+    )
+    return True, "expired artifact removed"
 
 
 def human_bytes(value: int | None) -> str:
@@ -961,6 +1447,175 @@ def append_ledger(path: Path, record: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def artifact_inventory(source: Path, relative: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if source.is_symlink():
+        records.append({"path": relative, "type": "symlink", "target": os.readlink(source)})
+        return records
+    if source.is_file():
+        stat = source.stat()
+        records.append(
+            {
+                "path": relative,
+                "type": "file",
+                "bytes": stat.st_size,
+                "sha256": sha256_file(source),
+                "mtime": dt.datetime.fromtimestamp(stat.st_mtime, dt.UTC).isoformat(),
+            }
+        )
+        return records
+    for current, dirnames, filenames in os.walk(source, followlinks=False):
+        current_path = Path(current)
+        for name in sorted(dirnames):
+            candidate = current_path / name
+            if not candidate.is_symlink():
+                continue
+            child_relative = candidate.relative_to(source.parent).as_posix()
+            records.append(
+                {
+                    "path": child_relative,
+                    "type": "symlink",
+                    "target": os.readlink(candidate),
+                }
+            )
+        for name in sorted(filenames):
+            candidate = current_path / name
+            child_relative = candidate.relative_to(source.parent).as_posix()
+            if candidate.is_symlink():
+                records.append(
+                    {
+                        "path": child_relative,
+                        "type": "symlink",
+                        "target": os.readlink(candidate),
+                    }
+                )
+                continue
+            stat = candidate.stat()
+            records.append(
+                {
+                    "path": child_relative,
+                    "type": "file",
+                    "bytes": stat.st_size,
+                    "sha256": sha256_file(candidate),
+                    "mtime": dt.datetime.fromtimestamp(stat.st_mtime, dt.UTC).isoformat(),
+                }
+            )
+    return records
+
+
+def archive_ignored_paths(
+    candidate: Decision,
+    artifact_root: Path,
+) -> tuple[bool, Path | None, str | None]:
+    if not candidate.archive_paths:
+        return True, None, None
+    if candidate.main_repo is None or candidate.head is None:
+        return False, None, "archive plan lacks repository or HEAD provenance"
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    destination_parent = artifact_root.expanduser() / candidate.main_repo.name / candidate.path.name
+    destination_parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(artifact_root.expanduser(), 0o700)
+    os.chmod(destination_parent, 0o700)
+    final = destination_parent / f"{stamp}-{candidate.head[:7]}"
+    suffix = 0
+    while final.exists():
+        suffix += 1
+        final = destination_parent / f"{stamp}-{candidate.head[:7]}-{suffix}"
+    staging = destination_parent / f".{final.name}.partial"
+    staging.mkdir(mode=0o700)
+    inventory: list[dict[str, Any]] = []
+    moved: list[str] = []
+    try:
+        destination_device = staging.stat().st_dev
+        for raw_relative in candidate.archive_paths:
+            relative = PurePosixPath(raw_relative.rstrip("/"))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise RuntimeError(f"unsafe archive path {raw_relative}")
+            source = candidate.path.joinpath(*relative.parts)
+            if not source.exists() and not source.is_symlink():
+                raise RuntimeError(f"archive source disappeared: {raw_relative}")
+            if source.lstat().st_dev != destination_device:
+                raise RuntimeError(f"artifact vault is on another filesystem: {raw_relative}")
+            inventory.extend(artifact_inventory(source, relative.as_posix()))
+            destination = staging / "files" / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, destination)
+            moved.append(raw_relative)
+        manifest = {
+            "archived_at": dt.datetime.now(dt.UTC).isoformat(),
+            "source_worktree": str(candidate.path),
+            "worktree_kind": candidate.worktree_kind,
+            "parent_worktree": str(candidate.parent_worktree) if candidate.parent_worktree else None,
+            "main_repo": str(candidate.main_repo),
+            "branch": candidate.branch,
+            "head": candidate.head,
+            "task_ids": list(candidate.task_ids),
+            "paths": list(candidate.archive_paths),
+            "bytes": candidate.archive_bytes,
+            "inventory": inventory,
+        }
+        manifest_path = staging / "manifest.json"
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(manifest_path, 0o600)
+        os.replace(staging, final)
+        return True, final, None
+    except Exception as exc:  # noqa: BLE001 - leave a recoverable partial archive for any failure
+        recovery = staging if staging.exists() else final
+        return False, recovery, f"{type(exc).__name__}: {exc}; moved={moved}"
+
+
+def archive_standalone_bundle(
+    candidate: Decision,
+    artifact_root: Path,
+) -> tuple[bool, Path | None, str | None]:
+    if not candidate.standalone_repo:
+        return True, None, None
+    if candidate.head is None:
+        return False, None, "standalone repository plan lacks HEAD provenance"
+    destination = artifact_root.expanduser() / "standalone-repositories" / candidate.path.name
+    destination.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(artifact_root.expanduser(), 0o700)
+    os.chmod(destination, 0o700)
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    final = destination / f"{stamp}-{candidate.head[:7]}.bundle"
+    suffix = 0
+    while final.exists():
+        suffix += 1
+        final = destination / f"{stamp}-{candidate.head[:7]}-{suffix}.bundle"
+    staging = destination / f".{final.name}.partial"
+    created = git(candidate.path, "bundle", "create", str(staging), "--all", timeout=1200)
+    if created.returncode:
+        return (
+            False,
+            staging if staging.exists() else None,
+            created.stderr.decode(errors="replace").strip() or "git bundle create failed",
+        )
+    verified = git(candidate.path, "bundle", "verify", str(staging), timeout=1200)
+    if verified.returncode:
+        return (
+            False,
+            staging,
+            verified.stderr.decode(errors="replace").strip() or "git bundle verify failed",
+        )
+    with staging.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.chmod(staging, 0o600)
+    os.replace(staging, final)
+    return True, final, None
+
+
 def refresh_dynamic_state(ctx: ScanContext) -> None:
     tasks, task_ok, _ = load_tasks(ctx.config_path)
     live_paths, sessions_ok, _ = load_live_paths(ctx.cm_home)
@@ -975,11 +1630,12 @@ def refresh_dynamic_state(ctx: ScanContext) -> None:
         ctx.tasks_by_branch = dict(by_branch)
     if sessions_ok:
         ctx.live_paths = live_paths
-    ctx.workspaces = load_workspace_facts(path for path in ctx.manifest_paths if path.is_file())
+    manager_workspaces = load_workspace_facts(path for path in ctx.manifest_paths if path.is_file())
+    ctx.workspaces = workspace_facts_for_native(manager_workspaces, ctx.native_parents) if ctx.worktree_kind == "native" else manager_workspaces
 
 
 def create_rescue_branch(worktree: Path, head: str) -> tuple[bool, str | None, str | None]:
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     base = f"cm-reaper/rescue-{stamp}-{head[:7]}"
     for suffix in range(100):
         branch = base if suffix == 0 else f"{base}-{suffix}"
@@ -1005,12 +1661,20 @@ def preserve_dirty_worktree(worktree: Path, task_ids: tuple[str, ...]) -> tuple[
         return True, branch, None
     add = git(worktree, "add", "-A")
     if add.returncode:
-        return False, branch, add.stderr.decode(errors="replace").strip() or "git add failed"
+        return (
+            False,
+            branch,
+            add.stderr.decode(errors="replace").strip() or "git add failed",
+        )
     staged = git(worktree, "diff", "--cached", "--quiet")
     if staged.returncode not in (0, 1):
-        return False, branch, staged.stderr.decode(errors="replace").strip() or "staged diff check failed"
+        return (
+            False,
+            branch,
+            staged.stderr.decode(errors="replace").strip() or "staged diff check failed",
+        )
     if staged.returncode == 1:
-        stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        stamp = dt.datetime.now(dt.UTC).isoformat()
         body = f"Worktree: {worktree}\nTasks: {','.join(task_ids) or 'none'}\nPreserved-at: {stamp}"
         commit = git(
             worktree,
@@ -1026,12 +1690,20 @@ def preserve_dirty_worktree(worktree: Path, task_ids: tuple[str, ...]) -> tuple[
         )
         if commit.returncode:
             git(worktree, "reset")
-            return False, branch, commit.stderr.decode(errors="replace").strip() or "WIP commit failed"
+            return (
+                False,
+                branch,
+                commit.stderr.decode(errors="replace").strip() or "WIP commit failed",
+            )
     after, after_error = inspect_git(worktree)
     if after is None:
         return False, branch, after_error or "Git post-commit inspection failed"
     if after.dirty_entries:
-        return False, branch, f"worktree still dirty after WIP commit: {', '.join(after.dirty_entries[:8])}"
+        return (
+            False,
+            branch,
+            f"worktree still dirty after WIP commit: {', '.join(after.dirty_entries[:8])}",
+        )
     return True, branch, None
 
 
@@ -1045,35 +1717,84 @@ def reap_one(candidate: Decision, ctx: ScanContext, ledger: Path) -> tuple[bool,
         return False, f"could not preserve changes: {preserve_error}", None
     refresh_dynamic_state(ctx)
     post_preserve = decision(candidate.path, ctx, refresh_processes=True)
-    expected_clock_reset = fresh.reason == "terminal_inactive_auto_commit" or fresh.branch is None
+    expected_clock_reset = fresh.reason in {"terminal_inactive_auto_commit", "unowned_inactive_auto_commit"} or fresh.branch is None
     clock_reset_reasons = {"below_retention", "unowned_below_retention"}
     if not post_preserve.eligible and not (expected_clock_reset and post_preserve.reason in clock_reset_reasons):
         return False, f"post-commit recheck changed to {post_preserve.reason}", None
-    size = directory_size(candidate.path)
-    result = git(post_preserve.main_repo or candidate.path, "worktree", "remove", "--force", str(candidate.path))
-    if result.returncode:
-        return False, result.stderr.decode(errors="replace").strip() or "git worktree remove failed", None
-    git(post_preserve.main_repo or candidate.path, "worktree", "prune")
-    record = post_preserve.as_dict()
+    archived, artifact_path, archive_error = archive_ignored_paths(fresh, ctx.artifact_root)
+    if not archived:
+        return (
+            False,
+            f"could not archive ignored artifacts: {archive_error}; recovery={artifact_path}",
+            None,
+        )
+    refresh_dynamic_state(ctx)
+    post_archive = decision(candidate.path, ctx, refresh_processes=True)
+    if not post_archive.eligible and not (expected_clock_reset and post_archive.reason in clock_reset_reasons):
+        return (
+            False,
+            f"post-archive recheck changed to {post_archive.reason}; artifacts={artifact_path}",
+            None,
+        )
+    bundled, bundle_path, bundle_error = archive_standalone_bundle(fresh, ctx.artifact_root)
+    if not bundled:
+        return (
+            False,
+            f"could not preserve standalone repository: {bundle_error}; recovery={bundle_path}",
+            None,
+        )
+    size = candidate.size_bytes if candidate.size_bytes is not None else directory_size(candidate.path)
+    if fresh.standalone_repo:
+        try:
+            shutil.rmtree(candidate.path)
+        except OSError as exc:
+            return (
+                False,
+                f"standalone checkout removal failed: {exc}; bundle={bundle_path}; artifacts={artifact_path}",
+                None,
+            )
+    else:
+        result = git(
+            post_archive.main_repo or candidate.path,
+            "worktree",
+            "remove",
+            "--force",
+            str(candidate.path),
+        )
+        if result.returncode:
+            suffix = f"; artifacts={artifact_path}" if artifact_path else ""
+            return (
+                False,
+                (result.stderr.decode(errors="replace").strip() or "git worktree remove failed") + suffix,
+                None,
+            )
+        git(post_archive.main_repo or candidate.path, "worktree", "prune")
+    record = fresh.as_dict()
     record.update(
         {
-            "reaped_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "reaped_at": dt.datetime.now(dt.UTC).isoformat(),
             "bytes_before": size,
             "eligibility_reason": fresh.reason,
             "pre_preservation_head": fresh.head,
-            "preservation_commit_created": fresh.reason == "terminal_inactive_auto_commit",
+            "preservation_commit_created": fresh.reason in {"terminal_inactive_auto_commit", "unowned_inactive_auto_commit"},
             "branch_preserved": True,
-            "preserved_branch": preserved_branch or post_preserve.branch,
+            "preserved_branch": preserved_branch or post_archive.branch,
+            "artifact_path": str(artifact_path) if artifact_path else None,
+            "standalone_bundle": str(bundle_path) if bundle_path else None,
         }
     )
     append_ledger(ledger, record)
-    return True, "removed; branch preserved", size
+    artifact_suffix = f"; artifacts archived at {artifact_path}" if artifact_path else ""
+    bundle_suffix = f"; standalone refs bundled at {bundle_path}" if bundle_path else ""
+    return True, f"removed; branch preserved{artifact_suffix}{bundle_suffix}", size
 
 
 def print_human(
     decisions: list[Decision],
     warnings: list[str],
     apply_results: list[dict[str, Any]],
+    artifact_gc: list[ArtifactGcCandidate],
+    artifact_gc_results: list[dict[str, Any]],
     *,
     summary_only: bool = False,
 ) -> None:
@@ -1088,38 +1809,113 @@ def print_human(
     counts: dict[str, int] = defaultdict(int)
     for item in decisions:
         counts[item.reason] += 1
+    eligible = [item for item in decisions if item.eligible]
     print("\nSummary:")
     for reason, count in sorted(counts.items()):
         print(f"  {reason}: {count}")
-    print(f"  eligible: {sum(item.eligible for item in decisions)}")
+    print(f"  eligible: {len(eligible)} ({human_bytes(sum(item.size_bytes or 0 for item in eligible))})")
+    print(f"  planned artifact archive: {human_bytes(sum(item.archive_bytes for item in eligible))}")
+    print(f"  planned ignored discard: {sum(len(item.discard_paths) for item in eligible)} path(s)")
+    print(f"  expired artifacts: {len(artifact_gc)} ({human_bytes(sum(item.size_bytes for item in artifact_gc))})")
     if apply_results:
-        removed = [item for item in apply_results if item["removed"]]
-        reclaimed = sum(item.get("bytes") or 0 for item in removed)
+        removed = [result for result in apply_results if result["removed"]]
+        reclaimed = sum(result.get("bytes") or 0 for result in removed)
         print(f"  removed: {len(removed)} ({human_bytes(reclaimed)})")
-        for item in apply_results:
-            print(f"  {'REMOVED' if item['removed'] else 'SKIPPED'} {item['path']}: {item['message']}")
+        for result in apply_results:
+            print(f"  {'REMOVED' if result['removed'] else 'SKIPPED'} {result['path']}: {result['message']}")
+    if artifact_gc_results:
+        for result in artifact_gc_results:
+            print(f"  {'REMOVED' if result['removed'] else 'SKIPPED'} artifact {result['path']}: {result['message']}")
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--root", type=Path, default=Path("~/.cm/worktrees"), help="managed worktree root")
-    result.add_argument("--cm-home", type=Path, default=Path("~/.cm"), help="claude-manager state directory")
-    result.add_argument("--config", type=Path, default=Path("~/.cm/daemon.toml"), help="daemon config carrying planning API credentials")
+    result.add_argument(
+        "--root",
+        type=Path,
+        default=Path("~/.cm/worktrees"),
+        help="managed worktree root",
+    )
+    result.add_argument(
+        "--native-root",
+        type=Path,
+        action="append",
+        help="Claude-native worktree root; repeatable (metadata-discovered roots are always included)",
+    )
+    result.add_argument(
+        "--claude-projects",
+        type=Path,
+        default=Path("~/.claude/projects"),
+        help="Claude transcript/agent metadata root used to link native children to manager parents",
+    )
+    result.add_argument(
+        "--cm-home",
+        type=Path,
+        default=Path("~/.cm"),
+        help="claude-manager state directory",
+    )
+    result.add_argument(
+        "--config",
+        type=Path,
+        default=Path("~/.cm/daemon.toml"),
+        help="daemon config carrying planning API credentials",
+    )
     result.add_argument("--manifest", type=Path, action="append", help="manifest to include; repeatable")
-    result.add_argument("--retention-days", type=int, default=7, help="retention after every associated task is terminal")
+    result.add_argument(
+        "--retention-days",
+        type=int,
+        default=7,
+        help="retention after every associated task is terminal",
+    )
     result.add_argument(
         "--unowned-retention-days",
         type=int,
-        default=30,
-        help="retention for clean unowned worktrees already represented in main",
+        default=7,
+        help="retention for unowned worktrees; their branch and any safe WIP commit are preserved",
     )
-    result.add_argument("--max-removals", type=int, default=25, help="mass-event cap per apply run")
-    result.add_argument("--apply", action="store_true", help="remove eligible worktrees; default is dry-run")
+    result.add_argument("--max-removals", type=int, default=100, help="mass-event cap per apply run")
+    result.add_argument(
+        "--apply",
+        action="store_true",
+        help="remove eligible worktrees; default is dry-run",
+    )
     result.add_argument("--json", action="store_true", help="emit JSON instead of the human report")
     result.add_argument("--summary-only", action="store_true", help="omit per-worktree dry-run rows")
-    result.add_argument("--no-fetch", action="store_true", help="do not refresh origin refs; intended for tests/offline diagnosis")
-    result.add_argument("--ledger", type=Path, default=Path("~/.cm/worktree-reaper.jsonl"), help="append-only apply audit ledger")
-    result.add_argument("--lock", type=Path, default=Path("~/.cm/worktree-reaper.lock"), help="host-local apply lock")
+    result.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="do not refresh origin refs; intended for tests/offline diagnosis",
+    )
+    result.add_argument(
+        "--ledger",
+        type=Path,
+        default=Path("~/.cm/worktree-reaper.jsonl"),
+        help="append-only apply audit ledger",
+    )
+    result.add_argument(
+        "--artifact-root",
+        type=Path,
+        default=Path("~/.cm/worktree-artifacts"),
+        help="same-filesystem vault for ignored outputs preserved before removal",
+    )
+    result.add_argument(
+        "--artifact-retention-days",
+        type=int,
+        default=30,
+        help="retention for unpinned archived outputs and standalone bundles",
+    )
+    result.add_argument(
+        "--max-artifact-removals",
+        type=int,
+        default=100,
+        help="mass-event cap for expired artifact removal per apply run",
+    )
+    result.add_argument(
+        "--lock",
+        type=Path,
+        default=Path("~/.cm/worktree-reaper.lock"),
+        help="host-local apply lock",
+    )
     result.add_argument("--now", type=float, help=argparse.SUPPRESS)
     return result
 
@@ -1133,21 +1929,64 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser().error("--unowned-retention-days must be positive")
     if args.max_removals < 1:
         parser().error("--max-removals must be positive")
+    if args.artifact_retention_days < 1:
+        parser().error("--artifact-retention-days must be positive")
+    if args.max_artifact_removals < 1:
+        parser().error("--max-artifact-removals must be positive")
 
     lock_path = args.lock.expanduser()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
-        ctx, warnings = build_context(args)
-        decisions = [decision(path, ctx) for path in worktree_paths(ctx.root)]
+        contexts, warnings = build_scan_contexts(args)
+        decision_contexts = [(decision(path, ctx), ctx) for ctx in contexts for path in worktree_paths(ctx.root)]
+        size_by_path = directory_sizes(item.path for item, _ in decision_contexts if item.eligible)
+        decision_contexts = [
+            (
+                dataclasses.replace(item, size_bytes=size_by_path.get(item.path.resolve(strict=False))) if item.eligible else item,
+                ctx,
+            )
+            for item, ctx in decision_contexts
+        ]
+        decisions = [item for item, _ in decision_contexts]
+        artifact_gc = artifact_gc_candidates(
+            args.artifact_root,
+            contexts[0].now,
+            args.artifact_retention_days,
+        )
         apply_results: list[dict[str, Any]] = []
+        artifact_gc_results: list[dict[str, Any]] = []
         if args.apply:
-            for candidate in (item for item in decisions if item.eligible):
+            eligible_with_context = sorted(
+                ((item, ctx) for item, ctx in decision_contexts if item.eligible),
+                key=lambda pair: pair[0].size_bytes or -1,
+                reverse=True,
+            )
+            for candidate, candidate_context in eligible_with_context:
                 if len(apply_results) >= args.max_removals:
                     break
-                removed, message, size = reap_one(candidate, ctx, args.ledger.expanduser())
+                removed, message, size = reap_one(candidate, candidate_context, args.ledger.expanduser())
                 apply_results.append(
-                    {"path": str(candidate.path), "removed": removed, "message": message, "bytes": size}
+                    {
+                        "path": str(candidate.path),
+                        "removed": removed,
+                        "message": message,
+                        "bytes": size,
+                    }
+                )
+            for artifact in artifact_gc[: args.max_artifact_removals]:
+                removed, message = remove_artifact_candidate(
+                    artifact,
+                    args.artifact_root,
+                    args.ledger.expanduser(),
+                )
+                artifact_gc_results.append(
+                    {
+                        "path": str(artifact.path),
+                        "removed": removed,
+                        "message": message,
+                        "bytes": artifact.size_bytes,
+                    }
                 )
 
     if args.json:
@@ -1159,20 +1998,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "retention_days": args.retention_days,
                         "unowned_retention_days": args.unowned_retention_days,
                         "terminal_statuses": sorted(TERMINAL_TASK_STATUSES),
+                        "roots": [str(ctx.root) for ctx in contexts],
+                        "artifact_root": str(args.artifact_root.expanduser().resolve(strict=False)),
+                        "artifact_retention_days": args.artifact_retention_days,
                     },
                     "warnings": warnings,
                     "decisions": [item.as_dict() for item in decisions],
                     "apply_results": apply_results,
+                    "artifact_gc": [item.as_dict() for item in artifact_gc],
+                    "artifact_gc_results": artifact_gc_results,
                 },
                 indent=2,
                 sort_keys=True,
             )
         )
     else:
-        print_human(decisions, warnings, apply_results, summary_only=args.summary_only)
+        print_human(
+            decisions,
+            warnings,
+            apply_results,
+            artifact_gc,
+            artifact_gc_results,
+            summary_only=args.summary_only,
+        )
     if args.apply and warnings:
         return 2
-    return 1 if args.apply and any(not item["removed"] for item in apply_results) else 0
+    all_apply_results = apply_results + artifact_gc_results
+    return 1 if args.apply and any(not item["removed"] for item in all_apply_results) else 0
 
 
 if __name__ == "__main__":

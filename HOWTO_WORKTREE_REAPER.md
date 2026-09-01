@@ -1,25 +1,29 @@
 # Worktree reaper
 
-`scripts/worktree_reaper.py` removes old claude-manager checkout directories while preserving Git branches. It is dry-run by default. The installed daily service uses a seven-day terminal-task tier, a 30-day clean-and-landed unowned tier, and an apply-time mass-event cap of 25 removals.
+`scripts/worktree_reaper.py` removes old claude-manager and Claude-native checkout directories while preserving Git branches and ignored outputs. It is dry-run by default. The daily policy is seven days for both task-owned and unowned checkouts, with an apply-time mass-event cap of 100 removals. Eligible candidates are measured and processed largest-first.
 
 ## Eligibility
 
 A task-owned checkout is eligible only when all of the following are true:
 
 - every task associated through a workspace binding or the task's `wip_branch` is `done` or `archived`;
-- at least seven days have elapsed since the newest task update, session/manifest event, Claude transcript, checkout/reflog/HEAD activity, or tracked/untracked changed-path mtime;
+- at least seven days have elapsed since the newest checkout-specific session input, Claude transcript, reflog event, tracked/untracked changed-path mtime, or meaningful ignored-output mtime;
 - no live daemon session or local process references the checkout;
 - the workspace is neither pinned nor continuous;
 - the planning API and daemon session inventory are both available;
-- Git reports no merge conflicts, secret-like or oversized untracked files, or meaningful ignored artifacts.
+- Git reports no merge conflicts or unsafe oversized/secret-like untracked files.
 
-An unowned checkout—one with neither an exact workspace binding nor a repository-scoped `wip_branch` match—uses the same hard safety gates but is eligible only after 30 days of inactivity, only when completely clean, and only when a fresh fetch proves its HEAD/tree/patch is represented in `origin/main`. Dirty or unlanded unowned worktrees are never auto-committed or removed.
+Task `updated_at`, task closure/report timestamps, the checkout root mtime, the `.git` pointer mtime, and the inherited HEAD commit timestamp do not count as activity. Inventory jobs, bulk task updates, and a recent trunk commit therefore cannot reset hundreds of retention clocks.
+
+An unowned checkout—one with neither an exact workspace binding nor a repository-scoped `wip_branch` match—uses the same seven-day policy and hard runtime gates. Its existing branch is retained, safe dirty changes receive a WIP commit, and detached HEADs receive a rescue branch. Whether its commits are represented in `origin/main` remains audit information, not an eligibility gate, because deleting a worktree never deletes its branch.
+
+Claude-native children are discovered from `~/.claude/projects/*/*/subagents/*.meta.json`. `worktreePath` identifies the child and the containing encoded project directory identifies its manager parent. An exactly linked child inherits the parent's task ids, pin/continuous state, and terminal-task requirement. The child's own transcript and Git state drive its activity clock; a live process or daemon session protects only the checkout it actually references. Metadata-discovered native roots are scanned automatically, and `--native-root` adds explicit roots for custom/workflow worktrees.
 
 Exact workspace/task bindings are authoritative. The fallback `wip_branch` association is accepted only when both the branch name and canonical repository URL match; branch names alone are not globally unique across projects.
 
-Ordinary tracked and untracked changes are staged and committed on the existing branch immediately before removal. A detached checkout first receives a `cm-reaper/rescue-...` branch. Branch refs are never deleted. Canonical provisioning symlinks such as a worktree `.env` pointing back to the primary checkout are safe because removal deletes only the symlink; a real ignored dataset, log tree, or credential file blocks removal. Every candidate is fully re-evaluated after acquiring the host lock and again after any preservation commit.
+Ordinary tracked and untracked changes are staged and committed on the existing branch immediately before removal. A detached checkout first receives a `cm-reaper/rescue-...` branch. Branch refs are never deleted. Empty ignored directories, external provisioning symlinks, caches, logs, scratch trees, and canonical secret copies are discarded with the checkout. Other ignored payloads—including divergent secret copies and analysis outputs—move atomically to `~/.cm/worktree-artifacts/` before removal; the mode-700 vault records task/branch/HEAD provenance and a per-file SHA-256 manifest. Unpinned archives expire after 30 days by default; place `.keep` inside an ignored-output archive (or `<bundle>.keep` beside a standalone bundle) to retain it. Every candidate is fully re-evaluated after acquiring the host lock, after any preservation commit, and after artifact archival.
 
-For a task-owned checkout, the script computes whether its commits are represented in `origin/main` for audit information only: terminal task state is the owner's completion signal, and the preserved branch is the recovery path for unmerged work. For an unowned checkout, the landed proof is mandatory because no task completion signal exists.
+A standalone Git clone accidentally created beneath the managed worktree root is eligible under the same policy. Before removal, all repository refs are captured in a verified Git bundle under the artifact vault. This is distinct from an ordinary registered worktree, whose refs already live in the primary repository.
 
 ## Commands and recovery
 
@@ -30,13 +34,16 @@ python3 scripts/worktree_reaper.py
 # Compact dry run
 python3 scripts/worktree_reaper.py --summary-only
 
-# Apply at most the default 25 removals
+# Include an explicit native root in addition to metadata discovery
+python3 scripts/worktree_reaper.py --native-root ~/code/projects/predictionTrading/.claude/worktrees --summary-only
+
+# Apply at most the default 100 removals, largest first
 python3 scripts/worktree_reaper.py --apply --summary-only
 ```
 
-Apply records are appended to `~/.cm/worktree-reaper.jsonl`. To resume work after a checkout is removed, start the task again through claude-manager; the existing worktree self-heal reattaches the preserved task branch. Manual recovery is also ordinary Git: `git worktree add <path> <preserved-branch>`.
+Apply records are appended to `~/.cm/worktree-reaper.jsonl`. To resume work after a checkout is removed, start the task again through claude-manager; the existing worktree self-heal reattaches the preserved task branch. Manual recovery is also ordinary Git: `git worktree add <path> <preserved-branch>`. Ignored outputs are recoverable from the ledger's `artifact_path`; standalone clones are recoverable from `standalone_bundle`.
 
-The deployed `cm-worktree-reaper.timer` runs daily between 12:55 and 13:05 UTC, ahead of the 13:15 UTC disk alert. A host without passwordless system-unit installation can run the same command from the user's crontab at 12:55 UTC. Scheduled runs fetch each candidate repository's origin once; a failed fetch makes the unowned tier fail closed.
+The deployed `cm-worktree-reaper.timer` runs daily between 12:55 and 13:05 UTC, ahead of the 13:15 UTC disk alert. A host without passwordless system-unit installation can run the same command from the user's crontab at 12:55 UTC. Scheduled runs fetch each candidate repository's origin once so the audit ledger can record landed status; a failed fetch is reported but does not endanger branch preservation.
 
 ## Installation
 
