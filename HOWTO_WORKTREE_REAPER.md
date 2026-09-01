@@ -36,7 +36,7 @@ python3 scripts/worktree_reaper.py --apply --summary-only
 
 Apply records are appended to `~/.cm/worktree-reaper.jsonl`. To resume work after a checkout is removed, start the task again through claude-manager; the existing worktree self-heal reattaches the preserved task branch. Manual recovery is also ordinary Git: `git worktree add <path> <preserved-branch>`.
 
-The deployed `cm-worktree-reaper.timer` runs daily between 12:55 and 13:05 UTC, ahead of the 13:15 UTC disk alert. The service uses `--no-fetch`; this only makes the audit-only landed proof rely on the locally cached `origin/main` ref and does not weaken an eligibility gate.
+The deployed `cm-worktree-reaper.timer` runs daily between 12:55 and 13:05 UTC, ahead of the 13:15 UTC disk alert. A host without passwordless system-unit installation can run the same command from the user's crontab at 12:55 UTC. Both scheduled forms use `--no-fetch`; this only makes the audit-only landed proof rely on the locally cached `origin/main` ref and does not weaken an eligibility gate.
 
 ## Installation
 
@@ -44,4 +44,10 @@ Install the script and system units on each host, then enable the timer:
 
 ```bash
 sudo install -D -m 0755 scripts/worktree_reaper.py /home/lucas/.local/libexec/cm-worktree-reaper && sudo install -m 0644 deploy/cm-worktree-reaper.service deploy/cm-worktree-reaper.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now cm-worktree-reaper.timer
+```
+
+User-cron fallback (install the script without `sudo`, preserve the existing crontab, then add this line once):
+
+```text
+55 12 * * * /usr/bin/python3 /home/lucas/.local/libexec/cm-worktree-reaper --apply --no-fetch --summary-only 2>&1 | /usr/bin/logger -t cm-worktree-reaper
 ```
