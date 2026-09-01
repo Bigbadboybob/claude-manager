@@ -1,0 +1,15 @@
+[Unit]
+Description=Safely reap inactive terminal claude-manager worktrees
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/lucas/.local/libexec/cm-worktree-reaper
+
+[Service]
+Type=oneshot
+User=lucas
+Environment=HOME=/home/lucas
+ExecStart=/usr/bin/python3 /home/lucas/.local/libexec/cm-worktree-reaper --apply --no-fetch --summary-only
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+UMask=0077
