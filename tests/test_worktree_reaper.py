@@ -25,7 +25,15 @@ class WorktreeReaperTests(unittest.TestCase):
         self.git(self.main_repo, "add", ".gitignore", "NOTES.md")
         self.git(self.main_repo, "commit", "-m", "base")
         self.git(self.main_repo, "update-ref", "refs/remotes/origin/main", "HEAD")
-        self.git(self.main_repo, "worktree", "add", "-b", "feature", str(self.worktree), "main")
+        self.git(
+            self.main_repo,
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            str(self.worktree),
+            "main",
+        )
         self.now = time.time() + 10 * reaper.DAY
 
     def tearDown(self) -> None:
@@ -83,6 +91,18 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertFalse(unowned.eligible)
         self.assertEqual(unowned.reason, "unowned_below_retention")
 
+    def test_missing_task_row_falls_back_to_unowned_policy(self) -> None:
+        context = self.context()
+        context.tasks = {}
+        context.tasks_by_branch = {}
+        context.unowned_retention_days = 7
+
+        result = reaper.decision(self.worktree, context)
+
+        self.assertTrue(result.eligible)
+        self.assertEqual(result.reason, "unowned_inactive")
+        self.assertEqual(result.task_ids, ("task-1",))
+
     def test_branch_fallback_requires_same_repository(self) -> None:
         context = self.context(task_owned=False)
         unrelated = reaper.TaskFacts(
@@ -107,12 +127,14 @@ class WorktreeReaperTests(unittest.TestCase):
         matched = reaper.decision(self.worktree, context)
         self.assertTrue(matched.eligible)
 
-    def test_old_clean_unowned_worktree_must_be_landed(self) -> None:
+    def test_old_clean_unowned_worktree_preserves_branch_even_when_not_landed(
+        self,
+    ) -> None:
         context = self.context(task_owned=False)
         context.now += 25 * reaper.DAY
         landed = reaper.decision(self.worktree, context)
         self.assertTrue(landed.eligible)
-        self.assertEqual(landed.reason, "unowned_landed_and_inactive")
+        self.assertEqual(landed.reason, "unowned_inactive")
         self.assertEqual(landed.landed_reason, "head_is_ancestor")
 
         (self.worktree / "NOTES.md").write_text("unowned change\n")
@@ -120,10 +142,11 @@ class WorktreeReaperTests(unittest.TestCase):
         self.git(self.worktree, "commit", "-m", "unlanded")
         context.now += reaper.DAY
         unlanded = reaper.decision(self.worktree, context)
-        self.assertFalse(unlanded.eligible)
-        self.assertEqual(unlanded.reason, "unowned_not_landed")
+        self.assertTrue(unlanded.eligible)
+        self.assertEqual(unlanded.reason, "unowned_inactive")
+        self.assertEqual(unlanded.landed_reason, "branch_changes_not_proven_in_main")
 
-    def test_old_dirty_unowned_worktree_is_never_auto_committed(self) -> None:
+    def test_old_dirty_unowned_worktree_gets_preservation_commit(self) -> None:
         context = self.context(task_owned=False)
         context.now += 25 * reaper.DAY
         (self.worktree / "NOTES.md").write_text("unfinished unowned work\n")
@@ -131,20 +154,26 @@ class WorktreeReaperTests(unittest.TestCase):
         reaper.os.utime(self.worktree / "NOTES.md", (old, old))
 
         result = reaper.decision(self.worktree, context)
-        self.assertFalse(result.eligible)
-        self.assertEqual(result.reason, "unowned_dirty")
+        self.assertTrue(result.eligible)
+        self.assertEqual(result.reason, "unowned_inactive_auto_commit")
 
-    def test_unowned_landed_gate_fails_closed_when_origin_fetch_fails(self) -> None:
+    def test_unowned_fetch_failure_is_reported_but_branch_is_still_preserved(
+        self,
+    ) -> None:
         context = self.context(task_owned=False)
         context.now += 25 * reaper.DAY
         context.fetch = True
 
         result = reaper.decision(self.worktree, context)
-        self.assertFalse(result.eligible)
-        self.assertEqual(result.reason, "unowned_not_landed")
+        self.assertTrue(result.eligible)
+        self.assertEqual(result.reason, "unowned_inactive")
+        self.assertIsNotNone(result.landed_reason)
+        assert result.landed_reason is not None
         self.assertIn("origin fetch failed", result.landed_reason)
 
-    def test_canonical_ignored_symlink_is_safe_but_real_ignored_data_is_not(self) -> None:
+    def test_external_ignored_symlink_is_safe_and_real_ignored_data_is_archived(
+        self,
+    ) -> None:
         canonical_env = self.main_repo / ".env"
         canonical_env.write_text("test-only\n")
         (self.worktree / ".env").symlink_to(canonical_env)
@@ -154,10 +183,128 @@ class WorktreeReaperTests(unittest.TestCase):
         data = self.worktree / "data"
         data.mkdir()
         (data / "unique.txt").write_text("unique\n")
-        blocked = reaper.decision(self.worktree, self.context())
-        self.assertFalse(blocked.eligible)
-        self.assertEqual(blocked.reason, "meaningful_ignored")
-        self.assertIn("data/", blocked.details)
+        planned = reaper.decision(self.worktree, self.context())
+        self.assertTrue(planned.eligible)
+        self.assertEqual(planned.archive_paths, ("data/",))
+        self.assertGreater(planned.archive_bytes, 0)
+
+    def test_empty_ignored_directory_is_discardable(self) -> None:
+        (self.worktree / "data").mkdir()
+        result = reaper.decision(self.worktree, self.context())
+        self.assertTrue(result.eligible)
+        self.assertEqual(result.archive_paths, ())
+        self.assertEqual(result.discard_paths, ("data/",))
+
+    def test_divergent_secret_like_ignored_file_is_archived_securely(self) -> None:
+        (self.worktree / ".env").write_text("test-only\n")
+        result = reaper.decision(self.worktree, self.context())
+        self.assertTrue(result.eligible)
+        self.assertEqual(result.archive_paths, (".env",))
+
+    def test_canonical_secret_copy_is_discardable(self) -> None:
+        (self.main_repo / ".env").write_text("same-test-value\n")
+        (self.worktree / ".env").write_text("same-test-value\n")
+        result = reaper.decision(self.worktree, self.context())
+        self.assertTrue(result.eligible)
+        self.assertEqual(result.archive_paths, ())
+        self.assertEqual(result.discard_paths, (".env",))
+
+    def test_public_env_template_is_safe_to_auto_commit(self) -> None:
+        (self.worktree / ".env.template").write_text("NAME=\n")
+        result = reaper.decision(self.worktree, self.context())
+        self.assertTrue(result.eligible)
+        self.assertEqual(result.reason, "terminal_inactive_auto_commit")
+
+    def test_ignored_artifact_is_moved_to_vault_with_manifest(self) -> None:
+        data = self.worktree / "data"
+        data.mkdir()
+        (data / "unique.txt").write_text("unique\n")
+        candidate = reaper.decision(self.worktree, self.context())
+        vault = self.base / "artifacts"
+
+        ok, archived, error = reaper.archive_ignored_paths(candidate, vault)
+
+        self.assertTrue(ok, error)
+        self.assertIsNotNone(archived)
+        assert archived is not None
+        self.assertFalse(data.exists())
+        self.assertEqual((archived / "files" / "data" / "unique.txt").read_text(), "unique\n")
+        manifest = reaper.json.loads((archived / "manifest.json").read_text())
+        self.assertEqual(manifest["source_worktree"], str(self.worktree))
+        self.assertEqual(manifest["paths"], ["data/"])
+        self.assertEqual(len(manifest["inventory"]), 1)
+
+    def test_artifact_gc_plans_old_unpinned_archives_only(self) -> None:
+        root = self.base / "artifacts"
+        old = root / "repo" / "tree" / "old"
+        old.mkdir(parents=True)
+        (old / "payload").write_text("old\n")
+        (old / "manifest.json").write_text(reaper.json.dumps({"archived_at": "2026-01-01T00:00:00+00:00"}))
+        pinned = root / "repo" / "tree" / "pinned"
+        pinned.mkdir()
+        (pinned / "manifest.json").write_text(reaper.json.dumps({"archived_at": "2026-01-01T00:00:00+00:00"}))
+        (pinned / ".keep").write_text("")
+        recent = root / "repo" / "tree" / "recent"
+        recent.mkdir()
+        (recent / "manifest.json").write_text(reaper.json.dumps({"archived_at": "2026-08-25T00:00:00+00:00"}))
+        now = reaper.dt.datetime(2026, 9, 1, tzinfo=reaper.dt.timezone.utc).timestamp()
+
+        candidates = reaper.artifact_gc_candidates(root, now, 30)
+
+        self.assertEqual([candidate.path for candidate in candidates], [old.resolve()])
+        self.assertGreater(candidates[0].size_bytes, 0)
+
+    def test_task_status_timestamp_and_root_mtime_do_not_reset_activity(self) -> None:
+        context = self.context()
+        context.tasks["task-1"] = reaper.dataclasses.replace(context.tasks["task-1"], updated_at=context.now)
+        context.tasks_by_branch["feature"] = [context.tasks["task-1"]]
+        reaper.os.utime(self.worktree, (context.now, context.now))
+
+        result = reaper.decision(self.worktree, context)
+
+        self.assertTrue(result.eligible)
+
+    def test_native_metadata_links_child_to_parent_and_carries_activity(self) -> None:
+        projects = self.base / "claude" / "projects"
+        parent = self.base / "cm" / "worktrees" / "parent"
+        metadata_dir = projects / reaper.encode_claude_project_path(parent) / "session-1" / "subagents"
+        metadata_dir.mkdir(parents=True)
+        metadata = metadata_dir / "agent-a.meta.json"
+        metadata.write_text(
+            reaper.json.dumps(
+                {
+                    "spawnedWithWorktree": True,
+                    "worktreePath": str(self.worktree),
+                }
+            )
+        )
+        transcript = metadata_dir / "agent-a.jsonl"
+        transcript.write_text("{}\n")
+
+        links, roots, warnings = reaper.load_native_parent_links(projects, [parent])
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(roots, {self.worktree.parent.resolve()})
+        self.assertEqual(links[self.worktree.resolve()].parent_worktree, parent.resolve())
+        self.assertEqual(len(links[self.worktree.resolve()].activity_at), 2)
+
+    def test_standalone_repo_under_managed_root_gets_verified_bundle_plan(self) -> None:
+        standalone = self.root / "standalone"
+        self.git(self.base, "clone", str(self.main_repo), str(standalone))
+        context = self.context(task_owned=False)
+        context.now += 25 * reaper.DAY
+        context.workspaces = {standalone.resolve(): reaper.WorkspaceFacts()}
+
+        candidate = reaper.decision(standalone, context)
+
+        self.assertTrue(candidate.eligible)
+        self.assertTrue(candidate.standalone_repo)
+        vault = self.base / "artifacts"
+        ok, bundle, error = reaper.archive_standalone_bundle(candidate, vault)
+        self.assertTrue(ok, error)
+        self.assertIsNotNone(bundle)
+        verify = self.git(standalone, "bundle", "verify", str(bundle))
+        self.assertEqual(verify.returncode, 0)
 
     def test_secret_like_untracked_file_blocks_auto_commit(self) -> None:
         (self.worktree / "private.pem").write_text("not-a-real-key\n")
@@ -194,6 +341,8 @@ class WorktreeReaperTests(unittest.TestCase):
         result = reaper.decision(self.worktree, context)
         self.assertFalse(result.eligible)
         self.assertEqual(result.reason, "below_retention")
+        self.assertIsNotNone(result.age_days)
+        assert result.age_days is not None
         self.assertLess(result.age_days, 1 / 24)
 
     def test_detached_head_gets_rescue_branch(self) -> None:
@@ -201,6 +350,7 @@ class WorktreeReaperTests(unittest.TestCase):
         ok, branch, error = reaper.preserve_dirty_worktree(self.worktree, ("task-1",))
         self.assertTrue(ok, error)
         self.assertIsNotNone(branch)
+        assert branch is not None
         self.assertTrue(branch.startswith("cm-reaper/rescue-"))
         self.git(self.worktree, "show-ref", "--verify", f"refs/heads/{branch}")
 
