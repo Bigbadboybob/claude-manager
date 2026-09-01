@@ -1,10 +1,10 @@
 # Worktree reaper
 
-`scripts/worktree_reaper.py` removes old claude-manager checkout directories while preserving Git branches. It is dry-run by default. The installed daily service uses a seven-day retention window and an apply-time mass-event cap of 25 removals.
+`scripts/worktree_reaper.py` removes old claude-manager checkout directories while preserving Git branches. It is dry-run by default. The installed daily service uses a seven-day terminal-task tier, a 30-day clean-and-landed unowned tier, and an apply-time mass-event cap of 25 removals.
 
 ## Eligibility
 
-A checkout is eligible only when all of the following are true:
+A task-owned checkout is eligible only when all of the following are true:
 
 - every task associated through a workspace binding or the task's `wip_branch` is `done` or `archived`;
 - at least seven days have elapsed since the newest task update, session/manifest event, Claude transcript, checkout/reflog/HEAD activity, or tracked/untracked changed-path mtime;
@@ -13,13 +13,13 @@ A checkout is eligible only when all of the following are true:
 - the planning API and daemon session inventory are both available;
 - Git reports no merge conflicts, secret-like or oversized untracked files, or meaningful ignored artifacts.
 
+An unowned checkout—one with neither an exact workspace binding nor a repository-scoped `wip_branch` match—uses the same hard safety gates but is eligible only after 30 days of inactivity, only when completely clean, and only when a fresh fetch proves its HEAD/tree/patch is represented in `origin/main`. Dirty or unlanded unowned worktrees are never auto-committed or removed.
+
 Exact workspace/task bindings are authoritative. The fallback `wip_branch` association is accepted only when both the branch name and canonical repository URL match; branch names alone are not globally unique across projects.
 
 Ordinary tracked and untracked changes are staged and committed on the existing branch immediately before removal. A detached checkout first receives a `cm-reaper/rescue-...` branch. Branch refs are never deleted. Canonical provisioning symlinks such as a worktree `.env` pointing back to the primary checkout are safe because removal deletes only the symlink; a real ignored dataset, log tree, or credential file blocks removal. Every candidate is fully re-evaluated after acquiring the host lock and again after any preservation commit.
 
-The script computes whether the checkout's commits are already represented in `origin/main` for audit information, but that is not an eligibility requirement. Task terminality is the owner's completion signal, and the preserved branch is the recovery path for unmerged work.
-
-Worktrees with no task association fail closed as `unowned_worktree`. This deliberately leaves true orphans for an explicit later policy decision instead of guessing that an absent binding means finished work.
+For a task-owned checkout, the script computes whether its commits are represented in `origin/main` for audit information only: terminal task state is the owner's completion signal, and the preserved branch is the recovery path for unmerged work. For an unowned checkout, the landed proof is mandatory because no task completion signal exists.
 
 ## Commands and recovery
 
@@ -36,7 +36,7 @@ python3 scripts/worktree_reaper.py --apply --summary-only
 
 Apply records are appended to `~/.cm/worktree-reaper.jsonl`. To resume work after a checkout is removed, start the task again through claude-manager; the existing worktree self-heal reattaches the preserved task branch. Manual recovery is also ordinary Git: `git worktree add <path> <preserved-branch>`.
 
-The deployed `cm-worktree-reaper.timer` runs daily between 12:55 and 13:05 UTC, ahead of the 13:15 UTC disk alert. A host without passwordless system-unit installation can run the same command from the user's crontab at 12:55 UTC. Both scheduled forms use `--no-fetch`; this only makes the audit-only landed proof rely on the locally cached `origin/main` ref and does not weaken an eligibility gate.
+The deployed `cm-worktree-reaper.timer` runs daily between 12:55 and 13:05 UTC, ahead of the 13:15 UTC disk alert. A host without passwordless system-unit installation can run the same command from the user's crontab at 12:55 UTC. Scheduled runs fetch each candidate repository's origin once; a failed fetch makes the unowned tier fail closed.
 
 ## Installation
 
@@ -49,5 +49,5 @@ sudo install -D -m 0755 scripts/worktree_reaper.py /home/lucas/.local/libexec/cm
 User-cron fallback (install the script without `sudo`, preserve the existing crontab, then add this line once):
 
 ```text
-55 12 * * * /usr/bin/python3 /home/lucas/.local/libexec/cm-worktree-reaper --apply --no-fetch --summary-only 2>&1 | /usr/bin/logger -t cm-worktree-reaper
+55 12 * * * /usr/bin/python3 /home/lucas/.local/libexec/cm-worktree-reaper --apply --summary-only 2>&1 | /usr/bin/logger -t cm-worktree-reaper
 ```

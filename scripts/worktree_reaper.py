@@ -11,6 +11,8 @@ Policy:
 * require every associated planning task to be ``done`` or ``archived``;
 * require seven days without task, session, transcript, checkout, reflog, or
   commit activity;
+* alternatively, reap an unowned checkout only when it is clean, at least 30
+  days inactive, and its changes are provably represented in ``origin/main``;
 * preserve ordinary tracked/untracked changes in a local WIP commit before
   removing the checkout, while refusing conflicts, likely secrets, oversized
   untracked files, and meaningful ignored artifacts;
@@ -181,6 +183,7 @@ class ScanContext:
     manifest_paths: tuple[Path, ...]
     now: float
     retention_days: int
+    unowned_retention_days: int
     workspaces: dict[Path, WorkspaceFacts]
     tasks: dict[str, TaskFacts]
     tasks_by_branch: dict[str, list[TaskFacts]]
@@ -809,15 +812,15 @@ def decision(
     all_task_ids = set(workspace.task_ids)
     all_task_ids.update(task.task_id for task in tasks)
     common["task_ids"] = tuple(sorted(all_task_ids))
-    if not tasks:
-        return Decision(path, "protect", "unowned_worktree", False, **common)
-    if any(task.kind == "continuous" for task in tasks):
-        detail = tuple(f"{task.task_id}:{task.status}:{task.kind}" for task in tasks if task.kind == "continuous")
-        return Decision(path, "protect", "continuous_task", False, details=detail, **common)
-    nonterminal_tasks = [task for task in tasks if task.status not in TERMINAL_TASK_STATUSES]
-    if nonterminal_tasks:
-        detail = tuple(f"{task.task_id}:{task.status}:{task.kind}" for task in nonterminal_tasks)
-        return Decision(path, "protect", "task_not_terminal", False, details=detail, **common)
+    unowned = not tasks
+    if not unowned:
+        if any(task.kind == "continuous" for task in tasks):
+            detail = tuple(f"{task.task_id}:{task.status}:{task.kind}" for task in tasks if task.kind == "continuous")
+            return Decision(path, "protect", "continuous_task", False, details=detail, **common)
+        nonterminal_tasks = [task for task in tasks if task.status not in TERMINAL_TASK_STATUSES]
+        if nonterminal_tasks:
+            detail = tuple(f"{task.task_id}:{task.status}:{task.kind}" for task in nonterminal_tasks)
+            return Decision(path, "protect", "task_not_terminal", False, details=detail, **common)
     activity = list(git_facts.activity_at)
     activity.extend(workspace.manifest_activity)
     activity.extend(task.updated_at for task in tasks if task.updated_at is not None)
@@ -825,7 +828,8 @@ def decision(
         return Decision(path, "block", "activity_unknown", False, **common)
     last_activity = max(activity)
     age_days = max(0.0, (ctx.now - last_activity) / DAY)
-    threshold = ctx.retention_days
+    threshold = ctx.unowned_retention_days if unowned else ctx.retention_days
+    below_retention_reason = "unowned_below_retention" if unowned else "below_retention"
     common.update(
         {
             "age_days": age_days,
@@ -833,7 +837,7 @@ def decision(
         }
     )
     if age_days < threshold:
-        return Decision(path, "wait", "below_retention", False, **common)
+        return Decision(path, "wait", below_retention_reason, False, **common)
 
     full_git_facts, full_error = inspect_git(path)
     if full_git_facts is None:
@@ -851,7 +855,7 @@ def decision(
     full_age_days = max(0.0, (ctx.now - max(full_activity)) / DAY)
     common["age_days"] = full_age_days
     if full_age_days < threshold:
-        return Decision(path, "wait", "below_retention", False, **common)
+        return Decision(path, "wait", below_retention_reason, False, **common)
     if git_facts.meaningful_ignored:
         return Decision(path, "block", "meaningful_ignored", False, details=git_facts.meaningful_ignored[:12], **common)
     if git_facts.unmerged_entries:
@@ -859,10 +863,16 @@ def decision(
     if git_facts.unsafe_untracked:
         return Decision(path, "block", "unsafe_untracked", False, details=git_facts.unsafe_untracked[:12], **common)
 
+    rescue_detail = ("will create rescue branch for detached HEAD",) if git_facts.branch is None else ()
+    if unowned and git_facts.dirty_entries:
+        return Decision(path, "protect", "unowned_dirty", False, details=git_facts.dirty_entries[:12], **common)
     proof = landed_proof(ctx, git_facts)
     commit_detail = ("will create WIP commit before removal",) if git_facts.dirty_entries else ()
-    rescue_detail = ("will create rescue branch for detached HEAD",) if git_facts.branch is None else ()
     common.update({"main_ref": proof.main_ref, "landed_reason": proof.reason})
+    if unowned and not proof.landed:
+        return Decision(path, "protect", "unowned_not_landed", False, **common)
+    if unowned:
+        return Decision(path, "reap", "unowned_landed_and_inactive", True, details=rescue_detail, **common)
     if git_facts.dirty_entries:
         return Decision(path, "reap", "terminal_inactive_auto_commit", True, details=commit_detail + rescue_detail, **common)
     return Decision(path, "reap", "terminal_and_inactive", True, details=rescue_detail, **common)
@@ -892,6 +902,7 @@ def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
             manifest_paths=manifests,
             now=args.now if args.now is not None else dt.datetime.now(dt.timezone.utc).timestamp(),
             retention_days=args.retention_days,
+            unowned_retention_days=args.unowned_retention_days,
             workspaces=workspace_facts,
             tasks=tasks,
             tasks_by_branch=dict(tasks_by_branch),
@@ -1035,7 +1046,8 @@ def reap_one(candidate: Decision, ctx: ScanContext, ledger: Path) -> tuple[bool,
     refresh_dynamic_state(ctx)
     post_preserve = decision(candidate.path, ctx, refresh_processes=True)
     expected_clock_reset = fresh.reason == "terminal_inactive_auto_commit" or fresh.branch is None
-    if not post_preserve.eligible and not (expected_clock_reset and post_preserve.reason == "below_retention"):
+    clock_reset_reasons = {"below_retention", "unowned_below_retention"}
+    if not post_preserve.eligible and not (expected_clock_reset and post_preserve.reason in clock_reset_reasons):
         return False, f"post-commit recheck changed to {post_preserve.reason}", None
     size = directory_size(candidate.path)
     result = git(post_preserve.main_repo or candidate.path, "worktree", "remove", "--force", str(candidate.path))
@@ -1095,6 +1107,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--config", type=Path, default=Path("~/.cm/daemon.toml"), help="daemon config carrying planning API credentials")
     result.add_argument("--manifest", type=Path, action="append", help="manifest to include; repeatable")
     result.add_argument("--retention-days", type=int, default=7, help="retention after every associated task is terminal")
+    result.add_argument(
+        "--unowned-retention-days",
+        type=int,
+        default=30,
+        help="retention for clean unowned worktrees already represented in main",
+    )
     result.add_argument("--max-removals", type=int, default=25, help="mass-event cap per apply run")
     result.add_argument("--apply", action="store_true", help="remove eligible worktrees; default is dry-run")
     result.add_argument("--json", action="store_true", help="emit JSON instead of the human report")
@@ -1111,6 +1129,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.retention_days < 1:
         parser().error("--retention-days must be positive")
+    if args.unowned_retention_days < 1:
+        parser().error("--unowned-retention-days must be positive")
     if args.max_removals < 1:
         parser().error("--max-removals must be positive")
 
@@ -1135,7 +1155,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps(
                 {
                     "mode": "apply" if args.apply else "dry-run",
-                    "policy": {"retention_days": args.retention_days, "terminal_statuses": sorted(TERMINAL_TASK_STATUSES)},
+                    "policy": {
+                        "retention_days": args.retention_days,
+                        "unowned_retention_days": args.unowned_retention_days,
+                        "terminal_statuses": sorted(TERMINAL_TASK_STATUSES),
+                    },
                     "warnings": warnings,
                     "decisions": [item.as_dict() for item in decisions],
                     "apply_results": apply_results,

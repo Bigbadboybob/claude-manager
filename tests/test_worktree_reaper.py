@@ -57,6 +57,7 @@ class WorktreeReaperTests(unittest.TestCase):
             manifest_paths=(),
             now=self.now,
             retention_days=7,
+            unowned_retention_days=30,
             workspaces={self.worktree.resolve(): workspace},
             tasks={"task-1": task} if task_owned else {},
             tasks_by_branch={"feature": [task]} if task_owned else {},
@@ -73,14 +74,14 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertEqual(result.reason, "terminal_and_inactive")
         self.assertEqual(result.landed_reason, "head_is_ancestor")
 
-    def test_nonterminal_and_unowned_worktrees_fail_closed(self) -> None:
+    def test_nonterminal_and_young_unowned_worktrees_fail_closed(self) -> None:
         running = reaper.decision(self.worktree, self.context(status="running"))
         self.assertFalse(running.eligible)
         self.assertEqual(running.reason, "task_not_terminal")
 
         unowned = reaper.decision(self.worktree, self.context(task_owned=False))
         self.assertFalse(unowned.eligible)
-        self.assertEqual(unowned.reason, "unowned_worktree")
+        self.assertEqual(unowned.reason, "unowned_below_retention")
 
     def test_branch_fallback_requires_same_repository(self) -> None:
         context = self.context(task_owned=False)
@@ -97,7 +98,7 @@ class WorktreeReaperTests(unittest.TestCase):
 
         result = reaper.decision(self.worktree, context)
         self.assertFalse(result.eligible)
-        self.assertEqual(result.reason, "unowned_worktree")
+        self.assertEqual(result.reason, "unowned_below_retention")
 
         origin = "https://github.com/example/repo.git"
         self.git(self.main_repo, "remote", "add", "origin", origin)
@@ -105,6 +106,43 @@ class WorktreeReaperTests(unittest.TestCase):
         context.tasks_by_branch["feature"] = [context.tasks[unrelated.task_id]]
         matched = reaper.decision(self.worktree, context)
         self.assertTrue(matched.eligible)
+
+    def test_old_clean_unowned_worktree_must_be_landed(self) -> None:
+        context = self.context(task_owned=False)
+        context.now += 25 * reaper.DAY
+        landed = reaper.decision(self.worktree, context)
+        self.assertTrue(landed.eligible)
+        self.assertEqual(landed.reason, "unowned_landed_and_inactive")
+        self.assertEqual(landed.landed_reason, "head_is_ancestor")
+
+        (self.worktree / "NOTES.md").write_text("unowned change\n")
+        self.git(self.worktree, "add", "NOTES.md")
+        self.git(self.worktree, "commit", "-m", "unlanded")
+        context.now += reaper.DAY
+        unlanded = reaper.decision(self.worktree, context)
+        self.assertFalse(unlanded.eligible)
+        self.assertEqual(unlanded.reason, "unowned_not_landed")
+
+    def test_old_dirty_unowned_worktree_is_never_auto_committed(self) -> None:
+        context = self.context(task_owned=False)
+        context.now += 25 * reaper.DAY
+        (self.worktree / "NOTES.md").write_text("unfinished unowned work\n")
+        old = context.now - 31 * reaper.DAY
+        reaper.os.utime(self.worktree / "NOTES.md", (old, old))
+
+        result = reaper.decision(self.worktree, context)
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "unowned_dirty")
+
+    def test_unowned_landed_gate_fails_closed_when_origin_fetch_fails(self) -> None:
+        context = self.context(task_owned=False)
+        context.now += 25 * reaper.DAY
+        context.fetch = True
+
+        result = reaper.decision(self.worktree, context)
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "unowned_not_landed")
+        self.assertIn("origin fetch failed", result.landed_reason)
 
     def test_canonical_ignored_symlink_is_safe_but_real_ignored_data_is_not(self) -> None:
         canonical_env = self.main_repo / ".env"

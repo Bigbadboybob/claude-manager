@@ -8,7 +8,7 @@ ConditionPathExists=/home/lucas/.local/libexec/cm-worktree-reaper
 Type=oneshot
 User=lucas
 Environment=HOME=/home/lucas
-ExecStart=/usr/bin/python3 /home/lucas/.local/libexec/cm-worktree-reaper --apply --no-fetch --summary-only
+ExecStart=/usr/bin/python3 /home/lucas/.local/libexec/cm-worktree-reaper --apply --summary-only
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=30min
