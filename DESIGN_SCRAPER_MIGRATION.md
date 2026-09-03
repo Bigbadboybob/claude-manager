@@ -124,8 +124,11 @@ dedupe_key IS NOT NULL`; index on `(queue, state, enqueued_at)`.
 - `POST /queues/{queue}/claim` `{max_items, claimed_by}` → `{items:[…]}` — atomic
   `FOR UPDATE SKIP LOCKED`, oldest-first.
 - `POST /queues/{queue}/ack` `{ids}` → claimed→consumed.
-- `POST /queues/{queue}/requeue` `{ids?}` → claimed→pending (recovery; no ids = all
-  claimed).
+- `POST /queues/{queue}/requeue` → claimed→pending (recovery). The selection is
+  ALWAYS explicit: `{ids}` for those items (empty list = nothing), or `{"all": true}`
+  for every claimed item; an empty/omitted body is a 400. *(Shipped as "no ids = all",
+  which made a bare `POST .../requeue` — and `{"ids": []}` — re-pend the batch an
+  in-flight Consumer fire had just claimed. The daemon only ever sends `{ids}`.)*
 All under the existing bearer-token auth.
 
 **1c. Daemon** (`daemon/src/continuous/queue.rs` + scheduler + fire path):
