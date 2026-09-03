@@ -451,14 +451,40 @@ async def ack_queue_batch(queue: str, body: dict, pool=Depends(get_pool)):
 
 @app.post("/queues/{queue}/requeue", dependencies=[Depends(verify_token)])
 async def requeue_queue_batch(queue: str, body: dict | None = None, pool=Depends(get_pool)):
-    """claimed -> pending (recovery after a crashed fire): {ids?} -> {requeued}.
-    No ids = requeue ALL claimed items in the queue."""
+    """claimed -> pending (recovery after a crashed fire) -> {requeued}.
+
+    The selection is ALWAYS explicit — exactly one of:
+      {"ids": [...]}   requeue those items (an empty list requeues nothing);
+      {"all": true}    requeue every claimed item in the queue.
+
+    An empty/omitted body is a 400, not "requeue everything". A blanket
+    requeue during an in-flight Consumer fire re-pends the batch that fire
+    just claimed, so a bare `POST .../requeue` — easy to reach for when
+    unsticking a queue by hand — used to hand the same items to a second
+    orchestrator. The daemon only ever sends {ids} (the batch IT claimed);
+    nothing in the daemon uses the `all` branch.
+    """
     _validate_queue_name(queue)
-    ids = (body or {}).get("ids")
+    body = body or {}
+    ids = body.get("ids")
+    requeue_all = body.get("all", False)
     if ids is not None and (
         not isinstance(ids, list) or not all(isinstance(i, str) for i in ids)
     ):
         raise HTTPException(status_code=400, detail="ids must be a list of strings")
+    if not isinstance(requeue_all, bool):
+        raise HTTPException(status_code=400, detail="all must be a boolean")
+    if ids is not None and requeue_all:
+        raise HTTPException(
+            status_code=400, detail='pass either {"ids": [...]} or {"all": true}, not both'
+        )
+    if ids is None and not requeue_all:
+        raise HTTPException(
+            status_code=400,
+            detail='requeue needs an explicit selection: {"ids": [...]} for specific '
+                   'items, or {"all": true} to requeue EVERY claimed item in the queue '
+                   '(which re-pends any batch an in-flight fire just claimed)',
+        )
     try:
         requeued = await db.requeue_queue_items(pool, queue, ids)
     except asyncpg.DataError:

@@ -10987,12 +10987,22 @@ fn stage_consumer_batch(
         .map(|()| file)
     });
     match write_result {
-        Ok(file) => Ok(Some(ConsumerBatch {
-            queue: queue.clone(),
-            file: file.display().to_string(),
-            count: ids.len(),
-            ids,
-        })),
+        Ok(file) => {
+            // Bounded retention (see `prune_staged_batches`): the newest N
+            // survive, plus whatever recovery still needs. Best-effort — a
+            // prune failure must never fail a fire.
+            let keep = {
+                let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                s.config.scheduler.consumer_batch_keep
+            };
+            prune_staged_batches(&dir, keep, &protected_batch_seqs(task, seq));
+            Ok(Some(ConsumerBatch {
+                queue: queue.clone(),
+                file: file.display().to_string(),
+                count: ids.len(),
+                ids,
+            }))
+        }
         Err(e) => {
             release_consumer_batch(state_arc, queue, &ids, &task.task_id);
             Err((
@@ -11002,6 +11012,88 @@ fn stage_consumer_batch(
                     task.task_id, task.worktree_path, e
                 ),
             ))
+        }
+    }
+}
+
+/// Batch seqs that must SURVIVE a prune no matter how old they are: the one
+/// being staged right now, the seq of a run still `Running` (its agent may
+/// still be reading the file, and an account block could strand it), and the
+/// seq recorded in a durable account-block marker —
+/// `scheduler::replay_account_blocked_consumer_batch` reads that file to
+/// re-enqueue items the delivery-time ack already marked `consumed`, and a
+/// missing file DEFERS recovery rather than dropping work.
+fn protected_batch_seqs(
+    task: &crate::continuous::task::ContinuousTask,
+    staging_seq: u64,
+) -> Vec<u64> {
+    let mut keep = vec![staging_seq];
+    if let Some(run) = task.last_run.as_ref() {
+        if run.status == crate::continuous::task::RunStatus::Running {
+            keep.push(run.seq);
+        }
+    }
+    if let Some(block) = task.account_blocked.as_ref() {
+        keep.push(block.run_seq);
+    }
+    keep
+}
+
+/// Bounded retention for `<worktree>/.queue/batch-<seq>.json`. Keeps the
+/// `keep` newest by seq plus every seq in `protected`, deletes the rest.
+/// `keep == 0` disables pruning entirely.
+///
+/// These files accumulated forever — one per Consumer fire, with no reaper —
+/// and they are ALSO the only replay source for an account-blocked batch, so
+/// retention has to be bounded without ever evicting a batch recovery could
+/// still need (hence `protected`). Best-effort throughout: a directory we
+/// can't read, or a file we can't unlink, is logged and skipped, never fatal.
+fn prune_staged_batches(dir: &std::path::Path, keep: u64, protected: &[u64]) {
+    if keep == 0 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: cannot list staged batches under {} to prune: {}",
+                dir.display(),
+                e,
+            );
+            return;
+        }
+    };
+    // (seq, path) for every well-formed `batch-<seq>.json`. Anything else in
+    // the directory is not ours and is left alone.
+    let mut batches: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(seq) = name
+            .strip_prefix("batch-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        batches.push((seq, path));
+    }
+    if batches.len() as u64 <= keep {
+        return;
+    }
+    batches.sort_by(|a, b| b.0.cmp(&a.0)); // newest seq first
+    for (seq, path) in batches.into_iter().skip(keep as usize) {
+        if protected.contains(&seq) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!(
+                "cm-daemon: failed to prune staged batch {}: {}",
+                path.display(),
+                e,
+            );
         }
     }
 }
@@ -27374,6 +27466,91 @@ mod tests {
             p,
             "bash stays exempt even as a Consumer (run-and-exit signals Done)",
         );
+    }
+
+    /// (e) Staged batches are bounded: the newest `keep` by seq survive, older
+    /// ones are unlinked — EXCEPT any seq recovery still needs (the run being
+    /// staged, a still-`Running` run, an account-blocked run), which is
+    /// retained however old it is. Non-batch files in `.queue/` are untouched,
+    /// and `keep = 0` disables pruning.
+    #[test]
+    fn prune_staged_batches_keeps_newest_n_and_protected_seqs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let write = |seq: u64| {
+            std::fs::write(dir.join(format!("batch-{}.json", seq)), "{}").unwrap();
+        };
+        for seq in 1..=10u64 {
+            write(seq);
+        }
+        std::fs::write(dir.join("notes.txt"), "not ours").unwrap();
+        let exists = |seq: u64| dir.join(format!("batch-{}.json", seq)).exists();
+
+        // Keep the 3 newest (8,9,10) plus protected seq 2 (say, an
+        // account-blocked run whose items are only recoverable from disk).
+        prune_staged_batches(dir, 3, &[2]);
+
+        for seq in [8, 9, 10] {
+            assert!(exists(seq), "batch-{} is among the newest 3", seq);
+        }
+        assert!(exists(2), "a protected seq survives however old it is");
+        for seq in [1, 3, 4, 5, 6, 7] {
+            assert!(!exists(seq), "batch-{} should have been pruned", seq);
+        }
+        assert!(dir.join("notes.txt").exists(), "non-batch files untouched");
+
+        // keep = 0 is "retain everything".
+        prune_staged_batches(dir, 0, &[]);
+        assert!(exists(2) && exists(10), "keep=0 disables pruning");
+
+        // A directory with fewer batches than the cap is left alone, and a
+        // missing directory is a no-op (best-effort).
+        prune_staged_batches(dir, 50, &[]);
+        assert!(exists(8), "under the cap, nothing is pruned");
+        prune_staged_batches(&dir.join("does-not-exist"), 1, &[]);
+    }
+
+    /// (e) `protected_batch_seqs` names exactly the batches a prune may never
+    /// evict: the one being staged, a still-`Running` run's, and the seq
+    /// pinned by a durable account block (the replay source for items the
+    /// delivery-time ack already marked consumed).
+    #[test]
+    fn protected_batch_seqs_covers_running_and_account_blocked_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = continuous_task(
+            "ct-protect",
+            crate::continuous::task::Engine::Claude,
+            crate::continuous::task::RunMode::Persistent,
+            tmp.path(),
+        );
+        assert_eq!(protected_batch_seqs(&task, 12), vec![12], "the staging seq");
+
+        task.last_run = Some(crate::continuous::task::RunRecord {
+            seq: 11,
+            fire_token: "ft-11".into(),
+            started_at: 1,
+            finished_at: None,
+            session_uid: Some("ts-11".into()),
+            status: crate::continuous::task::RunStatus::Running,
+            trigger_source: "operator".into(),
+        });
+        assert_eq!(protected_batch_seqs(&task, 12), vec![12, 11]);
+
+        task.account_blocked = Some(crate::continuous::task::AccountBlockRecord {
+            run_seq: 7,
+            session_uid: "ts-7".into(),
+            detected_at: 5,
+            kind: crate::continuous::task::AccountBlockKind::UsageLimited,
+            detail: "weekly limit".into(),
+        });
+        assert_eq!(protected_batch_seqs(&task, 12), vec![12, 11, 7]);
+
+        // A finished run pins nothing beyond the staging seq.
+        if let Some(r) = task.last_run.as_mut() {
+            r.status = crate::continuous::task::RunStatus::Done;
+        }
+        task.account_blocked = None;
+        assert_eq!(protected_batch_seqs(&task, 12), vec![12]);
     }
 
     /// Phase 4: a Consumer fire claims a batch from its queue, stages it as

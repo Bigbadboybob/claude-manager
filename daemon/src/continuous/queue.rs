@@ -44,8 +44,116 @@ pub struct QueueItem {
 pub struct QueueStats {
     pub pending: u64,
     pub claimed: u64,
+    /// `min(enqueued_at) FILTER (WHERE state = 'pending')`, ISO-8601 as
+    /// rendered by `datetime.isoformat()` over a `TIMESTAMPTZ` (sql/012), e.g.
+    /// `2026-09-02T14:05:03.123456+00:00`. `None` when the queue holds no
+    /// pending items. This is the TRUE age of the oldest waiting item — the
+    /// Consumer window arm measures against it rather than against the task's
+    /// own `last_fired_at` (see `scheduler::collect_due`).
     #[serde(default)]
     pub oldest_pending_at: Option<String>,
+}
+
+impl QueueStats {
+    /// [`Self::oldest_pending_at`] as unix seconds, or `None` when absent or
+    /// unparseable (an unparseable timestamp degrades the window arm to its
+    /// `last_fired_at` fallback rather than wedging the consumer).
+    pub fn oldest_pending_unix(&self) -> Option<u64> {
+        self.oldest_pending_at
+            .as_deref()
+            .and_then(parse_iso8601_unix)
+    }
+}
+
+/// Days from 1970-01-01 to `y-m-d` (proleptic Gregorian). Howard Hinnant's
+/// `days_from_civil`, the standard branch-free civil-calendar algorithm.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64; // [0, 399]
+    let mp = ((m + 9) % 12) as i64; // Mar=0 … Feb=11
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Minimal ISO-8601 / RFC-3339 → unix-seconds parser for the ONE producer we
+/// consume: `datetime.isoformat()` on an asyncpg `TIMESTAMPTZ`. Accepts
+/// `YYYY-MM-DD[T| ]HH:MM[:SS[.frac]][Z|±HH[:]MM]`; fractional seconds are
+/// truncated (second resolution is all the window arm needs) and a missing
+/// offset is read as UTC (the column is tz-aware, so this is only a
+/// defensive branch). Returns `None` for anything malformed — the caller
+/// treats that as "unknown", never as "now".
+///
+/// Hand-rolled because the daemon deliberately carries no date/time crate
+/// (see `daemon/Cargo.toml`); pulling `chrono`/`time` in for one field would
+/// add a dependency tree to a binary that has none.
+pub fn parse_iso8601_unix(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 16 {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> { s.get(from..to)?.parse::<i64>().ok() };
+    if bytes[4] != b'-' || bytes[7] != b'-' || !(bytes[10] == b'T' || bytes[10] == b' ') {
+        return None;
+    }
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    if bytes[13] != b':' {
+        return None;
+    }
+    let hour = num(11, 13)?;
+    let minute = num(14, 16)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+        return None;
+    }
+    // Optional `:SS[.frac]`, then an optional zone suffix.
+    let mut idx = 16;
+    let mut second = 0i64;
+    if bytes.get(idx) == Some(&b':') {
+        second = num(idx + 1, idx + 3)?;
+        if !(0..=60).contains(&second) {
+            return None; // 60 = leap second; clamped below.
+        }
+        second = second.min(59);
+        idx += 3;
+        if bytes.get(idx) == Some(&b'.') {
+            idx += 1;
+            while bytes.get(idx).is_some_and(|c| c.is_ascii_digit()) {
+                idx += 1; // truncate the fraction
+            }
+        }
+    }
+    // Zone: end-of-string / `Z` = UTC, else ±HH:MM or ±HHMM.
+    let offset_secs: i64 = match bytes.get(idx) {
+        None => 0,
+        Some(b'Z') | Some(b'z') if idx + 1 == bytes.len() => 0,
+        Some(sign @ (b'+' | b'-')) => {
+            let sign = if *sign == b'-' { -1 } else { 1 };
+            let rest = s.get(idx + 1..)?;
+            let (oh, om) = match rest.len() {
+                5 if rest.as_bytes()[2] == b':' => (rest[0..2].to_string(), rest[3..5].to_string()),
+                4 => (rest[0..2].to_string(), rest[2..4].to_string()),
+                2 => (rest[0..2].to_string(), "0".to_string()),
+                _ => return None,
+            };
+            let oh: i64 = oh.parse().ok()?;
+            let om: i64 = om.parse().ok()?;
+            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                return None;
+            }
+            sign * (oh * 3600 + om * 60)
+        }
+        _ => return None,
+    };
+    let days = days_from_civil(year, month as u32, day as u32);
+    let epoch = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
+    u64::try_from(epoch).ok()
 }
 
 /// Queue-name allowlist (twin of `task::validate_task_id`, distinct error
@@ -185,6 +293,11 @@ impl QueueClient {
     }
 
     /// `POST /queues/{queue}/requeue` — claimed → pending (crash recovery).
+    /// ALWAYS id-scoped: the daemon only ever releases the batch IT claimed.
+    /// The endpoint's requeue-everything branch needs an explicit
+    /// `{"all": true}` (api/main.py) and has no daemon caller by design — a
+    /// blanket requeue during an in-flight fire would re-pend another fire's
+    /// live batch. An empty slice is a no-op the API answers with `0`.
     pub fn requeue(&self, queue: &str, ids: &[String]) -> Result<u64, PlanningClientError> {
         let body = serde_json::json!({ "ids": ids });
         let v = self.post_json(&format!("/queues/{}/requeue", queue), &body)?;
@@ -205,6 +318,50 @@ mod tests {
         unsafe {
             std::env::remove_var("CM_API_URL");
             std::env::remove_var("CM_API_TOKEN");
+        }
+    }
+
+    /// The one producer shape we consume — `datetime.isoformat()` over a
+    /// TIMESTAMPTZ — plus the defensive variants (bare `Z`, naive, compact
+    /// offset, non-UTC offset, leap second) and rejects. Expected values are
+    /// Python `datetime.fromisoformat(...).timestamp()`.
+    #[test]
+    fn parse_iso8601_unix_covers_api_shapes_and_rejects_garbage() {
+        assert_eq!(parse_iso8601_unix("2026-07-04T00:00:00+00:00"), Some(1_783_123_200));
+        assert_eq!(
+            parse_iso8601_unix("2026-09-02T14:05:03.123456+00:00"),
+            Some(1_788_357_903),
+            "fractional seconds truncated, not rejected",
+        );
+        assert_eq!(parse_iso8601_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso8601_unix("2026-09-02 14:05:03+00:00"), Some(1_788_357_903));
+        assert_eq!(
+            parse_iso8601_unix("2026-03-01T12:00:00-05:00"),
+            Some(1_772_384_400),
+            "a negative offset shifts FORWARD in UTC",
+        );
+        assert_eq!(parse_iso8601_unix("2026-03-01T12:00:00-0500"), Some(1_772_384_400));
+        assert_eq!(
+            parse_iso8601_unix("2000-02-29T23:59:59Z"),
+            Some(951_868_799),
+            "leap day on a 400-year leap year",
+        );
+        assert_eq!(
+            parse_iso8601_unix("2026-09-02T14:05"),
+            Some(1_788_357_900),
+            "seconds optional; no zone = UTC",
+        );
+        for bad in [
+            "",
+            "not-a-time",
+            "2026-09-02",
+            "2026-09-02T14:05:03+99:00",
+            "2026-13-02T14:05:03Z",
+            "2026-09-02T25:05:03Z",
+            "2026/09/02T14:05:03Z",
+            "1969-12-31T23:59:59Z", // pre-epoch has no u64 representation
+        ] {
+            assert_eq!(parse_iso8601_unix(bad), None, "expected reject for {:?}", bad);
         }
     }
 
@@ -238,6 +395,11 @@ mod tests {
         assert_eq!(
             stats.oldest_pending_at.as_deref(),
             Some("2026-07-04T00:00:00+00:00"),
+        );
+        assert_eq!(
+            stats.oldest_pending_unix(),
+            Some(1_783_123_200),
+            "decoded to unix seconds for the Consumer window arm",
         );
         let cap = captured.lock().unwrap();
         let (method, path) = cap.method_and_path();

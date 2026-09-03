@@ -626,10 +626,18 @@ async def ack_queue_items(pool: asyncpg.Pool, queue: str, ids: list[str]) -> int
 async def requeue_queue_items(
     pool: asyncpg.Pool, queue: str, ids: list[str] | None = None,
 ) -> int:
-    """claimed -> pending (recovery after a crashed/failed fire). With no ids,
-    requeues ALL claimed items in the queue. Returns rows flipped."""
+    """claimed -> pending (recovery after a crashed/failed fire). Returns rows
+    flipped.
+
+    `ids=None` requeues ALL claimed items in the queue — the API reaches this
+    branch only on an explicit `{"all": true}`. An EMPTY list requeues nothing:
+    it means "these zero items", never "everything" (the old `if ids:` test
+    conflated the two, so `{"ids": []}` blanket-requeued the queue — including
+    a batch an in-flight fire had just claimed)."""
+    if ids is not None and not ids:
+        return 0
     async with pool.acquire() as conn:
-        if ids:
+        if ids is not None:
             result = await conn.execute(
                 """UPDATE queue_items
                    SET state = 'pending', claimed_at = NULL, claimed_by = NULL
