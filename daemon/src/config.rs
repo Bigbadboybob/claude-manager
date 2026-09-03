@@ -215,6 +215,18 @@ pub struct SchedulerConfig {
     /// `report_done` / a clean exit / an operator `force_done`. Default `3`.
     #[serde(default = "default_scheduler_wedge_close_limit")]
     pub wedge_close_limit: u32,
+    /// Staged-Consumer-batch retention: how many `<worktree>/.queue/batch-N.json`
+    /// files a Consumer task keeps. Every Consumer fire writes one and nothing
+    /// ever deleted them, so a task firing hourly accumulated them forever.
+    /// Pruned at STAGE time (newest N by seq survive), and never below what
+    /// recovery needs: the batch of a run still `Running` or account-blocked is
+    /// always retained, because
+    /// `scheduler::replay_account_blocked_consumer_batch` has no other source
+    /// for those items (delivery-time ack already moved them to `consumed`, so
+    /// the API's claimed→pending requeue cannot reach them). `0` = keep
+    /// everything (pruning off). Default `50`.
+    #[serde(default = "default_scheduler_consumer_batch_keep")]
+    pub consumer_batch_keep: u64,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -360,6 +372,13 @@ fn default_scheduler_wedge_grace_secs() -> u64 {
     3600
 }
 
+fn default_scheduler_consumer_batch_keep() -> u64 {
+    // 50 batches ≈ two days of hourly fires — deep enough to debug "what did
+    // that run actually get?" long after the fact, bounded enough that a
+    // long-lived consumer's worktree doesn't grow without limit.
+    50
+}
+
 fn default_scheduler_wedge_close_limit() -> u32 {
     // Three consecutive auto-closes, then escalate: enough to self-heal a
     // flaky missed report_done, few enough that a systemically-broken
@@ -379,6 +398,7 @@ impl Default for SchedulerConfig {
             persistent_max_stall_secs: None,
             consumer_wedge_grace_secs: default_scheduler_wedge_grace_secs(),
             wedge_close_limit: default_scheduler_wedge_close_limit(),
+            consumer_batch_keep: default_scheduler_consumer_batch_keep(),
         }
     }
 }
@@ -910,6 +930,27 @@ url = "git@github.com:u/other.git"
         assert_eq!(s.default_cap, 0);
         assert_eq!(s.max_investigations, 2);
         assert_eq!(s.default_investigator_runtime_secs, 600);
+        assert_eq!(s.consumer_batch_keep, 50, "staged-batch retention");
+    }
+
+    /// `[scheduler] consumer_batch_keep` overrides the staged-batch retention;
+    /// an absent key keeps the default, and `0` (pruning off) round-trips.
+    #[test]
+    fn scheduler_section_parses_consumer_batch_keep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (body, expected) in [
+            ("[scheduler]\nconsumer_batch_keep = 5\n", 5u64),
+            ("[scheduler]\nconsumer_batch_keep = 0\n", 0),
+            ("[scheduler]\nmax_investigations = 3\n", 50),
+        ] {
+            let path = tmp.path().join("daemon.toml");
+            std::fs::write(&path, format!("mcp_server_path = \"\"\n\n{}", body))
+                .expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+            let cfg = load_or_default(&path).expect("load");
+            assert_eq!(cfg.scheduler.consumer_batch_keep, expected, "body: {}", body);
+        }
     }
 
     /// Phase 3: an explicit `[scheduler]` section overrides each field, and a
