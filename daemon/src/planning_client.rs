@@ -92,6 +92,8 @@ struct ProposeTaskBody<'a> {
     difficulty: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     depends: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<&'a serde_json::Value>,
 }
 
 /// Parameters the daemon's `methods::propose_task` collects from
@@ -104,6 +106,7 @@ pub struct ProposeTaskRequest<'a> {
     pub repo_url: &'a str,
     pub difficulty: Option<i32>,
     pub depends: Option<&'a [String]>,
+    pub metadata: Option<&'a serde_json::Value>,
 }
 
 /// Concrete error variants. The dispatcher maps these onto
@@ -319,6 +322,7 @@ pub fn propose_task(
         priority: 0,
         difficulty: req.difficulty,
         depends: req.depends,
+        metadata: req.metadata,
     };
     let agent = build_agent();
     let auth = format!("Bearer {}", api_token);
@@ -620,6 +624,7 @@ mod tests {
             repo_url,
             difficulty: None,
             depends: None,
+            metadata: None,
         }
     }
 
@@ -631,7 +636,16 @@ mod tests {
             r#"{"id":"task-123","name":"hello","project":"proj"}"#,
         );
         set_env(&format!("http://127.0.0.1:{}", port), "token-abc");
-        let req = make_req("proj", "hello", "git@example.com:o/r.git");
+        let metadata = serde_json::json!({
+            "filer": {
+                "schema_version": 1,
+                "agent": "codex",
+                "session_id": "ts-proposer",
+                "submitted_via": "mcp.propose_task",
+            }
+        });
+        let mut req = make_req("proj", "hello", "git@example.com:o/r.git");
+        req.metadata = Some(&metadata);
         let resp = propose_task(&req, None, None).expect("propose ok");
         assert_eq!(resp["id"], "task-123");
         // Wire-shape pins.
@@ -650,6 +664,7 @@ mod tests {
         assert_eq!(body["source"], "claude");
         assert_eq!(body["is_cloud"], false);
         assert_eq!(body["priority"], 0);
+        assert_eq!(body["metadata"], metadata);
         assert!(body.get("difficulty").is_none() || body["difficulty"].is_null());
         clear_env();
     }
@@ -673,6 +688,7 @@ mod tests {
             repo_url: "git@x.com:a/b.git",
             difficulty: None,
             depends: None,
+            metadata: None,
         };
         let _ = propose_task(&req, None, None).expect("ok");
         let cap = captured.lock().unwrap();

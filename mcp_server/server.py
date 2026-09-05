@@ -263,6 +263,7 @@ def propose_task(
             return f"propose_task failed ({e.code}): {e.message}"
     else:
         client = PlanningClient()
+        filer = _caller_filer_context("mcp.propose_task")
         task = client.propose_task(
             project=project,
             name=name,
@@ -270,6 +271,7 @@ def propose_task(
             prompt=prompt,
             difficulty=difficulty,
             depends=depends,
+            metadata={"filer": filer},
         )
     # Inline round-trip preview so the caller sees what actually landed
     # without an extra get_task. Truncated to keep the response readable.
@@ -2936,8 +2938,8 @@ def _normalize_filer_agent(session_type: str | None) -> str:
     }.get((session_type or "").strip().lower(), "unknown")
 
 
-def _caller_filer_context() -> dict:
-    """Best-effort, control-plane-derived provenance for a backtest filer.
+def _caller_filer_context(submitted_via: str = "mcp.submit_backtest") -> dict:
+    """Best-effort, control-plane-derived provenance for an agent filer.
 
     Missing identity must never block submission. Local process facts supply
     the physical hostname and working directory; session/task/workflow facts
@@ -2945,7 +2947,7 @@ def _caller_filer_context() -> dict:
     """
     context: dict = {
         "schema_version": 1,
-        "submitted_via": "mcp.submit_backtest",
+        "submitted_via": submitted_via,
     }
     session_id = os.environ.get("CM_TUI_SESSION_ID", "").strip()
     if session_id:
@@ -3054,7 +3056,7 @@ def submit_backtest(
     _check_parameter_confusion("label", label)
     _check_parameter_confusion("config", config)
 
-    filer = _caller_filer_context()
+    filer = _caller_filer_context("mcp.submit_backtest")
     parent_task_id = filer.get("task_id")
 
     try:

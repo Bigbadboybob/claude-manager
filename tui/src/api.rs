@@ -57,7 +57,7 @@ pub struct Task {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Provenance stamped on agent-filed backtests at `metadata.filer`.
+/// Provenance stamped on agent-filed tasks at `metadata.filer`.
 ///
 /// Every field is optional so the TUI remains compatible with older rows and
 /// partially-known callers. New submitters currently write schema version 1.
@@ -194,6 +194,10 @@ pub struct TaskCreateBody {
     /// fall back to "main" as its start ref).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wip_branch: Option<String>,
+    /// Free-form task metadata. Agent-created rows use `metadata.filer` for
+    /// authenticated session/task/workspace provenance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Blocking HTTP client for the Claude Manager API.
@@ -362,7 +366,7 @@ mod tests {
                 "workflow_run_id": "workflow-1",
                 "workflow_role": "worker",
                 "managed_by_session_id": "manager-1",
-                "submitted_via": "mcp.submit_backtest"
+                "submitted_via": "mcp.propose_task"
             }
         }));
         let filer = FilerMetadata::from_metadata(&metadata).expect("filer");
@@ -378,7 +382,7 @@ mod tests {
         assert!(fields.contains(&("Continuous task", "continuous-1".into())));
         assert!(fields.contains(&("Workflow", "workflow-1 (worker)".into())));
         assert!(fields.contains(&("Managed by", "manager-1".into())));
-        assert!(fields.contains(&("Filed via", "mcp.submit_backtest".into())));
+        assert!(fields.contains(&("Filed via", "mcp.propose_task".into())));
     }
 
     #[test]

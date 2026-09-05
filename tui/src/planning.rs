@@ -5098,10 +5098,13 @@ mod tests {
     }
 
     #[test]
-    fn planning_detail_exposes_backtest_filer_metadata() {
-        let mut api = api_task("bt-1", "predictionTrading", "git@example.com:pt.git");
-        api.kind = "backtest".into();
-        api.source = "codex".into();
+    fn planning_detail_exposes_ordinary_task_filer_metadata() {
+        let mut api = api_task(
+            "task-1",
+            "predictionTrading",
+            "git@example.com:pt.git",
+        );
+        api.source = "claude".into();
         api.metadata = Some(serde_json::json!({
             "filer": {
                 "schema_version": 1,
@@ -5110,7 +5113,8 @@ mod tests {
                 "task_id": "parent-1",
                 "workspace_id": "workspace-1",
                 "machine": "host-1",
-                "continuous_task_id": "continuous-1"
+                "continuous_task_id": "continuous-1",
+                "submitted_via": "mcp.propose_task"
             }
         }));
 
@@ -5122,6 +5126,7 @@ mod tests {
         assert!(fields.contains(&("Workspace", "workspace-1".into())));
         assert!(fields.contains(&("Machine", "host-1".into())));
         assert!(fields.contains(&("Continuous task", "continuous-1".into())));
+        assert!(fields.contains(&("Filed via", "mcp.propose_task".into())));
     }
 
     #[test]

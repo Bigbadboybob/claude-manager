@@ -575,6 +575,7 @@ fn do_push(
             parent_task_id: None,
             worktree_mode: None,
             wip_branch: None,
+            metadata: None,
         };
         match client.create_task(&body) {
             Ok(task) => {
@@ -783,6 +784,7 @@ fn do_create_plan_task(
         parent_task_id: parent_task_id.map(str::to_string),
         worktree_mode: worktree_mode.map(str::to_string),
         wip_branch: None,
+        metadata: None,
     };
 
     match client.create_task(&body) {

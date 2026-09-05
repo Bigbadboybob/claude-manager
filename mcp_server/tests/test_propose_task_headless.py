@@ -77,6 +77,41 @@ class ProposeTaskHeadlessTests(unittest.TestCase):
         call_mock.assert_not_called()
         self.assertIn("could not detect the repo URL", out)
 
+    def test_direct_api_fallback_stamps_filer_metadata(self):
+        """Ad-hoc/TUI-socket callers that bypass the daemon still persist the
+        same versioned filer object on the planning row."""
+        from mcp_server import server, control_client
+
+        captured: dict = {}
+
+        class FakePlanningClient:
+            def propose_task(self, **kwargs):
+                captured.update(kwargs)
+                return {"id": "task-local"}
+
+        route = types.SimpleNamespace(chose_daemon=False, path="/tmp/tui.sock")
+        filer = {
+            "schema_version": 1,
+            "agent": "codex",
+            "session_id": "ts-local",
+            "task_id": "parent-local",
+            "submitted_via": "mcp.propose_task",
+        }
+        with mock.patch.object(
+            control_client, "resolve_socket_route", return_value=route
+        ), mock.patch.object(
+            server, "PlanningClient", return_value=FakePlanningClient()
+        ), mock.patch.object(
+            server, "_caller_filer_context", return_value=filer
+        ) as filer_context:
+            out = server.propose_task(
+                project="y", name="local task", description="d", prompt="p"
+            )
+
+        filer_context.assert_called_once_with("mcp.propose_task")
+        self.assertEqual(captured["metadata"], {"filer": filer})
+        self.assertIn("task-local", out)
+
 
 if __name__ == "__main__":
     unittest.main()

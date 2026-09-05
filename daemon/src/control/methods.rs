@@ -5521,6 +5521,27 @@ pub fn propose_task(
              daemon doesn't know the agent's cwd)".into(),
         ));
     }
+    // 12f F2: pass daemon.toml-sourced credentials as
+    // overrides. Empty fields fall through to env in the
+    // resolver — preserves the local-workstation case
+    // (daemon launched from a shell with CM_API_URL /
+    // CM_API_TOKEN exported, no daemon.toml on disk).
+    let machine = local_machine_hostname();
+    let (metadata, api_url_cfg, api_token_cfg) = {
+        let st = state_arc.lock().expect("state mutex");
+        (
+            json!({
+                "filer": filer_metadata(
+                    &st,
+                    caller_uid,
+                    machine.as_deref(),
+                    "mcp.propose_task",
+                ),
+            }),
+            st.config.api_url.clone(),
+            st.config.api_token.clone(),
+        )
+    };
     let req = crate::planning_client::ProposeTaskRequest {
         project: &p.project,
         name: &p.name,
@@ -5529,18 +5550,7 @@ pub fn propose_task(
         repo_url: &p.repo_url,
         difficulty: p.difficulty,
         depends: p.depends.as_deref(),
-    };
-    // 12f F2: pass daemon.toml-sourced credentials as
-    // overrides. Empty fields fall through to env in the
-    // resolver — preserves the local-workstation case
-    // (daemon launched from a shell with CM_API_URL /
-    // CM_API_TOKEN exported, no daemon.toml on disk).
-    let (api_url_cfg, api_token_cfg) = {
-        let st = state_arc.lock().expect("state mutex");
-        (
-            st.config.api_url.clone(),
-            st.config.api_token.clone(),
-        )
+        metadata: Some(&metadata),
     };
     let api_url_override = if api_url_cfg.is_empty() {
         None
@@ -14534,6 +14544,7 @@ pub fn create_subtask(
 
     // Resolve the caller + snapshot everything the unlocked HTTP/git
     // phase needs, then DROP the lock.
+    let machine = local_machine_hostname();
     let (
         parent_task_id,
         parent_workspace_id,
@@ -14543,6 +14554,7 @@ pub fn create_subtask(
         repos_dir,
         allow_clone,
         allow_entries,
+        filer,
         api_url_cfg,
         api_token_cfg,
     ): (
@@ -14554,6 +14566,7 @@ pub fn create_subtask(
         PathBuf,
         bool,
         Vec<(String, String)>,
+        Value,
         String,
         String,
     ) = {
@@ -14597,6 +14610,12 @@ pub fn create_subtask(
                 .iter()
                 .map(|e| (e.name.clone(), e.url.clone()))
                 .collect(),
+            filer_metadata(
+                &state,
+                caller_uid,
+                machine.as_deref(),
+                "mcp.create_subtask",
+            ),
             state.config.api_url.clone(),
             state.config.api_token.clone(),
         )
@@ -14764,6 +14783,7 @@ pub fn create_subtask(
         "slug": unique_slug,
         "source": "claude",
         "is_cloud": false,
+        "metadata": { "filer": filer },
         // null when the parent was deleted (top-level fallback) — never a
         // dangling FK that the API insert would reject.
         "parent_task_id": effective_parent_id,
@@ -15326,7 +15346,7 @@ fn default_backtest_project() -> String {
 /// `_BACKTEST_CONFIG_MAX_BYTES` in mcp_server/server.py.
 const BACKTEST_CONFIG_MAX_BYTES: usize = 32 * 1024;
 
-fn normalize_backtest_filer_agent(session_type: &str) -> &'static str {
+fn normalize_filer_agent(session_type: &str) -> &'static str {
     match session_type {
         "claude" | "claude-code" => "claude",
         "codex" => "codex",
@@ -15348,24 +15368,30 @@ fn local_machine_hostname() -> Option<String> {
         })
 }
 
-/// Build the persisted `metadata.filer` object from daemon-owned caller
-/// identity. No filer identity is accepted from request params: session,
-/// task, workspace, workflow, and continuous-task ids are authoritative
-/// snapshots of the caller that authenticated the RPC.
-fn backtest_filer_metadata(
+/// Build the persisted `metadata.filer` object from daemon-known caller
+/// identity (daemon-owned session first, then the TUI-pushed snapshot). No
+/// filer identity is accepted from request params: session, task, workspace,
+/// workflow, and continuous-task ids are authoritative snapshots of the
+/// caller that authenticated the RPC.
+fn filer_metadata(
     state: &DaemonState,
     caller_uid: Option<&str>,
     machine: Option<&str>,
+    submitted_via: &str,
 ) -> Value {
     let mut filer = serde_json::Map::new();
     filer.insert("schema_version".into(), json!(1));
-    filer.insert("submitted_via".into(), json!("mcp.submit_backtest"));
+    filer.insert("submitted_via".into(), json!(submitted_via));
 
-    let mut agent = if caller_uid.is_some() { "unknown" } else { "operator" };
+    let mut agent = if caller_uid.is_some() {
+        "unknown"
+    } else {
+        "operator"
+    };
     if let Some(uid) = caller_uid {
         filer.insert("session_id".into(), json!(uid));
         if let Some(session) = state.sessions.get(uid) {
-            agent = normalize_backtest_filer_agent(&session.session_type);
+            agent = normalize_filer_agent(&session.session_type);
             let mut put = |key: &str, value: Option<&str>| {
                 if let Some(value) = value.filter(|s| !s.is_empty()) {
                     filer.insert(key.to_string(), json!(value));
@@ -15384,6 +15410,28 @@ fn backtest_filer_metadata(
                     .get(&session.workspace_id)
                     .and_then(|w| w.worktree_path.as_ref())
                     .and_then(|p| p.to_str()),
+            );
+        } else if let Some(session) = state.tui_sessions.get(uid) {
+            agent = normalize_filer_agent(session.session_type.as_deref().unwrap_or(""));
+            let mut put = |key: &str, value: Option<&str>| {
+                if let Some(value) = value.filter(|s| !s.is_empty()) {
+                    filer.insert(key.to_string(), json!(value));
+                }
+            };
+            put("task_id", session.task_id.as_deref());
+            put("workspace_id", session.workspace_id.as_deref());
+            put("workflow_run_id", session.workflow_run_id.as_deref());
+            put("workflow_role", session.workflow_role.as_deref());
+            put(
+                "worktree_path",
+                session.worktree_path.as_deref().or_else(|| {
+                    session
+                        .workspace_id
+                        .as_deref()
+                        .and_then(|workspace_id| state.workspaces.get(workspace_id))
+                        .and_then(|workspace| workspace.worktree_path.as_ref())
+                        .and_then(|path| path.to_str())
+                }),
             );
         }
     }
@@ -15472,7 +15520,12 @@ pub fn backtest_submit(
         let caller_task = caller_uid
             .and_then(|u| state.sessions.get(u))
             .and_then(|s| s.task_id.clone());
-        let filer = backtest_filer_metadata(&state, caller_uid, machine.as_deref());
+        let filer = filer_metadata(
+            &state,
+            caller_uid,
+            machine.as_deref(),
+            "mcp.submit_backtest",
+        );
         (
             caller_task,
             filer,
@@ -29538,6 +29591,15 @@ mod tests {
                 s.workspaces.insert("ws-parent".to_string(), ws);
             }
             seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+            {
+                let mut s = state.lock().unwrap();
+                let caller = s.sessions.get_mut("ts-orch").unwrap();
+                caller.session_type = "codex".to_string();
+                caller.continuous_task_id = Some("continuous-1".to_string());
+                caller.workflow_run_id = Some("workflow-1".to_string());
+                caller.workflow_role = Some("orchestrator".to_string());
+                caller.managed_by_uid = Some("manager-1".to_string());
+            }
 
             let name_owned = name.to_string();
             let stub = spawn_routed_stub(move |method, path, _body| {
@@ -29626,6 +29688,19 @@ mod tests {
             assert_eq!(body["is_cloud"], false);
             assert_eq!(body["repo_branch"], "main");
             assert_eq!(body["repo_url"], name);
+            let filer = &body["metadata"]["filer"];
+            assert_eq!(filer["schema_version"], 1);
+            assert_eq!(filer["agent"], "codex");
+            assert_eq!(filer["session_id"], "ts-orch");
+            assert_eq!(filer["task_id"], "task-parent");
+            assert_eq!(filer["workspace_id"], "ws-parent");
+            assert_eq!(filer["worktree_path"], repo.to_string_lossy().as_ref());
+            assert_eq!(filer["continuous_task_id"], "continuous-1");
+            assert_eq!(filer["workflow_run_id"], "workflow-1");
+            assert_eq!(filer["workflow_role"], "orchestrator");
+            assert_eq!(filer["managed_by_session_id"], "manager-1");
+            assert_eq!(filer["submitted_via"], "mcp.create_subtask");
+            assert!(filer["machine"].as_str().is_some_and(|s| !s.is_empty()));
             let slug = body["slug"].as_str().unwrap();
             assert!(slug.starts_with("parent-task-branchy-"), "slug: {}", slug);
             let wip = body["wip_branch"].as_str().unwrap();
@@ -30813,6 +30888,13 @@ mod tests {
             s.config.api_token = "test-token".to_string();
         }
         seed_tasked_caller(&state, "ts-proposer", "ws-orch", "task-orch");
+        {
+            let mut s = state.lock().unwrap();
+            s.sessions
+                .get_mut("ts-proposer")
+                .unwrap()
+                .session_type = "codex".to_string();
+        }
 
         let params = json!({
             "project": "proj",
@@ -30846,6 +30928,23 @@ mod tests {
                 "creator edge must be immediately visible to the descendant walk",
             );
         }
+
+        let requests = stub.requests.lock().unwrap();
+        let last_post = requests
+            .iter()
+            .rev()
+            .find(|request| request.method == "POST" && request.path == "/tasks")
+            .expect("tasked caller POST captured");
+        let body: Value = serde_json::from_str(&last_post.body).expect("post body json");
+        let filer = &body["metadata"]["filer"];
+        assert_eq!(filer["schema_version"], 1);
+        assert_eq!(filer["agent"], "codex");
+        assert_eq!(filer["session_id"], "ts-proposer");
+        assert_eq!(filer["task_id"], "task-orch");
+        assert_eq!(filer["workspace_id"], "ws-orch");
+        assert_eq!(filer["submitted_via"], "mcp.propose_task");
+        assert!(filer["machine"].as_str().is_some_and(|s| !s.is_empty()));
+        drop(requests);
 
         kill_all_sessions(&state);
     }

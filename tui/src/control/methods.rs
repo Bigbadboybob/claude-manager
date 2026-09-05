@@ -53,6 +53,68 @@ pub fn find_live_session(workspaces: &[Workspace], uid: &str) -> Option<(usize, 
     None
 }
 
+fn normalize_filer_agent(session_type: &str) -> &'static str {
+    match session_type {
+        "claude" | "claude-code" => "claude",
+        "codex" => "codex",
+        "bash" => "bash",
+        _ => "unknown",
+    }
+}
+
+/// Build `metadata.filer` from the TUI's authenticated caller lookup. This is
+/// the legacy TUI-socket twin of the daemon's authoritative builder; callers
+/// never supply their own identity fields.
+fn filer_metadata_for_caller(
+    workspaces: &[Workspace],
+    caller_uid: &str,
+    submitted_via: &str,
+) -> Value {
+    let mut filer = serde_json::Map::new();
+    filer.insert("schema_version".into(), json!(1));
+    filer.insert("submitted_via".into(), json!(submitted_via));
+    filer.insert("session_id".into(), json!(caller_uid));
+
+    let mut agent = "unknown";
+    if let Some((workspace_index, session_index)) =
+        find_live_session(workspaces, caller_uid)
+    {
+        let workspace = &workspaces[workspace_index];
+        let session = &workspace.sessions[session_index];
+        agent = normalize_filer_agent(&session.session_type);
+        let mut put = |key: &str, value: Option<&str>| {
+            if let Some(value) = value.filter(|s| !s.is_empty()) {
+                filer.insert(key.to_string(), json!(value));
+            }
+        };
+        put("task_id", session.task_id.as_deref());
+        put("workspace_id", Some(&workspace.id));
+        put(
+            "worktree_path",
+            workspace.worktree_path.as_deref().and_then(|p| p.to_str()),
+        );
+        put("continuous_task_id", session.continuous_task_id.as_deref());
+        put("workflow_run_id", session.workflow_run_id.as_deref());
+        put("workflow_role", session.workflow_role.as_deref());
+        put("managed_by_session_id", session.managed_by_uid.as_deref());
+    }
+    filer.insert("agent".into(), json!(agent));
+    let machine = std::env::var("HOSTNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(machine) = machine {
+        filer.insert("machine".into(), json!(machine));
+    }
+    Value::Object(filer)
+}
+
 /// Locate a tombstone by uid. Returns (workspace_index, tombstone_index).
 pub fn find_tombstone(workspaces: &[Workspace], uid: &str) -> Option<(usize, usize)> {
     for (wi, ws) in workspaces.iter().enumerate() {
@@ -1513,6 +1575,11 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
         ));
     }
     let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
+    let filer = filer_metadata_for_caller(
+        &app.workspaces,
+        caller_uid,
+        "mcp.create_subtask",
+    );
 
     // Subtasks need a parent. Taskless callers should call propose_task
     // (the existing tool) to add a top-level task instead.
@@ -1717,6 +1784,7 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
         parent_task_id: Some(parent_task_id.clone()),
         worktree_mode: Some(p.worktree_mode.clone()),
         wip_branch: branch_name_for_new.clone(),
+        metadata: Some(json!({ "filer": filer })),
     };
     let new_task = api_client
         .create_task(&body)
@@ -2700,6 +2768,32 @@ mod tests {
             tombstones,
             is_pushing: false,
         }
+    }
+
+    #[test]
+    fn tui_task_filer_uses_authenticated_session_context() {
+        let mut session = live_ts("ts-filer", Some("task-parent"));
+        session.session_type = "codex".into();
+        session.workflow_run_id = Some("workflow-1".into());
+        session.workflow_role = Some("worker".into());
+        session.continuous_task_id = Some("continuous-1".into());
+        session.managed_by_uid = Some("manager-1".into());
+        let workspaces = vec![workspace_with(vec![session], vec![])];
+
+        let filer =
+            filer_metadata_for_caller(&workspaces, "ts-filer", "mcp.create_subtask");
+        assert_eq!(filer["schema_version"], 1);
+        assert_eq!(filer["agent"], "codex");
+        assert_eq!(filer["session_id"], "ts-filer");
+        assert_eq!(filer["task_id"], "task-parent");
+        assert_eq!(filer["workspace_id"], "ws-1");
+        assert_eq!(filer["worktree_path"], "/tmp/ws");
+        assert_eq!(filer["continuous_task_id"], "continuous-1");
+        assert_eq!(filer["workflow_run_id"], "workflow-1");
+        assert_eq!(filer["workflow_role"], "worker");
+        assert_eq!(filer["managed_by_session_id"], "manager-1");
+        assert_eq!(filer["submitted_via"], "mcp.create_subtask");
+        assert!(filer["machine"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     fn make_tombstone(uid: &str) -> SessionTombstone {

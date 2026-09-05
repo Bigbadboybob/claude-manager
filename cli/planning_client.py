@@ -73,6 +73,7 @@ class PlanningClient:
         repo_url: str | None = None,
         difficulty: int | None = None,
         depends: list[str] | None = None,
+        metadata: dict | None = None,
     ) -> dict:
         """Create a task with source='claude' in draft status."""
         if not repo_url:
@@ -93,6 +94,8 @@ class PlanningClient:
             body["difficulty"] = difficulty
         if depends:
             body["depends"] = depends
+        if metadata:
+            body["metadata"] = metadata
 
         r = self._client.client.post("/tasks", json=body)
         return _response_json(r)
