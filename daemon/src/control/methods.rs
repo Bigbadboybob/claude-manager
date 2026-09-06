@@ -14278,8 +14278,8 @@ fn api_get_task_artifacts(
     crate::planning_client::decode_json_response(resp, "get_task_artifacts")
 }
 
-/// GET /projects — [{name, repo_url}] (repo-URL default resolution for
-/// `backtest.submit`).
+/// GET /projects — [{name, repo_url}] for project discovery and repo-URL
+/// default resolution in `backtest.submit`.
 fn api_list_projects(creds: &PlanningApiCreds) -> Result<Vec<Value>, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
     let resp = agent
@@ -15253,6 +15253,15 @@ fn planning_creds(
         (state.config.api_url.clone(), state.config.api_token.clone())
     };
     PlanningApiCreds::from_config(&api_url, &api_token).map_err(|e| e.to_method_err())
+}
+
+/// Daemon-routed project discovery (`GET /projects`). Uses the daemon's
+/// credentials so MCP callers need no direct API configuration. Read-only
+/// and callable by both Operator and Session, like `list_tasks`.
+pub fn list_projects(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
+    let creds = planning_creds(state_arc)?;
+    let projects = api_list_projects(&creds).map_err(|e| e.to_method_err())?;
+    Ok(Value::Array(projects))
 }
 
 #[derive(Default, Deserialize)]

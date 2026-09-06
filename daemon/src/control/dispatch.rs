@@ -310,6 +310,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "workflow.get_state",
     "list_workflows",
     "list_subtasks",
+    "list_projects",
     "list_tasks",
     "get_task",
     "backtest.result",
@@ -720,6 +721,7 @@ pub fn dispatch_request(
         // forwarded to HTTP and rows are brief-projected before daemon framing.
         // (`get_current_task` is composed MCP-side from `ping` + `get_task`, so
         // it needs no method here.)
+        "list_projects" => DispatchOutcome::Done(dispatch_list_projects(state, req)),
         "list_tasks" => DispatchOutcome::Done(dispatch_list_tasks(state, req)),
         "get_task" => DispatchOutcome::Done(dispatch_get_task(state, req)),
 
@@ -949,6 +951,13 @@ fn dispatch_list_subtasks(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::list_subtasks(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_list_projects(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::list_projects(state) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -8932,6 +8941,74 @@ mod tests {
                 ws.worktree_path,
             );
         }
+    }
+
+    // ============================================================
+    // Planning project discovery
+    // ============================================================
+
+    #[test]
+    fn list_projects_uses_config_credentials_for_operator_and_session() {
+        let _g = crate::planning_client::test_env_lock();
+        let rows = r#"[{"name":"predictionTrading","repo_url":"https://example.com/trading"}]"#;
+        for request in [
+            operator_request("list_projects", serde_json::json!({})),
+            session_request("list_projects", serde_json::json!({}), "ts-projects"),
+        ] {
+            let (port, captured) =
+                crate::planning_client::spawn_stub_api_for_test(200, rows);
+            let state = state_with_session_in_workspace("ts-projects", "ws-projects");
+            {
+                let mut st = state.lock().unwrap();
+                st.config.api_url = format!("http://127.0.0.1:{}", port);
+                st.config.api_token = "projects-config-token".into();
+            }
+            let resp = dispatch_request(&state, &request).into_response();
+            assert!(resp.ok, "list_projects failed: {:?}", resp.error);
+            assert_eq!(
+                resp.result.unwrap(),
+                serde_json::from_str::<serde_json::Value>(rows).unwrap(),
+            );
+            assert_eq!(barrier_counts(&state), (0, 0), "project discovery is read-only");
+            let cap = captured.lock().unwrap();
+            assert_eq!(cap.method_and_path(), ("GET".into(), "/projects".into()));
+            assert_eq!(
+                cap.auth_header().as_deref(),
+                Some("Bearer projects-config-token"),
+            );
+        }
+    }
+
+    #[test]
+    fn list_projects_returns_empty_project_list() {
+        let _g = crate::planning_client::test_env_lock();
+        let (port, _) = crate::planning_client::spawn_stub_api_for_test(200, "[]");
+        let state = make_state();
+        set_stub_api_config(&state, port);
+        let resp = dispatch_request(
+            &state,
+            &operator_request("list_projects", serde_json::json!({})),
+        )
+        .into_response();
+        assert!(resp.ok, "list_projects failed: {:?}", resp.error);
+        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn list_projects_surfaces_api_error() {
+        let _g = crate::planning_client::test_env_lock();
+        let (port, _) = crate::planning_client::spawn_stub_api_for_test(503, "{}");
+        let state = make_state();
+        set_stub_api_config(&state, port);
+        let resp = dispatch_request(
+            &state,
+            &operator_request("list_projects", serde_json::json!({})),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("503"), "error: {}", err.message);
     }
 
     // ============================================================

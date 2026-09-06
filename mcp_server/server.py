@@ -290,8 +290,10 @@ def list_projects() -> list[dict]:
 
     Use this to discover valid project names before calling propose_task.
     """
-    client = PlanningClient()
-    return client.list_projects()
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        return control_client.call("list_projects", {}, socket_path=route.path)
+    return PlanningClient().list_projects()
 
 
 @mcp.tool()
