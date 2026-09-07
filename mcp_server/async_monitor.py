@@ -36,7 +36,7 @@ import secrets
 import sys
 import time
 
-from mcp_server import control_client
+from mcp_server import control_client, monitor_state
 from mcp_server.monitor import (
     _monitor_sessions,
     baseline_for,
@@ -89,12 +89,28 @@ def _log(msg: str) -> None:
     print(f"cm-monitor: {msg}", file=sys.stderr, flush=True)
 
 
+def persist_state() -> None:
+    """Publish all current monitors before claiming completion or delivering."""
+    for record in _MONITORS.values():
+        _refresh_delivery(record)
+    monitor_state.publish(_MONITORS)
+
+
+def _persist_best_effort() -> None:
+    try:
+        persist_state()
+    except (OSError, ValueError) as exc:
+        _log(f"durable monitor state unavailable ({type(exc).__name__}); drain remains blocked")
+
+
 def _active_monitors() -> list[dict]:
     return [m for m in _MONITORS.values() if m["state"] == "watching"]
 
 
 def _prune_finished() -> None:
-    done = [k for k, m in _MONITORS.items() if m["state"] != "watching"]
+    done = [k for k, m in _MONITORS.items()
+            if m["state"] not in ("watching", "fired")
+            and (m.get("task") is None or m["task"].done())]
     excess = len(done) - MAX_ACTIVE_MONITORS * 2
     for k in done[:max(0, excess)]:
         _MONITORS.pop(k, None)
@@ -232,6 +248,7 @@ def register_monitor(
             ):
                 _cancel_record(m)
                 m["state"] = "replaced"
+                _purge_inbox(m["caller"], m["monitor_id"])
 
     if len(_active_monitors()) >= MAX_ACTIVE_MONITORS:
         raise RegistrationError(
@@ -285,6 +302,11 @@ def register_monitor(
         "task": None,
     }
     _MONITORS[monitor_id] = record
+    try:
+        persist_state()
+    except (OSError, ValueError) as exc:
+        _MONITORS.pop(monitor_id, None)
+        raise RegistrationError("tracking_failed", "Could not persist the monitor obligation; no watch or notification was started.") from exc
     record["task"] = loop.create_task(
         _run_monitor(record, timeout_s=timeout_s),
         name=f"cm-monitor-{monitor_id}",
@@ -382,10 +404,12 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
                 await asyncio.sleep(5.0)
         record["result"] = result
         record["state"] = "fired"
+        persist_state()
         message = _format_fire_message(record, result)
         delivered = await _deliver_to_caller(record, message)
         record["delivered"] = delivered
         record["state"] = "delivered" if delivered else "undelivered"
+        persist_state()
         if not delivered:
             _log(
                 f"{monitor_id}: could not verify delivery to "
@@ -397,12 +421,16 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
         # cancelled mid-delivery ("fired") must not resurrect as
         # "undelivered" and keep sending. Only the auto-replace path's
         # "replaced" label survives.
-        if record["state"] != "replaced":
-            record["state"] = "cancelled"
+        if record["state"] not in ("replaced", "cancelled"):
+            # Event-loop/MCP shutdown is not an operator cancellation and
+            # must not erase an undelivered completion from the durable view.
+            record["state"] = "interrupted"
+        _persist_best_effort()
         raise
     except Exception as e:  # noqa: BLE001 — background task, never raise
         record["state"] = "error"
         record["error"] = str(e)
+        _persist_best_effort()
         _log(f"{monitor_id}: monitor loop crashed: {e!r}")
 
 
@@ -595,12 +623,17 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
     queue = Queue(record["caller"])
     event_id = f"monitor:{record['monitor_id']}"
     record["notification_id"] = event_id
+    # Preserve the drain obligation before publication, including a process
+    # shutdown or cancellation racing the native consumer's claim.
+    record["delivery_uncertain"] = True
+    persist_state()
     queue.publish(event_id, "session_monitor", message,
                   f"[cm-monitor {record['monitor_id']}")
     deadline = time.monotonic() + VERIFY_WINDOW_S
     while time.monotonic() < deadline:
         event = queue.get(event_id)
         record["delivery_status"] = event["status"]
+        record["delivery_uncertain"] = event["status"] not in {"observed", "cancelled"}
         if event["status"] == "observed":
             return True
         if event["status"] in {"uncertain", "cancelled"}:
@@ -647,6 +680,8 @@ def _cancel_record(m: dict) -> None:
     if event:
         m["delivery_status"] = event["status"]
         m["cancellation_retracted"] = event["status"] == "cancelled"
+        m["delivery_uncertain"] = event["status"] not in {"observed", "cancelled"}
+    _persist_best_effort()
 
 
 def cancel_monitor(monitor_id: str) -> dict:
@@ -692,10 +727,12 @@ def _refresh_delivery(m: dict) -> None:
             if event:
                 m["delivery_status"] = event["status"]
                 m["delivered"] = event["status"] == "observed"
-                if m["delivered"] and m["state"] == "undelivered":
+                m["delivery_uncertain"] = event["status"] not in {"observed", "cancelled"}
+                if m["delivered"] and m["state"] in {"undelivered", "interrupted", "error"}:
                     m["state"] = "delivered"
         except (OSError, ValueError):
             m["delivery_status"] = "state_unavailable"
+            m["delivery_uncertain"] = True
 
 
 def list_monitors() -> dict:
@@ -704,4 +741,9 @@ def list_monitors() -> dict:
     for m in _MONITORS.values():
         _refresh_delivery(m)
         out.append({k: v for k, v in m.items() if k != "task"})
-    return {"monitors": out}
+    try:
+        persist_state()
+        durable = monitor_state.read()
+    except (OSError, ValueError):
+        durable = {"available": False, "error": "Durable monitor journal is unreadable."}
+    return {"monitors": out, "durable": durable}

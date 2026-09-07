@@ -2682,6 +2682,7 @@ impl Drop for PendingSession {
 /// keeps the lock-then-clone-then-drop-then-write shape
 /// load-bearing.
 pub struct InputHandle {
+    session_uid: Option<String>,
     writer: SessionWriter,
     last_activity_at: SharedLastActivity,
     last_operator_input_at: SharedLastActivity,
@@ -2714,6 +2715,9 @@ impl InputHandle {
     /// deadlock the exec sequence's post-freeze state-lock holds),
     /// not just for RPC latency.
     pub fn write_and_stamp(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
         {
             let _permit = crate::writer_gate::write_permit();
             let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
@@ -2732,6 +2736,15 @@ impl InputHandle {
     /// than ~2.5s later when the thread's first write stamps. (The thread
     /// also stamps on each of its writes; this is the immediate signal.)
     pub fn stamp_activity(&self) {
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        // Some callers stamp while holding DaemonState. Never wait for a
+        // retirement writer that needs that state to validate completion.
+        let _fence = match gate.as_ref().map(|g| g.try_read()) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(_)) => return,
+            None => None,
+        };
+        if self.session_uid.as_deref().is_some_and(|uid| crate::continuous::retirement::ensure_open(uid).is_err()) { return; }
         stamp_now(&self.last_activity_at);
         stamp_now(&self.last_input_at);
     }
@@ -2780,6 +2793,7 @@ impl InputHandle {
     #[cfg(test)]
     pub(crate) fn test_handle() -> Self {
         InputHandle {
+            session_uid: None,
             writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
             last_activity_at: Arc::new(Mutex::new(None)),
             last_operator_input_at: Arc::new(Mutex::new(None)),
@@ -2810,6 +2824,7 @@ impl InputHandle {
         let captured: Arc<Mutex<Vec<(Instant, Vec<u8>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let handle = InputHandle {
+            session_uid: None,
             writer: Arc::new(Mutex::new(Box::new(CapturingWriter(
                 Arc::clone(&captured),
             )))),
@@ -2839,6 +2854,7 @@ impl DaemonSession {
     /// PTY writes don't stall other daemon RPCs.
     pub fn input_handle(&self) -> InputHandle {
         InputHandle {
+            session_uid: Some(self.uid.clone()),
             writer: Arc::clone(&self.writer),
             last_activity_at: Arc::clone(&self.last_activity_at),
             last_operator_input_at: Arc::clone(&self.last_operator_input_at),

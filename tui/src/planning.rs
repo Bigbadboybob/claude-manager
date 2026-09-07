@@ -342,8 +342,8 @@ struct ProjectData {
 #[derive(Clone, Copy, PartialEq)]
 enum NewProjectField { Name, RepoUrl }
 
-/// Agent engine chosen in the planning launch dialogs (`A-l` / `A-f`).
-/// Claude is the default; `←/→` cycles. Only the two agent engines are
+/// Agent engine chosen in the workspace and planning launch dialogs.
+/// Codex is the default; `←/→` cycles. Only the two agent engines are
 /// offered — a planning launch always delivers the task prompt to an
 /// agent, so `bash` (the third session type elsewhere in the TUI) has
 /// no meaning here.
@@ -364,7 +364,7 @@ impl LaunchEngine {
         }
     }
 
-    fn cycle(self) -> Self {
+    pub(crate) fn cycle(self) -> Self {
         match self {
             LaunchEngine::Claude => LaunchEngine::Codex,
             LaunchEngine::Codex => LaunchEngine::Claude,
@@ -374,14 +374,14 @@ impl LaunchEngine {
 
 impl Default for LaunchEngine {
     fn default() -> Self {
-        LaunchEngine::Claude
+        LaunchEngine::Codex
     }
 }
 
-/// The `Engine: [claude]  codex` row shared by both launch dialogs.
+/// The `Engine: [claude]  codex` row shared by the launch dialogs.
 /// Selected option is bracketed + bold so it reads at a glance in the
 /// same style as the other in-place cyclers (A-e color pickers).
-fn engine_line(engine: LaunchEngine) -> Line<'static> {
+pub(crate) fn engine_line(engine: LaunchEngine) -> Line<'static> {
     let dim = Style::default().fg(theme::DIM);
     let mut spans = vec![Span::styled("  Engine: ", dim)];
     for (i, opt) in [LaunchEngine::Claude, LaunchEngine::Codex].iter().enumerate() {
@@ -5506,15 +5506,14 @@ mod tests {
         view
     }
 
-    /// Default is Claude, and ←/→ toggles to Codex. The chosen engine
-    /// rides out on the `LaunchTask` action — the launch site spawns
-    /// that session_type instead of the old hardcoded "claude".
+    /// Default is Codex, and ←/→ toggles to Claude. The chosen engine
+    /// rides out on the `LaunchTask` action so the launch site honors it.
     #[test]
-    fn launch_confirm_engine_defaults_claude_and_arrow_toggles() {
+    fn launch_confirm_engine_defaults_codex_and_arrow_toggles() {
         use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
         let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
 
-        // Untouched → claude.
+        // Untouched → codex.
         let mut view = view_with_one_task();
         view.input_mode = PlanInputMode::LaunchConfirm {
             project_idx: 0,
@@ -5524,13 +5523,13 @@ mod tests {
         };
         match view.handle_event(&key(KeyCode::Enter)) {
             PlanAction::LaunchTask { engine, .. } => {
-                assert_eq!(engine, LaunchEngine::Claude, "default engine is claude");
-                assert_eq!(engine.as_session_type(), "claude");
+                assert_eq!(engine, LaunchEngine::Codex, "default engine is codex");
+                assert_eq!(engine.as_session_type(), "codex");
             }
             other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
         }
 
-        // One → (or ←) → codex.
+        // One → (or ←) → claude.
         for toggle in [KeyCode::Right, KeyCode::Left, KeyCode::Tab] {
             let mut view = view_with_one_task();
             view.input_mode = PlanInputMode::LaunchConfirm {
@@ -5542,8 +5541,8 @@ mod tests {
             view.handle_event(&key(toggle));
             match view.handle_event(&key(KeyCode::Enter)) {
                 PlanAction::LaunchTask { engine, .. } => {
-                    assert_eq!(engine, LaunchEngine::Codex, "{:?} must select codex", toggle);
-                    assert_eq!(engine.as_session_type(), "codex");
+                    assert_eq!(engine, LaunchEngine::Claude, "{:?} must select claude", toggle);
+                    assert_eq!(engine.as_session_type(), "claude");
                 }
                 other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
             }
@@ -5573,7 +5572,7 @@ mod tests {
         match view.handle_event(&enter) {
             PlanAction::LaunchTask { branch, engine, .. } => {
                 assert_eq!(branch.as_deref(), Some("hjkl"));
-                assert_eq!(engine, LaunchEngine::Claude, "letters must not cycle engine");
+                assert_eq!(engine, LaunchEngine::Codex, "letters must not cycle engine");
             }
             other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
         }
@@ -5596,14 +5595,14 @@ mod tests {
         view.handle_event(&key(KeyCode::Enter));
         match view.input_mode {
             PlanInputMode::LaunchConfirm { engine, .. } => {
-                assert_eq!(engine, LaunchEngine::Codex, "engine carries into LaunchConfirm");
+                assert_eq!(engine, LaunchEngine::Claude, "engine carries into LaunchConfirm");
             }
             _ => panic!("expected LaunchConfirm after selecting 'New workspace'"),
         }
     }
 
     /// The existing-workspace route honors the picker's engine too, so
-    /// both launch paths can start a codex worker.
+    /// both launch paths can start a claude worker.
     #[test]
     fn workspace_picker_engine_rides_into_existing_workspace_launch() {
         use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
@@ -5625,7 +5624,7 @@ mod tests {
         match view.handle_event(&key(KeyCode::Enter)) {
             PlanAction::LaunchTaskIntoWorkspace { engine, workspace_id, .. } => {
                 assert_eq!(workspace_id, "ws-1");
-                assert_eq!(engine, LaunchEngine::Codex);
+                assert_eq!(engine, LaunchEngine::Claude);
             }
             other => panic!(
                 "expected LaunchTaskIntoWorkspace, got {:?}",

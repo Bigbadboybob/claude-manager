@@ -141,9 +141,14 @@ already-published legacy inbox files during rollout. New notifications never use
 that inbox. Old ambiguous terminal/hook attempts are not replayed through the
 new native transport.
 
-Session **watch registration** remains MCP-process-resident, as before. Completed
-notification envelopes survive MCP restarts; still-running watches and the full
-in-memory monitor-result registry do not become daemon-resident in this change.
+Session **watch registration** remains MCP-process-resident. Completed
+notification envelopes survive MCP restarts; still-running watches do not become
+daemon-resident. Main's durable monitor-obligation journal retains unfinished
+watches and results for continuous-task drain checks. Native receipts reconcile
+late deliveries from current and previous MCP producers when the journal is
+published (including reconnect, `list_monitors`, and drain checkpoint). Cancelling
+an already claimed notice leaves an outstanding obligation until receipt is
+observed; neither reconnect nor cancellation erases uncertain legacy delivery.
 
 ## Installation and validation
 

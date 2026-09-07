@@ -218,6 +218,16 @@ pub fn try_rebind(
     snapshot: &[String],
 ) -> Result<Option<String>, PersistError> {
     let discovered = discover_rebind(engine, worktree, snapshot);
+    try_rebind_discovered(run_id, role, discovered)
+}
+
+/// Bind an independently verified candidate. The Codex finalizer supplies the
+/// live role process's rollout instead of guessing from a shared-directory diff.
+pub(crate) fn try_rebind_discovered(
+    run_id: &str,
+    role: &str,
+    discovered: Option<String>,
+) -> Result<Option<String>, PersistError> {
     let mut bound: Option<String> = None;
     run::modify(run_id, |r| {
         if let Some(b) = r.role_sessions.get_mut(role) {

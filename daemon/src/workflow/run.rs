@@ -243,10 +243,22 @@ pub struct PendingActivation {
     pub pre_clear_snapshot: Option<Vec<String>>,
     /// Unix-ms deadline after which the currently-pending Enter keystroke
     /// (`/clear`'s in `ClearBodySent`, the prompt's in `BodySent`) should fire.
+    /// A Codex redelivery also uses this deadline for its composer-clear/body gap.
     /// The Enter ENCODING is NOT frozen — it is recomputed from the live
     /// terminal mode at fire time. Persisted so a restart mid-gap still fires.
     #[serde(default)]
     pub enter_fire_at_ms: Option<u64>,
+    /// Bounded post-clear Codex delivery recovery. Persisted so restart cannot
+    /// reset the retry budget or resend a prompt whose new rollout appeared.
+    #[serde(default)]
+    pub codex_delivery: Option<CodexDeliveryConfirmation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodexDeliveryConfirmation {
+    pub started_at_ms: u64,
+    pub enter_retries: usize,
+    pub redelivered: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

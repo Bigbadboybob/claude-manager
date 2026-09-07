@@ -270,6 +270,10 @@ impl QueueClient {
             .map_err(|e| PlanningClientError::Transport(format!("decode stats: {}", e)))
     }
 
+    pub fn recover_item(&self, queue: &str, item_id: &str, claimed_by: &str, recovery_key: &str) -> Result<serde_json::Value, PlanningClientError> {
+        self.post_json(&format!("/queues/{queue}/recover"), &serde_json::json!({"item_id":item_id,"claimed_by":claimed_by,"recovery_key":recovery_key}))
+    }
+
     /// `POST /queues/{queue}/claim` — atomically claim up to `max_items`
     /// oldest pending items (`claimed_by` is the audit label, `<task>#<seq>`).
     pub fn claim(

@@ -689,6 +689,11 @@ pub fn codex_overrides(
         ),
         "-c".into(),
         format!(r#"mcp_servers.claude-manager.env={{{}}}"#, env_toml),
+        // Codex does not inherit arbitrary process variables into MCP
+        // children. Forward the daemon's fresh/resumed coverage decision;
+        // absence must remain absence for older launchers and sessions.
+        "-c".into(),
+        r#"mcp_servers.claude-manager.env_vars=["CM_MONITOR_TRACKING_V1"]"#.into(),
     ]
 }
 
@@ -1721,6 +1726,8 @@ mod tests {
             args.iter().any(|a| a.contains("ts-codex-1")),
             "codex overrides must reference session uid",
         );
+        assert!(args.iter().any(|a| a ==
+            r#"mcp_servers.claude-manager.env_vars=["CM_MONITOR_TRACKING_V1"]"#));
     }
 
     #[test]

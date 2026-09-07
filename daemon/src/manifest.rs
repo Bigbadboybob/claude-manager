@@ -583,6 +583,33 @@ pub struct Manifest {
     /// as the session/workspace `color` fields).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub task_colors: HashMap<String, String>,
+    /// Sidebar sections (doc/sidebar-sections.md): Owner-created,
+    /// collapsible groups of workspaces in the Sessions view's Task
+    /// sub-view, in display order. Pure TUI display state — the daemon
+    /// never reads them; they ride this struct because `tui-sessions.json`
+    /// shares it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<SidebarSection>,
+    /// Explicit `workspace_id` → `section_id` assignments. A workspace
+    /// absent here inherits its section through the task tree (a subtask
+    /// renders under its parent's section) or renders loose.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub workspace_sections: HashMap<String, String>,
+}
+
+/// One sidebar section (see `Manifest::sections`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarSection {
+    /// Stable id (`sec-<hex nanos>`); assignments key off it so renames
+    /// never orphan members.
+    pub id: String,
+    pub name: String,
+    /// Accent color — a name from the TUI's `USER_COLORS` palette.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Collapsed to its header line. Persisted so a fold survives restarts.
+    #[serde(default)]
+    pub folded: bool,
 }
 
 #[cfg(test)]
@@ -626,6 +653,30 @@ mod tests {
         assert_eq!(w.color.as_deref(), Some("cyan"));
         assert!(w.pinned);
         assert_eq!(back.task_colors.get("t1").map(String::as_str), Some("red"));
+    }
+
+    #[test]
+    fn sections_default_empty_and_round_trip() {
+        let legacy = r#"{"workspaces":{}}"#;
+        let m: Manifest = serde_json::from_str(legacy).unwrap();
+        assert!(m.sections.is_empty());
+        assert!(m.workspace_sections.is_empty());
+        // Empty sections serialize to nothing — legacy files stay byte-stable.
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(!s.contains("sections"));
+
+        let mut m2 = m.clone();
+        m2.sections.push(SidebarSection {
+            id: "sec-1".into(),
+            name: "Project X".into(),
+            color: Some("blue".into()),
+            folded: true,
+        });
+        m2.workspace_sections.insert("ws-a".into(), "sec-1".into());
+        let s = serde_json::to_string(&m2).unwrap();
+        let back: Manifest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.sections, m2.sections);
+        assert_eq!(back.workspace_sections.get("ws-a").map(String::as_str), Some("sec-1"));
     }
 
     #[test]

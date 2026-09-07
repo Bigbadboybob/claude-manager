@@ -4,7 +4,7 @@ description = "Worker implements; reviewer audits unstaged changes; manager deci
 role_order = ["worker", "reviewer", "manager"]
 
 [roles.worker]
-engine = "claude-code"
+engine = "codex"
 context = "persistent"
 # Worker hands off via static `on_idle` to reviewer — never calls workflow MCP
 # tools itself. Keeping needs_mcp=false means launching the workflow on an
@@ -22,7 +22,7 @@ Report a finding only when you're at least 80% confident it's a real issue AND i
 {{ rejected_findings }}"""
 
 [roles.manager]
-engine = "claude-code"
+engine = "codex"
 context = "persistent"
 activation_prompt = """You are the manager of a feedback-mode workflow. Your job is to decide whether iteration should continue, always judging against the ORIGINAL GOAL. Keep that goal front of mind every round — don't let scope creep in from the reviewer's nits.
 

@@ -4,7 +4,7 @@ description = "Designer writes a design doc; reviewer audits it; manager decides
 role_order = ["designer", "reviewer", "manager"]
 
 [roles.designer]
-engine = "claude-code"
+engine = "codex"
 context = "persistent"
 # Designer calls `update_task` at the end of /design-doc to attach the bundle
 # metadata (design_doc_path, designer_session_uid). MCP must be wired.
@@ -43,7 +43,7 @@ Only report findings you're at least 80% confident are real issues. Skip nitpick
 """
 
 [roles.manager]
-engine = "claude-code"
+engine = "codex"
 context = "persistent"
 activation_prompt = """You are the manager of a design-doc workflow. Your job is to decide whether the doc needs another round with the designer, or whether it's good to hand back to the user.
 

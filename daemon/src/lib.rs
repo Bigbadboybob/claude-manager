@@ -577,7 +577,7 @@ pub fn run() -> anyhow::Result<()> {
     // On a re-exec handoff every child survived by construction: hand the
     // sweep the manifest's pid+starttime-verified uids so survivors the argv
     // probe can't see (bash-engine runs) are re-adopted, not falsely closed.
-    let handoff_survivors: std::collections::HashSet<String> = reexec_handoff
+    let mut handoff_survivors: std::collections::HashSet<String> = reexec_handoff
         .as_ref()
         .map(|escrow| {
             escrow
@@ -593,6 +593,15 @@ pub fn run() -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    // Split-mode brains have no legacy re-exec escrow. The holder already
+    // supplied the surviving processes in its early adopt handshake; use
+    // their verified identities before the orphan sweep, not only later
+    // when constructing DaemonSessions. Codex argv no longer contains the
+    // legacy /mcp/<uid>/ marker, so the fallback process scan cannot rescue
+    // these live runs by itself.
+    if let Some(boot) = holder_boot.as_ref() {
+        handoff_survivors.extend(boot.live_session_uids());
+    }
     continuous::startup_orphan_sweep(&handoff_survivors);
 
     let path = default_socket_path();

@@ -1,0 +1,4 @@
+{"thread_id": "01a0792c-c3ec-7041-92ae-07b4826e625f", "type": "thread.started"}
+{"type": "turn.started"}
+{"message": "unexpected status 404 Not Found: CM fixture error, url: http://127.0.0.1:45751/v1/responses", "type": "error"}
+{"error": {"message": "unexpected status 404 Not Found: CM fixture error, url: http://127.0.0.1:45751/v1/responses"}, "type": "turn.failed"}

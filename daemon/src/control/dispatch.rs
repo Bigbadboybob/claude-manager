@@ -315,6 +315,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "get_task",
     "backtest.result",
     "continuous.list",
+    "continuous.context",
     "continuous.dispatch_pending",
     "queue.stats",
 ];
@@ -779,6 +780,14 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_continuous_dispatch_pending(state, req))
         }
         "continuous.pause" => DispatchOutcome::Done(dispatch_continuous_pause(state, req)),
+        "continuous.drain" => DispatchOutcome::Done(dispatch_continuous_drain(state, req)),
+        "continuous.migration_preview" => DispatchOutcome::Done(dispatch_continuous_migration(state, req)),
+        "continuous.reconcile" => DispatchOutcome::Done(dispatch_continuous_migration(state, req)),
+        "continuous.retire" => DispatchOutcome::Done(dispatch_continuous_migration(state, req)),
+        "continuous.migrate_engine" => DispatchOutcome::Done(dispatch_continuous_migration(state, req)),
+        "continuous.context" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
+        "continuous.ack_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
+        "continuous.checkpoint_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
         "continuous.force_done" => {
@@ -1144,6 +1153,14 @@ fn dispatch_continuous_create(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
 /// `continuous.update` — Operator-only in-place edit of a live task's mutable
 /// config (`compact_every`, `default_prompt`, schedule, …) without the
 /// delete+recreate that would lose run history and kill the session.
+fn dispatch_continuous_migration(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(response) = require_operator(req, "Continuous migration and reconciliation are operator-only") { return response; }
+    match crate::continuous::migration::handle(state, &req.method, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 fn dispatch_continuous_update(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     if let Err(resp) = require_operator(
         req,
@@ -1205,6 +1222,23 @@ fn dispatch_continuous_pause(state: &Arc<Mutex<DaemonState>>, req: &Request) -> 
         return resp;
     }
     match methods::continuous_pause(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_continuous_receipt(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match super::continuous_drain::handle(state, &req.caller, &req.method, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_continuous_drain(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "continuous.drain is Operator-callable only") {
+        return resp;
+    }
+    match methods::continuous_drain(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -2754,6 +2788,7 @@ mod tests {
             "workflow_transition",
             "trigger",
             "continuous.run_now",
+            "continuous.drain",
             "attach.open",
             "manifest.watch",
             "events.subscribe",
@@ -2783,6 +2818,20 @@ mod tests {
                 m
             );
         }
+    }
+
+    #[test]
+    fn continuous_drain_rejects_session_callers_before_task_lookup() {
+        let state = make_state();
+        let response = dispatch_continuous_drain(
+            &state,
+            &session_request(
+                "continuous.drain",
+                serde_json::json!({"task_id": "missing"}),
+                "worker",
+            ),
+        );
+        assert_eq!(response.error.unwrap().code, ErrorCode::Unauthorized);
     }
 
     // --- daemon.reexec_dev (DESIGN_SEAMLESS_RESTART phase 3b) ----------

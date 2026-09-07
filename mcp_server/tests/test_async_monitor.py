@@ -64,7 +64,7 @@ class _MonitorEnv(unittest.TestCase):
         self.rotate_on_deliver = False
         control_client.call = self._fake_call
         self._env = mock.patch.dict(
-            os.environ, {"CM_TUI_SESSION_ID": self.CALLER, "HOME": self.tmp.name}
+            os.environ, {"CM_TUI_SESSION_ID": self.CALLER, "HOME": self.tmp.name, "CM_MONITOR_TRACKING_V1": "1"}
         )
         self._env.start()
         original_publish = notifications.Queue.publish
@@ -201,6 +201,7 @@ class RegisterAndFireTests(_MonitorEnv):
         listed = async_monitor.list_monitors()["monitors"][0]
         self.assertEqual(listed["state"], "delivered")
         self.assertTrue(listed["delivered"])
+        self.assertFalse(listed["delivery_uncertain"])
         self.assertEqual(len(self.sent), 1)
 
     def test_auto_source_replaces_same_target_watch(self):
@@ -591,3 +592,82 @@ class FireMessageFormatTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DurableMonitorTests(_MonitorEnv):
+    def test_tracking_failure_prevents_registering_or_sending(self):
+        async def scenario():
+            with mock.patch.object(async_monitor, "persist_state", side_effect=OSError("disk full")):
+                with self.assertRaises(async_monitor.RegistrationError):
+                    async_monitor.register_monitor([self.WORKER], edge=False)
+            self.assertEqual(async_monitor._MONITORS, {})
+        asyncio.run(scenario())
+        self.assertEqual(self.sent, [])
+
+    def test_tracking_failure_before_delivery_prevents_queued_input(self):
+        real_publish = async_monitor.persist_state
+        writes = 0
+
+        def publish():
+            nonlocal writes
+            writes += 1
+            if writes == 3:  # registered, fired/result, then pre-send uncertainty
+                raise OSError("disk full")
+            real_publish()
+
+        async def scenario():
+            with mock.patch.object(async_monitor, "persist_state", publish):
+                reg = async_monitor.register_monitor([self.WORKER], edge=False)
+                rec = async_monitor._MONITORS[reg["monitor_id"]]
+                await rec["task"]
+                return rec
+        rec = asyncio.run(scenario())
+        self.assertEqual(rec["state"], "error")
+        self.assertEqual(self.sent, [])
+        journal = async_monitor.list_monitors()["durable"]
+        persisted = journal["producers"][async_monitor.monitor_state.PRODUCER_ID]["records"][rec["monitor_id"]]
+        self.assertEqual(persisted["state"], "error")
+
+    def test_native_submission_without_receipt_remains_unsettled(self):
+        self.deliver_on_send = False
+
+        async def scenario():
+            reg = async_monitor.register_monitor([self.WORKER], edge=False)
+            rec = async_monitor._MONITORS[reg["monitor_id"]]
+            queue = notifications.Queue(self.CALLER)
+            for _ in range(100):
+                if queue.get(f"monitor:{reg['monitor_id']}"):
+                    break
+                await asyncio.sleep(0.01)
+            queue.change(rec["notification_id"], {"pending"}, status="submitted")
+            await rec["task"]
+            return rec
+        rec = asyncio.run(scenario())
+        self.assertEqual(rec["state"], "undelivered")
+        self.assertTrue(rec["delivery_uncertain"])
+        self.assertEqual(len(self.sent), 1)
+        persisted = async_monitor.list_monitors()["durable"]["producers"][
+            async_monitor.monitor_state.PRODUCER_ID]["records"][rec["monitor_id"]]
+        self.assertTrue(persisted["delivery_uncertain"])
+
+    def test_event_loop_shutdown_retains_interrupted_watch(self):
+        async def scenario():
+            reg = async_monitor.register_monitor([self.WORKER], edge=True)
+            await asyncio.sleep(0.02)
+            return reg["monitor_id"]
+        monitor_id = asyncio.run(scenario())
+        journal = async_monitor.list_monitors()["durable"]
+        record = journal["producers"][async_monitor.monitor_state.PRODUCER_ID]["records"][monitor_id]
+        self.assertEqual(record["state"], "interrupted")
+        self.assertEqual(self.sent, [])
+
+    def test_transcript_verified_delivery_is_durably_settled(self):
+        async def scenario():
+            reg = async_monitor.register_monitor([self.WORKER], edge=False)
+            await async_monitor._MONITORS[reg["monitor_id"]]["task"]
+            return reg["monitor_id"]
+        monitor_id = asyncio.run(scenario())
+        journal = async_monitor.list_monitors()["durable"]
+        record = journal["producers"][async_monitor.monitor_state.PRODUCER_ID]["records"][monitor_id]
+        self.assertEqual(record["state"], "delivered")
+        self.assertFalse(record["delivery_uncertain"])
