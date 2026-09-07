@@ -290,6 +290,12 @@ Every capability delivered to agents in A or B has an Owner TUI equivalent at th
 
 ## Milestones
 
+For Owner's current release order after A/B, see the [follow-up roadmap](doc/messaging/ROADMAP.md):
+native notifications, tagging with explicit channel membership, then a separate
+Owner overview of all channels and agent DMs. The overview is planned and changes
+the earlier Owner DM visibility decision; deployed access rules remain unchanged
+until that slice ships.
+
 ### A — Useful single-host conversation
 
 Implement in dependency order: persisted daemon identity and envelope/store, session-name migration, six MCP tools, Owner Messages read/compose UI, then basic durable wake attempts. This is a complete vertical feature slice, not a storage-only delivery. Shared norms are initialized canonically and supplied inline; first sends do not require opening context first.

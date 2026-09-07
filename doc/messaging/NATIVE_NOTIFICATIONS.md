@@ -6,9 +6,9 @@ sessions run a CM-owned app-server with the ordinary Codex remote terminal UI.
 Neither notification path types into a terminal. `notify_user` still sends
 human-facing desktop/sidebar alerts.
 
-This implementation is on the messaging branch; installing it does not migrate
-an already running embedded Codex process. Channel membership and tagging UX
-are separate follow-up work.
+Installing this implementation does not migrate an already running embedded
+Codex process. Channel membership, tagging UX, and an Owner overview of all
+conversations are [separate follow-up work](ROADMAP.md).
 
 ## Agent usage
 
@@ -191,17 +191,15 @@ checked separately. See [research and interface evidence](NATIVE_DELIVERY_RESEAR
 | Full daemon library suite, serial execution | 1,247 passed; 4 ignored |
 | TUI launch/configuration suite | 19 passed |
 | Focused native queue, monitors, hooks and messaging Python suite | 55 passed |
-| Broad Python suite | 326 passed; two failures reproduced on unchanged `7cd8c53` |
+| Broad Python suite after baseline fixes | 329 passed; no failures |
 | Real Claude + actual CM MCP child, local mock model | Idle draft preserved; active command and explicit approval preserved; native receipts observed in all three cases |
 | Real Codex + owned launcher, local mock model | Draft preserved; active checkpoint delivery; approval forwarding; reconnect and exact thread selection passed |
 | Real holder + daemon + owned Codex | Brain SIGKILL preserved launcher/thread/transcript; wakes before and after passed; session kill stopped the launcher and its owned descendants |
 | Configured local Codex LB | Native tool-output turn and receipt passed, including the supervised backend |
 
-The two baseline Python failures are
-`test_dispatch_health_logging.CheckVmAliveLoggingTest.test_missing_google_libs_logs_warning_returns_false`
-and `test_socket_route_selection.DaemonMethodsAlignmentTests.test_daemon_methods_matches_dispatch_arms`.
-They were reproduced from a separate archive of the unchanged commit; this
-implementation does not modify either subsystem's routing/logging behavior.
+The two baseline Python failures were fixed in `71c010d`: the missing-Google-library
+test now blocks imports deterministically, and Python's routing table includes
+the daemon's 11 previously omitted operator RPCs.
 
 Local mock idle delivery reached Claude model context in about 67–141 ms;
 Codex's native receipt was observed in about 52–134 ms. These are fixture
