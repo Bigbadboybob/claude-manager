@@ -441,6 +441,8 @@ impl App {
             self.messages.reveal_selection = false;
         }
         *scroll = (*scroll).min(lines.len().saturating_sub(height));
+        let selected_top = selected_range.0.saturating_sub(*scroll).min(height);
+        let selected_bottom = selected_range.1.saturating_sub(*scroll).min(height);
         let visible = lines
             .into_iter()
             .skip(*scroll)
@@ -452,6 +454,13 @@ impl App {
                 .style(Style::default().bg(theme::CHAT_PANEL))
                 .block(chat_block(title, focused)),
             area,
+        );
+        // Paragraph line styles stop at the final glyph. Fill the selected
+        // message's visible rows too, including empty lines and trailing space.
+        frame.buffer_mut().set_style(
+            Rect::new(inner.x, inner.y + selected_top as u16, inner.width,
+                (selected_bottom - selected_top) as u16),
+            Style::default().bg(theme::CHAT_SELECTION),
         );
     }
 }
