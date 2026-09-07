@@ -108,7 +108,11 @@ impl Store {
                 return Err(err("not_found", "Conversation not found"));
             }
             if let Some(members) = self.conversations.get(id) {
-                scope.peer = members.iter().find(|m| m.as_str() != actor).cloned();
+                if members.len() == 2 {
+                    scope.peer = members.iter().find(|m| m.as_str() != actor).cloned();
+                } else {
+                    scope.conversation = Some(id.into());
+                }
             } else if let Some((path, _)) = self.channels.iter().find(|(_, cid)| cid.as_str() == id)
             {
                 scope.channel = Some(path.clone());
@@ -177,7 +181,7 @@ impl Store {
             if !self
                 .conversations
                 .get(cid)
-                .is_some_and(|members| members.contains(peer) && members.iter().any(|m| m == actor))
+                .is_some_and(|members| members.len() == 2 && members.contains(peer) && members.iter().any(|m| m == actor))
             {
                 return false;
             }

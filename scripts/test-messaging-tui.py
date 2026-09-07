@@ -38,15 +38,15 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
     screen = pyte.Screen(80, 24)
     stream = pyte.ByteStream(screen)
 
-    def rpc(method, params={}):
+    def rpc(method, params={}, *, session=None, raw=False):
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(8)
             s.connect(str(home / "d.sock"))
             body = json.dumps(
                 {
                     "id": "preview",
-                    "caller": {"token_id": "preview-token"},
-                    "method": "messaging." + method,
+                    "caller": {"session_uid": session} if session else {"token_id": "preview-token"},
+                    "method": method if raw else "messaging." + method,
                     "params": params,
                 }
             ).encode()
@@ -142,6 +142,12 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
                 time.sleep(0.05)
             initial = rpc("norms", {"action": "read"})
             initial_text = initial["text"]
+            # Registered fixture identities only: no model/PTY sessions are spawned.
+            fixtures = [{"uid": uid, "label": name} for uid, name in [("alpha", "Alpha"), ("beta", "Beta")]]
+            rpc("tui.update_sessions_snapshot", {"sessions": fixtures}, raw=True)
+            people = {p["session_uid"]: p["id"] for p in rpc("people")["items"] if p.get("session_uid")}
+            rpc("send", {"channel": "general", "name": "Alpha", "body": "Oldest full message.\nSecond paragraph stays visible.", "request_id": "timeline-a"}, session="alpha")
+            rpc("send", {"channel": "general", "name": "Beta", "body": "Newest full message.", "mentions": ["owner"], "request_id": "timeline-b"}, session="beta")
             tui = subprocess.Popen(
                 [str(release / "claude-manager-tui")],
                 env=env,
@@ -155,7 +161,47 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             drain(2)
             key(b"\x1bm", 1)
             assert "Messages" in screen.display[0]
-            key(b"jjj\r", 0.8)
+            key(b"\t", 0.4)
+            wait_text("Second paragraph stays visible.")
+            assert visible().index("Oldest full message.") < visible().index("Newest full message.")
+            assert "● @you" in visible()
+            assert not any("Alpha" in row[:24] for row in screen.display[1:-3])
+            shot("cm-chat-conversation-timeline")
+            # Go beyond a read page, navigate with k, and keep live updates
+            # while reading earlier history without jumping to the newest post.
+            for i in range(25):
+                rpc("send", {"channel": "general", "body": f"History item {i:02}", "request_id": f"history-{i}"})
+            key(b"g", 0.8)
+            key(b"k" * 27, 1.0)
+            wait_text("Oldest full message.")
+            for i in range(25):
+                rpc("send", {"channel": "general", "body": f"Burst item {i:02}", "request_id": f"burst-{i}"})
+            rpc("send", {"channel": "general", "body": "Arrived while reading history", "request_id": "while-reading"})
+            drain(3.5)
+            assert "Oldest full message." in visible(), "Refresh moved the selected message"
+            wait_text("53 messages")
+            key(b"j" * 60, 0.8)
+            wait_text("Arrived while reading history")
+            key(b"dAlpha\t", 0.6)
+            key(b"\x7f" * 5 + b"Beta\t", 0.6)
+            wait_text("Recipients: Alpha, Beta")
+            shot("cm-chat-conversation-picker")
+            key(b"\r", 0.8)
+            assert rpc("dms")["items"] == [], "Opening a group draft created a DM"
+            key(b"Group kickoff.\x13", 0.8)
+            wait_text("Group kickoff.")
+            groups = rpc("dms")["items"]
+            assert len(groups) == 1 and groups[0]["group"] and len(groups[0]["members"]) == 3, groups
+            rpc("tui.update_sessions_snapshot", {"sessions": fixtures}, raw=True)
+            rpc("send", {"conversation": groups[0]["id"], "body": "Group reply to Owner.", "request_id": "group-reply"}, session="alpha")
+            key(b"g", 0.8)
+            wait_text("● DM")
+            shot("cm-chat-conversation-group")
+            key(b"\t" + b"j" * 30 + b"k\r", 0.6)
+            assert not any("Alpha" in row[:24] for row in screen.display[1:-3]), visible()
+            key(b"\r", 0.3)
+            assert any("Alpha" in row[:24] for row in screen.display[1:-3]), visible()
+            key(b"k" * 30 + b"jj\r", 0.8)
             assert "Shared norms" in visible()
             for _ in range(28):
                 key(b"j", 0.04)
@@ -279,7 +325,7 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             tui.wait(timeout=5)
             assert tui.returncode == 0
             print(
-                "PASS: real release TUI norms acknowledge/publish/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
+                "PASS: timeline full messages/order/unread, searchable group creation/reply/collapse, real release TUI norms acknowledge/publish/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
                 flush=True,
             )
         except Exception:

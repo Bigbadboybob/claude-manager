@@ -277,3 +277,63 @@ fn messaging_first_dm_monitor_and_owner_bell_claim_survive_restart() {
     assert_eq!(s.attention("owner", true).unwrap()["ring"], false);
     assert_eq!(s.attention("owner", false).unwrap()["unread"], 2);
 }
+
+#[test]
+fn messaging_group_dms_are_canonical_private_and_survive_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a"); let b = person(&s, "b"); let c = person(&s, "c"); let outsider = person(&s, "outsider");
+    let people = vec![a.clone(), b.clone(), c.clone(), outsider.clone()];
+    assert!(s.read(&a.id, &json!({"dm":[b.id,c.id]}), &people).unwrap()["items"].as_array().unwrap().is_empty());
+    assert!(s.dms(&a.id,false).unwrap()["items"].as_array().unwrap().is_empty());
+    let first = post(&mut s,&a,json!({"dm":[c.id,b.id]}),"group first",&people);
+    let cid = first["event"]["conversation_id"].clone();
+    let retry = post(&mut s,&a,json!({"dm":[c.id,b.id]}),"group first",&people);
+    assert_eq!(first["event"]["id"],retry["event"]["id"]);
+    let reply = post(&mut s,&b,json!({"dm":[a.id,c.id]}),"group reply",&people);
+    assert_eq!(reply["event"]["conversation_id"],cid);
+    assert_eq!(s.dms(&c.id,true).unwrap()["items"][0]["unread"],2);
+    let listing=s.dms_page(&a.id,&json!({"peer":c.id})).unwrap();
+    assert_eq!(listing["items"][0]["members"].as_array().unwrap().len(),3);
+    assert_eq!(listing["items"][0]["peer"],Value::Null);
+    assert!(s.dms(&outsider.id,false).unwrap()["items"].as_array().unwrap().is_empty());
+    assert!(s.read(&outsider.id,&json!({"conversation":cid}),&people).is_err());
+    assert!(s.read("owner",&json!({"conversation":cid}),&people).is_err());
+    assert!(s.send(&outsider.id,"outsider","agent",&json!({"conversation":cid,"body":"intrude","request_id":"intrude","name":"Other"}),&people).is_err());
+    assert!(s.send(&a.id,"a","agent",&json!({"conversation":cid,"body":"mention","request_id":"mention","mentions":[outsider.id]}),&people).is_err());
+    let pair=post(&mut s,&a,json!({"dm":b.id}),"pair only",&people);
+    assert_ne!(cid,pair["event"]["conversation_id"]);
+    let wakes=s.wake_intents();
+    for uid in ["b","c"] { assert!(wakes[uid].iter().any(|w| w.event_id == first["event"]["id"].as_str().unwrap())); }
+    assert!(!wakes.contains_key("outsider"));
+    drop(s);
+    let mut restored=Store::open(tmp.path()).unwrap();
+    assert!(restored.degraded.is_none(),"{:?}",restored.degraded);
+    assert_eq!(restored.read(&c.id,&json!({"conversation":cid}),&people).unwrap()["items"].as_array().unwrap().len(),2);
+    for target in [json!([]),json!([a.id]),json!([b.id,b.id]),json!([b.id,42]),json!(["missing"])] {
+        assert!(restored.send(&a.id,"a","agent",&json!({"dm":target,"body":"invalid","request_id":"invalid"}),&people).is_err());
+    }
+}
+
+#[test]
+fn messaging_group_monitors_and_mutes_do_not_spill_into_other_dms() {
+    let tmp=tempfile::tempdir().unwrap(); let mut s=Store::open(tmp.path()).unwrap();
+    let a=person(&s,"a");let b=person(&s,"b");let c=person(&s,"c");
+    let people=vec![a.clone(),b.clone(),c.clone()];
+    let first=post(&mut s,&a,json!({"dm":[b.id,c.id]}),"start",&people);
+    let cid=first["event"]["conversation_id"].clone();
+    let group=s.register_monitor(&b.id,&json!({"scope":{"conversation":cid},"mode":"continuous","request_id":"group-watch"}),&people).unwrap();
+    let pair=s.register_monitor(&b.id,&json!({"scope":{"dm":a.id},"mode":"continuous","request_id":"pair-watch"}),&people).unwrap();
+    let all=s.register_monitor(&b.id,&json!({"scope":{"dms":true},"mode":"continuous","request_id":"all-watch"}),&people).unwrap();
+    post(&mut s,&a,json!({"dm":b.id}),"pair",&people);
+    post(&mut s,&c,json!({"conversation":cid}),"group",&people);
+    for (monitor,count) in [(&group,1),(&pair,1),(&all,2)] {
+        assert_eq!(s.monitors(&b.id,&json!({"action":"get","monitor_id":monitor["id"]})).unwrap()["monitor"]["hits"],count);
+    }
+    s.follow(&b.id,&json!({"action":"set","scope":{"conversation":cid},"muted":true,"request_id":"mute"}),&people).unwrap();
+    let group_msg=post(&mut s,&c,json!({"conversation":cid}),"muted group",&people);
+    let pair_msg=post(&mut s,&a,json!({"dm":b.id}),"unmuted pair",&people);
+    let wakes=s.wake_intents();
+    assert!(!wakes["b"].iter().any(|w| w.event_id == group_msg["event"]["id"].as_str().unwrap()));
+    assert!(wakes["b"].iter().any(|w| w.event_id == pair_msg["event"]["id"].as_str().unwrap()));
+}

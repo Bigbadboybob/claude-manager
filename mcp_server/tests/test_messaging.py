@@ -86,3 +86,10 @@ class MessagingToolsTests(unittest.TestCase):
             self.assertNotIn("expires_in", params)
             server.chat_norms(action="read", limit_chars=5)
             self.assertNotIn("ack_revision", call.call_args.args[1])
+
+    def test_group_dm_recipients_pass_through_without_losing_retry_identity(self):
+        with patch.object(control_client, "call", return_value={}) as call:
+            for fn, kwargs in [(server.chat_open, {}), (server.chat_read, {}),
+                               (server.chat_send, {"body": "Quick group reply", "request_id": "group-1"})]:
+                fn(dm=["agent-a", "agent-b"], **kwargs)
+                self.assertEqual(call.call_args.args[1]["dm"], ["agent-a", "agent-b"])

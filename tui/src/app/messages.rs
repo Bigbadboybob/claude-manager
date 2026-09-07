@@ -1,5 +1,6 @@
 //! Owner messaging view. Network work runs off the terminal event loop.
 mod manage;
+mod conversation;
 use super::*;
 use ratatui::widgets::Wrap;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ pub struct Draft {
 #[serde(default)]
 struct Saved {
     management: manage::SavedManagement,
+    dms_collapsed: bool,
     drafts: BTreeMap<String, Draft>,
     names: BTreeMap<String, (u64, String)>,
 }
@@ -58,6 +60,14 @@ pub struct Messages {
     daemon_id: String,
     space_id: String,
     body_scroll: u16,
+    timeline_scroll: usize,
+    timeline_size: (u16, u16),
+    reveal_selection: bool,
+    picker_selected: usize,
+    picker_members: Vec<String>,
+    append_older: bool,
+    select_older: bool,
+    loaded_target: Value,
     receipt: Value,
     pub settings_name: Option<(String, String, u64)>,
 }
@@ -134,7 +144,6 @@ impl Messages {
     fn menu_items(&self) -> Vec<(String, Value)> {
         let mut out = vec![
             ("Inbox".into(), json!({"inbox":true})),
-            ("New DMs".into(), json!({"dms":true,"unread_only":true})),
             (
                 "Needs Owner".into(),
                 json!({"channel":"*","tags":["needs-owner"]}),
@@ -157,25 +166,26 @@ impl Messages {
             ("Preferences".into(), json!({"preferences":true})),
         ];
         out.extend(self.channels.iter().map(|c| {
-            (
-                format!("#{}", c["path"].as_str().unwrap_or("?")),
-                json!({"channel":c["path"]}),
-            )
+            let unread = c["unread"].as_u64().unwrap_or(0);
+            let mentions = c["mentions"].as_u64().unwrap_or(0);
+            let badge = if mentions > 0 { format!(" @ {mentions}") }
+                else if unread > 0 { " ·".into() } else { String::new() };
+            (format!("#{}{badge}", c["path"].as_str().unwrap_or("?")),
+                json!({"channel":c["path"]}))
         }));
-        out.extend(self.people.iter().filter(|p| p["id"] != "owner").map(|p| {
-            (
-                format!(
-                    "DM {}{}",
-                    p["name"].as_str().unwrap_or("?"),
-                    if p["present"] == true {
-                        ""
-                    } else {
-                        " (offline)"
-                    }
-                ),
-                json!({"dm":p["id"]}),
-            )
-        }));
+        let count: u64 = self.dms.iter().filter_map(|d| d["unread"].as_u64()).sum();
+        out.push((format!("{} DMs{}", if self.saved.dms_collapsed { "▸" } else { "▾" },
+            if count > 0 { format!(" ● {count}") } else { String::new() }), json!({"dm_section":true})));
+        if !self.saved.dms_collapsed {
+            let mut dms: Vec<_> = self.dms.iter().collect();
+            dms.sort_by(|a,b| b["last"]["created_at"].as_str().cmp(&a["last"]["created_at"].as_str())
+                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+            out.extend(dms.into_iter().map(|d| {
+                let unread = d["unread"].as_u64().unwrap_or(0);
+                (format!("  {}{}", if unread > 0 { format!("●{unread} ") } else { String::new() }, self.dm_label(d)),
+                    json!({"conversation":d["id"]}))
+            }));
+        }
         out
     }
     fn target_label(&self) -> String {
@@ -195,22 +205,13 @@ impl Messages {
                 format!("#{c}")
             };
         }
-        let peer = self.target["dm"].as_str().map(str::to_owned).or_else(|| {
-            self.dms
-                .iter()
-                .find(|d| d["id"] == self.target["conversation"])
-                .and_then(|d| d["peer"].as_str())
-                .map(str::to_owned)
-        });
-        if let Some(id) = peer {
-            return format!(
-                "DM {}",
-                self.people
-                    .iter()
-                    .find(|p| p["id"] == id)
-                    .and_then(|p| p["name"].as_str())
-                    .unwrap_or(&id)
-            );
+        if let Some(dm) = self.target.get("dm") {
+            let ids: Vec<_> = if let Some(id) = dm.as_str() { vec![id] }
+                else { dm.as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default() };
+            return format!("DM {}", ids.iter().map(|id| self.person_name(id)).collect::<Vec<_>>().join(", "));
+        }
+        if let Some(d) = self.dms.iter().find(|d| d["id"] == self.target["conversation"]) {
+            return format!("DM {}", self.dm_label(d));
         }
         if let Some(c) = self
             .channels
@@ -403,35 +404,14 @@ impl App {
                             self.messaging_context(&v["open"]);
                             self.messages.norms =
                                 v["open"]["norms"]["text"].as_str().unwrap_or("").into();
-                            self.messages.dms = v["open"]["dms"]["items"]
+                            self.messages.dms = v["dms"]["items"]
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default();
                             self.messaging_refresh_target();
                         }
                         "messaging.read" => {
-                            let old = self
-                                .messages
-                                .items
-                                .get(self.messages.selected)
-                                .map(|v| v["id"].clone());
-                            self.messages.items =
-                                v["items"].as_array().cloned().unwrap_or_default();
-                            self.messages.management.last_position = v["position"].clone();
-                            if self.messages.target["inbox"] == true {
-                                self.messages.items.sort_by(|a, b| {
-                                    a["conversation_id"]
-                                        .as_str()
-                                        .cmp(&b["conversation_id"].as_str())
-                                });
-                            }
-                            self.messages.selected = old
-                                .and_then(|id| {
-                                    self.messages.items.iter().position(|v| v["id"] == id)
-                                })
-                                .unwrap_or(0);
-                            self.messages.next = v["next_cursor"].clone();
-                            self.messages.receipt = v["receipt"].clone();
+                            self.messages.accept_messages(&v);
                             if let Some(reason) = v["degraded"].as_str() {
                                 self.messages.error = format!("Storage is read only: {reason}");
                             }
@@ -460,6 +440,11 @@ impl App {
                             }
                             self.messages.mode.clear();
                             self.messages.status = "Sent · stored locally".into();
+                            if let Some(cid) = v["event"]["conversation_id"].as_str() {
+                                self.messages.target = json!({"conversation":cid});
+                            }
+                            self.messages.page_cursor = Value::Null;
+                            self.messages.loaded_target = Value::Null;
                             self.messaging_request("messaging.read", self.messages.query());
                         }
                         "messaging.channels" => self.messaging_request("bootstrap", json!({})),
@@ -475,7 +460,7 @@ impl App {
         if self.messages.visible
             && !self.messages.busy
             && self.messages.mode.is_empty()
-            && self.messages.page_cursor.is_null()
+            && (self.messages.page_cursor.is_null() || self.messages.live_conversation())
             && self
                 .messages
                 .last_refresh
@@ -495,6 +480,11 @@ impl App {
         };
         let token = self.host_pool.operator_token_for(&host);
         self.messages.management.request = params.clone();
+        let catch_up_to = (method == "messaging.read"
+            && self.messages.live_conversation()
+            && self.messages.loaded_target == self.messages.query()
+            && params["cursor"].is_null())
+            .then(|| self.messages.items.last().map(|m| m["id"].clone())).flatten();
         let method = method.to_owned();
         let (tx, rx) = mpsc::channel();
         self.messages.rx = Some(rx);
@@ -521,8 +511,31 @@ impl App {
             let result = if method == "bootstrap" {
                 (|| {
                     Ok(
-                        json!({"channels":directory("messaging.channels",json!({"action":"list"}))?,"people":directory("messaging.people",json!({"include_exited":true}))?,"open":call("messaging.open",json!({"channel":"general","claim_bell":true}))?}),
+                        json!({"channels":directory("messaging.channels",json!({"action":"list"}))?,"people":directory("messaging.people",json!({"include_exited":true}))?,"open":call("messaging.open",json!({"channel":"general","claim_bell":true}))?,"dms":directory("messaging.dms",json!({}))?}),
                     )
+                })()
+            } else if method == "messaging.read" {
+                (|| {
+                    let mut value = call(&method, params.clone())?;
+                    // A burst can exceed a read page. Catch up to the last known
+                    // message before merging, using the first page's frozen cursor.
+                    if let Some(anchor) = catch_up_to {
+                        while !value["items"].as_array().is_some_and(|items| items.iter().any(|m| m["id"] == anchor))
+                            && !value["next_cursor"].is_null()
+                        {
+                            let mut older = params.clone();
+                            older["cursor"] = value["next_cursor"].clone();
+                            let page = call(&method, older)?;
+                            value["items"].as_array_mut().unwrap().extend(page["items"].as_array().cloned().unwrap_or_default());
+                            value["receipt"]["ids"].as_array_mut().unwrap().extend(page["receipt"]["ids"].as_array().cloned().unwrap_or_default());
+                            value["next_cursor"] = page["next_cursor"].clone();
+                        }
+                    }
+                    // Sidebar failures must not hide successfully read messages.
+                    if let Ok(dms) = directory("messaging.dms", json!({})) { value["_dms"] = dms["items"].clone(); }
+                    if let Ok(channels) = directory("messaging.channels", json!({})) { value["_channels"] = channels["items"].clone(); }
+                    if let Ok(people) = directory("messaging.people", json!({"include_exited":true})) { value["_people"] = people["items"].clone(); }
+                    Ok(value)
                 })()
             } else if method == "norms_document" {
                 (|| {
@@ -595,6 +608,9 @@ impl App {
         if self.messages.mode.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
         }
+        if self.messaging_picker_key(key) {
+            return true;
+        }
         if self.messaging_management_key(key) {
             return true;
         }
@@ -648,7 +664,7 @@ impl App {
                 } else {
                     self.messages.selected = (self.messages.selected + 1)
                         .min(self.messages.items.len().saturating_sub(1));
-                    self.messages.body_scroll = 0;
+                    self.messages.reveal_selection = true;
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -657,21 +673,51 @@ impl App {
                 } else if self.messages.target["norms"] == true {
                     self.messages.body_scroll = self.messages.body_scroll.saturating_sub(1);
                 } else {
-                    self.messages.selected = self.messages.selected.saturating_sub(1);
-                    self.messages.body_scroll = 0;
+                    if self.messages.selected == 0 && !self.messages.next.is_null() {
+                        let mut p = self.messages.query();
+                        p["cursor"] = self.messages.next.clone();
+                        self.messages.page_cursor = self.messages.next.clone();
+                        self.messages.append_older = true;
+                        self.messages.select_older = true;
+                        self.messaging_request("messaging.read", p);
+                    } else {
+                        self.messages.selected = self.messages.selected.saturating_sub(1);
+                    }
+                    self.messages.reveal_selection = true;
                 }
             }
             KeyCode::PageDown => {
-                self.messages.body_scroll = self.messages.body_scroll.saturating_add(10)
+                self.messages.timeline_scroll = self.messages.timeline_scroll.saturating_add(10);
+                self.messages.reveal_selection = false;
             }
             KeyCode::PageUp => {
-                self.messages.body_scroll = self.messages.body_scroll.saturating_sub(10)
+                self.messages.timeline_scroll = self.messages.timeline_scroll.saturating_sub(10);
+                self.messages.reveal_selection = false;
+            }
+            KeyCode::Char('d') => {
+                self.messages.mode = "dm_picker".into();
+                self.messages.text.clear();
+                self.messages.fields.clear();
+                self.messages.error.clear();
+                self.messages.picker_selected = 0;
+                self.messages.picker_members.clear();
+            }
+            KeyCode::Char(' ') if self.messages.pane == 0 => {
+                if self.messages.menu_items().get(self.messages.menu).is_some_and(|(_, t)| t["dm_section"] == true) {
+                    self.messages.saved.dms_collapsed = !self.messages.saved.dms_collapsed;
+                    self.messages.persist();
+                }
             }
             KeyCode::Enter => {
                 if self.messages.pane == 0 {
                     if let Some((_, target)) =
                         self.messages.menu_items().get(self.messages.menu).cloned()
                     {
+                        if target["dm_section"] == true {
+                            self.messages.saved.dms_collapsed = !self.messages.saved.dms_collapsed;
+                            self.messages.persist();
+                            return true;
+                        }
                         self.messages.target = target;
                         self.messages.filter = json!({});
                         self.messages.page_cursor = Value::Null;
@@ -702,6 +748,8 @@ impl App {
                     self.messages.target = json!({"conversation":v["conversation_id"]});
                     let mut d = self.messages.draft();
                     d.reply_to = v["id"].as_str().map(str::to_owned);
+                    self.messages.filter = json!({});
+                    self.messages.page_cursor = Value::Null;
                     self.messages.set_draft(d);
                     self.messages.mode = "compose".into();
                 }
@@ -787,11 +835,15 @@ impl App {
                     let mut p = self.messages.query();
                     p["cursor"] = self.messages.next.clone();
                     self.messages.page_cursor = self.messages.next.clone();
+                    self.messages.append_older = true;
                     self.messaging_request("messaging.read", p);
                 }
             }
             KeyCode::Char('g') => {
                 self.messages.page_cursor = Value::Null;
+                self.messages.loaded_target = Value::Null;
+                self.messages.append_older = false;
+                self.messages.select_older = false;
                 self.messaging_request("bootstrap", json!({}));
             }
             KeyCode::Char('w') => {
@@ -1076,7 +1128,7 @@ impl App {
                     theme::CHAT_TAG
                 } else if target.get("channel").is_some() {
                     theme::CHAT_FOCUS
-                } else if target.get("dm").is_some() {
+                } else if target.get("dm").is_some() || target.get("conversation").is_some() || target["dm_section"] == true {
                     theme::CHAT_AGENT
                 } else if target["norms"] == true {
                     theme::CHAT_MUTED
@@ -1110,163 +1162,17 @@ impl App {
             );
         }
         if !narrow || self.messages.pane == 1 || !self.messages.mode.is_empty() {
-            if self.messages.management_view() {
+            if self.messages.mode == "dm_picker" {
+                self.draw_messaging_picker(frame, cols[1]);
+            } else if self.messages.management_view() {
                 self.draw_messaging_management(frame, cols[1], messages_focused);
             } else {
-                let content = Layout::vertical([
-                    Constraint::Length(if self.messages.mode.is_empty() { 6 } else { 3 }),
-                    Constraint::Min(3),
-                    Constraint::Length(if self.messages.mode.is_empty() {
-                        3
-                    } else if self.messages.mode == "filter" {
-                        9
-                    } else {
-                        7
-                    }),
-                ])
-                .split(cols[1]);
-                let lines = self
-                    .messages
-                    .items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        let selected = i == self.messages.selected;
-                        Line::from(vec![
-                            Span::styled(if selected { "› " } else { "  " }, accent),
-                            Span::styled(
-                                if self.messages.target["inbox"] == true {
-                                    format!(
-                                        "{} · ",
-                                        self.messages.conversation_label(&v["conversation_id"])
-                                    )
-                                } else {
-                                    String::new()
-                                },
-                                Style::default().fg(theme::CHAT_FOCUS),
-                            ),
-                            Span::styled(
-                                v["actor"]["name"].as_str().unwrap_or("?"),
-                                chat_actor_style(v).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(": ", muted),
-                            Span::styled(
-                                v["body"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .lines()
-                                    .next()
-                                    .unwrap_or(""),
-                                text_style,
-                            ),
-                        ])
-                        .style(if selected {
-                            Style::default().bg(theme::CHAT_SELECTION)
-                        } else {
-                            Style::default()
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                frame.render_widget(
-                    Paragraph::new(lines)
-                        .style(text_style.bg(theme::CHAT_PANEL))
-                        .scroll((self.messages.selected.saturating_sub(4) as u16, 0))
-                        .block(chat_block(self.messages.target_label(), messages_focused)),
-                    content[0],
-                );
-                let selected = self.messages.items.get(self.messages.selected);
-                let body = selected
-                    .map(|v| {
-                        let tags = v["data"]["tags"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(|s| format!("#{s}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            })
-                            .unwrap_or_default();
-                        let links = v["data"]["links"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .map(|v| {
-                                        format!(
-                                            "{}: {}",
-                                            v["label"].as_str().unwrap_or("Reference"),
-                                            v["uri"].as_str().unwrap_or("")
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            })
-                            .unwrap_or_default();
-                        let delivery = v["notification"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v["status"].as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            })
-                            .unwrap_or_default();
-                        let read = v["read"] == true;
-                        let mut lines = vec![Line::from(vec![
-                            Span::styled(
-                                v["actor"]["name"].as_str().unwrap_or("").to_owned(),
-                                chat_actor_style(v).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!(" · {} · ", v["created_at"].as_str().unwrap_or("")),
-                                muted,
-                            ),
-                            Span::styled(
-                                if read { "read" } else { "unread" },
-                                if read {
-                                    muted
-                                } else {
-                                    Style::default().fg(theme::CHAT_TAG)
-                                },
-                            ),
-                        ])];
-                        lines.extend(
-                            v["body"]
-                                .as_str()
-                                .unwrap_or("")
-                                .lines()
-                                .map(|line| Line::styled(line.to_owned(), text_style)),
-                        );
-                        if !tags.is_empty() {
-                            lines.push(Line::styled(tags, Style::default().fg(theme::CHAT_TAG)));
-                        }
-                        lines.extend(
-                            links
-                                .lines()
-                                .map(|line| Line::styled(line.to_owned(), accent)),
-                        );
-                        if !delivery.is_empty() {
-                            lines.push(Line::styled(delivery, muted));
-                        }
-                        lines
-                    })
-                    .unwrap_or_else(|| {
-                        vec![Line::styled(
-                            "No messages. Choose a channel or person; c composes.",
-                            muted,
-                        )]
-                    });
-                frame.render_widget(
-                    Paragraph::new(body)
-                        .style(text_style.bg(theme::CHAT_PANEL))
-                        .wrap(Wrap { trim: false })
-                        .scroll((self.messages.body_scroll, 0))
-                        .block(chat_block(
-                            "Message · Enter marks read · PgUp/PgDn scroll",
-                            messages_focused,
-                        )),
-                    content[1],
-                );
+                let composer_height = if self.messages.mode.is_empty() {
+                    if self.messages.draft().body.is_empty() { 0 } else { 3 }
+                } else if self.messages.mode == "filter" { 9 } else { 7 };
+                let content = Layout::vertical([Constraint::Min(3), Constraint::Length(composer_height)])
+                    .split(cols[1]);
+                self.draw_messaging_timeline(frame, content[0], messages_focused);
                 let d = self.messages.draft();
                 let text = if self.messages.mode.is_empty() || self.messages.mode == "compose" {
                     d.body
@@ -1316,7 +1222,7 @@ impl App {
                     )
                 };
                 if self.messages.mode == "compose" {
-                    let inner = content[2].inner(ratatui::layout::Margin::new(1, 1));
+                    let inner = content[1].inner(ratatui::layout::Margin::new(1, 1));
                     let (lines, cursor_row, cursor_col) =
                         wrap_draft(&text, d.cursor, inner.width.max(1) as usize);
                     let scroll = cursor_row.saturating_sub(inner.height.saturating_sub(1) as usize);
@@ -1325,7 +1231,7 @@ impl App {
                             .style(text_style.bg(theme::CHAT_PANEL))
                             .scroll((scroll as u16, 0))
                             .block(chat_block(title, editing)),
-                        content[2],
+                        content[1],
                     );
                     if inner.width > 0 && inner.height > 0 {
                         frame.set_cursor_position((
@@ -1339,7 +1245,7 @@ impl App {
                             .style(text_style.bg(theme::CHAT_PANEL))
                             .wrap(Wrap { trim: false })
                             .block(chat_block(title, editing)),
-                        content[2],
+                        content[1],
                     );
                 }
             }
@@ -1380,18 +1286,16 @@ impl App {
                     ("c", "compose"),
                     ("r", "reply"),
                     ("t", "thread"),
-                    ("n", "channel"),
-                    ("/", "filter"),
-                    ("e", "tags/mentions/links"),
+                    ("d", "new DM/group"),
+                    ("e", "metadata"),
                 ]),
                 chat_help(&[
-                    ("s", "DM session"),
-                    ("N", "rename session"),
+                    ("n", "channel"),
+                    ("/", "filter"),
                     ("]", "older"),
                     ("g", "refresh"),
                     ("W", "monitor"),
                     ("f", "preferences"),
-                    ("w", "save draft"),
                 ]),
                 Line::styled(
                     format!(

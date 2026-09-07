@@ -254,7 +254,7 @@ def chat_follow(action: str = "get", scope: dict | None = None,
 
 
 @mcp.tool()
-def chat_open(channel: str | None = None, dm: str | None = None,
+def chat_open(channel: str | None = None, dm: str | list[str] | None = None,
               conversation: str | None = None) -> dict:
     """Orient in shared messaging: current norms, identity, unread DMs and preview.
 
@@ -266,13 +266,16 @@ def chat_open(channel: str | None = None, dm: str | None = None,
 
 @mcp.tool()
 def chat_send(body: str, request_id: str, channel: str | None = None,
-              dm: str | None = None, conversation: str | None = None,
+              dm: str | list[str] | None = None, conversation: str | None = None,
               name: str | None = None, reply_to: str | None = None,
               mentions: list[str] | None = None, tags: list[str] | None = None,
               links: list[dict] | None = None, norms_seen: dict | None = None,
               ack_receipt: dict | None = None, origin_daemon_id: str | None = None) -> dict:
     """Send to exactly one channel, participant DM, or conversation ID.
 
+    dm accepts one recipient ID or a list (up to 31 others) for a group DM.
+    Membership is fixed; the same recipient set reuses its conversation. The
+    first message creates it. Use conversation ID for replies, monitors and follows.
     Quick replies and one sentence are often enough; usual messages are at most
     1–3 short paragraphs. Hard limit 3000 characters: summarize and reference a
     file for longer material. Never split an essay to evade the limit.
@@ -286,7 +289,7 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
 
 
 @mcp.tool()
-def chat_read(channel: str | None = None, dm: str | None = None,
+def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               conversation: str | None = None, thread: str | None = None,
               inbox: bool = False, dms: bool = False, unread_only: bool = False,
               time: dict | None = None, time_basis: str = "created",
@@ -308,7 +311,11 @@ def chat_read(channel: str | None = None, dm: str | None = None,
 @mcp.tool()
 def chat_dms(unread_only: bool = False, peer: str | None = None,
              cursor: dict | None = None, limit: int = 50) -> dict:
-    """Check DM conversations and unread counts, including first contact, without consuming them."""
+    """List started DMs and groups with members, unread counts and previews.
+
+    peer filters conversations containing that other participant. Empty drafts
+    are absent. Group entries have peers/members arrays and peer=null.
+    """
     return _chat_call("dms", locals())
 
 

@@ -321,11 +321,8 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             if p["action"] == "create" {
                 store.create_channel(&actor, p)
             } else if p["action"].is_null() || p["action"] == "list" {
-                store.directory_page(
-                    &actor,
-                    p,
-                    store.channels().as_array().cloned().unwrap_or_default(),
-                )
+                let channels = store.channels_for(&actor)?;
+                store.directory_page(&actor, p, channels)
             } else {
                 Err(ChatError {
                     code: "unsupported_feature".into(),
@@ -345,7 +342,7 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":store.channels().as_array().and_then(|a|a.iter().find(|v|v["path"]==query["channel"]).cloned()),"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow"],"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":store.channels().as_array().and_then(|a|a.iter().find(|v|v["path"]==query["channel"]).cloned()),"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow"],"features":["group_dms"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {

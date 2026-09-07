@@ -70,13 +70,7 @@ impl Messages {
             return format!("#{}", c["path"].as_str().unwrap_or("?"));
         }
         if let Some(d) = self.dms.iter().find(|d| d["id"] == *id) {
-            let name = self
-                .people
-                .iter()
-                .find(|p| p["id"] == d["peer"])
-                .and_then(|p| p["name"].as_str())
-                .unwrap_or("peer");
-            return format!("DM {name}");
+            return format!("DM {}", self.dm_label(d));
         }
         "DM".into()
     }

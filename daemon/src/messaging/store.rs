@@ -514,8 +514,13 @@ impl Store {
         if let Some(c) = e["data"].get("conversation_create") {
             let id = required(c, "id")?;
             let members: Vec<String> = serde_json::from_value(c["members"].clone())?;
-            if members.len() != 2 {
-                return Err(err("invalid_record", "DM needs two members"));
+            if !(2..=32).contains(&members.len())
+                || members.windows(2).any(|pair| pair[0] >= pair[1])
+                || !members.iter().any(|m| m == strv(&e["actor"], "id"))
+                || members.iter().any(|m| m.is_empty() || m == "system")
+                || self.conversations.get(&id).is_some_and(|old| old != &members)
+            {
+                return Err(err("invalid_record", "DM needs 2–32 sorted, distinct, immutable members including its sender"));
             }
             self.conversations.insert(id, members);
         }
@@ -808,35 +813,34 @@ impl Store {
                 Err(err("not_found", "Conversation not found"))
             };
         }
-        let peer = required(p, "dm")?;
-        let peer = if peer == "owner" || self.names.contains_key(&peer) {
-            peer
-        } else if people.iter().any(|x| x.id == peer) {
-            peer
-        } else {
-            let hits: Vec<_> = self
-                .names
-                .iter()
-                .filter(|(_, n)| {
+        let peers: Vec<String> = match &p["dm"] {
+            Value::String(peer) => vec![peer.clone()],
+            Value::Array(peers) => peers.iter().map(|v| v.as_str().filter(|s| !s.is_empty())
+                .map(str::to_owned).ok_or_else(|| err("invalid_target", "DM recipients must be participant IDs or names"))).collect::<Result<_>>()?,
+            _ => return Err(err("invalid_target", "dm must be a participant or a list of recipients")),
+        };
+        if peers.is_empty() || peers.len() > 31 {
+            return Err(err("invalid_target", "Choose 1–31 DM recipients; the sender is included automatically"));
+        }
+        let mut members = vec![actor.to_owned()];
+        for peer in peers {
+            let peer = if peer == "owner" || self.names.contains_key(&peer) || people.iter().any(|x| x.id == peer) {
+                peer
+            } else {
+                let hits: Vec<_> = self.names.iter().filter(|(_, n)| {
                     normalize(&n.name) == normalize(&peer)
                         || n.aliases.iter().any(|a| normalize(a) == normalize(&peer))
-                })
-                .collect();
-            if hits.len() != 1 {
-                return Err(err(
-                    "not_found",
-                    "Peer not found; use chat_people to resolve a participant ID",
-                ));
+                }).collect();
+                if hits.len() != 1 {
+                    return Err(err("not_found", "Peer not found; use chat_people to resolve a participant ID"));
+                }
+                hits[0].0.clone()
+            };
+            if members.contains(&peer) {
+                return Err(err("invalid_target", "Choose distinct recipients and omit yourself"));
             }
-            hits[0].0.clone()
-        };
-        if peer == actor {
-            return Err(err(
-                "invalid_target",
-                "A DM needs two distinct participants",
-            ));
+            members.push(peer);
         }
-        let mut members = vec![actor.to_string(), peer];
         members.sort();
         if let Some((id, _)) = self.conversations.iter().find(|(_, m)| **m == members) {
             return Ok((id.clone(), None));
@@ -1198,6 +1202,19 @@ impl Store {
             .map(|(path, id)| self.channel_info(path, id))
             .collect::<Vec<_>>())
     }
+    pub fn channels_for(&mut self, actor: &str) -> Result<Vec<Value>> {
+        self.load_read(actor)?;
+        let mut channels = self.channels().as_array().cloned().unwrap_or_default();
+        for channel in &mut channels {
+            let unread: Vec<_> = self.events.iter().filter(|e| e.event["type"] == "message.create"
+                && e.event["conversation_id"] == channel["id"] && e.event["actor"]["id"] != actor
+                && !self.reads[actor].ids.contains(strv(&e.event, "id"))).collect();
+            channel["unread"] = json!(unread.len());
+            channel["mentions"] = json!(unread.iter().filter(|e| e.event["data"]["mentions"].as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id == actor))).count());
+        }
+        Ok(channels)
+    }
     fn position_token(&self, pos: u64) -> Value {
         json!({"space_id":self.space_id,"replica_id":self.daemon_id,"generation":self.generation,"position":pos})
     }
@@ -1466,7 +1483,8 @@ impl Store {
             let n = strv(&e.event, "body").chars().count();
             let mut v = e.event.clone();
             v["received_at"] = json!(e.received_at);
-            v["read"] = json!(read.contains(strv(&e.event, "id")));
+            v["read"] = json!(read.contains(strv(&e.event, "id")) || e.event["actor"]["id"] == actor);
+            v["conversation_kind"] = json!(if self.conversations.contains_key(strv(&e.event, "conversation_id")) { "dm" } else { "channel" });
             if e.event["actor"]["id"] == actor {
                 v["notification"] = self.notification_status(&e.event);
             }
@@ -1519,8 +1537,9 @@ impl Store {
             if !m.iter().any(|x| x == actor) {
                 continue;
             }
-            let peer = m.iter().find(|x| x.as_str() != actor).unwrap();
-            if p["peer"].as_str().is_some_and(|s| s != peer) {
+            let peers: Vec<_> = m.iter().filter(|x| x.as_str() != actor).collect();
+            let peer = (peers.len() == 1).then(|| peers[0]);
+            if p["peer"].as_str().is_some_and(|s| !peers.iter().any(|id| id.as_str() == s)) {
                 continue;
             }
             let events: Vec<_> = self
@@ -1541,7 +1560,7 @@ impl Store {
                 continue;
             }
             let last=events.last().map(|e|json!({"id":e.event["id"],"actor":e.event["actor"],"created_at":e.event["created_at"],"preview":strv(&e.event,"body").chars().take(180).collect::<String>()}));
-            out.push(json!({"id":id,"peer":peer,"unread":count,"last":last}));
+            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"group":m.len()>2,"unread":count,"last":last}));
         }
         self.directory_page(actor, p, out)
     }
