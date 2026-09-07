@@ -64,7 +64,7 @@ class _MonitorEnv(unittest.TestCase):
         self.rotate_on_deliver = False
         control_client.call = self._fake_call
         self._env = mock.patch.dict(
-            os.environ, {"CM_TUI_SESSION_ID": self.CALLER}
+            os.environ, {"CM_TUI_SESSION_ID": self.CALLER, "HOME": self.tmp.name, "CM_MONITOR_TRACKING_V1": "1"}
         )
         self._env.start()
         self._patches = [
@@ -258,7 +258,8 @@ class InboxDeliveryTests(_MonitorEnv):
     def _record(self):
         return {"monitor_id": "mon-test", "caller": self.CALLER}
 
-    def test_hook_consumption_counts_as_delivery(self):
+    def test_hook_consumption_without_receipt_remains_uncertain(self):
+        record = self._record()
         async def scenario():
             async def busy(_caller):
                 return False, None
@@ -266,7 +267,7 @@ class InboxDeliveryTests(_MonitorEnv):
             with mock.patch.object(async_monitor, "_caller_at_prompt", busy):
                 task = asyncio.get_running_loop().create_task(
                     async_monitor._deliver_to_caller(
-                        self._record(), "[cm-monitor mon-test fired] hi",
+                        record, "[cm-monitor mon-test fired] hi",
                     )
                 )
                 inbox = os.path.join(async_monitor.INBOX_ROOT, self.CALLER)
@@ -287,6 +288,7 @@ class InboxDeliveryTests(_MonitorEnv):
 
         delivered = asyncio.run(scenario())
         self.assertTrue(delivered)
+        self.assertTrue(record["delivery_uncertain"], "deleting an inbox file is not proof of agent receipt")
         self.assertEqual(
             self.sent, [], "hook delivery must not touch the PTY",
         )
@@ -760,3 +762,79 @@ class FireMessageFormatTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DurableMonitorTests(_MonitorEnv):
+    def test_tracking_failure_prevents_registering_or_sending(self):
+        async def scenario():
+            with mock.patch.object(async_monitor, "persist_state", side_effect=OSError("disk full")):
+                with self.assertRaises(async_monitor.RegistrationError):
+                    async_monitor.register_monitor([self.WORKER], edge=False)
+            self.assertEqual(async_monitor._MONITORS, {})
+        asyncio.run(scenario())
+        self.assertEqual(self.sent, [])
+
+    def test_tracking_failure_before_delivery_prevents_queued_input(self):
+        real_publish = async_monitor.persist_state
+        writes = 0
+
+        def publish():
+            nonlocal writes
+            writes += 1
+            if writes == 3:  # registered, fired/result, then pre-send uncertainty
+                raise OSError("disk full")
+            real_publish()
+
+        async def scenario():
+            with mock.patch.object(async_monitor, "persist_state", publish):
+                reg = async_monitor.register_monitor([self.WORKER], edge=False)
+                rec = async_monitor._MONITORS[reg["monitor_id"]]
+                await rec["task"]
+                return rec
+        rec = asyncio.run(scenario())
+        self.assertEqual(rec["state"], "error")
+        self.assertEqual(self.sent, [])
+        journal = async_monitor.list_monitors()["durable"]
+        persisted = journal["producers"][async_monitor.monitor_state.PRODUCER_ID]["records"][rec["monitor_id"]]
+        self.assertEqual(persisted["state"], "error")
+
+    def test_rpc_acceptance_without_transcript_receipt_remains_unsettled(self):
+        real_call = self._fake_call
+
+        def no_caller_transcript(method, params=None, **kwargs):
+            if method == "resolve_authorized_session" and params["session_uid"] == self.CALLER:
+                return {"state": "ready", "idle": True, "engine": "codex", "transcript_path": None}
+            return real_call(method, params, **kwargs)
+
+        async def scenario():
+            with mock.patch.object(control_client, "call", no_caller_transcript):
+                reg = async_monitor.register_monitor([self.WORKER], edge=False)
+                rec = async_monitor._MONITORS[reg["monitor_id"]]
+                await rec["task"]
+                return rec
+        rec = asyncio.run(scenario())
+        self.assertEqual(rec["state"], "undelivered")
+        self.assertTrue(rec["delivery_uncertain"])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_event_loop_shutdown_retains_interrupted_watch(self):
+        async def scenario():
+            reg = async_monitor.register_monitor([self.WORKER], edge=True)
+            await asyncio.sleep(0.02)
+            return reg["monitor_id"]
+        monitor_id = asyncio.run(scenario())
+        journal = async_monitor.list_monitors()["durable"]
+        record = journal["producers"][async_monitor.monitor_state.PRODUCER_ID]["records"][monitor_id]
+        self.assertEqual(record["state"], "interrupted")
+        self.assertEqual(self.sent, [])
+
+    def test_transcript_verified_delivery_is_durably_settled(self):
+        async def scenario():
+            reg = async_monitor.register_monitor([self.WORKER], edge=False)
+            await async_monitor._MONITORS[reg["monitor_id"]]["task"]
+            return reg["monitor_id"]
+        monitor_id = asyncio.run(scenario())
+        journal = async_monitor.list_monitors()["durable"]
+        record = journal["producers"][async_monitor.monitor_state.PRODUCER_ID]["records"][monitor_id]
+        self.assertEqual(record["state"], "delivered")
+        self.assertFalse(record["delivery_uncertain"])

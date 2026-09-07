@@ -246,7 +246,9 @@ impl App {
             // the immutable borrow of `input_mode` ends.
             let mut peek_max: Option<u16> = None;
             match &self.input_mode {
+                InputMode::ContinuousControl(menu) => menu.draw(frame, area),
                 InputMode::NewSession {
+                    engine,
                     label_text,
                     branch_text,
                     idle_timeout_text,
@@ -264,6 +266,7 @@ impl App {
                         repo_url,
                         seed_from.as_deref(),
                         host_id,
+                        *engine,
                         *active_field,
                     );
                 }
@@ -478,11 +481,11 @@ impl App {
         repo_url: &str,
         seed_from: Option<&str>,
         host_id: &cm_daemon::host_id::HostId,
+        engine: LaunchEngine,
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        // +1 row over the pre-host-picker layout for the host line.
-        let height = 14u16;
+        let height = 15u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -551,6 +554,11 @@ impl App {
             ""
         };
 
+        let mut engine_line = crate::planning::engine_line(engine);
+        if active_field == 6 {
+            engine_line.spans.push(Span::styled("  ←/→ change", dim));
+        }
+
         let lines = vec![
             Line::from(vec![
                 Span::styled("    Repo: ", dim),
@@ -584,6 +592,7 @@ impl App {
                 Span::styled(host_label, host_style),
                 Span::styled(host_hint, dim),
             ]),
+            engine_line,
             Line::from(""),
             Line::from(Span::styled(
                 "Tab switch field \u{00b7} Enter start \u{00b7} Esc cancel",
@@ -1435,6 +1444,7 @@ impl App {
             ("A-H    hide", "A-z  catalog"),
             ("A-f    workflow", "A-t  planning"),
             ("A-o    stop wf", "A-c  cont-col"),
+            ("A-C    cont-stop", ""),
             ("A-b    snapshot", "A-g  attention"),
             ("A-O    reopen ws", "A-9  push"),
             ("PgUp/Dn scroll", "A-0  pull"),

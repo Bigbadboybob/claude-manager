@@ -636,6 +636,9 @@ impl App {
     /// main tick. Bounds the `list_sessions` RPC to once per
     /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
     pub fn maybe_adopt_daemon_sessions(&mut self) {
+        if let InputMode::ContinuousControl(menu) = &mut self.input_mode {
+            self.needs_redraw |= menu.poll();
+        }
         // Drain the off-thread session pollers into the per-host cache FIRST
         // (cheap, non-blocking). The remote branch of the adopt scan reads this
         // cache instead of issuing a synchronous remote `list_sessions` RPC on

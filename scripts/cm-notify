@@ -8,10 +8,10 @@
 # a DEDICATED bot for cm-manager (clean separation from the trading bot,
 # independent blast radius, future-proof if orchestrators ever need to receive).
 #
-# Use it ONLY for out-of-band blockers an agent cannot fix in code and the
-# operator must resolve — billing / credits exhausted, cloud IAM / gcloud
-# permissions, a disabled API, a revoked key. NOT for ordinary bugs or routine
-# findings (those flow through the normal lifecycle).
+# Use it for out-of-band blockers the operator must resolve (billing, IAM,
+# disabled APIs, revoked keys), or notifications the operator explicitly
+# subscribed to, such as Codex update alerts. Ordinary task findings flow
+# through their normal lifecycle.
 #
 # Creds (NEVER commit these) live in ~/.cm/notify.env:
 #     TELEGRAM_BOT_TOKEN=123456789:ABC...

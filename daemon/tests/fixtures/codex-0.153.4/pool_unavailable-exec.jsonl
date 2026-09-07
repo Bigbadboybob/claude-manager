@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a07a07-3bc6-7cc1-8707-077627b7b73b"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Falling back from WebSockets to HTTPS transport. unexpected status 503 Service Unavailable: No available accounts. Service is operating in degraded mode: all upstream accounts are unavailable"}}
+{"type":"error","message":"unexpected status 503 Service Unavailable: No available accounts. Service is operating in degraded mode: all upstream accounts are unavailable, url: http://127.0.0.1:12455/backend-api/codex/responses, request id: 0eb8fca0-c2a8-4a5f-a8d9-af65ef446593"}
+{"type":"turn.failed","error":{"message":"unexpected status 503 Service Unavailable: No available accounts. Service is operating in degraded mode: all upstream accounts are unavailable, url: http://127.0.0.1:12455/backend-api/codex/responses, request id: 0eb8fca0-c2a8-4a5f-a8d9-af65ef446593"}}

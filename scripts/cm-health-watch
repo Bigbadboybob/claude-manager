@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Read-only CM fleet, Codex pool quota, and migration-evidence watcher.
+
+Uses the existing cm-notify delivery command. Never launches, pauses, resumes,
+requeues, repairs, or retires work. No model requests or credentials exports.
+"""
+import argparse
+import datetime as dt
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import socket
+import sqlite3
+import struct
+import subprocess
+import time
+
+
+class WatchError(RuntimeError):
+    pass
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text())
+
+
+def write_json(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    temporary.replace(path)
+
+
+def epoch(value):
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    parsed = dt.datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
+
+
+def rpc(root, method, params=None):
+    # A new authenticated operator connection per read; never inherit session scope.
+    payload = json.dumps({'id': 'health-watch', 'caller': {
+        'token_id': (root / 'operator-token').read_text().strip()},
+        'method': method, 'params': params or {}}).encode()
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(10)
+        sock.connect(str(root / 'daemon.sock'))
+        sock.sendall(struct.pack('>I', len(payload)) + payload)
+        def receive(count):
+            result = bytearray()
+            while len(result) < count:
+                chunk = sock.recv(count - len(result))
+                if not chunk:
+                    raise WatchError('daemon response ended early')
+                result.extend(chunk)
+            return result
+        size = struct.unpack('>I', receive(4))[0]
+        if size > 16 * 1024 * 1024:
+            raise WatchError('daemon response exceeds limit')
+        result = json.loads(receive(size))
+    if not result.get('ok'):
+        raise WatchError('daemon read failed: ' + method)
+    return result['result']
+
+
+def pool_accounts(database):
+    # Explicit safe columns: never read OAuth tokens, email addresses, or keys.
+    with sqlite3.connect(Path(database).resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as db:
+        db.row_factory = sqlite3.Row
+        db.execute('BEGIN')
+        accounts = []
+        for row in db.execute('SELECT id,status FROM accounts WHERE delete_requested_at IS NULL'):
+            windows = [dict(w) for w in db.execute('''
+                SELECT window,used_percent,recorded_at,reset_at,window_minutes,
+                       credits_has,credits_unlimited,credits_balance
+                FROM usage_history u WHERE account_id=? AND id=(
+                    SELECT id FROM usage_history x WHERE x.account_id=u.account_id
+                    AND x.window=u.window ORDER BY recorded_at DESC,id DESC LIMIT 1)
+                ''', (row['id'],))]
+            accounts.append({'status': row['status'], 'windows': windows})
+        return accounts
+
+
+def pool_status(accounts, now, low=10, stale=1200):
+    """Best account's limiting headroom, not a sum of percentages or balances."""
+    usable, exhausted, unknown, resets = [], 0, 0, []
+    enabled = [a for a in accounts if a['status'] != 'paused']
+    for account in enabled:
+        if account['status'] in ('deactivated', 'reauth_required'):
+            continue
+        if account['status'] not in ('active', 'rate_limited', 'quota_exceeded'):
+            unknown += 1
+            continue
+        windows = account['windows']
+        if not windows:
+            unknown += 1
+            continue
+        valid, supplemental = [], False
+        for window in windows:
+            used = window['used_percent']
+            at = epoch(window['recorded_at'])
+            reset = window.get('reset_at')
+            if (not isinstance(used, (int, float)) or not math.isfinite(used)
+                    or not 0 <= used <= 100 or not 0 <= now - at <= stale
+                    or (reset is not None and epoch(reset) <= now and (at < epoch(reset) or used >= 100))):
+                valid = []
+                break
+            valid.append(100 - used)
+            supplemental |= bool(window.get('credits_unlimited') or (
+                window.get('credits_has') and (window.get('credits_balance') or 0) > 0))
+        if not valid:
+            unknown += 1
+            continue
+        headroom = min(valid)
+        if headroom <= 0 and not supplemental:
+            exhausted += 1
+            # An account needs ALL exhausted windows to reset before it can serve.
+            blocked_resets = [epoch(w['reset_at']) for w in windows
+                              if w['used_percent'] >= 100 and w.get('reset_at') is not None]
+            if len(blocked_resets) == sum(w['used_percent'] >= 100 for w in windows):
+                resets.append(max(blocked_resets))
+        elif account['status'] == 'active':
+            usable.append({'headroom': headroom, 'supplemental': supplemental})
+    best = max((a['headroom'] for a in usable), default=0)
+    supplemental = any(a['supplemental'] for a in usable)
+    if best > low or supplemental:
+        status = 'healthy'
+    elif unknown:
+        status = 'unknown'
+    elif usable:
+        status = 'low'
+    elif enabled and exhausted == len(enabled):
+        status = 'exhausted'
+    else:
+        status = 'unavailable'
+    return {'status': status, 'usable_accounts': len(usable), 'accounts': len(enabled),
+            'exhausted_accounts': exhausted, 'unknown_accounts': unknown,
+            'best_headroom_percent': best, 'supplemental_capacity': supplemental,
+            'next_reset_at': min(resets) if resets else None}
+
+
+def quota_alert(status, low):
+    kind = status['status']
+    if kind == 'healthy':
+        return {}
+    if kind == 'unknown':
+        raise WatchError('pool quota observations are missing, stale, or awaiting reset refresh')
+    reset = status.get('next_reset_at')
+    when = dt.datetime.fromtimestamp(reset, dt.timezone.utc).strftime('%a %b %d %H:%M UTC') if reset else 'unknown'
+    if kind == 'low':
+        text = (f'Codex pool is low: no usable account has more than {low:g}% left '
+                f'in every reported quota window. Best remaining headroom: '
+                f'{status["best_headroom_percent"]:g}%. This covers both laptop and cm-manager usage.')
+    elif kind == 'exhausted':
+        text = f'Codex pool quota is exhausted across all enabled accounts. Earliest expected account reset: {when}. Work is preserved.'
+    else:
+        text = 'Codex pool has no usable enabled account. Check account authentication/status; this is not proof that all quota is exhausted.'
+    return {'quota:' + kind: text}
+
+
+def fleet_alerts(health, tasks, queues, now, overdue=600):
+    alerts = {}
+    if (not health.get('ok') or not health.get('mcp_ok') or health.get('restarting')
+            or health.get('holder_status_error') or health.get('holder_pending_exit_events')
+            or health.get('holder_pings_unanswered') or health.get('breaker_state') != 'running'
+            or (health.get('split') and health.get('sessions') != health.get('holder_sessions'))):
+        alerts['daemon'] = 'CM daemon health is unsettled. Check the saved health-watch snapshot; no work was interrupted.'
+    for task in tasks:
+        if not task['enabled'] or task['paused']:
+            continue
+        name = task['task_id']
+        run = task.get('last_run') or {}
+        key = 'task:' + name
+        if task.get('account_blocked') or task.get('recovery_hold'):
+            alerts[key] = f"Continuous task '{name}' is held. Other accounts may still have capacity; inspect this task's preserved run before recovery."
+        elif run.get('status') in ('failed', 'orphaned'):
+            alerts[key] = f"Continuous task '{name}' run {run.get('seq')} ended {run['status']}. Inspect its preserved work."
+        elif not task.get('in_flight') and run.get('status') != 'running':
+            schedule = task['schedule']
+            due = task.get('next_fire_at')
+            if schedule['kind'] == 'consumer':
+                queue = queues[schedule['queue']]
+                oldest = queue.get('oldest_pending_at')
+                threshold = schedule['depth_threshold']
+                due = None
+                if queue['pending'] and oldest:
+                    due = epoch(oldest) + (0 if threshold and queue['pending'] >= threshold else schedule['window_secs'])
+            if due is not None and now > due + overdue:
+                alerts[key] = f"Continuous task '{name}' appears overdue for eligible work. Check scheduling and queue evidence. No run was forced."
+    return alerts
+
+
+def migration_progress(root, config, now):
+    results = {}
+    for name, rule in config.items():
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+            raise WatchError('invalid task ID in migration configuration')
+        task_root = root / 'continuous-tasks' / name
+        task = read_json(task_root / 'state.json')
+        rows = [json.loads(line) for line in (task_root / 'runs.jsonl').read_text().splitlines() if line.strip()]
+        fired = {r['seq']: r for r in rows if r.get('event') == 'fired' and r['seq'] > rule['baseline_seq']}
+        finished = {r['seq']: r for r in rows if r.get('event') == 'report_done' and r.get('status') == 'done' and r['seq'] in fired}
+        cycles, scheduled, batches = [], [], []
+        for seq, end in sorted(finished.items()):
+            start = fired[seq]
+            if (start.get('session_uid') != end.get('session_uid')
+                    or start.get('fire_token') != end.get('fire_token')
+                    or 'handover' in str(start.get('fire_token', ''))):
+                continue
+            cycles.append(seq)
+            if str(start.get('fire_token', '')).startswith('ft_sched_'):
+                scheduled.append(seq)
+            detail = start.get('detail') or {}
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except ValueError:
+                    detail = {}
+            count = detail.get('batch_count') if isinstance(detail, dict) else None
+            if count is None and task['schedule']['kind'] == 'consumer':
+                path = Path(task['worktree_path']) / '.queue' / f'batch-{seq}.json'
+                if path.exists():
+                    batch = read_json(path)
+                    if batch.get('task_id') == name and batch.get('seq') == seq and batch.get('queue') == task['schedule']['queue']:
+                        count = len(batch['items'])
+            if isinstance(count, int) and count > 0:
+                batches.append(seq)
+        first = min((finished[s]['ts'] for s in cycles), default=now)
+        ready = (len(cycles) >= rule.get('completed', 2)
+                 and len(scheduled) >= rule.get('scheduled', 0)
+                 and len(batches) >= rule.get('nonempty', 0)
+                 and now >= first + rule.get('observe_seconds', 0))
+        results[name] = {'completed_seqs': cycles, 'scheduled_seqs': scheduled,
+                         'nonempty_seqs': batches, 'runtime_ready': ready,
+                         'artifact_review_required': True}
+    return results
+
+
+def notify(command, tag, message):
+    result = subprocess.run([command, message], env=dict(os.environ, CM_NOTIFY_TAG=tag),
+                            capture_output=True, timeout=30)
+    if result.returncode:
+        raise WatchError('notification delivery failed')
+
+
+def deliver(state, component, alerts, command, enabled):
+    previous = state.setdefault('active_alerts', {}).setdefault(component, {})
+    if not enabled:
+        return
+    for key, text in alerts.items():
+        if key not in previous:
+            notify(command, 'codex-pool' if component == 'pool' else 'cm-health', text)
+            previous[key] = text
+    for key in list(previous):
+        if key in alerts:
+            continue
+        # A quota severity change is one incident, not a spurious recovery.
+        if component != 'pool' or not alerts:
+            notify(command, 'codex-pool' if component == 'pool' else 'cm-health',
+                   'Recovered: ' + ('Codex pool has usable capacity again.' if component == 'pool' else key + ' is clear on the latest check.'))
+        previous.pop(key)
+
+
+def run(config, root, state, now, notifications=False):
+    snapshot = {'checked_at': now}
+    failures = state.setdefault('failures', {})
+    for component in ('pool', 'fleet', 'migration'):
+        if component not in config:
+            continue
+        try:
+            if component == 'pool':
+                cfg = config[component]
+                status = pool_status(pool_accounts(cfg['database']), now, cfg.get('low_percent', 10), cfg.get('stale_seconds', 1200))
+                snapshot[component] = status
+                # Clear an existing low warning only above 20%, avoiding quota jitter spam.
+                low = cfg.get('low_percent', 10)
+                if ('quota:low' in state.get('active_alerts', {}).get('pool', {})
+                        and status['status'] == 'healthy' and not status['supplemental_capacity']
+                        and status['best_headroom_percent'] <= cfg.get('recovery_percent', 20)):
+                    status['status'] = 'low'
+                alerts = quota_alert(status, low)
+            elif component == 'fleet':
+                health = rpc(root, 'daemon.health')
+                tasks = [t for t in rpc(root, 'continuous.list')['tasks'] if t['task_id'] in config['fleet']['tasks']]
+                expected = set(config['fleet']['tasks'])
+                if {t['task_id'] for t in tasks} != expected:
+                    raise WatchError('expected fleet definition is missing')
+                queues = {t['schedule']['queue']: rpc(root, 'queue.stats', {'queue': t['schedule']['queue']})
+                          for t in tasks if t['enabled'] and not t['paused'] and t['schedule']['kind'] == 'consumer'}
+                snapshot[component] = {'health': health, 'tasks': tasks, 'queues': queues}
+                alerts = fleet_alerts(health, tasks, queues, now, config['fleet'].get('overdue_seconds', 600))
+            else:
+                progress = migration_progress(root, config[component], now)
+                snapshot[component] = progress
+                notified = state.setdefault('migration_notified', [])
+                for name, item in progress.items():
+                    if item['runtime_ready'] and name not in notified and notifications:
+                        notify(config['notify_command'], 'codex-migration', f'{name}: required scheduled/repeated Codex runtime observations passed. Artifact/scope review remains separate.')
+                        notified.append(name)
+                alerts = {}
+            deliver(state, component, alerts, config['notify_command'], notifications)
+            failures[component] = 0
+            deliver(state, component + '-check', {}, config['notify_command'], notifications)
+        except Exception as error:
+            # Never include raw HTTP/RPC/database errors, credentials, or payloads.
+            snapshot[component + '_error'] = type(error).__name__
+            failures[component] = failures.get(component, 0) + 1
+            if failures[component] >= config.get('failure_checks', 3):
+                try:
+                    deliver(state, component + '-check', {'check:' + component:
+                        f'CM {component} monitoring failed three or more consecutive checks. Inspect the health-watch snapshot/log; prior alerts remain active.'}, config['notify_command'], notifications)
+                except Exception:
+                    snapshot['notification_error'] = True
+    state['last_checked_at'] = now
+    state['snapshot'] = snapshot
+    return any(k.endswith('_error') for k in snapshot)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, default=Path.home() / '.cm/health-watch-config.json')
+    parser.add_argument('--state', type=Path, default=Path.home() / '.cm/health-watch-state.json')
+    parser.add_argument('--notify', action='store_true')
+    args = parser.parse_args()
+    os.umask(0o077)
+    args.state.parent.mkdir(parents=True, exist_ok=True)
+    with args.state.with_suffix('.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        config = read_json(args.config)
+        state = read_json(args.state) if args.state.exists() else {}
+        failed = run(config, Path.home() / '.cm', state, time.time(), args.notify)
+        write_json(args.state, state)
+        print(json.dumps({'checked_at': state['last_checked_at'], 'failed': failed,
+                          'failures': state['failures'], 'notifications_enabled': args.notify}))
+        return int(failed)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -526,6 +526,19 @@ pub(crate) fn start_session_with_spawn_fn(
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
 
+    // Serialize the entire spawn/registry insertion with retirement of both
+    // this UID and its manager. A late child cannot appear after drain proof.
+    let mut fence_uids = vec![p.uid.as_str()];
+    fence_uids.extend(p.managed_by_uid.as_deref());
+    fence_uids.sort_unstable();
+    fence_uids.dedup();
+    let fences: Vec<_> = fence_uids.iter().map(|uid| crate::continuous::retirement::gate(uid)).collect();
+    let _permits: Vec<_> = fences.iter().map(|g| g.read().unwrap_or_else(|p| p.into_inner())).collect();
+    for uid in &fence_uids {
+        crate::continuous::retirement::ensure_open(uid)
+            .map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
+    }
+
     if p.argv.is_empty() {
         return Err((
             ErrorCode::InvalidParams,
@@ -820,6 +833,14 @@ pub(crate) fn start_session_with_spawn_fn(
     spawn_params
         .env
         .insert("CM_TUI_SESSION_ID".into(), session_uid.clone());
+
+    // Coverage can begin only with a fresh conversation launched by a daemon
+    // that knows the durable monitor protocol. Reconnecting an old MCP process
+    // or resuming legacy history cannot certify missing prior obligations.
+    // An existing tracked journal retains coverage across a legitimate resume.
+    let fresh_monitor_coverage = p.transcript_path.is_none()
+        && !p.argv.iter().any(|arg| matches!(arg.as_str(), "resume" | "fork" | "--resume" | "--continue") || arg.starts_with("--resume="));
+    spawn_params.env.insert("CM_MONITOR_TRACKING_V1".into(), if fresh_monitor_coverage { "1" } else { "0" }.into());
 
     // Memory-cap plumbing (slice 10c-e-3b-fix2). When the TUI
     // indicates a cap was applied (via `memory_cap_bytes`), the
@@ -1551,6 +1572,7 @@ pub(crate) fn close_continuous_run_for_exit(
     let now = crate::continuous::task::now_unix();
     let mut flipped: Option<(u64, String)> = None;
     let _ = crate::continuous::task::modify(continuous_task_id, |t| {
+        if t.recovery.is_some() || (t.engine == crate::continuous::task::Engine::Codex && t.account_blocked.is_some()) { return; }
         if let Some(run) = t.last_run.as_mut() {
             if run.session_uid.as_deref() == Some(session_uid)
                 && matches!(run.status, crate::continuous::task::RunStatus::Running)
@@ -2777,6 +2799,8 @@ pub fn resolve_authorized_session(
 #[derive(Deserialize)]
 struct SessionTurnEndedParams {
     session_uid: String,
+    /// Stop-hook inbox messages resume the turn; invalidate old idle/done
+    /// signals instead of advertising a boundary while those messages run.
     #[serde(default)]
     continuing: bool,
     /// The transcript file Claude Code handed the Stop hook for THIS turn
@@ -4765,25 +4789,13 @@ pub fn start_workflow(
         }
         full.insert("cols".into(), Value::Number(cols.into()));
         full.insert("rows".into(), Value::Number(rows.into()));
-        // P-A: SERIALIZE each participant's snapshot+spawn+detect through the
-        // worktree spawn queue (mirrors mcp_start_session). Two claude roles
-        // (worker, manager) share one transcript dir; without serialization
-        // their detectors each diff against a stale pre-snapshot taken before
-        // the other's transcript appears and can cross-bind. By enqueueing +
-        // waiting BEFORE the snapshot, role B's snapshot isn't taken until role
-        // A's detector has bound (so A's transcript is excluded from B's diff).
         let wt_path = std::path::Path::new(&worktree).to_path_buf();
-        // Cross-bind fix: spawn-time detectors are CODEX-ONLY. A Codex agent
-        // writes its rollout file at boot, so detection-at-spawn is causal and
-        // the spawn-queue serialization above actually serializes. A Claude
-        // participant writes NO transcript until its first prompt — its
-        // detector window always outlives the slot wait, every role's detector
-        // ends up armed concurrently against an empty snapshot, and whichever
-        // polls first claims the worker's first transcript (observed on
-        // cm-manager: the worker's transcript bound to the idle manager,
-        // wedging the run headlessly). Claude roles instead bind causally at
-        // activation time via the finalize drainer's deliver-then-discover
-        // snapshot diff (`ActivationPhase::RebindPending`).
+        // Codex discovery follows the session process's open rollout, so roles
+        // sharing a worktree can bind independently without snapshot ordering.
+        // Do not wait for an idle role to create a rollout: initial delivery
+        // happens after every role is spawned, and two 20s queue waits exceed
+        // the client's RPC timeout. Claude binds at activation through the
+        // finalize drainer's deliver-then-discover path instead.
         let detector_engine = if workflow_detector_disabled() {
             None
         } else {
@@ -4794,40 +4806,7 @@ pub fn start_workflow(
                 _ => None,
             }
         };
-        let ticket = match detector_engine {
-            Some(_) => {
-                let queue_arc = workflow_spawn_queue(state_arc, &wt_path);
-                let seq = queue_arc.enqueue();
-                let ticket = crate::state::WorktreeSpawnTicket::new(queue_arc.clone(), seq);
-                // Bounded wait — a slow/non-writing prior detector shouldn't
-                // block the launch forever. On timeout, drop the slot and arm
-                // this role's detector unserialized (best-effort): correctness
-                // for the common (transcript-on-startup) case, liveness for the
-                // pathological one.
-                if queue_arc.wait_for_turn_timeout(seq, slot_wait_timeout()).is_err() {
-                    eprintln!(
-                        "cm-daemon: start_workflow: spawn-queue wait timed out for role {} \
-                         — arming detector unserialized (best-effort)",
-                        role_name
-                    );
-                    drop(ticket);
-                    None
-                } else {
-                    Some(ticket)
-                }
-            }
-            None => None,
-        };
-        // Snapshot AFTER the wait so prior roles' bound transcripts are excluded.
-        let pre_snapshot: Vec<String> = match detector_engine {
-            Some(crate::transcript_detect::DetectorEngine::ClaudeCode) => {
-                crate::transcript_detect::snapshot_claude_transcript_ids(&wt_path)
-            }
-            Some(crate::transcript_detect::DetectorEngine::Codex) => {
-                crate::transcript_detect::snapshot_codex_transcript_ids(&wt_path)
-            }
-            None => Vec::new(),
-        };
+        let pre_snapshot = Vec::new();
         #[cfg(test)]
         record_spawn_snapshot_for_test(&uid, &pre_snapshot);
         if let Err((c, m)) = start_session(state_arc, &Value::Object(full)) {
@@ -4835,13 +4814,7 @@ pub fn start_workflow(
             return Err((c, format!("start_workflow spawn {}: {}", role_name, m)));
         }
         spawned_uids.push(uid.clone());
-        // P-B: arm the detector whenever this engine needs one — INCLUDING the
-        // timeout case where `ticket` is None (serialization lost, but the role
-        // still needs its transcript bound or the run wedges). Passing the
-        // `Option<ticket>` straight through means None → unserialized arm
-        // (best-effort), matching the timeout comment's stated intent. The old
-        // `if let (Some(engine), Some(ticket))` guard SKIPPED the detector on
-        // None, leaving the participant with no transcript_path forever.
+        // Every newly spawned Codex role needs its process-owned detector.
         if let Some(engine) = detector_engine {
             // P-B: FAIL CLOSED on detector-thread spawn failure — a participant
             // with no detector never gets `transcript_path`, so
@@ -4856,7 +4829,7 @@ pub fn start_workflow(
                 engine,
                 wt_path.clone(),
                 pre_snapshot,
-                ticket,
+                None,
                 workflow_detector_spawn_fn(),
             ) {
                 cleanup_spawned(&spawned_uids);
@@ -4946,7 +4919,7 @@ pub fn start_workflow(
             phase: crate::workflow::run::ActivationPhase::Queued,
             rendered_prompt: None,
             pre_clear_snapshot: None,
-            enter_fire_at_ms: None,
+            enter_fire_at_ms: None, codex_delivery: None,
         });
     }
     if let Err(e) = crate::workflow::run::save(&run) {
@@ -6169,7 +6142,7 @@ pub fn workflow_transition(
                 phase: crate::workflow::run::ActivationPhase::Queued,
                 rendered_prompt: None,
                 pre_clear_snapshot: None,
-                enter_fire_at_ms: None,
+                enter_fire_at_ms: None, codex_delivery: None,
             });
             Ok(())
         },
@@ -7470,12 +7443,12 @@ fn spawn_agent_prompt_delivery(
 }
 
 /// How long the codex confirm loop waits, total, from delivery return.
-const CODEX_CONFIRM_MAX: std::time::Duration = std::time::Duration::from_secs(75);
+pub(crate) const CODEX_CONFIRM_MAX: std::time::Duration = std::time::Duration::from_secs(75);
 /// Re-send Enter at these offsets while the rollout is still empty. The
 /// first covers a dropped/eaten Enter with the body still in the composer
 /// (an extra Enter on an EMPTY composer is a no-op, so this can never
 /// double-submit); the second covers one more modal layer.
-const CODEX_CONFIRM_ENTER_RETRIES: [std::time::Duration; 2] = [
+pub(crate) const CODEX_CONFIRM_ENTER_RETRIES: [std::time::Duration; 2] = [
     std::time::Duration::from_secs(8),
     std::time::Duration::from_secs(18),
 ];
@@ -7487,7 +7460,7 @@ const CODEX_CONFIRM_ENTER_RETRIES: [std::time::Duration; 2] = [
 /// the same probe submitted A+B concatenated). On an empty composer one
 /// C-c just arms the quit hint, which the immediately following paste
 /// disarms.
-const CODEX_CONFIRM_REDELIVER_AT: std::time::Duration = std::time::Duration::from_secs(32);
+pub(crate) const CODEX_CONFIRM_REDELIVER_AT: std::time::Duration = std::time::Duration::from_secs(32);
 
 /// True when `uid`'s codex rollout shows a started turn: a bound
 /// `transcript_path` whose file is non-empty. codex creates the rollout
@@ -7675,6 +7648,18 @@ fn deliver_agent_body(
     fresh_spawn: bool,
     what: &str,
 ) -> bool {
+    deliver_agent_body_guarded(handle, fanout, session_uid, body_text, fresh_spawn, what, None)
+}
+
+fn deliver_agent_body_guarded(
+    handle: &crate::session::InputHandle,
+    fanout: &std::sync::Arc<crate::session::PtyByteFanout>,
+    session_uid: &str,
+    body_text: &str,
+    fresh_spawn: bool,
+    what: &str,
+    notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
+) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
     // Own the fanout subscription for the life of THIS delivery rather
@@ -7794,6 +7779,13 @@ fn deliver_agent_body(
     // Enter is corrupted terminal input no rehydrate can repair.
     // (Nested `write_and_stamp` calls below take no-op permits — see
     // `writer_gate`'s reentrancy contract.)
+    let _notice_guard = if let Some(notice) = notice {
+        let Some(guard) = notice.acquire() else { return false; };
+        // Unlike ordinary prompt delivery, a stop notice never falls through
+        // a still-typing operator gate or uses a fresh-spawn recovery path.
+        if handle.operator_quiet_for().is_some_and(|quiet| quiet < OPERATOR_QUIET_WINDOW) { return false; }
+        Some(guard)
+    } else { None };
     let _unit = crate::writer_gate::unit_permit();
     if let Err(e) = handle.write_and_stamp(&payload) {
         eprintln!(
@@ -8038,6 +8030,8 @@ enum WorkspaceResolution {
 /// Everything `mint_task_workspace` needs that lives behind the state
 /// lock, snapshotted so the mint itself runs unlocked.
 struct MintContext {
+    /// A retained binding must recover its prior branch, never mint empty work.
+    recover_existing: bool,
     /// The caller workspace's repo + main checkout. Used only when the
     /// task's own `repo_url` matches, so a caller in repo A can't drag a
     /// task in repo B into A's checkout.
@@ -8231,6 +8225,14 @@ fn mint_task_workspace(
     // branch (re-creating the directory) beats cutting a fresh
     // zero-commit decoy and overwriting the pointer to the real work.
     let wip_branch_hint = field("wip_branch");
+    if ctx.recover_existing && !wip_branch_hint.as_deref()
+        .is_some_and(|branch| crate::worktree::local_branch_exists(&main_repo, branch)
+            && crate::worktree::worktree_dir_for_branch(&main_repo, branch).is_some())
+    {
+        return Err((ErrorCode::Conflict, format!(
+            "Task '{}' retains a workspace binding but its prior local branch could not be verified; reconcile the existing checkout before relaunching.", task_id
+        )));
+    }
     let minted = crate::worktree::mint_task_worktree(
         &main_repo,
         task_id,
@@ -8253,7 +8255,7 @@ fn mint_task_workspace(
     // inline, so the NEXT spawn on this task resolves through the
     // ordinary `task_workspaces` / `bindings` lookup and reuses this
     // checkout rather than minting a second one.
-    let workspace_id = uuid::Uuid::new_v4().simple().to_string();
+    let workspace_id;
     {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Re-check under the lock. Two `start_session(task_id=X)` calls
@@ -8284,6 +8286,13 @@ fn mint_task_workspace(
                 });
             }
         }
+        // A restart persists live workspaces only. A retained task binding
+        // can therefore name an absent workspace after its worker exits.
+        // Re-register that same identity once git has recovered its checkout.
+        workspace_id = state.task_workspaces.get(task_id)
+            .or_else(|| state.bindings.get(task_id))
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         state.workspaces.insert(
             workspace_id.clone(),
             crate::manifest::ManifestWorkspace {
@@ -8687,6 +8696,14 @@ pub fn mcp_start_session(
                 .cloned(),
             None => Some(caller.workspace_id.clone()),
         };
+        // A task binding outlives its last worker, but the restart manifest
+        // contains only live workspaces. Recover an authorized descendant's
+        // existing branch through the mint path when that workspace is absent.
+        // Its retained binding preserves the workspace ID at registration.
+        let recover_existing = descendant_task_target.is_some() && bound_workspace_id.as_ref()
+            .is_some_and(|ws_id| !state.workspaces.contains_key(ws_id));
+        let bound_workspace_id = bound_workspace_id.filter(|ws_id|
+            descendant_task_target.is_none() || state.workspaces.contains_key(ws_id));
         // ux-1a/1b: the workspace-less arm. Pre-fix this fell back to the
         // CALLER's workspace whenever the daemon had minted the task
         // itself (`agent_task_edges`), which is exactly the live incident
@@ -8743,6 +8760,7 @@ pub fn mcp_start_session(
                 WorkspaceResolution::Mint {
                     task_id: req_task.to_string(),
                     ctx: MintContext {
+                        recover_existing,
                         caller_repo_url: caller_ws.and_then(|w| w.repo_url.clone()),
                         caller_main_repo: caller_ws.and_then(|w| w.main_repo_path.clone()),
                         repos_dir: state.config.repos_dir_or_default(),
@@ -10212,7 +10230,7 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
 /// [`continuous_restorable`] (it loads the task to decide) — see
 /// [`restore_sessions`].
 fn restore_in_scope(e: &crate::manifest::ManifestEntry) -> bool {
-    e.last_exit.is_none() && e.workflow_run_id.is_none()
+    e.last_exit.is_none() && e.workflow_run_id.is_none() && crate::continuous::retirement::ensure_open(&e.uid).is_ok()
 }
 
 /// S5: should restore re-spawn a CONTINUOUS session, or leave it to the
@@ -10249,6 +10267,13 @@ fn compose_restore_params(
     worktree: &std::path::Path,
     e: &crate::manifest::ManifestEntry,
 ) -> MethodResult {
+    crate::continuous::retirement::ensure_open(&e.uid).map_err(|err| (ErrorCode::Conflict, err.to_string()))?;
+    if let Some(id) = &e.continuous_task_id {
+        let t = crate::continuous::task::load_one(id).ok_or((ErrorCode::Conflict, "Continuous task disappeared; cannot restore its old session.".into()))?;
+        if t.engine.as_session_type() != e.session_type || (t.current_session_uid.as_deref() != Some(&e.uid) && t.in_flight.as_ref().map(|f| f.session_uid.as_str()) != Some(&e.uid)) {
+            return Err((ErrorCode::Conflict, "Stale continuous session identity or engine; restore is refused.".into()));
+        }
+    }
     // S3 (resume): a persisted transcript_id means "continue this
     // conversation" — the argv gets `--resume <id>` (claude) / the `resume`
     // subcommand (codex). `None` → fresh spawn (a session that never bound a
@@ -10938,8 +10963,50 @@ struct TriggerParams {
 /// Reason a `trigger` fire was abandoned inside the inside-flock check-and-set.
 /// Mapped to a clean `{fired:false, reason}` response, NOT an `ErrorCode` error.
 enum FireAbort {
+    Paused,
+    RecoveryHeld,
+    StaleAdmission,
     Busy,
     DuplicateFireToken,
+}
+
+/// Admission is checked against the persisted record, never the pre-prompt
+/// snapshot. No claim, spawn, compaction or prompt delivery may precede this.
+fn arm_continuous_fire(
+    snapshot: &crate::continuous::task::ContinuousTask,
+    fire_token: &str,
+    session_uid: &str,
+    started_at: u64,
+) -> crate::continuous::task::TryModifyOutcome<FireAbort> {
+    crate::continuous::task::try_modify(&snapshot.task_id, |t| {
+        if t.paused || t.drain.is_some() {
+            return Err(FireAbort::Paused);
+        }
+        if t.recovery_hold.is_some() || t.account_blocked.is_some() || t.retirement.is_some() || t.recovery.is_some() { return Err(FireAbort::RecoveryHeld); }
+        if t.admission_revision != snapshot.admission_revision || t.engine != snapshot.engine {
+            return Err(FireAbort::StaleAdmission);
+        }
+        if t.in_flight.is_some() {
+            return Err(FireAbort::Busy);
+        }
+        if t.last_run
+            .as_ref()
+            .is_some_and(|last| last.fire_token == fire_token)
+        {
+            return Err(FireAbort::DuplicateFireToken);
+        }
+        if t.run_count != snapshot.run_count
+            || t.current_session_uid != snapshot.current_session_uid
+        {
+            return Err(FireAbort::StaleAdmission);
+        }
+        t.in_flight = Some(crate::continuous::task::InFlight {
+            fire_token: fire_token.to_string(),
+            session_uid: session_uid.to_string(),
+            started_at,
+        });
+        Ok(())
+    })
 }
 
 /// `trigger` — fire a continuous task once (Phase 2 manual fire + Phase 3
@@ -11239,7 +11306,8 @@ fn release_consumer_batch(
 }
 
 /// Returns `{fired:true, fire_token, session_uid, run_mode:"fresh"|"persistent"}`
-/// on a fire, else `{fired:false, reason:"busy"|"duplicate_fire_token"|"paused"}`.
+/// on a fire, else `{fired:false, reason:"busy"|"duplicate_fire_token"|"paused"|"stale_admission"}`.
+/// A stale-admission skip requires a fresh read before retrying the fire.
 pub fn trigger(
     state_arc: &Arc<Mutex<DaemonState>>,
     caller: &Caller,
@@ -11403,24 +11471,18 @@ pub fn trigger(
     // pinned contract. A freshly-minted fire_token is unique by construction,
     // so the duplicate branch only ever fires for a CALLER-supplied token.
     let started_at = crate::continuous::task::now_unix();
-    let armed = crate::continuous::task::try_modify::<_, FireAbort>(&p.task_id, |t| {
-        if t.in_flight.is_some() {
-            return Err(FireAbort::Busy);
-        }
-        if let Some(last) = &t.last_run {
-            if last.fire_token == fire_token {
-                return Err(FireAbort::DuplicateFireToken);
-            }
-        }
-        t.in_flight = Some(crate::continuous::task::InFlight {
-            fire_token: fire_token.clone(),
-            session_uid: session_uid.clone(),
-            started_at,
-        });
-        Ok(())
-    });
+    let armed = arm_continuous_fire(&task, &fire_token, &session_uid, started_at);
     match armed {
         crate::continuous::task::TryModifyOutcome::Ok(_) => {}
+        crate::continuous::task::TryModifyOutcome::Aborted(FireAbort::RecoveryHeld) => {
+            return Ok(json!({"fired": false, "reason": "reconciliation_required"}));
+        }
+        crate::continuous::task::TryModifyOutcome::Aborted(FireAbort::Paused) => {
+            return Ok(json!({ "fired": false, "reason": "paused" }));
+        }
+        crate::continuous::task::TryModifyOutcome::Aborted(FireAbort::StaleAdmission) => {
+            return Ok(json!({ "fired": false, "reason": "stale_admission" }));
+        }
         crate::continuous::task::TryModifyOutcome::Aborted(FireAbort::Busy) => {
             return Ok(json!({ "fired": false, "reason": "busy" }));
         }
@@ -11916,6 +11978,10 @@ pub fn report_done(
         }
     };
 
+    let report_gate = crate::continuous::retirement::gate(&caller_uid);
+    let _report_permit = report_gate.read().unwrap_or_else(|p| p.into_inner());
+    crate::continuous::retirement::ensure_open(&caller_uid).map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
+
     // Effect 1 — stamp the session-scoped marker, and resolve the caller's
     // continuous tag while we hold the lock (read the DaemonSession field
     // directly; SessionViewAny omits it). Brief lock, dropped before the disk
@@ -11979,6 +12045,9 @@ pub fn report_done(
                 // consumer-wedge close limit counts CONSECUTIVE wedges only.
                 t.consecutive_wedge_closes = 0;
                 t.account_blocked = None;
+                if let Some(drain) = t.drain.as_mut() {
+                    drain.diagnostic = None;
+                }
                 marked = true;
             }
         }
@@ -12007,7 +12076,10 @@ pub fn report_done(
                 event: "report_done".to_string(),
                 fire_token,
                 session_uid,
-                run_mode: Some("fresh".to_string()),
+                run_mode: Some(match updated.run_mode {
+                    crate::continuous::task::RunMode::Fresh => "fresh".to_string(),
+                    crate::continuous::task::RunMode::Persistent => "persistent".to_string(),
+                }),
                 trigger_source: Some(format!("session:{}", caller_uid)),
                 status: Some("done".to_string()),
                 detail: p.reason.clone().map(Value::String),
@@ -12233,6 +12305,8 @@ pub fn resolve_stuck(
     }
 
     // Gate 2: the caller must be the task's CURRENT investigator.
+    let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
+        .map_err(|e| (ErrorCode::Internal, format!("resolve_stuck lock: {e}")))?;
     let task = crate::continuous::task::load_one(&p.task_id).ok_or((
         ErrorCode::NotFound,
         format!("resolve_stuck: continuous task '{}' not found", p.task_id),
@@ -12247,6 +12321,9 @@ pub fn resolve_stuck(
         ));
     }
 
+    if task.drain.is_some() && p.action != "mark_unstuck" {
+        return Ok(json!({ "ok": false, "reason": "draining", "task_id": p.task_id, "seq": p.seq }));
+    }
     let reason = p.reason.clone().unwrap_or_default();
     match p.action.as_str() {
         "mark_unstuck" => {
@@ -12681,20 +12758,19 @@ fn investigator_prompt(
     )
 }
 
-/// Spawn a FRESH claude investigator session for a stuck run (the scheduler
+/// Spawn a fresh investigator session for a stuck run (the scheduler
 /// watchdog calls this after [`snapshot_stuck_run`]; DESIGN_CONTINUOUS_TASKS.md
 /// §11). A near-verbatim restructure of `trigger`'s FRESH executor arm: mint a
 /// uid, compose `start_session` params via the SAME choke point
 /// (`compose_continuous_spawn_params` → `continuous_fresh_spawn`), then deliver
 /// the daemon-constructed verdict prompt on the detached delivery thread.
 ///
-/// The investigator is ALWAYS a `claude-code` session regardless of the task's
-/// own engine (it reads snapshot files + git, not a codex/bash workload),
-/// labelled `"investigator"`, tagged with the task's `continuous_task_id` (so
+/// The investigator follows the task's agent engine; explicit bash tasks retain
+/// the Claude investigator policy. It is labelled `"investigator"`, tagged with
+/// the task's `continuous_task_id` (so
 /// `list_sessions` groups it under the same task and the watchdog can find it via
-/// `investigator_uid`), and pinned to the task's OWN worktree (two claude
-/// sessions sharing one worktree is fine — claude transcripts are per-session
-/// UUID files). 80×24: headless, no caller terminal.
+/// `investigator_uid`), and pinned to the task's own worktree. Transcript
+/// identity is session-specific. 80×24: headless, no caller terminal.
 ///
 /// On a successful spawn it RECORDS the investigation: `investigator_uid =
 /// Some(uid)` + `investigation_count += 1` via `task::modify`, and appends a
@@ -12716,9 +12792,12 @@ pub(crate) fn spawn_investigator(
     snapshot_dir: &std::path::Path,
 ) -> MethodResult {
     let uid = new_daemon_minted_session_uid();
-    // ALWAYS claude — the investigator reads snapshot files + git state,
-    // regardless of the task's own engine (which may be codex/bash).
-    let engine = crate::continuous::task::Engine::Claude.as_session_type();
+    // Keep the investigator on the task's agent engine. Bash still needs an
+    // agent to interpret the evidence and retains its Claude investigator.
+    let engine = match task.engine {
+        crate::continuous::task::Engine::Codex => crate::continuous::task::Engine::Codex,
+        _ => crate::continuous::task::Engine::Claude,
+    }.as_session_type();
     let working_dir = PathBuf::from(&task.worktree_path);
 
     // Compose via the continuous spawn choke point (tags continuous_task_id +
@@ -12824,6 +12903,13 @@ pub(crate) fn spawn_investigator(
 // lifecycle; agents fan out via `trigger`).
 // ===================================================================
 
+// A creation-policy default, deliberately separate from Engine::default().
+// Existing task records require an explicit engine; deserialization of other
+// callers of the enum must not silently change their historical behavior.
+fn default_continuous_create_engine() -> crate::continuous::task::Engine {
+    crate::continuous::task::Engine::Codex
+}
+
 /// `continuous.create` params. The durable worktree is created ONCE here
 /// (reused every fire — the disk-growth bound) and the workspace is registered
 /// in the daemon's manifest snapshot. Config beyond the `ContinuousTask::new`
@@ -12843,8 +12929,8 @@ struct ContinuousCreateParams {
     planning_task_id: Option<String>,
     /// Human-readable sidebar label.
     label: String,
-    /// Wire engine: `"claude"`|`"codex"`|`"bash"` (default `claude`).
-    #[serde(default)]
+    /// Wire engine: `"claude"`|`"codex"`|`"bash"` (default `codex` for NEW tasks).
+    #[serde(default = "default_continuous_create_engine")]
     engine: crate::continuous::task::Engine,
     /// `"fresh"`|`"persistent"` (default `fresh`; persistent is a Phase-3 no-op).
     #[serde(default)]
@@ -13177,6 +13263,9 @@ pub fn continuous_update(
     _state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    if params.get("engine").is_some() {
+        return Err((ErrorCode::InvalidParams, "Use continuous.migrate_engine to change engines after draining and retiring the old session.".into()));
+    }
     let p: ContinuousUpdateParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.update params: {}", e)))?;
     crate::continuous::task::validate_task_id(&p.task_id)
@@ -13187,6 +13276,8 @@ pub fn continuous_update(
             format!("continuous.update: task '{}' not found", p.task_id),
         ));
     }
+    let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
+        .map_err(|e| (ErrorCode::Internal, format!("continuous.update lock: {e}")))?;
     if let Some(dp) = &p.default_prompt {
         if dp.trim().is_empty() {
             return Err((
@@ -13295,7 +13386,7 @@ pub fn continuous_update(
 /// next_fire_at, last_fired_at, last_outcome, last_run, account_blocked, review_kind,
 /// review_surface }, … ] }`.
 pub fn continuous_list(
-    _state_arc: &Arc<Mutex<DaemonState>>,
+    state_arc: &Arc<Mutex<DaemonState>>,
     _params: &Value,
 ) -> MethodResult {
     let tasks = crate::continuous::task::load_all();
@@ -13312,6 +13403,9 @@ pub fn continuous_list(
                 "schedule": t.schedule,
                 "enabled": t.enabled,
                 "paused": t.paused,
+                "drain": t.drain,
+                "drain_status": continuous_drain_status(state_arc, t),
+                "admission_revision": t.admission_revision,
                 "run_count": t.run_count,
                 "current_session_uid": t.current_session_uid,
                 "in_flight": t.in_flight.is_some(),
@@ -13325,6 +13419,10 @@ pub fn continuous_list(
                 // the exact seq/uid and when positive recovery proof must be
                 // newer than. `null` outside an account-block episode.
                 "account_blocked": t.account_blocked,
+                "recovery_hold": t.recovery_hold,
+                "recovery": t.recovery,
+                "retirement": t.retirement,
+                "engine_changes": t.engine_changes,
                 // Config-driven review discovery: which tasks `/triage-review`
                 // handles, and fix-first vs investigate-first. `null` = not
                 // reviewable via triage-review.
@@ -13374,12 +13472,179 @@ pub fn continuous_dispatch_pending(
     Ok(json!({ "tasks": items }))
 }
 
+/// `continuous.drain` params.
+#[derive(serde::Deserialize)]
+struct ContinuousDrainParams {
+    task_id: String,
+}
+
+/// Read-only runtime facts, including workers spawned after the stop request.
+/// Missing retained sessions remain explicit unknowns; MCP journals are read
+/// separately after releasing the global daemon-state lock.
+pub(crate) fn capture_drain_sessions(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task: &crate::continuous::task::ContinuousTask,
+) -> Vec<crate::continuous::drain::SessionObservation> {
+    use crate::continuous::drain::SessionObservation;
+    let Some(drain) = task.drain.as_ref() else { return Vec::new(); };
+    let mut codex_checks = Vec::new();
+    let mut sessions = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let mut uids = std::collections::HashSet::new();
+        uids.extend(drain.session_uid.iter().cloned());
+        uids.extend(task.current_session_uid.iter().cloned());
+        uids.extend(task.investigator_uid.iter().cloned());
+        // Iterate to a fixed point so grandchildren and children of an exited
+        // worker remain obligations independent of HashMap iteration order.
+        loop {
+            let before = uids.len();
+            for (uid, s) in &state.sessions {
+                if s.continuous_task_id.as_deref() == Some(&task.task_id)
+                    || s.managed_by_uid
+                        .as_ref()
+                        .is_some_and(|parent| uids.contains(parent))
+                {
+                    uids.insert(uid.clone());
+                }
+            }
+            for s in &state.recently_exited {
+                if s.managed_by_uid
+                    .as_ref()
+                    .is_some_and(|parent| uids.contains(parent))
+                {
+                    uids.insert(s.session_uid.clone());
+                }
+            }
+            if before == uids.len() {
+                break;
+            }
+        }
+        let mut observations = Vec::new();
+        for uid in uids {
+            let orchestrator = drain.session_uid.as_deref() == Some(&uid);
+            if let Some(s) = state.sessions.get(&uid) {
+                let done = s.reported_done();
+                if s.session_type == "codex" {
+                    if let (Some(path), Some(report)) = (&s.transcript_path, &done) {
+                        codex_checks.push((uid.clone(), path.clone(), report.at_unix));
+                    }
+                }
+                let end = *s.last_turn_end_at.lock().unwrap_or_else(|p| p.into_inner());
+                observations.push(SessionObservation {
+                    session_uid: uid,
+                    orchestrator,
+                    exited: s.last_exit.kernel_set(),
+                    reported_done: done.is_some(),
+                    reported_at: done.as_ref().map(|r| r.at_unix),
+                    last_input_at: s.last_input_at.lock().unwrap_or_else(|p| p.into_inner())
+                        .map(|at| now_unix_f64() - at.elapsed().as_secs_f64()),
+                    failed: s.last_exit.operator_kill_requested(),
+                    final_turn_ended: done
+                        .as_ref()
+                        .is_some_and(|r| end.is_some_and(|e| e >= r.at_instant)),
+                });
+            } else if let Some(tomb) = state.exited_tombstone(&uid) {
+                observations.push(SessionObservation {
+                    session_uid: uid,
+                    orchestrator,
+                    exited: true,
+                    reported_done: tomb.reported_done_at.is_some(),
+                    reported_at: tomb.reported_done_at,
+                    last_input_at: None,
+                    failed: tomb.killed,
+                    final_turn_ended: true,
+                });
+            }
+        }
+        observations.sort_by(|a, b| a.session_uid.cmp(&b.session_uid));
+        observations
+    };
+    for (uid, path, after) in codex_checks {
+        if let Some(session) = sessions.iter_mut().find(|s| s.session_uid == uid) {
+            session.final_turn_ended = crate::continuous::completion::codex_turn_finished_after(&path, after);
+        }
+    }
+    sessions
+}
+
+fn continuous_drain_status(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task: &crate::continuous::task::ContinuousTask,
+) -> Option<crate::continuous::drain::DrainStatus> {
+    if let Some(status) = crate::continuous::migration::reconciled_drain_status(state_arc, task) { return Some(status); }
+    let drain = task.drain.as_ref()?;
+    let sessions = capture_drain_sessions(state_arc, task);
+    let monitors = crate::continuous::completion::load_session_monitors(drain.session_uid.as_deref(), &sessions);
+    crate::continuous::drain::status_with_evidence(task, &sessions, &monitors)
+}
+
+/// Close admission and capture already-admitted work without input, a signal,
+/// a new queue claim or a session kill. Operator-only at dispatch.
+pub fn continuous_drain(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let p: ContinuousDrainParams = serde_json::from_value(params.clone()).map_err(|e| {
+        (
+            ErrorCode::InvalidParams,
+            format!("continuous.drain params: {e}"),
+        )
+    })?;
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.drain: {e}")))?;
+    if crate::continuous::task::load_one(&p.task_id).is_none() {
+        return Err((
+            ErrorCode::NotFound,
+            format!("continuous.drain: task '{}' not found", p.task_id),
+        ));
+    }
+    let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
+        .map_err(|e| (ErrorCode::Internal, format!("continuous.drain lock: {e}")))?;
+    let updated = crate::continuous::task::modify(&p.task_id, |t| {
+        crate::continuous::drain::request(t, crate::continuous::task::now_unix());
+    })
+    .map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!("continuous.drain persist: {e}"),
+        )
+    })?;
+    super::continuous_drain::queue_notices(state_arc, std::slice::from_ref(&updated));
+    Ok(json!({
+        "task_id": p.task_id,
+        "paused": updated.paused,
+        "drain": updated.drain,
+        "drain_status": continuous_drain_status(state_arc, &updated),
+    }))
+}
+
+pub(super) fn deliver_drain_notice(state: &Arc<Mutex<DaemonState>>, task: &crate::continuous::task::ContinuousTask) {
+    let Some(drain) = task.drain.as_ref() else { return; };
+    let Some(uid) = drain.session_uid.as_deref() else { return; };
+    let Some(text) = super::continuous_drain::notice(task) else { return; };
+    let target = {
+        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+        state.sessions.get(uid).map(|s| (s.input_handle(), s.fanout.clone()))
+    };
+    let Some((handle, fanout)) = target else { return; };
+    let binding = super::continuous_drain::NoticeBinding { state, task_id: &task.task_id, request_id: &drain.request_id, session_uid: uid };
+    if deliver_agent_body_guarded(&handle, &fanout, uid, &text, false, "continuous stop notice", Some(&binding)) {
+        let _ = crate::continuous::task::modify(&task.task_id, |task| {
+            if let Some(current) = task.drain.as_mut() {
+                if current.request_id == drain.request_id {
+                    current.notice_submitted_at = Some(now_unix_f64());
+                }
+            }
+        });
+    }
+}
+
 /// `continuous.pause` params.
 #[derive(serde::Deserialize)]
 struct ContinuousPauseParams {
     task_id: String,
     /// Target paused state (`true` to pause, `false` to resume).
     paused: bool,
+    /// Optional compare-and-swap guards for a UI acting on a cached inventory.
+    expected_drain_request_id: Option<String>,
+    expected_admission_revision: Option<u64>,
 }
 
 /// `continuous.pause` — set/clear a task's `paused` flag (a paused task is
@@ -13403,15 +13668,27 @@ pub fn continuous_pause(
             format!("continuous.pause: continuous task '{}' not found", p.task_id),
         ));
     }
-    let updated = crate::continuous::task::modify(&p.task_id, |t| {
+    let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
+        .map_err(|e| (ErrorCode::Internal, format!("continuous.pause lock: {e}")))?;
+    let updated = crate::continuous::task::try_modify::<_, ()>(&p.task_id, |t| {
+        if !p.paused && t.reconciliation.as_ref().is_some_and(|r|r.items.values().any(|i|i.status != crate::continuous::migration::ItemStatus::Completed)) && t.account_blocked.is_none() && t.recovery_hold.is_none() && t.recovery.is_none() { return Err(()); }
+        if !p.paused && t.retirement.is_some() && !(t.current_session_uid.is_none() && t.engine_changes.last().is_some_and(|c| c.target == t.engine && c.run_count == t.run_count)) { return Err(()); }
+        if p.expected_admission_revision.is_some_and(|revision| revision != t.admission_revision)
+            || p.expected_drain_request_id.as_ref().is_some_and(|id| t.drain.as_ref().map(|d| &d.request_id) != Some(id)) {
+            return Err(());
+        }
+        if t.paused != p.paused || (!p.paused && t.drain.is_some()) {
+            t.admission_revision = t.admission_revision.saturating_add(1);
+        }
         t.paused = p.paused;
-    })
-    .map_err(|e| {
-        (
-            ErrorCode::Internal,
-            format!("continuous.pause persist '{}': {}", p.task_id, e),
-        )
-    })?;
+        if !p.paused { t.drain = None; t.reconciliation = None; t.retirement = None; }
+        Ok(())
+    });
+    let updated = match updated {
+        crate::continuous::task::TryModifyOutcome::Ok(task) => task,
+        crate::continuous::task::TryModifyOutcome::Aborted(()) => return Err((ErrorCode::Conflict, "Task admission or stop request changed; refresh before resuming.".into())),
+        crate::continuous::task::TryModifyOutcome::Persist(e) => return Err((ErrorCode::Internal, format!("continuous.pause persist '{}': {e}", p.task_id))),
+    };
     Ok(json!({ "task_id": p.task_id, "paused": updated.paused }))
 }
 
@@ -13986,8 +14263,8 @@ pub(crate) fn set_configured_cap_prefix_override_for_test(prefix: Option<String>
     CONFIGURED_CAP_PREFIX_OVERRIDE.with(|c| *c.borrow_mut() = prefix);
 }
 
-/// Get-or-create the per-worktree spawn queue (serializes snapshot+spawn+detect
-/// so participants in one worktree don't cross-bind transcripts — P-A).
+/// Test helper: occupy the shared queue to verify workflow launch ignores it.
+#[cfg(test)]
 fn workflow_spawn_queue(
     state_arc: &Arc<Mutex<DaemonState>>,
     working_dir: &std::path::Path,
@@ -21114,7 +21391,7 @@ mod tests {
                 "orch".into(),
                 "ws-ct".into(),
                 wt.to_string_lossy().into_owned(),
-                Engine::Claude,
+                Engine::Bash,
                 RunMode::Persistent,
                 Schedule::OnDemand,
                 "go".into(),
@@ -21129,7 +21406,7 @@ mod tests {
             task::save(&t).unwrap();
 
             // bash (not claude) so the test doesn't need a real claude binary;
-            // continuous_restorable keys off the TASK's run_mode, not the engine.
+            // Keep the persisted task and actual runtime engines consistent.
             // transcript_id present so the S5 resume-only guard admits it.
             let mut e = me(uid, "bash");
             e.continuous_task_id = Some("ct-orch".into());
@@ -24617,20 +24894,11 @@ mod tests {
         });
     }
 
-    /// P-B (timeout branch): when the spawn-queue wait TIMES OUT, the role's
-    /// detector is still armed UNSERIALIZED (ticket = None) — it must NOT be
-    /// skipped. The old `if let (Some(engine), Some(ticket))` guard skipped the
-    /// detector entirely on a None ticket, leaving the participant with no
-    /// `transcript_path` so `sync_role_session_ids` could never bind its sid and
-    /// the run wedged after returning a run_id. Codex role (the only engine
-    /// that still arms a spawn-time detector post-cross-bind-fix). Here we
-    /// pre-occupy the worktree queue (never released) so the worker's wait
-    /// times out, then prove arming was still ATTEMPTED via the failing
-    /// detector hook: fail-closed Err means `spawn_queued_detector` was
-    /// reached on the timeout path. Mutation: restoring the `Some(ticket)`
-    /// guard skips arming → the launch would succeed → this fails.
+    /// An occupied worktree queue cannot delay a Codex workflow role. Its
+    /// process-owned detector must still be armed and fail the launch closed
+    /// if the detector thread cannot start.
     #[test]
-    fn start_workflow_timeout_still_arms_detector_unserialized() {
+    fn start_workflow_codex_ignores_occupied_queue_and_arms_detector() {
         use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
         use std::collections::BTreeMap;
         let _tmp = with_temp_home(|| {
@@ -24651,11 +24919,9 @@ mod tests {
                     role_order: vec!["worker".into()], transitions: vec![],
                 });
             }
-            // Pre-occupy the worktree spawn queue with a seq that is NEVER
-            // released, so the worker's `wait_for_turn_timeout` is guaranteed to
-            // time out (→ ticket None → unserialized arm path).
+            // Keep an unrelated detector's slot occupied throughout launch.
             let queue = workflow_spawn_queue(&state, &wt);
-            let _blocking_seq = queue.enqueue(); // held forever, never signal_done
+            let blocking_seq = queue.enqueue();
 
             let _wait_guard = set_slot_wait_timeout_for_test(std::time::Duration::from_millis(60));
             set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
@@ -24668,12 +24934,10 @@ mod tests {
             set_failing_detector_for_test(false);
             set_spawn_program_override_for_test(None);
 
-            // Fail-closed Err == spawn_queued_detector was REACHED on the
-            // timeout path (arming attempted, unserialized). A skip (the old
-            // Some(ticket) guard) would have returned Ok with no detector.
+            assert_eq!(queue.enqueue(), blocking_seq + 1,
+                "workflow launch must not acquire a worktree queue slot");
             let (_code, msg) = result.expect_err(
-                "P-B: detector arming must still be attempted after a \
-                 spawn-queue timeout (old guard skipped it → would wedge)",
+                "Codex detector arming must be attempted without a queue ticket",
             );
             assert!(
                 msg.contains("transcript detector spawn failed"),
@@ -28342,6 +28606,13 @@ mod tests {
             let last = reloaded.last_run.expect("last_run");
             assert_eq!(last.status, crate::continuous::task::RunStatus::Done);
             assert!(last.finished_at.is_some(), "finished_at set");
+            let audit = std::fs::read_to_string(crate::continuous::task::runs_log_path("ct-rd")).unwrap();
+            let completed: Value = audit.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|line| line["event"] == "report_done").unwrap();
+            assert_eq!(completed["run_mode"], "fresh");
+            assert_eq!(completed["seq"], last.seq);
+            assert_eq!(completed["fire_token"], last.fire_token);
+            assert_eq!(completed["session_uid"], uid);
             assert_eq!(
                 reloaded.consecutive_wedge_closes, 0,
                 "clean completion resets the wedge streak",
@@ -28369,6 +28640,8 @@ mod tests {
             let resp = report_done(&state, &Caller::session(caller_uid.clone()), &json!({}))
                 .expect("report_done ok (soft no-op)");
             assert_eq!(resp["done"], json!(false));
+
+            assert!(!crate::continuous::task::runs_log_path("ct-rd-mm").exists(), "a no-op completion must not write an audit line");
 
             let reloaded = crate::continuous::task::load_one("ct-rd-mm").unwrap();
             assert_eq!(
@@ -28857,6 +29130,52 @@ mod tests {
                 .expect("a 'stuck' line is present");
             assert_eq!(stuck.detail.as_ref().unwrap()["investigation"], json!(1));
         });
+    }
+
+    #[test]
+    fn continuous_investigator_uses_task_agent_engine() {
+        with_continuous_home(|home| {
+            use crate::continuous::task::{self, Engine};
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            for (engine, expected) in [
+                (Engine::Codex, "codex"),
+                (Engine::Claude, "claude-code"),
+                (Engine::Bash, "claude-code"),
+            ] {
+                let mut t = fresh_task_running("engine-investigator", home, "ts-stuck-engine-0");
+                t.engine = engine;
+                task::save(&t).unwrap();
+                arm_continuous_spawn_spy_for_test();
+                spawn_investigator(&state, &t, 1, &task::task_dir(&t.task_id).join("stuck/1"))
+                    .unwrap();
+                let captured = take_continuous_spawn_spy_for_test();
+                assert_eq!(captured.len(), 1);
+                assert_eq!(captured[0]["session_type"], expected);
+            }
+        });
+    }
+
+    #[test]
+    fn continuous_create_defaults_to_codex_without_changing_enum_default() {
+        use crate::continuous::task::Engine;
+        let params = json!({"task_id": "new-task", "label": "New", "repo_url": "repo", "default_prompt": "go"});
+        let created: ContinuousCreateParams = serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(created.engine, Engine::Codex);
+        assert_eq!(Engine::default(), Engine::Claude);
+        for (name, engine) in [
+            ("claude", Engine::Claude),
+            ("codex", Engine::Codex),
+            ("bash", Engine::Bash),
+        ] {
+            let mut explicit = params.clone();
+            explicit["engine"] = json!(name);
+            assert_eq!(
+                serde_json::from_value::<ContinuousCreateParams>(explicit)
+                    .unwrap()
+                    .engine,
+                engine
+            );
+        }
     }
 
     /// `investigator_prompt` pins the EXACT `resolve_stuck` call (task_id + seq),
@@ -29585,6 +29904,385 @@ mod tests {
             let err = continuous_pause(&state, &json!({ "task_id": "ghost", "paused": true }))
                 .expect_err("missing task is an error");
             assert_eq!(err.0, ErrorCode::NotFound);
+        });
+    }
+
+    #[test]
+    fn continuous_drain_blocks_stale_fire_and_resume_invalidates_its_snapshot() {
+        with_continuous_home(|home| {
+            use crate::continuous::task::{self, Engine, RunMode, TryModifyOutcome};
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let snapshot = continuous_task("drain-race", Engine::Codex, RunMode::Persistent, home);
+            task::save(&snapshot).unwrap();
+            let response = continuous_drain(&state, &json!({"task_id": snapshot.task_id})).unwrap();
+            let id = response["drain"]["request_id"].clone();
+            assert_eq!(response["drain_status"]["state"], "drained");
+            assert!(matches!(
+                arm_continuous_fire(&snapshot, "late", "uid", 1),
+                TryModifyOutcome::Aborted(FireAbort::Paused)
+            ));
+            let skipped = continuous_run_now(
+                &state,
+                &Caller::operator("test"),
+                &json!({"task_id": snapshot.task_id}),
+            )
+            .unwrap();
+            assert_eq!(skipped["reason"], "paused");
+            let twice = continuous_drain(&state, &json!({"task_id": snapshot.task_id})).unwrap();
+            assert_eq!(twice["drain"]["request_id"], id);
+            continuous_pause(
+                &state,
+                &json!({"task_id": snapshot.task_id, "paused": true}),
+            )
+            .unwrap();
+            assert_eq!(
+                continuous_list(&state, &json!({})).unwrap()["tasks"][0]["drain"]["request_id"],
+                id
+            );
+            continuous_pause(
+                &state,
+                &json!({"task_id": snapshot.task_id, "paused": false}),
+            )
+            .unwrap();
+            assert!(task::load_one(&snapshot.task_id).unwrap().drain.is_none());
+            // A stop followed by resume must not revive an old prepared fire.
+            assert!(matches!(
+                arm_continuous_fire(&snapshot, "late", "uid", 1),
+                TryModifyOutcome::Aborted(FireAbort::StaleAdmission)
+            ));
+            let current = task::load_one(&snapshot.task_id).unwrap();
+            assert!(matches!(
+                arm_continuous_fire(&current, "new", "uid", 2),
+                TryModifyOutcome::Ok(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn continuous_drain_preserves_admitted_fire_and_run_history() {
+        with_continuous_home(|home| {
+            use crate::continuous::task::{self, Engine, RunMode, TryModifyOutcome};
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let t = continuous_task("admitted", Engine::Codex, RunMode::Persistent, home);
+            task::save(&t).unwrap();
+            assert!(matches!(
+                arm_continuous_fire(&t, "winner", "worker", 5),
+                TryModifyOutcome::Ok(_)
+            ));
+            std::fs::write(task::runs_log_path(&t.task_id), "retained audit\n").unwrap();
+            let response = continuous_drain(&state, &json!({"task_id": t.task_id})).unwrap();
+            assert_eq!(response["drain"]["fire_token"], "winner");
+            assert_eq!(response["drain"]["run_seq"], 1);
+            assert_eq!(response["drain_status"]["state"], "draining");
+            let restored = task::load_one(&t.task_id).unwrap();
+            assert_eq!(restored.in_flight.as_ref().unwrap().session_uid, "worker");
+            assert_eq!(restored.run_count, 0);
+            assert_eq!(restored.engine, Engine::Codex);
+            assert_eq!(
+                std::fs::read_to_string(task::runs_log_path(&t.task_id)).unwrap(),
+                "retained audit\n"
+            );
+            assert!(!home.join(".queue").exists());
+        });
+    }
+
+    #[test]
+    fn continuous_drain_rejects_unknown_and_unsafe_task_ids() {
+        with_continuous_home(|_| {
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            assert_eq!(
+                continuous_drain(&state, &json!({"task_id": "missing"}))
+                    .unwrap_err()
+                    .0,
+                ErrorCode::NotFound
+            );
+            assert_eq!(
+                continuous_drain(&state, &json!({"task_id": "../escape"}))
+                    .unwrap_err()
+                    .0,
+                ErrorCode::InvalidParams
+            );
+        });
+    }
+
+    #[test]
+    fn continuous_drain_and_fire_race_has_one_durable_admission_order() {
+        with_continuous_home(|home| {
+            use crate::continuous::task::{self, Engine, RunMode, TryModifyOutcome};
+            for i in 0..16 {
+                let t = continuous_task(
+                    &format!("race-{i}"),
+                    Engine::Codex,
+                    RunMode::Persistent,
+                    home,
+                );
+                task::save(&t).unwrap();
+                let barrier = Arc::new(std::sync::Barrier::new(3));
+                let fire_barrier = Arc::clone(&barrier);
+                let fire_snapshot = t.clone();
+                let fire = std::thread::spawn(move || {
+                    fire_barrier.wait();
+                    match arm_continuous_fire(&fire_snapshot, "fire", "uid", 1) {
+                        TryModifyOutcome::Ok(_) => true,
+                        TryModifyOutcome::Aborted(FireAbort::Paused) => false,
+                        _ => panic!("unexpected admission outcome"),
+                    }
+                });
+                let drain_barrier = Arc::clone(&barrier);
+                let task_id = t.task_id.clone();
+                let drain = std::thread::spawn(move || {
+                    let state = Arc::new(Mutex::new(DaemonState::new()));
+                    drain_barrier.wait();
+                    continuous_drain(&state, &json!({"task_id": task_id})).unwrap()
+                });
+                barrier.wait();
+                let admitted = fire.join().unwrap();
+                let response = drain.join().unwrap();
+                let current = task::load_one(&t.task_id).unwrap();
+                assert!(current.paused);
+                assert_eq!(current.in_flight.is_some(), admitted);
+                assert_eq!(
+                    current.drain.as_ref().unwrap().fire_token.is_some(),
+                    admitted
+                );
+                assert_eq!(
+                    response["drain_status"]["state"],
+                    if admitted { "draining" } else { "drained" }
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn continuous_drain_tracks_late_workers_and_turns_after_report_done() {
+        with_continuous_home(|home| {
+            use crate::continuous::task;
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let root = fresh_test_uid();
+            let child = fresh_test_uid();
+            let leaf = fresh_test_uid();
+            let t = fresh_task_running("drain-workers", home, &root);
+            task::save(&t).unwrap();
+            insert_continuous_session(&state, &root, &t.task_id);
+            continuous_drain(&state, &json!({"task_id": t.task_id})).unwrap();
+            report_done(&state, &Caller::session(root.clone()), &json!({})).unwrap();
+            let current = task::load_one(&t.task_id).unwrap();
+            assert!(continuous_drain_status(&state, &current)
+                .unwrap()
+                .outstanding
+                .iter()
+                .any(|o| o.kind == "orchestrator_turn"));
+            state.lock().unwrap().sessions[&root].stamp_turn_end();
+            // Spawn new descendants after both the request and report_done.
+            // Only managed_by_uid links them; they have no continuous tag.
+            for (uid, parent) in [(&child, &root), (&leaf, &child)] {
+                insert_continuous_session(&state, uid, "unused");
+                let mut s = state.lock().unwrap();
+                let worker = s.sessions.get_mut(uid).unwrap();
+                worker.continuous_task_id = None;
+                worker.managed_by_uid = Some(parent.clone());
+                worker.stamp_turn_end(); // interim idle does not settle work
+            }
+            let status = continuous_drain_status(&state, &current).unwrap();
+            assert_eq!(
+                status
+                    .outstanding
+                    .iter()
+                    .filter(|o| o.kind == "worker")
+                    .count(),
+                2
+            );
+            assert!(!status
+                .outstanding
+                .iter()
+                .any(|o| o.kind == "orchestrator_turn"));
+            for uid in [&child, &leaf] {
+                report_done(&state, &Caller::session(uid.clone()), &json!({})).unwrap();
+                // An old turn-end stamp cannot prove the report's trailing turn.
+                assert!(continuous_drain_status(&state, &current)
+                    .unwrap()
+                    .outstanding
+                    .iter()
+                    .any(|o| o.kind == "worker" && o.session_uid.as_ref() == Some(uid)));
+                state.lock().unwrap().sessions[uid].stamp_turn_end();
+            }
+            let status = continuous_drain_status(&state, &current).unwrap();
+            assert_eq!(status.state, crate::continuous::drain::DrainState::Blocked);
+            assert!(status.outstanding.iter().any(|o| o.kind == "completion_evidence_unavailable"));
+            assert!(status.outstanding.iter().any(|o| o.kind == "checkpoint_missing"));
+            kill_all_sessions(&state);
+        });
+    }
+
+    fn write_drain_monitor_journal(uid: &str, records: Value) {
+        let dir = crate::path::dot_cm_dir().join("monitor-state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{uid}.json")), serde_json::to_vec(&json!({
+            "schema_version": 1, "coverage_version": 1, "session_uid": uid, "revision": 1,
+            "producers": {"test-producer": {"records": records}}
+        })).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn continuous_drain_checkpoint_requires_settled_work_and_final_turn() {
+        with_continuous_home(|home| {
+            use crate::continuous::{drain::DrainState, task};
+            use crate::control::continuous_drain::handle;
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let root = fresh_test_uid();
+            let child = fresh_test_uid();
+            let t = fresh_task_running("drain-proof", home, &root);
+            task::save(&t).unwrap();
+            insert_continuous_session(&state, &root, &t.task_id);
+            let response = continuous_drain(&state, &json!({"task_id": t.task_id})).unwrap();
+            let request = response["drain"]["request_id"].clone();
+            let caller = Caller::session(root.clone());
+            let checkpoint = json!({"request_id": request, "notes": "Batch reconciled; artifacts recorded in memory/checkpoint.md.", "background_work_complete": true, "work_reconciled": true});
+            let receipt = json!({"request_id": request});
+            assert!(handle(&state, &caller, "continuous.context", &json!({})).unwrap()["notice"].is_string());
+            assert_eq!(handle(&state, &caller, "continuous.checkpoint_drain", &checkpoint).unwrap_err().0, ErrorCode::Conflict);
+            let ack = handle(&state, &caller, "continuous.ack_drain", &receipt).unwrap();
+            let twice = handle(&state, &caller, "continuous.ack_drain", &receipt).unwrap();
+            assert!((twice["drain"]["acknowledgment"]["received_at"].as_f64().unwrap() - ack["drain"]["acknowledgment"]["received_at"].as_f64().unwrap()).abs() < 0.000001);
+            assert_eq!(twice["drain"]["acknowledgment"]["session_uid"], root);
+            assert_eq!(handle(&state, &caller, "continuous.checkpoint_drain", &checkpoint).unwrap_err().0, ErrorCode::Conflict, "missing journal cannot mean no monitors");
+            write_drain_monitor_journal(&root, json!({}));
+            insert_continuous_session(&state, &child, "unused");
+            {
+                let mut state = state.lock().unwrap();
+                let worker = state.sessions.get_mut(&child).unwrap();
+                worker.continuous_task_id = None;
+                worker.managed_by_uid = Some(root.clone());
+                worker.stamp_turn_end();
+            }
+            write_drain_monitor_journal(&child, json!({}));
+            assert_eq!(handle(&state, &Caller::session(child.clone()), "continuous.ack_drain", &receipt).unwrap_err().0, ErrorCode::Unauthorized);
+            assert!(handle(&state, &caller, "continuous.checkpoint_drain", &checkpoint).is_err(), "interim worker idle isn't done");
+            report_done(&state, &Caller::session(child.clone()), &json!({})).unwrap();
+            assert!(handle(&state, &caller, "continuous.checkpoint_drain", &checkpoint).is_err(), "worker's trailing turn is outstanding");
+            state.lock().unwrap().sessions[&child].stamp_turn_end();
+            for owner in [&root, &child] {
+                for monitor in [json!({"monitor_id": "mon-a", "state": "watching"}), json!({"monitor_id": "mon-a", "state": "delivered", "delivery_uncertain": true})] {
+                    write_drain_monitor_journal(owner, json!({"mon-a": monitor}));
+                    assert!(handle(&state, &caller, "continuous.checkpoint_drain", &checkpoint).is_err());
+                }
+                write_drain_monitor_journal(owner, json!({}));
+            }
+            let mut false_claim = checkpoint.clone();
+            false_claim["work_reconciled"] = json!(false);
+            assert_eq!(handle(&state, &caller, "continuous.checkpoint_drain", &false_claim).unwrap_err().0, ErrorCode::InvalidParams);
+            handle(&state, &caller, "continuous.checkpoint_drain", &checkpoint).unwrap();
+            let current = task::load_one(&t.task_id).unwrap();
+            assert_eq!(continuous_drain_status(&state, &current).unwrap().state, DrainState::Draining);
+            report_done(&state, &caller, &json!({})).unwrap();
+            assert_eq!(continuous_drain_status(&state, &task::load_one(&t.task_id).unwrap()).unwrap().state, DrainState::Draining);
+            state.lock().unwrap().sessions[&root].stamp_turn_end();
+            let current = task::load_one(&t.task_id).unwrap();
+            let status = continuous_drain_status(&state, &current).unwrap();
+            assert_eq!(status.state, DrainState::Drained, "{:?}", status.outstanding);
+            // Receipt and the durable checkpoint survive task deserialization.
+            assert!(current.drain.as_ref().unwrap().checkpoint.is_some());
+            write_drain_monitor_journal(&child, json!({"late": {"monitor_id": "late", "state": "watching"}}));
+            assert_eq!(continuous_drain_status(&state, &current).unwrap().state, DrainState::Blocked);
+            write_drain_monitor_journal(&child, json!({}));
+            state.lock().unwrap().sessions[&root].input_handle().stamp_activity();
+            let status = continuous_drain_status(&state, &current).unwrap();
+            assert!(status.outstanding.iter().any(|o| o.kind == "checkpoint_stale"));
+            assert_ne!(status.state, DrainState::Drained);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_drain_notice_and_receipt_cannot_cross_resume_or_new_request() {
+        with_continuous_home(|home| {
+            use crate::continuous::task;
+            use crate::control::continuous_drain::{handle, NoticeBinding};
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let root = fresh_test_uid();
+            let impostor = fresh_test_uid();
+            let t = fresh_task_running("drain-stale", home, &root);
+            task::save(&t).unwrap();
+            insert_continuous_session(&state, &root, &t.task_id);
+            insert_continuous_session(&state, &impostor, &t.task_id);
+            // Exercise the final binding guard without racing the real
+            // notification worker for the same idle boundary.
+            let requested = task::modify(&t.task_id, |current| {
+                crate::continuous::drain::request(current, task::now_unix());
+            }).unwrap();
+            let request = requested.drain.as_ref().unwrap().request_id.as_str();
+            let binding = NoticeBinding { state: &state, task_id: &t.task_id, request_id: request, session_uid: &root };
+            assert!(binding.acquire().is_none(), "a busy turn must receive no notice");
+            state.lock().unwrap().sessions[&root].stamp_turn_end();
+            assert!(binding.acquire().is_some(), "the same request is eligible at a final turn boundary");
+            let receipt = json!({"request_id": request});
+            assert_eq!(handle(&state, &Caller::session(impostor.clone()), "continuous.ack_drain", &receipt).unwrap_err().0, ErrorCode::Conflict);
+            let revision = task::load_one(&t.task_id).unwrap().admission_revision;
+            continuous_pause(&state, &json!({"task_id": t.task_id, "paused": false, "expected_drain_request_id": request, "expected_admission_revision": revision})).unwrap();
+            assert!(binding.acquire().is_none());
+            assert_eq!(handle(&state, &Caller::session(root.clone()), "continuous.ack_drain", &receipt).unwrap_err().0, ErrorCode::Conflict);
+            // Keep the new request's notification thread from writing to our
+            // synthetic busy session; test the final guard directly instead.
+            state.lock().unwrap().sessions[&root].input_handle().stamp_activity();
+            continuous_drain(&state, &json!({"task_id": t.task_id})).unwrap();
+            assert!(binding.acquire().is_none());
+            assert_eq!(continuous_pause(&state, &json!({"task_id": t.task_id, "paused": false, "expected_admission_revision": revision})).unwrap_err().0, ErrorCode::Conflict);
+            assert_eq!(continuous_pause(&state, &json!({"task_id": t.task_id, "paused": false, "expected_drain_request_id": request})).unwrap_err().0, ErrorCode::Conflict);
+            assert!(task::load_one(&t.task_id).unwrap().paused);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_drain_stop_hook_continuation_invalidates_idle_and_old_report() {
+        with_continuous_home(|home| {
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let root = fresh_test_uid();
+            let t = fresh_task_running("drain-hook", home, &root);
+            crate::continuous::task::save(&t).unwrap();
+            insert_continuous_session(&state, &root, &t.task_id);
+            report_done(&state, &Caller::session(root.clone()), &json!({})).unwrap();
+            state.lock().unwrap().sessions[&root].stamp_turn_end();
+            assert_eq!(state.lock().unwrap().sessions[&root].semantic_idle(), Some(true));
+            session_turn_ended(&state, &json!({"session_uid": root, "continuing": true}), Some(&root)).unwrap();
+            assert_eq!(state.lock().unwrap().sessions[&root].semantic_idle(), Some(false));
+            assert!(state.lock().unwrap().sessions[&root].reported_done().is_none());
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_drain_rejects_late_investigator_restart_and_escalation() {
+        with_continuous_home(|home| {
+            use crate::continuous::task;
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let root = fresh_test_uid();
+            let investigator = fresh_test_uid();
+            let mut t = fresh_task_running("drain-verdict", home, &root);
+            t.investigator_uid = Some(investigator.clone());
+            task::save(&t).unwrap();
+            insert_continuous_session(&state, &root, &t.task_id);
+            insert_continuous_session(&state, &investigator, &t.task_id);
+            continuous_drain(&state, &json!({"task_id": t.task_id})).unwrap();
+            arm_continuous_spawn_spy_for_test();
+            for action in ["restart", "escalate"] {
+                let response = resolve_stuck(
+                    &state,
+                    &Caller::session(investigator.clone()),
+                    &json!({"task_id": t.task_id, "seq": 1, "action": action}),
+                )
+                .unwrap();
+                assert_eq!(response["reason"], "draining");
+                assert!(!state.lock().unwrap().sessions[&root]
+                    .last_exit
+                    .operator_kill_requested());
+            }
+            assert!(take_continuous_spawn_spy_for_test().is_empty());
+            assert_eq!(
+                task::load_one(&t.task_id).unwrap().last_run.unwrap().status,
+                task::RunStatus::Running
+            );
+            kill_all_sessions(&state);
         });
     }
 
@@ -30704,6 +31402,69 @@ mod tests {
         (wt, branch, sha)
     }
 
+    #[test]
+    fn mcp_start_session_restores_missing_bound_workspace_without_losing_work() {
+        use std::sync::atomic::Ordering;
+        with_home_and_repo("restorebound", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            let (wt, branch, sha) = seed_bound_subtask_with_reaped_worktree(
+                &state, &repo, name, "task-sub", true,
+            );
+            run_git(&repo, &["worktree", "prune"]);
+            run_git(&repo, &["worktree", "add", wt.to_str().unwrap(), &branch]);
+            std::fs::write(wt.join("unfinished.txt"), "preserve this uncommitted work").unwrap();
+            // The restart manifest omits a workspace after its final worker
+            // exits, while retaining both task-to-workspace bindings.
+            state.lock().unwrap().workspaces.remove("ws-sub");
+            let name = name.to_string();
+            let branch_known = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let known = branch_known.clone();
+            let stub = spawn_routed_stub(move |method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-sub") => (200, json!({
+                    "id":"task-sub", "name":"Existing worker", "status":"running",
+                    "repo_url":name, "wip_branch":match known.load(Ordering::SeqCst) {
+                        0 => None, 1 => Some("main"), _ => Some(branch.as_str()),
+                    },
+                }).to_string()),
+                ("PATCH", "/tasks/task-sub") => (200, "{}".into()),
+                _ => (404, "{}".into()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".into();
+            }
+            for hint in [0, 1] {
+                branch_known.store(hint, Ordering::SeqCst);
+                let refusal = mcp_start_session(&state,
+                    &json!({"type":"bash", "label":"restored", "task_id":"task-sub"}),
+                    Some("ts-orch"),
+                ).expect_err("missing or unmanaged prior branch cannot create an empty replacement");
+                assert_eq!(refusal.0, ErrorCode::Conflict);
+                assert!(refusal.1.contains("prior local branch"));
+                assert_eq!(state.lock().unwrap().workspaces.len(), 1);
+            }
+            branch_known.store(2, Ordering::SeqCst);
+            let response = mcp_start_session(&state,
+                &json!({"type":"bash", "label":"restored", "task_id":"task-sub"}),
+                Some("ts-orch"),
+            ).expect("restore the existing worker workspace");
+            assert_eq!(response["worktree_path"], wt.to_string_lossy().as_ref());
+            assert_eq!(git_sha(&wt, "HEAD"), sha);
+            assert_eq!(std::fs::read_to_string(wt.join("unfinished.txt")).unwrap(),
+                "preserve this uncommitted work");
+            {
+                let s = state.lock().unwrap();
+                assert_eq!(s.sessions[response["session_uid"].as_str().unwrap()].workspace_id, "ws-sub");
+                assert_eq!(s.workspaces.len(), 2);
+                assert_eq!(s.bindings["task-sub"], "ws-sub");
+                assert_eq!(s.task_workspaces["task-sub"], "ws-sub");
+            }
+            kill_all_sessions(&state);
+        });
+    }
+
     /// THE FIX, end to end: `start_session(task_id=<subtask whose
     /// worktree was reaped>)` used to return success with a
     /// `worktree_path` that did not exist (the child ran in a nonexistent
@@ -31569,4 +32330,185 @@ mod tests {
         drop(s);
         kill_all_sessions(&state);
     }
+    fn migration_request(state: &Arc<Mutex<DaemonState>>, id: &str, home: &std::path::Path) -> Value {
+        use crate::continuous::migration as m;
+        let preview=m::handle(state,"continuous.migration_preview",&json!({"task_id":id})).unwrap();
+        let handover=home.join("HANDOVER_CODEX.md");
+        std::fs::write(&handover,"Fixture handover: inspected work and monitors; no background work remains.\n").unwrap();
+        use sha2::{Digest,Sha256};
+        json!({"task_id":id,"expected_state_hash":preview["state_hash"],"expected_evidence_hash":preview["evidence_hash"],
+            "handover":{"path":handover,"sha256":format!("{:x}",Sha256::digest(std::fs::read(&handover).unwrap()))},
+            "notes":"Inspected legacy transcript, monitor results, worker artifacts and background work.",
+            "background_work_complete":true,"deliveries_reconciled":true,"items":{}})
+    }
+    fn migration_guard(state: &Arc<Mutex<DaemonState>>, id: &str) -> Value {
+        let preview=crate::continuous::migration::handle(state,"continuous.migration_preview",&json!({"task_id":id})).unwrap();
+        json!({"task_id":id,"expected_state_hash":preview["state_hash"]})
+    }
+
+    #[test]
+    fn continuous_migration_retire_commit_retry_and_rollback_preserve_history() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m,retirement};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let uid=fresh_test_uid();
+            let mut t=fresh_task_running("migrate",home,&uid);
+            t.run_mode=task::RunMode::Persistent; t.current_session_uid=Some(uid.clone());
+            crate::continuous::drain::request(&mut t,2); task::save(&t).unwrap();
+            insert_continuous_session(&state,&uid,&t.task_id);
+            report_done(&state,&Caller::session(uid.clone()),&json!({})).unwrap();
+            state.lock().unwrap().sessions[&uid].stamp_turn_end();
+            let handle=state.lock().unwrap().sessions[&uid].input_handle();
+            let request=migration_request(&state,&t.task_id,home);
+            m::handle(&state,"continuous.reconcile",&request).unwrap();
+            let before=task::load_one(&t.task_id).unwrap();
+            let log_before=std::fs::read(task::runs_log_path(&t.task_id)).unwrap();
+            let guard=migration_guard(&state,&t.task_id);
+            m::handle(&state,"continuous.retire",&guard).unwrap();
+            assert_eq!(handle.write_and_stamp(b"late input").unwrap_err().kind(),std::io::ErrorKind::PermissionDenied);
+            assert!(retirement::ensure_open(&uid).is_err());
+            let mut swap=migration_guard(&state,&t.task_id);
+            swap["target_engine"]=json!("codex"); swap["operation_id"]=json!(uuid::Uuid::new_v4().to_string());
+            assert!(m::handle(&state,"continuous.migrate_engine",&swap).is_err(),"must wait for registry exit");
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+            while !state.lock().unwrap().sessions[&uid].last_exit.kernel_set() {
+                assert!(std::time::Instant::now()<deadline); std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            handle_session_exit(&mut state.lock().unwrap(),&uid);
+            swap["expected_state_hash"]=migration_guard(&state,&t.task_id)["expected_state_hash"].clone();
+            let bytes=std::fs::read(task::task_dir(&t.task_id).join("state.json")).unwrap();
+            let mut dry=swap.clone(); dry["dry_run"]=json!(true);
+            assert_eq!(m::handle(&state,"continuous.migrate_engine",&dry).unwrap()["committed"],false);
+            assert_eq!(std::fs::read(task::task_dir(&t.task_id).join("state.json")).unwrap(),bytes);
+            assert_eq!(m::handle(&state,"continuous.migrate_engine",&swap).unwrap()["committed"],true);
+            assert_eq!(m::handle(&state,"continuous.migrate_engine",&swap).unwrap()["already_committed"],true);
+            let after=task::load_one(&t.task_id).unwrap();
+            assert_eq!(after.engine,task::Engine::Codex); assert!(after.paused); assert!(after.current_session_uid.is_none());
+            assert_eq!(after.run_count,before.run_count); assert_eq!(json!(after.last_run),json!(before.last_run));
+            assert_eq!(after.workspace_id,before.workspace_id); assert_eq!(after.worktree_path,before.worktree_path);
+            assert!(std::fs::read(task::runs_log_path(&t.task_id)).unwrap().starts_with(&log_before));
+            assert_eq!(after.engine_changes.len(),1);
+            let params=json!({"uid":uid,"label":"retired","workspace_id":"none","working_dir":home,"session_type":"claude-code","argv":["/bin/true"]});
+            assert_eq!(start_session(&state,&params).unwrap_err().0,ErrorCode::Conflict);
+            let mut child=params.clone(); child["uid"]=json!(fresh_test_uid()); child["managed_by_uid"]=json!(uid);
+            assert_eq!(start_session(&state,&child).unwrap_err().0,ErrorCode::Conflict);
+            let mut rollback=migration_guard(&state,&t.task_id);
+            rollback["target_engine"]=json!("claude"); rollback["operation_id"]=json!(uuid::Uuid::new_v4().to_string());
+            m::handle(&state,"continuous.migrate_engine",&rollback).unwrap();
+            assert_eq!(task::load_one(&t.task_id).unwrap().engine,task::Engine::Claude);
+            continuous_pause(&state,&json!({"task_id":t.task_id,"paused":false})).unwrap();
+            assert!(!task::load_one(&t.task_id).unwrap().paused);
+        });
+    }
+
+    #[test]
+    fn continuous_migration_reconciliation_rejects_active_late_and_ambiguous_work() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new())); let uid=fresh_test_uid();
+            let mut t=fresh_task_running("migrate-active",home,&uid); t.current_session_uid=Some(uid.clone());
+            crate::continuous::drain::request(&mut t,2); task::save(&t).unwrap();
+            insert_continuous_session(&state,&uid,&t.task_id);
+            assert!(m::handle(&state,"continuous.reconcile",&migration_request(&state,&t.task_id,home)).is_err());
+            assert!(!state.lock().unwrap().sessions[&uid].last_exit.kernel_set());
+            report_done(&state,&Caller::session(uid.clone()),&json!({})).unwrap();
+            state.lock().unwrap().sessions[&uid].stamp_turn_end();
+            let stale=migration_request(&state,&t.task_id,home);
+            write_drain_monitor_journal(&uid,json!({"late":{"monitor_id":"late","state":"watching"}}));
+            assert!(m::handle(&state,"continuous.reconcile",&stale).is_err());
+            assert!(m::handle(&state,"continuous.reconcile",&migration_request(&state,&t.task_id,home)).is_err());
+            write_drain_monitor_journal(&uid,json!({}));
+            m::handle(&state,"continuous.reconcile",&migration_request(&state,&t.task_id,home)).unwrap();
+            let prior=migration_guard(&state,&t.task_id);
+            let handle=state.lock().unwrap().sessions[&uid].input_handle(); handle.stamp_activity();
+            assert!(m::handle(&state,"continuous.retire",&prior).is_err());
+            assert!(!state.lock().unwrap().sessions[&uid].last_exit.operator_kill_requested());
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_migration_never_fired_dry_run_and_stale_config() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let mut t=continuous_task("migrate-new",task::Engine::Claude,task::RunMode::Persistent,home);
+            crate::continuous::drain::request(&mut t,2); task::save(&t).unwrap();
+            m::handle(&state,"continuous.retire",&migration_guard(&state,&t.task_id)).unwrap();
+            let mut params=migration_guard(&state,&t.task_id); params["target_engine"]=json!("codex"); params["operation_id"]=json!(uuid::Uuid::new_v4().to_string());
+            assert_eq!(continuous_update(&state,&json!({"task_id":t.task_id,"engine":"codex"})).unwrap_err().0,ErrorCode::InvalidParams);
+            continuous_update(&state,&json!({"task_id":t.task_id,"default_prompt":"new instructions"})).unwrap();
+            assert_eq!(m::handle(&state,"continuous.migrate_engine",&params).unwrap_err().0,ErrorCode::Conflict);
+            params["expected_state_hash"]=migration_guard(&state,&t.task_id)["expected_state_hash"].clone();
+            m::handle(&state,"continuous.migrate_engine",&params).unwrap();
+            let after=task::load_one(&t.task_id).unwrap(); assert_eq!(after.run_count,0); assert!(after.paused); assert_eq!(after.default_prompt,"new instructions");
+        });
+    }
+
+    fn migration_probe_fixture(home: &std::path::Path, started: f64) {
+        use sha2::{Digest,Sha256};
+        let root=home.join(".cm"); std::fs::create_dir_all(&root).unwrap();
+        let binary=home.join("fixture-codex"); std::fs::write(&binary,"test runtime").unwrap();
+        let config=json!({"schema_version":1,"executable":binary,"executable_hash":format!("{:x}",Sha256::digest(b"test runtime")),
+            "cli_version":"0.153.4","requested_model":"gpt-5.6-sol","model_provider":"openai","configuration_id":"fixture", "codex_home":home.join(".codex")});
+        let mut proof=config.clone(); proof.as_object_mut().unwrap().extend(json!({"engine":"codex","status":"OK","started_at":started,"checked_at":110.0,"observed_model":"gpt-5.6-sol"}).as_object().unwrap().clone());
+        std::fs::write(root.join("codex-probe-config.json"),config.to_string()).unwrap();
+        std::fs::write(root.join("codex-probe-state.json"),proof.to_string()).unwrap();
+    }
+
+    #[test]
+    fn continuous_migration_codex_recovery_keeps_completed_items_and_resumes_after_restart() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new())); let uid=fresh_test_uid();
+            let mut t=fresh_task_running("codex-recover",home,&uid); t.engine=task::Engine::Codex;
+            t.run_mode=task::RunMode::Persistent; t.current_session_uid=Some(uid.clone());
+            t.schedule=task::Schedule::Consumer{queue:"canary".into(),batch_max:2,window_secs:1,depth_threshold:0};
+            t.account_blocked=Some(task::AccountBlockRecord{run_seq:1,session_uid:uid.clone(),detected_at:100,kind:task::AccountBlockKind::UsageLimited,detail:"fixture".into()});
+            task::save(&t).unwrap(); insert_continuous_session(&state,&uid,&t.task_id);
+            let transcript=home.join("rollout.jsonl");
+            std::fs::write(&transcript,"{\"timestamp\":\"2026-09-06T22:00:00.500Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"error\":{\"codex_error_info\":\"usage_limit_exceeded\"}}}\n").unwrap();
+            { let mut state=state.lock().unwrap(); let s=state.sessions.get_mut(&uid).unwrap(); s.session_type="codex".into(); s.transcript_path=Some(transcript.to_string_lossy().into_owned()); }
+            let first=uuid::Uuid::new_v4().to_string(); let second=uuid::Uuid::new_v4().to_string();
+            std::fs::create_dir_all(home.join(".queue")).unwrap();
+            std::fs::write(home.join(".queue/batch-1.json"),json!({"queue":"canary","task_id":t.task_id,"seq":1,"items":[
+                {"id":first,"payload":{"work":"completed"},"dedupe_key":"first","enqueued_at":"2026-09-06T20:00:00Z"},
+                {"id":second,"payload":{"work":"unfinished"},"dedupe_key":"second","enqueued_at":"2026-09-06T20:00:01Z"}
+            ]}).to_string()).unwrap();
+            let mut request=migration_request(&state,&t.task_id,home);
+            assert!(m::handle(&state,"continuous.reconcile",&request).is_err(),"missing outcomes stay held");
+            request["items"]=json!({first.clone():{"status":"completed","evidence":"artifact A exists"},second.clone():{"status":"ambiguous","evidence":"unknown"}});
+            assert!(m::handle(&state,"continuous.reconcile",&request).is_err(),"ambiguous item cannot be replayed");
+            request["items"][&second]["status"]=json!("unfinished"); request["items"][&second]["evidence"]=json!("No effects; inspected files and worker history");
+            m::handle(&state,"continuous.reconcile",&request).unwrap();
+            migration_probe_fixture(home,99.0);
+            assert!(!m::recover_codex(&state,&t.task_id,111).unwrap(),"stale probe cannot release hold");
+            assert!(!state.lock().unwrap().sessions[&uid].last_exit.operator_kill_requested());
+            migration_probe_fixture(home,101.0);
+            assert!(!m::recover_codex(&state,&t.task_id,111).unwrap(),"wait for verified exit before queue mutation");
+            assert!(task::load_one(&t.task_id).unwrap().recovery.is_some());
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+            while !state.lock().unwrap().sessions[&uid].last_exit.kernel_set() { assert!(std::time::Instant::now()<deadline); std::thread::sleep(std::time::Duration::from_millis(10)); }
+            handle_session_exit(&mut state.lock().unwrap(),&uid);
+            assert!(task::load_one(&t.task_id).unwrap().account_blocked.is_some(),"reaper must retain the transaction's hold");
+            crate::continuous::startup_sweep::startup_orphan_sweep_with(|_| false);
+            assert!(task::load_one(&t.task_id).unwrap().account_blocked.is_some(),"restart orphan sweep must retain recovery");
+            let want=second.clone();
+            let api=spawn_routed_stub(move |method,path,body| {
+                assert_eq!(method,"POST"); assert_eq!(path,"/queues/canary/recover");
+                let value:Value=serde_json::from_str(body).unwrap(); assert_eq!(value["item_id"],want); assert_eq!(value["claimed_by"],"codex-recover#1");
+                (200,json!({"recovered":true,"already_recovered":false,"id":want}).to_string())
+            });
+            let restarted=Arc::new(Mutex::new(DaemonState::new()));
+            {let mut state=restarted.lock().unwrap(); state.config.api_url=format!("http://127.0.0.1:{}",api.port); state.config.api_token="fixture-token".into();}
+            assert!(m::recover_codex(&restarted,&t.task_id,111).unwrap());
+            assert!(!m::recover_codex(&restarted,&t.task_id,111).unwrap(),"completed retry does nothing");
+            assert_eq!(api.requests.lock().unwrap().len(),1,"completed item was not replayed");
+            let after=task::load_one(&t.task_id).unwrap(); assert!(after.account_blocked.is_none()); assert!(after.current_session_uid.is_none()); assert_eq!(after.run_count,1); assert!(!after.paused);
+            assert_eq!(after.last_run.unwrap().status,task::RunStatus::Failed);
+            let receipt:Value=serde_json::from_slice(&std::fs::read(task::task_dir(&t.task_id).join("recoveries/1.json")).unwrap()).unwrap();
+            assert_eq!(receipt["progress"]["replayed"],json!([second])); assert_eq!(receipt["progress"]["reconciliation"]["items"][&first]["status"],"completed");
+        });
+    }
+
 }

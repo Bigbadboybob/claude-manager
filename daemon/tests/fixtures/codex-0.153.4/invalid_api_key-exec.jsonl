@@ -1,0 +1,4 @@
+{"thread_id": "01a0792c-b9b8-7b72-a8a2-3bbec125b8f7", "type": "thread.started"}
+{"type": "turn.started"}
+{"message": "unexpected status 401 Unauthorized: CM fixture error, url: http://127.0.0.1:35789/v1/responses", "type": "error"}
+{"error": {"message": "unexpected status 401 Unauthorized: CM fixture error, url: http://127.0.0.1:35789/v1/responses"}, "type": "turn.failed"}

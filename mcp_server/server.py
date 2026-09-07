@@ -8,6 +8,7 @@ import re
 import socket
 import sys
 import time
+from contextlib import asynccontextmanager
 
 # Optional: full JSON-Schema validation for the `schema=` structured-output
 # option on the spawn-and-run / send-and-wait tools. Absent on the lean
@@ -66,7 +67,23 @@ from mcp_server import async_monitor
 # Supplied in the MCP initialization response, independent of the agent's
 # project. Keep the short introduction with the deployed MCP server.
 AGENT_GUIDE = Path(__file__).with_name("AGENT_GUIDE.md").read_text(encoding="utf-8")
-mcp = FastMCP("claude-manager", instructions=AGENT_GUIDE)
+@asynccontextmanager
+async def _monitor_lifespan(_server):
+    if os.environ.get("CM_TUI_SESSION_ID"):
+        async_monitor._persist_best_effort()
+    try:
+        yield {}
+    finally:
+        # A process shutdown leaves unfinished work visible to the next
+        # producer; it is not an acknowledgment of those notifications.
+        for record in async_monitor._MONITORS.values():
+            if record["state"] in ("watching", "fired"):
+                record["state"] = "interrupted"
+        if os.environ.get("CM_TUI_SESSION_ID"):
+            async_monitor._persist_best_effort()
+
+
+mcp = FastMCP("claude-manager", instructions=AGENT_GUIDE, lifespan=_monitor_lifespan)
 
 # 11g-2 (A2): the `_append_event` direct file-write helper and the
 # `_workflow_run_dir` accessor have been retired. Pre-11g-2 the
@@ -3033,6 +3050,48 @@ def queue_depth(queue: str) -> dict:
         claim; `claimed` items are in (or stranded from) an in-flight batch.
     """
     return control_client.call("queue.stats", {"queue": queue})
+
+
+@mcp.tool()
+def get_continuous_context() -> dict:
+    """Read your continuous task's stop request, admitted run and checkpoint.
+
+    A stop request asks you to finish the current period/claimed batch and its
+    workers. New periods are gated by the daemon. Receipt is not completion.
+    """
+    return control_client.call("continuous.context", {})
+
+
+@mcp.tool()
+def acknowledge_continuous_drain(request_id: str) -> dict:
+    """Acknowledge receipt of this stop request; keep finishing admitted work.
+
+    Use the request_id from get_continuous_context or the stop notice. The
+    daemon binds it to your session and admitted run; a resumed/replaced
+    request cannot be acknowledged by stale work.
+    """
+    return control_client.call("continuous.ack_drain", {"request_id": request_id})
+
+
+@mcp.tool()
+def checkpoint_continuous_drain(request_id: str, notes: str,
+                               background_work_complete: bool,
+                               work_reconciled: bool) -> dict:
+    """Record a checkpoint after finishing the admitted work and its workers.
+
+    Read final monitors, reconcile batch outcomes/artifacts and checkpoint
+    pending next actions on disk first. Set both flags true only after all
+    background jobs finish and that reconciliation is done. Notes describe
+    the checkpoint locations/outcomes. The daemon independently checks known
+    workers and durable monitor deliveries. After success call report_done,
+    finish your final response, and end the turn. Never start a new period.
+    """
+    async_monitor.persist_state()
+    return control_client.call("continuous.checkpoint_drain", {
+        "request_id": request_id, "notes": notes,
+        "background_work_complete": background_work_complete,
+        "work_reconciled": work_reconciled,
+    })
 
 
 @mcp.tool()

@@ -575,6 +575,52 @@ async def queue_stats(pool: asyncpg.Pool, queue: str) -> dict:
         }
 
 
+class QueueRecoveryConflict(ValueError):
+    """The item/claim no longer matches the reconciled recovery request."""
+
+
+async def recover_queue_item(pool, queue: str, item_id: str,
+                             claimed_by: str, recovery_key: str) -> dict:
+    """Restore one reconciled consumed item, once for this recovery identity.
+
+    The receipt is committed with the row update. A retry after a lost response
+    returns the same ID even if a later consumer has already consumed it again.
+    Payload, original ID, dedupe key and enqueue order are preserved.
+    """
+    item_uuid = uuid.UUID(item_id)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Serialize equal request keys, including requests naming different
+            # IDs. Different keys for one item serialize on the item row below.
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                               json.dumps([queue, recovery_key]))
+            receipt = await conn.fetchrow(
+                "SELECT item_id, claimed_by FROM queue_recovery_receipts "
+                "WHERE queue=$1 AND recovery_key=$2", queue, recovery_key)
+            if receipt:
+                if receipt["item_id"] != item_uuid or receipt["claimed_by"] != claimed_by:
+                    raise QueueRecoveryConflict("Recovery key already names another item or claim")
+                return {"recovered": True, "already_recovered": True, "id": item_id}
+            row = await conn.fetchrow(
+                "SELECT state, claimed_by FROM queue_items WHERE queue=$1 AND id=$2 FOR UPDATE",
+                queue, item_uuid)
+            if not row or row["state"] != "consumed" or row["claimed_by"] != claimed_by:
+                raise QueueRecoveryConflict("Item is not consumed by the expected run")
+            try:
+                async with conn.transaction():
+                    await conn.execute(
+                        "UPDATE queue_items SET state='pending', claimed_at=NULL, "
+                        "claimed_by=NULL, consumed_at=NULL WHERE queue=$1 AND id=$2",
+                        queue, item_uuid)
+            except asyncpg.UniqueViolationError as exc:
+                raise QueueRecoveryConflict(
+                    "Another pending item has the same dedupe key; reconcile it first") from exc
+            await conn.execute(
+                "INSERT INTO queue_recovery_receipts (queue,recovery_key,item_id,claimed_by) "
+                "VALUES ($1,$2,$3,$4)", queue, recovery_key, item_uuid, claimed_by)
+            return {"recovered": True, "already_recovered": False, "id": item_id}
+
+
 async def claim_queue_items(
     pool: asyncpg.Pool, queue: str, max_items: int, claimed_by: str,
 ) -> list[dict]:

@@ -1274,6 +1274,7 @@ impl App {
         };
 
         self.input_mode = InputMode::NewSession {
+            engine: LaunchEngine::default(),
             label_text: String::new(),
             branch_text: String::new(),
             idle_timeout_text: DEFAULT_IDLE_TIMEOUT_SECS.to_string(),
@@ -1315,7 +1316,7 @@ impl App {
         let workspace_id = self.workspaces[wi].id.clone();
         self.input_mode = InputMode::NewTerminalSession {
             workspace_id,
-            session_type: "claude".to_string(),
+            session_type: LaunchEngine::default().as_session_type().to_string(),
             task_id,
             seed_from: None,
             resume_from: None,
@@ -1909,6 +1910,7 @@ impl App {
         chosen_host: &cm_daemon::host_id::HostId,
         repo_url: &str,
         label: &str,
+        engine: LaunchEngine,
         start_branch: Option<&str>,
         idle_timeout_secs: u16,
         seed_from: Option<&str>,
@@ -1933,6 +1935,7 @@ impl App {
                 &active_host,
                 repo_url,
                 label,
+                engine,
                 start_branch,
                 idle_timeout_secs,
                 seed_from,
@@ -1989,15 +1992,16 @@ impl App {
             worktree::setup_worktree(&main_repo, &worktree_path);
         }
 
-        // If the user picked a snapshot, materialize it into the new
-        // worktree's expected paths before we spawn. The returned id is
-        // what `claude --resume <id>` reads — for Claude this is also
-        // the live transcript id (post-resume Claude keeps writing to
-        // the same file), so we set it directly on `ts` below.
+        let session_type = engine.as_session_type();
+        // Materialize the seed before taking the transcript baseline so a
+        // Codex resume discovers the new rollout rather than its seed file.
         let cloned: Option<agent_memory::ClonedSession> = match seed_from {
             Some(name) => match self.clone_snapshot_for_spawn(
                 name,
-                Engine::ClaudeCode,
+                match engine {
+                    LaunchEngine::Claude => Engine::ClaudeCode,
+                    LaunchEngine::Codex => Engine::Codex,
+                },
                 &worktree_path,
             ) {
                 Some(c) => Some(c),
@@ -2012,14 +2016,12 @@ impl App {
         // workflow meta.
         let session_uid = new_session_uid();
         let cloned_transcript_id = cloned.as_ref().map(|c| c.transcript_id.clone());
-        // For a seeded Claude session, the JSONL is already on disk and
-        // `--resume` keeps writing to it — there's no "new file" for the
-        // detector to find, so leave `pending_jsonl_files = None`
-        // (matches the resumed-Claude pattern at app.rs:5512).
-        let pending = if cloned.is_some() {
-            None
-        } else {
-            Some(Self::list_jsonl_files(&worktree_path))
+        // Claude resumes keep their transcript; Codex resumes mint a fresh
+        // rollout, which must be discovered after spawn (same as A-s).
+        let pending = match (engine, cloned.is_some()) {
+            (LaunchEngine::Claude, true) => None,
+            (LaunchEngine::Claude, false) => Some(Self::list_jsonl_files(&worktree_path)),
+            (LaunchEngine::Codex, _) => Some(Self::list_codex_sessions(&worktree_path)),
         };
 
         // Slice 10c-e-3: pre-generate the workspace id so the
@@ -2037,14 +2039,14 @@ impl App {
         // (no seed) leave transcript_path None — the post-spawn
         // detector handles the fresh transcript.
         let pre_spawn_transcript = cloned_transcript_id.as_deref().and_then(|sid| {
-            pre_spawn_transcript_path("claude", &worktree_path, sid)
+            pre_spawn_transcript_path(session_type, &worktree_path, sid)
         });
         let s = match self.try_spawn_via_daemon(
             &session_uid,
             &workspace_id_pre,
             &worktree_path,
-            "claude",
-            "claude",
+            session_type,
+            session_type,
             cloned_transcript_id.as_deref(),
             cols,
             rows,
@@ -2076,15 +2078,14 @@ impl App {
                 return;
             }
             None => {
-                // Unreachable post-migrate-tui-local: "claude" is
-                // daemon-eligible, so try_spawn_via_daemon never
+                // Both launch engines are daemon-eligible, so this never
                 // returns None here. Surface loudly if it does.
                 if let Some(c) = cloned.as_ref() {
                     Self::cleanup_failed_clone(c);
                 }
-                self.set_status_msg(
-                    "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
-                );
+                self.set_status_msg(&format!(
+                    "Internal: try_spawn_via_daemon returned None for '{session_type}'",
+                ));
                 return;
             }
         };
@@ -2092,13 +2093,17 @@ impl App {
         let ts = TerminalSession {
             color: None,
             uid: session_uid,
-            label: "claude".to_string(),
-            session_type: "claude".to_string(),
+            label: session_type.to_string(),
+            session_type: session_type.to_string(),
             session: s,
             status: SessionStatus::Running,
             idle_since: None,
             last_write_at: None,
-            transcript_id: cloned_transcript_id.clone(),
+            transcript_id: if engine == LaunchEngine::Claude {
+                cloned_transcript_id
+            } else {
+                None
+            },
             generation: 0,
             pending_jsonl_files: pending,
             hidden: false,
@@ -2187,6 +2192,7 @@ impl App {
         host: &cm_daemon::host_id::HostId,
         repo_url: &str,
         label: &str,
+        engine: LaunchEngine,
         start_branch: Option<&str>,
         idle_timeout_secs: u16,
         seed_from: Option<&str>,
@@ -2237,16 +2243,19 @@ impl App {
         let op_token_owned = self.host_pool.operator_token_for(host);
         let op_token = op_token_owned.as_str();
 
-        // create_session: daemon resolves repo → worktree → argv/env. Engine
-        // travels in the daemon's WIRE vocabulary ("claude-code"). A-n is
-        // taskless.
+        let session_type = engine.as_session_type();
+        let wire_engine = match engine {
+            LaunchEngine::Claude => "claude-code",
+            LaunchEngine::Codex => "codex",
+        };
+        // The daemon resolves repo → worktree → argv/env. A-n is taskless.
         let res = match crate::client_session::rpc_create_session(
             &socket,
             op_token,
             &session_uid,
             &workspace_id_pre,
-            "claude",
-            "claude-code",
+            session_type,
+            wire_engine,
             repo_url,
             start_branch,
             &slug,
@@ -2268,8 +2277,8 @@ impl App {
             &res.session_uid,
             &res.workspace_id,
             &worktree_path,
-            "claude",
-            "claude",
+            session_type,
+            session_type,
             cols,
             rows,
             None,
@@ -2304,8 +2313,8 @@ impl App {
         let ts = TerminalSession {
             color: None,
             uid: res.session_uid,
-            label: "claude".to_string(),
-            session_type: "claude".to_string(),
+            label: session_type.to_string(),
+            session_type: session_type.to_string(),
             session,
             status: SessionStatus::Running,
             idle_since: None,
@@ -2673,7 +2682,7 @@ impl App {
                 .ok()
                 .map(|s| make_simple_session("ssh", "bash", s, None))
         } else if let Some(wt) = worktree_path {
-            // migrate-tui-local Issue C: the local-claude branch
+            // migrate-tui-local Issue C: the local-agent branch
             // sends the workspace's local-filesystem worktree
             // (and per-session MCP config under `~/.cm/mcp/...`)
             // to the daemon. `spawn_host` is already proven `local`
@@ -2687,13 +2696,18 @@ impl App {
                 None
             } else {
                 let session_uid = new_session_uid();
-                let pending = Self::list_jsonl_files(&wt);
+                let engine = LaunchEngine::default();
+                let session_type = engine.as_session_type();
+                let pending = match engine {
+                    LaunchEngine::Claude => Self::list_jsonl_files(&wt),
+                    LaunchEngine::Codex => Self::list_codex_sessions(&wt),
+                };
                 match self.try_spawn_via_daemon(
                     &session_uid,
                     &workspace_id,
                     &wt,
-                    "claude",
-                    "claude",
+                    session_type,
+                    session_type,
                     None,
                     cols,
                     rows,
@@ -2708,8 +2722,8 @@ impl App {
                 ) {
                     Some(Ok(s)) => Some(make_simple_session_with_uid(
                         session_uid,
-                        "claude",
-                        "claude",
+                        session_type,
+                        session_type,
                         s,
                         Some(pending),
                     )),
@@ -2718,9 +2732,9 @@ impl App {
                         None
                     }
                     None => {
-                        self.set_status_msg(
-                            "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
-                        );
+                        self.set_status_msg(&format!(
+                            "Internal: try_spawn_via_daemon returned None for '{session_type}'",
+                        ));
                         None
                     }
                 }
@@ -4006,7 +4020,7 @@ impl App {
         in_place: bool,
         // Agent engine picked in the launch dialog — internal
         // session-type vocabulary ("claude" | "codex"). Defaults to
-        // "claude" in the UI; never "bash" (a planning launch always
+        // "codex" in the UI; never "bash" (a planning launch always
         // delivers the task prompt to an agent).
         engine: &str,
     ) {
@@ -4792,7 +4806,8 @@ mod slice_12e_tests {
             .insert("r".into(), "https://github.com/a/b".into());
         app.start_new_session();
         match &app.input_mode {
-            InputMode::NewSession { host_id, .. } => {
+            InputMode::NewSession { host_id, engine, .. } => {
+                assert_eq!(*engine, LaunchEngine::Codex);
                 assert_eq!(
                     *host_id,
                     HostId::local(),

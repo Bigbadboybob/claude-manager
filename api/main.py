@@ -417,6 +417,23 @@ async def get_queue_stats(queue: str, pool=Depends(get_pool)):
     return await db.queue_stats(pool, queue)
 
 
+@app.post("/queues/{queue}/recover", dependencies=[Depends(verify_token)])
+async def recover_queue_item(queue: str, body: dict, pool=Depends(get_pool)):
+    """Recover one explicitly reconciled item with a permanent retry receipt."""
+    _validate_queue_name(queue)
+    if set(body) != {"item_id", "claimed_by", "recovery_key"} or any(
+        not isinstance(body.get(k), str) or not body[k] or len(body[k]) > 256
+        for k in ("item_id", "claimed_by", "recovery_key")
+    ):
+        raise HTTPException(status_code=400, detail="item_id, claimed_by and recovery_key are required strings (1–256 characters)")
+    try:
+        return await db.recover_queue_item(pool, queue, **body)
+    except db.QueueRecoveryConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except (ValueError, asyncpg.DataError):
+        raise HTTPException(status_code=400, detail="item_id must be a UUID")
+
+
 @app.post("/queues/{queue}/claim", dependencies=[Depends(verify_token)])
 async def claim_queue_batch(queue: str, body: dict, pool=Depends(get_pool)):
     """Atomically claim up to max_items oldest pending items:

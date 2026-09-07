@@ -662,14 +662,11 @@ impl WorkflowPoller {
     /// `transcript_path` would rebind to the wrong file). Persistent roles never
     /// `/clear`, so their `transcript_path` stays valid for the whole run.
     fn sync_role_session_ids(&self) {
-        let bindings: Vec<(String, String, String)> = {
+        let candidates = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let mut out = Vec::new();
             for run in crate::workflow::run::load_all().iter().filter(|r| r.is_active()) {
                 for (role, b) in &run.role_sessions {
-                    if b.current_session_id.is_some() {
-                        continue;
-                    }
                     // Let the fresh-reset RebindPending path own a fresh role's sid.
                     let fresh_in_flight = run
                         .pending_activation
@@ -684,26 +681,50 @@ impl WorkflowPoller {
                     let Some(session) = state.sessions.get(uid) else {
                         continue;
                     };
-                    let Some(tp) = session.transcript_path.as_deref() else {
+                    if session.session_type != "codex" && b.current_session_id.is_some() {
                         continue;
-                    };
-                    // P-2: the canonical session id is engine-specific (Claude
-                    // file-stem / Codex first-line `payload.id`). Shared with
-                    // `start_workflow`'s bind path via [`resolve_existing_sid`].
-                    let sid = resolve_existing_sid(&session.session_type, tp);
-                    if let Some(sid) = sid {
-                        out.push((run.run_id.clone(), role.clone(), sid));
                     }
+                    out.push((run.run_id.clone(), role.clone(), uid.to_owned(),
+                        session.pid as u32, session.session_type.clone(),
+                        session.transcript_path.clone(), b.current_session_id.clone()));
                 }
             }
             out
         };
-        for (run_id, role, sid) in bindings {
+        for (run_id, role, uid, pid, engine, transcript, previous_sid) in candidates {
+            // Codex roles share a cwd. Initial UI/directory detection may
+            // temporarily stamp a sibling's path; a one-time binding would
+            // preserve that mistake after the process watcher corrects it.
+            // Read process-owned evidence outside the daemon state lock and
+            // keep the role binding synchronized, including after compaction.
+            let path = if engine == "codex" {
+                crate::transcript_detect::scan_live_codex_rollout(pid).rollout
+            } else {
+                transcript.map(std::path::PathBuf::from)
+            };
+            let Some(sid) = path.as_deref().and_then(|p| {
+                resolve_existing_sid(&engine, &p.to_string_lossy())
+            }) else { continue; };
+            if previous_sid.as_deref() == Some(sid.as_str()) { continue; }
+            {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if !state.sessions.get(&uid).is_some_and(|s| s.pid as u32 == pid) {
+                    continue;
+                }
+            }
             let _ = crate::workflow::run::modify(&run_id, |r| {
-                if let Some(b) = r.role_sessions.get_mut(&role) {
-                    if b.current_session_id.is_none() {
-                        b.current_session_id = Some(sid.clone());
-                    }
+                let Some(b) = r.role_sessions.get_mut(&role) else { return; };
+                if b.daemon_session_uid.as_deref() != Some(uid.as_str())
+                    || b.current_session_id != previous_sid
+                    || r.pending_activation.as_ref().is_some_and(|pa| {
+                        pa.target_role == role && pa.needs_fresh_reset
+                    }) {
+                    return;
+                }
+                b.current_session_id = Some(sid.clone());
+                let rebound = previous_sid.is_some();
+                if rebound {
+                    r.role_baselines.insert(role.clone(), crate::workflow::run::MessageBaseline::default());
                 }
                 // Patch the role's latest history entry's pending session_id too
                 // (e.g. the initial worker entry seeded with sid unknown).
@@ -711,9 +732,10 @@ impl WorkflowPoller {
                     .history
                     .iter_mut()
                     .rev()
-                    .find(|h| h.role == role && h.session_id.is_none())
+                    .find(|h| h.role == role)
                 {
                     h.session_id = Some(sid.clone());
+                    if rebound { h.assistant_count_at_start = 0; }
                 }
             });
         }
@@ -835,9 +857,9 @@ impl WorkflowPoller {
                 state
                     .sessions
                     .get(&w.uid)
-                    .map(|s| (s.input_handle(), Arc::clone(&s.fanout)))
+                    .map(|s| (s.input_handle(), Arc::clone(&s.fanout), s.pid as u32, s.session_type.clone()))
             };
-            let Some((handle, fanout)) = handle_fanout else {
+            let Some((handle, fanout, pid, session_type)) = handle_fanout else {
                 continue;
             };
             let tracker = self.tracker_for(&w.uid, &fanout);
@@ -849,6 +871,9 @@ impl WorkflowPoller {
                     workflow: &w.workflow,
                     worktree: &w.worktree,
                     role_engines: w.role_engines.clone(),
+                    codex_rollout_id: if session_type == "codex" {
+                        crate::transcript_detect::detect_live_codex_id(pid, &w.worktree).map(|(id, _)| id)
+                    } else { None },
                     now_ms: now_unix_ms(),
                     now_instant: Instant::now(),
                     gap_ms,
@@ -2653,7 +2678,7 @@ mod tests {
                 raw_prompt: String::new(), verbatim: false, needs_fresh_reset: true,
                 is_initial: false,
                 phase: ActivationPhase::Queued, rendered_prompt: None,
-                pre_clear_snapshot: None, enter_fire_at_ms: None,
+                pre_clear_snapshot: None, enter_fire_at_ms: None, codex_delivery: None,
             });
             r.set_paused(true);
         })
@@ -3389,13 +3414,16 @@ mod tests {
             let mut s = state.lock().unwrap();
             // A daemon-owned codex worker with NO current_session_id yet, but a
             // transcript_path pointing at the rollout (what the detector sets).
-            let mut sp = SpawnParams::new("ts-codex-w", "worker", "/bin/sleep");
-            sp.args = vec!["60".to_string()];
+            let mut sp = SpawnParams::new("ts-codex-w", "worker", "/bin/sh");
+            sp.args = vec!["-c".into(), "exec 3<\"$1\"; exec sleep 60".into(),
+                "fixture".into(), roll_path.to_string_lossy().into_owned()];
             sp.session_type = "codex".to_string();
             sp.workflow_run_id = Some("r-codex".to_string());
             sp.workflow_role = Some("worker".to_string());
             let mut ds = DaemonSession::spawn(sp).expect("spawn");
-            ds.transcript_path = Some(roll_path.to_str().unwrap().to_string());
+            let sibling = roll_dir.join("wrong-sibling.jsonl");
+            std::fs::write(&sibling, "{\"payload\":{\"id\":\"wrong-sibling\"}}\n").unwrap();
+            ds.transcript_path = Some(sibling.to_string_lossy().into_owned());
             s.sessions.insert("ts-codex-w".to_string(), ds);
         }
         // Bind the daemon uid to the role, current_session_id left None.
@@ -3410,7 +3438,14 @@ mod tests {
         .unwrap();
 
         let poller = WorkflowPoller::new(state);
-        poller.sync_role_session_ids();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            poller.sync_role_session_ids();
+            if crate::workflow::run::load_one("r-codex").unwrap()
+                .role_sessions["worker"].current_session_id.is_some() { break; }
+            assert!(Instant::now() < until, "fixture process did not open its rollout");
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         let run = crate::workflow::run::load_one("r-codex").unwrap();
         assert_eq!(
@@ -3418,6 +3453,22 @@ mod tests {
             Some("codex-canonical-xyz"),
             "Codex role must bind payload.id, not the filename stem",
         );
+        // A previous heuristic/TUI bind must not remain authoritative after
+        // process evidence identifies the actual participant conversation.
+        crate::workflow::run::modify("r-codex", |r| {
+            r.role_sessions.get_mut("worker").unwrap().current_session_id = Some("wrong-sibling".into());
+            r.role_baselines.insert("worker".into(), MessageBaseline { user_count: 8, assistant_count: 9 });
+            let h = r.history.iter_mut().rev().find(|h| h.role == "worker").unwrap();
+            h.session_id = Some("wrong-sibling".into());
+            h.assistant_count_at_start = 9;
+        }).unwrap();
+        poller.sync_role_session_ids();
+        let run = crate::workflow::run::load_one("r-codex").unwrap();
+        assert_eq!(run.role_sessions["worker"].current_session_id.as_deref(), Some("codex-canonical-xyz"));
+        assert_eq!(run.role_baselines["worker"].assistant_count, 0);
+        let h = run.history.iter().rev().find(|h| h.role == "worker").unwrap();
+        assert_eq!(h.session_id.as_deref(), Some("codex-canonical-xyz"));
+        assert_eq!(h.assistant_count_at_start, 0);
     }
 
     /// P-A (criterion #4), daemon half: `poll_once` broadcasts a fresh snapshot
@@ -4879,7 +4930,7 @@ to = "reviewer"
                 phase: crate::workflow::run::ActivationPhase::Queued,
                 rendered_prompt: None,
                 pre_clear_snapshot: None,
-                enter_fire_at_ms: None,
+                enter_fire_at_ms: None, codex_delivery: None,
             });
         })
         .unwrap();
@@ -5015,7 +5066,7 @@ to = "reviewer"
                 raw_prompt: "the goal".to_string(), verbatim: true,
                 needs_fresh_reset: false, is_initial: true,
                 phase: crate::workflow::run::ActivationPhase::Queued,
-                rendered_prompt: None, pre_clear_snapshot: None, enter_fire_at_ms: None,
+                rendered_prompt: None, pre_clear_snapshot: None, enter_fire_at_ms: None, codex_delivery: None,
             });
         })
         .unwrap();
@@ -5149,7 +5200,7 @@ to = "reviewer"
                 raw_prompt: "the goal".to_string(), verbatim: true,
                 needs_fresh_reset: false, is_initial: true,
                 phase: crate::workflow::run::ActivationPhase::Queued,
-                rendered_prompt: None, pre_clear_snapshot: None, enter_fire_at_ms: None,
+                rendered_prompt: None, pre_clear_snapshot: None, enter_fire_at_ms: None, codex_delivery: None,
             });
         })
         .unwrap();

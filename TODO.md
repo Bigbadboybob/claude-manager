@@ -28,6 +28,12 @@ Open threads, refreshed 2026-06-29 (late session). Priority order; each item has
 - **bug-003 / 004 / 005 / 006 / 007 / 008** — still need review + merge as you go through them. The restored ones (003/004/005/006) are re-parented, so marking done keeps them nested until you close the session.
 - **Decision still pending:** pause the orchestrator? It's now spawning up to **bug-012** — churn while we stabilize.
 
+### P2 — Correct continuous `report_done` audit run mode (deployed, 2026-09-07)
+
+[`report_done`](daemon/src/control/methods.rs) previously hardcoded `RunLogLine.run_mode = Some("fresh")` after marking a continuous run complete. Persistent tasks therefore produced a misleading completion audit entry; observed on cm-manager for `structured-scraper-creation` seq 1 at 2026-09-06 21:15:14 UTC. The task definition and matching `fired` event are persistent, and the actual run completed normally.
+
+The local fix emits the completed task's actual mode, with coverage for fresh/persistent completions, run identity and no audit entry for a completion no-op. Historical logs stay intact; the [Codex migration manifest](doc/continuous-codex-migration.md) should annotate this known discrepancy and derive mode from the definition plus matching fire record for historical events. No completed work should be rerun or interrupted for this audit correction.
+
 ### P3 — Other headless planning tools 🟢 (reads DONE locally; deploy + notify_user pending)
 The READ tools (`list_tasks` / `get_task` / `get_current_task`) are **implemented + tested** (commit `0581a56`): daemon `list_tasks`/`get_task` RPC handlers (reuse `api_*` helpers); MCP routes through the daemon when headless, else PlanningClient; `get_current_task` composed from `ping` + `get_task`. daemon 442 + mcp 136 green.
 - **Pending: cm-manager deploy** (daemon binary + mcp_server → another clean restart) for it to take effect there.

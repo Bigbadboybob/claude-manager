@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Check Codex releases and notify the operator; never install or restart anything.
+
+Run daily via cron. Configuration: ~/.cm/codex-update-config.json, e.g.
+{"hold_version": "0.153.4"}. Removing the hold only changes alert wording;
+this program has no installation path. See doc/codex-update-checker.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+
+REGISTRY_URL = "https://registry.npmjs.org/@openai%2Fcodex/latest"
+RELEASE_NOTES = "https://learn.chatgpt.com/docs/changelog"
+FAILURE_THRESHOLD = 2
+FAILURE_REMINDER_SECONDS = 7 * 86400
+MAX_RESPONSE_BYTES = 1024 * 1024
+
+
+class CheckError(Exception):
+    pass
+
+
+def version_tuple(value: str) -> tuple[int, int, int]:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", value):
+        raise CheckError("expected a stable major.minor.patch version")
+    return tuple(int(part) for part in value.split("."))
+
+
+def installed_version(cli: str) -> str:
+    try:
+        result = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CheckError(f"installed Codex version check failed ({type(exc).__name__})") from exc
+    if result.returncode:
+        raise CheckError(f"installed Codex version check exited {result.returncode}")
+    match = re.search(r"^codex-cli (\S+)\s*$", result.stdout, re.MULTILINE)
+    if not match:
+        raise CheckError("could not parse installed Codex version")
+    version_tuple(match[1])
+    return match[1]
+
+
+def latest_version() -> str:
+    request = urllib.request.Request(REGISTRY_URL, headers={"User-Agent": "cm-codex-update-check/1"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise CheckError("npm registry response exceeded size limit")
+        data = json.loads(body)
+    except CheckError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise CheckError(f"npm registry check failed ({type(exc).__name__})") from exc
+    if not isinstance(data, dict) or data.get("name") != "@openai/codex":
+        raise CheckError("npm registry returned unexpected package metadata")
+    version = data.get("version")
+    version_tuple(version)
+    return version
+
+
+def notify(command: str, message: str) -> None:
+    env = dict(os.environ, CM_NOTIFY_TAG="codex-updates")
+    try:
+        result = subprocess.run([command, message], env=env, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CheckError(f"operator notification failed ({type(exc).__name__})") from exc
+    if result.returncode:
+        # The notifier may print credential-bearing curl diagnostics. Never
+        # copy its stdout/stderr into state, logs or another notification.
+        raise CheckError(f"operator notification exited {result.returncode}")
+
+
+def load_json(path: Path, *, required: bool = False) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError as exc:
+        if not required:
+            return {}
+        raise CheckError(f"missing configuration: {path.name}") from exc
+    except (OSError, ValueError) as exc:
+        raise CheckError(f"cannot read {path.name} ({type(exc).__name__})") from exc
+    if not isinstance(data, dict):
+        raise CheckError(f"{path.name} must contain a JSON object")
+    return data
+
+
+def save_state(path: Path, state: dict) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(state, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def validate_state(state: dict) -> None:
+    if state.get("schema_version", 1) != 1:
+        raise CheckError("unsupported update-check state schema")
+    if not isinstance(state.get("notified", {}), dict):
+        raise CheckError("invalid notification history in update-check state")
+    for key in ("consecutive_failures", "failure_alerted_at"):
+        value = state.get(key, 0)
+        if type(value) is not int or value < 0:
+            raise CheckError(f"invalid {key} in update-check state")
+
+
+def check(config_path: Path, state: dict, cli: str, notifier: str, now: int) -> int:
+    state["schema_version"] = 1
+    state["checked_at"] = now
+    sent = state.setdefault("notified", {})
+    try:
+        config = load_json(config_path, required=True)
+        if set(config) - {"hold_version"}:
+            raise CheckError("unknown update-check configuration field")
+        hold = config.get("hold_version")
+        if hold is not None:
+            version_tuple(hold)
+        current, latest = installed_version(cli), latest_version()
+        state.update(installed_version=current, latest_version=latest, hold_version=hold,
+                     last_successful_version_check_at=now)
+        events = []
+        available = version_tuple(latest) > version_tuple(current)
+        drift = hold is not None and current != hold
+        if available:
+            hold_text = (
+                f"Migration hold: {hold}. Keep that version until validation allows an update. "
+                if hold else "Installation remains manual. "
+            )
+            events.append((f"release:{latest}",
+                f"Codex update available: installed {current}, latest stable {latest}. "
+                f"{hold_text}No automatic installation.\n"
+                f"Release notes: {RELEASE_NOTES}\n"
+                f"When ready: sudo /usr/bin/npm install -g --prefix /usr @openai/codex@{latest}"))
+        if drift:
+            events.append((f"hold:{hold}:installed:{current}",
+                f"Codex version hold mismatch: expected {hold}, installed {current}. "
+                "Check the migration baseline before continuing. No installation or rollback was performed."))
+        for key, message in events:
+            if key not in sent:
+                notify(notifier, message)
+                sent[key] = now
+        if state.get("failure_alerted_at", 0):
+            notify(notifier, f"Codex update checks recovered. Installed {current}; latest stable {latest}. "
+                   "Automatic installation remains disabled.")
+        state.update(status="hold_mismatch" if drift else "update_available" if available else "current",
+                     consecutive_failures=0, failure_alerted_at=0, last_error=None,
+                     last_success_at=now)
+        return 0
+    except (CheckError, OSError, ValueError) as exc:
+        state["status"] = "error"
+        state["last_error"] = str(exc)[:400]
+        state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+        last_alert = state.get("failure_alerted_at", 0)
+        if state["consecutive_failures"] >= FAILURE_THRESHOLD and (
+            not last_alert or now - last_alert >= FAILURE_REMINDER_SECONDS
+        ):
+            try:
+                notify(notifier, f"Codex update checker failed {state['consecutive_failures']} consecutive checks: "
+                       f"{state['last_error']}. Update visibility may be stale. "
+                       "Inspect ~/.cm/codex-update-check.log; installed Codex was not changed.")
+                state["failure_alerted_at"] = now
+            except CheckError as notification_error:
+                print(str(notification_error), file=sys.stderr)
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    root = Path.home() / ".cm"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=root / "codex-update-config.json")
+    parser.add_argument("--state", type=Path, default=root / "codex-update-state.json")
+    parser.add_argument("--cli", default="/usr/bin/codex")
+    parser.add_argument("--notify-command", default=str(root / "bin/cm-notify"))
+    args = parser.parse_args(argv)
+    try:
+        args.state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(args.state) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("Codex update check already running; skipped.")
+                return 0
+            state = load_json(args.state)
+            validate_state(state)
+            code = check(args.config, state, args.cli, args.notify_command, int(time.time()))
+            save_state(args.state, state)
+            print(json.dumps({key: state.get(key) for key in (
+                "checked_at", "status", "installed_version", "latest_version", "hold_version",
+                "consecutive_failures", "last_error")}))
+            return code
+    except (CheckError, OSError, ValueError) as exc:
+        # Preserve corrupt/unwritable state rather than discarding deduplication
+        # history. Storage faults are actionable immediately (once per cron run).
+        message = f"Codex update checker cannot persist trustworthy state ({type(exc).__name__}): {str(exc)[:300]}"
+        print(message, file=sys.stderr)
+        try:
+            notify(args.notify_command, message + ". Inspect ~/.cm/codex-update-check.log. No update performed.")
+        except CheckError as notification_error:
+            print(str(notification_error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
