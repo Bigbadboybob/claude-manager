@@ -1,0 +1,83 @@
+{
+  "date": "2026-09-07",
+  "sources": [
+    {
+      "url": "https://code.claude.com/docs/en/cross-session-messaging",
+      "sha256_fetched_html": "f020c4a3ee7bba63537c40e0f96fc6dbd7f4293f195cb01abd809e63e109ac94"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/channels",
+      "sha256_fetched_html": "ea3685223a561e1ea84bdd8b1f59f6a910ac1bf5bfc5cd5d2a23e21af6bf996b"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/channels-reference",
+      "sha256_fetched_html": "4d4171c26b79aa394b24875ee44fa99b145b82de9422970739ec86c29f46ec3b"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/tools-reference",
+      "sha256_fetched_html": "4c5814e0246a8172434b5c2e7934cc39c1976645c5c89d8cd3421a4bff1ccbea"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/plugins-reference",
+      "sha256_fetched_html": "6f18f4d97ded1011a0701643505bdb74f4eb1a45f7b9fed1a5b8eb8eb888a13a"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/mcp",
+      "sha256_fetched_html": "5c98eca22ed28542deb845085ba985e172c08dc34a5e7794de8cabc9d367775f"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/hooks",
+      "sha256_fetched_html": "65bb0a58e5aa9848fa8b1214c2ae3dca34ab176e27996cc2a8cccf3d855a4456"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/scheduled-tasks",
+      "sha256_fetched_html": "3855f2777c53cc2aa4c7fa8609f59b3f72c9194a733d7382a8011941dd519d91"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/headless",
+      "sha256_fetched_html": "971b43008bd59bef188c0d86c270df17f2d3fd6078f9fdb711783228ef7e12a3"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode",
+      "sha256_fetched_html": "7eeb16f1a6ff76c1d9b7e209390873dfa90bd65f863c0cbc77249933aa0a0a33"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/cli-reference",
+      "sha256_fetched_html": "696e1bf9de03470b9aa8f879147e35be943bb8bfe2e1e64d1948cd1ad2c6afad"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/agent-view",
+      "sha256_fetched_html": "a62ed534b4d9de46d089d81d0ae50a4d2e4dc941fa3ad6b9288143e066e8982d"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/agent-teams",
+      "sha256_fetched_html": "6fb4a8b32cf4e77bff55b024c6adebd42dd65bccca787502a62601625a00a91d"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/remote-control",
+      "sha256_fetched_html": "397a8e8cbf45b617dd2e8cceeb3ac2581963ccdabcae692f4a90824795b8fc6b"
+    },
+    {
+      "url": "https://developers.openai.com/codex/app-server/",
+      "sha256_fetched_html": "904bfe0ba7cbd30d6309531e15607820a8b6612b6271c947d7bfc2c77fa01f65"
+    },
+    {
+      "url": "https://learn.chatgpt.com/docs/hooks",
+      "sha256_fetched_html": "9e4888f811b3ca5cd5c615e599aaa956bd97ad74c86e8a7002e3c1cf49db0998"
+    },
+    {
+      "url": "https://learn.chatgpt.com/docs/extend/mcp",
+      "sha256_fetched_html": "e80e95d75faa61a48800b3379616fcd1515a7f910a7530336b05571067ce4d7c"
+    }
+  ],
+  "executables": [
+    {
+      "version": "Claude Code 2.1.263",
+      "sha256": "26d020351e8112f4006790f3cfce43b4c9df0c1bb1d0e542364d64151b81d5ba"
+    },
+    {
+      "version": "Codex 0.153.4",
+      "sha256": "56ef98ab4032d317ab26e9b5e5a175650717351edb16ed9cde0cb6d1734d62da"
+    }
+  ]
+}

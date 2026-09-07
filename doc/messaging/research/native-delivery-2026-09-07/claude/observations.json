@@ -1,0 +1,226 @@
+{
+  "recorded": "2026-09-07",
+  "client": "Claude Code 2.1.263",
+  "model": "deterministic loopback fixture; no real model inference",
+  "latency_definition": "trigger written/sent to next main-conversation model HTTP request; synthetic local endpoint",
+  "results": {
+    "claude-bash": {
+      "settled_before_release": true,
+      "requests_before": 2,
+      "requests_after": 3,
+      "woke": true,
+      "latency_s": 0.11489439010620117,
+      "draft_in_request": false,
+      "notification_in_request": false,
+      "task_notification": true
+    },
+    "claude-bash-active": {
+      "requests_before": 2,
+      "woke_while_foreground_blocked": false,
+      "notification_before_release": false,
+      "task_notification_before_release": false,
+      "notification_after_release": false,
+      "task_notification_after_release": true
+    },
+    "claude-channel": {
+      "woke": false,
+      "requests_before": 1,
+      "requests_after": 1,
+      "latency_s": null,
+      "draft_in_request": false,
+      "notification_in_request": false
+    },
+    "claude-child-bridge": {
+      "events": [
+        {
+          "event": 0,
+          "received": true,
+          "latency_s": 0.03564190864562988
+        },
+        {
+          "event": 1,
+          "received": true,
+          "latency_s": 0.046404123306274414
+        }
+      ],
+      "draft_not_submitted": true,
+      "draft_intact": true,
+      "explicit_inbound_setting": false,
+      "arming_tool_calls": false
+    },
+    "claude-generic-mcp": {
+      "requests_before": 1,
+      "requests_after": 1,
+      "woke_idle": false,
+      "log_or_progress_in_next_request": false,
+      "initialize": [
+        {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "roots": {
+              "listChanged": true
+            },
+            "elicitation": {}
+          },
+          "clientInfo": {
+            "name": "claude-code",
+            "title": "Claude Code",
+            "version": "2.1.263",
+            "description": "Anthropic's agentic coding tool",
+            "websiteUrl": "https://claude.com/claude-code"
+          }
+        }
+      ],
+      "sampling_reply": [
+        {
+          "jsonrpc": "2.0",
+          "id": "server-sampling-1",
+          "error": {
+            "code": -32601,
+            "message": "Method not found"
+          }
+        }
+      ]
+    },
+    "claude-hook-async": {
+      "woke_idle": false,
+      "requests_before": 1,
+      "requests_after": 1,
+      "latency_s": null,
+      "draft_in_request_before_submit": false,
+      "hook_context_before_submit": false,
+      "draft_submitted_intact": true,
+      "hook_context_after_submit": true
+    },
+    "claude-hook-rewake": {
+      "woke_idle": true,
+      "requests_before": 1,
+      "requests_after": 2,
+      "latency_s": 0.057869672775268555,
+      "draft_in_request_before_submit": false,
+      "hook_context_before_submit": true,
+      "draft_submitted_intact": true,
+      "hook_context_after_submit": true
+    },
+    "claude-mcp": {
+      "settled_before_release": true,
+      "requests_before": 2,
+      "requests_after": 3,
+      "woke": true,
+      "latency_s": 0.04246950149536133,
+      "draft_in_request": false,
+      "notification_in_request": true,
+      "task_notification": true
+    },
+    "claude-mcp-active": {
+      "requests_before": 2,
+      "woke_while_foreground_blocked": false,
+      "notification_before_release": false,
+      "task_notification_before_release": false,
+      "notification_after_release": true,
+      "task_notification_after_release": true
+    },
+    "claude-mcp-approval": {
+      "requests_before": 2,
+      "woke_while_foreground_blocked": false,
+      "notification_before_release": false,
+      "task_notification_before_release": false,
+      "approval_was_visible": true,
+      "notification_after_release": true,
+      "task_notification_after_release": true
+    },
+    "claude-mcp-disconnect": {
+      "completion_after_server_disconnect": true,
+      "task_notification": true,
+      "connection_error_in_context": true,
+      "result_is_notification_payload": false
+    },
+    "claude-mcp-timeout": {
+      "requests_before": 2,
+      "woke_while_foreground_blocked": true,
+      "notification_before_release": false,
+      "task_notification_before_release": true,
+      "notification_after_release": false,
+      "task_notification_after_release": true,
+      "timeout_context": true
+    },
+    "claude-socket-active": {
+      "woke_before_release": false,
+      "latency_s": null,
+      "draft_in_request_before_submit": false,
+      "notification_in_request": false,
+      "received_after_tool_completion": true
+    },
+    "claude-socket-approval": {
+      "woke_before_release": false,
+      "latency_s": null,
+      "draft_in_request_before_submit": false,
+      "notification_in_request": false,
+      "approval_visible": true,
+      "received_after_approval": true,
+      "approval_detection": "ANSI-stripped terminal contains Do you want to proceed"
+    },
+    "claude-socket-default": {
+      "woke_before_release": false,
+      "latency_s": null,
+      "draft_in_request_before_submit": false,
+      "notification_in_request": false
+    },
+    "claude-socket-idle": {
+      "woke_before_release": true,
+      "latency_s": 0.019278764724731445,
+      "draft_in_request_before_submit": false,
+      "notification_in_request": true,
+      "same_id_same_body_extra_requests": 0,
+      "changed_body_same_id_received": true,
+      "new_connection_received": true,
+      "draft_submitted_intact": true
+    },
+    "claude-socket-ownchild": {
+      "self_event_received": true,
+      "calls": 3,
+      "inherited_socket_and_token": true
+    },
+    "claude-socket-refuse": {
+      "woke_before_release": false,
+      "latency_s": null,
+      "draft_in_request_before_submit": false,
+      "notification_in_request": false
+    },
+    "claude-stream-owned": {
+      "first_result": true,
+      "alive_with_stdin_open": true,
+      "second_turn_same_process": true,
+      "latency_s": 0.012238740921020508,
+      "session_ids": [
+        "e1ad8ddb-1932-48d6-8bf5-1592d416125f"
+      ],
+      "requests_before": 1,
+      "requests_after": 2
+    }
+  },
+  "repeat_draft_confirmation": {
+    "claude-bash": {
+      "settled_before_release": true,
+      "requests_before": 2,
+      "requests_after": 3,
+      "woke": true,
+      "latency_s": 0.12291622161865234,
+      "draft_in_request": false,
+      "notification_in_request": false,
+      "task_notification": true,
+      "draft_submitted_intact": true
+    },
+    "claude-mcp": {
+      "settled_before_release": true,
+      "requests_before": 2,
+      "requests_after": 3,
+      "woke": true,
+      "latency_s": 0.039153099060058594,
+      "draft_in_request": false,
+      "notification_in_request": true,
+      "task_notification": true,
+      "draft_submitted_intact": true
+    }
+  }
+}

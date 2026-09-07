@@ -1,0 +1,169 @@
+{
+  "version": "0.153.4",
+  "date": "2026-09-07",
+  "provider": "isolated loopback mock Responses API; no paid calls",
+  "production_modified": false,
+  "cases": {
+    "queue-tui": {
+      "queue_cli_exit": 0,
+      "delivery_observed_within_s": 15,
+      "draft_preserved": true,
+      "draft_submitted_only_after_explicit_enter": true,
+      "note": "Raw request count includes a separate mock title-generation request."
+    },
+    "queue-latency": [
+      {
+        "case": "same-process",
+        "latency_s": 0.05701613426208496,
+        "delivered": true
+      },
+      {
+        "case": "cross-process-1",
+        "latency_s": 9.347106456756592,
+        "delivered": true
+      },
+      {
+        "case": "cross-process-2",
+        "latency_s": 9.560717582702637,
+        "delivered": true
+      }
+    ],
+    "queue-appserver": {
+      "queue_duplicate_ids_differ": true,
+      "duplicate_user_messages_with_same_client_id": 2,
+      "queued_input_waited_for_active_turn_end": true,
+      "short_idle_observation_superseded": true
+    },
+    "queue-tui-approval": {
+      "observation_s": 12,
+      "main_model_requests_during_approval": 1,
+      "main_model_requests_after_explicit_approval": 3,
+      "dialog_preserved": true
+    },
+    "queue-tui-reconnect": {
+      "responses_while_closed": 0,
+      "responses_after_resume": 3,
+      "remaining_queue": 0,
+      "same_history_resumed": true
+    },
+    "native-appserver-control": {
+      "idle_wake_s": 0.05520343780517578,
+      "same_live_thread_rejoined": true,
+      "loaded_thread_count": 1,
+      "reconnect_same_id": true,
+      "reconnect_turn_count": 2,
+      "stale_steer_error": "{\"code\": -32600, \"message\": \"no active turn to steer\"}"
+    },
+    "native-appserver-control-retry": {
+      "idle_wake_s": 0.05388617515563965,
+      "same_client_id_retry": {
+        "new_turn": true,
+        "response_delta": 1
+      },
+      "same_live_thread_rejoined": true,
+      "loaded_thread_count": 1,
+      "reconnect_same_id": true,
+      "reconnect_turn_count": 3,
+      "stale_steer_error": "{\"code\": -32600, \"message\": \"no active turn to steer\"}"
+    },
+    "native-appserver-remote-tui": {
+      "idle_wake_s": 0.05428194999694824,
+      "remote_tui_draft_preserved": true,
+      "draft_was_submitted": false,
+      "same_live_thread_rejoined": true,
+      "loaded_thread_count": 1,
+      "reconnect_same_id": true,
+      "reconnect_turn_count": 2,
+      "stale_steer_error": "{\"code\": -32600, \"message\": \"no active turn to steer\"}"
+    },
+    "background-shell-idle": {
+      "requests_after_completion_observation": 2,
+      "requests_after_next_explicit_user_turn": 3,
+      "idle_wake": false,
+      "automatic_result_in_next_model_context": false,
+      "command_exit_code": 0
+    },
+    "background-shell-active": {
+      "requests_after_completion_observation": 3,
+      "requests_after_next_explicit_user_turn": 4,
+      "idle_wake": false,
+      "automatic_result_in_next_model_context": false,
+      "command_exit_code": 0
+    },
+    "background-shell-tui": {
+      "main_model_requests_after_job_finished": 2,
+      "observation_s": 12,
+      "idle_wake": false
+    },
+    "mcp-code-long-hold": {
+      "first_turn_seconds": 130.25180387496948,
+      "responses_at_first_turn_end": 2,
+      "responses_after_completion_wait": 2,
+      "request_offsets": [
+        0.10733509063720703,
+        130.2424771785736
+      ]
+    },
+    "mcp-code-yielded": {
+      "first_turn_seconds": 0.28093385696411133,
+      "responses_at_first_turn_end": 2,
+      "responses_after_completion_wait": 2,
+      "request_offsets": [
+        0.14176177978515625,
+        0.2723984718322754
+      ]
+    },
+    "mcp-code-yielded-active": {
+      "requests_after_active_and_idle": 3,
+      "model_received_mcp_at_requests_before_explicit_read": [],
+      "model_received_mcp_after_explicit_read": [
+        5
+      ]
+    },
+    "hook-async-idle": {
+      "requests_after_background_completion": 2,
+      "hook_ran": true,
+      "model_received_hook_at_requests": [
+        3
+      ]
+    },
+    "hook-async-active": {
+      "requests_after_background_completion": 3,
+      "hook_ran": true,
+      "model_received_hook_at_requests": [
+        3,
+        4
+      ]
+    },
+    "native-structured-input": {
+      "inject_items_started_turn": false,
+      "idle_tool_output_woke": true,
+      "idle_tool_output_completion_s": 0.04014277458190918,
+      "context_visible_after_next_turn": true,
+      "idle_tool_output_items": [
+        {
+          "type": "function_call_output",
+          "name": "cm_notification",
+          "output": "CM_STANDALONE_IDLE_EVENT"
+        }
+      ],
+      "active_returned_same_turn": true,
+      "active_tool_output_in_next_request": true,
+      "foreground_tool_completed": true
+    }
+  },
+  "mcp_client_initialize": {
+    "protocolVersion": "2025-06-18",
+    "capabilities": {
+      "elicitation": {
+        "form": {},
+        "url": {}
+      }
+    },
+    "clientVersion": "0.153.4"
+  },
+  "excluded_experiments": [
+    "mcp-direct-long: direct tool was not exposed; mock failed before testing wait behavior.",
+    "The initial 3-second cross-process queue observation was too short; superseded by demonstrated longer pickup."
+  ]
+}
