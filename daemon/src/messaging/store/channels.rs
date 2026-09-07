@@ -53,6 +53,7 @@ impl Store {
         p: &Value,
         creator: &str,
         people: &[Person],
+        existing_admins: &[Value],
     ) -> Result<Value> {
         let mut fields = json!({});
         for (key, max) in [("name", 100), ("description", 1000)] {
@@ -94,6 +95,7 @@ impl Store {
                     && id != creator
                     && !self.names.contains_key(id)
                     && !people.iter().any(|p| p.id == id)
+                    && !existing_admins.iter().any(|v| v == id)
                 {
                     return Err(err(
                         "not_found",
@@ -162,7 +164,7 @@ impl Store {
         if self.channels.contains_key(&path) {
             return Err(err("channel_exists", "Channel already exists"));
         }
-        let fields = self.validate_channel_fields(p, actor, people)?;
+        let fields = self.validate_channel_fields(p, actor, people, &[])?;
         let mut items = vec![];
         let mut part = String::new();
         for segment in path.split('/') {
@@ -258,7 +260,15 @@ impl Store {
                 json!({"status":"conflict","current_revision":current["revision"],"channel":current}),
             );
         }
-        let fields = self.validate_channel_fields(p, strv(&current, "created_by"), people)?;
+        let fields = self.validate_channel_fields(
+            p,
+            strv(&current, "created_by"),
+            people,
+            current["admins"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )?;
         if fields.as_object().unwrap().is_empty() {
             return Err(err(
                 "invalid_params",

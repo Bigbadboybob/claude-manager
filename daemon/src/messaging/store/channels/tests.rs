@@ -52,6 +52,47 @@ fn pin(
 }
 
 #[test]
+fn messaging_channel_retains_admin_ids_after_unnamed_agents_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let creator = person(&s, "creator");
+    let admin = person(&s, "admin");
+    let created = s
+        .channel_action(
+            &creator.id,
+            &json!({"action":"create","path":"handoff","admins":[admin.id],"request_id":"create"}),
+            &[creator.clone(), admin.clone()],
+        )
+        .unwrap();
+    let channel = &created["channel"];
+    let id = channel["id"].as_str().unwrap();
+    let saved = update(
+        &mut s,
+        "owner",
+        id,
+        json!({"description":"Successor notes","admins":channel["admins"]}),
+        &[],
+        "after-exit",
+    )
+    .unwrap();
+    assert_eq!(saved["channel"]["admins"], channel["admins"]);
+    assert_eq!(saved["channel"]["description"], "Successor notes");
+    assert_eq!(
+        update(
+            &mut s,
+            "owner",
+            id,
+            json!({"admins":["unknown"]}),
+            &[],
+            "unknown-admin",
+        )
+        .unwrap_err()
+        .code,
+        "not_found"
+    );
+}
+
+#[test]
 fn messaging_channel_admin_defaults_open_editing_and_owner_override_survive_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let mut s = Store::open(tmp.path()).unwrap();

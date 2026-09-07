@@ -100,6 +100,13 @@ mod tests {
         assert_eq!(pending["params"]["expected_revision"], "r1");
         assert_eq!(pending["params"]["admins"], json!(["a", "b"]));
         app.messages.saved.management.pending = None;
+        app.messages.people.clear();
+        app.messaging_channel_form(true);
+        app.messaging_save_channel();
+        let pending = serde_json::to_value(&app.messages.saved.management.pending).unwrap();
+        assert_eq!(pending["params"]["admins"], json!(["a", "b"]));
+        app.messages.saved.management.pending = None;
+        app.messages.fields[3] = "Creator, Reviewer".into();
         app.messages.fields[1] = "Long description ".repeat(50);
         app.messages.field = 3;
         let mut narrow =
@@ -290,6 +297,16 @@ impl App {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            // A saved admin may have exited before enrolling a messaging name.
+            // Preserve known IDs even when the people directory no longer has them.
+            if edit
+                && self.messages.channel_edit_base["admins"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id == name))
+            {
+                admins.push(json!(name));
+                continue;
+            }
             let hits: Vec<_> = self
                 .messages
                 .people
