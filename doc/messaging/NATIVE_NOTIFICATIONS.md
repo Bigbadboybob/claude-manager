@@ -193,10 +193,10 @@ checked separately. See [research and interface evidence](NATIVE_DELIVERY_RESEAR
 
 | Check | Result |
 |---|---|
-| Full daemon library suite, serial execution | 1,247 passed; 4 ignored |
+| Full daemon library suite after main integration, serial execution | 1,289 passed; 4 ignored |
 | TUI launch/configuration suite | 19 passed |
 | Focused native queue, monitors, hooks and messaging Python suite | 55 passed |
-| Broad Python suite after baseline fixes | 329 passed; no failures |
+| Broad Python suite after main integration | 348 passed; no failures |
 | Real Claude + actual CM MCP child, local mock model | Idle draft preserved; active command and explicit approval preserved; native receipts observed in all three cases |
 | Real Codex + owned launcher, local mock model | Draft preserved; active checkpoint delivery; approval forwarding; reconnect and exact thread selection passed |
 | Real holder + daemon + owned Codex | Brain SIGKILL preserved launcher/thread/transcript; wakes before and after passed; session kill stopped the launcher and its owned descendants |
@@ -214,3 +214,34 @@ smokes in approximately 3.8 and 47.7 seconds. Two intermediate runs exceeded a
 and the provider stream continued emitting keepalives. Native delivery removes
 the artificial queue-drain delay; it cannot eliminate provider scheduling or
 model execution time.
+
+
+### Local rollout — 2026-09-07
+
+Merged and pushed to main at `170ed8c`, including continuous-task drain tracking
+from current main. The shared release daemon and TUI were rebuilt; the installed
+MCP uses `/home/lucas/code/projects/claude-manager/mcp_server/server.py` and its
+existing compatible Python environment. No manual MCP server-path override is
+needed.
+
+The local holder stayed at PID 5517 and advanced from epoch 11 to 12. All 26
+sessions were retained at the brain swap; the 25 session processes saved in the
+pre-build snapshot retained their PIDs and start times (one additional session
+started before deployment). Live MCP preflight and messaging reads passed. The running executable matched
+the release SHA-256; the shared cargo cache retained an older `build_id` string
+(see the holder runbook). The disposable holder integration test also passed
+against these release binaries, including native wakes across a brain restart
+and cleanup of all owned descendants. The full ten-minute stability check passed:
+epoch stayed 12, the breaker stayed `running`, MCP remained healthy, all 26
+sessions remained present, and no saved process identity changed.
+
+Restart only the CM viewer (`Alt+q`, relaunch) to load its new launch builder.
+Compatible Claude sessions can reconnect MCP. Existing embedded Codex sessions
+pick up the owned app-server on a deliberate session restart/resume; deployment
+did not restart them. New Codex spawns use the new transport automatically.
+The remote `cm-manager` host was not part of this local rollout.
+
+Rollback copies, binary hashes, before/after health and process evidence are in
+`~/.cm/backups/native-notifications-20260907T204029Z`. Use the holder's
+`daemon.rollback_brain` procedure if the deployed brain must be reverted;
+restore the matching MCP files and viewer artifact from that backup as needed.
