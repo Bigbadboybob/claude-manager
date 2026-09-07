@@ -956,6 +956,17 @@ pub(crate) fn persist_all_checked(
                         e
                     )
                 })?;
+                // Replay rings (best-effort, never aborts the swap) —
+                // the readers are frozen by now, so every ring is at
+                // rest; the new image seeds adopted fanouts from them.
+                let rings_dir = crate::fanout_persist::rings_dir_for(&path);
+                match crate::fanout_persist::save_rings(&st, &rings_dir) {
+                    Ok(n) => eprintln!("cm-daemon: re-exec: {n} replay ring(s) persisted"),
+                    Err(e) => eprintln!(
+                        "cm-daemon: re-exec: replay rings NOT persisted ({e}) — \
+                         reattached sessions will start from an empty screen"
+                    ),
+                }
                 eprintln!(
                     "cm-daemon: re-exec checked persist — {} live session(s) \
                      fsynced to {}, {} tombstone(s) fsynced to {}",
@@ -2639,6 +2650,14 @@ fn rehydrate_transaction(
     // the read-side twin of build_manifest's single capture anchor,
     // which is what keeps cell ORDER exact across the swap.
     let anchor = Instant::now();
+    // Replay rings the old image persisted beside its sessions file
+    // (`crate::fanout_persist`).
+    let rings_dir = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.daemon_sessions_path
+            .clone()
+            .map(|p| crate::fanout_persist::rings_dir_for(&p))
+    };
 
     // ---- Validation phase (dups only, no promotion) ----
     let mut seen_uids: HashSet<&str> = HashSet::new();
@@ -2769,7 +2788,18 @@ fn rehydrate_transaction(
                     rec.uid, e,
                 )
             })?;
+        // Seed before any thread exists (the reader starts at commit),
+        // so the carried tail precedes the kernel-buffered bytes.
+        if let Some(ring) = rings_dir
+            .as_deref()
+            .and_then(|d| crate::fanout_persist::take_ring(d, &rec.uid))
+        {
+            build.seed_replay(&ring);
+        }
         builds.push((i, build, checkpoint));
+    }
+    if let Some(d) = rings_dir.as_deref() {
+        crate::fanout_persist::sweep(d);
     }
 
     // ---- Reap phase (4b): consume the swap-dead zombies. ----

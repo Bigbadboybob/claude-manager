@@ -18,7 +18,7 @@ Task orchestration system for planning and running Claude coding sessions. Prima
   | Change | Primitive | Sessions |
   |---|---|---|
   | Config value (`mcp_server_path`, `api_*`, `notify_command`, …) | `daemon.reload_config` RPC or `kill -HUP` (to the BRAIN pid — `daemon.health.brain_pid`; the holder ignores HUP) | untouched |
-  | Brain/daemon code (the weekly case) | `daemon.restart` via `scripts/cm-redeploy` — in split mode this arms `restart_brain`: the brain quiesces, persists, exits; the holder execs the pinned new binary; verification keys on `holder_epoch` +1 exactly | untouched — never signaled; attach streams blip and auto-reattach |
+  | Brain/daemon code (the weekly case) | `daemon.restart` via `scripts/cm-redeploy` — in split mode this arms `restart_brain`: the brain quiesces, persists (registry, tombstones, and each session's replay ring → `~/.cm/daemon-rings/`), exits; the holder execs the pinned new binary; verification keys on `holder_epoch` +1 exactly | untouched — never signaled; attach streams blip and auto-reattach, and the reattach replays the pre-restart screen (the new brain seeds each adopted session's ring from the persisted one — pre-fix the pane came back blank until `A-R`) |
   | Bad brain deploy that crash-loops | automatic: the holder's breaker (3 strikes) rolls back to the previous pin; no previous → `HELD_DOWN` + path-retry (fix the binary on disk = self-heal; SIGUSR2 forces a retry) | untouched throughout |
   | Bad brain, alive but wrong | `daemon.rollback_brain` (strong-operator) | untouched |
   | Brain deadlocked but heartbeat-alive (RPCs hang, pongs flow) | operator SIGKILLs the brain pid; the holder counts a strike and respawns | untouched |
