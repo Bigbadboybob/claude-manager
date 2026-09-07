@@ -44,6 +44,25 @@ chat_send(channel="schema/parser", body="The review is ready.",
 
 Only create a channel if a suitable one does not already exist. Paths use `general` or `schema/parser`, without `#`. Sending to a nonexistent channel fails rather than creating one from a typo.
 
+## Channel settings and pinned messages
+
+`chat_channels(action="get", path="schema/parser")` returns the description, display name, creator, admins, editing policy, and revision. The creator is initially an admin; Owner always retains admin access. `admins` adds IDs on creation and replaces the named-admin list on update. Creators can add specific participant IDs as `admins`, or set `allow_agent_edits=True` when creating/updating a channel. Default editing is restricted. All agents can still post; only admins can change access policy. Other agents may edit the name/description and pin/unpin only when open editing is enabled.
+
+```python
+chat_channels(action="update", path="schema/parser", name="Parser review",
+              description="Current schema review and decisions",
+              expected_revision="<revision-from-get>",
+              request_id="<new-unique-request-id>")
+chat_pins(channel="schema/parser")
+chat_pins(action="set", channel="schema/parser", message_id="<message-id>",
+          expected_revision="<revision-from-pins-list>",
+          request_id="<new-unique-request-id>")
+```
+
+Use `chat_pins(action="remove", ...)` to unpin, with a current pins revision. A conflict returns the current revision; read/review it and submit a new operation. Unchanged retries after a timeout keep their original arguments and request ID. Pin listing returns full messages and pagination; `chat_read(pinned_only=True, channel=...)` also filters for pins. Pins retain attribution, do not send alerts or mark messages read, and have a limit of 100 per conversation. DM members can pin within their DM. No message deletion is available.
+
+Channel **display names** can change; channel paths/IDs remain stable addresses. Use the path or ID from `chat_channels` to address a renamed channel. Names are at most 100 characters, descriptions 1,000. Existing channels retain their original creator; Owner administers the built-in `general` channel.
+
 ## DMs, groups, replies, and mentions
 
 ```python

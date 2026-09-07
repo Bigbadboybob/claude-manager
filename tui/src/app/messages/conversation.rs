@@ -90,6 +90,12 @@ impl Messages {
             }
         }
         self.items = incoming;
+        if let Some(pins) = value["pins"].as_object() {
+            for item in &mut self.items {
+                item["pinned"] = json!(pins.contains_key(item["id"].as_str().unwrap_or("")));
+                item["pin"] = pins.get(item["id"].as_str().unwrap_or("")).cloned().unwrap_or(Value::Null);
+            }
+        }
         self.selected = if at_bottom && !self.append_older {
             self.items.len().saturating_sub(1)
         } else {
@@ -331,6 +337,7 @@ impl App {
         );
     }
     pub(super) fn draw_messaging_timeline(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+        let area = self.draw_channel_summary(frame, area, focused);
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
         let width = inner.width.max(1) as usize;
         if self.messages.timeline_size != (inner.width, inner.height) {
@@ -370,6 +377,7 @@ impl App {
                         chat_actor_style(m).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(format!("  {stamp}"), muted),
+                    Span::styled(if m["pinned"] == true { "  ◆ pinned" } else { "" }, Style::default().fg(theme::CHAT_TAG)),
                 ])
                 .style(Style::default().bg(bg)),
             );
@@ -448,7 +456,8 @@ impl App {
             .skip(*scroll)
             .take(height)
             .collect::<Vec<_>>();
-        let title = format!("{} · j/k select · Enter read", self.messages.target_label());
+        let title = format!("{}{} · j/k select · Enter read", self.messages.target_label(),
+            if self.messages.filter["pinned_only"] == true { " · Pinned messages" } else { "" });
         frame.render_widget(
             Paragraph::new(visible)
                 .style(Style::default().bg(theme::CHAT_PANEL))

@@ -26,6 +26,7 @@ mod norms;
 pub use norms::textual_diff as norms_diff;
 mod watches;
 mod preferences;
+mod channels;
 use personal::Personal;
 
 pub fn now() -> String {
@@ -1103,58 +1104,6 @@ impl Store {
         let _ = self.project();
         Ok(self.send_response(&e))
     }
-    pub fn create_channel(&mut self, actor: &str, p: &Value) -> Result<Value> {
-        let (key, digest, prior) = self.request(actor, p, "channel.create")?;
-        if let Some(e) = prior {
-            return Ok(self.send_response(&e));
-        }
-        let path = required(p, "path")?;
-        channel_path(&path)?;
-        if self.channels.contains_key(&path) {
-            return Err(err("channel_exists", "Channel already exists"));
-        }
-        let desc = strv(p, "description");
-        if desc.chars().count() > 1000 {
-            return Err(err("invalid_params", "Description exceeds 1000 characters"));
-        }
-        let mut items = vec![];
-        let mut part = String::new();
-        for segment in path.split('/') {
-            if !part.is_empty() {
-                part.push('/');
-            }
-            part.push_str(segment);
-            if !self.channels.contains_key(&part) {
-                items.push(
-                    json!({"path":part,"id":uuid(),"description":if part==path{desc}else{""}}),
-                );
-            }
-        }
-        let name = self
-            .names
-            .get(actor)
-            .map(|n| n.name.clone())
-            .unwrap_or_else(|| {
-                if actor == "owner" {
-                    "Owner".into()
-                } else {
-                    "Unenrolled session".into()
-                }
-            });
-        let e = self.publish(
-            "channel.create",
-            None,
-            &format!("Created #{path}"),
-            json!({"channels":items}),
-            actor,
-            &name,
-            if actor == "owner" { "owner" } else { "agent" },
-            &key,
-            &digest,
-        )?;
-        let _ = self.project();
-        Ok(self.send_response(&e))
-    }
     pub fn people(&self, live: &[Person]) -> Value {
         let mut people = live.to_vec();
         for (id, n) in &self.names {
@@ -1184,16 +1133,7 @@ impl Store {
             .collect::<Vec<_>>())
     }
     pub fn channel_info(&self, path: &str, id: &str) -> Value {
-        let description = self
-            .events
-            .iter()
-            .rev()
-            .filter_map(|e| e.event["data"]["channels"].as_array())
-            .flatten()
-            .find(|v| v["id"] == id)
-            .map(|v| v["description"].clone())
-            .unwrap_or(json!(""));
-        json!({"path":path,"id":id,"revision":id,"kind":"channel","description":description})
+        self.channel_at(path, id, self.position)
     }
     pub fn channels(&self) -> Value {
         json!(self
@@ -1209,6 +1149,7 @@ impl Store {
             let unread: Vec<_> = self.events.iter().filter(|e| e.event["type"] == "message.create"
                 && e.event["conversation_id"] == channel["id"] && e.event["actor"]["id"] != actor
                 && !self.reads[actor].ids.contains(strv(&e.event, "id"))).collect();
+            self.channel_permissions(actor, channel);
             channel["unread"] = json!(unread.len());
             channel["mentions"] = json!(unread.iter().filter(|e| e.event["data"]["mentions"].as_array()
                 .is_some_and(|ids| ids.iter().any(|id| id == actor))).count());
@@ -1365,6 +1306,7 @@ impl Store {
         } else {
             vec![]
         };
+        let pin_states = self.pin_states(high);
         let read = &self.reads[actor].ids;
         let mut items: Vec<_> = self
             .events
@@ -1372,7 +1314,9 @@ impl Store {
             .filter(|e| {
                 let v = &e.event;
                 let cid = strv(v, "conversation_id");
-                if v["conversation_id"].is_null()
+                if v["type"] == "conversation.pin"
+                    || (p["pinned_only"] == true && !pin_states.contains_key(strv(v, "id")))
+                    || v["conversation_id"].is_null()
                     || e.position > high
                     || e.position <= after
                     || !self.visible(actor, cid)
@@ -1482,6 +1426,8 @@ impl Store {
             let e = items[index];
             let n = strv(&e.event, "body").chars().count();
             let mut v = e.event.clone();
+            v["pinned"] = json!(pin_states.contains_key(strv(&v, "id")));
+            v["pin"] = pin_states.get(strv(&v, "id")).cloned().unwrap_or(Value::Null);
             v["received_at"] = json!(e.received_at);
             v["read"] = json!(read.contains(strv(&e.event, "id")) || e.event["actor"]["id"] == actor);
             v["conversation_kind"] = json!(if self.conversations.contains_key(strv(&e.event, "conversation_id")) { "dm" } else { "channel" });
@@ -1523,8 +1469,14 @@ impl Store {
                 }
             }
         }
+        let target = conv.as_deref().and_then(|id| self.channels.iter().find(|(_, cid)| cid.as_str() == id))
+            .map(|(path, id)| { let mut c = self.channel_at(path, id, high); self.channel_permissions(actor, &mut c); c });
+        let pins_revision = conv.as_deref().map(|id| self.pins_revision(id, high));
+        let pins: Option<BTreeMap<_,_>> = conv.as_deref().map(|cid| self.events.iter()
+            .filter(|e| e.event["conversation_id"] == cid)
+            .filter_map(|e| pin_states.get(strv(&e.event,"id")).map(|pin| (strv(&e.event,"id"), pin.clone()))).collect());
         Ok(
-            json!({"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded}),
+            json!({"target":target,"pins_revision":pins_revision,"pins":pins,"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded}),
         )
     }
     pub fn dms(&mut self, actor: &str, unread: bool) -> Result<Value> {

@@ -295,7 +295,7 @@ impl App {
     fn messaging_document(&mut self, p: Value) {
         self.messaging_request("norms_document", p);
     }
-    fn messaging_mutation(&mut self, method: &str, mut p: Value) {
+    pub(super) fn messaging_mutation(&mut self, method: &str, mut p: Value) {
         if self.messages.saved.management.pending.is_some() {
             self.messages.error = "A saved operation is pending; press R to retry it first".into();
             return;
@@ -321,6 +321,10 @@ impl App {
             "invalid_receipt:",
             "event_too_large:",
             "preference_limit:",
+            "unauthorized:",
+            "channel_exists:",
+            "invalid_channel:",
+            "pin_limit:",
             "unsupported_feature:",
         ];
         if self
@@ -346,6 +350,8 @@ impl App {
             "messaging.monitor",
             "messaging.monitors",
             "messaging.follow",
+            "messaging.channels",
+            "messaging.pins",
         ]
         .contains(&method)
         {
@@ -366,6 +372,10 @@ impl App {
             .as_str()
             .unwrap_or("")
             .to_owned();
+        if method == "messaging.channels" || method == "messaging.pins" {
+            self.messaging_channel_result(method, v);
+            return true;
+        }
         if method == "norms_document" {
             self.messages.management.doc = v.clone();
             self.messages.management.next = Value::Null;

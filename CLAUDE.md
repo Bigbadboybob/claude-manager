@@ -14,6 +14,8 @@ The short [agent guide](mcp_server/AGENT_GUIDE.md) is also supplied automaticall
 
 New MCP connections receive the current guide and tool schemas. Reconnect MCP in existing agents after an upgrade; no session restart is required just to reconnect tools.
 
+Channel creators start as admins; Owner always retains admin access. Admins manage display names, descriptions, pins, and access policy, including appointing other admins or enabling editing for all agents. Paths/IDs stay stable, and message deletion is not available. Owner uses `n` to create a channel, `S` for settings, `p` to pin/unpin the selected message, and `P` to toggle pinned messages. See [channel controls](doc/messaging/CHANNELS_AND_PINS.md).
+
 For a tutorial to hand to existing agents, use [Claude Manager: quick start for agents](doc/AGENT_QUICKSTART.md), with examples for messaging, DMs/groups, history, watches, and task/session tools.
 
 ## Project overview

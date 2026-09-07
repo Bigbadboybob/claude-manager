@@ -1,6 +1,7 @@
 //! Owner messaging view. Network work runs off the terminal event loop.
 mod manage;
 mod conversation;
+mod channel;
 use super::*;
 use ratatui::widgets::Wrap;
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,8 @@ pub struct Messages {
     select_older: bool,
     loaded_target: Value,
     receipt: Value,
+    channel_edit_base: Value,
+    channel_selection_pending: bool,
     pub settings_name: Option<(String, String, u64)>,
 }
 impl Messages {
@@ -165,12 +168,14 @@ impl Messages {
             ),
             ("Preferences".into(), json!({"preferences":true})),
         ];
-        out.extend(self.channels.iter().map(|c| {
+        let mut channels: Vec<_> = self.channels.iter().collect();
+        channels.sort_by(|a,b| a["path"].as_str().cmp(&b["path"].as_str()));
+        out.extend(channels.into_iter().map(|c| {
             let unread = c["unread"].as_u64().unwrap_or(0);
             let mentions = c["mentions"].as_u64().unwrap_or(0);
             let badge = if mentions > 0 { format!(" @ {mentions}") }
                 else if unread > 0 { " ·".into() } else { String::new() };
-            (format!("#{}{badge}", c["path"].as_str().unwrap_or("?")),
+            (format!("#{}{badge}", c["name"].as_str().or_else(|| c["path"].as_str()).unwrap_or("?")),
                 json!({"channel":c["path"]}))
         }));
         let count: u64 = self.dms.iter().filter_map(|d| d["unread"].as_u64()).sum();
@@ -202,7 +207,7 @@ impl Messages {
             return if c == "*" {
                 "Needs Owner".into()
             } else {
-                format!("#{c}")
+                self.channels.iter().find(|ch| ch["path"] == c).map(|ch| format!("#{}", ch["name"].as_str().unwrap_or(c))).unwrap_or_else(|| format!("#{c}"))
             };
         }
         if let Some(dm) = self.target.get("dm") {
@@ -218,7 +223,7 @@ impl Messages {
             .iter()
             .find(|c| c["id"] == self.target["conversation"])
         {
-            return format!("#{}", c["path"].as_str().unwrap_or("?"));
+            return format!("#{}", c["name"].as_str().or_else(|| c["path"].as_str()).unwrap_or("?"));
         }
         "Conversation".into()
     }
@@ -408,6 +413,7 @@ impl App {
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default();
+                            self.messages.select_saved_channel();
                             self.messaging_refresh_target();
                         }
                         "messaging.read" => {
@@ -447,7 +453,7 @@ impl App {
                             self.messages.loaded_target = Value::Null;
                             self.messaging_request("messaging.read", self.messages.query());
                         }
-                        "messaging.channels" => self.messaging_request("bootstrap", json!({})),
+                        "pin_prepare" => self.messaging_pin_prepared(&v),
                         "session.set_name" => {
                             self.messages.status = "Session name updated".into();
                             self.messaging_request("bootstrap", json!({}));
@@ -537,6 +543,9 @@ impl App {
                     if let Ok(people) = directory("messaging.people", json!({"include_exited":true})) { value["_people"] = people["items"].clone(); }
                     Ok(value)
                 })()
+            } else if method == "pin_prepare" {
+                (|| { let mut value = call("messaging.pins", json!({"conversation":params["conversation"],"limit":1}))?;
+                    value["intent"] = params; Ok(value) })()
             } else if method == "norms_document" {
                 (|| {
                     let mut p = params;
@@ -761,10 +770,10 @@ impl App {
                     self.messaging_request("messaging.read", self.messages.query());
                 }
             }
-            KeyCode::Char('n') => {
-                self.messages
-                    .start_form("channel", vec![String::new(), String::new()]);
-            }
+            KeyCode::Char('n') => self.messaging_channel_form(false),
+            KeyCode::Char('S') => self.messaging_channel_form(true),
+            KeyCode::Char('p') => self.messaging_pin_selected(),
+            KeyCode::Char('P') => self.messaging_show_pins(),
             KeyCode::Char('/') => {
                 let f = &self.messages.filter;
                 let fields = vec![
@@ -890,6 +899,10 @@ impl App {
         self.messaging_request("messaging.send", p);
     }
     fn messaging_submit_form(&mut self) {
+        if matches!(self.messages.mode.as_str(), "channel" | "channel_edit") {
+            self.messaging_save_channel();
+            return;
+        }
         let text = self.messages.text.clone();
         let fields = self.messages.fields.clone();
         let split = |s: &str| {
@@ -900,9 +913,6 @@ impl App {
                 .collect::<Vec<_>>()
         };
         match self.messages.mode.as_str() {
-            "channel" => {
-                self.messaging_request("messaging.channels",json!({"action":"create","path":fields[0].trim(),"description":fields[1],"request_id":uuid::Uuid::new_v4().to_string()}));
-            }
             "filter" => {
                 if !fields[0].trim().is_empty()
                     && (!fields[1].trim().is_empty() || !fields[2].trim().is_empty())
@@ -1094,11 +1104,7 @@ impl App {
         let rows = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(if self.messages.management_view() {
-                4
-            } else {
-                3
-            }),
+            Constraint::Length(4),
         ])
         .split(area);
         frame.render_widget(
@@ -1164,12 +1170,14 @@ impl App {
         if !narrow || self.messages.pane == 1 || !self.messages.mode.is_empty() {
             if self.messages.mode == "dm_picker" {
                 self.draw_messaging_picker(frame, cols[1]);
+            } else if matches!(self.messages.mode.as_str(), "channel" | "channel_edit") {
+                self.draw_messaging_channel_form(frame, cols[1]);
             } else if self.messages.management_view() {
                 self.draw_messaging_management(frame, cols[1], messages_focused);
             } else {
                 let composer_height = if self.messages.mode.is_empty() {
                     if self.messages.draft().body.is_empty() { 0 } else { 3 }
-                } else if self.messages.mode == "filter" { 9 } else { 7 };
+                } else if matches!(self.messages.mode.as_str(), "filter" | "channel" | "channel_edit") { 10 } else { 7 };
                 let content = Layout::vertical([Constraint::Min(3), Constraint::Length(composer_height)])
                     .split(cols[1]);
                 self.draw_messaging_timeline(frame, content[0], messages_focused);
@@ -1190,6 +1198,8 @@ impl App {
                             "Mention names (Shift+Tab completes)",
                             "Reference URIs, comma separated",
                         ],
+                        "channel" => vec!["Permanent path", "Display name (optional)", "Description", "All agents may edit (yes/no)", "Additional admin names or IDs"],
+                        "channel_edit" => vec!["Display name", "Description", "All agents may edit (yes/no)", "Additional admin names or IDs"],
                         _ => vec!["Channel path", "Description"],
                     };
                     self.messages
@@ -1290,8 +1300,12 @@ impl App {
                     ("e", "metadata"),
                 ]),
                 chat_help(&[
-                    ("n", "channel"),
+                    ("n", "new channel"),
+                    ("S", "settings"),
+                    ("p/P", "pin/pins"),
                     ("/", "filter"),
+                ]),
+                chat_help(&[
                     ("]", "older"),
                     ("g", "refresh"),
                     ("W", "monitor"),

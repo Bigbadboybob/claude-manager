@@ -300,11 +300,12 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               freshness: str = "cached", tags: list[str] | None = None,
               after: dict | None = None, cursor: dict | None = None,
               limit: int = 50, ack_receipt: dict | None = None,
-              newest_first: bool = False) -> dict:
+              newest_first: bool = False, pinned_only: bool | None = None) -> dict:
     """Read history, a thread, your inbox, or incoming DMs. Select one scope.
 
     time={"since":"10m"} or {"start":RFC3339,"end":RFC3339} filters a fixed
-    window. channel="*" reads all public channels. newest_first shows recent
+    window. pinned_only filters to pinned messages at the read snapshot.
+    channel="*" reads all public channels. newest_first shows recent
     messages first. received basis finds late arrivals. tags must all match. Use cursor
     unchanged for pagination. Acknowledge the returned receipt on a later read
     or send to mark only fully supplied messages read; previews do not consume.
@@ -333,13 +334,45 @@ def chat_people(query: str | None = None, include_exited: bool = False,
 @mcp.tool()
 def chat_channels(action: str = "list", path: str | None = None,
                   description: str | None = None, request_id: str | None = None,
-                  cursor: dict | None = None, limit: int = 50) -> dict:
-    """List channels or create a subchannel such as news/parser. Creation requires a request ID.
+                  cursor: dict | None = None, limit: int = 50,
+                  name: str | None = None, allow_agent_edits: bool | None = None,
+                  admins: list[str] | None = None, conversation: str | None = None,
+                  expected_revision: str | None = None,
+                  origin_daemon_id: str | None = None) -> dict:
+    """List/get/create/update channels, their descriptions and editing policy.
 
-    Missing ancestors are created with the requested channel. Sends never silently
-    create a channel from a typo. Channel membership does not imply Owner alerts.
+    Create requires path and request_id; name defaults to path. Paths/IDs are
+    permanent addresses; editable display names do not break links or watches.
+    Missing ancestors are created with creator-only editing. Creator is initially an admin; Owner
+    always retains admin access. admins adds IDs on create and replaces the list on update. allow_agent_edits
+    defaults false; true lets other agents edit name/description and pin/unpin,
+    but only admins can change access. Posting is open to all agents regardless.
+    Get by path or conversation ID before update; pass its revision as
+    expected_revision. A conflict returns current channel values; review/retry
+    with a new request_id. Omitted update fields keep existing values.
+    Names are at most 100 characters; descriptions at most 1000. No deletion.
     """
     return _chat_call("channels", locals())
+
+
+@mcp.tool()
+def chat_pins(action: str = "list", channel: str | None = None,
+              dm: str | list[str] | None = None, conversation: str | None = None,
+              message_id: str | None = None, request_id: str | None = None,
+              expected_revision: str | None = None, cursor: dict | None = None,
+              limit: int = 50, origin_daemon_id: str | None = None) -> dict:
+    """List/set/remove attributed pins in one channel or DM/group.
+
+    Read the list first; pass its revision as expected_revision on set/remove,
+    together with a message_id and unique request_id. A conflict requires a fresh
+    list and a new request_id. Pins reference existing messages; they do not edit,
+    delete, repost, notify, or mark them read. List pages return full messages;
+    cursor continues the snapshot. Channel admins (always including Owner) can
+    pin/unpin; allow_agent_edits also permits other agents. DM members can pin
+    within their DM. At most 100 pins per conversation. Owner's channel-admin role does not grant access to other DMs.
+    Keep request_id, arguments and original daemon binding unchanged on retries.
+    """
+    return _chat_call("pins", locals())
 
 
 @mcp.tool()

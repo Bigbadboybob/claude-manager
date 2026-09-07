@@ -167,6 +167,40 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             assert "● @you" in visible()
             assert not any("Alpha" in row[:24] for row in screen.display[1:-3])
             shot("cm-chat-conversation-timeline")
+            # Owner creates a channel with restricted editing, then manages pins
+            # and changes its display name/description without changing its address.
+            key(b"nrelease-notes\tRelease room\tUpdates shared by agents.\t\t\r", 0.8)
+            wait_text("#Release room")
+            channel = rpc("channels", {"action": "get", "path": "release-notes"})
+            assert channel["created_by"] == "owner" and channel["allow_agent_edits"] is False, channel
+            key(b"cPinned reference for the release.\x13", 0.8)
+            wait_text("Pinned reference for the release.")
+            key(b"p", 0.8)
+            wait_text("pinned")
+            pins = rpc("pins", {"channel": "release-notes"})
+            assert len(pins["items"]) == 1 and pins["items"][0]["body"] == "Pinned reference for the release.", pins
+            key(b"P", 0.8)
+            wait_text("Pinned messages")
+            shot("cm-chat-channel-pins")
+            key(b"P", 0.5)
+            key(b"S", 0.3)
+            wait_text("Channel settings")
+            shot("cm-chat-channel-settings")
+            key(b"\x7f" * len("Release room") + b"Release review\t" + b"\x7f" * len("Updates shared by agents.") + b"Agent coordination for release review.\t" + b"\x7f" * 2 + b"yes\tAlpha\r", 0.8)
+            wait_text("#Release review")
+            wait_text("Agent coordination for release review.")
+            changed = rpc("channels", {"action": "get", "path": "release-notes"})
+            assert changed["id"] == channel["id"] and changed["allow_agent_edits"] is True and people["alpha"] in changed["admins"], changed
+            assert rpc("pins", {"channel": "release-notes"})["items"][0]["id"] == pins["items"][0]["id"]
+            key(b"p", 0.8)
+            assert rpc("pins", {"channel": "release-notes"})["items"] == []
+            key(b"P", 0.6)
+            assert "Pinned reference for the release." not in visible()
+            key(b"P", 0.6)
+            wait_text("Pinned reference for the release.")
+            shot("cm-chat-channel-renamed")
+            key(b"\t" + b"k" * 30 + b"j" * 5 + b"\r", 0.7)
+            wait_text("Second paragraph stays visible.")
             # Go beyond a read page, navigate with k, and keep live updates
             # while reading earlier history without jumping to the newest post.
             for i in range(25):
@@ -325,7 +359,7 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             tui.wait(timeout=5)
             assert tui.returncode == 0
             print(
-                "PASS: timeline full messages/order/unread, searchable group creation/reply/collapse, real release TUI norms acknowledge/publish/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
+                "PASS: channel creation/settings/admins, stable-name edits, pin/unpin and pins view; timeline full messages/order/unread, searchable group creation/reply/collapse, real release TUI norms acknowledge/publish/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
                 flush=True,
             )
         except Exception:

@@ -404,6 +404,7 @@ pub fn dispatch_request(
         "messaging.dms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.people" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.channels" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.pins" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.norms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.monitor" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),

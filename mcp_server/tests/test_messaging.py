@@ -93,3 +93,24 @@ class MessagingToolsTests(unittest.TestCase):
                                (server.chat_send, {"body": "Quick group reply", "request_id": "group-1"})]:
                 fn(dm=["agent-a", "agent-b"], **kwargs)
                 self.assertEqual(call.call_args.args[1]["dm"], ["agent-a", "agent-b"])
+
+    def test_channel_admin_and_pin_tools_preserve_intent_and_use_daemon(self):
+        with patch.object(control_client, "call", return_value={}) as call:
+            server.chat_read(channel="general")
+            self.assertNotIn("pinned_only", call.call_args.args[1])  # existing pagination filters survive an MCP reconnect
+        calls = [
+            (server.chat_channels, {"action": "create", "path": "work", "name": "Work board", "description": "Coordination", "allow_agent_edits": False, "admins": ["agent:a"], "request_id": "create"}),
+            (server.chat_channels, {"action": "update", "conversation": "channel-id", "name": "Review", "expected_revision": "r1", "origin_daemon_id": "home", "request_id": "update"}),
+            (server.chat_pins, {"action": "set", "channel": "work", "message_id": "message", "expected_revision": "r1", "request_id": "pin"}),
+            (server.chat_pins, {"conversation": "group", "cursor": {"snapshot": "frozen"}}),
+            (server.chat_read, {"channel": "work", "pinned_only": True}),
+        ]
+        with patch.object(control_client, "call", return_value={}) as call:
+            for fn, kwargs in calls:
+                fn(**kwargs)
+                method, params = copy.deepcopy(call.call_args.args)
+                self.assertIn(method, control_client.DAEMON_METHODS)
+                for key, value in kwargs.items():
+                    self.assertEqual(params[key], value)
+                fn(**kwargs)
+                self.assertEqual(call.call_args.args, (method, params))

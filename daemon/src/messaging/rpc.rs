@@ -317,19 +317,8 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             }
             store.directory_page(&actor, p, value.as_array().cloned().unwrap_or_default())
         }
-        "messaging.channels" => {
-            if p["action"] == "create" {
-                store.create_channel(&actor, p)
-            } else if p["action"].is_null() || p["action"] == "list" {
-                let channels = store.channels_for(&actor)?;
-                store.directory_page(&actor, p, channels)
-            } else {
-                Err(ChatError {
-                    code: "unsupported_feature".into(),
-                    message: "Supported channel actions: list, create".into(),
-                })
-            }
-        }
+        "messaging.channels" => store.channel_action(&actor, p, &people),
+        "messaging.pins" => store.pins(&actor, p, &people),
         "messaging.open" => {
             let mut query = p.clone();
             if ["channel", "dm", "conversation"]
@@ -342,7 +331,7 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":store.channels().as_array().and_then(|a|a.iter().find(|v|v["path"]==query["channel"]).cloned()),"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow"],"features":["group_dms"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
@@ -425,6 +414,16 @@ mod tests {
                 params: p,
             },
         )
+    }
+    #[test]
+    fn messaging_channel_admin_uses_authenticated_caller_not_supplied_roles() {
+        let root = tempfile::tempdir().unwrap(); let state = setup(root.path());
+        let channel = call(&state,"a","channels",json!({"action":"create","path":"roles","request_id":"create"})).unwrap()["channel"].clone();
+        let p = json!({"action":"update","path":"roles","description":"Hijack","admins":[],"created_by":"owner","role":"admin","expected_revision":channel["revision"],"request_id":"bad"});
+        assert_eq!(call(&state,"b","channels",p).unwrap_err().code,"unauthorized");
+        let opened=call(&state,"b","open",json!({"channel":"roles"})).unwrap();
+        assert_eq!(opened["target"]["can_edit"],false);
+        assert_eq!(opened["target"]["created_by"],channel["created_by"]);
     }
     #[test]
     fn messaging_cancel_serializes_at_delivery_boundary_but_reads_and_sends_do_not() {
