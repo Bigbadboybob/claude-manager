@@ -31,9 +31,8 @@ class ContinuousDrainToolsTests(unittest.TestCase):
         for messages in [[], ["monitor final report"]]:
             with self.subTest(messages=messages), mock.patch.dict(os.environ, {"CM_TUI_SESSION_ID": "ts-root"}), mock.patch.object(cm_stop_hook, "_drain_inbox", return_value=messages), mock.patch.object(control_client, "call", return_value={}) as call, mock.patch("sys.stdin", io.StringIO("{}")), mock.patch("sys.stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(cm_stop_hook.main(), 0)
-                params = {"session_uid": "ts-root"}
+                params = {"session_uid": "ts-root", "continuing": bool(messages)}
                 if messages:
-                    params["continuing"] = True
                     self.assertEqual(json.loads(output.getvalue())["decision"], "block")
                 else:
                     self.assertEqual(output.getvalue(), "")

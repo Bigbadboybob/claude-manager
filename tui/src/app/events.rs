@@ -1862,6 +1862,82 @@ impl App {
         for uid in adopted_cap_kills {
             self.try_emit_cap_kill_toast(&uid);
         }
+        // proper-resume: converge every tracked row on the daemon's
+        // resume key — the catch-up for transcript `Updated` diffs
+        // missed while the stream was down.
+        let mut rebound = 0usize;
+        for (uid, id) in &snapshot.session_transcripts {
+            if self.converge_transcript_id(&snapshot.host, uid, id) {
+                rebound += 1;
+            }
+        }
+        if rebound > 0 {
+            self.save_session_manifest();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// proper-resume: mirror a broadcast transcript rebind onto the
+    /// tracked row for `uid` on `host` (see the `Added`/`Updated` arm of
+    /// `apply_manifest_diff`). The daemon is the only party that learns
+    /// about an in-pane `/resume` (the Stop hook reports the live path
+    /// every turn) or a codex rollout rotation (its `/proc` watcher);
+    /// the TUI's own detector binds once at spawn and never looks
+    /// again. Pre-fix the row kept the spawn-time id, and every
+    /// TUI-driven respawn — A-R, a user-owned row's startup restore —
+    /// resumed the WRONG conversation (or a throwaway empty one), so
+    /// the operator had to `/resume` again after every restart.
+    ///
+    /// Entries without a resume key (`Added`s, workflow-binding
+    /// `Updated`s, the global-perms shape) are left alone: a missing
+    /// field is never a clear. Returns whether the row changed.
+    pub(crate) fn apply_transcript_from_diff(
+        &mut self,
+        host: &cm_daemon::host_id::HostId,
+        uid: &str,
+        entry: &serde_json::Value,
+    ) -> bool {
+        let Some(id) = crate::manifest_watch::transcript_id_from_entry(entry) else {
+            return false;
+        };
+        let changed = self.converge_transcript_id(host, uid, &id);
+        if changed {
+            self.save_session_manifest();
+            self.needs_redraw = true;
+        }
+        changed
+    }
+
+    /// Rebind the tracked row for `uid` on `host` to `id` unless it
+    /// already holds it. Goes through `rebind_transcript` so any reader
+    /// holding a cursor against the old file restarts at offset 0 of
+    /// the new one, and clears a still-armed spawn detector (the
+    /// daemon's answer supersedes a scan that could only ever find a
+    /// NEW file). Does not save — callers batch the manifest write.
+    fn converge_transcript_id(
+        &mut self,
+        host: &cm_daemon::host_id::HostId,
+        uid: &str,
+        id: &str,
+    ) -> bool {
+        let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid)
+        else {
+            return false;
+        };
+        let ts = &mut self.workspaces[wi].sessions[si];
+        if &ts.host_id != host {
+            return false;
+        }
+        if ts.transcript_id.as_deref() == Some(id) {
+            return false;
+        }
+        if ts.transcript_id.is_some() {
+            ts.rebind_transcript(Some(id.to_string()));
+        } else {
+            ts.transcript_id = Some(id.to_string());
+        }
+        ts.pending_jsonl_files = None;
+        true
     }
 
     /// The reconcile half of [`Self::apply_manifest_snapshot`] — see the
@@ -2085,7 +2161,9 @@ impl App {
                 // re-assert that healed a drifted row). Entries that
                 // don't carry the field (workflow-binding `Updated`s,
                 // `Added`s) are left alone.
+                self.apply_messaging_name(&host, &uid, &entry);
                 self.apply_global_perms_from_diff(&uid, &entry);
+                self.apply_transcript_from_diff(&host, &uid, &entry);
                 // Option B (criterion #4): adopt daemon-launched WORKFLOW
                 // PARTICIPANTS into the sidebar from broadcasts. The helper is
                 // deliberately scoped to entries carrying `workflow_run_id` —
@@ -3159,6 +3237,7 @@ mod apply_manifest_diff_tests {
     ) -> crate::manifest_watch::ManifestSnapshotPayload {
         crate::manifest_watch::ManifestSnapshotPayload {
             host,
+            session_transcripts: Vec::new(),
             listed_uids: listed.iter().map(|u| u.to_string()).collect(),
             session_last_exits: listed
                 .iter()
@@ -3588,6 +3667,98 @@ mod apply_manifest_diff_tests {
         assert!(!app.workspaces[0].sessions[0].global_perms, "revoke mirrored");
     }
 
+    /// proper-resume: a transcript `Updated` from the daemon (the Stop
+    /// hook's re-stamp after an in-pane `/resume`, or a codex rollout
+    /// rotation) rebinds the tracked row, bumping its generation and
+    /// clearing any still-armed spawn detector. Entries without a
+    /// resume key never clear a binding; a same-id re-assert is a no-op.
+    #[test]
+    fn apply_updated_diff_rebinds_transcript_from_daemon_truth() {
+        let mut app = build_app_with_session("ts-resume-row");
+        app.sessions_restored = true;
+        {
+            let ts = &mut app.workspaces[0].sessions[0];
+            ts.transcript_id = Some("spawn-time-id".into());
+            ts.pending_jsonl_files = Some(vec!["older".into()]);
+        }
+        let gen0 = app.workspaces[0].sessions[0].generation;
+
+        // The Stop hook reported a different live transcript.
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-resume-row".into(),
+            entry: serde_json::json!({
+                "uid": "ts-resume-row",
+                "transcript_path": "/h/.claude/projects/-x/resumed-conv.jsonl",
+                "transcript_id": "resumed-conv",
+            }),
+        });
+        let ts = &app.workspaces[0].sessions[0];
+        assert_eq!(ts.transcript_id.as_deref(), Some("resumed-conv"), "row follows the daemon");
+        assert!(ts.generation > gen0, "a rebind bumps the reader generation");
+        assert!(ts.pending_jsonl_files.is_none(), "the spawn detector is disarmed");
+
+        // Same id again: nothing moves.
+        let gen1 = app.workspaces[0].sessions[0].generation;
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-resume-row".into(),
+            entry: serde_json::json!({ "transcript_id": "resumed-conv" }),
+        });
+        assert_eq!(app.workspaces[0].sessions[0].generation, gen1);
+
+        // An Updated WITHOUT a resume key (global-perms / workflow shape)
+        // must not clear the binding.
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-resume-row".into(),
+            entry: serde_json::json!({ "uid": "ts-resume-row", "global_perms": true }),
+        });
+        assert_eq!(app.workspaces[0].sessions[0].transcript_id.as_deref(), Some("resumed-conv"));
+
+        // A diff from ANOTHER host never touches a local row.
+        app.apply_manifest_diff_from_host(
+            cm_daemon::host_id::HostId::new("manager"),
+            ManifestDiff::Updated {
+                uid: "ts-resume-row".into(),
+                entry: serde_json::json!({ "transcript_id": "remote-id" }),
+            },
+        );
+        assert_eq!(app.workspaces[0].sessions[0].transcript_id.as_deref(), Some("resumed-conv"));
+
+        // A row with NO binding yet (the "/resume before the first
+        // message" shape, where the spawn detector can never fire
+        // because the resumed file pre-existed) binds from the diff.
+        app.workspaces[0].sessions[0].transcript_id = None;
+        app.workspaces[0].sessions[0].pending_jsonl_files = Some(vec![]);
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-resume-row".into(),
+            entry: serde_json::json!({ "transcript_path": "/p/first-bind.jsonl" }),
+        });
+        let ts = &app.workspaces[0].sessions[0];
+        assert_eq!(ts.transcript_id.as_deref(), Some("first-bind"));
+        assert!(ts.pending_jsonl_files.is_none());
+    }
+
+    /// proper-resume: the snapshot on every `manifest.watch`
+    /// (re)connect carries each session's resume key, and the apply
+    /// converges tracked rows on it — the catch-up for transcript
+    /// `Updated` diffs missed while the stream was down.
+    #[test]
+    fn apply_snapshot_converges_transcript_ids() {
+        let mut app = build_app_with_session("ts-snap-resume");
+        app.sessions_restored = true;
+        app.workspaces[0].sessions[0].transcript_id = Some("stale".into());
+        app.needs_redraw = false;
+        let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            host: cm_daemon::host_id::HostId::local(),
+            listed_uids: vec!["ts-snap-resume".into()],
+            session_last_exits: Vec::new(),
+            session_transcripts: vec![("ts-snap-resume".into(), "current".into())],
+            received_at: std::time::Instant::now(),
+        };
+        app.apply_manifest_snapshot(payload);
+        assert_eq!(app.workspaces[0].sessions[0].transcript_id.as_deref(), Some("current"));
+        assert!(app.needs_redraw);
+    }
+
     /// T22 (10e-c r1 F1) — `apply_manifest_snapshot` adopts the
     /// daemon's last_exit when the local field is `None`, AND
     /// triggers a redraw. This is the "stale-None clobber" fix:
@@ -3609,6 +3780,7 @@ mod apply_manifest_diff_tests {
         let payload = crate::manifest_watch::ManifestSnapshotPayload {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
+            session_transcripts: Vec::new(),
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t22".into(),
@@ -3650,6 +3822,7 @@ mod apply_manifest_diff_tests {
         let payload = crate::manifest_watch::ManifestSnapshotPayload {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
+            session_transcripts: Vec::new(),
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t23".into(),
@@ -3808,6 +3981,7 @@ mod apply_manifest_diff_tests {
         let payload = crate::manifest_watch::ManifestSnapshotPayload {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
+            session_transcripts: Vec::new(),
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t27".into(),
@@ -3847,6 +4021,7 @@ mod apply_manifest_diff_tests {
         let payload = crate::manifest_watch::ManifestSnapshotPayload {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
+            session_transcripts: Vec::new(),
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t28".into(),
@@ -5575,6 +5750,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert(mw.id.clone(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -5783,6 +5959,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-r".to_string(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -5988,6 +6165,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-r".to_string(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -6135,6 +6313,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-g".to_string(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -6272,6 +6451,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-ssh".to_string(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -7052,6 +7232,25 @@ mod manifest_stream_reprime_tests {
     #[test]
     fn stream_reconnect_reprimes_swapped_daemon_across_two_generations() {
         let _guard = crate::test_support::home_lock();
+        // A test launched from inside CM inherits live socket overrides.
+        // Confine both clients to the temporary home, restoring even on panic.
+        struct SocketOverrides(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for SocketOverrides {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+        let _sockets = SocketOverrides(["CM_DAEMON_SOCKET", "CM_TUI_SOCKET"]
+            .into_iter().map(|name| {
+                let old = std::env::var_os(name);
+                std::env::remove_var(name);
+                (name, old)
+            }).collect());
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().to_path_buf();
         let cm_dir = home.join(".cm");

@@ -154,8 +154,10 @@ class CheckVmAliveLoggingTest(unittest.TestCase):
                 "google.api_core", "google.api_core.exceptions",
             ) if k in sys.modules
         }
+        # Block imports even when the real SDK is installed in the test venv.
+        # Deleting cached modules alone simply re-imports the installed package.
         for k in saved:
-            del sys.modules[k]
+            sys.modules[k] = None
         try:
             with self.assertLogs("cm.dispatch", level=logging.WARNING) as cap:
                 self.assertFalse(dispatch_daemon._check_vm_alive("vm-x"))

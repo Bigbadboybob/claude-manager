@@ -61,9 +61,7 @@ def _report_turn_ended(uid: str, transcript_path: str | None = None, *, continui
     try:
         from mcp_server import control_client
 
-        params = {"session_uid": uid}
-        if continuing:
-            params["continuing"] = True
+        params = {"session_uid": uid, "continuing": continuing}
         if transcript_path:
             params["transcript_path"] = transcript_path
         control_client.call(
@@ -137,6 +135,8 @@ def main() -> int:
             return 0  # not a cm session — nothing to do
 
         messages = _drain_inbox(uid)
+        # A blocked Stop continues the turn. Do not advertise an idle composer
+        # while Claude is processing inbox work.
         _report_turn_ended(uid, transcript_path, continuing=bool(messages))
         if messages:
             reason = "\n\n".join(messages)

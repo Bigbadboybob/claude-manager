@@ -95,6 +95,14 @@ pub struct ManifestSnapshotPayload {
     /// down (tunnel drop, daemon re-exec, token rejection) is caught up
     /// in one pass.
     pub listed_uids: Vec<String>,
+    /// proper-resume: `(uid, transcript_id)` for every listed session
+    /// that carries a resume key. The App-side apply converges each
+    /// tracked row on the daemon's id (the daemon learns about an
+    /// in-pane `/resume` from the Stop hook and about codex rollout
+    /// rotations from its `/proc` watcher; the TUI's own detector only
+    /// binds once, at spawn). Catch-up for every transcript `Updated`
+    /// diff missed while the stream was down.
+    pub session_transcripts: Vec<(String, String)>,
     /// When the consumer thread read the frame. Rows created locally
     /// after (or just before) this instant may be newer than the
     /// daemon's capture and are exempt from the reconcile prune.
@@ -481,6 +489,12 @@ fn drive_stream(
         match wire::read_stream_frame(&mut stream) {
             Ok(Some(frame)) => match frame.kind {
                 StreamKind::ManifestSnapshot => {
+                    if let Some(names) = frame.payload.get("messaging_names").and_then(|v|v.as_object()) {
+                        for (uid,name) in names {
+                            let diff=ManifestDiff::Updated {uid:uid.clone(),entry:serde_json::json!({"label":name["name"],"name_revision":name["revision"]})};
+                            if event_tx.send(ManifestEvent::Diff{host:host.clone(),diff}).is_err(){return DriveOutcome::ChannelDisconnected;}
+                        }
+                    }
                     // 10e-c r1 F1: parse the snapshot's
                     // workspaces → flatten to (uid, last_exit)
                     // pairs → forward as ManifestEvent::Snapshot.
@@ -587,6 +601,7 @@ fn parse_snapshot_payload(
         .ok_or_else(|| "snapshot 'workspaces' is not an object".to_string())?;
     let mut session_last_exits: Vec<(String, Option<LastExit>)> = Vec::new();
     let mut listed_uids: Vec<String> = Vec::new();
+    let mut session_transcripts: Vec<(String, String)> = Vec::new();
     for (_ws_id, ws_value) in workspaces {
         let sessions = match ws_value.get("sessions").and_then(|v| v.as_array()) {
             Some(s) => s,
@@ -598,6 +613,9 @@ fn parse_snapshot_payload(
                 None => continue,
             };
             listed_uids.push(uid.clone());
+            if let Some(id) = transcript_id_from_entry(entry) {
+                session_transcripts.push((uid.clone(), id));
+            }
             // `last_exit` is `#[serde(skip_serializing_if = "Option::is_none")]`
             // on ManifestEntry — so a session with no exit
             // simply omits the field entirely, not Null.
@@ -617,8 +635,33 @@ fn parse_snapshot_payload(
         host: host.clone(),
         session_last_exits,
         listed_uids,
+        session_transcripts,
         received_at: std::time::Instant::now(),
     })
+}
+
+/// The resume key a manifest entry (snapshot row or `Updated` diff
+/// payload) carries, normalized to the TUI's `transcript_id` shape:
+/// the explicit `transcript_id` when present, else derived from
+/// `transcript_path` (claude: file stem; codex: the rollout's trailing
+/// thread uuid — the same normalization the daemon's manifest uses).
+/// `None` when the entry has neither, so a consumer never CLEARS a
+/// binding off a diff that simply didn't carry the field.
+pub fn transcript_id_from_entry(entry: &serde_json::Value) -> Option<String> {
+    if let Some(id) = entry
+        .get("transcript_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(id.to_string());
+    }
+    entry
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(cm_daemon::session::transcript_id_from_path)
 }
 
 #[cfg(test)]
@@ -686,6 +729,50 @@ mod tests {
 
     /// T13 — consumer sends a well-formed `manifest.watch` request:
     /// method matches, caller is Operator, params is `{}`.
+    #[test]
+    fn transcript_id_from_entry_prefers_explicit_id_then_derives_from_path() {
+        use serde_json::json;
+        assert_eq!(
+            transcript_id_from_entry(&json!({ "transcript_id": "abc", "transcript_path": "/x/def.jsonl" })),
+            Some("abc".into())
+        );
+        assert_eq!(
+            transcript_id_from_entry(&json!({ "transcript_path": "/p/11111111-2222-3333-4444-555555555555.jsonl" })),
+            Some("11111111-2222-3333-4444-555555555555".into())
+        );
+        // Codex rollout: the id is the thread uuid, not the whole stem.
+        assert_eq!(
+            transcript_id_from_entry(&json!({
+                "transcript_path": "/h/.codex/sessions/2026/09/06/rollout-2026-09-06T13-15-34-01a077ee-d12c-7611-a855-440c37783e88.jsonl"
+            })),
+            Some("01a077ee-d12c-7611-a855-440c37783e88".into())
+        );
+        assert_eq!(transcript_id_from_entry(&json!({ "transcript_id": "", "uid": "x" })), None);
+        assert_eq!(transcript_id_from_entry(&json!({ "uid": "x" })), None);
+    }
+
+    #[test]
+    fn parse_snapshot_payload_collects_session_transcripts() {
+        use serde_json::json;
+        let payload = json!({
+            "workspaces": {
+                "ws-a": { "sessions": [
+                    { "uid": "ts-1", "transcript_id": "id-1" },
+                    { "uid": "ts-2", "transcript_path": "/p/id-2.jsonl" },
+                    { "uid": "ts-3" }
+                ]}
+            }
+        });
+        let parsed = parse_snapshot_payload(&payload, &HostId::local()).expect("parse");
+        assert_eq!(parsed.listed_uids.len(), 3);
+        let mut got = parsed.session_transcripts.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("ts-1".to_string(), "id-1".to_string()), ("ts-2".to_string(), "id-2".to_string())]
+        );
+    }
+
     #[test]
     fn consumer_sends_well_formed_manifest_watch_request() {
         let (sock, listener, _dir) = spawn_test_listener();

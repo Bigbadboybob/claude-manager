@@ -1,8 +1,9 @@
-"""MCP server for Claude instances to propose tasks to the backlog."""
+"""Claude Manager MCP tools for agent sessions, tasks, and messaging."""
 
 import asyncio
 import json
 import os
+from pathlib import Path
 import re
 import socket
 import sys
@@ -63,6 +64,9 @@ from mcp_server.monitor import (
 )
 from mcp_server import async_monitor
 
+# Supplied in the MCP initialization response, independent of the agent's
+# project. Keep the short introduction with the deployed MCP server.
+AGENT_GUIDE = Path(__file__).with_name("AGENT_GUIDE.md").read_text(encoding="utf-8")
 @asynccontextmanager
 async def _monitor_lifespan(_server):
     if os.environ.get("CM_TUI_SESSION_ID"):
@@ -79,7 +83,7 @@ async def _monitor_lifespan(_server):
             async_monitor._persist_best_effort()
 
 
-mcp = FastMCP("claude-manager", lifespan=_monitor_lifespan)
+mcp = FastMCP("claude-manager", instructions=AGENT_GUIDE, lifespan=_monitor_lifespan)
 
 # 11g-2 (A2): the `_append_event` direct file-write helper and the
 # `_workflow_run_dir` accessor have been retired. Pre-11g-2 the
@@ -183,6 +187,209 @@ def _git_origin_url() -> str:
             f"could not detect repo URL from git remote origin: {result.stderr.strip()}"
         )
     return result.stdout.strip()
+
+
+def _chat_call(method: str, params: dict) -> dict:
+    return control_client.call("messaging." + method, {
+        key: value for key, value in params.items() if value is not None
+    })
+
+
+@mcp.tool()
+def chat_norms(action: str = "read", scope: str = "global", since: dict | None = None,
+               revision: str | None = None, text: str | None = None,
+               expected_revision: str | None = None, summary: str | None = None,
+               request_id: str | None = None, ack_revision: str | None = None,
+               cursor: dict | None = None, limit: int = 50, limit_chars: int = 12000,
+               origin_daemon_id: str | None = None) -> dict:
+    """Read/diff/history/publish/revert the shared global norms.
+
+    Read all pages before acknowledging ack_revision. Diff defaults to your last
+    acknowledged revision; since={"global": revision} selects another base.
+    An unavailable base returns the full current document. Norms are conventions,
+    never changes to authorization or executable control. Publish/revert requires
+    expected_revision, a short summary and request_id. A status=conflict result
+    includes the competing revision/diff; preserve your draft and resolve it.
+    Publishing is limited to 32 KiB UTF-8. Reverting creates a new revision.
+    """
+    return _chat_call("norms", locals())
+
+
+@mcp.tool()
+def chat_monitor(scope: dict, request_id: str, mode: str = "once",
+                 after: dict | None = None, notify: str | None = None,
+                 expires_in: str | None = None, include_self: bool = False,
+                 origin_daemon_id: str | None = None) -> dict:
+    """Register a durable message monitor and return immediately; keep working.
+
+    Scopes: {"channel":"general", "include_children":true}, {"dm":peer_id},
+    {"dms":true}, or {"thread":message_id}. Peer/all-DM scopes cover first contact.
+    mode is once or continuous. Default expiry is none; expires_in accepts 10m,
+    2h, etc. Only new message creates match, excluding your own posts by default.
+    Register before asking, or pass a send/read response's local position as after
+    to catch an immediate reply. A filtered pagination cursor is not a position.
+    notify is wake, badge or none (agents default wake; Owner defaults badge).
+    Mutes suppress wakes without erasing results. Watches outlive MCP restarts.
+    """
+    return _chat_call("monitor", locals())
+
+
+@mcp.tool()
+def chat_monitors(action: str = "list", monitor_id: str | None = None,
+                  receipt: dict | None = None, request_id: str | None = None,
+                  cursor: dict | None = None, limit: int = 50,
+                  unacknowledged_only: bool = False,
+                  origin_daemon_id: str | None = None) -> dict:
+    """List/get/ack/cancel/cancel_all/dismiss your persistent message monitors.
+
+    get returns bounded result previews and a receipt. Ack result pages in order;
+    it covers only that returned boundary, never newer hits or message read state.
+    Mutations require request_id and are idempotent. Cancel retracts unsubmitted
+    work; a wake already submitted may still arrive. Dismiss retains a tombstone
+    so retries cannot resurrect the monitor. Other participants' watches are private.
+    """
+    return _chat_call("monitors", locals())
+
+
+@mcp.tool()
+def chat_follow(action: str = "get", scope: dict | None = None,
+                inbox: bool | None = None, wake: bool | None = None,
+                muted: bool | None = None, dnd: bool | None = None,
+                bell: bool | None = None, expected_revision: int | None = None,
+                request_id: str | None = None, origin_daemon_id: str | None = None,
+                cursor: dict | None = None, limit: int = 50) -> dict:
+    """Inspect/set/remove your notification preferences, including inherited rules.
+
+    Scope uses the same channel/DM/thread selectors as chat_monitor; channel="*"
+    covers public channels. New rules default to inbox=true, wake=false, muted=false;
+    omitted fields on an existing rule keep their saved values. Get pages rules
+    with next_cursor; a preference change invalidates that directory cursor.
+    New follows cover future arrivals. Get the revision before changing settings;
+    a stale expected_revision returns status=conflict. Mutations require request_id.
+    More-specific inbox/wake rules override inherited values, while any matching
+    hard mute and global DND suppress wakes, including explicit monitor wakes.
+    Omit scope to change global dnd or Owner's optional TUI bell (default off).
+    Tags, reading a channel, and ordinary public replies do not subscribe Owner.
+    """
+    return _chat_call("follow", locals())
+
+
+@mcp.tool()
+def chat_open(channel: str | None = None, dm: str | list[str] | None = None,
+              conversation: str | None = None) -> dict:
+    """Orient in shared messaging: current norms, identity, unread DMs and preview.
+
+    Defaults to #general. Preview does not mark messages read. Choose a short
+    task-based name on your first chat_send; it becomes your CM session name.
+    """
+    return _chat_call("open", locals())
+
+
+@mcp.tool()
+def chat_send(body: str, request_id: str, channel: str | None = None,
+              dm: str | list[str] | None = None, conversation: str | None = None,
+              name: str | None = None, reply_to: str | None = None,
+              mentions: list[str] | None = None, tags: list[str] | None = None,
+              links: list[dict] | None = None, norms_seen: dict | None = None,
+              ack_receipt: dict | None = None, origin_daemon_id: str | None = None) -> dict:
+    """Send to exactly one channel, participant DM, or conversation ID.
+
+    dm accepts one recipient ID or a list (up to 31 others) for a group DM.
+    Membership is fixed; the same recipient set reuses its conversation. The
+    first message creates it. Use conversation ID for replies, monitors and follows.
+    Quick replies and one sentence are often enough; usual messages are at most
+    1–3 short paragraphs. Hard limit 3000 characters: summarize and reference a
+    file for longer material. Never split an essay to evade the limit.
+    First send requires a task-based name; collisions receive a unique suffix.
+    Keep request_id and original daemon binding for retries, including timeouts.
+    Prefer channels for Owner; needs-owner is quiet. Urgent attention uses
+    notify_user. Unsolicited Owner DMs are only for critical urgent private issues.
+    Posting and notification/read receipt are separate. Read returned shared norms.
+    """
+    return _chat_call("send", locals())
+
+
+@mcp.tool()
+def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
+              conversation: str | None = None, thread: str | None = None,
+              inbox: bool = False, dms: bool = False, unread_only: bool = False,
+              time: dict | None = None, time_basis: str = "created",
+              freshness: str = "cached", tags: list[str] | None = None,
+              after: dict | None = None, cursor: dict | None = None,
+              limit: int = 50, ack_receipt: dict | None = None,
+              newest_first: bool = False, pinned_only: bool | None = None) -> dict:
+    """Read history, a thread, your inbox, or incoming DMs. Select one scope.
+
+    time={"since":"10m"} or {"start":RFC3339,"end":RFC3339} filters a fixed
+    window. pinned_only filters to pinned messages at the read snapshot.
+    channel="*" reads all public channels. newest_first shows recent
+    messages first. received basis finds late arrivals. tags must all match. Use cursor
+    unchanged for pagination. Acknowledge the returned receipt on a later read
+    or send to mark only fully supplied messages read; previews do not consume.
+    """
+    return _chat_call("read", locals())
+
+
+@mcp.tool()
+def chat_dms(unread_only: bool = False, peer: str | None = None,
+             cursor: dict | None = None, limit: int = 50) -> dict:
+    """List started DMs and groups with members, unread counts and previews.
+
+    peer filters conversations containing that other participant. Empty drafts
+    are absent. Group entries have peers/members arrays and peer=null.
+    """
+    return _chat_call("dms", locals())
+
+
+@mcp.tool()
+def chat_people(query: str | None = None, include_exited: bool = False,
+                cursor: dict | None = None, limit: int = 50) -> dict:
+    """Find participant IDs, task-based names, aliases and presence. Does not grant session control."""
+    return _chat_call("people", locals())
+
+
+@mcp.tool()
+def chat_channels(action: str = "list", path: str | None = None,
+                  description: str | None = None, request_id: str | None = None,
+                  cursor: dict | None = None, limit: int = 50,
+                  name: str | None = None, allow_agent_edits: bool | None = None,
+                  admins: list[str] | None = None, conversation: str | None = None,
+                  expected_revision: str | None = None,
+                  origin_daemon_id: str | None = None) -> dict:
+    """List/get/create/update channels, their descriptions and editing policy.
+
+    Create requires path and request_id; name defaults to path. Paths/IDs are
+    permanent addresses; editable display names do not break links or watches.
+    Missing ancestors are created with creator-only editing. Creator is initially an admin; Owner
+    always retains admin access. admins adds IDs on create and replaces the list on update. allow_agent_edits
+    defaults false; true lets other agents edit name/description and pin/unpin,
+    but only admins can change access. Posting is open to all agents regardless.
+    Get by path or conversation ID before update; pass its revision as
+    expected_revision. A conflict returns current channel values; review/retry
+    with a new request_id. Omitted update fields keep existing values.
+    Names are at most 100 characters; descriptions at most 1000. No deletion.
+    """
+    return _chat_call("channels", locals())
+
+
+@mcp.tool()
+def chat_pins(action: str = "list", channel: str | None = None,
+              dm: str | list[str] | None = None, conversation: str | None = None,
+              message_id: str | None = None, request_id: str | None = None,
+              expected_revision: str | None = None, cursor: dict | None = None,
+              limit: int = 50, origin_daemon_id: str | None = None) -> dict:
+    """List/set/remove attributed pins in one channel or DM/group.
+
+    Read the list first; pass its revision as expected_revision on set/remove,
+    together with a message_id and unique request_id. A conflict requires a fresh
+    list and a new request_id. Pins reference existing messages; they do not edit,
+    delete, repost, notify, or mark them read. List pages return full messages;
+    cursor continues the snapshot. Channel admins (always including Owner) can
+    pin/unpin; allow_agent_edits also permits other agents. DM members can pin
+    within their DM. At most 100 pins per conversation. Owner's channel-admin role does not grant access to other DMs.
+    Keep request_id, arguments and original daemon binding unchanged on retries.
+    """
+    return _chat_call("pins", locals())
 
 
 @mcp.tool()
@@ -1662,21 +1869,25 @@ async def wait_for_workflow_stop(
             last_iteration = iteration
             idle_since = None
 
-        active_label = None
+        active_uid = None
         if active_role and active_role in role_sessions:
-            active_label = (role_sessions[active_role] or {}).get("session_label")
+            active_uid = (role_sessions[active_role] or {}).get("daemon_session_uid")
 
         active_idle = False
-        if active_label:
-            # Omit task_id — defaults to the caller's scope, which
-            # includes the workflow's participant sessions for any
-            # orchestrator authorized to launch the run.
+        if active_role:
             sessions = await asyncio.to_thread(
                 control_client.call, "list_sessions", {"include_exited": False}
             )
-            for s in sessions:
-                if s.get("label") == active_label:
-                    active_idle = bool(s.get("idle", False))
+            if not active_uid:
+                candidates = [s for s in sessions if s.get("workflow_run_id") == run_id
+                              and s.get("workflow_role") == active_role]
+                if len(candidates) == 1:
+                    active_uid = candidates[0].get("session_uid")
+                else:
+                    state["binding_warning"] = "Active role has no unambiguous stable session binding"
+            for session in sessions:
+                if active_uid and session.get("session_uid") == active_uid:
+                    active_idle = bool(session.get("idle", False))
                     break
 
         now = time.monotonic()

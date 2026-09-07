@@ -1319,6 +1319,7 @@ impl App {
             session_type: LaunchEngine::default().as_session_type().to_string(),
             task_id,
             seed_from: None,
+            resume_from: None,
             active_field: 0,
         };
     }
@@ -2890,6 +2891,7 @@ impl App {
         session_type: &str,
         task_id: Option<String>,
         seed_from: Option<&str>,
+        resume_from: Option<&str>,
     ) {
         // Host is a property of the WORKSPACE, not the global active_host
         // (which only seeds NEW workspaces). The spawn host is resolved and
@@ -3013,7 +3015,20 @@ impl App {
         // (detector path isn't used). For Codex, baseline is taken AFTER
         // the clone so the seed file is excluded and the detector picks
         // the freshly-minted rollout id post-resume.
-        let pending = match (session_type, cloned.is_some()) {
+        // proper-resume: a picked transcript rides the SAME plumbing a
+        // cloned snapshot does — `--resume <id>` / `codex resume <id>`
+        // at spawn, the claude row bound to the id from construction
+        // (claude appends to the same file), codex rebound by the
+        // detector to the fresh rollout the resume mints. A seed wins
+        // when both are set (the form makes them mutually exclusive).
+        let resume_id: Option<String> = cloned
+            .as_ref()
+            .map(|c| c.transcript_id.clone())
+            .or_else(|| match session_type {
+                "claude" | "codex" => resume_from.map(str::to_string),
+                _ => None,
+            });
+        let pending = match (session_type, resume_id.is_some()) {
             ("claude", true) => None,
             ("claude", false) => wt.as_ref().map(|p| Self::list_jsonl_files(p)),
             ("codex", _) => wt.as_ref().map(|p| Self::list_codex_sessions(p)),
@@ -3024,7 +3039,7 @@ impl App {
         // are taskless from MCP's POV (they inherit a task_id below for
         // sidebar grouping but no workflow context).
         let session_uid_pre = new_session_uid();
-        let cloned_transcript_id = cloned.as_ref().map(|c| c.transcript_id.clone());
+        let cloned_transcript_id = resume_id;
         // migrate-tui-local: A-s spawns route through the daemon
         // for all three engines (claude / codex / bash). Workspaces
         // here always have a worktree (the cloud / VM branch above
@@ -3143,7 +3158,14 @@ impl App {
                 }
                 self.cursor = Cursor::Session(ws_index, si);
                 self.save_session_manifest();
-                self.set_status_msg(&format!("Started {} session", session_type));
+                match (resume_from, seed_from) {
+                    (Some(id), None) => self.set_status_msg(&format!(
+                        "Started {} session resumed from {}",
+                        session_type,
+                        transcripts::short_id(id),
+                    )),
+                    _ => self.set_status_msg(&format!("Started {} session", session_type)),
+                }
             }
             Err(e) => {
                 if let Some(c) = cloned.as_ref() {
@@ -6193,6 +6215,7 @@ mod slice_12e_tests {
         };
         workspaces.insert(ws.id.clone(), ws);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -6383,6 +6406,7 @@ remote_socket = "/remote/manager.sock"
             );
         }
         let on_disk = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),

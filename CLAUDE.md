@@ -4,6 +4,22 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
 > **Note:** This project started out cloud-first, but in practice local + worktrees turned out to be much smoother and is now the default mode. Cloud support is retained but secondary. When working on this project, assume local usage unless the user explicitly mentions cloud.
 
+## If you are running inside CM
+
+Use the `claude-manager` MCP tools to inspect your context (`ping`), look up work (`list_tasks`, `get_task`), file draft tasks (`propose_task`), delegate authorized work (`start_session`, `create_subtask`), and communicate with other sessions (`chat_open`, `chat_read`, `chat_send`). Start workers in separate worktrees when appropriate, and use background monitors to follow their progress.
+
+Messaging is primarily for agent-to-agent coordination. Owner mostly observes the board and may use it to address groups. Owner's primary way of communicating with agents is still prompting them directly in their sessions. Keep routine updates and questions to Owner in your normal session chat.
+
+Use `#cm-general` for Claude Manager usage, coordination, upcoming changes, and release notes. When working on CM changes that affect agents or Owner, post a concise advance notice once the plan is concrete, then a follow-up when the change is available, with relevant usage-guide links and any required action. Owner has requested these channel announcements; no additional confirmation is needed. Channels span projects on the connected daemon; cross-machine sync is not yet enabled.
+
+The short [agent guide](mcp_server/AGENT_GUIDE.md) is also supplied automatically in the MCP initialization response, so agents in other repositories receive the same introduction. It covers session identity, tool discovery, first-message names, shared norms, group DMs, and Owner's quiet-inbox convention. Quick messages are welcome; usual posts are at most 1–3 short paragraphs, with a 3,000-character hard limit and file references for longer material. Messaging currently stays within one daemon; cross-machine sync is a later milestone.
+
+New MCP connections receive the current guide and tool schemas. Reconnect MCP in existing agents after an upgrade; no session restart is required just to reconnect tools.
+
+Channel creators start as admins; Owner always retains admin access. Admins manage display names, descriptions, pins, and access policy, including appointing other admins or enabling editing for all agents. Paths/IDs stay stable, and message deletion is not available. Owner uses `n` to create a channel, `S` for settings, `p` to pin/unpin the selected message, and `P` to toggle pinned messages. See [channel controls](doc/messaging/CHANNELS_AND_PINS.md).
+
+For a tutorial to hand to existing agents, use [Claude Manager: quick start for agents](doc/AGENT_QUICKSTART.md), with examples for messaging, DMs/groups, history, watches, and task/session tools.
+
 ## Project overview
 
 - **`tui/`** — Rust TUI client. The user-facing entry point. Workflow orchestration, planning board rendering, API communication, and the attach-stream side of session I/O. Build with `cargo build --workspace` (the TUI binary lives in `tui/` and depends on `daemon/`).
@@ -18,7 +34,7 @@ Task orchestration system for planning and running Claude coding sessions. Prima
   | Change | Primitive | Sessions |
   |---|---|---|
   | Config value (`mcp_server_path`, `api_*`, `notify_command`, …) | `daemon.reload_config` RPC or `kill -HUP` (to the BRAIN pid — `daemon.health.brain_pid`; the holder ignores HUP) | untouched |
-  | Brain/daemon code (the weekly case) | `daemon.restart` via `scripts/cm-redeploy` — in split mode this arms `restart_brain`: the brain quiesces, persists, exits; the holder execs the pinned new binary; verification keys on `holder_epoch` +1 exactly | untouched — never signaled; attach streams blip and auto-reattach |
+  | Brain/daemon code (the weekly case) | `daemon.restart` via `scripts/cm-redeploy` — in split mode this arms `restart_brain`: the brain quiesces, persists (registry, tombstones, and each session's replay ring → `~/.cm/daemon-rings/`), exits; the holder execs the pinned new binary; verification keys on `holder_epoch` +1 exactly | untouched — never signaled; attach streams blip and auto-reattach, and the reattach replays the pre-restart screen (the new brain seeds each adopted session's ring from the persisted one — pre-fix the pane came back blank until `A-R`) |
   | Bad brain deploy that crash-loops | automatic: the holder's breaker (3 strikes) rolls back to the previous pin; no previous → `HELD_DOWN` + path-retry (fix the binary on disk = self-heal; SIGUSR2 forces a retry) | untouched throughout |
   | Bad brain, alive but wrong | `daemon.rollback_brain` (strong-operator) | untouched |
   | Brain deadlocked but heartbeat-alive (RPCs hang, pongs flow) | operator SIGKILLs the brain pid; the holder counts a strike and respawns | untouched |
@@ -111,13 +127,13 @@ Global:
 
 Sessions view:
 - `A-n` — new workspace (creates a worktree); Tab to Engine and ←/→ to choose Claude or Codex, default Codex
-- `A-s` — add a session to the focused task (defaults to Codex)
+- `A-s` — add a session to the focused task (defaults to Codex). The form has a **Resume** field (Tab to it, Enter opens a picker of the worktree's claude/codex transcripts, newest first with age, size, and the first prompt): the new session spawns `claude --resume <id>` / `codex resume <id>` with its row bound to that transcript from the start. This is the native replacement for "A-s, then `/resume` inside the pane". Mutually exclusive with the Seed field.
 - `A-a` — attach
 - `A-w` — close session
 - `A-H` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden). Moved from `A-h`; the old `A-H` active-host switcher is retired (global host is being removed — new sessions use the `local` default).
 - `A-h` / `A-l` — move the sidebar cursor LEFT / RIGHT between the main column and the **continuous column** (when the continuous column is shown; see `A-c`). `A-j`/`A-k` stay vertical within the focused column. See `DESIGN_CONTINUOUS_PANEL.md`.
 - `A-c` — toggle the dedicated **continuous column** (orchestrators with their spawned subtasks nested) on/off. This is the single continuous control: ON = a third pane splits off the right (terminal | main | continuous) showing the continuous tree; OFF = continuous tasks are hidden entirely. Continuous tasks (an orchestrator + its subtasks, matched by `managed_by_uid` **or** task-tree `parent_task_id` **or** — for same-task workers like momentum-detective's ephemeral `detective-*` spawns, which carry the orchestrator's own `task_id` and no subtask — `managed_by_uid.is_some() && task_id == orchestrator.task_id`, so they group correctly across orchestrator respawns; pre-fix a prior instance's worker fell into the main sidebar the moment the scheduler respawned its parent) render **only** in this column — never in the main sidebar. Persisted. (The old `A-C` column toggle + the separate `A-c` master-hide were merged into this one key.)
-- `A-e` — settings for the focused row (Tab cycles fields; Space toggles checkboxes; Space/←/→ cycles color pickers). On a **session**: label, idle/burst timers, hidden, notify-on-idle, **global perms**, accent color. On a **workspace**: name, accent color (cascades to its sessions), **pinned** (pinned workspaces sort to the top of the sidebar with a 📌 marker). On a **task** subheader: name, accent color (stored TUI-side in the manifest's `task_colors` sidecar — tasks live in the planning API). Colors come from the named `USER_COLORS` palette and tint the row in the sidebar; selection highlight still overrides.
+- `A-e` — settings for the focused row (Tab cycles fields; Space toggles checkboxes; Space/←/→ cycles color pickers). On a **session**: label, idle/burst timers, hidden, notify-on-idle, **global perms**, accent color, and **Transcript** (Enter opens the same picker as A-s's Resume field and rebinds the row — repair a mis-detected binding, or point a dead row at the right conversation before `A-R` revives it; the pick applies immediately and closes the form, so save other edits first). On a live session a rebind is metadata only: the pane keeps its conversation until you run `/resume <id>` in it, after which the binding follows on its own (below). On a **workspace**: name, accent color (cascades to its sessions), **pinned** (pinned workspaces sort to the top of the sidebar with a 📌 marker). On a **task** subheader: name, accent color (stored TUI-side in the manifest's `task_colors` sidecar — tasks live in the planning API). Colors come from the named `USER_COLORS` palette and tint the row in the sidebar; selection highlight still overrides.
 - `A-v` — toggle Status / Task sub-view
 - `A-g` — jump to the next session needing attention (pending `notify_user` alerts first, then idle sessions; wraps, crosses into the continuous column)
 - `A-;` — MRU quick-switch: alt-tab through recently focused sessions (first press ping-pongs A↔B; repeated presses walk deeper; any other key resets the walk)
@@ -127,6 +143,8 @@ Sessions view:
 - `A-9` — push (cloud) · `A-0` — pull (cloud)  *(moved off `A-p`/`A-l`)*
 - `A-r` — refresh
 - `A-R` — **revive / restart** the focused session in place: same uid, label, and task binding, with the conversation resumed (claude `--resume` / codex `resume`; bash respawns fresh). On a **dead** session it's a revive; on a **live** session it's a forced restart — the TUI kills the daemon child, waits (bounded ~2s) for the reaper to clear the uid, then runs the same revive flow (use case: pick up an updated agent binary/model without losing the conversation). Local sessions re-run the startup-restore primitive for one slot (re-attach if the daemon still holds the uid live, else respawn-resumed); remote sessions go through the daemon's `session.revive` RPC (argv/env composed daemon-side) and then auto-reattach via the deferred-reattach flow. Workflow participants are refused (the workflow engine owns their lifecycle — `A-u` resumes the run), as are continuous sessions (scheduler-owned).
+
+**Transcript binding follows the daemon.** The daemon is the only party that learns about an in-pane `/resume` or `/clear` (the Stop hook reports the live transcript path every turn → `session.turn_ended` re-stamps the resume key) and about codex rollout rotations (the `/proc` watcher → `session.set_transcript_path`). Both now BROADCAST a manifest `Updated` carrying `transcript_path` + `transcript_id`, the TUI mirrors it onto the row (`apply_transcript_from_diff`, via `rebind_transcript`), and every `manifest.watch` (re)connect converges rows on the snapshot's ids. So `A-R`, a user-owned row's startup restore, tombstones, and `read_session_output` all resume the conversation the pane is actually in. Pre-fix the TUI's detector bound once at spawn and never looked again, so after an in-pane `/resume` every TUI-driven respawn resumed the throwaway spawn-time conversation and the operator had to `/resume` again (and the ESmisc codex row was revived into an unrelated test thread its spawn-time guess had picked). Needs the daemon rebuilt for the broadcast half; the TUI half is harmless against an old daemon (no diffs carry the field).
 
 Sidebar/pane state cues: idle sessions age through three visual buckets — just-finished "afterglow" (bright `●`, <2 min), settled (white `●`), and stale (>30 min, glyph + label dimmed). The status bar carries a session rollup (`⠹2 ●1 ⚑1` = running / idle / pending alerts) next to the task counts. The terminal pane's border tints by the active session's state (green running, yellow reconnecting, afterglow just-idle) and shows a right-aligned `▲ scrollback` tag whenever the view isn't at the live tail.
 
@@ -245,18 +263,7 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
 - `/home/lucas/.cm/daemon.toml` — daemon config (mode 0600). Sets `mcp_server_path`, `api_url = "http://localhost:8000"`, `api_token`, `log_path`, `workflows_dir`, and `[auth] mode = "ssh-trust"` (the SSH session IS the auth — no separate operator token over SSH-unix).
 - `/etc/systemd/system/cm-daemon.service` — `Restart=always`, runs as user `lucas`, `Environment=PATH=/opt/cm-daemon/mcp_server/.venv/bin:...`. Being a **system** unit run as `lucas`, it has no user-session bus, so `systemd-run --user --scope` (memory caps) can't create scopes: the daemon's capability probe degrades every fire to **uncapped** by default. To enable per-session memory caps, install `deploy/cm-daemon.service.d/user-scope-cap.conf` (adds `XDG_RUNTIME_DIR=/run/user/%U`) + `loginctl enable-linger lucas`. See `DESIGN_MEMORY_CAP.md` → "Daemon-side (headless) capping".
 
-Deploying daemon-side changes:
-
-```bash
-# Binary
-cargo build --release -p cm-daemon  # locally
-gcloud compute scp target/release/cm-daemon cm-manager:/tmp/cm-daemon --zone=us-east4-a --project=claude-manager-prod
-ssh cm-manager 'sudo cp /tmp/cm-daemon /opt/cm-daemon/cm-daemon && sudo systemctl restart cm-daemon'
-
-# MCP server / workflows
-gcloud compute scp --recurse mcp_server/ cm-manager:/tmp/ --zone=us-east4-a --project=claude-manager-prod
-ssh cm-manager 'sudo cp -r /tmp/mcp_server/* /opt/cm-daemon/mcp_server/ && sudo systemctl restart cm-daemon'
-```
+Deploy daemon and MCP changes using [HOWTO_HOLDER_BRAIN_SPLIT.md §3](HOWTO_HOLDER_BRAIN_SPLIT.md#3-routine-deploys-brain-code--the-weekly-case). Stage the binary and the complete `mcp_server/` payload (including `AGENT_GUIDE.md`), preflight, then call `daemon.restart` to rotate only the brain. Do not use `systemctl restart` or the legacy `cm-redeploy --manager` path for routine deploys: they kill sessions.
 
 `claude` (npm `@anthropic-ai/claude-code`) and `codex` (npm `@openai/codex`) are installed system-wide so the daemon can spawn them from any session.
 

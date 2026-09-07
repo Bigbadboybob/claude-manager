@@ -873,6 +873,34 @@ fn brain_deploy_via_daemon_restart_rides_sessions_through() {
         .and_then(|v| v.as_u64())
         .expect("holder_epoch");
 
+    // Output produced BEFORE the deploy must still be in the ring the
+    // deployed brain replays to a reattaching client (the blank-pane
+    // bug: pre-fix the new brain adopted every session with an empty
+    // fanout). The quoted split keeps the marker out of the PTY echo
+    // of the command line itself, so only bash's OUTPUT matches.
+    let send = sb.op(
+        "send_input",
+        serde_json::json!({ "session_uid": uid, "text": "echo PRE-DEPLOY-''RING", "submit": true }),
+    );
+    assert!(send.ok);
+    wait_for(
+        Instant::now() + Duration::from_secs(20),
+        "PRE-DEPLOY-RING marker pre-deploy",
+        &sb.guard,
+        || {
+            let resp = round_trip(
+                &sb.socket,
+                &operator_request(
+                    &sb.token,
+                    "read_session_output",
+                    serde_json::json!({ "session_uid": uid }),
+                ),
+            )
+            .ok()?;
+            output_text(&resp).filter(|t| t.contains("PRE-DEPLOY-RING"))
+        },
+    );
+
     // Deploy "the new brain" (same binary — the mechanism under
     // test, not the code delta).
     let t0 = Instant::now();
@@ -911,6 +939,27 @@ fn brain_deploy_via_daemon_restart_rides_sessions_through() {
     assert_eq!(proc_starttime(bash_pid), Some(bash_start), "session disturbed");
     assert_eq!(proc_ppid(bash_pid), Some(sb.holder_pid));
 
+    // The replay ring rode through: the pre-deploy marker is in the
+    // new brain's fanout from the moment it is healthy, no new output
+    // needed (a reattaching TUI paints the old screen, not a blank one).
+    let resp = sb.op(
+        "read_session_output",
+        serde_json::json!({ "session_uid": uid }),
+    );
+    let text = output_text(&resp).unwrap_or_default();
+    assert!(
+        text.contains("PRE-DEPLOY-RING"),
+        "pre-deploy output missing from the deployed brain's replay ring:\n{text}\n{}",
+        sb.guard.log_tail()
+    );
+    assert!(
+        std::fs::read_to_string(&sb.guard.log_path)
+            .unwrap_or_default()
+            .contains("1 replay ring(s) restored"),
+        "{}",
+        sb.guard.log_tail()
+    );
+
     // PTY still works through the deployed brain.
     let send = sb.op(
         "send_input",
@@ -934,6 +983,16 @@ fn brain_deploy_via_daemon_restart_rides_sessions_through() {
             output_text(&resp).filter(|t| t.contains("DEPLOYED"))
         },
     );
+    // Seeded tail FIRST, then post-deploy output — the ring is one
+    // continuous stream across the generation boundary.
+    let resp = sb.op(
+        "read_session_output",
+        serde_json::json!({ "session_uid": uid }),
+    );
+    let text = output_text(&resp).unwrap_or_default();
+    let pre = text.find("PRE-DEPLOY-RING").expect("pre marker");
+    let post = text.rfind("DEPLOYED").expect("post marker");
+    assert!(pre < post, "replay order inverted:\n{text}");
 
     // Phase 6's rollback ladder, live: deploy a binary that PASSES
     // the preflight but crash-loops → the breaker trips → the holder

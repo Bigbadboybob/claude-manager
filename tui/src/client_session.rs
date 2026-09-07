@@ -4414,3 +4414,9 @@ mod tests {
         );
     }
 }
+
+/// Owner messaging calls use the daemon socket; callers run this off-thread.
+pub fn rpc_messaging(socket: &Path, token: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
+    Ok(rpc_round_trip(socket, &req)?.result.unwrap_or(serde_json::Value::Null))
+}

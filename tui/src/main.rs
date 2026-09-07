@@ -396,6 +396,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // sessions produce no events of their own. ~1 Hz check, redraw
         // only on an actual bucket change.
         app.tick_idle_ages();
+        app.messaging_tick();
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();

@@ -2671,6 +2671,7 @@ fn serialize_workflow_run(run: &crate::workflow::run::WorkflowRun) -> Value {
                 role.clone(),
                 json!({
                     "session_label": binding.session_label,
+                    "daemon_session_uid": binding.daemon_session_uid,
                     "current_transcript_id": binding.current_session_id,
                 }),
             )

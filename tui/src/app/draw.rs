@@ -134,6 +134,7 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.messages.visible { self.draw_messages(frame); return; }
         let area = frame.area();
 
         // Phase 6: bottom layout — content / [activity strip] / status bar.
@@ -273,6 +274,7 @@ impl App {
                     workspace_id,
                     session_type,
                     seed_from,
+                    resume_from,
                     active_field,
                     ..
                 } => {
@@ -282,10 +284,11 @@ impl App {
                         workspace_id,
                         session_type,
                         seed_from.as_deref(),
+                        resume_from.as_deref(),
                         *active_field,
                     );
                 }
-                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, global_perms, color, seeded_from_snapshot, active_field, .. } => {
+                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, global_perms, color, seeded_from_snapshot, transcript_id, session_type, active_field, .. } => {
                     self.draw_session_settings(
                         frame,
                         area,
@@ -297,8 +300,13 @@ impl App {
                         *global_perms,
                         color.as_deref(),
                         seeded_from_snapshot.as_deref(),
+                        transcript_id.as_deref(),
+                        session_type,
                         *active_field,
                     );
+                }
+                InputMode::TranscriptPicker { candidates, selected, target } => {
+                    self.draw_transcript_picker(frame, area, candidates, *selected, target);
                 }
                 InputMode::WorkspaceSettings { name, color, pinned, active_field, .. } => {
                     self.draw_workspace_settings(
@@ -602,11 +610,12 @@ impl App {
         workspace_id: &str,
         session_type: &str,
         seed_from: Option<&str>,
+        resume_from: Option<&str>,
         active_field: u8,
     ) {
         let width = 50u16.min(area.width.saturating_sub(4));
-        // +2 rows for the seed-from line.
-        let height = 11u16;
+        // +2 rows for the seed-from line, +1 for resume-from.
+        let height = 12u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -684,6 +693,25 @@ impl App {
             Span::styled(seed_label, seed_style),
             Span::styled(seed_hint, dim),
         ]));
+        // proper-resume: resume an existing conversation of this
+        // worktree (the native replacement for A-s + `/resume`).
+        let resume_label = match (resume_from, session_type) {
+            (_, "bash") => "[N/A]".to_string(),
+            (Some(id), _) => format!("{}\u{2026}", transcripts::short_id(id)),
+            (None, _) => "[none]".to_string(),
+        };
+        let resume_style = if active_field == 2 { highlight } else { white };
+        let resume_hint = match (active_field == 2, resume_from.is_some(), session_type) {
+            (true, _, "bash") => "  not pickable",
+            (true, true, _) => "  Esc clear",
+            (true, false, _) => "  Enter pick",
+            _ => "",
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Resume: ", dim),
+            Span::styled(resume_label, resume_style),
+            Span::styled(resume_hint, dim),
+        ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Tab field \u{00b7} j/k type \u{00b7} Enter start \u{00b7} Esc cancel",
@@ -705,14 +733,17 @@ impl App {
         global_perms: bool,
         color: Option<&str>,
         seeded_from_snapshot: Option<&str>,
+        transcript_id: Option<&str>,
+        session_type: &str,
         active_field: u8,
     ) {
         let width = 55u16.min(area.width.saturating_sub(4));
         // Seeded-from line is a 2-line block (blank + "Seeded from: <name>")
         // only when the field is set; otherwise the dialog keeps its old
         // size so the unrelated common case doesn't grow. +2 rows for the
-        // global-perms field (blank + line), +2 for the color picker.
-        let height = if seeded_from_snapshot.is_some() { 21u16 } else { 19u16 };
+        // global-perms field (blank + line), +2 for the color picker,
+        // +2 for the transcript field.
+        let height = if seeded_from_snapshot.is_some() { 23u16 } else { 21u16 };
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -805,6 +836,30 @@ impl App {
                 )];
                 spans.extend(color_picker_spans(color, active_field == 6));
                 Line::from(spans)
+            },
+            Line::from(""),
+            {
+                // proper-resume: the row's transcript binding — what A-R
+                // and a startup restore resume from. Enter opens the
+                // picker to rebind it.
+                let value = match (session_type, transcript_id) {
+                    ("bash", _) => "[N/A]".to_string(),
+                    (_, Some(id)) => format!("{}\u{2026}", transcripts::short_id(id)),
+                    (_, None) => "[none]".to_string(),
+                };
+                let hint = match (active_field == 7, session_type) {
+                    (true, "bash") => "  no transcript",
+                    (true, _) => "  Enter to rebind",
+                    _ => "",
+                };
+                Line::from(vec![
+                    Span::styled(
+                        "     Transcript: ",
+                        if active_field == 7 { white } else { dim },
+                    ),
+                    Span::styled(value, if active_field == 7 { white } else { dim }),
+                    Span::styled(hint, dim),
+                ])
             },
         ];
 
@@ -1395,7 +1450,8 @@ impl App {
             ("PgUp/Dn scroll", "A-0  pull"),
             ("A-Ent  newline", "A-;  recent"),
             ("A-p    find", "A-i  info"),
-            ("A-'    yank", "A-m  mouse"),
+            ("A-'    yank", "A-M  mouse"),
+            ("F8     messages", "A-m  messages"),
         ];
         let help_rows = help_entries.len() as u16;
         let list_height = inner.height.saturating_sub(help_rows + 1);
@@ -2275,6 +2331,148 @@ impl App {
             .style(Style::default().fg(theme::TEXT));
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, dialog);
+    }
+
+    /// proper-resume: the transcript picker — one row per resumable
+    /// conversation of the target's worktree, newest first:
+    /// `▸ 01a077ee  2h   142K  <first prompt>`, tagged `(this)` when the
+    /// row being rebound already holds it and `[<label>]` when another
+    /// sidebar row does.
+    pub fn draw_transcript_picker(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        candidates: &[TranscriptCandidate],
+        selected: usize,
+        target: &TranscriptPickTarget,
+    ) {
+        let total = candidates.len();
+        let width = area.width.min(100).max(50);
+        let max_dialog_height = area.height.saturating_sub(2).max(7);
+        let desired_height = (total as u16).saturating_add(5).max(7);
+        let height = desired_height.min(max_dialog_height);
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, dialog);
+
+        let inner_height = height.saturating_sub(2) as usize;
+        let footer_rows = 2; // blank + key-hint line
+        let list_budget = inner_height.saturating_sub(footer_rows).max(1);
+        let needs_scroll = total > list_budget;
+        let body_rows = if needs_scroll {
+            list_budget.saturating_sub(2).max(1)
+        } else {
+            list_budget
+        };
+        let offset = if !needs_scroll || selected < body_rows {
+            0
+        } else {
+            selected
+                .saturating_sub(body_rows)
+                .saturating_add(1)
+                .min(total.saturating_sub(body_rows))
+        };
+        let above = offset;
+        let end = (offset + body_rows).min(total);
+        let below = total.saturating_sub(end);
+
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
+        let bold = Style::default()
+            .fg(theme::TEXT)
+            .add_modifier(Modifier::BOLD);
+        let (title, engine) = match target {
+            TranscriptPickTarget::BindSession { .. } => (" Bind Transcript ", None),
+            TranscriptPickTarget::NewTerminalSession { session_type, .. } => {
+                (" Resume Transcript ", Some(session_type.as_str()))
+            }
+        };
+        let now = std::time::SystemTime::now();
+        let mut lines: Vec<Line> = Vec::new();
+        if candidates.is_empty() {
+            lines.push(Line::from(Span::styled(
+                match engine {
+                    Some(e) => format!("No {} transcripts for this worktree.", e),
+                    None => "No transcripts for this worktree.".to_string(),
+                },
+                dim,
+            )));
+        } else {
+            if needs_scroll {
+                lines.push(Line::from(Span::styled(
+                    if above > 0 { format!("  \u{2191} {} more", above) } else { String::new() },
+                    dim,
+                )));
+            }
+            // Preview budget: width minus borders, cursor, id, age, size,
+            // and the separators between them.
+            let fixed = 2 + 2 + 8 + 2 + 4 + 2 + 6 + 2;
+            let preview_budget = (width as usize).saturating_sub(fixed).max(10);
+            for idx in offset..end {
+                let cand = &candidates[idx];
+                let is_active = idx == selected;
+                let cursor = if is_active { "\u{25b8} " } else { "  " };
+                let style = if is_active { bold } else { white };
+                let mut preview: String = if cand.preview.is_empty() {
+                    "(no prompt yet)".to_string()
+                } else {
+                    cand.preview.clone()
+                };
+                let tag = match cand.bound_to.as_deref() {
+                    Some("") => " (this)".to_string(),
+                    Some(label) => format!(" [{}]", label),
+                    None => String::new(),
+                };
+                let tag_len = tag.chars().count();
+                let budget = preview_budget.saturating_sub(tag_len);
+                if preview.chars().count() > budget {
+                    preview = preview.chars().take(budget.saturating_sub(1)).collect();
+                    preview.push('\u{2026}');
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(cursor, style),
+                    Span::styled(transcripts::short_id(&cand.id), style),
+                    Span::styled(
+                        format!(
+                            "  {:>4}  {:>6}  ",
+                            transcripts::age_label(cand.modified, now),
+                            transcripts::size_label(cand.size_bytes),
+                        ),
+                        dim,
+                    ),
+                    Span::styled(preview, if is_active { white } else { dim }),
+                    Span::styled(tag, Style::default().fg(theme::ATTN)),
+                ]));
+            }
+            if needs_scroll {
+                lines.push(Line::from(Span::styled(
+                    if below > 0 { format!("  \u{2193} {} more", below) } else { String::new() },
+                    dim,
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            match target {
+                TranscriptPickTarget::BindSession { .. } => {
+                    "j/k move \u{00b7} Enter bind \u{00b7} Esc cancel"
+                }
+                TranscriptPickTarget::NewTerminalSession { .. } => {
+                    "j/k move \u{00b7} Enter pick \u{00b7} Esc back to form"
+                }
+            },
+            dim,
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::TEXT))
+            .title(Span::styled(title, bold));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     pub fn draw_past_workspace_picker(

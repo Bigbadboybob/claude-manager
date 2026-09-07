@@ -1404,6 +1404,21 @@ fn spawn_deploy_thread(
                     guard.abort();
                     return;
                 }
+                // Replay rings (best-effort, never aborts): the reader
+                // gate is frozen above, so every ring is at rest — the
+                // next brain seeds each adopted session's fanout from
+                // these so a reattaching TUI paints the screen it had,
+                // not a blank pane.
+                match crate::fanout_persist::save_rings(
+                    &st,
+                    &crate::fanout_persist::default_rings_dir(),
+                ) {
+                    Ok(n) => eprintln!("cm-daemon: brain deploy: {n} replay ring(s) persisted"),
+                    Err(e) => eprintln!(
+                        "cm-daemon: brain deploy: replay rings NOT persisted ({e}) — \
+                         reattached sessions will start from an empty screen"
+                    ),
+                }
             }
             // Reverse migration only (phase 7): compose + stream one
             // standard-schema record per live session — the C1 blobs
@@ -1777,6 +1792,10 @@ pub fn adopt_at_boot(
         Arc::downgrade(&st.restart_coordinator)
     };
     let mut adopted_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Replay rings the previous brain persisted at its deploy step
+    // (`crate::fanout_persist`); a crash-class predecessor left none.
+    let rings_dir = crate::fanout_persist::default_rings_dir();
+    let mut seeded = 0usize;
 
     for (rec, master, pidfd) in records {
         // V2 reconciliation rule 3: reaped, nothing pending — the
@@ -1831,6 +1850,13 @@ pub fn adopt_at_boot(
                 continue;
             }
         };
+        // Seed BEFORE arm: the fanout has no reader yet, so the
+        // carried tail lands ahead of the kernel-buffered bytes the
+        // new reader is about to drain.
+        if let Some(ring) = crate::fanout_persist::take_ring(&rings_dir, &rec.uid) {
+            build.seed_replay(&ring);
+            seeded += 1;
+        }
         let pending = HolderPending {
             build: Some(build),
             uid: rec.uid.clone(),
@@ -1930,6 +1956,13 @@ pub fn adopt_at_boot(
             "cm-daemon: holder adopt '{}' (pid {}, incarnation {})",
             rec.uid, rec.child_pid, rec.incarnation
         );
+    }
+
+    // Anything left is a ring for a session this generation did not
+    // adopt — never replay it later.
+    crate::fanout_persist::sweep(&rings_dir);
+    if seeded > 0 {
+        eprintln!("cm-daemon: holder adopt: {seeded} replay ring(s) restored");
     }
 
     // § Exit provenance, the "no status" residual: a SURVIVING holder

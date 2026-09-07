@@ -89,6 +89,9 @@ class SocketRoute:
 # included for correctness — the resolver gives the right
 # answer regardless of who's calling.
 DAEMON_METHODS: frozenset[str] = frozenset({
+    "messaging.open", "messaging.read", "messaging.send",
+    "messaging.dms", "messaging.people", "messaging.channels", "messaging.pins", "session.set_name",
+    "messaging.norms", "messaging.monitor", "messaging.monitors", "messaging.follow",
     "ping",
     # Internal/operator dispatch surface; routing does not grant authorization.
     "daemon.migrate_split", "daemon.reexec_dev", "daemon.upgrade_holder",
