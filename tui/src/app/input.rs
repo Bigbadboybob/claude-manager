@@ -102,7 +102,7 @@ pub(super) enum InputMode {
         target: TranscriptPickTarget,
     },
     /// Workspace settings: display label (branch and worktree path stay
-    /// the same), accent color, and the pinned flag.
+    /// the same), accent color, the pinned flag, and the sidebar section.
     WorkspaceSettings {
         ws_index: usize,
         name: String,
@@ -111,7 +111,20 @@ pub(super) enum InputMode {
         color: Option<String>,
         /// Pinned workspaces sort to the top of the sidebar.
         pinned: bool,
-        /// 0 = name, 1 = color, 2 = pinned
+        /// Sidebar section choice (see `cycle_section_choice`): `None` =
+        /// auto (inherit through the task tree), `Some("")` = loose,
+        /// `Some(id)` = that section.
+        section: Option<String>,
+        /// 0 = name, 1 = color, 2 = pinned, 3 = section
+        active_field: u8,
+    },
+    /// Create (`section_id == None`) or edit a sidebar section: name and
+    /// accent color. Opened via A-N (new) or A-e on a section header.
+    SectionSettings {
+        section_id: Option<String>,
+        name: String,
+        color: Option<String>,
+        /// 0 = name, 1 = color
         active_field: u8,
     },
     /// Save the focused session as a named agent-memory snapshot. Opened
@@ -167,7 +180,11 @@ pub(super) enum InputMode {
         name: String,
         /// Accent color (`USER_COLORS` name) for the sidebar task header.
         color: Option<String>,
-        /// 0 = name, 1 = color
+        /// Sidebar section choice for the task's WORKSPACE (sections group
+        /// workspaces; a task row is just the handiest place to set it).
+        /// Same encoding as `WorkspaceSettings::section`.
+        section: Option<String>,
+        /// 0 = name, 1 = color, 2 = section
         active_field: u8,
     },
     /// Picking which workflow to launch when more than one is defined.
@@ -264,6 +281,8 @@ pub struct PastCandidate {
 pub enum ConfirmAction {
     MarkDone,
     Delete,
+    /// A-x on a section header: remove the section (members become loose).
+    DeleteSection { section_id: String },
     StopWorkflow { run_id: String },
     /// Y/n prompt that follows A-O reopen when the workspace had any
     /// tombstoned sessions. Y respawns one session per tombstone (claude
@@ -368,6 +387,9 @@ pub(crate) struct InputCtx<'a> {
     /// (←/→) on field 5. Empty in contexts where host selection doesn't
     /// apply — cycling is then a no-op.
     pub host_ids: &'a [cm_daemon::host_id::HostId],
+    /// Sidebar section ids in display order, for the ←/→ section picker
+    /// on the workspace / task settings forms (`cycle_section_choice`).
+    pub section_ids: &'a [String],
 }
 
 /// Post-condition signal from a per-mode handler back to the dispatcher.
@@ -486,6 +508,16 @@ pub(crate) enum SubmitAction {
         name: String,
         color: Option<String>,
         pinned: bool,
+        section: Option<String>,
+    },
+    /// Create (`section_id == None`) or update a sidebar section.
+    SaveSection {
+        section_id: Option<String>,
+        name: String,
+        color: Option<String>,
+    },
+    DeleteSection {
+        section_id: String,
     },
     SaveSnapshot {
         workspace_id: String,
@@ -505,6 +537,7 @@ pub(crate) enum SubmitAction {
         task_id: String,
         name: String,
         color: Option<String>,
+        section: Option<String>,
     },
     EnterWorkflowLaunchConfirm {
         ws_id: String,
@@ -583,6 +616,14 @@ pub(crate) struct WorkspaceSettingsMut<'a> {
     pub name: &'a mut String,
     pub color: &'a mut Option<String>,
     pub pinned: &'a mut bool,
+    pub section: &'a mut Option<String>,
+    pub active_field: &'a mut u8,
+}
+
+pub(crate) struct SectionSettingsMut<'a> {
+    pub section_id: Option<&'a str>,
+    pub name: &'a mut String,
+    pub color: &'a mut Option<String>,
     pub active_field: &'a mut u8,
 }
 
@@ -868,6 +909,7 @@ pub(crate) struct TaskSettingsMut<'a> {
     pub task_id: &'a str,
     pub name: &'a mut String,
     pub color: &'a mut Option<String>,
+    pub section: &'a mut Option<String>,
     pub active_field: &'a mut u8,
 }
 
@@ -1254,7 +1296,7 @@ pub(crate) fn handle_session_settings(
 
 pub(crate) fn handle_workspace_settings(
     state: WorkspaceSettingsMut<'_>,
-    _ctx: InputCtx<'_>,
+    ctx: InputCtx<'_>,
     event: &CrosstermEvent,
 ) -> InputOutcome {
     let CrosstermEvent::Key(key) = event else {
@@ -1263,7 +1305,17 @@ pub(crate) fn handle_workspace_settings(
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
         KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 3;
+            *state.active_field = (*state.active_field + 1) % 4;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 3 => {
+            *state.section =
+                cycle_section_choice(state.section.as_deref(), ctx.section_ids, true);
+            InputOutcome::Consumed
+        }
+        KeyCode::Left if *state.active_field == 3 => {
+            *state.section =
+                cycle_section_choice(state.section.as_deref(), ctx.section_ids, false);
             InputOutcome::Consumed
         }
         KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
@@ -1283,6 +1335,7 @@ pub(crate) fn handle_workspace_settings(
             name: state.name.trim().to_string(),
             color: state.color.clone(),
             pinned: *state.pinned,
+            section: state.section.clone(),
         }),
         KeyCode::Backspace if *state.active_field == 0 => {
             state.name.pop();
@@ -1727,6 +1780,59 @@ pub(crate) fn handle_save_snapshot(
 
 pub(crate) fn handle_task_settings(
     state: TaskSettingsMut<'_>,
+    ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Tab | KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + 1) % 3;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 2 => {
+            *state.section =
+                cycle_section_choice(state.section.as_deref(), ctx.section_ids, true);
+            InputOutcome::Consumed
+        }
+        KeyCode::Left if *state.active_field == 2 => {
+            *state.section =
+                cycle_section_choice(state.section.as_deref(), ctx.section_ids, false);
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
+            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
+            InputOutcome::Consumed
+        }
+        KeyCode::Left if *state.active_field == 1 => {
+            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveTaskName {
+            task_id: state.task_id.to_string(),
+            name: state.name.trim().to_string(),
+            color: state.color.clone(),
+            section: state.section.clone(),
+        }),
+        KeyCode::Backspace if *state.active_field == 0 => {
+            state.name.pop();
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) if *state.active_field == 0 => {
+            state.name.push(c);
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+/// Create / edit a sidebar section: name (field 0) + color (field 1).
+/// Enter with an empty name on CREATE is refused with a status hint; on
+/// edit an empty name keeps the old one (matches the other settings forms).
+pub(crate) fn handle_section_settings(
+    state: SectionSettingsMut<'_>,
     _ctx: InputCtx<'_>,
     event: &CrosstermEvent,
 ) -> InputOutcome {
@@ -1747,11 +1853,17 @@ pub(crate) fn handle_task_settings(
             *state.color = theme::cycle_user_color(state.color.as_deref(), false);
             InputOutcome::Consumed
         }
-        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveTaskName {
-            task_id: state.task_id.to_string(),
-            name: state.name.trim().to_string(),
-            color: state.color.clone(),
-        }),
+        KeyCode::Enter => {
+            let name = state.name.trim().to_string();
+            if state.section_id.is_none() && name.is_empty() {
+                return InputOutcome::Status("Section name is required".into());
+            }
+            InputOutcome::Submit(SubmitAction::SaveSection {
+                section_id: state.section_id.map(str::to_string),
+                name,
+                color: state.color.clone(),
+            })
+        }
         KeyCode::Backspace if *state.active_field == 0 => {
             state.name.pop();
             InputOutcome::Consumed
@@ -2116,6 +2228,9 @@ pub(crate) fn handle_confirm(
             let submit = match action.clone() {
                 ConfirmAction::MarkDone => SubmitAction::MarkActiveDone,
                 ConfirmAction::Delete => SubmitAction::DeleteActive,
+                ConfirmAction::DeleteSection { section_id } => {
+                    SubmitAction::DeleteSection { section_id }
+                }
                 ConfirmAction::StopWorkflow { run_id } => SubmitAction::StopWorkflow { run_id },
                 ConfirmAction::RestoreTombstones { ws_id } => {
                     SubmitAction::RestoreTombstones { ws_id }
@@ -2376,6 +2491,25 @@ impl App {
     /// Open settings for whatever the cursor is focused on — a workspace
     /// (rename) when on a header, a session (label / idle / hidden) when on
     /// a specific session.
+    /// A-N: open the create-section form.
+    fn open_new_section(&mut self) {
+        self.input_mode = InputMode::SectionSettings {
+            section_id: None,
+            name: String::new(),
+            color: None,
+            active_field: 0,
+        };
+    }
+
+    /// A-J / A-K: reorder the focused section; a hint elsewhere.
+    fn reorder_section_key(&mut self, dir: i32) {
+        if matches!(self.cursor, Cursor::Section(_)) {
+            self.move_section(dir);
+        } else {
+            self.set_status_msg("A-J/K reorder sections — focus a section header");
+        }
+    }
+
     fn open_session_settings(&mut self) {
         match self.cursor.clone() {
             Cursor::Session(wi, si) => {
@@ -2417,6 +2551,7 @@ impl App {
                         name: ws.name.clone(),
                         color: ws.color.clone(),
                         pinned: ws.pinned,
+                        section: self.workspace_sections.get(&ws.id).cloned(),
                         active_field: 0,
                     };
                 }
@@ -2429,10 +2564,19 @@ impl App {
                     .map(|t| t.name.clone())
                     .unwrap_or_default();
                 let current_color = self.task_colors.get(&task_id).cloned();
+                // The section rides on the task's WORKSPACE (the cursor's).
+                let current_section = match &self.cursor {
+                    Cursor::Task { ws_idx, .. } => self
+                        .workspaces
+                        .get(*ws_idx)
+                        .and_then(|ws| self.workspace_sections.get(&ws.id).cloned()),
+                    _ => None,
+                };
                 self.input_mode = InputMode::TaskSettings {
                     task_id,
                     name: current_name,
                     color: current_color,
+                    section: current_section,
                     active_field: 0,
                 };
             }
@@ -2440,6 +2584,16 @@ impl App {
                 self.set_status_msg(
                     "Backtest runs have no settings here — A-i peeks details",
                 );
+            }
+            Cursor::Section(id) => {
+                if let Some(sec) = self.section_by_id(&id) {
+                    self.input_mode = InputMode::SectionSettings {
+                        section_id: Some(id.clone()),
+                        name: sec.name.clone(),
+                        color: sec.color.clone(),
+                        active_field: 0,
+                    };
+                }
             }
         }
     }
@@ -2793,6 +2947,18 @@ impl App {
                         self.should_quit = true;
                         return true;
                     }
+                    KeyCode::Char('j')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.reorder_section_key(1);
+                        return true;
+                    }
+                    KeyCode::Char('k')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.reorder_section_key(-1);
+                        return true;
+                    }
                     KeyCode::Char('j') => {
                         let prev = self.cursor_session_uid();
                         self.navigate(1);
@@ -2871,6 +3037,10 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('d') => {
+                        if matches!(self.cursor, Cursor::Section(_)) {
+                            self.set_status_msg("A section is not a task — nothing to mark done");
+                            return true;
+                        }
                         self.input_mode = InputMode::Confirm {
                             prompt: "Mark task done? Sessions for this task will close.".to_string(),
                             action: ConfirmAction::MarkDone,
@@ -2878,6 +3048,14 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('x') => {
+                        if let Cursor::Section(id) = &self.cursor {
+                            self.input_mode = InputMode::Confirm {
+                                prompt: "Delete this section? Its workspaces stay (they become loose)."
+                                    .to_string(),
+                                action: ConfirmAction::DeleteSection { section_id: id.clone() },
+                            };
+                            return true;
+                        }
                         let prompt = if self.cursor_task_id().is_some() {
                             "Delete this task and close its sessions?".to_string()
                         } else {
@@ -2968,8 +3146,32 @@ impl App {
                         self.open_snapshot_catalog(None);
                         return true;
                     }
+                    // A-N (Alt+Shift+n): new sidebar section. Same
+                    // Char('N') / Char('n')+SHIFT idiom as A-W / A-R above.
+                    // (Planning's A-N "new subtask" is dispatched in
+                    // planning.rs before this match.)
+                    KeyCode::Char('N') => {
+                        self.open_new_section();
+                        return true;
+                    }
+                    KeyCode::Char('n')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.open_new_section();
+                        return true;
+                    }
                     KeyCode::Char('n') => {
                         self.start_new_session();
+                        return true;
+                    }
+                    // A-J / A-K: reorder the focused section (mirrors the
+                    // planning view's A-J/K row reorder). No-op elsewhere.
+                    KeyCode::Char('J') => {
+                        self.reorder_section_key(1);
+                        return true;
+                    }
+                    KeyCode::Char('K') => {
+                        self.reorder_section_key(-1);
                         return true;
                     }
                     // Cloud push/pull moved off A-p / A-l (freed for the
@@ -3038,13 +3240,15 @@ impl App {
         // Space-fold idiom). Guarded on the cursor so a stray Space while a
         // real session is focused still reaches its terminal below.
         if let CrosstermEvent::Key(key) = event {
-            if matches!(self.cursor, Cursor::Backtest(_))
+            if matches!(self.cursor, Cursor::Backtest(_) | Cursor::Section(_))
                 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
                 && !key
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
             {
-                self.toggle_backtest_fold();
+                if !self.toggle_backtest_fold() {
+                    self.toggle_section_fold();
+                }
                 return true;
             }
         }
@@ -3300,6 +3504,8 @@ impl App {
         // (1-3 entries) so the cost is negligible.
         let host_ids: Vec<cm_daemon::host_id::HostId> =
             self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
+        // Section ids for the workspace / task settings pickers.
+        let section_ids: Vec<String> = self.section_ids();
         let outcome = match &mut self.input_mode {
             InputMode::ContinuousControl(menu) => match event {
                 CrosstermEvent::Key(key) => menu.key(*key),
@@ -3326,7 +3532,7 @@ impl App {
                     host_id,
                     active_field,
                 },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
             InputMode::NewTerminalSession {
@@ -3345,7 +3551,7 @@ impl App {
                     resume_from,
                     active_field,
                 },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
             InputMode::SessionSettings {
@@ -3375,19 +3581,37 @@ impl App {
                     color,
                     active_field,
                 },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
-            InputMode::WorkspaceSettings { ws_index, name, color, pinned, active_field } => {
-                handle_workspace_settings(
-                    WorkspaceSettingsMut {
-                        ws_index: *ws_index,
+            InputMode::WorkspaceSettings {
+                ws_index,
+                name,
+                color,
+                pinned,
+                section,
+                active_field,
+            } => handle_workspace_settings(
+                WorkspaceSettingsMut {
+                    ws_index: *ws_index,
+                    name,
+                    color,
+                    pinned,
+                    section,
+                    active_field,
+                },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
+                event,
+            ),
+            InputMode::SectionSettings { section_id, name, color, active_field } => {
+                handle_section_settings(
+                    SectionSettingsMut {
+                        section_id: section_id.as_deref(),
                         name,
                         color,
-                        pinned,
                         active_field,
                     },
-                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                     event,
                 )
             }
@@ -3407,7 +3631,7 @@ impl App {
                     active_field,
                     error,
                 },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
             InputMode::SnapshotCatalog {
@@ -3424,18 +3648,19 @@ impl App {
                     picker_target: picker_target.as_ref(),
                     status_msg,
                 },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
-            InputMode::TaskSettings { task_id, name, color, active_field } => {
+            InputMode::TaskSettings { task_id, name, color, section, active_field } => {
                 handle_task_settings(
                     TaskSettingsMut {
                         task_id: task_id.as_str(),
                         name,
                         color,
+                        section,
                         active_field,
                     },
-                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                     event,
                 )
             }
@@ -3455,7 +3680,7 @@ impl App {
                     goal,
                     cursor_task_id: cursor_task_id.as_deref(),
                 },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
             InputMode::WorkflowPicker {
@@ -3472,17 +3697,17 @@ impl App {
                     selected,
                     cursor_task_id: cursor_task_id.as_deref(),
                 },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
             InputMode::WorkflowHistory { run_id: _ } => {
-                handle_workflow_history(InputCtx { repo_urls: &urls, host_ids: &host_ids }, event)
+                handle_workflow_history(InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids }, event)
             }
             InputMode::PastWorkspacePicker { candidates, selected } => {
                 handle_past_workspace_picker(
                     candidates,
                     selected,
-                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                     event,
                 )
             }
@@ -3491,7 +3716,7 @@ impl App {
                     candidates,
                     query,
                     selected,
-                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                     event,
                 )
             }
@@ -3499,13 +3724,13 @@ impl App {
                 handle_task_peek(scroll, *max_scroll, event)
             }
             InputMode::Confirm { action, .. } => {
-                handle_confirm(action, InputCtx { repo_urls: &urls, host_ids: &host_ids }, event)
+                handle_confirm(action, InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids }, event)
             }
             InputMode::TranscriptPicker { candidates, selected, .. } => {
                 handle_transcript_picker(
                     candidates,
                     selected,
-                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                     event,
                 )
             }
@@ -3777,8 +4002,20 @@ impl App {
                     None => self.set_status_msg("Settings saved"),
                 }
             }
-            SubmitAction::SaveWorkspaceSettings { ws_index, name, color, pinned } => {
+            SubmitAction::SaveWorkspaceSettings { ws_index, name, color, pinned, section } => {
                 let mut pinned_changed = false;
+                if let Some(ws_id) = self.workspaces.get(ws_index).map(|w| w.id.clone()) {
+                    // Sidecar map, not a Workspace field — write it before
+                    // the save below so one manifest write carries both.
+                    match section {
+                        Some(sid) => {
+                            self.workspace_sections.insert(ws_id, sid);
+                        }
+                        None => {
+                            self.workspace_sections.remove(&ws_id);
+                        }
+                    }
+                }
                 if let Some(ws) = self.workspaces.get_mut(ws_index) {
                     // An emptied name keeps the old one (matches the old
                     // rename-only behavior); color/pinned always apply.
@@ -3818,7 +4055,7 @@ impl App {
                 // emits it.
                 let _ = name;
             }
-            SubmitAction::SaveTaskName { task_id, name, color } => {
+            SubmitAction::SaveTaskName { task_id, name, color, section } => {
                 // Color rides the local manifest sidecar, not the API row —
                 // apply it regardless of whether the rename half is valid.
                 match color {
@@ -3827,6 +4064,30 @@ impl App {
                     }
                     None => {
                         self.task_colors.remove(&task_id);
+                    }
+                }
+                // Section applies to the task's bound workspace (the row the
+                // form was opened from, else the binding).
+                let ws_id = match &self.cursor {
+                    Cursor::Task { ws_idx, .. } => {
+                        self.workspaces.get(*ws_idx).map(|w| w.id.clone())
+                    }
+                    _ => None,
+                }
+                .or_else(|| {
+                    self.tasks
+                        .iter()
+                        .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
+                        .and_then(|t| t.workspace_id.clone())
+                });
+                if let Some(ws_id) = ws_id {
+                    match section {
+                        Some(sid) => {
+                            self.workspace_sections.insert(ws_id, sid);
+                        }
+                        None => {
+                            self.workspace_sections.remove(&ws_id);
+                        }
                     }
                 }
                 self.save_session_manifest();
@@ -3891,6 +4152,22 @@ impl App {
             }
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
+            SubmitAction::SaveSection { section_id, name, color } => match section_id {
+                Some(id) => {
+                    self.update_section(&id, &name, color);
+                    self.set_status_msg("Section saved");
+                }
+                None => {
+                    self.create_section(&name, color);
+                    self.set_status_msg(
+                        "Section created — A-e on a workspace/task to add it, A-n creates inside",
+                    );
+                }
+            },
+            SubmitAction::DeleteSection { section_id } => {
+                self.delete_section(&section_id);
+                self.set_status_msg("Section deleted — its workspaces are loose now");
+            }
             SubmitAction::StopWorkflow { run_id } => self.stop_workflow_run(&run_id),
             SubmitAction::ReopenPastWorkspace { ws_id } => {
                 self.reopen_workspace_by_id(&ws_id);
@@ -4099,7 +4376,7 @@ mod input_handler_tests {
     }
 
     fn ctx_no_repos<'a>() -> InputCtx<'a> {
-        InputCtx { repo_urls: &[], host_ids: &[] }
+        InputCtx { repo_urls: &[], host_ids: &[], section_ids: &[] }
     }
 
     fn assert_consumed(o: &InputOutcome) {
@@ -4356,7 +4633,7 @@ mod input_handler_tests {
                 host_id: &mut host,
                 active_field: &mut active,
             },
-            InputCtx { repo_urls: &urls, host_ids: &[] },
+            InputCtx { repo_urls: &urls, host_ids: &[], section_ids: &[] },
             &key(KeyCode::Right),
         );
         assert_consumed(&outcome);
@@ -4652,7 +4929,7 @@ mod input_handler_tests {
                     host_id: host,
                     active_field: &mut active,
                 },
-                InputCtx { repo_urls: &[], host_ids: &hosts },
+                InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
                 &key(code),
             );
         };
@@ -4691,7 +4968,7 @@ mod input_handler_tests {
                 host_id: &mut host,
                 active_field: &mut active,
             },
-            InputCtx { repo_urls: &[], host_ids: &hosts },
+            InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
             &key(KeyCode::Right),
         );
         let outcome = handle_new_session(
@@ -4705,7 +4982,7 @@ mod input_handler_tests {
                 host_id: &mut host,
                 active_field: &mut active,
             },
-            InputCtx { repo_urls: &[], host_ids: &hosts },
+            InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
             &key(KeyCode::Enter),
         );
         match outcome {
@@ -5872,12 +6149,14 @@ mod input_handler_tests {
     fn workspace_settings_char_appends() {
         let mut name = "foo".to_string();
         let (mut color, mut pinned, mut active) = (None::<String>, false, 0u8);
+        let mut section: Option<String> = None;
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
                 ws_index: 0,
                 name: &mut name,
                 color: &mut color,
                 pinned: &mut pinned,
+                section: &mut section,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -5891,12 +6170,14 @@ mod input_handler_tests {
     fn workspace_settings_backspace_pops() {
         let mut name = "abc".to_string();
         let (mut color, mut pinned, mut active) = (None::<String>, false, 0u8);
+        let mut section: Option<String> = None;
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
                 ws_index: 0,
                 name: &mut name,
                 color: &mut color,
                 pinned: &mut pinned,
+                section: &mut section,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -5910,12 +6191,14 @@ mod input_handler_tests {
     fn workspace_settings_enter_submits_trimmed_name() {
         let mut name = "  hello  ".to_string();
         let (mut color, mut pinned, mut active) = (None::<String>, false, 0u8);
+        let mut section: Option<String> = None;
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
                 ws_index: 3,
                 name: &mut name,
                 color: &mut color,
                 pinned: &mut pinned,
+                section: &mut section,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -5927,6 +6210,7 @@ mod input_handler_tests {
                 name,
                 color,
                 pinned,
+                ..
             }) => {
                 assert_eq!(ws_index, 3);
                 assert_eq!(name, "hello");
@@ -5941,12 +6225,14 @@ mod input_handler_tests {
     fn workspace_settings_esc_cancels() {
         let mut name = "n".to_string();
         let (mut color, mut pinned, mut active) = (None::<String>, false, 0u8);
+        let mut section: Option<String> = None;
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
                 ws_index: 0,
                 name: &mut name,
                 color: &mut color,
                 pinned: &mut pinned,
+                section: &mut section,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -6755,11 +7041,13 @@ mod input_handler_tests {
         let task_id = "task-id-1".to_string();
         let mut name = "abc".to_string();
         let (mut color, mut active) = (None::<String>, 0u8);
+        let mut section: Option<String> = None;
         let outcome = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
                 name: &mut name,
                 color: &mut color,
+                section: &mut section,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -6774,18 +7062,20 @@ mod input_handler_tests {
         let task_id = "task-id-1".to_string();
         let mut name = " new name ".to_string();
         let (mut color, mut active) = (Some("cyan".to_string()), 0u8);
+        let mut section: Option<String> = None;
         let outcome = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
                 name: &mut name,
                 color: &mut color,
+                section: &mut section,
                 active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
         );
         match outcome {
-            InputOutcome::Submit(SubmitAction::SaveTaskName { task_id, name, color }) => {
+            InputOutcome::Submit(SubmitAction::SaveTaskName { task_id, name, color, .. }) => {
                 assert_eq!(task_id, "task-id-1");
                 assert_eq!(name, "new name");
                 assert_eq!(color.as_deref(), Some("cyan"));
@@ -6799,11 +7089,13 @@ mod input_handler_tests {
         let task_id = "task-id-1".to_string();
         let mut name = "abc".to_string();
         let (mut color, mut active) = (None::<String>, 1u8);
+        let mut section: Option<String> = None;
         let outcome = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
                 name: &mut name,
                 color: &mut color,
+                section: &mut section,
                 active_field: &mut active,
             },
             ctx_no_repos(),

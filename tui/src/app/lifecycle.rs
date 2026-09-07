@@ -1247,8 +1247,9 @@ impl App {
                 self.needs_redraw = true;
                 return;
             }
-            // Backtest rows have no hidden bit — the group folds instead.
-            Cursor::Backtest(_) => return,
+            // Backtest rows have no hidden bit — the group folds instead;
+            // section headers likewise.
+            Cursor::Backtest(_) | Cursor::Section(_) => return,
         };
         if let Some(ts) = self
             .workspaces
@@ -1845,6 +1846,9 @@ impl App {
                      the group on their own",
                 );
             }
+            Cursor::Section(_) => {
+                self.set_status_msg("A section has no session to close (A-x deletes the section)");
+            }
         }
     }
 
@@ -1924,6 +1928,10 @@ impl App {
         // can't tag the session with a different host mid-create. (Was the
         // 12e-r2 F1 active_host snapshot before the picker landed.)
         let active_host = chosen_host.clone();
+        // Sidebar sections: a workspace created while the cursor is inside a
+        // section (its header, or any row of a member workspace) joins that
+        // section. Captured BEFORE the spawn moves the cursor.
+        let inherit_section = self.cursor_section_id();
         // Phase 3 (remote-session-execution): a non-local chosen host routes
         // A-n to the daemon-resolved `create_session` path — the daemon makes
         // the worktree and builds argv/env on its OWN filesystem, then the TUI
@@ -2149,7 +2157,12 @@ impl App {
             is_pushing: false,
         };
         let new_wi = self.workspaces.len();
+        let new_ws_id = ws.id.clone();
         self.workspaces.push(ws);
+        if let Some(sid) = inherit_section {
+            // Persisted by the manifest save further down this path.
+            self.workspace_sections.insert(new_ws_id, sid);
+        }
         // Sub-2b-1 review-r#2 #3: seeded sessions have a known
         // transcript_id at construction time (the clone's id —
         // see `cloned_transcript_id`). The discovery loop's
@@ -2365,7 +2378,12 @@ impl App {
             is_pushing: false,
         };
         let new_wi = self.workspaces.len();
+        let new_ws_id = ws.id.clone();
         self.workspaces.push(ws);
+        if let Some(sid) = self.cursor_section_id() {
+            // Same A-n-inside-a-section inheritance as the local path.
+            self.workspace_sections.insert(new_ws_id, sid);
+        }
         self.cursor = Cursor::Session(new_wi, 0);
         self.save_session_manifest();
         self.set_status_msg(&format!("Workspace created on `{}`", host.as_str()));
@@ -3643,7 +3661,7 @@ impl App {
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => *wi,
             Cursor::Task { ws_idx, .. } => *ws_idx,
             // Not on any workspace — nothing to exempt from the sweep.
-            Cursor::Backtest(_) => usize::MAX,
+            Cursor::Backtest(_) | Cursor::Section(_) => usize::MAX,
         };
 
         let mut changed = false;
@@ -6223,6 +6241,8 @@ mod slice_12e_tests {
             view: Some("status".to_string()),
             hide_continuous: false,
             continuous_column_on: false,
+            sections: Vec::new(),
+            workspace_sections: HashMap::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6414,6 +6434,8 @@ remote_socket = "/remote/manager.sock"
             view: Some("task".to_string()),
             hide_continuous: false,
             continuous_column_on: false,
+            sections: Vec::new(),
+            workspace_sections: HashMap::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),

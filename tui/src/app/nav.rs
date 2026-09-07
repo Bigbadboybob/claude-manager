@@ -304,6 +304,11 @@ pub enum Cursor {
     /// Identified structurally (stem / task_id), not by index, so it
     /// survives rows entering/leaving the group between refreshes.
     Backtest(BacktestCursor),
+    /// Cursor is on a sidebar section header (Task sub-view), by section
+    /// id — stable across reorders and member churn. Space/Enter fold it,
+    /// A-e / A-x / A-J / A-K edit / delete / reorder it, and A-n creates a
+    /// workspace inside it. See `app/sections.rs`.
+    Section(String),
 }
 
 /// Which row of the `backtests` group the cursor is on. Space/Enter (which
@@ -372,6 +377,10 @@ pub(super) enum VisualItem {
     /// One backtest run. `depth` is 1 for fleet members (indented under
     /// their fleet row), 0 for singletons. Selectable (A-i peeks it).
     BacktestRun { task_id: String, depth: u8 },
+    /// Sidebar section header (Task sub-view only). Selectable; its member
+    /// workspaces follow until the next section header / separator unless
+    /// the section is folded. See doc/sidebar-sections.md.
+    SectionHeader(String),
 }
 
 /// One row in the dedicated continuous column (the two-column panel, S2 of
@@ -537,7 +546,7 @@ impl App {
             ),
             // Backtest rows live outside the workspace list — the reorder
             // can't move them, so the cursor needs no re-resolution.
-            Cursor::Backtest(_) => (None, None, None),
+            Cursor::Backtest(_) | Cursor::Section(_) => (None, None, None),
         };
         self.workspaces.sort_by_key(|w| !w.pinned);
         if let Some(id) = saved_ws_id {
@@ -594,6 +603,14 @@ impl App {
             }
             return;
         }
+        // A section header is valid regardless of the workspace list (an
+        // empty section still renders); a deleted section falls back.
+        if let Cursor::Section(id) = &self.cursor {
+            if self.section_index(id).is_none() {
+                self.cursor = Cursor::Workspace(0);
+            }
+            return;
+        }
         if self.workspaces.is_empty() {
             self.cursor = Cursor::Workspace(0);
             return;
@@ -631,8 +648,8 @@ impl App {
                     self.cursor = Cursor::Workspace(wi);
                 }
             }
-            // Fully handled by the early-return at the top of this fn.
-            Cursor::Backtest(_) => {}
+            // Fully handled by the early-returns at the top of this fn.
+            Cursor::Backtest(_) | Cursor::Section(_) => {}
         }
     }
 
@@ -878,26 +895,62 @@ impl App {
     /// follows. Past workspaces are hidden — reachable via the A-O picker.
     pub(super) fn visual_items_task(&self) -> Vec<VisualItem> {
         let members = self.continuous_members();
+        // Visibility filter shared with the section rollup: open, not past,
+        // and not continuous-only (those render in the continuous column,
+        // never here — see `task_view_visible_workspaces`).
+        let visible = self.task_view_visible_workspaces(&members);
         let mut items = Vec::new();
-        let mut first = true;
-        for (wi, ws) in self.workspaces.iter().enumerate() {
-            if ws.is_closed || self.is_past_workspace(wi) {
-                continue;
+
+        // Sections first, in display order. Each header is followed by its
+        // member workspaces (explicit assignment or inherited through the
+        // task tree — `section_of_workspace`) unless folded. An empty
+        // section still shows its header so it can be populated.
+        let mut loose: Vec<usize> = Vec::new();
+        let mut by_section: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for &wi in &visible {
+            match self.section_of_workspace(wi) {
+                Some(sid) => by_section.entry(sid).or_default().push(wi),
+                None => loose.push(wi),
             }
-            // Continuous-orchestrator sessions + their subtasks render only in
-            // the dedicated column (or are hidden when it's off). A workspace
-            // whose ONLY sessions are continuous members — the orchestrator's
-            // own workspace, a cm-sub subtask workspace — is skipped entirely so
-            // no bare header is left in the main sidebar.
-            if !ws.sessions.is_empty()
-                && (0..ws.sessions.len()).all(|si| members.contains(&(wi, si)))
-            {
-                continue;
-            }
-            if !first {
+        }
+        for sec in &self.sections {
+            if !items.is_empty() {
                 items.push(VisualItem::Separator);
             }
-            first = false;
+            items.push(VisualItem::SectionHeader(sec.id.clone()));
+            if sec.folded {
+                continue;
+            }
+            let mut first_in_section = true;
+            for wi in by_section.remove(&sec.id).unwrap_or_default() {
+                if !first_in_section {
+                    items.push(VisualItem::Separator);
+                }
+                first_in_section = false;
+                self.push_task_view_workspace(&mut items, wi, &members);
+            }
+        }
+        // Loose workspaces (no section) follow, exactly as pre-feature.
+        for wi in loose {
+            if !items.is_empty() {
+                items.push(VisualItem::Separator);
+            }
+            self.push_task_view_workspace(&mut items, wi, &members);
+        }
+        items
+    }
+
+    /// One workspace's Task sub-view rows: the header, then its sessions
+    /// bucketed by task (subheaders) and workflow run (grouped).
+    fn push_task_view_workspace(
+        &self,
+        items: &mut Vec<VisualItem>,
+        wi: usize,
+        members: &std::collections::HashSet<(usize, usize)>,
+    ) {
+        let ws = &self.workspaces[wi];
+        {
             items.push(VisualItem::WorkspaceHeader(wi));
 
             // Partition sessions by task_id bucket. Unbound sessions live in
@@ -1003,9 +1056,7 @@ impl App {
                     }
                 }
             }
-
         }
-        items
     }
 
     /// Map each session task_id to its `parent_task_id` (from `self.tasks`).
@@ -1345,6 +1396,8 @@ impl App {
             VisualItem::BacktestHeader => true,
             VisualItem::BacktestFleet(_) => true,
             VisualItem::BacktestRun { .. } => true,
+            // Section headers fold on Space/Enter and take A-e/A-x/A-n.
+            VisualItem::SectionHeader(_) => true,
         };
 
         if !items.iter().any(is_selectable) {
@@ -1374,6 +1427,7 @@ impl App {
                     Cursor::Backtest(BacktestCursor::Run(tid)),
                     VisualItem::BacktestRun { task_id: vtid, .. },
                 ) => tid == vtid,
+                (Cursor::Section(id), VisualItem::SectionHeader(vid)) => id == vid,
                 _ => false,
             })
             .unwrap_or(0);
@@ -1404,6 +1458,9 @@ impl App {
             }
             VisualItem::BacktestRun { task_id, .. } => {
                 self.cursor = Cursor::Backtest(BacktestCursor::Run(task_id.clone()));
+            }
+            VisualItem::SectionHeader(id) => {
+                self.cursor = Cursor::Section(id.clone());
             }
             _ => {}
         }
@@ -1802,6 +1859,36 @@ impl App {
                 }
             }
             Cursor::Backtest(bc) => out.extend(self.backtest_peek_lines(bc)),
+            Cursor::Section(id) => {
+                if let Some(sec) = self.section_by_id(id) {
+                    let (n, running, idle) = self.section_rollup(id);
+                    out.push(PeekLine::Title(format!("Section: {}", sec.name)));
+                    out.push(PeekLine::Field {
+                        label: "Workspaces".into(),
+                        value: n.to_string(),
+                    });
+                    out.push(PeekLine::Field {
+                        label: "Sessions".into(),
+                        value: format!("{} running, {} idle", running, idle),
+                    });
+                    out.push(PeekLine::Blank);
+                    for wi in self.section_members(id) {
+                        let explicit = self
+                            .workspace_sections
+                            .get(&self.workspaces[wi].id)
+                            .is_some();
+                        out.push(PeekLine::Text(format!(
+                            "  {}{}",
+                            self.workspaces[wi].name,
+                            if explicit { "" } else { "  (inherited)" }
+                        )));
+                    }
+                    out.push(PeekLine::Blank);
+                    out.push(PeekLine::Text(
+                        "Space fold · A-e edit · A-x delete · A-J/K reorder · A-n new ws here".into(),
+                    ));
+                }
+            }
         }
         if out.is_empty() {
             out.push(PeekLine::Text("Nothing focused.".into()));
@@ -2119,7 +2206,7 @@ mod nav_quickswitch_tests {
     }
 
     fn ctx<'a>() -> InputCtx<'a> {
-        InputCtx { repo_urls: &[], host_ids: &[] }
+        InputCtx { repo_urls: &[], host_ids: &[], section_ids: &[] }
     }
 
     // ── palette_match_indices ─────────────────────────────────────

@@ -115,6 +115,8 @@ impl App {
             hide_continuous: self.hide_continuous,
             continuous_column_on: self.continuous_column_on,
             task_colors: self.task_colors.clone(),
+            sections: self.sections.clone(),
+            workspace_sections: self.workspace_sections.clone(),
         };
 
         let path = Self::manifest_path();

@@ -1134,6 +1134,8 @@ impl DaemonState {
             // TUI-only view state; the daemon-owned registry doesn't track it.
             continuous_column_on: false,
             task_colors: HashMap::new(),
+            sections: Vec::new(),
+            workspace_sections: HashMap::new(),
         }
     }
 

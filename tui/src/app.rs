@@ -30,6 +30,8 @@ use cm_daemon::worktree;
 
 mod backtests;
 use backtests::*;
+mod sections;
+use sections::*;
 mod model;
 use model::*;
 mod nav;
@@ -324,6 +326,13 @@ pub struct App {
     /// manifest as a sidecar (`Manifest::task_colors`). Consumed by the
     /// sidebar `TaskHeader` arm; edited via A-e on a task row.
     pub task_colors: HashMap<String, String>,
+    /// Sidebar sections (doc/sidebar-sections.md) in display order.
+    /// Persisted as `Manifest::sections`; see `app/sections.rs`.
+    pub(crate) sections: Vec<SidebarSection>,
+    /// Explicit `workspace_id` → section choice (`SECTION_NONE` = pulled
+    /// out to loose). Absent = inherit through the task tree. Persisted as
+    /// `Manifest::workspace_sections`.
+    pub(crate) workspace_sections: HashMap<String, String>,
     /// Cloud backtest runs, rendered as the sidebar's `backtests` group
     /// instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
@@ -625,6 +634,7 @@ impl App {
         let hide_continuous = manifest.hide_continuous;
         let continuous_column_on = manifest.continuous_column_on;
         let task_colors = manifest.task_colors.clone();
+        let sections = manifest.sections.clone();
         // Only keep bindings whose target workspace still exists in the
         // manifest — otherwise we'd set workspace_id to a dangling id that
         // nothing resolves to.
@@ -633,6 +643,15 @@ impl App {
             .bindings
             .iter()
             .filter(|(_, ws_id)| known_ws_ids.contains(ws_id))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // Section assignments: drop ones whose workspace is gone; a
+        // dangling section id is kept (the resolver treats it as auto) so
+        // a hand-edited manifest degrades rather than silently rewrites.
+        let workspace_sections: HashMap<String, String> = manifest
+            .workspace_sections
+            .iter()
+            .filter(|(ws_id, _)| known_ws_ids.contains(ws_id))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let workflows_dir = workflow::toml_schema::workflows_dir();
@@ -860,6 +879,8 @@ impl App {
             hide_continuous,
             continuous_column_on,
             task_colors,
+            sections,
+            workspace_sections,
             backtest_rows: Vec::new(),
             backtests_folded: false,
             backtest_unfolded_fleets: HashSet::new(),
@@ -944,7 +965,7 @@ impl App {
             Cursor::Workspace(wi) => *wi,
             Cursor::Task { ws_idx, .. } => *ws_idx,
             Cursor::Session(wi, _) => *wi,
-            Cursor::Backtest(_) => return None,
+            Cursor::Backtest(_) | Cursor::Section(_) => return None,
         };
         (wi < self.workspaces.len()).then_some(wi)
     }
@@ -966,6 +987,8 @@ impl App {
             // (A-d done, A-x delete) must not act on a backtest task from
             // the sidebar — the dispatch daemon owns its lifecycle.
             Cursor::Backtest(_) => None,
+            // A section header is a display grouping, not a task.
+            Cursor::Section(_) => None,
         }
     }
 
@@ -1000,7 +1023,7 @@ impl App {
             }
             // No PTY behind backtest rows — plain keys fall through to the
             // fold toggle in input.rs instead of a terminal.
-            Cursor::Backtest(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) => None,
         }
     }
 
@@ -1036,7 +1059,7 @@ impl App {
                 }
                 ws.sessions.get_mut(found_idx?)
             }
-            Cursor::Backtest(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) => None,
         }
     }
 
@@ -1193,6 +1216,7 @@ impl App {
 #[cfg(test)]
 const APP_SRC_FOR_SCAN: &str = concat!(
     include_str!("app/backtests.rs"),
+    include_str!("app/sections.rs"),
     include_str!("app/model.rs"),
     include_str!("app/nav.rs"),
     include_str!("app/workflow_ui.rs"),

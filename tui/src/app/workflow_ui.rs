@@ -567,6 +567,10 @@ impl App {
                 );
                 return;
             }
+            Cursor::Section(_) => {
+                self.set_status_msg("Focus a session or task to launch a workflow");
+                return;
+            }
         };
         if wi >= self.workspaces.len() {
             self.set_status_msg("No workspace selected");
@@ -958,7 +962,7 @@ impl App {
                 })
             }
             Cursor::Workspace(_) => None,
-            Cursor::Backtest(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) => None,
         }
     }
 }

@@ -308,13 +308,31 @@ impl App {
                 InputMode::TranscriptPicker { candidates, selected, target } => {
                     self.draw_transcript_picker(frame, area, candidates, *selected, target);
                 }
-                InputMode::WorkspaceSettings { name, color, pinned, active_field, .. } => {
+                InputMode::WorkspaceSettings {
+                    name,
+                    color,
+                    pinned,
+                    section,
+                    active_field,
+                    ..
+                } => {
                     self.draw_workspace_settings(
                         frame,
                         area,
                         name,
                         color.as_deref(),
                         *pinned,
+                        section.as_deref(),
+                        *active_field,
+                    );
+                }
+                InputMode::SectionSettings { section_id, name, color, active_field } => {
+                    self.draw_section_settings(
+                        frame,
+                        area,
+                        section_id.is_none(),
+                        name,
+                        color.as_deref(),
                         *active_field,
                     );
                 }
@@ -365,8 +383,15 @@ impl App {
                         goal,
                     );
                 }
-                InputMode::TaskSettings { name, color, active_field, .. } => {
-                    self.draw_task_settings(frame, area, name, color.as_deref(), *active_field);
+                InputMode::TaskSettings { name, color, section, active_field, .. } => {
+                    self.draw_task_settings(
+                        frame,
+                        area,
+                        name,
+                        color.as_deref(),
+                        section.as_deref(),
+                        *active_field,
+                    );
                 }
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
@@ -401,10 +426,11 @@ impl App {
         area: Rect,
         name: &str,
         color: Option<&str>,
+        section: Option<&str>,
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 7u16;
+        let height = 9u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -437,8 +463,102 @@ impl App {
                 Line::from(spans)
             },
             Line::from(""),
+            self.section_picker_line("Section: ", section, active_field == 2),
+            Line::from(""),
             Line::from(Span::styled(
                 "Tab next \u{00b7} Enter save \u{00b7} Esc cancel",
+                dim,
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// `<label>: <choice>` row for the sidebar-section picker on the
+    /// workspace / task settings forms. `auto` = inherit through the task
+    /// tree, `none` = explicitly loose, else the section name.
+    fn section_picker_line(
+        &self,
+        label: &str,
+        section: Option<&str>,
+        focused: bool,
+    ) -> Line<'static> {
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
+        let mut spans = vec![Span::styled(label.to_string(), if focused { white } else { dim })];
+        let value = self.section_choice_label(section);
+        let value_style = match section {
+            Some(id) if !id.is_empty() => self
+                .section_by_id(id)
+                .and_then(|s| s.color.as_deref())
+                .and_then(theme::user_color)
+                .map(|c| Style::default().fg(c))
+                .unwrap_or(white),
+            _ => white,
+        };
+        spans.push(Span::styled(value, value_style));
+        if focused {
+            spans.push(Span::styled(
+                if self.sections.is_empty() {
+                    "  \u{2190}/\u{2192}  (no sections yet — A-N creates one)".to_string()
+                } else {
+                    "  \u{2190}/\u{2192}".to_string()
+                },
+                dim,
+            ));
+        }
+        Line::from(spans)
+    }
+
+    /// Create / edit form for a sidebar section (A-N / A-e on a header).
+    fn draw_section_settings(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        creating: bool,
+        name: &str,
+        color: Option<&str>,
+        active_field: u8,
+    ) {
+        let width = 60u16.min(area.width.saturating_sub(4));
+        let height = 7u16;
+        let x = (area.width.saturating_sub(width)) / 2;
+        let y = (area.height.saturating_sub(height)) / 2;
+        let dialog_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::TEXT))
+            .title(if creating { " New Section " } else { " Section Settings " });
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
+        let name_cursor = if active_field == 0 { "\u{2588}" } else { "" };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("   Name: ", dim),
+                Span::styled(name.to_string(), white),
+                Span::styled(name_cursor, white),
+            ]),
+            Line::from(""),
+            {
+                let mut spans = vec![Span::styled(
+                    "  Color: ",
+                    if active_field == 1 { white } else { dim },
+                )];
+                spans.extend(color_picker_spans(color, active_field == 1));
+                Line::from(spans)
+            },
+            Line::from(""),
+            Line::from(Span::styled(
+                if creating {
+                    "Tab next \u{00b7} Enter create \u{00b7} Esc cancel"
+                } else {
+                    "Tab next \u{00b7} Enter save \u{00b7} Esc cancel"
+                },
                 dim,
             )),
         ];
@@ -957,10 +1077,11 @@ impl App {
         name: &str,
         color: Option<&str>,
         pinned: bool,
+        section: Option<&str>,
         active_field: u8,
     ) {
-        let width = 55u16.min(area.width.saturating_sub(4));
-        let height = 9u16;
+        let width = 60u16.min(area.width.saturating_sub(4));
+        let height = 11u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -1008,6 +1129,8 @@ impl App {
                     dim,
                 ),
             ]),
+            Line::from(""),
+            self.section_picker_line(" Section: ", section, active_field == 3),
             Line::from(""),
             Line::from(Span::styled(
                 "Tab next \u{00b7} Enter save \u{00b7} Esc cancel  (branch unchanged)",
@@ -1447,6 +1570,7 @@ impl App {
             ("A-C    cont-stop", ""),
             ("A-b    snapshot", "A-g  attention"),
             ("A-O    reopen ws", "A-9  push"),
+            ("A-N    +section", "A-J/K sect order"),
             ("PgUp/Dn scroll", "A-0  pull"),
             ("A-Ent  newline", "A-;  recent"),
             ("A-p    find", "A-i  info"),
@@ -1459,6 +1583,26 @@ impl App {
         let visual = self.visual_items();
         let mut items: Vec<ListItem> = Vec::new();
         let max = list_height as usize;
+        // Workspaces rendered inside a section get one extra leading space
+        // on every row (header, task subheaders, sessions, workflow
+        // headers) so the grouping reads at a glance. Resolved once per
+        // frame; empty when no sections exist (byte-identical pre-feature
+        // rendering).
+        let in_section: HashSet<usize> = if self.sections.is_empty() {
+            HashSet::new()
+        } else {
+            visual
+                .iter()
+                .filter_map(|vi| match vi {
+                    VisualItem::WorkspaceHeader(wi) => Some(*wi),
+                    _ => None,
+                })
+                .filter(|wi| self.section_of_workspace(*wi).is_some())
+                .collect()
+        };
+        let indent = |wi: usize| -> &'static str {
+            if in_section.contains(&wi) { " " } else { "" }
+        };
 
         for vi in &visual {
             if items.len() >= max {
@@ -1500,7 +1644,7 @@ impl App {
                     // name truncation sites below.
                     let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
-                    let mut header_spans = vec![Span::raw(" ")];
+                    let mut header_spans = vec![Span::raw(" "), Span::raw(indent(*wi))];
                     if ws.pinned {
                         header_spans.push(Span::raw("\u{1f4cc} "));
                     }
@@ -1647,10 +1791,10 @@ impl App {
                         }
                     };
 
-                    let mut spans = vec![Span::styled(
-                        format!(" {} ", indicator),
-                        indicator_style,
-                    )];
+                    let mut spans = vec![
+                        Span::raw(indent(*wi)),
+                        Span::styled(format!(" {} ", indicator), indicator_style),
+                    ];
                     // Vertical line prefix for sessions inside a workflow group
                     // (only in task view where grouping makes sense visually).
                     if in_active_workflow && self.sidebar_view == SidebarView::Task {
@@ -1737,6 +1881,7 @@ impl App {
                         })
                         .unwrap_or("");
                     let line = Line::from(vec![
+                        Span::raw(indent(*ws_idx)),
                         Span::styled(format!(" {} ", agg_indicator), agg_style),
                         Span::styled(
                             format!("\u{256d}\u{2500} {}{}", name, paused_suffix),
@@ -1778,8 +1923,51 @@ impl App {
                         Style::default().fg(theme::HEADER)
                     };
                     let line = Line::from(vec![
+                        Span::raw(indent(*ws_idx)),
                         Span::raw("  "),
                         Span::raw(name),
+                    ]);
+                    items.push(ListItem::new(line).style(base_style));
+                }
+                // Sidebar section header: `▾ Name` unfolded, `▸ Name (n)`
+                // with a running/idle rollup when folded. Colored by the
+                // section's accent (else HEADER); selection keeps White+BOLD.
+                VisualItem::SectionHeader(id) => {
+                    let is_selected = matches!(&self.cursor, Cursor::Section(cid) if cid == id);
+                    let Some(sec) = self.section_by_id(id) else {
+                        continue;
+                    };
+                    let (n, running, idle) = self.section_rollup(id);
+                    let glyph = if sec.folded { "\u{25b8}" } else { "\u{25be}" };
+                    let tail = if sec.folded {
+                        let mut t = format!("  ({})", n);
+                        if running > 0 {
+                            t.push_str(&format!(" \u{283f}{}", running));
+                        }
+                        if idle > 0 {
+                            t.push_str(&format!(" \u{25cf}{}", idle));
+                        }
+                        t
+                    } else {
+                        String::new()
+                    };
+                    let max_name = (inner.width as usize)
+                        .saturating_sub(3)
+                        .saturating_sub(tail.chars().count());
+                    let name = crate::planning::truncate_with_ellipsis(&sec.name, max_name);
+                    let accent = sec.color.as_deref().and_then(theme::user_color);
+                    let base_style = if is_selected {
+                        Style::default()
+                            .fg(theme::TEXT)
+                            .add_modifier(Modifier::BOLD)
+                    } else if let Some(c) = accent {
+                        Style::default().fg(c).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)
+                    };
+                    let line = Line::from(vec![
+                        Span::raw(format!("{} {}", glyph, name)),
+                        Span::styled(tail, Style::default().fg(theme::DIM)),
                     ]);
                     items.push(ListItem::new(line).style(base_style));
                 }

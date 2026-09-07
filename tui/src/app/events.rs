@@ -2471,7 +2471,7 @@ impl App {
             Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Task { ws_idx, .. } => self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
             // Not workspace-scoped; clamp_cursor re-validates it at the end.
-            Cursor::Backtest(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) => None,
         };
         let saved_session_uid = match &self.cursor {
             Cursor::Session(wi, si) => self
@@ -5758,6 +5758,8 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            sections: Vec::new(),
+            workspace_sections: HashMap::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -5967,6 +5969,8 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            sections: Vec::new(),
+            workspace_sections: HashMap::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6173,6 +6177,8 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            sections: Vec::new(),
+            workspace_sections: HashMap::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6321,6 +6327,8 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            sections: Vec::new(),
+            workspace_sections: HashMap::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6459,6 +6467,8 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            sections: Vec::new(),
+            workspace_sections: HashMap::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
