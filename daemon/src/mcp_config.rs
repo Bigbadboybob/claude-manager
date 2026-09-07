@@ -184,6 +184,8 @@ fn render_launcher_script(pairs: &[(String, String)]) -> String {
          \t[ -f \"$t_dir/$REL\" ] || return 1\n\
          \tif [ \"$REL\" = \"server.py\" ]; then\n\
          \t\t\"$t_py\" -c 'import mcp' >/dev/null 2>&1 || return 1\n\
+         \telif [ \"$REL\" = \"native_codex.py\" ]; then\n\
+         \t\t\"$t_py\" -c 'from websockets.asyncio.client import unix_connect; from websockets.asyncio.server import unix_serve' >/dev/null 2>&1 || return 1\n\
          \telse\n\
          \t\t\"$t_py\" -c '' >/dev/null 2>&1 || return 1\n\
          \tfi\n\
@@ -1552,6 +1554,61 @@ mod tests {
             String::from_utf8_lossy(&out3.stderr).contains("no working"),
             "stderr must name the failure",
         );
+    }
+
+    #[test]
+    fn launcher_native_codex_skips_override_without_asyncio_websockets() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().unwrap();
+        let server = root.path().join("server.py");
+        std::fs::write(&server, "").unwrap();
+        std::fs::write(root.path().join("native_codex.py"), "").unwrap();
+        let old_python = root.path().join("old-python");
+        // System Python runs successfully and can import mcp, but its old
+        // websockets package has no asyncio client/server API.
+        std::fs::write(&old_python, concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = '-c' ]; then\n",
+            "  case \"$2\" in *websockets.asyncio*) exit 1;; esac\n",
+            "  exit 0\n",
+            "fi\n",
+            "echo WRONG_INTERPRETER\nexit 77\n",
+        )).unwrap();
+        let good_python = root.path().join("venv-python");
+        std::fs::write(&good_python, concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = '-c' ]; then exit 0; fi\n",
+            "printf '%s\\n' \"$@\"\n",
+        )).unwrap();
+        for py in [&old_python, &good_python] {
+            std::fs::set_permissions(py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = root.path().join("launcher.sh");
+        let pairs = vec![(good_python.to_string_lossy().into_owned(), server.to_string_lossy().into_owned())];
+        std::fs::write(&script, render_launcher_script(&pairs)).unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg(&script).args(["native_codex.py", "--session-uid", "ts-test-1"])
+            .env("CM_MCP_SERVER", &server)
+            .env("CM_MCP_PYTHON", &old_python)
+            .output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!(
+            "{}\n--session-uid\nts-test-1\n", root.path().join("native_codex.py").display()
+        ));
+        // An explicitly selected compatible interpreter still takes priority.
+        std::fs::write(&script, render_launcher_script(&[])).unwrap();
+        let good = std::process::Command::new("/bin/sh")
+            .arg(&script).arg("native_codex.py")
+            .env("CM_MCP_SERVER", &server).env("CM_MCP_PYTHON", &good_python)
+            .output().unwrap();
+        assert!(good.status.success());
+        let bad = std::process::Command::new("/bin/sh")
+            .arg(&script).arg("native_codex.py")
+            .env("CM_MCP_SERVER", &server).env("CM_MCP_PYTHON", &old_python)
+            .output().unwrap();
+        assert!(!bad.status.success());
+        assert!(String::from_utf8_lossy(&bad.stderr).contains("no working"));
+        assert!(!String::from_utf8_lossy(&bad.stdout).contains("WRONG_INTERPRETER"));
     }
 
     #[test]
