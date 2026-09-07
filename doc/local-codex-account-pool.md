@@ -79,3 +79,7 @@ codex -c 'model_provider="openai"'
 The earlier proposal to send all laptop requests through cm-manager was tested with one disposable request and then abandoned before activation. Its prepared configuration is saved as `~/.local/share/cm-codex-pool/remote-config-unapplied.toml`. That directory's `setup-state.json` explicitly marks its role as remote-dashboard access only.
 
 References: [codex-lb onboarding](https://soju06.github.io/codex-lb/getting-started/), [refresh coordination implementation](https://github.com/Soju06/codex-lb/blob/v1.24.0/app/modules/accounts/refresh_claims.py), and [Codex custom-provider authentication](https://learn.chatgpt.com/docs/config-file/config-advanced#custom-model-providers).
+
+## Shared quota notifications
+
+The permanent [CM health watcher](cm-health-watch.md) on cm-manager sends pool-wide low, exhausted, unavailable and recovery notifications through the existing session-independent `cm-notify` command. Both pools use the same upstream accounts, so one notifier covers their shared quota. It does not alert on one depleted account while another has healthy quota; individual task/continuation failures remain separate diagnostics. Defaults are a 10% warning threshold, 20% recovery threshold, and a five-minute check cadence. Installed and verified September 7; see the [execution record](continuous-codex-migration-execution-20260907.md).

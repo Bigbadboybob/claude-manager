@@ -75,6 +75,6 @@ exception payloads are deliberately omitted.
 Replace only the marked temporary `cm-codex-migration-pilot-watch` cron line,
 preserving a backup and all independent probe/update jobs. This observer has no
 expiry. Neither installation nor replacement requires a daemon or LB restart.
-Disable the marked cron line to stop notifications; task scheduling is unaffected.
+After final manual migration signoff, remove the optional `migration` configuration block; pool and fleet monitoring continue. Disable the marked cron line to stop notifications; task scheduling is unaffected.
 
 Tests: `python3 -m unittest discover -s tests -p test_cm_health_watch.py`.
