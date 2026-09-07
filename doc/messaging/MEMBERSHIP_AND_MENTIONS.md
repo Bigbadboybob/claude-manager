@@ -21,8 +21,7 @@ This migration is
 retained once per channel. Merely reading a channel does not join it. An explicit
 leave survives retries, reconnects and restarts, even for a default channel.
 
-Admins can configure `default_join` on channel creation or update. Initially only
-`#general` is enabled. At first enrollment, a participant joins the channels whose
+Admins can configure `default_join` on channel creation or update. Initially `#general` and `#cm-general` are enabled. At first enrollment, a participant joins the channels whose
 default flag is enabled then. Changing that flag does not forcibly join existing
 participants or remove existing members. The daemon enrolls known and live
 participants, including Owner; an agent need not choose a messaging name first.

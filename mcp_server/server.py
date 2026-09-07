@@ -394,7 +394,7 @@ def chat_channels(action: str = "list", path: str | None = None,
     or conversation and a unique request_id. List supports joined_only and query
     (path/name/description). members returns the paginated channel roster.
     default_join is admin-only and enrolls new participants on first messaging
-    enrollment; #general starts enabled. Explicit leaves survive reconnects.
+    enrollment; #general and #cm-general start enabled. Explicit leaves survive reconnects.
     Joining does not enable all-message alerts; DMs/direct mentions/@here are default.
 
     Create requires path and request_id; name defaults to path. Paths/IDs are

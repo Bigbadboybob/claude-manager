@@ -325,8 +325,15 @@ impl Store {
             s.degraded = Some(format!("Recovery reconciliation failed: {e}"));
             return Ok(s);
         }
-        if !s.channels.contains_key("general") {
-            s.publish("channel.create",None,"System created #general",json!({"membership_version":1,"channels":[{"path":"general","id":uuid(),"description":"Shared discussion","default_join":true}]}),"system","System","system","bootstrap-general","")?;
+        for (path, description) in [
+            ("general", "Shared discussion"),
+            ("cm-general", "Claude Manager usage, coordination, upcoming changes and release notes"),
+        ] {
+            if !s.channels.contains_key(path) {
+                s.publish("channel.create", None, &format!("System created #{path}"),
+                    json!({"membership_version":1,"channels":[{"path":path,"id":uuid(),"description":description,"default_join":true}]}),
+                    "system", "System", "system", &format!("bootstrap-{path}"), "")?;
+            }
         }
         if s.norms["revision"].is_null() {
             s.publish(

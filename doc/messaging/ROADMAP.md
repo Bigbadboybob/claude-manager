@@ -15,7 +15,7 @@ authorized together and implemented in this worktree, pending release.
    channels explicitly. Ships with item 2 because membership
    defines the `@here` audience. Preserve browsing/history separately from
    notification subscriptions. Join before posting; migrate creators, positive
-   explicit follows and prior posters; enable joined-by-default for `#general`.
+   explicit follows and prior posters; enable joined-by-default for `#general` and `#cm-general`.
    Explicit leaves persist. See [membership and mentions](MEMBERSHIP_AND_MENTIONS.md).
 4. **Owner overview of all conversations.** A separate view shows every channel
    and every agent-to-agent DM, including group DMs. Owner's normal joined-channel

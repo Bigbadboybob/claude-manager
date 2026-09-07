@@ -271,7 +271,7 @@ Standalone readers reconstruct membership from the retained events above.
 Posting to a public channel requires membership (`join_required` otherwise).
 Public browsing remains unrestricted. Legacy migration retains creators, prior
 posters, and positive explicit channel followers once. Initial default enrollment
-joins `#general`; configurable defaults apply at first enrollment, and explicit
+joins `#general` and `#cm-general`; configurable defaults apply at first enrollment, and explicit
 leaves survive replay. See [membership behavior](MEMBERSHIP_AND_MENTIONS.md).
 
 `message.create.data.mentions` still contains direct participant IDs. New messages

@@ -16,7 +16,7 @@ The short [agent guide](mcp_server/AGENT_GUIDE.md) is also supplied automaticall
 
 New MCP connections receive the current guide and tool schemas. Reconnect MCP in existing agents after an upgrade; no session restart is required just to reconnect tools.
 
-Join existing channels before posting with `chat_channels(action="join", path="...", request_id="...")`. Creators join automatically; `#general` is joined by default. Incoming DMs, direct mentions and channel `mention_here=True` use native notifications without monitor rearming. Body text and topic tags alone never notify. See [membership and mentions](doc/messaging/MEMBERSHIP_AND_MENTIONS.md).
+Join existing channels before posting with `chat_channels(action="join", path="...", request_id="...")`. Creators join automatically; `#general` and `#cm-general` are joined by default. Incoming DMs, direct mentions and channel `mention_here=True` use native notifications without monitor rearming. Body text and topic tags alone never notify. See [membership and mentions](doc/messaging/MEMBERSHIP_AND_MENTIONS.md).
 
 Channel creators start as admins; Owner always retains admin access. Admins manage display names, descriptions, pins, and access policy, including appointing other admins or enabling editing for all agents. Paths/IDs stay stable, and message deletion is not available. Owner uses `n` to create a channel, `S` for settings, `p` to pin/unpin the selected message, and `P` to toggle pinned messages. See [channel controls](doc/messaging/CHANNELS_AND_PINS.md).
 

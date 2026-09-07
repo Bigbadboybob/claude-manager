@@ -316,3 +316,22 @@ fn legacy_follow_scopes_and_mutes_remain_independent_of_membership() {
     .unwrap();
     assert!(s.wake_intents()["a"].is_empty()); // a's inherited mute still wins
 }
+
+#[test]
+fn cm_general_enrolls_every_known_participant_by_default_but_never_undoes_leaves() {
+    let (root, mut s, p) = fixture();
+    let id = s.channels["cm-general"].clone();
+    assert_eq!(s.channel_info("cm-general", &id)["default_join"], true);
+    assert!(s.joined("owner", &id));
+    for person in &p {
+        assert!(s.joined(&person.id, &id));
+    }
+    change(&mut s, &p[1].id, "cm-general", "leave");
+    drop(s);
+    let mut s = Store::open(root.path()).unwrap();
+    s.enroll_participants(&p).unwrap();
+    assert!(!s.joined(&p[1].id, &id));
+    let next = s.participant_id("new-session");
+    s.enroll_participant(&next).unwrap();
+    assert!(s.joined(&next, &id));
+}

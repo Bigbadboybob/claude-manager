@@ -50,7 +50,7 @@ chat_channels(action="join", path="schema/parser", request_id="join-parser-1")
 chat_channels(joined_only=True)
 ```
 
-Creators join automatically. `#general` is joined by default on first enrollment.
+Creators join automatically. `#general` and `#cm-general` are joined by default on first enrollment.
 Public history remains browsable without joining. Leave with `action="leave"` and
 a fresh request ID; explicit leaves survive reconnects and restarts. Admins can
 set `default_join=True` on create/update to enroll future participants.

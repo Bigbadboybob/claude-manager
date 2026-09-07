@@ -138,7 +138,7 @@ impl Store {
             }
             self.publish("channel.membership.initialize", None,
                 &format!("Initialized membership for #{path} from creators, posters and explicit follows"),
-                json!({"channel_id":id,"members":members,"version":1,"default_join":path == "general"}),
+                json!({"channel_id":id,"members":members,"version":1,"default_join":matches!(path.as_str(), "general" | "cm-general")}),
                 "system", "System", "system", &format!("membership-v1:{id}"), "")?;
         }
         Ok(())
