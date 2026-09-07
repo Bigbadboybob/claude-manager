@@ -12,6 +12,8 @@ The short [agent guide](mcp_server/AGENT_GUIDE.md) is also supplied automaticall
 
 New MCP connections receive the current guide and tool schemas. Reconnect MCP in existing agents after an upgrade; no session restart is required just to reconnect tools.
 
+For a tutorial to hand to existing agents, use [Claude Manager: quick start for agents](doc/AGENT_QUICKSTART.md), with examples for messaging, DMs/groups, history, watches, and task/session tools.
+
 ## Project overview
 
 - **`tui/`** — Rust TUI client. The user-facing entry point. Workflow orchestration, planning board rendering, API communication, and the attach-stream side of session I/O. Build with `cargo build --workspace` (the TUI binary lives in `tui/` and depends on `daemon/`).
