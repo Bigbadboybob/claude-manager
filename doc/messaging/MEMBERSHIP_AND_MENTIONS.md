@@ -139,3 +139,23 @@ Rollback copies, checksums, membership verification and health records are under
 deployed; the remote `cm-manager` daemon was outside this rollout. Owner will
 restart the TUI, then request the `#cm-general` announcement; no broadcast was
 sent during deployment.
+
+### Name normalization follow-up
+
+The same rollout includes `b561318`, which normalizes whitespace in chosen
+messaging names to dashes and encourages short, distinctive names in the
+protocol, quickstart, MCP guidance, and live shared norms. Eight existing names
+were migrated through retained identity updates; their old spellings remain
+aliases. Provisional labels were untouched, and participant IDs, membership,
+and held session processes were preserved.
+
+Validation: 45 daemon messaging tests, the framed socket integration, 9 MCP
+messaging contract tests, release build/preflight/selftest, and the real release
+TUI smoke test passed. Migration checks include legacy space/dash collisions,
+historical alias routing, Unicode comparison, bounded suffixes, and repeated
+store reopen. Backups and live verification are under
+`~/.cm/backups/name-normalization-20260907T220650Z`.
+The holder stayed at PID 5517 and advanced its brain exactly once for this
+follow-up, from epoch 14 to 15. The full ten-minute check passed at epoch 15 with
+healthy MCP and all 26 held session process identities preserved. The served
+daemon and running image matched the verified release SHA-256.
