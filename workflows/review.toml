@@ -4,7 +4,7 @@ description = "Reviewer audits; worker implements; reviewer decides whether to i
 role_order = ["reviewer", "worker"]
 
 [roles.reviewer]
-engine = "claude-code"
+engine = "codex"
 context = "persistent"
 subsequent_activation_prompt = """Take another look.
 
@@ -14,7 +14,7 @@ Worker's latest message:
 If you're satisfied, call the `workflow_done` tool with a short `reason`. Otherwise, write your review — it will be sent to the worker automatically."""
 
 [roles.worker]
-engine = "claude-code"
+engine = "codex"
 context = "persistent"
 # Worker drives the loop via the static `on_idle` hand-off to reviewer and only
 # OPTIONALLY calls workflow_transition (to ask a question before touching code).

@@ -63,6 +63,9 @@ pub struct FinalizeCtx<'a> {
     pub workflow: &'a Workflow,
     pub worktree: &'a Path,
     pub role_engines: BTreeMap<String, Engine>,
+    /// Canonical ID read from the live role process's open Codex rollout.
+    /// Never inferred from the newest file in a shared worktree.
+    pub codex_rollout_id: Option<String>,
     pub now_ms: u64,
     pub now_instant: Instant,
     pub gap_ms: u64,
@@ -123,6 +126,28 @@ where
     let role = pa.target_role.clone();
     let engine = engine_for(ctx, &role);
 
+    // /clear may still be rebooting MCP when the first activation prompt is
+    // sent. A NEW process-owned rollout is the ground truth that input reached
+    // the new chat. Check it before every retry, including after the composer
+    // clear gap, so late successful input is never replayed.
+    if engine == Engine::Codex && pa.needs_fresh_reset
+        && (pa.phase == ActivationPhase::RebindPending || pa.codex_delivery.is_some())
+    {
+        let snapshot = pa.pre_clear_snapshot.as_deref().unwrap_or_default();
+        if let Some(sid) = ctx.codex_rollout_id.as_ref().filter(|id| !snapshot.contains(id)) {
+            fresh_reset::try_rebind_discovered(ctx.run_id, &role, Some(sid.clone()))?;
+            run::modify(ctx.run_id, |r| {
+                if r.pending_activation.as_ref().map(|p| p.activation_id) == Some(pa.activation_id) {
+                    if let Some(h) = r.history.iter_mut().rev().find(|h| h.role == role) {
+                        h.session_id = Some(sid.clone());
+                    }
+                    r.pending_activation = None;
+                }
+            })?;
+            return Ok(FinalizeStep::Done);
+        }
+    }
+
     match pa.phase {
         ActivationPhase::Queued => {
             // Step 1: render from the PRE-reset, PRE-append snapshot and freeze.
@@ -166,7 +191,16 @@ where
                 if !tracker.quiet_for(ctx.quiet_window, ctx.now_instant) {
                     return Ok(FinalizeStep::Blocked);
                 }
-                let snapshot = fresh_reset::snapshot_pre_clear(engine, ctx.worktree);
+                let mut snapshot = fresh_reset::snapshot_pre_clear(engine.clone(), ctx.worktree);
+                // An isolated CODEX_HOME may live outside the global listing.
+                // Explicitly exclude this process's old rollout in that case.
+                if engine == Engine::Codex {
+                    for old in ctx.codex_rollout_id.iter().chain(
+                        run.role_sessions.get(&role).and_then(|b| b.current_session_id.as_ref())
+                    ) {
+                        if !snapshot.contains(old) { snapshot.push(old.clone()); }
+                    }
+                }
                 // Body only; the /clear Enter fires later (recomputed for the
                 // live mode). The returned Enter bytes are intentionally unused.
                 let _ = fresh_reset::send_clear_body(tracker, &mut write)
@@ -216,6 +250,13 @@ where
             // Step 5 (body): deliver the frozen prompt body, gated on PTY-quiet,
             // framed for the live mode. Persist the Enter deadline + phase.
             if !tracker.quiet_for(ctx.quiet_window, ctx.now_instant) {
+                return Ok(FinalizeStep::Blocked);
+            }
+            // One bounded full redelivery clears the composer first. Keep the
+            // clear/body gap durable, just like the normal body/Enter gap.
+            if pa.codex_delivery.as_ref().map_or(false, |d| d.redelivered)
+                && ctx.now_ms < pa.enter_fire_at_ms.unwrap_or(0)
+            {
                 return Ok(FinalizeStep::Blocked);
             }
             // Bound-session readiness + baseline (existing-session binding): the
@@ -374,6 +415,11 @@ where
                 run::modify(ctx.run_id, |r| {
                     if let Some(pa) = r.pending_activation.as_mut() {
                         pa.enter_fire_at_ms = None;
+                        if engine == Engine::Codex && pa.needs_fresh_reset && pa.codex_delivery.is_none() {
+                            pa.codex_delivery = Some(run::CodexDeliveryConfirmation {
+                                started_at_ms: ctx.now_ms, enter_retries: 0, redelivered: false,
+                            });
+                        }
                         pa.phase = ActivationPhase::RebindPending;
                     }
                 })?;
@@ -388,6 +434,9 @@ where
         }
 
         ActivationPhase::RebindPending => {
+            if engine == Engine::Codex && pa.needs_fresh_reset {
+                return retry_codex_fresh_delivery(ctx, &pa, tracker, &mut write);
+            }
             // Step 6 (fresh): discovery rebinds current_session_id, then patch
             // the appended entry's session_id and clear the record.
             let snapshot = pa.pre_clear_snapshot.clone().unwrap_or_default();
@@ -416,6 +465,62 @@ where
             Ok(FinalizeStep::Done)
         }
     }
+}
+
+/// Same bounded recovery policy as fresh Codex session delivery, but persisted
+/// on the workflow activation and checked against its post-clear owned rollout.
+fn retry_codex_fresh_delivery<W>(
+    ctx: &FinalizeCtx,
+    pa: &run::PendingActivation,
+    tracker: &PtyModeTracker,
+    write: &mut W,
+) -> Result<FinalizeStep, PersistError>
+where W: FnMut(&[u8]) -> std::io::Result<()>,
+{
+    use crate::control::methods::{CODEX_CONFIRM_ENTER_RETRIES, CODEX_CONFIRM_MAX, CODEX_CONFIRM_REDELIVER_AT};
+    let Some(delivery) = pa.codex_delivery.as_ref() else {
+        // Upgrade of an already-pending activation: start a fresh bounded
+        // observation window; never assume elapsed time or replay immediately.
+        run::modify(ctx.run_id, |r| {
+            if let Some(p) = r.pending_activation.as_mut() {
+                p.codex_delivery = Some(run::CodexDeliveryConfirmation {
+                    started_at_ms: ctx.now_ms, enter_retries: 0, redelivered: false,
+                });
+            }
+        })?;
+        return Ok(FinalizeStep::Blocked);
+    };
+    let elapsed = ctx.now_ms.saturating_sub(delivery.started_at_ms);
+    if elapsed >= CODEX_CONFIRM_MAX.as_millis() as u64 {
+        // Keep the frozen prompt and evidence for an operator; no endless
+        // input loop into a startup modal, quota screen or changed CLI.
+        run::modify(ctx.run_id, |r| r.paused = true)?;
+        eprintln!("cm-daemon: workflow {} activation {} paused: post-clear Codex prompt unconfirmed after bounded retries", ctx.run_id, pa.activation_id);
+        return Ok(FinalizeStep::Blocked);
+    }
+    if let Some(deadline) = CODEX_CONFIRM_ENTER_RETRIES.get(delivery.enter_retries) {
+        if elapsed >= deadline.as_millis() as u64 {
+            let _unit = crate::writer_gate::unit_permit();
+            write(pty_tracker::enter_bytes_for_mode(tracker.term_mode())).map_err(PersistError::Io)?;
+            run::modify(ctx.run_id, |r| {
+                if let Some(d) = r.pending_activation.as_mut().and_then(|p| p.codex_delivery.as_mut()) {
+                    d.enter_retries += 1;
+                }
+            })?;
+        }
+    } else if !delivery.redelivered && elapsed >= CODEX_CONFIRM_REDELIVER_AT.as_millis() as u64 {
+        let _unit = crate::writer_gate::unit_permit();
+        write(b"\x03").map_err(PersistError::Io)?;
+        run::modify(ctx.run_id, |r| {
+            if let Some(p) = r.pending_activation.as_mut() {
+                if let Some(d) = p.codex_delivery.as_mut() { d.redelivered = true; }
+                p.enter_fire_at_ms = Some(ctx.now_ms.saturating_add(300));
+                p.phase = ActivationPhase::Appended;
+            }
+        })?;
+        return Ok(FinalizeStep::Advanced(ActivationPhase::Appended));
+    }
+    Ok(FinalizeStep::Blocked)
 }
 
 /// Render the activation prompt for `pa`, applying the empty -> template
@@ -609,6 +714,7 @@ to = "manager"
             workflow: wf,
             worktree: wt,
             role_engines: role_engines(),
+            codex_rollout_id: None,
             now_ms,
             now_instant: Instant::now(),
             gap_ms,
@@ -668,7 +774,7 @@ to = "manager"
             phase: ActivationPhase::Queued,
             rendered_prompt: None,
             pre_clear_snapshot: None,
-            enter_fire_at_ms: None,
+            enter_fire_at_ms: None, codex_delivery: None,
         });
         run::save(&run).unwrap();
     }
@@ -827,7 +933,7 @@ to = "manager"
             raw_prompt: "implement {{ roles.worker.last_message }} literally".into(),
             verbatim: true, needs_fresh_reset: false, is_initial: true,
             phase: ActivationPhase::Queued, rendered_prompt: None,
-            pre_clear_snapshot: None, enter_fire_at_ms: None,
+            pre_clear_snapshot: None, enter_fire_at_ms: None, codex_delivery: None,
         });
         run::save(&run).unwrap();
         let _ = advance_finalization(&ctx("wf-verbatim", &wf, &wt, 1, 0), &PtyModeTracker::new(), |_| Ok(())).unwrap();
@@ -1028,6 +1134,104 @@ to = "manager"
         std::env::remove_var("HOME");
     }
 
+    #[test]
+    fn codex_fresh_delivery_retries_once_and_binds_only_owned_new_rollout() {
+        let _g = env_guard();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let wt = home.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wf = workflow();
+        let tracker = PtyModeTracker::new();
+        let id = "wf-codex-clear-retry";
+        seed_run(id, &wt, "reviewer", 2, TriggerKind::Initial,
+            "frozen review prompt", true, &[("reviewer", None)], vec![hist("reviewer", 2, None, 0)]);
+        run::modify(id, |r| {
+            let p = r.pending_activation.as_mut().unwrap();
+            p.phase = ActivationPhase::RebindPending;
+            p.rendered_prompt = Some("frozen review prompt".into());
+            p.pre_clear_snapshot = Some(vec!["old-review".into()]);
+        }).unwrap();
+        // A sibling's new rollout is tempting to a directory-diff detector,
+        // but must not count as this reviewer's input or completion evidence.
+        let dir = home.path().join(".codex/sessions/2026/09/07");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("rollout-sibling.jsonl"), format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"sibling\",\"cwd\":{}}}}}\n",
+            serde_json::to_string(wt.to_str().unwrap()).unwrap())).unwrap();
+        let make_ctx = |now, owned: Option<&str>| FinalizeCtx {
+            role_engines: [("reviewer".into(), Engine::Codex)].into_iter().collect(),
+            codex_rollout_id: owned.map(str::to_string),
+            ..ctx(id, &wf, &wt, now, 1000)
+        };
+        let mut writes = Vec::new();
+        let mut tick = |now, owned| advance_finalization(&make_ctx(now, owned), &tracker,
+            |b| { writes.push(b.to_vec()); Ok(()) }).unwrap();
+        // Legacy activation initializes a durable observation window. Its old
+        // owned rollout cannot confirm the new chat. Each call reloads disk,
+        // exercising the same retry budget across a daemon restart.
+        assert_eq!(tick(0, Some("old-review")), FinalizeStep::Blocked);
+        assert_eq!(tick(8000, Some("old-review")), FinalizeStep::Blocked);
+        assert_eq!(tick(8000, Some("old-review")), FinalizeStep::Blocked);
+        assert_eq!(run::load_one(id).unwrap().pending_activation.unwrap().codex_delivery.unwrap().enter_retries, 1);
+        assert_eq!(tick(18000, None), FinalizeStep::Blocked);
+        assert_eq!(tick(32000, None), FinalizeStep::Advanced(ActivationPhase::Appended));
+        assert_eq!(tick(32299, None), FinalizeStep::Blocked);
+        assert_eq!(tick(32300, None), FinalizeStep::Advanced(ActivationPhase::BodySent));
+        assert_eq!(tick(33300, None), FinalizeStep::Advanced(ActivationPhase::RebindPending));
+        assert_eq!(tick(40000, None), FinalizeStep::Blocked);
+        assert_eq!(tick(41000, Some("new-review")), FinalizeStep::Done);
+        drop(tick);
+        assert_eq!(writes.iter().filter(|b| b.as_slice() == b"\x03").count(), 1);
+        assert_eq!(writes.iter().filter(|b| String::from_utf8_lossy(b).contains("frozen review prompt")).count(), 1);
+        assert!(!writes.iter().any(|b| b.as_slice() == b"/clear"), "recovery must not clear the chat a second time");
+        let r = run::load_one(id).unwrap();
+        assert!(r.pending_activation.is_none());
+        assert_eq!(r.role_sessions["reviewer"].current_session_id.as_deref(), Some("new-review"));
+        assert_eq!(r.history.last().unwrap().session_id.as_deref(), Some("new-review"));
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn codex_fresh_delivery_pauses_after_retry_budget_without_more_input() {
+        let _g = env_guard();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let wt = home.path().join("wt");
+        let wf = workflow();
+        let tracker = PtyModeTracker::new();
+        let id = "wf-codex-clear-exhausted";
+        seed_run(id, &wt, "reviewer", 2, TriggerKind::Initial,
+            "review", true, &[("reviewer", None)], vec![hist("reviewer", 2, None, 0)]);
+        run::modify(id, |r| {
+            let p = r.pending_activation.as_mut().unwrap();
+            p.phase = ActivationPhase::RebindPending;
+            p.pre_clear_snapshot = Some(vec!["old".into()]);
+            p.codex_delivery = Some(run::CodexDeliveryConfirmation {
+                started_at_ms: 0, enter_retries: 2, redelivered: true,
+            });
+        }).unwrap();
+        let c = FinalizeCtx {
+            role_engines: [("reviewer".into(), Engine::Codex)].into_iter().collect(),
+            ..ctx(id, &wf, &wt, 75000, 1000)
+        };
+        assert_eq!(advance_finalization(&c, &tracker, |_| panic!("retry budget exhausted")).unwrap(), FinalizeStep::Blocked);
+        let r = run::load_one(id).unwrap();
+        assert!(r.paused);
+        assert!(r.pending_activation.is_some());
+        assert_eq!(advance_finalization(&c, &tracker, |_| panic!("paused workflow must not receive input")).unwrap(), FinalizeStep::Blocked);
+        // A late successful submit at the full-retry boundary must win over
+        // Ctrl+C recovery; it must never interrupt an already-started turn.
+        run::modify(id, |r| {
+            r.paused = false;
+            let d = r.pending_activation.as_mut().unwrap().codex_delivery.as_mut().unwrap();
+            d.redelivered = false;
+        }).unwrap();
+        let late = FinalizeCtx { now_ms: 32000, codex_rollout_id: Some("late-new".into()), ..c };
+        assert_eq!(advance_finalization(&late, &tracker, |_| panic!("a started turn must not receive retry input")).unwrap(), FinalizeStep::Done);
+        std::env::remove_var("HOME");
+    }
+
     // ---- Existing-session binding: bound initial delivery readiness ------
 
     /// A BOUND initial worker (`RoleBinding::bound` + an already-resolved sid) is
@@ -1068,7 +1272,7 @@ to = "manager"
             trigger: TriggerKind::Initial, raw_prompt: "the goal".into(),
             verbatim: true, needs_fresh_reset: false, is_initial: true,
             phase: ActivationPhase::Queued, rendered_prompt: None,
-            pre_clear_snapshot: None, enter_fire_at_ms: None,
+            pre_clear_snapshot: None, enter_fire_at_ms: None, codex_delivery: None,
         });
         run::save(&run).unwrap();
 
@@ -1149,7 +1353,7 @@ to = "manager"
             trigger: TriggerKind::Initial, raw_prompt: "the goal".into(),
             verbatim: true, needs_fresh_reset: false, is_initial: true,
             phase: ActivationPhase::Queued, rendered_prompt: None,
-            pre_clear_snapshot: None, enter_fire_at_ms: None,
+            pre_clear_snapshot: None, enter_fire_at_ms: None, codex_delivery: None,
         });
         run::save(&run).unwrap();
 

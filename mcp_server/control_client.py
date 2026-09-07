@@ -90,6 +90,11 @@ class SocketRoute:
 # answer regardless of who's calling.
 DAEMON_METHODS: frozenset[str] = frozenset({
     "ping",
+    # Internal/operator dispatch surface; routing does not grant authorization.
+    "daemon.migrate_split", "daemon.reexec_dev", "daemon.upgrade_holder",
+    "daemon.restart", "daemon.drain", "daemon.rollback_brain",
+    "daemon.split_rollback", "daemon.reload_config", "daemon.health",
+    "session.revive", "task.register_agent_subtask",
     "start_session",
     "session.attach",
     "attach.open",
@@ -144,9 +149,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # creds) so a daemon-spawned agent can inspect the board / its own task
     # when the cli-routed PlanningClient isn't installed. The server.py tools
     # pass `socket_path=route.path` explicitly (like propose_task), so the
-    # daemon route is taken on a headless host and PlanningClient on a laptop.
+    # daemon route is taken whenever pinned, with PlanningClient for standalone use.
     # (`get_current_task` is composed MCP-side from `ping` + `get_task` — no
     # dedicated daemon method.)
+    "list_projects",
     "list_tasks",
     "get_task",
     # 10d-2b: workflow_transition / workflow_done flip from
@@ -229,6 +235,14 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "continuous.create",
     "continuous.update",
     "continuous.list",
+    "continuous.drain",
+    "continuous.migration_preview",
+    "continuous.reconcile",
+    "continuous.retire",
+    "continuous.migrate_engine",
+    "continuous.context",
+    "continuous.ack_drain",
+    "continuous.checkpoint_drain",
     "continuous.pause",
     "continuous.run_now",
     "continuous.delete",

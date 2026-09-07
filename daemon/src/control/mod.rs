@@ -18,6 +18,7 @@
 //!     slice 4 (`server.rs` + `queue.rs` relocation) lands here.
 
 pub mod auth;
+pub mod continuous_drain;
 pub mod dispatch;
 pub mod methods;
 pub mod operator;

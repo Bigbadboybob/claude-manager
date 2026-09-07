@@ -105,7 +105,7 @@ rpc("continuous.create", {
     "task_id": "<slug>",                 # durable id; keys the worktree + workspace + state dir
     "planning_task_id": planning_task_id, # from §2 — the subtask parent
     "label": "<Label> Orchestrator",
-    "engine": "claude",                  # claude | codex | bash
+    "engine": "codex",                   # codex (new-task default) | claude | bash
     "run_mode": "persistent",            # persistent | fresh
     "schedule": {"kind": "periodic", "every_secs": 86400},
     "default_prompt": prompt,            # from §3
@@ -124,6 +124,8 @@ rpc("continuous.create", {
 ```
 
 Other accepted params (see `ContinuousCreateParams` in `daemon/src/control/methods.rs`): `slug`, `workspace_id`, `project`, `start_branch`, `skill`, `modes`, `max_runtime_secs`, `downstream`, `enqueue_to`, `retention`. To change any of these later on a **live** task, use `continuous.update` (preserves `run_count` + history) — see §8.
+
+The create-only default in this source revision is Codex; existing task records retain their explicit engine. Use an explicit engine when operating across daemon versions. CM adds no model override locally; cm-manager's Codex configuration selects `gpt-5.6-sol`. Fresh-run watchdog investigators use the task's agent engine: Codex for Codex, Claude for Claude. Explicit bash tasks retain a Claude investigator. These source changes await deployment and the [continuous Codex migration gates](doc/continuous-codex-migration.md), including actual model and lifecycle verification; they do not migrate existing sessions.
 
 ---
 

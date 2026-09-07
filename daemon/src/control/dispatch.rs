@@ -310,10 +310,12 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "workflow.get_state",
     "list_workflows",
     "list_subtasks",
+    "list_projects",
     "list_tasks",
     "get_task",
     "backtest.result",
     "continuous.list",
+    "continuous.context",
     "continuous.dispatch_pending",
     "queue.stats",
 ];
@@ -720,6 +722,7 @@ pub fn dispatch_request(
         // forwarded to HTTP and rows are brief-projected before daemon framing.
         // (`get_current_task` is composed MCP-side from `ping` + `get_task`, so
         // it needs no method here.)
+        "list_projects" => DispatchOutcome::Done(dispatch_list_projects(state, req)),
         "list_tasks" => DispatchOutcome::Done(dispatch_list_tasks(state, req)),
         "get_task" => DispatchOutcome::Done(dispatch_get_task(state, req)),
 
@@ -765,6 +768,14 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_continuous_dispatch_pending(state, req))
         }
         "continuous.pause" => DispatchOutcome::Done(dispatch_continuous_pause(state, req)),
+        "continuous.drain" => DispatchOutcome::Done(dispatch_continuous_drain(state, req)),
+        "continuous.migration_preview" => DispatchOutcome::Done(dispatch_continuous_migration(state, req)),
+        "continuous.reconcile" => DispatchOutcome::Done(dispatch_continuous_migration(state, req)),
+        "continuous.retire" => DispatchOutcome::Done(dispatch_continuous_migration(state, req)),
+        "continuous.migrate_engine" => DispatchOutcome::Done(dispatch_continuous_migration(state, req)),
+        "continuous.context" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
+        "continuous.ack_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
+        "continuous.checkpoint_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
         "continuous.force_done" => {
@@ -954,6 +965,13 @@ fn dispatch_list_subtasks(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
     }
 }
 
+fn dispatch_list_projects(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::list_projects(state) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 fn dispatch_list_tasks(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     match methods::list_tasks(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
@@ -1123,6 +1141,14 @@ fn dispatch_continuous_create(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
 /// `continuous.update` — Operator-only in-place edit of a live task's mutable
 /// config (`compact_every`, `default_prompt`, schedule, …) without the
 /// delete+recreate that would lose run history and kill the session.
+fn dispatch_continuous_migration(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(response) = require_operator(req, "Continuous migration and reconciliation are operator-only") { return response; }
+    match crate::continuous::migration::handle(state, &req.method, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 fn dispatch_continuous_update(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     if let Err(resp) = require_operator(
         req,
@@ -1184,6 +1210,23 @@ fn dispatch_continuous_pause(state: &Arc<Mutex<DaemonState>>, req: &Request) -> 
         return resp;
     }
     match methods::continuous_pause(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_continuous_receipt(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match super::continuous_drain::handle(state, &req.caller, &req.method, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_continuous_drain(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "continuous.drain is Operator-callable only") {
+        return resp;
+    }
+    match methods::continuous_drain(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -2732,6 +2775,7 @@ mod tests {
             "workflow_transition",
             "trigger",
             "continuous.run_now",
+            "continuous.drain",
             "attach.open",
             "manifest.watch",
             "events.subscribe",
@@ -2761,6 +2805,20 @@ mod tests {
                 m
             );
         }
+    }
+
+    #[test]
+    fn continuous_drain_rejects_session_callers_before_task_lookup() {
+        let state = make_state();
+        let response = dispatch_continuous_drain(
+            &state,
+            &session_request(
+                "continuous.drain",
+                serde_json::json!({"task_id": "missing"}),
+                "worker",
+            ),
+        );
+        assert_eq!(response.error.unwrap().code, ErrorCode::Unauthorized);
     }
 
     // --- daemon.reexec_dev (DESIGN_SEAMLESS_RESTART phase 3b) ----------
@@ -8932,6 +8990,74 @@ mod tests {
                 ws.worktree_path,
             );
         }
+    }
+
+    // ============================================================
+    // Planning project discovery
+    // ============================================================
+
+    #[test]
+    fn list_projects_uses_config_credentials_for_operator_and_session() {
+        let _g = crate::planning_client::test_env_lock();
+        let rows = r#"[{"name":"predictionTrading","repo_url":"https://example.com/trading"}]"#;
+        for request in [
+            operator_request("list_projects", serde_json::json!({})),
+            session_request("list_projects", serde_json::json!({}), "ts-projects"),
+        ] {
+            let (port, captured) =
+                crate::planning_client::spawn_stub_api_for_test(200, rows);
+            let state = state_with_session_in_workspace("ts-projects", "ws-projects");
+            {
+                let mut st = state.lock().unwrap();
+                st.config.api_url = format!("http://127.0.0.1:{}", port);
+                st.config.api_token = "projects-config-token".into();
+            }
+            let resp = dispatch_request(&state, &request).into_response();
+            assert!(resp.ok, "list_projects failed: {:?}", resp.error);
+            assert_eq!(
+                resp.result.unwrap(),
+                serde_json::from_str::<serde_json::Value>(rows).unwrap(),
+            );
+            assert_eq!(barrier_counts(&state), (0, 0), "project discovery is read-only");
+            let cap = captured.lock().unwrap();
+            assert_eq!(cap.method_and_path(), ("GET".into(), "/projects".into()));
+            assert_eq!(
+                cap.auth_header().as_deref(),
+                Some("Bearer projects-config-token"),
+            );
+        }
+    }
+
+    #[test]
+    fn list_projects_returns_empty_project_list() {
+        let _g = crate::planning_client::test_env_lock();
+        let (port, _) = crate::planning_client::spawn_stub_api_for_test(200, "[]");
+        let state = make_state();
+        set_stub_api_config(&state, port);
+        let resp = dispatch_request(
+            &state,
+            &operator_request("list_projects", serde_json::json!({})),
+        )
+        .into_response();
+        assert!(resp.ok, "list_projects failed: {:?}", resp.error);
+        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn list_projects_surfaces_api_error() {
+        let _g = crate::planning_client::test_env_lock();
+        let (port, _) = crate::planning_client::spawn_stub_api_for_test(503, "{}");
+        let state = make_state();
+        set_stub_api_config(&state, port);
+        let resp = dispatch_request(
+            &state,
+            &operator_request("list_projects", serde_json::json!({})),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("503"), "error: {}", err.message);
     }
 
     // ============================================================

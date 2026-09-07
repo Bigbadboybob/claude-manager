@@ -3,20 +3,13 @@
 `--settings` (see `mcp_config::claude_settings_hook_arg` in the daemon,
 mirrored by the TUI's `claude_args`). Runs at every turn boundary and:
 
-  1. Reports the turn-end to the daemon (`session.turn_ended`), which
-     stamps `last_turn_end_at` → `resolve_authorized_session` derives
-     `semantic_idle` from it. This is the event-driven idle signal that
-     PTY-quietness heuristics can't provide (a background task's
-     spinner keeps the PTY noisy while the agent sits at its prompt).
+  1. Drains this session's monitor inbox (`~/.cm/inbox/<uid>/*.json`).
+     Pending messages produce `{"decision": "block", "reason": <messages>}`
+     so Claude continues with those messages, without PTY typing.
 
-  2. Drains this session's monitor inbox (`~/.cm/inbox/<uid>/*.json`,
-     written by `async_monitor` when a fired monitor found the session
-     mid-turn). If messages are pending, emits Stop-hook
-     `{"decision": "block", "reason": <messages>}` — Claude then
-     CONTINUES the turn, processing the messages as its next
-     instruction. This delivers monitor notifications at the exact turn
-     boundary with zero PTY typing (no mangling, no kitty timing).
-     Verified empirically on claude CLI 2.1.214 (see NOTES.md S0).
+  2. Reports `session.turn_ended` with `continuing=true` when the inbox
+     resumes the turn. Otherwise it stamps the final turn-end. A continuing
+     hook must invalidate the old completion report and idle signal.
 
 Design constraints:
   - FAIL OPEN. A broken daemon socket, malformed stdin, or any other
@@ -53,7 +46,7 @@ def _session_uid() -> str:
     return os.environ.get("CM_TUI_SESSION_ID", "").strip()
 
 
-def _report_turn_ended(uid: str, transcript_path: str | None = None) -> None:
+def _report_turn_ended(uid: str, transcript_path: str | None = None, *, continuing: bool = False) -> None:
     """Best-effort `session.turn_ended` self-report.
 
     `transcript_path` is the file Claude Code names in this hook's stdin
@@ -69,6 +62,8 @@ def _report_turn_ended(uid: str, transcript_path: str | None = None) -> None:
         from mcp_server import control_client
 
         params = {"session_uid": uid}
+        if continuing:
+            params["continuing"] = True
         if transcript_path:
             params["transcript_path"] = transcript_path
         control_client.call(
@@ -141,9 +136,8 @@ def main() -> int:
         if not uid:
             return 0  # not a cm session — nothing to do
 
-        _report_turn_ended(uid, transcript_path)
-
         messages = _drain_inbox(uid)
+        _report_turn_ended(uid, transcript_path, continuing=bool(messages))
         if messages:
             reason = "\n\n".join(messages)
             print(json.dumps({"decision": "block", "reason": reason}))

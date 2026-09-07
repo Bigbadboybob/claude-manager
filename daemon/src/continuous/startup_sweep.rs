@@ -68,6 +68,7 @@ pub fn startup_orphan_sweep_with(alive: impl Fn(&str) -> bool) {
     let mut orphaned = 0usize;
     let mut readopted = 0usize;
     for tk in task::load_all() {
+        if tk.recovery.is_some() || (tk.engine == task::Engine::Codex && (tk.account_blocked.is_some() || tk.recovery_hold.is_some())) { continue; }
         // Resolve the stranded run from whichever guard is present — the same
         // two shapes `reconcile_orphans` handles: an armed `in_flight` (died
         // during the spawn window) or a `Running` `last_run` (died mid-run).
@@ -364,6 +365,43 @@ mod tests {
             let log = read_runlog("t-bash");
             assert_eq!(log.len(), 1);
             assert_eq!(log[0]["event"], "readopted");
+        });
+    }
+
+    /// Split-mode holder custody is the authority for surviving Codex runs.
+    #[test]
+    fn holder_boot_survivor_preserves_codex_run_without_legacy_argv_marker() {
+        with_temp_home(|| {
+            let pid = std::process::id() as i32;
+            let start = crate::adopt::proc_starttime(pid).unwrap();
+            let mut boot = crate::holder_mode::HolderBoot {
+                records: Vec::new(), listeners: Vec::new(), exit_events_pending: 0,
+            };
+            for (id, offset, reaped, pending) in [
+                ("holder-live", 0, false, false),
+                ("holder-reused-pid", 1, false, false),
+                ("holder-reaped", 0, true, false),
+                ("holder-pending-exit", 0, false, true),
+            ] {
+                let uid = format!("ts-{}", id);
+                let mut task = task_with_running_run(id, &uid);
+                task.engine = Engine::Codex;
+                task::save(&task).unwrap();
+                let record = serde_json::from_value(serde_json::json!({
+                    "uid":uid, "incarnation":1, "child_pid":pid,
+                    "child_start_time":start+offset, "reap_armed":true,
+                    "reaped":reaped, "exit_event_pending":pending,
+                })).unwrap();
+                boot.records.push((record,
+                    std::fs::File::open("/dev/null").unwrap().into(),
+                    std::fs::File::open("/dev/null").unwrap().into()));
+            }
+            startup_orphan_sweep(&boot.live_session_uids());
+            assert_eq!(task::load_one("holder-live").unwrap().last_run.unwrap().status, RunStatus::Running);
+            assert_eq!(read_runlog("holder-live")[0]["event"], "readopted");
+            for id in ["holder-reused-pid", "holder-reaped", "holder-pending-exit"] {
+                assert_eq!(task::load_one(id).unwrap().last_run.unwrap().status, RunStatus::Orphaned);
+            }
         });
     }
 

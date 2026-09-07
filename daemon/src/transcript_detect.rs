@@ -19,8 +19,7 @@
 //! through the TUI side. We do NOT relocate the TUI-wide
 //! detector here; that's 10e/10f territory.
 //!
-//! ## Heuristic (mirrors `tui/src/app.rs::detect_session_id`
-//! and `tui/src/app.rs::detect_codex_session_id`)
+//! ## Discovery
 //!
 //! - **Claude Code**: each session writes
 //!   `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, where
@@ -33,8 +32,11 @@
 //!   `~/.codex/sessions/YYYY/MM/DD/<uuid>.jsonl`. The first line
 //!   is a JSON record whose `payload.cwd` carries the working
 //!   directory and whose `payload.id` is the session UUID. The
-//!   detector walks the date-bucketed tree, parses just the first
-//!   line of each candidate file, and matches on the cwd.
+//!   daemon detector finds the rollout open in the session's own
+//!   process tree, then verifies that first record's cwd and id.
+//!   Directory-delta helpers remain available for other callers,
+//!   but cannot identify concurrently spawned workflow roles in
+//!   a shared worktree; an idle role must not claim its sibling.
 //!
 //! ## Lifecycle
 //!
@@ -1013,12 +1015,13 @@ fn run_detector(
         }
         // Bail early if the session was killed / exited before
         // the agent had a chance to write its transcript.
-        {
+        let pid = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
-            if !s.sessions.contains_key(&session_uid) {
+            let Some(session) = s.sessions.get(&session_uid) else {
                 return DetectorOutcome::SessionGone;
-            }
-        }
+            };
+            session.pid as u32
+        };
         let effective_existing: Vec<String> = existing
             .iter()
             .chain(claimed_collisions.iter())
@@ -1033,8 +1036,12 @@ fn run_detector(
                     })
             }
             DetectorEngine::Codex => {
-                detect_new_codex_id(&worktree_path, &effective_existing)
-                    .and_then(|id| codex_transcript_path(&id).map(|p| (id, p)))
+                // Workflow participants share a worktree and may remain at an
+                // empty prompt until their role activates. A directory delta
+                // can therefore belong to another participant. Bind only the
+                // rollout actually open in this session's process tree, just
+                // as the lifetime compaction watcher does.
+                detect_live_codex_id(pid, &worktree_path)
             }
         };
         if let Some((id, path)) = detected {
@@ -1067,6 +1074,9 @@ fn run_detector(
             let Some(session) = s.sessions.get_mut(&session_uid) else {
                 return DetectorOutcome::SessionGone;
             };
+            if session.pid as u32 != pid {
+                continue;
+            }
             // Mirrors `methods::set_transcript_path` mutate-
             // and-bump-on-change semantics. Bump only when the
             // path actually changed so re-runs against a steady
@@ -1098,6 +1108,17 @@ fn run_detector(
         };
         std::thread::sleep(interval);
     }
+}
+
+pub(crate) fn detect_live_codex_id(pid: u32, worktree: &Path) -> Option<(String, PathBuf)> {
+    let path = scan_live_codex_rollout(pid).rollout?;
+    let first = read_first_line(&path)?;
+    let value: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+    if value.pointer("/payload/cwd")?.as_str()? != worktree.to_str()? {
+        return None;
+    }
+    let id = value.pointer("/payload/id")?.as_str()?.to_owned();
+    Some((id, path))
 }
 
 #[cfg(test)]
@@ -1318,6 +1339,49 @@ mod tests {
         let _release_probe = crate::state::WorktreeSpawnTicket::new(queue.clone(), probe_seq);
         drop(_release_probe);
         state.lock().unwrap().sessions.remove("ts-spawn-fail");
+    }
+
+    #[test]
+    fn codex_detector_binds_each_process_own_rollout_in_shared_worktree() {
+        let env = HomeEnv::make();
+        let wt = env.path().join("shared-worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let rolls = env.path().join(".codex/sessions/2026/09/07");
+        std::fs::create_dir_all(&rolls).unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        for id in ["reviewer", "worker"] {
+            let path = rolls.join(format!("rollout-{}.jsonl", id));
+            std::fs::write(&path, format!("{}\n", serde_json::json!({
+                "type":"session_meta", "payload":{"id":id,"cwd":wt}
+            }))).unwrap();
+            let mut params = crate::session::SpawnParams::new(id, id, "/bin/sh");
+            params.args = vec!["-c".into(), "exec 3<\"$1\"; exec sleep 60".into(),
+                "fixture".into(), path.to_string_lossy().into_owned()];
+            params.session_type = "codex".into();
+            let session = crate::session::DaemonSession::spawn(params).unwrap();
+            let pid = session.pid as u32;
+            state.lock().unwrap().sessions.insert(id.into(), session);
+            let until = Instant::now() + Duration::from_secs(5);
+            while scan_live_codex_rollout(pid).rollout.is_none() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(scan_live_codex_rollout(pid).rollout.as_deref(), Some(path.as_path()));
+        }
+        // Both files are new in the same cwd before either detector runs.
+        // An unowned directory-delta heuristic may select the worker for the
+        // reviewer. Process ownership must decide, independent of file order.
+        for id in ["reviewer", "worker"] {
+            assert_eq!(run_detector_sync(state.clone(), id.into(), DetectorEngine::Codex,
+                wt.clone(), Vec::new()), DetectorOutcome::Bound);
+            assert_eq!(state.lock().unwrap().sessions[id].transcript_path.as_deref(),
+                rolls.join(format!("rollout-{}.jsonl", id)).to_str());
+        }
+        let mut idle = crate::session::SpawnParams::new("idle", "idle", "/bin/sleep");
+        idle.args = vec!["60".into()];
+        let idle = crate::session::DaemonSession::spawn(idle).unwrap();
+        assert!(detect_live_codex_id(idle.pid as u32, &wt).is_none(),
+            "an inactive role must not bind either sibling's existing rollout");
+        state.lock().unwrap().sessions.clear();
     }
 
     /// DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): the rollout

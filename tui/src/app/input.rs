@@ -6,8 +6,10 @@ use super::*;
 pub(super) enum InputMode {
     /// Normal operation — keys go to terminal or app navigation.
     Normal,
-    /// Typing a name/label for a new local session.
+    ContinuousControl(super::continuous_control::Menu),
+    /// Configuring a new workspace and its initial agent session.
     NewSession {
+        engine: LaunchEngine,
         label_text: String,
         branch_text: String,
         idle_timeout_text: String,
@@ -24,7 +26,8 @@ pub(super) enum InputMode {
         host_id: cm_daemon::host_id::HostId,
         /// 0 = repo (←/→ to cycle), 1 = name, 2 = branch, 3 = idle timeout,
         /// 4 = seed-from (Enter opens snapshot picker, Esc clears),
-        /// 5 = host (←/→ to cycle the configured hosts)
+        /// 5 = host (←/→ to cycle the configured hosts),
+        /// 6 = engine (←/→ cycles; changing engine clears seed-from)
         active_field: u8,
     },
     /// Picking a session type to add to a workspace.
@@ -371,6 +374,7 @@ pub(crate) enum SubmitAction {
     /// empty workspace name, no workflow selected). Modal still closes.
     None,
     CreateLocalSession {
+        engine: LaunchEngine,
         repo_url: String,
         label: String,
         branch: Option<String>,
@@ -395,6 +399,7 @@ pub(crate) enum SubmitAction {
     /// the form state so the catalog can re-open the form (with seed_from
     /// set on pick or unchanged on cancel) on submit / cancel.
     OpenSnapshotPickerForNewSession {
+        engine: LaunchEngine,
         label_text: String,
         branch_text: String,
         idle_timeout_text: String,
@@ -488,6 +493,7 @@ pub(crate) enum SubmitAction {
 }
 
 pub(crate) struct NewSessionMut<'a> {
+    pub engine: &'a mut LaunchEngine,
     pub label_text: &'a mut String,
     pub branch_text: &'a mut String,
     pub idle_timeout_text: &'a mut String,
@@ -549,6 +555,7 @@ pub(crate) struct SaveSnapshotMut<'a> {
 #[derive(Debug, Clone)]
 pub enum PickerTarget {
     NewSession {
+        engine: LaunchEngine,
         label_text: String,
         branch_text: String,
         idle_timeout_text: String,
@@ -632,6 +639,7 @@ fn catalog_open_outcome(
 fn rebuild_form_from_picker(target: PickerTarget, name: Option<String>) -> InputMode {
     match target {
         PickerTarget::NewSession {
+            engine,
             label_text,
             branch_text,
             idle_timeout_text,
@@ -639,6 +647,7 @@ fn rebuild_form_from_picker(target: PickerTarget, name: Option<String>) -> Input
             existing_seed_from,
             host_id,
         } => InputMode::NewSession {
+            engine,
             label_text,
             branch_text,
             idle_timeout_text,
@@ -665,13 +674,14 @@ fn rebuild_form_from_picker(target: PickerTarget, name: Option<String>) -> Input
 }
 
 /// Engine constraint the catalog enforces when opened in picker mode.
-/// `NewSession` always spawns a Claude Code session, so the filter is
-/// always `ClaudeCode`. `NewTerminalSession` filters to whichever engine
-/// the user selected on the form (no filter for bash — that path
-/// doesn't reach the picker).
+/// Both forms filter to the selected engine (no filter for bash — that
+/// path doesn't reach the picker).
 fn picker_target_engine(t: &PickerTarget) -> Option<Engine> {
     match t {
-        PickerTarget::NewSession { .. } => Some(Engine::ClaudeCode),
+        PickerTarget::NewSession { engine, .. } => Some(match engine {
+            LaunchEngine::Claude => Engine::ClaudeCode,
+            LaunchEngine::Codex => Engine::Codex,
+        }),
         PickerTarget::NewTerminalSession { session_type, .. } => {
             match session_type.as_str() {
                 "claude" => Some(Engine::ClaudeCode),
@@ -781,7 +791,7 @@ pub(crate) fn handle_new_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    const FIELD_COUNT: u8 = 6; // repo, label, branch, idle, seed-from, host
+    const FIELD_COUNT: u8 = 7; // repo, label, branch, idle, seed-from, host, engine
     match key.code {
         KeyCode::Esc => {
             // Esc on the seed-from field with a value clears the
@@ -839,6 +849,12 @@ pub(crate) fn handle_new_session(
             }
             InputOutcome::Consumed
         }
+        KeyCode::Left | KeyCode::Right if *state.active_field == 6 => {
+            *state.engine = state.engine.cycle();
+            // A snapshot is specific to its engine, as in the A-s form.
+            *state.seed_from = None;
+            InputOutcome::Consumed
+        }
         KeyCode::Enter if *state.active_field == 4 => {
             // Open the snapshot catalog in picker mode. The dispatcher
             // stashes the form state on the submit action so it can
@@ -846,6 +862,7 @@ pub(crate) fn handle_new_session(
             // existing_seed_from is captured so picker-cancel doesn't
             // wipe a previously-picked snapshot.
             InputOutcome::Submit(SubmitAction::OpenSnapshotPickerForNewSession {
+                engine: *state.engine,
                 label_text: state.label_text.clone(),
                 branch_text: state.branch_text.clone(),
                 idle_timeout_text: state.idle_timeout_text.clone(),
@@ -872,6 +889,7 @@ pub(crate) fn handle_new_session(
                     .parse::<u16>()
                     .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
                 InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                    engine: *state.engine,
                     repo_url: state.repo_url.clone(),
                     label: state.label_text.clone(),
                     branch,
@@ -2360,6 +2378,18 @@ impl App {
 
         // Alt+t toggles between Sessions and Planning view.
         if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('C') {
+                let preferred = self.active_session().and_then(|(_, session)| {
+                    session.continuous_task_id.clone().map(|id| (session.host_id.clone(), id))
+                });
+                self.view_mode = ViewMode::Sessions;
+                self.input_mode = InputMode::ContinuousControl(super::continuous_control::Menu::new(
+                    std::sync::Arc::clone(&self.host_pool), &self.hosts, preferred,
+                ));
+                return true;
+            }
+        }
+        if let CrosstermEvent::Key(key) = event {
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('t') {
                 self.view_mode = match self.view_mode {
                     ViewMode::Sessions => {
@@ -3071,8 +3101,13 @@ impl App {
         let host_ids: Vec<cm_daemon::host_id::HostId> =
             self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
         let outcome = match &mut self.input_mode {
+            InputMode::ContinuousControl(menu) => match event {
+                CrosstermEvent::Key(key) => menu.key(*key),
+                _ => InputOutcome::Consumed,
+            },
             InputMode::Normal => InputOutcome::Ignored,
             InputMode::NewSession {
+                engine,
                 label_text,
                 branch_text,
                 idle_timeout_text,
@@ -3082,6 +3117,7 @@ impl App {
                 active_field,
             } => handle_new_session(
                 NewSessionMut {
+                    engine,
                     label_text,
                     branch_text,
                     idle_timeout_text,
@@ -3334,6 +3370,7 @@ impl App {
         match action {
             SubmitAction::None => {}
             SubmitAction::CreateLocalSession {
+                engine,
                 repo_url,
                 label,
                 branch,
@@ -3346,6 +3383,7 @@ impl App {
                     &host_id,
                     &repo_url,
                     &label,
+                    engine,
                     branch.as_deref(),
                     idle_timeout_secs,
                     seed_from.as_deref(),
@@ -3366,6 +3404,7 @@ impl App {
                 );
             }
             SubmitAction::OpenSnapshotPickerForNewSession {
+                engine,
                 label_text,
                 branch_text,
                 idle_timeout_text,
@@ -3374,6 +3413,7 @@ impl App {
                 host_id,
             } => {
                 self.open_snapshot_catalog(Some(PickerTarget::NewSession {
+                    engine,
                     label_text,
                     branch_text,
                     idle_timeout_text,
@@ -3834,6 +3874,7 @@ mod input_handler_tests {
             new_session_state("hello", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -3856,6 +3897,7 @@ mod input_handler_tests {
             new_session_state("foo", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -3877,6 +3919,7 @@ mod input_handler_tests {
             new_session_state("my-task", "feat/x", "10", "https://github.com/a/b", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -3890,6 +3933,7 @@ mod input_handler_tests {
         );
         match outcome {
             InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                engine,
                 repo_url,
                 label,
                 branch,
@@ -3898,6 +3942,7 @@ mod input_handler_tests {
                 in_place,
                 host_id,
             }) => {
+                assert_eq!(engine, LaunchEngine::Codex);
                 assert_eq!(repo_url, "https://github.com/a/b");
                 assert_eq!(label, "my-task");
                 assert_eq!(branch.as_deref(), Some("feat/x"));
@@ -3921,6 +3966,7 @@ mod input_handler_tests {
                 new_session_state("my-task", raw, "10", "https://github.com/a/b", 1);
             let outcome = handle_new_session(
                 NewSessionMut {
+                    engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
                     idle_timeout_text: &mut timeout,
@@ -3948,6 +3994,7 @@ mod input_handler_tests {
             new_session_state("my-task", "./foo", "10", "https://github.com/a/b", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -3979,6 +4026,7 @@ mod input_handler_tests {
             new_session_state("   ", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4006,6 +4054,7 @@ mod input_handler_tests {
             new_session_state("", "", "2", "", 2);
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4029,6 +4078,7 @@ mod input_handler_tests {
             new_session_state("", "", "2", "b", 0);
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4047,14 +4097,23 @@ mod input_handler_tests {
     // ── NewSession seed-from (chunk 5) ────────────────────────────
 
     #[test]
-    fn new_session_tab_cycles_through_six_fields() {
-        // 0 → 1 → 2 → 3 → 4 → 5 → 0 (host picker added as field 5)
+    fn new_session_tab_cycles_through_seven_fields() {
+        // The engine picker is field 6; both directions wrap through every field.
         let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("", "", "", "", 0);
         let mut seed: Option<String> = None;
-        for expected in [1, 2, 3, 4, 5, 0] {
+        for (code, expected) in [1, 2, 3, 4, 5, 6, 0]
+            .into_iter()
+            .map(|field| (KeyCode::Tab, field))
+            .chain(
+                [6, 5, 4, 3, 2, 1, 0]
+                    .into_iter()
+                    .map(|field| (KeyCode::BackTab, field)),
+            )
+        {
             handle_new_session(
                 NewSessionMut {
+                    engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
                     idle_timeout_text: &mut timeout,
@@ -4064,7 +4123,7 @@ mod input_handler_tests {
                     active_field: &mut active,
                 },
                 ctx_no_repos(),
-                &key(KeyCode::Tab),
+                &key(code),
             );
             assert_eq!(active, expected);
         }
@@ -4077,6 +4136,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = None;
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4091,6 +4151,7 @@ mod input_handler_tests {
         match outcome {
             InputOutcome::Submit(
                 SubmitAction::OpenSnapshotPickerForNewSession {
+                    engine,
                     label_text,
                     branch_text,
                     idle_timeout_text,
@@ -4099,6 +4160,7 @@ mod input_handler_tests {
                     host_id,
                 },
             ) => {
+                assert_eq!(engine, LaunchEngine::Codex);
                 assert_eq!(label_text, "my-task");
                 assert_eq!(branch_text, "feat/x");
                 assert_eq!(idle_timeout_text, "12");
@@ -4120,6 +4182,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = Some("reviewer".into());
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4143,6 +4206,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = None;
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4164,6 +4228,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = Some("reviewer-strict".into());
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4180,6 +4245,113 @@ mod input_handler_tests {
                 seed_from, ..
             }) => assert_eq!(seed_from.as_deref(), Some("reviewer-strict")),
             other => panic!("expected CreateLocalSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_session_engine_choice_clears_seed_and_reaches_submit() {
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
+            new_session_state("task", ".", "2", "https://github.com/a/b", 6);
+        let mut engine = LaunchEngine::Claude;
+        let mut seed = Some("claude-seed".to_string());
+        for (code, expected) in [
+            (KeyCode::Right, LaunchEngine::Codex),
+            (KeyCode::Right, LaunchEngine::Claude),
+            (KeyCode::Left, LaunchEngine::Codex),
+        ] {
+            let outcome = handle_new_session(
+                NewSessionMut {
+                    engine: &mut engine,
+                    label_text: &mut label,
+                    branch_text: &mut branch,
+                    idle_timeout_text: &mut timeout,
+                    repo_url: &mut repo,
+                    seed_from: &mut seed,
+                    host_id: &mut host,
+                    active_field: &mut active,
+                },
+                ctx_no_repos(),
+                &key(code),
+            );
+            assert_consumed(&outcome);
+            assert_eq!(engine, expected);
+            assert!(seed.is_none());
+        }
+        let outcome = handle_new_session(
+            NewSessionMut {
+                engine: &mut engine,
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut seed,
+                host_id: &mut host,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        assert!(matches!(
+            outcome,
+            InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                engine: LaunchEngine::Codex,
+                seed_from: None,
+                in_place: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn new_session_codex_snapshot_picker_preserves_engine_on_pick_and_cancel() {
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
+            new_session_state("task", "feat/x", "12", "https://github.com/a/b", 4);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                engine: &mut LaunchEngine::Codex,
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut Some("prior-codex-seed".into()),
+                host_id: &mut host,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        let InputOutcome::Submit(SubmitAction::OpenSnapshotPickerForNewSession {
+            engine,
+            label_text,
+            branch_text,
+            idle_timeout_text,
+            repo_url,
+            existing_seed_from,
+            host_id,
+        }) = outcome else {
+            panic!("expected snapshot picker")
+        };
+        assert_eq!(engine, LaunchEngine::Codex);
+        let target = PickerTarget::NewSession {
+            engine,
+            label_text,
+            branch_text,
+            idle_timeout_text,
+            repo_url,
+            existing_seed_from,
+            host_id,
+        };
+        assert_eq!(picker_target_engine(&target), Some(Engine::Codex));
+        for picked in [None, Some("new-codex-seed".to_string())] {
+            let expected_seed = picked.as_deref().unwrap_or("prior-codex-seed");
+            match rebuild_form_from_picker(target.clone(), picked.clone()) {
+                InputMode::NewSession { engine, seed_from, active_field, .. } => {
+                    assert_eq!(engine, LaunchEngine::Codex);
+                    assert_eq!(seed_from.as_deref(), Some(expected_seed));
+                    assert_eq!(active_field, 4);
+                }
+                _ => panic!("expected workspace form"),
+            }
         }
     }
 
@@ -4202,6 +4374,7 @@ mod input_handler_tests {
         let mut press = |code: KeyCode, host: &mut cm_daemon::host_id::HostId| {
             handle_new_session(
                 NewSessionMut {
+                    engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
                     idle_timeout_text: &mut timeout,
@@ -4240,6 +4413,7 @@ mod input_handler_tests {
         // Cycle to the remote host, then submit from the host field.
         handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4253,6 +4427,7 @@ mod input_handler_tests {
         );
         let outcome = handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4280,6 +4455,7 @@ mod input_handler_tests {
             new_session_state("task", "", "2", "https://github.com/a/b", 5);
         handle_new_session(
             NewSessionMut {
+                engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
@@ -4528,6 +4704,7 @@ mod input_handler_tests {
         // to maybe change it, then Escs out. rebuild_form_from_picker
         // with name=None must restore the captured existing value.
         let target = PickerTarget::NewSession {
+            engine: LaunchEngine::default(),
             label_text: "task".into(),
             branch_text: "br".into(),
             idle_timeout_text: "30".into(),
@@ -4575,6 +4752,7 @@ mod input_handler_tests {
         // existing-seed_from preservation logic doesn't accidentally
         // inject something).
         let target = PickerTarget::NewSession {
+            engine: LaunchEngine::default(),
             label_text: String::new(),
             branch_text: String::new(),
             idle_timeout_text: String::new(),
@@ -4790,6 +4968,7 @@ mod input_handler_tests {
         // rebuild_form_from_picker, preserving every typed field plus
         // any existing seed_from.
         let target = PickerTarget::NewSession {
+            engine: LaunchEngine::default(),
             label_text: "task".into(),
             branch_text: "feat/x".into(),
             idle_timeout_text: "30".into(),
@@ -4805,6 +4984,7 @@ mod input_handler_tests {
             super::catalog_open_outcome(Err(err), Some(target));
         match mode {
             InputMode::NewSession {
+                engine,
                 label_text,
                 branch_text,
                 idle_timeout_text,
@@ -4812,6 +4992,7 @@ mod input_handler_tests {
                 seed_from,
                 ..
             } => {
+                assert_eq!(engine, LaunchEngine::default());
                 assert_eq!(label_text, "task");
                 assert_eq!(branch_text, "feat/x");
                 assert_eq!(idle_timeout_text, "30");
@@ -4870,19 +5051,31 @@ mod input_handler_tests {
                 },
             },
         ];
-        let target = PickerTarget::NewTerminalSession {
-            workspace_id: "ws-0".into(),
-            session_type: "codex".into(),
-            task_id: None,
-            existing_seed_from: None,
-        };
-        let (mode, _) = super::catalog_open_outcome(Ok(snaps), Some(target));
-        match mode {
-            InputMode::SnapshotCatalog { snapshots, .. } => {
-                assert_eq!(snapshots.len(), 1);
-                assert_eq!(snapshots[0].name, "codex-one");
+        for target in [
+            PickerTarget::NewTerminalSession {
+                workspace_id: "ws-0".into(),
+                session_type: "codex".into(),
+                task_id: None,
+                existing_seed_from: None,
+            },
+            PickerTarget::NewSession {
+                engine: LaunchEngine::Codex,
+                label_text: "task".into(),
+                branch_text: String::new(),
+                idle_timeout_text: "2".into(),
+                repo_url: "https://github.com/a/b".into(),
+                existing_seed_from: None,
+                host_id: cm_daemon::host_id::HostId::local(),
+            },
+        ] {
+            let (mode, _) = super::catalog_open_outcome(Ok(snaps.clone()), Some(target));
+            match mode {
+                InputMode::SnapshotCatalog { snapshots, .. } => {
+                    assert_eq!(snapshots.len(), 1);
+                    assert_eq!(snapshots[0].name, "codex-one");
+                }
+                _ => panic!("expected SnapshotCatalog"),
             }
-            _ => panic!("expected SnapshotCatalog"),
         }
     }
 
@@ -5020,6 +5213,7 @@ mod input_handler_tests {
     fn picker_target_engine_resolves_per_target() {
         assert_eq!(
             super::picker_target_engine(&PickerTarget::NewSession {
+                engine: LaunchEngine::Claude,
                 label_text: String::new(),
                 branch_text: String::new(),
                 idle_timeout_text: String::new(),
@@ -5616,6 +5810,7 @@ mod input_handler_tests {
                 selected: &mut selected,
                 mode: &mut mode,
                 picker_target: Some(&PickerTarget::NewSession {
+                    engine: LaunchEngine::default(),
                     label_text: String::new(),
                     branch_text: String::new(),
                     idle_timeout_text: String::new(),
@@ -5693,6 +5888,7 @@ mod input_handler_tests {
                     selected: &mut selected,
                     mode: &mut mode,
                     picker_target: Some(&PickerTarget::NewSession {
+                        engine: LaunchEngine::default(),
                         label_text: String::new(),
                         branch_text: String::new(),
                         idle_timeout_text: String::new(),

@@ -87,6 +87,9 @@ pub struct TailProbe {
     /// ordinary agent prose that merely discusses a weekly limit must not
     /// freeze an orchestrator.
     pub usage_limit: Option<String>,
+    /// A Codex pool could not serve this request. This may reflect capacity
+    /// or continuation ownership; it is not an individual-account diagnosis.
+    pub pool_unavailable: Option<String>,
 }
 
 /// Classify the transcript's tail. `None` when the file can't be read, is
@@ -146,6 +149,7 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
         shape,
         auth_error,
         usage_limit,
+        pool_unavailable: None,
     })
 }
 

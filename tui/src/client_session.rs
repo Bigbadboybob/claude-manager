@@ -666,6 +666,13 @@ fn rpc_round_trip(daemon_socket: &Path, req: &Request) -> anyhow::Result<Respons
     rpc_round_trip_with_read_timeout(daemon_socket, req, DEFAULT_RPC_READ_TIMEOUT)
 }
 
+pub(crate) fn rpc_continuous_control(daemon_socket: &Path, token: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    anyhow::ensure!(matches!(method, "continuous.list" | "continuous.drain" | "continuous.pause"), "unsupported continuous control");
+    let request = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
+    let response = rpc_round_trip_with_read_timeout(daemon_socket, &request, Duration::from_secs(5))?;
+    response.result.ok_or_else(|| anyhow::anyhow!("daemon returned no result"))
+}
+
 fn rpc_round_trip_with_read_timeout(
     daemon_socket: &Path,
     req: &Request,

@@ -5065,7 +5065,9 @@ pub(super) mod pending_workflow_events_tests {
         // (which stays local here) — proving the host-picker choice drives it.
         let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
-        app.create_local_session(&chosen, "somerepo", "label", None, 0, None, true);
+        app.create_local_session(
+            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, None, true,
+        );
         assert!(
             status_text(&app).contains("in-place"),
             "remote in_place must be rejected with a clear message; got {:?}",
@@ -5081,7 +5083,9 @@ pub(super) mod pending_workflow_events_tests {
         let mut app = build_app_for_buffer_tests();
         let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
-        app.create_local_session(&chosen, "somerepo", "label", None, 0, Some("snap-1"), false);
+        app.create_local_session(
+            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, Some("snap-1"), false,
+        );
         assert!(
             status_text(&app).contains("snapshot"),
             "remote seed_from must be rejected with a clear message; got {:?}",
@@ -5098,7 +5102,9 @@ pub(super) mod pending_workflow_events_tests {
     fn local_a_n_in_place_not_rejected() {
         let mut app = build_app_for_buffer_tests();
         let chosen = cm_daemon::host_id::HostId::local();
-        app.create_local_session(&chosen, "no-such-repo-xyz", "label", None, 0, None, true);
+        app.create_local_session(
+            &chosen, "no-such-repo-xyz", "label", LaunchEngine::default(), None, 0, None, true,
+        );
         let st = status_text(&app);
         assert!(
             !st.contains("in-place") && !st.contains("remote host"),
@@ -5123,6 +5129,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut app = build_app_for_buffer_tests();
         let before = app.workspaces.len();
         app.apply_submit_action(SubmitAction::CreateLocalSession {
+            engine: LaunchEngine::default(),
             repo_url: "somerepo".into(),
             label: "label".into(),
             branch: None,
@@ -5142,6 +5149,7 @@ pub(super) mod pending_workflow_events_tests {
         // Local choice → existing local path (stops at the repo lookup).
         let mut app = build_app_for_buffer_tests();
         app.apply_submit_action(SubmitAction::CreateLocalSession {
+            engine: LaunchEngine::default(),
             repo_url: "no-such-repo-xyz".into(),
             label: "label".into(),
             branch: None,

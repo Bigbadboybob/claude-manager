@@ -1,4 +1,4 @@
-"""Headless planning READS (list_tasks / get_task / get_current_task).
+"""Headless planning READS (list_projects / list_tasks / get_task / get_current_task).
 
 On a headless host (a daemon-spawned agent with no cli-routed `PlanningClient`)
 these route through the DAEMON, which holds the planning-API creds. The daemon
@@ -9,6 +9,7 @@ that left bug-fix agents unable to read the board on cm-manager.
 
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,52 @@ def _daemon_route():
 
 
 class HeadlessPlanningReadsTests(unittest.TestCase):
+    def test_list_projects_uses_daemon_without_api_env_or_cli(self):
+        from mcp_server import control_client, server
+
+        rows = [{"name": "predictionTrading", "repo_url": "https://example.com/trading"}]
+        with mock.patch.dict(
+            os.environ, {"CM_DAEMON_SOCKET": "/tmp/daemon.sock"}, clear=True
+        ), mock.patch.object(
+            server, "PlanningClient", side_effect=RuntimeError("cli unavailable")
+        ) as client, mock.patch.object(control_client, "call", return_value=rows) as call:
+            self.assertEqual(server.list_projects(), rows)
+
+        client.assert_not_called()
+        call.assert_called_once_with(
+            "list_projects", {}, socket_path=Path("/tmp/daemon.sock")
+        )
+
+    def test_list_projects_without_daemon_uses_direct_client(self):
+        from mcp_server import control_client, server
+
+        rows = [{"name": "p1", "repo_url": "https://example.com/p1"}]
+        with mock.patch.dict(
+            os.environ, {"CM_TUI_SOCKET": "/tmp/tui.sock"}, clear=True
+        ), mock.patch.object(server, "PlanningClient") as client, mock.patch.object(
+            control_client, "call"
+        ) as call:
+            client.return_value.list_projects.return_value = rows
+            self.assertEqual(server.list_projects(), rows)
+
+        client.return_value.list_projects.assert_called_once_with()
+        call.assert_not_called()
+
+    def test_list_projects_surfaces_daemon_error_without_direct_fallback(self):
+        from mcp_server import control_client, server
+
+        error = control_client.ControlError("internal", "planning API transport failure")
+        with mock.patch.dict(
+            os.environ, {"CM_DAEMON_SOCKET": "/tmp/daemon.sock"}, clear=True
+        ), mock.patch.object(server, "PlanningClient") as client, mock.patch.object(
+            control_client, "call", side_effect=error
+        ):
+            with self.assertRaises(control_client.ControlError) as raised:
+                server.list_projects()
+
+        self.assertIs(raised.exception, error)
+        client.assert_not_called()
+
     def test_list_tasks_routes_to_daemon_with_server_side_filters(self):
         from mcp_server import control_client, server
 

@@ -12,7 +12,7 @@ methods (daemon.restart, daemon.migrate_split, daemon.split_rollback)
 the connection dies at the exec — reported as `"exec": true`; poll
 daemon.health afterward (see HOWTO_HOLDER_BRAIN_SPLIT.md).
 """
-import json, os, pathlib, socket, struct, subprocess, sys
+import json, os, pathlib, shlex, socket, struct, subprocess, sys
 
 def rpc(method, params):
     home = pathlib.Path.home()
@@ -54,7 +54,8 @@ def main(argv):
         # Run THIS script remotely (the token and socket are host-local).
         me = pathlib.Path(__file__).read_text()
         remote = subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=15", ssh_host, "python3", "-", method, json.dumps(params)],
+            ["ssh", "-o", "ConnectTimeout=15", ssh_host,
+             "python3 - " + shlex.join([method, json.dumps(params)])],
             input=me, capture_output=True, text=True)
         sys.stdout.write(remote.stdout)
         sys.stderr.write(remote.stderr)

@@ -67,6 +67,16 @@ pub enum RunMode {
     Persistent,
 }
 
+/// A terminal run whose staged work cannot yet be safely abandoned or replayed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryHold {
+    pub run_seq: u64,
+    pub session_uid: String,
+    pub fire_token: String,
+    pub detected_at: u64,
+    pub detail: String,
+}
+
 /// When a task fires.
 ///
 /// **Wire shape (stable):** internally tagged on `kind` with `snake_case`
@@ -241,6 +251,19 @@ pub struct ContinuousTask {
     pub run_count: u32,
     pub enabled: bool,
     pub paused: bool,
+    /// An operator's durable request to finish admitted work and stop. Resume
+    /// clears this together with `paused`; ordinary pause preserves it.
+    #[serde(default)]
+    pub drain: Option<super::drain::DrainRecord>,
+    #[serde(default)]
+    pub reconciliation: Option<super::migration::Reconciliation>,
+    #[serde(default)]
+    pub retirement: Option<super::migration::Retirement>,
+    #[serde(default)]
+    pub engine_changes: Vec<super::migration::EngineChange>,
+    /// Invalidates a fire prepared before a pause/drain/resume transition.
+    #[serde(default)]
+    pub admission_revision: u64,
     #[serde(default)]
     pub in_flight: Option<InFlight>,
     #[serde(default)]
@@ -291,6 +314,12 @@ pub struct ContinuousTask {
     /// lifecycle path supersedes the run).
     #[serde(default)]
     pub account_blocked: Option<AccountBlockRecord>,
+    /// Durable admission hold after a consumer wedge; resume alone cannot
+    /// discard an acknowledged batch with unverified processing outcomes.
+    #[serde(default)]
+    pub recovery_hold: Option<RecoveryHold>,
+    #[serde(default)]
+    pub recovery: Option<super::migration::RecoveryProgress>,
     /// Per-task override of the run-wedge close grace (seconds of post-turn
     /// silence before a `Running` run is judged wedged and auto-closed by
     /// `scheduler::auth_wedge_pass`). `None` (default) falls back to
@@ -370,6 +399,11 @@ impl ContinuousTask {
             run_count: 0,
             enabled: true,
             paused: false,
+            drain: None,
+            reconciliation: None,
+            retirement: None,
+            engine_changes: Vec::new(),
+            admission_revision: 0,
             in_flight: None,
             last_run: None,
             started_at: now_unix(),
@@ -383,6 +417,8 @@ impl ContinuousTask {
             investigation_count: 0,
             consecutive_wedge_closes: 0,
             account_blocked: None,
+            recovery_hold: None,
+            recovery: None,
             wedge_grace_secs: None,
             investigator_uid: None,
             investigator_started_at: None,
@@ -648,6 +684,21 @@ struct LockGuard {
     _file: fs::File,
 }
 
+/// Serializes operator pause/drain with scheduler interventions. Unlike the
+/// short state lock, this guard can span a spawn/kill/recovery operation. Never
+/// acquire it while holding DaemonState or the state-file lock. Lock order:
+/// lifecycle -> brief state-file / daemon locks (never both together).
+pub struct LifecycleGuard {
+    _lock: LockGuard,
+}
+
+pub fn lock_lifecycle(task_id: &str) -> std::io::Result<LifecycleGuard> {
+    validate_task_id(task_id)?;
+    Ok(LifecycleGuard {
+        _lock: LockGuard::acquire_named(&task_dir(task_id), "lifecycle.lock", libc::LOCK_EX)?,
+    })
+}
+
 impl LockGuard {
     fn exclusive(dir: &std::path::Path) -> Result<Self, std::io::Error> {
         Self::acquire(dir, libc::LOCK_EX)
@@ -658,8 +709,12 @@ impl LockGuard {
     }
 
     fn acquire(dir: &std::path::Path, op: libc::c_int) -> Result<Self, std::io::Error> {
+        Self::acquire_named(dir, "state.json.lock", op)
+    }
+
+    fn acquire_named(dir: &std::path::Path, name: &str, op: libc::c_int) -> Result<Self, std::io::Error> {
         use std::os::unix::io::AsRawFd;
-        let lock_path = dir.join("state.json.lock");
+        let lock_path = dir.join(name);
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)

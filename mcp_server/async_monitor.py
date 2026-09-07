@@ -42,7 +42,7 @@ import secrets
 import sys
 import time
 
-from mcp_server import control_client
+from mcp_server import control_client, monitor_state
 from mcp_server.monitor import (
     _monitor_sessions,
     baseline_for,
@@ -120,12 +120,26 @@ def _log(msg: str) -> None:
     print(f"cm-monitor: {msg}", file=sys.stderr, flush=True)
 
 
+def persist_state() -> None:
+    """Publish all current monitors before claiming completion or delivering."""
+    monitor_state.publish(_MONITORS)
+
+
+def _persist_best_effort() -> None:
+    try:
+        persist_state()
+    except (OSError, ValueError) as exc:
+        _log(f"durable monitor state unavailable ({type(exc).__name__}); drain remains blocked")
+
+
 def _active_monitors() -> list[dict]:
     return [m for m in _MONITORS.values() if m["state"] == "watching"]
 
 
 def _prune_finished() -> None:
-    done = [k for k, m in _MONITORS.items() if m["state"] != "watching"]
+    done = [k for k, m in _MONITORS.items()
+            if m["state"] not in ("watching", "fired")
+            and (m.get("task") is None or m["task"].done())]
     excess = len(done) - MAX_ACTIVE_MONITORS * 2
     for k in done[:max(0, excess)]:
         _MONITORS.pop(k, None)
@@ -263,6 +277,7 @@ def register_monitor(
             ):
                 m["task"].cancel()
                 m["state"] = "replaced"
+                _purge_inbox(m["caller"], m["monitor_id"])
 
     if len(_active_monitors()) >= MAX_ACTIVE_MONITORS:
         raise RegistrationError(
@@ -316,6 +331,11 @@ def register_monitor(
         "task": None,
     }
     _MONITORS[monitor_id] = record
+    try:
+        persist_state()
+    except (OSError, ValueError) as exc:
+        _MONITORS.pop(monitor_id, None)
+        raise RegistrationError("tracking_failed", "Could not persist the monitor obligation; no watch or notification was started.") from exc
     record["task"] = loop.create_task(
         _run_monitor(record, timeout_s=timeout_s),
         name=f"cm-monitor-{monitor_id}",
@@ -412,10 +432,12 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
                 await asyncio.sleep(5.0)
         record["result"] = result
         record["state"] = "fired"
+        persist_state()
         message = _format_fire_message(record, result)
         delivered = await _deliver_to_caller(record, message)
         record["delivered"] = delivered
         record["state"] = "delivered" if delivered else "undelivered"
+        persist_state()
         if not delivered:
             _log(
                 f"{monitor_id}: could not verify delivery to "
@@ -427,12 +449,16 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
         # cancelled mid-delivery ("fired") must not resurrect as
         # "undelivered" and keep sending. Only the auto-replace path's
         # "replaced" label survives.
-        if record["state"] != "replaced":
-            record["state"] = "cancelled"
+        if record["state"] not in ("replaced", "cancelled"):
+            # Event-loop/MCP shutdown is not an operator cancellation and
+            # must not erase an undelivered completion from the durable view.
+            record["state"] = "interrupted"
+        _persist_best_effort()
         raise
     except Exception as e:  # noqa: BLE001 — background task, never raise
         record["state"] = "error"
         record["error"] = str(e)
+        _persist_best_effort()
         _log(f"{monitor_id}: monitor loop crashed: {e!r}")
 
 
@@ -688,15 +714,29 @@ async def _try_inbox_delivery(record: dict, message: str) -> bool:
     the caller then gets the PTY path instead."""
     caller = record["caller"]
     monitor_id = record["monitor_id"]
+    record["delivery_uncertain"] = True
+    persist_state()
     path = _write_inbox(caller, monitor_id, message)
     if path is None:
         return False
+    async def consumed() -> bool:
+        # Removal only proves that somebody took the file. The hook may have
+        # failed to read it or exited before returning its block instruction.
+        # Avoid a duplicate send, but keep that ambiguity as a drain blocker.
+        deadline = time.monotonic() + VERIFY_WINDOW_S
+        while time.monotonic() < deadline:
+            if await _marker_landed(caller, f"[cm-monitor {monitor_id}", None):
+                record["delivery_uncertain"] = False
+                return True
+            await asyncio.sleep(POLL_S)
+        return True
+
     try:
         deadline = time.monotonic() + CALLER_IDLE_MAX_WAIT_S
         while time.monotonic() < deadline:
             if not os.path.exists(path):
-                _log(f"{monitor_id}: delivered via Stop-hook inbox")
-                return True
+                _log(f"{monitor_id}: Stop-hook inbox consumed; verifying receipt")
+                return await consumed()
             at_prompt, _ = await _caller_at_prompt(caller)
             if at_prompt:
                 # Caller is at its prompt but nothing consumed the
@@ -705,7 +745,7 @@ async def _try_inbox_delivery(record: dict, message: str) -> bool:
                 try:
                     os.remove(path)
                 except FileNotFoundError:
-                    return True  # consumed in the race after all
+                    return await consumed()  # consumed in the race after all
                 except OSError:
                     pass
                 return False
@@ -721,7 +761,7 @@ async def _try_inbox_delivery(record: dict, message: str) -> bool:
     try:
         os.remove(path)
     except FileNotFoundError:
-        return True
+        return await consumed()
     except OSError:
         pass
     return False
@@ -794,6 +834,7 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
             cleared = False
             while time.monotonic() < regate_deadline:
                 if await _marker_landed(caller, marker, last_tpath):
+                    record["delivery_uncertain"] = record.get("send_attempts", 0) > 1
                     return True
                 at_prompt, resolved = await _caller_at_prompt(caller)
                 if resolved and resolved.get("transcript_path"):
@@ -809,6 +850,11 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
                 )
                 break
         try:
+            # The daemon may queue this send on another thread. Cancellation
+            # or an RPC timeout cannot prove it will never arrive later.
+            record["delivery_uncertain"] = True
+            record["send_attempts"] = record.get("send_attempts", 0) + 1
+            persist_state()
             await asyncio.to_thread(
                 control_client.call,
                 "send_input",
@@ -819,12 +865,13 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
             await asyncio.sleep(POLL_S)
             continue
         if last_tpath is None:
-            # Nothing to verify against (caller transcript unknown) —
-            # trust the successful send.
-            return True
+            # Retain the delivery as unverified; accepting the RPC only
+            # acknowledges enqueueing, not actual receipt by the agent.
+            return False
         verify_deadline = time.monotonic() + VERIFY_WINDOW_S
         while time.monotonic() < verify_deadline:
             if await _marker_landed(caller, marker, last_tpath):
+                record["delivery_uncertain"] = record.get("send_attempts", 0) > 1
                 return True
             await asyncio.sleep(POLL_S)
         _log(
@@ -868,6 +915,7 @@ def _cancel_record(m: dict) -> None:
     if m["state"] in _LIVE_STATES:
         m["state"] = "cancelled"
     _purge_inbox(m["caller"], m["monitor_id"])
+    _persist_best_effort()
 
 
 def cancel_monitor(monitor_id: str) -> dict:
@@ -893,4 +941,8 @@ def list_monitors() -> dict:
         out.append({
             k: v for k, v in m.items() if k != "task"
         })
-    return {"monitors": out}
+    try:
+        durable = monitor_state.read()
+    except (OSError, ValueError):
+        durable = {"available": False, "error": "Durable monitor journal is unreadable."}
+    return {"monitors": out, "durable": durable}

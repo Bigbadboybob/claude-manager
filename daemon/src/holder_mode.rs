@@ -797,6 +797,17 @@ pub struct HolderBoot {
 }
 
 impl HolderBoot {
+    /// Kernel-verified survivors for the early continuous-run orphan sweep.
+    /// Reaped records and queued exit events are not live work, even when
+    /// their retained holder record still has the old pid metadata.
+    pub fn live_session_uids(&self) -> std::collections::HashSet<String> {
+        self.records.iter().filter_map(|(record, _, _)| {
+            if record.reaped || record.exit_event_pending { return None; }
+            let start = crate::adopt::proc_starttime(record.child_pid).ok()?;
+            (start == record.child_start_time).then(|| record.uid.clone())
+        }).collect()
+    }
+
     /// Take the custodied listener of `kind`, if the holder held one.
     pub fn take_listener(&mut self, kind: &str) -> Option<(ch::ListenerMeta, OwnedFd)> {
         let pos = self.listeners.iter().position(|(m, _)| m.kind == kind)?;

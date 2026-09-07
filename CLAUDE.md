@@ -110,8 +110,8 @@ Global:
 - `A-,` — toggle the activity feed (5-line strip above the status bar showing recent agent-initiated mutations: start_session, send_input, kill_session, start/stop_workflow, create_subtask, mark_subtask_done). Off by default.
 
 Sessions view:
-- `A-n` — new local session (creates a worktree)
-- `A-s` — add a session to the focused task
+- `A-n` — new workspace (creates a worktree); Tab to Engine and ←/→ to choose Claude or Codex, default Codex
+- `A-s` — add a session to the focused task (defaults to Codex)
 - `A-a` — attach
 - `A-w` — close session
 - `A-H` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden). Moved from `A-h`; the old `A-H` active-host switcher is retired (global host is being removed — new sessions use the `local` default).
@@ -259,6 +259,10 @@ ssh cm-manager 'sudo cp -r /tmp/mcp_server/* /opt/cm-daemon/mcp_server/ && sudo 
 ```
 
 `claude` (npm `@anthropic-ai/claude-code`) and `codex` (npm `@openai/codex`) are installed system-wide so the daemon can spawn them from any session.
+
+On **cm-manager**, Codex is root-owned under `/usr/lib/node_modules/@openai/codex`, launched through `/usr/bin/codex`. Update it with `sudo /usr/bin/npm install -g --prefix /usr @openai/codex@<version>`, then verify `codex --version` as `lucas`. Its user-run self-updater cannot rename this root-owned installation and fails with `EACCES`; use the sudo command for this host. The local machine uses its own installation path.
+
+Codex update notifications use `scripts/codex-update-check` → `~/.cm/bin/codex-update-check`, daily at 13:00 UTC in the marked `cm-codex-update-check` crontab block. Configuration is `~/.cm/codex-update-config.json` (`hold_version: "0.153.4"` during migration); results and notification history are in `~/.cm/codex-update-state.json`. It checks npm and sends subscribed Telegram alerts through `cm-notify`; it never installs or restarts anything. With this managed checker active, cm-manager's Codex startup checks are disabled. See [the update-checker runbook](doc/codex-update-checker.md) for manual checks, failures and removing the hold.
 
 ### `cm-manager` backtest-replay DB (predictionTrading)
 

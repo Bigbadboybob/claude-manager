@@ -159,7 +159,7 @@ enum FireOutcome {
     /// [`Fired`] but floors the spacing at [`COMPACT_SETTLE_SPACING_SECS`] so
     /// the NEXT fire's paste cannot land mid-summarization and be dropped.
     FiredCompact,
-    /// `Ok({fired:false, reason:busy|paused|duplicate_fire_token})` — a benign
+    /// `Ok({fired:false, reason:busy|paused|duplicate_fire_token|stale_admission})` — a benign
     /// skip (the `in_flight` guard / `paused` flag already prevents
     /// re-selection). Do NOT bump `consecutive_failures`. Leaves `next_fire_at`
     /// UNADVANCED — the task is re-evaluated next due tick.
@@ -388,6 +388,9 @@ impl ContinuousScheduler {
     ///   (e) fire + advance — fire each due task, advance `next_fire_at`
     ///       catch-up-once (or back off on failure).
     pub fn tick_once(&self) {
+        // Operator stop notices remain usable with scheduled fires disabled.
+        // The notifier separately respects host restart drain/quiescence.
+        crate::control::continuous_drain::queue_notices(&self.state, &task::load_all());
         // Master on/off (read under a brief lock). lib.rs still constructs +
         // starts the thread when disabled; the tick is just a no-op.
         // H3: drain mode also parks the tick — firing a continuous task
@@ -701,6 +704,23 @@ impl ContinuousScheduler {
             if tk.run_mode != task::RunMode::Fresh || !tk.enabled || tk.paused {
                 continue;
             }
+            // Serialize the whole intervention with operator pause/drain,
+            // then reload: the scheduler snapshot may predate the stop.
+            // No DaemonState lock is held while acquiring this task lock.
+            let Ok(_lifecycle) = task::lock_lifecycle(&tk.task_id) else {
+                continue;
+            };
+            let Some(current) = task::load_one(&tk.task_id) else {
+                continue;
+            };
+            let tk = &current;
+            if tk.run_mode != task::RunMode::Fresh
+                || !tk.enabled
+                || tk.paused
+                || tk.drain.is_some()
+            {
+                continue;
+            }
             // Must have an ACTIVE run.
             let Some(run) = tk.last_run.as_ref() else {
                 continue;
@@ -989,9 +1009,14 @@ impl ContinuousScheduler {
 
         let mut held = HashSet::new();
         for tk in tasks {
-            // Claude-only: the tail shapes (turn_duration records, the
-            // authentication_failed marker) are claude-code transcript vocab.
-            if tk.engine != task::Engine::Claude || !tk.enabled || tk.paused {
+            if tk.engine == task::Engine::Bash || !tk.enabled || (tk.paused && tk.drain.is_none()) {
+                continue;
+            }
+            if tk.engine == task::Engine::Codex && (tk.recovery_hold.is_some() || tk.recovery.is_some()) {
+                held.insert(tk.task_id.clone());
+                if let Err((_, error)) = crate::continuous::migration::recover_codex(&self.state, &tk.task_id, now) {
+                    eprintln!("cm-daemon: Codex recovery for {} remains held: {error}", tk.task_id);
+                }
                 continue;
             }
             let Some(run) = tk.last_run.as_ref() else {
@@ -1003,6 +1028,19 @@ impl ContinuousScheduler {
             let Some(uid) = run.session_uid.as_deref() else {
                 continue;
             };
+            // A task definition alone cannot establish the active runtime's
+            // engine. A stale UID or engine mismatch stays held for diagnosis.
+            let runtime = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.sessions.get(uid).map(|session| session.session_type.clone())
+                    .or_else(|| state.exited_tombstone(uid).map(|s| s.session_type.clone()))
+            };
+            if (runtime.is_some() && runtime.as_deref() != Some(tk.engine.as_session_type()))
+                || (tk.engine == task::Engine::Codex && runtime.is_none()) {
+                held.insert(tk.task_id.clone());
+                self.record_drain_diagnostic(tk, run.seq, uid, Some("Active run/session engine identity could not be validated.".into()));
+                continue;
+            }
             // Per-task probe throttle.
             {
                 let mut probes = self.probe_at.lock().unwrap_or_else(|p| p.into_inner());
@@ -1020,7 +1058,7 @@ impl ContinuousScheduler {
             // later end-to-end probe must complete successfully.
             if let Some(block) = active_account_block(tk) {
                 held.insert(tk.task_id.clone());
-                if self.account_recovery_proven(block) {
+                if self.account_recovery_proven(tk, block, now) {
                     self.recover_account_block(
                         tk,
                         run.seq,
@@ -1055,9 +1093,51 @@ impl ContinuousScheduler {
             let Some(mtime) = mtime_unix(&path) else {
                 continue;
             };
-            let Some(tail) = probe::probe_transcript_tail(&path) else {
+            let tail = match tk.engine {
+                task::Engine::Claude => probe::probe_transcript_tail(&path),
+                task::Engine::Codex => crate::continuous::codex_probe::probe(&path, run.started_at.max(tk.last_fired_at) as f64),
+                task::Engine::Bash => None,
+            };
+            let Some(tail) = tail else {
+                if tk.engine == task::Engine::Codex {
+                    held.insert(tk.task_id.clone());
+                    self.record_drain_diagnostic(tk, run.seq, uid, Some("Codex rollout is missing, unknown, stale or has an unclassified runtime error; no automatic close or recovery.".into()));
+                    eprintln!("cm-daemon: Codex tail evidence unavailable for {} seq {}; run remains held", tk.task_id, run.seq);
+                }
                 continue;
             };
+            if tail.shape == TailShape::MidTurn {
+                self.record_drain_diagnostic(tk, run.seq, uid, None);
+            }
+
+            if let Some(detail) = tail.pool_unavailable.as_deref() {
+                held.insert(tk.task_id.clone());
+                // Persist admission closure for every schedule, including
+                // manual run_now and restarts. Workers may still finish;
+                // retirement/replay remain gated on their separate evidence.
+                let mut recorded = false;
+                let _ = task::modify(&tk.task_id, |current| {
+                    if current.engine != task::Engine::Codex || current.in_flight.is_some()
+                        || current.recovery_hold.is_some() { return; }
+                    let Some(active) = current.last_run.as_mut() else { return; };
+                    if active.seq != run.seq || active.fire_token != run.fire_token
+                        || active.session_uid.as_deref() != Some(uid) || active.status != RunStatus::Running { return; }
+                    active.status = RunStatus::Failed;
+                    active.finished_at = Some(now);
+                    current.account_blocked = None;
+                    current.recovery_hold = Some(task::RecoveryHold { run_seq: run.seq, session_uid: uid.to_string(),
+                        fire_token: run.fire_token.clone(), detected_at: now, detail: detail.into() });
+                    current.admission_revision = current.admission_revision.saturating_add(1);
+                    recorded = true;
+                });
+                if recorded {
+                    crate::notify::notify_operator(notify_cmd.as_deref(), "codex-pool", &format!("Continuous task '{}' held: {detail}", tk.task_id));
+                    let _ = ContinuousRunLog::append(&RunLogLine { seq: run.seq, ts: now as f64, task_id: tk.task_id.clone(),
+                        event: "pool_unavailable".into(), fire_token: Some(run.fire_token.clone()), session_uid: Some(uid.into()),
+                        run_mode: None, trigger_source: Some(SCHEDULER_CALLER_TOKEN.into()), status: Some("failed".into()), detail: Some(detail.into()) });
+                }
+                continue;
+            }
 
             // --- 1. account blocker (any schedule) ---
             let blocker = tail
@@ -1082,6 +1162,9 @@ impl ContinuousScheduler {
                 if let Err(e) = task::modify(&tk.task_id, |t| {
                     if t.last_run.as_ref().is_some_and(|current| {
                         current.seq == run.seq
+                            && t.engine == tk.engine
+                            && t.in_flight.is_none()
+                            && current.fire_token == run.fire_token
                             && current.status == RunStatus::Running
                             && current.session_uid.as_deref() == Some(uid)
                     }) {
@@ -1134,6 +1217,15 @@ impl ContinuousScheduler {
                 TailShape::TurnComplete | TailShape::AwaitingResponse => {}
             }
             let quiet_secs = now.saturating_sub(quiet_since);
+            // An ended orchestrator turn can still have live workers or a
+            // pending final monitor. During drain, expose the missing report
+            // without declaring that work abandoned or releasing its hold.
+            // The locked helper also catches a drain newer than this snapshot.
+            if self.record_drain_diagnostic(tk, run.seq, uid, Some(format!(
+                "No report_done after {quiet_secs}s since the last turn activity; verify workers and completion deliveries. The run and batch remain held."
+            ))) {
+                continue;
+            }
             if tk.consecutive_wedge_closes >= wedge_limit {
                 self.escalate_wedged_run(
                     tk,
@@ -1149,6 +1241,48 @@ impl ContinuousScheduler {
             }
         }
         held
+    }
+
+    /// Returns true when a matching active drain owns the observation. A new
+    /// request/run or a concurrent report_done cannot inherit an old warning.
+    fn record_drain_diagnostic(
+        &self,
+        tk: &ContinuousTask,
+        seq: u64,
+        uid: &str,
+        detail: Option<String>,
+    ) -> bool {
+        let mut draining = false;
+        let result = task::try_modify::<_, ()>(&tk.task_id, |current| {
+            if current.last_run.as_ref().is_some_and(|run| {
+                run.seq == seq
+                    && run.session_uid.as_deref() == Some(uid)
+                    && run.status == RunStatus::Running
+            }) {
+                if let Some(drain) = current.drain.as_mut() {
+                    draining = true;
+                    if tk
+                        .drain
+                        .as_ref()
+                        .is_some_and(|old| old.request_id != drain.request_id)
+                    {
+                        return Err(());
+                    }
+                    // The active task's run identity is authoritative even if
+                    // drain arrived after the scheduler took its snapshot.
+                    if drain.run_seq == Some(seq) && drain.session_uid.as_deref() == Some(uid) {
+                        if drain.diagnostic == detail {
+                            return Err(());
+                        }
+                        drain.diagnostic = detail;
+                        return Ok(());
+                    }
+                }
+            }
+            Err(())
+        });
+        // A failed read/write cannot authorize a wedge close past a stop.
+        draining || matches!(result, task::TryModifyOutcome::Persist(_))
     }
 
     /// Account-block surfacing: attributed runlog + push alert, at most once per
@@ -1175,16 +1309,15 @@ impl ContinuousScheduler {
             AccountBlockKind::AuthExpired => ("AUTH EXPIRED", "auth_expired"),
             AccountBlockKind::UsageLimited => ("USAGE LIMITED", "usage_limited"),
         };
+        let engine = if tk.engine == task::Engine::Codex { "codex" } else { "claude" };
+        let recovery = if tk.engine == task::Engine::Codex {
+            "Inspect ~/.cm/codex-probe-state.json for fresh account evidence. Work reconciliation and safe retirement are required before releasing the hold; a successful probe alone does not resume this task."
+        } else {
+            "After /login, recovery is automatic once ~/.cm/claude-probe-state.json records a newer successful check (continuous.force_done remains the break-glass fallback)."
+        };
         crate::notify::notify_operator(
-            notify_cmd,
-            "account-blocked",
-            &format!(
-                "claude account {}: continuous task '{}' (session {}) ended its turn \
-                 with \"{}\". Run seq {} is left Running to block further fires and \
-                 protect queued work. After /login, recovery is automatic once \
-                 ~/.cm/claude-probe-state.json records a newer successful check \
-                 (continuous.force_done remains the break-glass fallback).",
-                kind_label, tk.task_id, uid, banner, seq,
+            notify_cmd, "account-blocked", &format!(
+                "{engine} account {kind_label}: continuous task '{}' (session {uid}) ended its turn with \"{banner}\". Run seq {seq} remains Running to protect queued work. {recovery}", tk.task_id,
             ),
         );
         if let Err(e) = ContinuousRunLog::append(&RunLogLine {
@@ -1209,9 +1342,13 @@ impl ContinuousScheduler {
     /// Positive recovery proof comes from the host's end-to-end
     /// `claude-usage-probe`, not from credential-file shape. The latter cannot
     /// distinguish a fresh account from a perfectly-valid exhausted account.
-    fn account_recovery_proven(&self, block: &AccountBlockRecord) -> bool {
-        let path = crate::path::dot_cm_dir().join("claude-probe-state.json");
-        crate::continuous::probe::usage_probe_ok_after(&path, block.detected_at)
+    fn account_recovery_proven(&self, tk: &ContinuousTask, block: &AccountBlockRecord, now: u64) -> bool {
+        let root = crate::path::dot_cm_dir();
+        match tk.engine {
+            task::Engine::Claude => crate::continuous::probe::usage_probe_ok_after(&root.join("claude-probe-state.json"), block.detected_at),
+            task::Engine::Codex => crate::continuous::codex_account::ok_after(&root.join("codex-probe-config.json"), &root.join("codex-probe-state.json"), block.detected_at, now as f64),
+            task::Engine::Bash => false,
+        }
     }
 
     /// Retire the poisoned run and kill its old session after a later probe has
@@ -1228,6 +1365,38 @@ impl ContinuousScheduler {
         notify_cmd: Option<&str>,
         now: u64,
     ) {
+        if tk.engine == task::Engine::Codex {
+            if let Err((_, error)) = crate::continuous::migration::recover_codex(&self.state, &tk.task_id, now) {
+                eprintln!("cm-daemon: Codex recovery for {} remains held: {error}", tk.task_id);
+            }
+            return;
+        }
+        // Admission being closed must also prevent replay/retirement. Hold
+        // this separate lifecycle lock through recovery so a concurrent drain
+        // cannot land between validation and a queue mutation or kill.
+        let Ok(_lifecycle) = task::lock_lifecycle(&tk.task_id) else {
+            return;
+        };
+        let Some(current) = task::load_one(&tk.task_id) else {
+            return;
+        };
+        if current.paused
+            || current.drain.is_some()
+            || current.engine != tk.engine
+            || current.in_flight.is_some()
+            || !current.enabled
+            || current.account_blocked.as_ref() != Some(block)
+            || !current.last_run.as_ref().is_some_and(|run| {
+                run.seq == seq
+                    && run.session_uid.as_deref() == Some(uid)
+                    && run.status == RunStatus::Running
+            })
+        {
+            return;
+        }
+        let tk = &current;
+
+
         // Consumer items were acked when the poisoned prompt was delivered.
         // Re-enqueue the staged batch BEFORE releasing the run hold; retries
         // are idempotent through the original (or synthesized) dedupe key.
@@ -1433,9 +1602,30 @@ impl ContinuousScheduler {
         notify_cmd: Option<&str>,
         now: u64,
     ) {
+        let Ok(_lifecycle) = task::lock_lifecycle(&tk.task_id) else { return; };
+        if tk.engine == task::Engine::Codex {
+            let mut observed = tk.clone();
+            crate::continuous::drain::request(&mut observed, now);
+            let sessions = crate::control::methods::capture_drain_sessions(&self.state, &observed);
+            let monitors = crate::continuous::completion::load_session_monitors(Some(uid), &sessions);
+            if sessions.iter().any(|s| !s.orchestrator && (s.failed || !s.reported_done || (!s.exited && !s.final_turn_ended)))
+                || monitors.fingerprint.is_none() || !monitors.outstanding.is_empty() { return; }
+            let Some(path) = self.session_transcript_path(uid) else { return; };
+            let after = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(session) = state.sessions.get(uid) else { return; };
+                let input = *session.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+                input.map(|at| crate::control::methods::now_unix_f64() - at.elapsed().as_secs_f64()).unwrap_or(0.0)
+            };
+            let Some(tail) = crate::continuous::codex_probe::probe(&path, after.max(tk.last_fired_at as f64)) else { return; };
+            if tail.shape == crate::continuous::probe::TailShape::MidTurn || tail.auth_error.is_some() || tail.usage_limit.is_some() || tail.pool_unavailable.is_some() { return; }
+        }
         let mut closed = false;
         let mut closes = tk.consecutive_wedge_closes;
         let _ = task::modify(&tk.task_id, |t| {
+            if t.paused || t.drain.is_some() || t.in_flight.is_some() || t.engine != tk.engine {
+                return;
+            }
             if let Some(run) = t.last_run.as_mut() {
                 if run.seq == seq
                     && run.status == RunStatus::Running
@@ -1445,6 +1635,12 @@ impl ContinuousScheduler {
                     run.finished_at = Some(now);
                     t.consecutive_wedge_closes = t.consecutive_wedge_closes.saturating_add(1);
                     t.account_blocked = None;
+                    if t.engine == task::Engine::Codex && matches!(t.schedule, Schedule::Consumer { .. }) {
+                        t.recovery_hold = Some(task::RecoveryHold { run_seq: seq, session_uid: uid.to_string(), fire_token: run.fire_token.clone(), detected_at: now,
+                            detail: "Codex turn ended without report_done. The staged batch remains held until completed and unfinished items are reconciled.".into() });
+                        t.admission_revision = t.admission_revision.saturating_add(1);
+                    }
+
                     closes = t.consecutive_wedge_closes;
                     closed = true;
                 }
@@ -1453,13 +1649,16 @@ impl ContinuousScheduler {
         if !closed {
             return; // raced with report_done / a newer fire — nothing wedged
         }
+        let next_action = if tk.engine == task::Engine::Codex && matches!(tk.schedule, Schedule::Consumer { .. }) {
+            "The staged batch remains held for item reconciliation; no new claim or automatic replay is allowed."
+        } else { "The schedule may fire again." };
         crate::notify::notify_operator(
             notify_cmd,
             "run-wedge",
             &format!(
                 "continuous task '{}' run seq {} WEDGED: session {} ended its turn \
                  without report_done and produced nothing for {}s. Auto-closed \
-                 (Running → Failed); the schedule refires naturally. (consecutive \
+                 (Running → Failed); {next_action} (consecutive \
                  close {}/{} — at the limit the scheduler escalates instead)",
                 tk.task_id, seq, uid, quiet_secs, closes, wedge_limit,
             ),
@@ -1630,6 +1829,7 @@ impl ContinuousScheduler {
     /// overdue on-disk guard from before a daemon restart clears here too.
     fn reconcile_orphans(&self, now: u64) {
         for tk in task::load_all() {
+            if tk.recovery.is_some() || (tk.engine == task::Engine::Codex && (tk.account_blocked.is_some() || tk.recovery_hold.is_some())) { continue; }
             // A run can be stranded `Running` with no live reaper to finish it
             // when the daemon restarts / crashes / is SIGKILLed mid-run (systemd
             // kills the whole cgroup, so the child dies without its clean-exit
@@ -1887,7 +2087,7 @@ impl ContinuousScheduler {
                         FireOutcome::Fired
                     }
                 } else {
-                    // busy / paused / duplicate_fire_token — a benign skip.
+                    // busy / paused / duplicate / stale admission — a benign skip.
                     FireOutcome::Skipped
                 }
             }
@@ -2016,6 +2216,9 @@ fn should_supervise(tk: &ContinuousTask) -> bool {
         && !tk.paused
         && tk.in_flight.is_none()
         && active_account_block(tk).is_none()
+        && tk.recovery_hold.is_none()
+        && tk.recovery.is_none()
+        && tk.retirement.is_none()
 }
 
 /// Phase 3b DUE-SKIP-ACTIVE predicate: a FRESH task whose most recent run is
@@ -2041,7 +2244,7 @@ fn fresh_run_active(tk: &ContinuousTask) -> bool {
 /// tasks keep the Phase-3b fresh-only semantics. `pub(crate)` so the trigger
 /// compact-boundary regression tests can assert the gate directly.
 pub(crate) fn run_active_blocks_fire(tk: &ContinuousTask) -> bool {
-    if active_account_block(tk).is_some() {
+    if tk.recovery_hold.is_some() || tk.recovery.is_some() || tk.retirement.is_some() || active_account_block(tk).is_some() {
         return true;
     }
     if matches!(tk.schedule, Schedule::Consumer { .. }) {
@@ -3299,6 +3502,55 @@ mod tests {
         });
     }
 
+    #[test]
+    fn drain_prevents_watchdog_intervention_from_a_stale_snapshot() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let uid = "drain-stale-worker";
+            insert_live_session(&state, uid);
+            for count in [0, 100] {
+                let mut snapshot = fresh_running_task("drain-watchdog", uid, 1);
+                snapshot.investigation_count = count;
+                task::save(&snapshot).unwrap();
+                crate::control::methods::continuous_drain(
+                    &state,
+                    &serde_json::json!({"task_id": snapshot.task_id}),
+                )
+                .unwrap();
+                crate::control::methods::arm_continuous_spawn_spy_for_test();
+                sched.watchdog_pass(&[snapshot], task::now_unix());
+                assert!(crate::control::methods::take_continuous_spawn_spy_for_test().is_empty());
+                let current = task::load_one("drain-watchdog").unwrap();
+                assert_eq!(current.last_run.unwrap().status, RunStatus::Running);
+                assert_eq!(current.investigation_count, count);
+                assert!(!sched.session_is_dead(uid));
+            }
+        });
+    }
+
+    #[test]
+    fn codex_watchdog_spawns_a_codex_investigator() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let uid = "codex-watchdog-worker";
+            insert_live_session(&state, uid);
+            let mut t = fresh_running_task("codex-watchdog", uid, 1);
+            t.engine = Engine::Codex;
+            task::save(&t).unwrap();
+            crate::control::methods::arm_continuous_spawn_spy_for_test();
+            sched.watchdog_pass(&[t], task::now_unix());
+            let spawns = crate::control::methods::take_continuous_spawn_spy_for_test();
+            assert_eq!(spawns.len(), 1);
+            assert_eq!(spawns[0]["session_type"], "codex");
+            let current = task::load_one("codex-watchdog").unwrap();
+            assert_eq!(current.investigation_count, 1);
+            assert!(current.investigator_uid.is_some());
+            assert_eq!(current.last_run.unwrap().status, RunStatus::Running);
+        });
+    }
+
     /// At the investigation cap (`investigation_count == max_investigations`,
     /// default 2) the watchdog AUTO-ESCALATES: it kills the stuck session via
     /// kill_session semantics (left in registry, operator-kill flag set), flips
@@ -3696,6 +3948,112 @@ mod tests {
         });
     }
 
+    #[test]
+    fn drain_keeps_account_diagnostics_but_prevents_stale_recovery() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let uid = "drain-account-worker";
+            let mtime = bind_transcript(
+                &state,
+                uid,
+                "drain-auth.jsonl",
+                &[T_USER, T_AUTH_401, T_TURN_END],
+            );
+            let t = fresh_running_task("drain-account", uid, 1);
+            task::save(&t).unwrap();
+            // Ordinary pause retains its existing diagnostic skip.
+            crate::control::methods::continuous_pause(
+                &state,
+                &serde_json::json!({"task_id": t.task_id, "paused": true}),
+            )
+            .unwrap();
+            sched.auth_wedge_pass(&task::load_all(), mtime + 100);
+            assert!(task::load_one(&t.task_id)
+                .unwrap()
+                .account_blocked
+                .is_none());
+            crate::control::methods::continuous_drain(
+                &state,
+                &serde_json::json!({"task_id": t.task_id}),
+            )
+            .unwrap();
+            sched.auth_wedge_pass(&task::load_all(), mtime + 101);
+            let current = task::load_one(&t.task_id).unwrap();
+            let block = current
+                .account_blocked
+                .as_ref()
+                .expect("diagnostics continue during drain");
+            // Pretend an earlier pass already proved account health. The
+            // recovery helper must reload before any replay or retirement.
+            let mut stale = current.clone();
+            stale.paused = false;
+            stale.drain = None;
+            sched.recover_account_block(&stale, 1, uid, block, None, mtime + 102);
+            let current = task::load_one(&t.task_id).unwrap();
+            assert!(current.paused && current.drain.is_some());
+            assert!(current.account_blocked.is_some());
+            assert_eq!(current.last_run.unwrap().status, RunStatus::Running);
+            assert!(!sched.session_is_dead(uid));
+        });
+    }
+
+    #[test]
+    fn drain_surfaces_missing_completion_without_closing_the_run() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let uid = "drain-wedge-worker";
+            let mtime = bind_transcript(
+                &state,
+                uid,
+                "drain-wedge.jsonl",
+                &[T_USER, T_ASSISTANT, T_TURN_END],
+            );
+            let mut snapshot = running_consumer("drain-wedge", uid, RunMode::Persistent, 5, mtime);
+            snapshot.wedge_grace_secs = Some(1);
+            task::save(&snapshot).unwrap();
+            crate::control::methods::continuous_drain(
+                &state,
+                &serde_json::json!({"task_id": snapshot.task_id}),
+            )
+            .unwrap();
+            sched.auth_wedge_pass(&[snapshot], mtime + 10_000);
+            let t = task::load_one("drain-wedge").unwrap();
+            assert!(t.drain.as_ref().unwrap().diagnostic.is_some());
+            assert_eq!(t.last_run.as_ref().unwrap().status, RunStatus::Running);
+            assert_eq!(t.consecutive_wedge_closes, 0);
+            assert!(!sched.session_is_dead(uid));
+            let response =
+                crate::control::methods::continuous_list(&state, &serde_json::json!({})).unwrap();
+            assert_eq!(response["tasks"][0]["drain_status"]["state"], "blocked");
+            // Its own healthy completion still closes the run normally.
+            state
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut(uid)
+                .unwrap()
+                .continuous_task_id = Some(t.task_id.clone());
+            crate::control::methods::report_done(
+                &state,
+                &crate::control::protocol::Caller::session(uid),
+                &serde_json::json!({}),
+            )
+            .unwrap();
+            let t = task::load_one("drain-wedge").unwrap();
+            assert_eq!(t.last_run.as_ref().unwrap().status, RunStatus::Done);
+            assert!(t.drain.as_ref().unwrap().diagnostic.is_none());
+            let audit = std::fs::read_to_string(task::runs_log_path(&t.task_id)).unwrap();
+            let completed: serde_json::Value = audit
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|line| line["event"] == "report_done")
+                .unwrap();
+            assert_eq!(completed["run_mode"], "persistent");
+        });
+    }
+
     /// The 2026-08-22 incident shape was NOT `authentication_failed`: Claude
     /// emitted an ordinary assistant weekly-limit banner. It must create a
     /// durable account hold immediately, block both due-fire and persistent
@@ -3830,6 +4188,94 @@ mod tests {
     /// session's transcript ends in a COMPLETED healthy turn and nothing has
     /// happened past the grace. Auto-closed `Running → Failed` (due-gate
     /// unblocked), counter bumped, `"wedge_closed"` audited.
+    #[test]
+    fn codex_wedge_requires_delivery_evidence_and_holds_consumer_batch() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let uid = "codex-wedge-root";
+            let mtime = bind_transcript(&state, uid, "codex.jsonl", &[include_str!("../../tests/fixtures/codex-0.153.4/success.jsonl")]);
+            state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "codex".into();
+            let mut t = running_consumer("codex-wedge", uid, RunMode::Persistent, 1, 1);
+            t.engine = Engine::Codex;
+            task::save(&t).unwrap();
+            let now = mtime + state.lock().unwrap().config.scheduler.consumer_wedge_grace_secs + 1;
+            sched.auth_wedge_pass(&task::load_all(), now);
+            assert_eq!(task::load_one(&t.task_id).unwrap().last_run.unwrap().status, RunStatus::Running, "missing journal cannot prove an abandoned run");
+            let journal = crate::path::dot_cm_dir().join("monitor-state").join(format!("{uid}.json"));
+            std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+            std::fs::write(&journal, serde_json::json!({"schema_version":1,"coverage_version":1,"session_uid":uid,"revision":1,"producers":{"p":{"records":{}}}}).to_string()).unwrap();
+            sched.auth_wedge_pass(&task::load_all(), now + TAIL_PROBE_INTERVAL_SECS + 1);
+            let closed = task::load_one(&t.task_id).unwrap();
+            assert_eq!(closed.last_run.as_ref().unwrap().status, RunStatus::Failed);
+            assert_eq!(closed.recovery_hold.as_ref().unwrap().run_seq, 1);
+            assert!(run_active_blocks_fire(&closed));
+            assert!(!should_supervise(&closed));
+            let response = crate::control::methods::continuous_run_now(&state, &crate::control::protocol::Caller::operator("test"), &serde_json::json!({"task_id":t.task_id})).unwrap();
+            assert_eq!(response["reason"], "reconciliation_required");
+            assert!(!state.lock().unwrap().sessions[uid].last_exit.operator_kill_requested(), "wedge close never interrupts the session");
+        });
+    }
+
+    #[test]
+    fn codex_account_errors_and_unknown_runtime_keep_run_and_batch_held() {
+        let _tmp = with_temp_home(|| {
+            for (name, fixture, expected) in [
+                ("codex-auth", include_str!("../../tests/fixtures/codex-0.153.4/invalid_api_key.jsonl"), Some(AccountBlockKind::AuthExpired)),
+                ("codex-usage", include_str!("../../tests/fixtures/codex-0.153.4/usage_limit_reached.jsonl"), Some(AccountBlockKind::UsageLimited)),
+                ("codex-unknown", include_str!("../../tests/fixtures/codex-0.153.4/model_not_found.jsonl"), None),
+            ] {
+                let state = Arc::new(Mutex::new(DaemonState::default()));
+                let sched = ContinuousScheduler::new(Arc::clone(&state));
+                let mtime = bind_transcript(&state, name, &format!("{name}.jsonl"), &[fixture]);
+                state.lock().unwrap().sessions.get_mut(name).unwrap().session_type = "codex".into();
+                let mut t = running_consumer(name, name, RunMode::Persistent, 1, 1);
+                t.engine = Engine::Codex;
+                crate::continuous::drain::request(&mut t, 2);
+                task::save(&t).unwrap();
+                let held = sched.auth_wedge_pass(&[t.clone()], mtime + 3600);
+                assert!(held.contains(name));
+                let current = task::load_one(name).unwrap();
+                assert_eq!(current.last_run.unwrap().status, RunStatus::Running);
+                assert_eq!(current.account_blocked.map(|b| b.kind), expected);
+                assert!(current.paused);
+                assert!(!state.lock().unwrap().sessions[name].last_exit.operator_kill_requested());
+                if expected.is_none() { assert!(current.drain.unwrap().diagnostic.unwrap().contains("unclassified")); }
+            }
+        });
+    }
+
+    #[test]
+    fn pool_failure_durably_holds_all_schedules_without_interrupting_sessions() {
+        let _tmp = with_temp_home(|| {
+            for name in ["consumer", "periodic", "on-demand"] {
+                let state = Arc::new(Mutex::new(DaemonState::default()));
+                let sched = ContinuousScheduler::new(Arc::clone(&state));
+                let id = format!("pool-{name}");
+                let mtime = bind_transcript(&state, &id, &format!("{id}.jsonl"),
+                    &[include_str!("../../tests/fixtures/codex-0.153.4/pool_unavailable.jsonl")]);
+                state.lock().unwrap().sessions.get_mut(&id).unwrap().session_type = "codex".into();
+                let mut t = running_consumer(&id, &id, RunMode::Persistent, 1, 1);
+                t.engine = Engine::Codex;
+                if name == "periodic" { t.schedule = Schedule::Periodic { every_secs: 3600 }; }
+                if name == "on-demand" { t.schedule = Schedule::OnDemand; }
+                task::save(&t).unwrap();
+                assert!(sched.auth_wedge_pass(&[t], mtime + 1).contains(&id));
+                let current = task::load_one(&id).unwrap();
+                assert_eq!(current.last_run.as_ref().unwrap().status, RunStatus::Failed);
+                assert!(current.account_blocked.is_none());
+                assert!(current.recovery_hold.as_ref().unwrap().detail.contains("continuation ownership"));
+                assert!(run_active_blocks_fire(&current));
+                assert!(!should_supervise(&current));
+                let response = crate::control::methods::continuous_run_now(&state,
+                    &crate::control::protocol::Caller::operator("test"), &serde_json::json!({"task_id":id})).unwrap();
+                assert_eq!(response["reason"], "reconciliation_required");
+                assert!(!state.lock().unwrap().sessions[&id].last_exit.operator_kill_requested());
+                assert!(std::fs::read_to_string(task::runs_log_path(&id)).unwrap().contains("pool_unavailable"));
+            }
+        });
+    }
+
     #[test]
     fn auth_wedge_pass_closes_wedged_consumer_run() {
         let _tmp = with_temp_home(|| {
