@@ -100,6 +100,21 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "read_session_output",
     "list_sessions",
     "task.update_tree",
+    # Operator-only subtask registration and session revival, called by the
+    # TUI. Included for dispatch-surface alignment; no MCP tools expose them.
+    "task.register_agent_subtask",
+    "session.revive",
+    # Operator-only daemon lifecycle/configuration RPCs. Routing does not
+    # grant access: the daemon retains each method's authorization gates.
+    "daemon.health",
+    "daemon.reload_config",
+    "daemon.drain",
+    "daemon.restart",
+    "daemon.rollback_brain",
+    "daemon.migrate_split",
+    "daemon.split_rollback",
+    "daemon.upgrade_holder",
+    "daemon.reexec_dev",
     "resolve_authorized_session",
     "session.set_transcript_path",
     # The cm Stop hook's turn-end self-report (S3, async-wait branch).

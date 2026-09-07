@@ -16,6 +16,7 @@ import subprocess
 import sys
 import types
 import unittest
+from unittest import mock
 
 os.environ.setdefault("CM_DB_DSN", "postgres://stub")
 os.environ.setdefault("CM_API_TOKEN", "stub")
@@ -24,7 +25,7 @@ os.environ.setdefault("CM_API_TOKEN", "stub")
 def _install_google_stubs():
     """Stand in for google-cloud-compute / google.api_core in the test env.
 
-    Real google libs aren't installed where these tests run, but
+    Avoid depending on installed Google libraries or credentials.
     ``_check_vm_alive`` lazy-imports them, so registering fake modules
     in ``sys.modules`` is enough for the function to exercise its
     real except-clause structure against our fake exception classes.
@@ -148,15 +149,9 @@ class CheckVmAliveLoggingTest(unittest.TestCase):
         # broken google-cloud-compute install doesn't propagate
         # ModuleNotFoundError up into the dispatch loop. Old catch-all
         # silently returned False; we preserve that, just observably.
-        saved = {
-            k: sys.modules[k] for k in (
-                "google", "google.cloud", "google.cloud.compute_v1",
-                "google.api_core", "google.api_core.exceptions",
-            ) if k in sys.modules
-        }
-        for k in saved:
-            del sys.modules[k]
-        try:
+        # Removing cached modules can import the real SDK from disk.
+        # None explicitly blocks the import, even when the SDK is installed.
+        with mock.patch.dict(sys.modules, {"google.cloud": None}):
             with self.assertLogs("cm.dispatch", level=logging.WARNING) as cap:
                 self.assertFalse(dispatch_daemon._check_vm_alive("vm-x"))
             warn_msgs = [
@@ -172,8 +167,6 @@ class CheckVmAliveLoggingTest(unittest.TestCase):
                 ),
                 f"expected WARNING about missing gcloud libs: {cap.output}",
             )
-        finally:
-            sys.modules.update(saved)
 
 
 class ProbeWarmVmLoggingTest(unittest.IsolatedAsyncioTestCase):
