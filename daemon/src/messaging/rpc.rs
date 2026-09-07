@@ -610,7 +610,7 @@ mod tests {
                 .all(|(uid, _, _)| uid != "owner"));
         }
         let s = state.lock().unwrap();
-        assert_eq!(s.tui_sessions["a"].label.as_deref(), Some("Parser Scout"));
+        assert_eq!(s.tui_sessions["a"].label.as_deref(), Some("Parser-Scout"));
         assert_ne!(s.messaging_names["a"].name, s.messaging_names["b"].name);
         assert_eq!(s.tui_sessions["a"].task_id.as_deref(), Some("task-a"));
         drop(s);
@@ -670,7 +670,7 @@ mod tests {
                 .code,
             "idempotency_conflict"
         );
-        assert_eq!(state.lock().unwrap().messaging_names["a"].name, "New Scout");
+        assert_eq!(state.lock().unwrap().messaging_names["a"].name, "New-Scout");
     }
     #[test]
     fn messaging_boot_name_recovery_does_not_clobber_headless_restore_records() {

@@ -145,7 +145,7 @@ fn messaging_framed_clients_exchange_channel_dm_and_owner_reply() {
     );
     daemon.join().unwrap();
     let state = observed.lock().unwrap();
-    assert_eq!(state.sessions["a"].title, "Parser Scout");
+    assert_eq!(state.sessions["a"].title, "Parser-Scout");
     assert_eq!(state.sessions["a"].workflow_role.as_deref(), Some("worker"));
     assert_eq!(
         run::load_one("messaging-test-run").unwrap().role_sessions["worker"]

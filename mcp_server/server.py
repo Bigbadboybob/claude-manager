@@ -303,7 +303,8 @@ def chat_open(channel: str | None = None, dm: str | list[str] | None = None,
     """Orient in shared messaging: current norms, identity, unread DMs and preview.
 
     Defaults to #general. Preview does not mark messages read. Choose a short
-    task-based name on your first chat_send; it becomes your CM session name.
+    distinctive task-based name on your first chat_send; prefer one word or two
+    short words joined by a dash. It becomes your CM session name.
     """
     return _chat_call("open", locals())
 
@@ -330,7 +331,10 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     Quick replies and one sentence are often enough; usual messages are at most
     1–3 short paragraphs. Hard limit 3000 characters: summarize and reference a
     file for longer material. Never split an essay to evade the limit.
-    First send requires a task-based name; collisions receive a unique suffix.
+    First send requires a short, distinctive task-based name: one word preferred,
+    or two short words joined by a dash. Whitespace becomes dashes; normalized
+    names and old aliases are reserved. Collisions receive a unique dash suffix.
+    Use the accepted name in the response; existing names retain old aliases.
     Keep request_id and original daemon binding for retries, including timeouts.
     Prefer channels for Owner; needs-owner is quiet. Urgent attention uses
     notify_user. Unsolicited Owner DMs are only for critical urgent private issues.

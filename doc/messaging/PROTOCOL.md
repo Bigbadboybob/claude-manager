@@ -20,6 +20,12 @@ A **thread** is a root message plus replies in the same conversation. Threads do
 
 A **participant** is a stable identity with a changeable name. Agent identity is derived from the persistent daemon ID plus CM session UID, never a transcript filename, display label, task title, or PID. Owner has the reserved identity `owner` within the space. `system` is reserved for daemon-authored records.
 
+Chosen participant names should be short, distinctive, and connected to the task. Prefer one word (for example `Kestrel`), or two short words joined by a dash (`Schema-Scout`); avoid generic names and long task titles. The coordinator trims outer whitespace and converts each internal Unicode whitespace run to one ASCII `-` before allocation. Names must contain 2–40 graphemes after conversion, and control characters are rejected. Case and other non-whitespace characters are preserved for display. `Owner` and `System` remain reserved.
+
+Name claims and renames compare current names and historical aliases using NFKC, full case folding, NFKC again, and whitespace-to-dash conversion. A collision gets a stable participant-ID-derived suffix such as `-7a2`; the coordinator grows the suffix and shortens the base at grapheme boundaries until the complete candidate is unique within the limit. An identity may reclaim its own alias. The accepted name is returned to the sender.
+
+Existing chosen names containing whitespace migrate through ordinary retained `identity.update` records, with old spellings preserved as aliases. Provisional session labels are untouched. IDs, conversation membership, mentions, and historical message snapshots do not change. Migration reuses collision protection and is idempotent across restart. For legacy names that differed only by spaces versus dashes, exact names/aliases (under the previous Unicode/case/whitespace comparison) resolve first; a normalized fallback resolves only an unambiguous participant. Clients should address recipients by stable ID.
+
 The persistent daemon ID is **new infrastructure**, not today's `HostId` from `hosts.toml`. Mint a UUID once into `<cm-state-root>/daemon-id` (normally `~/.cm/daemon-id`) before enrolling any participant. Initialize under a startup lock with atomic, durable creation; concurrent starters must load the winning ID. Advertise it from daemon health/messaging capabilities. A brain restart, holder upgrade, or rename of an operator's host alias does not mint another ID. Existing CM UIDs remain opaque, typically `ts-<nanos>-<counter>` allocated by the spawning process; prefix the exact UID, without regeneration or normalization.
 
 A routing alias may change from `manager` to `production` while the same daemon ID and session UID continue to identify the participant. This preservation is a new messaging integration guarantee, not a claim that the current host configuration already handles rename/migration. Verify the daemon ID when reconnecting to an alias. If an alias points to a replacement installation with a different ID, do not silently rebind old participants or DMs.
@@ -103,7 +109,7 @@ Each event is UTF-8 JSON containing one object. Its body is Markdown text. Requi
   "created_at": "2026-09-06T19:12:41.381Z",
   "actor": {
     "id": "agent:d_83ac:ts_parser",
-    "name": "Parser Gardener",
+    "name": "Parser-Gardener",
     "kind": "agent"
   },
   "conversation_id": "ch_parser",

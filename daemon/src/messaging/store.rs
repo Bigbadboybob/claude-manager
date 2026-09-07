@@ -151,6 +151,12 @@ fn normalize(s: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+fn dashed_name(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join("-")
+}
+fn name_key(s: &str) -> String {
+    dashed_name(&normalize(s))
+}
 fn channel_path(s: &str) -> Result<()> {
     if s.len() > 512
         || s.split('/').count() > 16
@@ -348,7 +354,7 @@ impl Store {
                 "",
             )?;
         }
-        if let Err(e) = s.initialize_memberships().and_then(|_| s.enroll_participants(&[])).and_then(|_| s.repair_attestations()).and_then(|_| s.project()) {
+        if let Err(e) = s.initialize_memberships().and_then(|_| s.enroll_participants(&[])).and_then(|_| s.repair_attestations()).and_then(|_| s.normalize_existing_names()).and_then(|_| s.project()) {
             s.degraded = Some(format!("Projection recovery failed: {e}"));
         }
         Ok(s)
@@ -732,29 +738,32 @@ impl Store {
         format!("agent:{}:{uid}", self.daemon_id)
     }
     fn allocate(&self, actor: &str, base: &str, uid: &str) -> Result<Name> {
-        let base = base.trim();
+        if base.chars().any(char::is_control) {
+            return Err(err("invalid_name", "Choose a name without controls"));
+        }
+        let base = dashed_name(base);
         let count = base.graphemes(true).count();
-        if !(2..=40).contains(&count) || base.chars().any(char::is_control) {
+        if !(2..=40).contains(&count) {
             return Err(err(
                 "invalid_name",
                 "Choose a name of 2–40 characters without controls",
             ));
         }
-        if ["owner", "system"].contains(&normalize(base).as_str()) {
+        if ["owner", "system"].contains(&name_key(&base).as_str()) {
             return Err(err("reserved_name", "Owner and System are reserved"));
         }
         let occupied = |s: &str| {
-            let n = normalize(s);
+            let n = name_key(s);
             self.names.iter().any(|(id, v)| {
                 id != actor
-                    && (normalize(&v.name) == n || v.aliases.iter().any(|a| normalize(a) == n))
+                    && (name_key(&v.name) == n || v.aliases.iter().any(|a| name_key(a) == n))
             })
         };
         let mut name = base.to_string();
         if occupied(&name) {
             let suffix = hash(actor.as_bytes());
             for len in 3..=32 {
-                let tail = format!(" · {}", &suffix[..len]);
+                let tail = format!("-{}", &suffix[..len]);
                 let take = 40 - tail.graphemes(true).count();
                 name = format!(
                     "{}{}",
@@ -786,6 +795,28 @@ impl Store {
             revision_id: uuid(),
             session_uid: uid.into(),
         })
+    }
+    /// Upgrade chosen chat names through retained identity events. The old
+    /// spelling remains an alias; replay/reopen cannot rename the same record
+    /// twice, and provisional session labels are outside this store.
+    fn normalize_existing_names(&mut self) -> Result<()> {
+        let pending: Vec<_> = self.names.iter()
+            .filter(|(_, n)| dashed_name(&n.name) != n.name)
+            .map(|(actor, n)| (actor.clone(), n.clone()))
+            .collect();
+        for (actor, old) in pending {
+            let name = self.allocate(&actor, &old.name, &old.session_uid)?;
+            let mut identity = serde_json::to_value(&name)?;
+            identity["participant_id"] = json!(actor);
+            self.publish(
+                "identity.update", None,
+                &format!("System normalized session name to {}", name.name),
+                json!({"identity":identity}),
+                "system", "System", "system",
+                &format!("normalize-name-v1:{actor}:{}", old.revision_id), "",
+            )?;
+        }
+        Ok(())
     }
     fn visible(&self, actor: &str, conv: &str) -> bool {
         self.channels.values().any(|c| c == conv)
@@ -844,10 +875,18 @@ impl Store {
             let peer = if peer == "owner" || self.names.contains_key(&peer) || people.iter().any(|x| x.id == peer) {
                 peer
             } else {
-                let hits: Vec<_> = self.names.iter().filter(|(_, n)| {
+                let mut hits: Vec<_> = self.names.iter().filter(|(_, n)| {
                     normalize(&n.name) == normalize(&peer)
                         || n.aliases.iter().any(|a| normalize(a) == normalize(&peer))
                 }).collect();
+                // Honor exact legacy names/aliases first: before this policy,
+                // "Build Scout" and "Build-Scout" could belong to different IDs.
+                if hits.is_empty() {
+                    hits = self.names.iter().filter(|(_, n)| {
+                        name_key(&n.name) == name_key(&peer)
+                            || n.aliases.iter().any(|a| name_key(a) == name_key(&peer))
+                    }).collect();
+                }
                 if hits.len() != 1 {
                     return Err(err("not_found", "Peer not found; use chat_people to resolve a participant ID"));
                 }
@@ -1705,6 +1744,7 @@ mod tests {
         let a = person(&s, "a");
         let b = person(&s, "b");
         let first = send(&mut s, &a, "Ready", "one", "Straße Scout");
+        assert_eq!(first["name"], "Straße-Scout");
         let second = send(&mut s, &b, "Me too", "two", "STRASSE SCOUT");
         assert_ne!(
             normalize(first["name"].as_str().unwrap()),
@@ -1723,6 +1763,64 @@ mod tests {
             send(&mut s, &a, "Ready", "one", "Straße Scout")["event_id"],
             first["event_id"]
         );
+    }
+    #[test]
+    fn dashed_names_protect_unicode_aliases_reserved_names_and_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Store::open(tmp.path()).unwrap();
+        let a = person(&s, "a");
+        let b = person(&s, "b");
+        assert_eq!(send(&mut s, &a, "Hi", "one", "  Build\u{a0}  Scout  ")["name"], "Build-Scout");
+        let second = send(&mut s, &b, "Hi", "two", "ＢＵＩＬＤ-ＳＣＯＵＴ");
+        assert!(second["name"].as_str().unwrap().contains('-'));
+        assert_ne!(name_key(second["name"].as_str().unwrap()), name_key("Build-Scout"));
+        assert_eq!(s.resolve("owner", &json!({"dm":"build scout"}), &[], true).unwrap().1.unwrap()["members"], json!([a.id, "owner"]));
+        s.rename(&a.id, "a", &json!({"name":"Gardener","request_id":"rename","expected_name_revision":1})).unwrap();
+        assert_ne!(s.allocate(&b.id, "Build Scout", "b").unwrap().name, "Build-Scout");
+        for invalid in ["OＷNER", "system", "x", "\tScout", "Scout\nName"] {
+            assert!(s.allocate(&b.id, invalid, "b").is_err(), "{invalid:?}");
+        }
+        let c = person(&s, "c");
+        let long = "🐱".repeat(40);
+        send(&mut s, &c, "Hi", "long", &long);
+        let collision = s.allocate(&b.id, &long, "b").unwrap().name;
+        assert_eq!(collision.graphemes(true).count(), 40);
+        assert!(!collision.chars().any(char::is_whitespace));
+    }
+    #[test]
+    fn legacy_name_migration_preserves_alias_routing_and_is_restart_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Store::open(tmp.path()).unwrap();
+        let a = person(&s, "a");
+        let b = person(&s, "b");
+        let c = person(&s, "c");
+        // Retained records from the old policy could distinguish spaces/dashes.
+        for (p, old) in [(&a, "Build Scout"), (&b, "Build-Scout"), (&c, "Alpha Beta")] {
+            let mut n = s.allocate(&p.id, "Temporary", &p.session_uid).unwrap();
+            n.name = old.into();
+            let mut identity = serde_json::to_value(n).unwrap();
+            identity["participant_id"] = json!(p.id);
+            s.publish("identity.update", None, "Legacy name", json!({"identity":identity}), "system", "System", "system", &format!("legacy-{}", p.session_uid), "").unwrap();
+        }
+        let dm = s.send("owner", "", "owner", &json!({"dm":a.id,"body":"Hello","request_id":"hello"}), &[]).unwrap();
+        drop(s);
+        let mut s = Store::open(tmp.path()).unwrap();
+        assert!(s.names[&a.id].name.starts_with("Build-Scout-"));
+        assert_eq!(s.names[&a.id].aliases, vec!["Build Scout"]);
+        assert_eq!(s.names[&a.id].revision, 2);
+        assert_eq!(s.names[&b.id].name, "Build-Scout");
+        assert_eq!(s.names[&b.id].revision, 1);
+        assert_eq!(s.names[&c.id].name, "Alpha-Beta");
+        assert!(!s.names.contains_key("owner"));
+        assert_eq!(s.resolve("owner", &json!({"dm":"Build Scout"}), &[], false).unwrap().0, dm["event"]["conversation_id"].as_str().unwrap());
+        assert_eq!(s.resolve("owner", &json!({"dm":"Build-Scout"}), &[], true).unwrap().1.unwrap()["members"], json!([b.id, "owner"]));
+        let count = s.events.len();
+        let revision = s.names[&a.id].revision_id.clone();
+        drop(s);
+        s = Store::open(tmp.path()).unwrap();
+        assert_eq!(s.events.len(), count);
+        assert_eq!(s.names[&a.id].revision_id, revision);
+        assert!(s.degraded.is_none());
     }
     #[test]
     fn rejected_first_message_never_claims_name_or_creates_dm() {
@@ -1948,7 +2046,7 @@ mod tests {
         let c = person(&s, "c");
         send(&mut s, &a, "Hi", "a", "Scout");
         let suffix = hash(b.id.as_bytes());
-        send(&mut s, &c, "Hi", "c", &format!("Scout · {}", &suffix[..3]));
+        send(&mut s, &c, "Hi", "c", &format!("Scout-{}", &suffix[..3]));
         let named = send(&mut s, &b, "Hi", "b", "Scout");
         assert!(named["name"].as_str().unwrap().ends_with(&suffix[..4]));
         let renamed=s.rename(&a.id,"a",&json!({"_authenticated_actor":"owner","uid":"a","name":"Gardener","expected_name_revision":1,"request_id":"rename"})).unwrap();
