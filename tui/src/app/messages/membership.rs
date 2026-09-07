@@ -47,7 +47,22 @@ impl Messages {
             })
             .cloned()
             .collect();
-        matches.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        let rank = |c: &Value| {
+            let path = c["path"].as_str().unwrap_or("").to_lowercase();
+            let name = c["name"].as_str().unwrap_or("").to_lowercase();
+            if path == query || name == query {
+                0
+            } else if path.starts_with(&query) || name.starts_with(&query) {
+                1
+            } else {
+                2
+            }
+        };
+        matches.sort_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
+        });
         matches
     }
     pub(super) fn can_post(&mut self) -> bool {
@@ -278,6 +293,11 @@ mod tests {
             .iter()
             .any(|(_, t)| t["channel"] == "work"));
         app.messages.browse_channels();
+        app.messages
+            .channels
+            .push(json!({"id":"cm","path":"cm-general","joined":true}));
+        app.messages.text = "general".into();
+        assert_eq!(app.messages.channel_matches()[0]["path"], "general");
         app.messages.text = "parser".into();
         assert_eq!(app.messages.channel_matches().len(), 1);
         let mut terminal =
