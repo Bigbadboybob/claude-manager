@@ -93,11 +93,6 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "messaging.dms", "messaging.people", "messaging.channels", "messaging.pins", "session.set_name",
     "messaging.norms", "messaging.monitor", "messaging.monitors", "messaging.follow",
     "ping",
-    # Internal/operator dispatch surface; routing does not grant authorization.
-    "daemon.migrate_split", "daemon.reexec_dev", "daemon.upgrade_holder",
-    "daemon.restart", "daemon.drain", "daemon.rollback_brain",
-    "daemon.split_rollback", "daemon.reload_config", "daemon.health",
-    "session.revive", "task.register_agent_subtask",
     "start_session",
     "session.attach",
     "attach.open",
