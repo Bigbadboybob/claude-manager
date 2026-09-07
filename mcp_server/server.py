@@ -1,6 +1,7 @@
 """Claude Manager MCP tools for agent sessions, tasks, and messaging."""
 
 import asyncio
+from contextlib import asynccontextmanager, suppress
 import json
 import os
 from pathlib import Path
@@ -66,7 +67,37 @@ from mcp_server import async_monitor
 # Supplied in the MCP initialization response, independent of the agent's
 # project. Keep the short introduction with the deployed MCP server.
 AGENT_GUIDE = Path(__file__).with_name("AGENT_GUIDE.md").read_text(encoding="utf-8")
-mcp = FastMCP("claude-manager", instructions=AGENT_GUIDE)
+
+@asynccontextmanager
+async def _lifespan(_server):
+    bridge = None
+    if (os.environ.get("CM_TUI_SESSION_ID") and os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
+            and os.environ.get("CM_AGENT_ENGINE") != "codex"):
+        from mcp_server.native_claude import run
+        bridge = asyncio.create_task(run(), name="cm-native-notifications")
+    try:
+        yield {}
+    finally:
+        if bridge:
+            bridge.cancel()
+            with suppress(asyncio.CancelledError):
+                await bridge
+
+
+mcp = FastMCP("claude-manager", instructions=AGENT_GUIDE, lifespan=_lifespan)
+
+
+@mcp.tool()
+async def notification_status() -> dict:
+    """Inspect your native wake connection and retained notification deliveries.
+
+    pending means no native submission; submitted is not an observed receipt.
+    uncertain submissions are never automatically retried. Reading this status
+    does not acknowledge chat messages. Older embedded Codex sessions need a
+    deliberate CM session restart/resume to use the owned app-server.
+    """
+    from mcp_server.notifications import Queue
+    return await asyncio.to_thread(Queue.own().snapshot)
 
 # 11g-2 (A2): the `_append_event` direct file-write helper and the
 # `_workflow_run_dir` accessor have been retired. Pre-11g-2 the

@@ -509,6 +509,10 @@ pub fn is_codex_rollout_shaped(path: &Path) -> bool {
 /// permission errors are reported via
 /// [`LiveRolloutScan::permission_denied`].
 pub fn scan_live_codex_rollout(root_pid: u32) -> LiveRolloutScan {
+    scan_live_codex_rollout_preferred(root_pid, None)
+}
+
+fn scan_live_codex_rollout_preferred(root_pid: u32, native: Option<&serde_json::Value>) -> LiveRolloutScan {
     // Bounded BFS over the descendant tree.
     let mut pids: Vec<u32> = vec![root_pid];
     let mut frontier: Vec<u32> = vec![root_pid];
@@ -557,6 +561,18 @@ pub fn scan_live_codex_rollout(root_pid: u32) -> LiveRolloutScan {
         }
     }
 
+    // An owned app-server may have several live threads, including the old
+    // conversation after /resume. Prefer the remote frontend's exact selection
+    // only when its publisher belongs to this process tree AND the backend
+    // actually holds that rollout open. Never bind another session's file.
+    if let Some(native) = native.filter(|n| n["engine"] == "codex"
+        && n["pid"].as_u64().is_some_and(|pid| pids.contains(&(pid as u32)))) {
+        let selected = native["transcript_path"].as_str().map(PathBuf::from);
+        return LiveRolloutScan {
+            rollout: selected.filter(|path| candidates.contains(path)),
+            permission_denied,
+        };
+    }
     let rollout = match candidates.len() {
         0 => None,
         1 => candidates.pop(),
@@ -631,7 +647,7 @@ pub fn observe_codex_rollout_once(
     session_uid: &str,
     warned_permission: &mut bool,
 ) -> RolloutObserveOutcome {
-    let (pid, current) = {
+    let (pid, current, native_path) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(sess) = s.sessions.get(session_uid) else {
             return RolloutObserveOutcome::SessionGone;
@@ -639,11 +655,14 @@ pub fn observe_codex_rollout_once(
         if sess.session_type != "codex" {
             return RolloutObserveOutcome::NotCodex;
         }
-        (sess.pid as u32, sess.transcript_path.clone())
+        (sess.pid as u32, sess.transcript_path.clone(),
+            crate::notifications::directory(&s.messaging_root, session_uid).join("transport.json"))
     };
 
     // /proc IO runs lock-free.
-    let scan = scan_live_codex_rollout(pid);
+    let native = std::fs::read(native_path).ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let scan = scan_live_codex_rollout_preferred(pid, native.as_ref());
     if scan.permission_denied && !*warned_permission {
         *warned_permission = true;
         eprintln!(
@@ -1344,6 +1363,22 @@ mod tests {
         no("/home/u/.codex/sessions/2026/08/18/.jsonl");
         // Too shallow.
         no("/.codex/sessions/2026/08/r.jsonl");
+    }
+
+    #[test]
+    fn codex_native_binding_selects_exact_owned_rollout_and_rejects_unopened_file() {
+        let _env = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".codex/sessions/2026/09/07");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.jsonl");
+        let second = dir.join("second.jsonl");
+        let first_file = std::fs::File::create(&first).unwrap();
+        let _second_file = std::fs::File::create(&second).unwrap();
+        let native = serde_json::json!({"engine":"codex", "pid":std::process::id(), "transcript_path":first});
+        assert_eq!(scan_live_codex_rollout_preferred(std::process::id(), Some(&native)).rollout, Some(first));
+        drop(first_file);
+        assert!(scan_live_codex_rollout_preferred(std::process::id(), Some(&native)).rollout.is_none());
     }
 
     #[test]

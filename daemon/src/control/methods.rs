@@ -2833,6 +2833,7 @@ pub fn session_turn_ended(
     } else {
         session.stamp_turn_end();
     }
+    let native_codex = session.session_type == "codex";
     // fix-stale-resume: refresh the recorded resume key from the hook's
     // report. Unlike `session.set_transcript_path` (Operator-only, because
     // the TUI is authoritative for path conventions) this is a SELF-report
@@ -2878,6 +2879,13 @@ pub fn session_turn_ended(
                 broadcast_transcript_updated(&state, &p.session_uid, entry);
             }
         }
+    }
+    drop(state);
+    if native_codex {
+        // The native launcher reports the selected thread immediately. The
+        // existing /proc ownership check validates its exact rollout before
+        // persisting/broadcasting the resume identity.
+        crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
     }
     Ok(json!({ "ok": true }))
 }
@@ -21277,7 +21285,9 @@ mod tests {
                 .iter()
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect();
-            assert_eq!(argv[1], "resume", "codex resumes via the subcommand");
+            assert_eq!(argv[1], "native_codex.py", "Codex uses the owned backend launcher");
+            let engine_start = argv.iter().position(|a| a == "--").unwrap() + 1;
+            assert_eq!(argv[engine_start], "resume", "the owned backend resumes the exact history");
             assert_eq!(
                 argv.last().map(String::as_str),
                 Some(uuid),

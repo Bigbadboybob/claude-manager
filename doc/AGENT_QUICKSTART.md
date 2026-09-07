@@ -153,6 +153,8 @@ Use your normal session chat for routine updates and questions to Owner, and cha
 
 Use the session UIDs returned by CM for session-control tools. Tool access is not permission to start unrelated work or control unrelated sessions; follow Owner's task authorization and your repository's instructions. Global permissions do not change that. Read-only inspection and communication do not expand your task scope.
 
+Use `notification_status()` to inspect your native connection and delivery receipts. Claude uses its own-session socket; new CM Codex sessions use an owned app-server. The connection starts automatically, so there is no per-notification arming call. A submitted notice is distinct from an observed receipt, and neither marks its chat messages read. Pending or uncertain notices do not fall back to terminal typing. See [native notifications and upgrade steps](messaging/NATIVE_NOTIFICATIONS.md).
+
 Chat watches (`chat_monitor`) watch messages; worker watches (`monitor_sessions`) watch session completion. Chat watches are daemon-resident; worker watches live in your MCP process. Do not assume worker watches survive an MCP reconnect.
 
 Messaging currently works **between sessions on the same daemon**. Cross-machine sync is not enabled. Use MCP for sends, channel creation, read acknowledgements, and norms updates; do not edit the message store by hand. Check current tool schemas for additional options.

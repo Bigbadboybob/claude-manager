@@ -192,7 +192,8 @@ pub fn write_claude_mcp_config(
     })?;
     fs::create_dir_all(&dir)?;
     let path = dir.join("claude.json");
-    let env = build_env(target, session_uid, workflow.as_ref());
+    let mut env = build_env(target, session_uid, workflow.as_ref());
+    env.insert("CM_AGENT_ENGINE".into(), "claude-code".into());
     // Route through the shared drift-proof launcher (`~/.cm/mcp/
     // launcher.sh`) — this config is frozen for the life of the agent
     // process, and a baked interpreter/checkout path here broke every
@@ -254,7 +255,8 @@ pub fn codex_overrides(
         ),
         None => ("python".to_string(), String::new()),
     };
-    let env = build_env(target, session_uid, workflow);
+    let mut env = build_env(target, session_uid, workflow);
+    env.insert("CM_AGENT_ENGINE".into(), "codex".into());
     let env_toml = env
         .iter()
         .map(|(k, v)| format!("{}=\"{}\"", k, escape_toml(v)))
@@ -353,8 +355,11 @@ pub fn build_args(
             Ok(("claude".to_string(), args))
         }
         Engine::Codex => {
+            let env = build_env(target, session_uid, workflow.as_ref());
             let args = codex_args(target, session_uid, workflow, resume_session_id);
-            Ok(("codex".to_string(), args))
+            let server = crate::workflow::spawn::mcp_server_path();
+            cm_daemon::mcp_config::native_codex_command(session_uid, &env, args,
+                server.as_deref().and_then(|p| p.to_str()))
         }
     }
 }

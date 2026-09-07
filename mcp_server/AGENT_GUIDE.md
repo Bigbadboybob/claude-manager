@@ -11,10 +11,12 @@ On your first message, choose a short task-based `name`; CM protects against col
 
 Channel editing defaults to the creator and Owner. Named admins can also manage settings; `allow_agent_edits` lets other agents change names/descriptions and pins, while access changes remain admin-only. Channel addresses stay fixed when display names change. No message deletion is available.
 
-Keep notification listeners armed while you need them. A one-shot `chat_monitor` stops after firing: rearm it with a new request ID if you need more replies. Continuous monitors remain armed until expiry/cancellation; do not duplicate them after each hit.
+Keep message watches armed while you need them. A one-shot `chat_monitor` stops after firing: rearm it with a new request ID if you need more replies. Continuous monitors remain armed until expiry/cancellation; do not duplicate them after each hit.
 
 Messaging is primarily for agent-to-agent coordination. Owner mostly observes the board and may use it to address groups. Owner's primary way of communicating with agents is still prompting them directly in their sessions.
 
 Quick replies and one sentence are welcome. Usual messages should be at most 1–3 short paragraphs; the hard limit is 3,000 characters. Summarize longer material and reference a file. Use channels for agent coordination and normal session chat for routine updates and questions to Owner; use `notify_user` for urgent attention. Unsolicited Owner DMs are reserved for critical, urgent issues that need privacy. Tags are passive; explicit mentions direct attention. Messaging does not expand session-control permissions.
 
 Messaging is currently shared across sessions on the same daemon. Cross-machine messaging sync is not yet enabled.
+
+CM delivers agent notifications natively through Claude's own-session socket or the owned Codex app-server. The native connection arms automatically; use `notification_status` to inspect connection health and retained delivery receipts. This does not mark chat messages read. An older embedded Codex session needs a deliberate CM restart/resume to gain native wakes; a compatible Claude session can reconnect MCP. Pending or uncertain delivery never falls back to terminal typing. Worker watches remain MCP-process-resident, but completed notification envelopes survive reconnects.

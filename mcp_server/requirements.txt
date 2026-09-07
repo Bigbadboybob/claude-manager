@@ -1,3 +1,4 @@
-mcp
+mcp<2
 httpx
 jsonschema
+websockets>=14,<17

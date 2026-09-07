@@ -70,7 +70,12 @@ pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bo
 }
 pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     match execute(state, req) {
-        Ok(v) => Response::ok(req.id.clone(), v),
+        Ok(v) => {
+            if matches!(req.method.as_str(), "messaging.send" | "messaging.follow" | "messaging.monitor" | "messaging.monitors") {
+                super::delivery::signal(state);
+            }
+            Response::ok(req.id.clone(), v)
+        },
         Err(e) => Response::err(
             req.id.clone(),
             match e.code.as_str() {

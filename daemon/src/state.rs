@@ -385,6 +385,7 @@ pub struct DaemonState {
     pub messaging: Arc<Mutex<Option<crate::messaging::Store>>>,
     /// Serializes chat cancellation/preferences with the final delivery boundary.
     pub messaging_delivery: Arc<Mutex<()>>,
+    pub messaging_wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
     pub messaging_root: PathBuf,
     pub messaging_names: std::collections::BTreeMap<String, crate::messaging::Name>,
     /// Daemon-owned per-session state (PTY, fanout, memory cap).
@@ -807,6 +808,7 @@ impl Default for DaemonState {
             base_workflow_definitions: HashMap::new(),
             messaging: Arc::new(Mutex::new(None)),
             messaging_delivery: Arc::new(Mutex::new(())),
+            messaging_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             messaging_root: crate::messaging::rpc::default_root(),
             messaging_names: Default::default(),
             manifest_watcher: Arc::new(crate::manifest::ManifestWatcher::new()),

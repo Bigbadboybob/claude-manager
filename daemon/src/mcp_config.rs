@@ -578,7 +578,8 @@ pub fn write_claude_mcp_config(
     })?;
     fs::create_dir_all(&dir)?;
     let path = dir.join("claude.json");
-    let env = build_env(session_uid, workflow);
+    let mut env = build_env(session_uid, workflow);
+    env.insert("CM_AGENT_ENGINE".into(), "claude-code".into());
     // Route through the drift-proof launcher; fall back to the direct
     // (python, server) pair only if the launcher can't be written —
     // see `ensure_launcher` (fail-open: never block a spawn).
@@ -614,9 +615,39 @@ fn escape_toml(s: &str) -> String {
 }
 
 /// Build Codex inline `-c mcp_servers.claude-manager.*` overrides.
-/// Returns a flat `[..., "-c", "k=v", ...]` list ready to splice
-/// into argv. Codex doesn't take a per-session config file —
-/// everything is inline.
+/// Keep the app-server and ordinary remote TUI inside the holder-owned child.
+/// Per-session environment and provider overrides belong to the backend.
+pub fn native_codex_command(
+    session_uid: &str,
+    env: &BTreeMap<String, String>,
+    args: Vec<String>,
+    server_path_override: Option<&str>,
+) -> std::io::Result<(String, Vec<String>)> {
+    let server = resolve_server_path(server_path_override).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Codex native launcher requires configured mcp_server_path",
+        )
+    })?;
+    let (program, script) = match ensure_launcher(&server) {
+        Ok(launcher) => (
+            launcher.to_string_lossy().into_owned(),
+            "native_codex.py".to_string(),
+        ),
+        Err(_) => (
+            resolve_python_interpreter(&server),
+            server.with_file_name("native_codex.py").to_string_lossy().into_owned(),
+        ),
+    };
+    let mut wrapped = vec![
+        script, "--session-uid".into(), session_uid.into(),
+        "--cm-env".into(), serde_json::to_string(env)?, "--".into(),
+    ];
+    wrapped.extend(args);
+    Ok((program, wrapped))
+}
+
+/// Inline per-session MCP registration for the owned Codex backend.
 pub fn codex_overrides(
     session_uid: &str,
     workflow: Option<&WorkflowMeta>,
@@ -638,7 +669,8 @@ pub fn codex_overrides(
         ),
         None => ("python".to_string(), String::new()),
     };
-    let env = build_env(session_uid, workflow);
+    let mut env = build_env(session_uid, workflow);
+    env.insert("CM_AGENT_ENGINE".into(), "codex".into());
     let env_toml = env
         .iter()
         .map(|(k, v)| format!("{}=\"{}\"", k, escape_toml(v)))
@@ -747,7 +779,9 @@ pub fn build_args(
             }
             // No pin for codex: `--session-id` is a claude flag; codex
             // transcript identity stays detector-bound.
-            Ok(("codex".to_string(), args, None))
+            let (program, args) = native_codex_command(session_uid,
+                &build_env(session_uid, workflow), args, server_path_override)?;
+            Ok((program, args, None))
         }
         "bash" => {
             // Raw shell. No MCP injection — bash sessions have
@@ -1629,11 +1663,12 @@ mod tests {
         let _h = HomeGuard::set(dir.path());
         let (prog, args, _pin) =
             build_args("codex", "ts-rsm-2", None, None, Some("sid-xyz")).expect("ok");
-        assert_eq!(prog, "codex");
+        assert!(prog.ends_with("launcher.sh"));
+        assert_eq!(args[0], "native_codex.py");
         assert_eq!(
-            args.first().map(String::as_str),
+            args.get(args.iter().position(|a| a == "--").unwrap() + 1).map(String::as_str),
             Some("resume"),
-            "codex resume must be the FIRST arg (subcommand): {:?}",
+            "wrapped codex resume must be the first engine argument: {:?}",
             args,
         );
         assert_eq!(
@@ -1671,7 +1706,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, _pin) = build_args("codex", "ts-codex-1", None, None, None).expect("ok");
-        assert_eq!(prog, "codex");
+        assert!(prog.ends_with("launcher.sh"));
+        assert_eq!(args[0], "native_codex.py");
         assert!(
             args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
             "codex needs the approvals-and-sandbox bypass flag",

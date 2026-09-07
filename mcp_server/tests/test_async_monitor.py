@@ -1,12 +1,11 @@
 """Tests for the self-notifying async monitor (S2): registration,
-fire-message formatting, self-delivery + verification + retry, dedupe,
+fire-message formatting, durable native delivery, cancellation, dedupe,
 and the `send_input` auto-registration.
 
 Scaffolding matches test_session_monitor: stub `control_client.call`
 with scripted responses, back transcript reads with real temp JSONL
-files. The delivery stub APPENDS the sent text to the caller's
-transcript file — mimicking what a real injection does — so the
-verification loop runs for real.
+files. Native publication is recorded separately from explicit worker prompts.
+Queue/adapter receipt and crash tests live in test_native_notifications.
 """
 
 from __future__ import annotations
@@ -18,7 +17,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from mcp_server import async_monitor, control_client
+from mcp_server import async_monitor, control_client, notifications
+from pathlib import Path
 
 
 def _write_transcript(path: str, lines: list[dict]) -> None:
@@ -64,14 +64,19 @@ class _MonitorEnv(unittest.TestCase):
         self.rotate_on_deliver = False
         control_client.call = self._fake_call
         self._env = mock.patch.dict(
-            os.environ, {"CM_TUI_SESSION_ID": self.CALLER}
+            os.environ, {"CM_TUI_SESSION_ID": self.CALLER, "HOME": self.tmp.name}
         )
         self._env.start()
+        original_publish = notifications.Queue.publish
+        def publish(queue, event_id, source, text, marker):
+            result = original_publish(queue, event_id, source, text, marker)
+            self.sent.append({"session_uid": queue.uid, "text": text, "transport": "native"})
+            if self.deliver_on_send:
+                queue.change(event_id, {"pending"}, status="observed")
+            return result
         self._patches = [
-            mock.patch.object(async_monitor, "POLL_S", 0.05),
+            mock.patch.object(notifications.Queue, "publish", publish),
             mock.patch.object(async_monitor, "VERIFY_WINDOW_S", 0.5),
-            mock.patch.object(async_monitor, "CALLER_IDLE_MAX_WAIT_S", 2.0),
-            mock.patch.object(async_monitor, "REDELIVERY_GATE_S", 1.0),
         ]
         for p in self._patches:
             p.start()
@@ -152,7 +157,7 @@ class RegisterAndFireTests(_MonitorEnv):
             listed[0]["result"]["completed"][0]["session_uid"], self.WORKER,
         )
 
-    def test_failed_verification_retries_then_retains(self):
+    def test_failed_verification_retains_without_replay(self):
         self.deliver_on_send = False  # injection never lands
 
         async def scenario():
@@ -166,8 +171,9 @@ class RegisterAndFireTests(_MonitorEnv):
         rec = asyncio.run(scenario())
         self.assertEqual(rec["state"], "undelivered")
         self.assertFalse(rec["delivered"])
-        # Original attempt + MAX_REDELIVERIES retries.
-        self.assertEqual(len(self.sent), 1 + async_monitor.MAX_REDELIVERIES)
+        # Native submission is never repeated on ambiguous receipt.
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(rec["delivery_status"], "pending")
         # The watch result itself is retained.
         self.assertEqual(
             rec["result"]["completed"][0]["session_uid"], self.WORKER,
@@ -181,6 +187,21 @@ class RegisterAndFireTests(_MonitorEnv):
         with self.assertRaises(async_monitor.RegistrationError) as ctx:
             asyncio.run(scenario())
         self.assertEqual(ctx.exception.code, "no_caller")
+
+    def test_late_native_receipt_updates_retained_monitor_without_resending(self):
+        self.deliver_on_send = False
+        async def scenario():
+            reg = async_monitor.register_monitor([self.WORKER], edge=False)
+            record = async_monitor._MONITORS[reg["monitor_id"]]
+            await record["task"]
+            return record
+        record = asyncio.run(scenario())
+        self.assertEqual(record["state"], "undelivered")
+        notifications.Queue(self.CALLER).change(record["notification_id"], {"pending"}, status="observed")
+        listed = async_monitor.list_monitors()["monitors"][0]
+        self.assertEqual(listed["state"], "delivered")
+        self.assertTrue(listed["delivered"])
+        self.assertEqual(len(self.sent), 1)
 
     def test_auto_source_replaces_same_target_watch(self):
         async def scenario():
@@ -235,92 +256,6 @@ class RegisterAndFireTests(_MonitorEnv):
         self.assertEqual(
             async_monitor.cancel_monitor("mon-zzz")["error"], "not_found",
         )
-
-
-class InboxDeliveryTests(_MonitorEnv):
-    """S3: a mid-turn caller gets its notification via the Stop-hook
-    inbox (file consumed at the turn boundary) instead of PTY typing;
-    a hook-less caller that reaches its prompt gets the message taken
-    back and PTY-injected."""
-
-    def setUp(self):
-        super().setUp()
-        self._inbox_patch = mock.patch.object(
-            async_monitor, "INBOX_ROOT",
-            os.path.join(self.tmp.name, "inbox"),
-        )
-        self._inbox_patch.start()
-
-    def tearDown(self):
-        self._inbox_patch.stop()
-        super().tearDown()
-
-    def _record(self):
-        return {"monitor_id": "mon-test", "caller": self.CALLER}
-
-    def test_hook_consumption_counts_as_delivery(self):
-        async def scenario():
-            async def busy(_caller):
-                return False, None
-
-            with mock.patch.object(async_monitor, "_caller_at_prompt", busy):
-                task = asyncio.get_running_loop().create_task(
-                    async_monitor._deliver_to_caller(
-                        self._record(), "[cm-monitor mon-test fired] hi",
-                    )
-                )
-                inbox = os.path.join(async_monitor.INBOX_ROOT, self.CALLER)
-                # Wait for the message to land in the inbox...
-                for _ in range(100):
-                    files = os.listdir(inbox) if os.path.isdir(inbox) else []
-                    if files:
-                        break
-                    await asyncio.sleep(0.02)
-                self.assertTrue(files, "inbox message written for busy caller")
-                payload = json.load(
-                    open(os.path.join(inbox, files[0]), encoding="utf-8")
-                )
-                self.assertIn("[cm-monitor mon-test", payload["text"])
-                # ...then consume it the way the Stop hook does.
-                os.remove(os.path.join(inbox, files[0]))
-                return await task
-
-        delivered = asyncio.run(scenario())
-        self.assertTrue(delivered)
-        self.assertEqual(
-            self.sent, [], "hook delivery must not touch the PTY",
-        )
-
-    def test_prompt_reached_unconsumed_falls_back_to_pty(self):
-        async def scenario():
-            calls = {"n": 0}
-
-            async def busy_then_prompt(_caller):
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return False, None
-                return True, {
-                    "state": "ready", "idle": True,
-                    "engine": "claude-code",
-                    "transcript_path": self.caller_path, "generation": 0,
-                }
-
-            with mock.patch.object(
-                async_monitor, "_caller_at_prompt", busy_then_prompt,
-            ):
-                return await async_monitor._deliver_to_caller(
-                    self._record(), "[cm-monitor mon-test fired] hi",
-                )
-
-        delivered = asyncio.run(scenario())
-        self.assertTrue(delivered, "PTY fallback delivers + verifies")
-        # The message went through send_input (PTY), not the inbox.
-        self.assertEqual(len(self.sent), 1)
-        self.assertEqual(self.sent[0]["session_uid"], self.CALLER)
-        # Taken back: nothing left in the inbox.
-        inbox = os.path.join(async_monitor.INBOX_ROOT, self.CALLER)
-        leftover = os.listdir(inbox) if os.path.isdir(inbox) else []
-        self.assertEqual(leftover, [])
 
 
 class SendInputAutoRegisterTests(_MonitorEnv):
@@ -418,34 +353,26 @@ class CancelTests(_MonitorEnv):
         self._inbox_patch.stop()
         super().tearDown()
 
-    def test_cancel_mid_delivery_is_terminal_and_purges_inbox(self):
+    def test_cancel_mid_delivery_is_terminal_and_retracts_native_event(self):
+        self.deliver_on_send = False
         async def scenario():
-            async def busy(_caller):
-                return False, None
-
-            with mock.patch.object(async_monitor, "_caller_at_prompt", busy):
-                reg = async_monitor.register_monitor(
-                    [self.WORKER], edge=False,
-                )
-                rec = async_monitor._MONITORS[reg["monitor_id"]]
-                inbox = os.path.join(async_monitor.INBOX_ROOT, self.CALLER)
-                for _ in range(200):
-                    if rec["state"] == "fired" and (
-                        os.path.isdir(inbox) and os.listdir(inbox)
-                    ):
-                        break
-                    await asyncio.sleep(0.02)
-                self.assertEqual(rec["state"], "fired")
-                out = async_monitor.cancel_monitor(reg["monitor_id"])
-                await asyncio.gather(rec["task"], return_exceptions=True)
-                leftovers = os.listdir(inbox) if os.path.isdir(inbox) else []
-                return out, rec, leftovers
-
-        out, rec, leftovers = asyncio.run(scenario())
+            reg = async_monitor.register_monitor([self.WORKER], edge=False)
+            rec = async_monitor._MONITORS[reg["monitor_id"]]
+            queue = notifications.Queue(self.CALLER)
+            event_id = f"monitor:{reg['monitor_id']}"
+            for _ in range(100):
+                if queue.get(event_id):
+                    break
+                await asyncio.sleep(.01)
+            self.assertEqual(rec["state"], "fired")
+            out = async_monitor.cancel_monitor(reg["monitor_id"])
+            await asyncio.gather(rec["task"], return_exceptions=True)
+            return out, rec, queue.get(event_id)
+        out, rec, event = asyncio.run(scenario())
         self.assertEqual(out["state"], "cancelled")
         self.assertEqual(rec["state"], "cancelled")
-        self.assertEqual(leftovers, [])
-        self.assertEqual(self.sent, [])
+        self.assertEqual(event["status"], "cancelled")
+        self.assertTrue(rec["cancellation_retracted"])
 
     def test_cancel_all_cancels_every_live_monitor(self):
         async def scenario():
@@ -481,102 +408,6 @@ class CancelTests(_MonitorEnv):
         for rec in recs:
             self.assertEqual(rec["state"], "cancelled")
         self.assertEqual(self.sent, [])
-
-
-class DeliveryVerificationTests(_MonitorEnv):
-    """Regression: a delivered copy the verifier initially missed must
-    not earn the caller a duplicate."""
-
-    def test_late_landing_copy_prevents_redelivery(self):
-        self.deliver_on_send = False
-
-        async def scenario():
-            calls = {"n": 0}
-
-            async def prompt_once(_caller):
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return True, {
-                        "state": "ready", "idle": True,
-                        "engine": "claude-code",
-                        "transcript_path": self.caller_path,
-                        "generation": 0,
-                    }
-                return False, None
-
-            with mock.patch.object(
-                async_monitor, "_caller_at_prompt", prompt_once,
-            ):
-                reg = async_monitor.register_monitor(
-                    [self.WORKER], edge=False,
-                )
-                rec = async_monitor._MONITORS[reg["monitor_id"]]
-                for _ in range(200):
-                    if self.sent:
-                        break
-                    await asyncio.sleep(0.02)
-                self.assertEqual(len(self.sent), 1)
-                # The verify window lapses with nothing landed...
-                await asyncio.sleep(0.6)
-                # ...then the copy finally lands (e.g. submitted along
-                # with the operator's next message).
-                with open(self.caller_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(_user(self.sent[0]["text"])) + "\n")
-                await rec["task"]
-                return rec
-
-        rec = asyncio.run(scenario())
-        self.assertEqual(rec["state"], "delivered")
-        self.assertEqual(len(self.sent), 1)
-
-    def test_regate_timeout_skips_redelivery(self):
-        """A caller that never returns to its prompt gets NO duplicate —
-        the result is retained instead of spamming mid-turn."""
-        self.deliver_on_send = False
-
-        async def scenario():
-            calls = {"n": 0}
-
-            async def prompt_once(_caller):
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return True, {
-                        "state": "ready", "idle": True,
-                        "engine": "claude-code",
-                        "transcript_path": self.caller_path,
-                        "generation": 0,
-                    }
-                return False, None
-
-            with mock.patch.object(
-                async_monitor, "_caller_at_prompt", prompt_once,
-            ):
-                reg = async_monitor.register_monitor(
-                    [self.WORKER], edge=False,
-                )
-                rec = async_monitor._MONITORS[reg["monitor_id"]]
-                await rec["task"]
-                return rec
-
-        rec = asyncio.run(scenario())
-        self.assertEqual(rec["state"], "undelivered")
-        self.assertEqual(len(self.sent), 1)
-
-    def test_verification_follows_rotated_transcript(self):
-        """Caller resumed mid-delivery → transcript path rotates; the
-        verifier follows the live path instead of the arm-time snapshot
-        (the spurious-redelivery bug)."""
-        self.rotate_on_deliver = True
-
-        async def scenario():
-            reg = async_monitor.register_monitor([self.WORKER], edge=False)
-            rec = async_monitor._MONITORS[reg["monitor_id"]]
-            await rec["task"]
-            return rec
-
-        rec = asyncio.run(scenario())
-        self.assertEqual(rec["state"], "delivered")
-        self.assertEqual(len(self.sent), 1)
 
 
 class FingerprintTests(unittest.TestCase):
