@@ -101,12 +101,13 @@ separate work.
 
 ## Validation and release state
 
-Implemented and tested on the messaging branch; not yet deployed. The local
-native-notification release remains the running release.
+Deployed locally on September 7, 2026, from `1283d5f`, after merging and pushing
+remote main. `#general` and `#cm-general` both have default enrollment enabled.
+All 29 known participants, including Owner, were joined during migration.
 
 - Daemon unit suite: 1,297 passed, 4 ignored, with `--test-threads=1` to isolate
   fork-based tests from concurrent store reopen/lock checks.
-- Focused daemon messaging suite: 42 passed, including migration, persistent leaves,
+- Focused daemon messaging suite: 43 passed, including migration, persistent leaves,
   default enrollment, retries, broadcast snapshots, mute handling and both native
   delivery queues. Framed daemon-client integration: 1 passed.
 - MCP Python suite: 349 passed, plus 15 subtests.
@@ -118,6 +119,23 @@ native-notification release remains the running release.
   monitor/preferences flows, and 80×24 / 48×16 layouts.
 
 The smoke test accepts `CM_CHAT_BIN_DIR` so a debug build can be tested without
-replacing the shared release binaries. Future rollout should stage daemon, TUI,
-and the complete MCP payload together, then use the routine brain-only deployment
-process and reconnect MCP clients for the new tool schemas.
+replacing the shared release binaries. The release stages daemon, TUI,
+and the complete MCP payload together and uses the routine brain-only deployment
+process. Restart the TUI for the new viewer, and reconnect MCP clients for the
+new tool schemas; no manual MCP path override is needed.
+
+### Local rollout evidence
+
+The holder stayed at PID 5517; its brain advanced exactly once, from epoch 13 to
+14. All 26 held session process identities were preserved. The loaded daemon
+matched the built release binary's SHA-256, live MCP preflight passed, and public
+membership/feature queries passed. The real release TUI smoke test passed with
+disposable state, including exact `general`/`cm-general` search.
+The full ten-minute stability check completed with epoch 14 unchanged, the
+breaker running, healthy MCP, and 26 held sessions throughout.
+
+Rollback copies, checksums, membership verification and health records are under
+`~/.cm/backups/membership-release-20260907T214703Z`. Only the local daemon was
+deployed; the remote `cm-manager` daemon was outside this rollout. Owner will
+restart the TUI, then request the `#cm-general` announcement; no broadcast was
+sent during deployment.

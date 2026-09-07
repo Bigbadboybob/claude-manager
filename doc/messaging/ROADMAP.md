@@ -1,7 +1,7 @@
 # Messaging follow-up work
 
-Owner's priorities, September 7, 2026. Native notification infrastructure is deployed locally. Items 2 + 3 are
-authorized together and implemented in this worktree, pending release.
+Owner's priorities, September 7, 2026. Native notification infrastructure is deployed locally. Items 2 + 3 shipped together locally on September 7, 2026; see
+[membership rollout](MEMBERSHIP_AND_MENTIONS.md#local-rollout-evidence).
 
 1. **Native notification infrastructure — deployed locally.** Durable delivery for
    existing chat wakes and worker-monitor notices using Claude's native session
