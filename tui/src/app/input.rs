@@ -2175,6 +2175,7 @@ impl App {
                     if let Some(ts) = ws.sessions.get(si) {
                         let timeout = ts.idle_timeout_secs;
                         let burst = ts.burst_threshold;
+                        self.messages.settings_name = Some((ts.uid.clone(), ts.label.clone(), self.messages_name_revision(&ts.uid)));
                         self.input_mode = InputMode::SessionSettings {
                             ws_index: wi,
                             session_index: si,
@@ -2286,7 +2287,7 @@ impl App {
         if self.mouse_capture_enabled {
             let _ = execute!(stdout, DisableMouseCapture);
             self.mouse_capture_enabled = false;
-            self.set_status_msg("Mouse capture OFF — use terminal's native selection (Alt+m to re-enable)");
+            self.set_status_msg("Mouse capture OFF — use terminal's native selection (Alt+M to re-enable)");
         } else {
             let _ = execute!(stdout, EnableMouseCapture);
             self.mouse_capture_enabled = true;
@@ -2346,6 +2347,19 @@ impl App {
         }
 
         self.needs_redraw = true;
+        // Alt+M toggles mouse capture, including while Messages is open.
+        // Terminals may report shifted letters as uppercase or lowercase + Shift.
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && (key.code == KeyCode::Char('M')
+                    || key.code == KeyCode::Char('m')
+                        && key.modifiers.contains(KeyModifiers::SHIFT))
+            {
+                self.toggle_mouse_capture();
+                return true;
+            }
+        }
+        if self.messaging_event(event) { return true; }
 
         // A-; MRU walk boundary: any OTHER key press ends the walk, so
         // the next A-; starts fresh from the live deque. This is the
@@ -2373,13 +2387,7 @@ impl App {
             }
         }
 
-        // Alt+m toggles mouse capture so the user can use their terminal's
-        // native selection (including block-select chords).
         if let CrosstermEvent::Key(key) = event {
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
-                self.toggle_mouse_capture();
-                return true;
-            }
             // Phase 6: Alt+, toggles the activity feed strip.
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char(',') {
                 self.activity_visible = !self.activity_visible;
@@ -3420,10 +3428,14 @@ impl App {
                 // stale local value made the operator's re-grant a
                 // silent no-op (the 2026-08-21 planning-session
                 // incident). The RPC is idempotent.
+                let messaging_enrolled = match self.rename_messaging_settings(ws_index, session_index, &name) {
+                    Ok(enrolled) => enrolled,
+                    Err(e) => { self.set_status_msg(&e); return; }
+                };
                 let mut perms_push: Option<(String, bool, bool)> = None;
                 if let Some(ws) = self.workspaces.get_mut(ws_index) {
                     if let Some(ts) = ws.sessions.get_mut(session_index) {
-                        if !name.trim().is_empty() {
+                        if !messaging_enrolled && !name.trim().is_empty() {
                             ts.label = name;
                         }
                         ts.idle_timeout_secs = idle_timeout;

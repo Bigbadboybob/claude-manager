@@ -53,7 +53,7 @@ def _session_uid() -> str:
     return os.environ.get("CM_TUI_SESSION_ID", "").strip()
 
 
-def _report_turn_ended(uid: str, transcript_path: str | None = None) -> None:
+def _report_turn_ended(uid: str, transcript_path: str | None = None, *, continuing: bool = False) -> None:
     """Best-effort `session.turn_ended` self-report.
 
     `transcript_path` is the file Claude Code names in this hook's stdin
@@ -68,7 +68,7 @@ def _report_turn_ended(uid: str, transcript_path: str | None = None) -> None:
     try:
         from mcp_server import control_client
 
-        params = {"session_uid": uid}
+        params = {"session_uid": uid, "continuing": continuing}
         if transcript_path:
             params["transcript_path"] = transcript_path
         control_client.call(
@@ -141,9 +141,10 @@ def main() -> int:
         if not uid:
             return 0  # not a cm session — nothing to do
 
-        _report_turn_ended(uid, transcript_path)
-
         messages = _drain_inbox(uid)
+        # A blocked Stop continues the turn. Do not advertise an idle composer
+        # while Claude is processing inbox work.
+        _report_turn_ended(uid, transcript_path, continuing=bool(messages))
         if messages:
             reason = "\n\n".join(messages)
             print(json.dumps({"decision": "block", "reason": reason}))

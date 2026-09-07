@@ -2085,6 +2085,7 @@ impl App {
                 // re-assert that healed a drifted row). Entries that
                 // don't carry the field (workflow-binding `Updated`s,
                 // `Added`s) are left alone.
+                self.apply_messaging_name(&host, &uid, &entry);
                 self.apply_global_perms_from_diff(&uid, &entry);
                 // Option B (criterion #4): adopt daemon-launched WORKFLOW
                 // PARTICIPANTS into the sidebar from broadcasts. The helper is
@@ -5567,6 +5568,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert(mw.id.clone(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -5775,6 +5777,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-r".to_string(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -5980,6 +5983,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-r".to_string(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -6127,6 +6131,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-g".to_string(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -6264,6 +6269,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-ssh".to_string(), mw);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),

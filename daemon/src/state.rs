@@ -382,6 +382,9 @@ pub type WorktreeSpawnQueues = Arc<Mutex<HashMap<PathBuf, Arc<WorktreeSpawnQueue
 /// almost always mutate — even read-only-looking calls like
 /// `list_sessions` need a consistent snapshot.
 pub struct DaemonState {
+    pub messaging: Arc<Mutex<Option<crate::messaging::Store>>>,
+    pub messaging_root: PathBuf,
+    pub messaging_names: std::collections::BTreeMap<String, crate::messaging::Name>,
     /// Daemon-owned per-session state (PTY, fanout, memory cap).
     /// Empty in 10a; populated by 10c when the daemon starts
     /// spawning sessions. Indexed by the stable session uid that
@@ -800,6 +803,9 @@ impl Default for DaemonState {
             workflow_runs: HashMap::new(),
             workflow_definitions: HashMap::new(),
             base_workflow_definitions: HashMap::new(),
+            messaging: Arc::new(Mutex::new(None)),
+            messaging_root: crate::messaging::rpc::default_root(),
+            messaging_names: Default::default(),
             manifest_watcher: Arc::new(crate::manifest::ManifestWatcher::new()),
             workflow_event_watcher: Arc::new(
                 crate::workflow::events::WorkflowEventWatcher::new(),
@@ -1022,7 +1028,17 @@ impl DaemonState {
         let manifest: Manifest = serde_json::from_str(&contents).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
+        for (uid, name) in manifest.messaging_names {
+            self.messaging_names.entry(uid).or_insert(name);
+        }
         self.workspaces = manifest.workspaces;
+        for ws in self.workspaces.values_mut() {
+            for entry in &mut ws.sessions {
+                if let Some(name) = self.messaging_names.get(&entry.uid) {
+                    entry.label = name.name.clone();
+                }
+            }
+        }
         self.bindings = manifest.bindings;
         // Agent-minted creator edges (fix-start-session). Empty for the
         // TUI-written `tui-sessions.json`; carries entries when this loads
@@ -1103,6 +1119,7 @@ impl DaemonState {
             ws.sessions.push(sess.to_manifest_entry());
         }
         Manifest {
+            messaging_names: self.messaging_names.clone(),
             workspaces,
             bindings: self.bindings.clone(),
             // Kept whole like `bindings` (small, and restart-durable auth

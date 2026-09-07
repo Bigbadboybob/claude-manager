@@ -6178,6 +6178,7 @@ mod slice_12e_tests {
         };
         workspaces.insert(ws.id.clone(), ws);
         let manifest = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
@@ -6368,6 +6369,7 @@ remote_socket = "/remote/manager.sock"
             );
         }
         let on_disk = Manifest {
+            messaging_names: Default::default(),
             task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),

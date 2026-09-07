@@ -61,6 +61,19 @@ pub(crate) const HEADER_SELECT_BG: Color = Color::Rgb(40, 40, 50);
 /// selected conflict rows use a full [`ERROR`] background instead).
 pub(crate) const CONFLICT_BG: Color = Color::Rgb(80, 0, 0);
 
+/// Messages: navy surfaces, slate chrome, and a cyan focus outline.
+/// Content accents stay the same when focus moves between panes.
+pub(crate) const CHAT_BG: Color = Color::Rgb(16, 21, 32);
+pub(crate) const CHAT_PANEL: Color = Color::Rgb(23, 30, 43);
+pub(crate) const CHAT_BORDER: Color = Color::Rgb(62, 79, 101);
+pub(crate) const CHAT_FOCUS: Color = Color::Rgb(92, 210, 232);
+pub(crate) const CHAT_TEXT: Color = Color::Rgb(221, 229, 242);
+pub(crate) const CHAT_MUTED: Color = Color::Rgb(140, 157, 181);
+pub(crate) const CHAT_OWNER: Color = Color::Rgb(134, 216, 174);
+pub(crate) const CHAT_AGENT: Color = Color::Rgb(187, 166, 246);
+pub(crate) const CHAT_TAG: Color = Color::Rgb(233, 190, 120);
+pub(crate) const CHAT_SELECTION: Color = Color::Rgb(37, 51, 73);
+
 /// Rainbow the `notify_user` attention alert color cycles through, one step
 /// per frame. 7 colors — coprime with the 6-frame pulse, so the glyph size
 /// and color never re-lock into a short loop (full repeat period is

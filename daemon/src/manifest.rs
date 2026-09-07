@@ -543,6 +543,9 @@ pub const TOMBSTONE_RETENTION_SECS: f64 = 30.0 * 24.0 * 60.0 * 60.0;
 /// Top-level on-disk shape of `~/.cm/tui-sessions.json`.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Manifest {
+    /// Messaging name revisions; canonical event history remains authoritative.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub messaging_names: std::collections::BTreeMap<String, crate::messaging::Name>,
     /// Workspaces keyed by stable workspace id.
     #[serde(default)]
     pub workspaces: HashMap<String, ManifestWorkspace>,

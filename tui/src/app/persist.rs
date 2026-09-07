@@ -105,6 +105,7 @@ impl App {
             SidebarView::Task => "task",
         };
         let manifest = Manifest {
+            messaging_names: self.messaging_manifest_names(),
             workspaces,
             bindings,
             // Daemon-only field (daemon-sessions.json); the TUI never
@@ -255,6 +256,7 @@ impl App {
     /// tasks are legal).
     pub(super) fn restore_sessions(&mut self) {
         let mut manifest = Self::load_manifest();
+        self.overlay_messaging_names(&mut manifest);
         // Heal duplicate-uid slots BEFORE any downstream pass reads the
         // workspaces (bound/useful computation, the spawn/reattach loop) so a
         // manifest carrying pre-fix phantom duplicates collapses to one slot per

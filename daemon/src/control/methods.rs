@@ -1194,6 +1194,9 @@ pub(crate) fn start_session_with_spawn_fn(
         session.watcher_handle = Some(w.handle);
         session.watcher_state = Some(w.state);
     }
+    if let Some(name) = state.messaging_names.get(&session_uid) {
+        session.title = name.name.clone();
+    }
     state.sessions.insert(session_uid.clone(), session);
     // P0 session durability (S1): persist the registry now that the
     // new session is live, so a daemon restart can restore it. Covers
@@ -1214,7 +1217,8 @@ pub(crate) fn start_session_with_spawn_fn(
     let added_entry = json!({
         "uid": session_uid,
         "workspace_id": p.workspace_id,
-        "label": p.label,
+        "label": state.messaging_names.get(&session_uid).map(|n|n.name.as_str()).unwrap_or(&p.label),
+        "name_revision": state.messaging_names.get(&session_uid).map(|n|n.revision),
         "session_type": p.session_type,
         "workflow_run_id": p.workflow_run_id,
         "workflow_role": p.workflow_role,
@@ -2425,6 +2429,7 @@ pub fn list_sessions(
         sessions.push(json!({
             "session_uid": uid,
             "label": session.title,
+            "name_revision": state.messaging_names.get(uid).map(|n|n.revision),
             "type": session.session_type,
             "state": state_str,
             "idle": idle,
@@ -2772,6 +2777,8 @@ pub fn resolve_authorized_session(
 #[derive(Deserialize)]
 struct SessionTurnEndedParams {
     session_uid: String,
+    #[serde(default)]
+    continuing: bool,
     /// The transcript file Claude Code handed the Stop hook for THIS turn
     /// (fix-stale-resume). Optional: older hooks omit it.
     ///
@@ -2821,7 +2828,11 @@ pub fn session_turn_ended(
             format!("session '{}' not in daemon registry", p.session_uid),
         )
     })?;
-    session.stamp_turn_end();
+    if p.continuing {
+        session.input_handle().stamp_activity();
+    } else {
+        session.stamp_turn_end();
+    }
     // fix-stale-resume: refresh the recorded resume key from the hook's
     // report. Unlike `session.set_transcript_path` (Operator-only, because
     // the TUI is authoritative for path conventions) this is a SELF-report
@@ -4004,7 +4015,10 @@ pub fn tui_update_sessions_snapshot(
         ))?;
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     state.tui_sessions.clear();
-    for entry in p.sessions {
+    for mut entry in p.sessions {
+        if let Some(name) = state.messaging_names.get(&entry.uid) {
+            entry.label = Some(name.name.clone());
+        }
         state.tui_sessions.insert(entry.uid.clone(), entry);
     }
     state.tui_sessions_pushed = true;
@@ -5426,6 +5440,7 @@ fn serialize_workflow_run_full(run: &crate::workflow::run::WorkflowRun) -> Value
                 role.clone(),
                 json!({
                     "session_label": binding.session_label,
+                    "daemon_session_uid": binding.daemon_session_uid,
                     "current_transcript_id": binding.current_session_id,
                 }),
             )

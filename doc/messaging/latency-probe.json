@@ -1,0 +1,35 @@
+{
+  "measured_at_utc": "2026-09-07T01:41:29.090678+00:00",
+  "route": "current workspace host -> cm-manager",
+  "method": "12 sequential echo requests over one established SSH connection; no CM RPC/storage work",
+  "connection_and_helper_setup_ms": 3598.35,
+  "samples_ms": [
+    135.253,
+    218.621,
+    279.432,
+    53.652,
+    122.15,
+    179.594,
+    47.636,
+    132.328,
+    149.385,
+    186.903,
+    179.335,
+    179.279
+  ],
+  "median_ms": 164.332,
+  "min_ms": 47.636,
+  "max_ms": 279.432,
+  "icmp_summary": {
+    "samples": 8,
+    "loss_percent": 0,
+    "min_ms": 45.007,
+    "mean_ms": 79.669,
+    "max_ms": 147.331,
+    "mdev_ms": 33.49
+  },
+  "limitations": [
+    "Small sample on one route; not a messaging API or durable-write benchmark.",
+    "Echo includes SSH and process scheduling; connection setup is separate from warm requests."
+  ]
+}

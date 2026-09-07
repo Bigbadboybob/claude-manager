@@ -64,6 +64,7 @@ pub mod control;
 pub mod holder_mode;
 pub mod host_id;
 pub mod manifest;
+pub mod messaging;
 pub mod mcp_config;
 pub mod migrate;
 pub mod notify;
@@ -856,6 +857,9 @@ pub fn run() -> anyhow::Result<()> {
         initial_state.seed_recently_exited_from_sidecar(&sidecar);
     }
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
+    if let Err(e) = messaging::rpc::initialize(&state) {
+        eprintln!("cm-daemon: messaging unavailable: {e}");
+    }
 
     // H2 (restart hardening): SIGHUP → `daemon.reload_config` without
     // speaking the socket protocol (`kill -HUP $(pgrep cm-daemon)`), for
@@ -1177,6 +1181,15 @@ pub fn run() -> anyhow::Result<()> {
         None => control::methods::restore_sessions(&state),
     }
     } // !holder_active
+
+    if let Err(e) = messaging::rpc::initialize(&state) {
+        eprintln!("cm-daemon: messaging pending: {e}");
+    }
+    // Registry restore must finish before persisting the name projection; an
+    // early save could replace headless restore records with the TUI subset.
+    state.lock().unwrap_or_else(|p| p.into_inner())
+        .persist_sessions_best_effort();
+    messaging::delivery::spawn(&state);
 
     // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver
     // since Phase 4 (the TUI is a pure observer). It fires transitions,

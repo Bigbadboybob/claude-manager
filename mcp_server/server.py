@@ -168,6 +168,90 @@ def _git_origin_url() -> str:
     return result.stdout.strip()
 
 
+def _chat_call(method: str, params: dict) -> dict:
+    return control_client.call("messaging." + method, {
+        key: value for key, value in params.items() if value is not None
+    })
+
+
+@mcp.tool()
+def chat_open(channel: str | None = None, dm: str | None = None,
+              conversation: str | None = None) -> dict:
+    """Orient in shared messaging: current norms, identity, unread DMs and preview.
+
+    Defaults to #general. Preview does not mark messages read. Choose a short
+    task-based name on your first chat_send; it becomes your CM session name.
+    """
+    return _chat_call("open", locals())
+
+
+@mcp.tool()
+def chat_send(body: str, request_id: str, channel: str | None = None,
+              dm: str | None = None, conversation: str | None = None,
+              name: str | None = None, reply_to: str | None = None,
+              mentions: list[str] | None = None, tags: list[str] | None = None,
+              links: list[dict] | None = None, norms_seen: dict | None = None,
+              ack_receipt: dict | None = None, origin_daemon_id: str | None = None) -> dict:
+    """Send to exactly one channel, participant DM, or conversation ID.
+
+    Quick replies and one sentence are often enough; usual messages are at most
+    1–3 short paragraphs. Hard limit 3000 characters: summarize and reference a
+    file for longer material. Never split an essay to evade the limit.
+    First send requires a task-based name; collisions receive a unique suffix.
+    Keep request_id and original daemon binding for retries, including timeouts.
+    Prefer channels for Owner; needs-owner is quiet. Urgent attention uses
+    notify_user. Unsolicited Owner DMs are only for critical urgent private issues.
+    Posting and notification/read receipt are separate. Read returned shared norms.
+    """
+    return _chat_call("send", locals())
+
+
+@mcp.tool()
+def chat_read(channel: str | None = None, dm: str | None = None,
+              conversation: str | None = None, thread: str | None = None,
+              inbox: bool = False, dms: bool = False, unread_only: bool = False,
+              time: dict | None = None, time_basis: str = "created",
+              freshness: str = "cached", tags: list[str] | None = None,
+              after: dict | None = None, cursor: dict | None = None,
+              limit: int = 50, ack_receipt: dict | None = None,
+              newest_first: bool = False) -> dict:
+    """Read history, a thread, your inbox, or incoming DMs. Select one scope.
+
+    time={"since":"10m"} or {"start":RFC3339,"end":RFC3339} filters a fixed
+    window. channel="*" reads all public channels. newest_first shows recent
+    messages first. received basis finds late arrivals. tags must all match. Use cursor
+    unchanged for pagination. Acknowledge the returned receipt on a later read
+    or send to mark only fully supplied messages read; previews do not consume.
+    """
+    return _chat_call("read", locals())
+
+
+@mcp.tool()
+def chat_dms(unread_only: bool = False, peer: str | None = None,
+             cursor: dict | None = None, limit: int = 50) -> dict:
+    """Check DM conversations and unread counts, including first contact, without consuming them."""
+    return _chat_call("dms", locals())
+
+
+@mcp.tool()
+def chat_people(query: str | None = None, include_exited: bool = False,
+                cursor: dict | None = None, limit: int = 50) -> dict:
+    """Find participant IDs, task-based names, aliases and presence. Does not grant session control."""
+    return _chat_call("people", locals())
+
+
+@mcp.tool()
+def chat_channels(action: str = "list", path: str | None = None,
+                  description: str | None = None, request_id: str | None = None,
+                  cursor: dict | None = None, limit: int = 50) -> dict:
+    """List channels or create a subchannel such as news/parser. Creation requires a request ID.
+
+    Missing ancestors are created with the requested channel. Sends never silently
+    create a channel from a typo. Channel membership does not imply Owner alerts.
+    """
+    return _chat_call("channels", locals())
+
+
 @mcp.tool()
 def propose_task(
     project: str,
@@ -1645,21 +1729,25 @@ async def wait_for_workflow_stop(
             last_iteration = iteration
             idle_since = None
 
-        active_label = None
+        active_uid = None
         if active_role and active_role in role_sessions:
-            active_label = (role_sessions[active_role] or {}).get("session_label")
+            active_uid = (role_sessions[active_role] or {}).get("daemon_session_uid")
 
         active_idle = False
-        if active_label:
-            # Omit task_id — defaults to the caller's scope, which
-            # includes the workflow's participant sessions for any
-            # orchestrator authorized to launch the run.
+        if active_role:
             sessions = await asyncio.to_thread(
                 control_client.call, "list_sessions", {"include_exited": False}
             )
-            for s in sessions:
-                if s.get("label") == active_label:
-                    active_idle = bool(s.get("idle", False))
+            if not active_uid:
+                candidates = [s for s in sessions if s.get("workflow_run_id") == run_id
+                              and s.get("workflow_role") == active_role]
+                if len(candidates) == 1:
+                    active_uid = candidates[0].get("session_uid")
+                else:
+                    state["binding_warning"] = "Active role has no unambiguous stable session binding"
+            for session in sessions:
+                if active_uid and session.get("session_uid") == active_uid:
+                    active_idle = bool(session.get("idle", False))
                     break
 
         now = time.monotonic()

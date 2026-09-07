@@ -481,6 +481,12 @@ fn drive_stream(
         match wire::read_stream_frame(&mut stream) {
             Ok(Some(frame)) => match frame.kind {
                 StreamKind::ManifestSnapshot => {
+                    if let Some(names) = frame.payload.get("messaging_names").and_then(|v|v.as_object()) {
+                        for (uid,name) in names {
+                            let diff=ManifestDiff::Updated {uid:uid.clone(),entry:serde_json::json!({"label":name["name"],"name_revision":name["revision"]})};
+                            if event_tx.send(ManifestEvent::Diff{host:host.clone(),diff}).is_err(){return DriveOutcome::ChannelDisconnected;}
+                        }
+                    }
                     // 10e-c r1 F1: parse the snapshot's
                     // workspaces → flatten to (uid, last_exit)
                     // pairs → forward as ManifestEvent::Snapshot.

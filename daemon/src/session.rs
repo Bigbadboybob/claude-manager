@@ -2685,9 +2685,9 @@ impl InputHandle {
             let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
             w.write_all(bytes)?;
             w.flush()?;
+            stamp_now(&self.last_activity_at);
+            stamp_now(&self.last_input_at);
         }
-        stamp_now(&self.last_activity_at);
-        stamp_now(&self.last_input_at);
         Ok(())
     }
 
@@ -2707,11 +2707,81 @@ impl InputHandle {
     /// `last_operator_input_at` so the agent-prompt delivery threads
     /// can defer injection while the operator is actively typing.
     pub fn write_and_stamp_operator(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.write_and_stamp(bytes)?;
+        let _permit = crate::writer_gate::write_permit();
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        // Stamp while holding the same writer lock used by chat's draft gate.
+        // Even a partial/failed human write means the composer may contain text.
         stamp_now(&self.last_operator_input_at);
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
         Ok(())
     }
 
+    /// A conservative chat adapter: only a known idle composer untouched by
+    /// operator input is eligible. The writer lock spans body, settle and Enter,
+    /// so a concurrent human keystroke cannot be interleaved into the message.
+    /// False means nothing was written; any I/O error is an uncertain attempt.
+    pub fn try_chat_prompt(
+        &self,
+        text: &str,
+        expected_input: Option<Instant>,
+        turn_end: &SharedLastActivity,
+        fanout: &Arc<PtyByteFanout>,
+    ) -> std::io::Result<bool> {
+        let _permit = crate::writer_gate::write_permit();
+        let mut writer = match self.writer.try_lock() {
+            Ok(w) => w,
+            Err(_) => return Ok(false),
+        };
+        if self
+            .last_operator_input_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        let ended = *turn_end.lock().unwrap_or_else(|p| p.into_inner());
+        if input != expected_input || ended.is_none_or(|end| input.is_some_and(|i| i > end)) {
+            return Ok(false);
+        }
+        let snapshot = fanout.snapshot_since(None);
+        if snapshot.closed || snapshot.start_offset != 0 {
+            return Ok(false);
+        }
+        let mut tracker = crate::workflow::pty_tracker::PtyModeTracker::new();
+        tracker.feed(&snapshot.bytes, Instant::now());
+        if !tracker.composer_ready() || !tracker.bracketed_paste() {
+            return Ok(false);
+        }
+        let bytes =
+            crate::workflow::pty_tracker::format_body_for_delivery(text, tracker.term_mode());
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let next = fanout.snapshot_since(Some(snapshot.cursor));
+        if next.closed || next.evicted_since_cursor {
+            return Err(std::io::Error::other(
+                "Recipient mode became unavailable after chat body",
+            ));
+        }
+        tracker.feed(&next.bytes, Instant::now());
+        if !tracker.composer_ready() {
+            return Err(std::io::Error::other(
+                "Recipient left composer before chat Enter",
+            ));
+        }
+        writer.write_all(tracker.enter_bytes())?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        Ok(true)
+    }
     /// Time since the operator last typed into this PTY through the
     /// attach stream. `None` = never (no operator interference
     /// possible). Used by the delivery threads' typing-quiet gate.
@@ -4535,5 +4605,31 @@ mod tests {
                 v,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod messaging_input_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn messaging_idle_write_serializes_operator_and_uses_live_modes() {
+        let (input,writes)=InputHandle::test_handle_capturing();let fanout=Arc::new(PtyByteFanout::new(4096));fanout.push(b"\x1b[?2004h");
+        let ended=Arc::new(Mutex::new(Some(Instant::now())));
+        let input=Arc::new(input);let other=input.clone();let captured=writes.clone();
+        let thread=std::thread::spawn(move||{while captured.lock().unwrap().is_empty(){std::thread::yield_now();}other.write_and_stamp_operator(b"human draft").unwrap();});
+        assert!(input.try_chat_prompt("[cm-chat test] Read inbox.",None,&ended,&fanout).unwrap());thread.join().unwrap();
+        let written=writes.lock().unwrap();assert_eq!(written.len(),3);assert!(written[0].1.windows(7).any(|s|s==b"cm-chat"));assert_eq!(written[1].1,b"\r");assert_eq!(written[2].1,b"human draft");
+    }
+    #[test]
+    fn messaging_idle_unknown_draft_stale_input_closed_and_evicted_defer_without_writes() {
+        let (input,writes)=InputHandle::test_handle_capturing();let ended=Arc::new(Mutex::new(None));let fanout=Arc::new(PtyByteFanout::new(32));
+        assert!(!input.try_chat_prompt("wake",None,&ended,&fanout).unwrap());*ended.lock().unwrap()=Some(Instant::now());
+        assert!(!input.try_chat_prompt("wake",None,&ended,&fanout).unwrap());fanout.push(b"\x1b[?2004h");
+        input.stamp_activity();assert!(!input.try_chat_prompt("wake",None,&ended,&fanout).unwrap());
+        let (input,second)=InputHandle::test_handle_capturing();input.stamp_operator_input_at(Instant::now()-Duration::from_secs(1000));
+        assert!(!input.try_chat_prompt("wake",None,&ended,&fanout).unwrap());
+        let input=InputHandle::test_handle();fanout.push(&[b'x';40]);assert!(!input.try_chat_prompt("wake",None,&ended,&fanout).unwrap());fanout.close();assert!(!input.try_chat_prompt("wake",None,&ended,&fanout).unwrap());
+        assert!(writes.lock().unwrap().is_empty());assert!(second.lock().unwrap().is_empty());
     }
 }

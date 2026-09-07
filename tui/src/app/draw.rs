@@ -134,6 +134,7 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.messages.visible { self.draw_messages(frame); return; }
         let area = frame.area();
 
         // Phase 6: bottom layout — content / [activity strip] / status bar.
@@ -1385,7 +1386,8 @@ impl App {
             ("PgUp/Dn scroll", "A-0  pull"),
             ("A-Ent  newline", "A-;  recent"),
             ("A-p    find", "A-i  info"),
-            ("A-'    yank", "A-m  mouse"),
+            ("A-'    yank", "A-M  mouse"),
+            ("F8     messages", "A-m  messages"),
         ];
         let help_rows = help_entries.len() as u16;
         let list_height = inner.height.saturating_sub(help_rows + 1);

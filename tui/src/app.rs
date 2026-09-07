@@ -46,6 +46,7 @@ use lifecycle::*;
 mod input;
 use input::*;
 mod draw;
+mod messages;
 
 pub(crate) use lifecycle::try_attach_via_daemon_with_deps;
 
@@ -184,6 +185,7 @@ fn play_notification_sound() {
 // only the variant payload through.
 
 pub struct App {
+    pub messages: messages::Messages,
     pub tasks: Vec<TaskEntry>,
     /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
     pub workspaces: Vec<Workspace>,
@@ -270,7 +272,7 @@ pub struct App {
     pending_rotations: Vec<(String, u64, Instant)>,
     /// Mouse capture state. When false, `DisableMouseCapture` has been sent so
     /// the user can use the terminal's native selection (including block-select
-    /// chords). Toggle with Alt+m.
+    /// chords). Toggle with Alt+M.
     pub mouse_capture_enabled: bool,
     /// Pending requests from the control socket. Drained each tick by the
     /// main loop and dispatched to method handlers. The server thread
@@ -813,7 +815,7 @@ impl App {
         };
 
         App {
-            tasks: Vec::new(),
+            messages: messages::Messages::load(),            tasks: Vec::new(),
             workspaces: Vec::new(),
             cursor: Cursor::Workspace(0),
             cursor_column: SidebarColumn::Main,

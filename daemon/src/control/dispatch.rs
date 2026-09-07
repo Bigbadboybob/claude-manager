@@ -398,6 +398,13 @@ pub fn dispatch_request(
         None
     };
     match req.method.as_str() {
+        "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.read" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.send" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.dms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.people" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.channels" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         // Reads the caller's session (when known) to report its
         // own perms + scope; still pongs for unknown callers.
         "ping" => DispatchOutcome::Done(dispatch_ping(state, req)),
@@ -2291,6 +2298,7 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
     let snapshot_payload = serde_json::json!({
         "workspaces": state.workspaces,
         "bindings": state.bindings,
+        "messaging_names": state.messaging_names,
     });
 
     let response = Response::ok(
