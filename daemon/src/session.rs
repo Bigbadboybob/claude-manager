@@ -199,6 +199,31 @@ impl PtyByteFanout {
         }
     }
 
+    /// Seed the ring with a replay tail carried over from a previous
+    /// daemon generation (`crate::fanout_persist`). Unlike
+    /// [`push`](Self::push) this broadcasts to nobody and stamps no
+    /// activity — the bytes are old output, not new — so an
+    /// idle-for-an-hour session still reads idle after adoption.
+    /// Meant for a freshly built session with no reader thread yet;
+    /// the seed lands FIRST in the ring, ahead of whatever the new
+    /// reader drains from the kernel buffer. Over-long seeds keep
+    /// their tail, like any push.
+    pub fn seed_replay(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let cap = inner.capacity;
+        let keep = &bytes[bytes.len().saturating_sub(cap)..];
+        let new_len = inner.buffer.len() + keep.len();
+        if new_len > cap {
+            let to_drain = new_len - cap;
+            inner.buffer.drain(..to_drain);
+        }
+        inner.buffer.extend(keep);
+        inner.bytes_written = inner.bytes_written.saturating_add(keep.len() as u64);
+    }
+
     /// Signal "no more data coming" to all subscribers. The
     /// producer (reader thread) calls this when the PTY master's
     /// `read()` returns 0 (EOF) or an unrecoverable error.
@@ -2305,6 +2330,15 @@ impl AdoptedSessionBuild {
         &self.uid
     }
 
+    /// Seed this build's (still reader-less) fanout ring with the
+    /// replay tail the previous generation persisted for it — see
+    /// [`PtyByteFanout::seed_replay`] and `crate::fanout_persist`.
+    /// Safe before `arm` only: after arming, the reader thread is
+    /// pushing live bytes and a seed would land out of order.
+    pub fn seed_replay(&self, bytes: &[u8]) {
+        self.fanout.seed_replay(bytes);
+    }
+
     /// The ARM stage: start the two threads and produce the armed
     /// `DaemonSession`. **This is the moment kill-on-drop semantics
     /// BEGIN**, deliberately: a session that made it through the
@@ -3641,6 +3675,32 @@ mod tests {
         let rx = fanout.subscribe();
         let replay = rx.try_recv().expect("replay");
         assert_eq!(replay, b"cdefg");
+    }
+
+    #[test]
+    fn seed_replay_lands_first_broadcasts_nothing_and_keeps_activity_untouched() {
+        let activity: SharedLastActivity = Arc::new(Mutex::new(None));
+        let fanout = PtyByteFanout::with_activity_tracker(64, Some(Arc::clone(&activity)));
+        let rx = fanout.subscribe();
+        fanout.seed_replay(b"old-screen");
+        assert!(rx.try_recv().is_err(), "a seed is not live output — no broadcast");
+        assert!(activity.lock().unwrap().is_none(), "a seed stamps no activity");
+        fanout.push(b"+live");
+        assert_eq!(rx.try_recv().unwrap(), b"+live");
+        let snap = fanout.snapshot_since(None);
+        assert_eq!(snap.bytes, b"old-screen+live");
+        assert_eq!(snap.cursor, 15, "seed counts toward bytes_written");
+        let late = fanout.subscribe();
+        assert_eq!(late.try_recv().unwrap(), b"old-screen+live", "replay = seed ++ live");
+    }
+
+    #[test]
+    fn seed_replay_over_capacity_keeps_tail() {
+        let fanout = PtyByteFanout::new(4);
+        fanout.seed_replay(b"abcdefg");
+        assert_eq!(fanout.snapshot_since(None).bytes, b"defg");
+        fanout.seed_replay(b"");
+        assert_eq!(fanout.snapshot_since(None).bytes, b"defg");
     }
 
     #[test]
