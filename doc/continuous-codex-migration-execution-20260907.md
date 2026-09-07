@@ -9,14 +9,14 @@ At the September 7 morning cutover checkpoint, all ten production definitions ta
 | Task | First Codex observation | Remaining validation |
 |---|---|---|
 | api-update | Clean seq 75 completed; six review branches across seqs 74–75 preserved | Scheduled cadence and second clean productive cycle; seq 74's incorrect Orphaned status is not a pass |
-| bug-triage | Seq 586 completed; two retained child worktrees reconciled by Codex workers | Second and scheduled cycle |
-| perf-triage | Seq 279 completed; three retained child tasks finished Codex reconciliations | Second and scheduled cycle |
-| scraper-triage | Seq 277 completed; legitimate quiet scan, review/monitoring state preserved | Second and scheduled cycle |
+| bug-triage | Seqs 586–587 completed, including a scheduled cycle; retained children reconciled | Normal ongoing artifact/operator review |
+| perf-triage | Seqs 279–280 completed, including a scheduled cycle; retained children reconciled | Normal ongoing artifact/operator review |
+| scraper-triage | Seqs 277–278 completed, including a scheduled cycle; review/monitoring state preserved | Normal ongoing artifact/operator review |
 | code-bughunt | Seq 29 completed **handover/binding verification only**; baseline and three owner dispatches unchanged | Productive hunt on original 72-hour schedule; subsequent observations |
-| momentum-detective | Seq 573 completed with an empty batch | Two nonempty production batches |
-| scraper-creation | Seq 384 completed; both new proposals reached terminal dedup outcomes | Second nonempty batch |
-| structured-scraper-creation | Seq 7 progressing through five new UUIDs and retained backlog; real Codex workers and disabled-record validation verified | First full completion and second nonempty batch; continue artifact review |
-| behavior-triage | Configured for Codex; remains paused | Deferred until explicit resume; recover missing historical ignored index before productive use |
+| momentum-detective | Seq 573 empty; scheduled seq 574 completed three real items | Second nonempty production batch |
+| scraper-creation | Seqs 384–385 completed nonempty batches; seq 385 scheduled, both outcomes reviewed | Normal ongoing artifact/operator review |
+| structured-scraper-creation | Seq 7 completed; scheduled seq 8 admitted and its worker still progressing | Second completed nonempty batch; continue artifact review |
+| behavior-triage | Configured for Codex; remains paused; historical index recovered and reconciled | Productive validation deferred until explicit resume |
 | scraper-opt | Configured for Codex; remains paused | Deferred until explicit resume |
 
 All nine morning cutovers preserved the old `runs.jsonl` bytes as an exact prefix; the archive-prefix checks cover more than 5.7 MB of history. Stable configuration fields, schedules, identity, worktrees, enabled flags, supervision, retention and limits match the original snapshot. Run count, last run and next-fire timestamp were unchanged at each engine commit; only normal subsequent fires then advanced runtime state. No old staged consumer UUID was replayed. Final backups, expected-state requests, retirement barriers, engine operation IDs and proofs are under `fleet-cutover-1424Z/` in the private migration directory, mirrored locally.
@@ -25,9 +25,23 @@ Structured creation now binds the previously reserved parent **bf0aac2b-39c3-447
 
 The independently running `scraperOptimization.service` (PID 2363677 observed under its systemd cgroup) remains running. It is an application producer, not an active continuous-task worker; the paused scraper-opt configuration cutover did not signal or restart it.
 
-PredictionTrading prompt sources now reside on private branch `cm/continuous-codex-prompts-20260907` at **90c7ea905** (following `4aad0ab6e`). All ten live default prompts were applied during their own paused cutover. The detective template's reviewed Codex form is also preserved in task memory; its orchestrator renders the current repository brief and appends the required CM completion instruction, so normal main fast-forwards retain current task content and the completion requirement. The source branch remains unpushed/unmerged. CM source changes remain in this worktree; the tested daemon/MCP deployment is unchanged during these morning cutovers.
+PredictionTrading prompt sources now reside on private branch `cm/continuous-codex-prompts-20260907` at **90c7ea905** (following `4aad0ab6e`). All ten live default prompts were applied during their own paused cutover. The detective template's reviewed Codex form is also preserved in task memory; its orchestrator renders the current repository brief and appends the required CM completion instruction, so normal main fast-forwards retain current task content and the completion requirement. The prompt source branch was subsequently integrated and pushed to PredictionTrading main at `08067c77f`; all ten live prompt bodies match the merged files. CM migration and pool-monitor source was integrated and pushed at `c61fe41`, preserving newer messaging and native-resume code. The tested daemon/MCP deployment remains unchanged at holder epoch 12.
 
 ## Runtime and validation
+
+### Source, memory and artifact closeout, September 7, after 19:30 UTC
+
+CM main `c61fe41` and PredictionTrading main `08067c77f` contain the migration work and are pushed to origin. CM integration preserves main's messaging and native transcript-resume changes. The merged workspace passed `cargo check --workspace`, **1,289 daemon library tests (four existing ignores), 51 daemon integration tests, 853 TUI tests, and 404 Python/MCP tests plus 26 subtests**. PredictionTrading's prompt selector passed **36 targeted tests**, plus targeted mypy and ruff. The merged sources match all ten live prompts byte-for-byte; no live prompt was bulk-reapplied. This closeout deployed only the read-only health watcher; no daemon, holder, LB, or application service was restarted.
+
+The permanent watcher's first actual cron execution observed scraper-creation seq 385 complete and delivered its runtime milestone. Subsequent five-minute checks have zero component failures and no active incidents. The 19:30 real Codex probe returned OK and independently observed the exact required `cm_pool / gpt-5.6-sol / 0.153.4` runtime. At the latest runtime check holder epoch 12/PID 2893373 is stable, holder/brain each have 28 sessions, pending exits/unanswered pings are zero, and no production task is account-blocked or under recovery hold. Structured creation's seq 8 is Running with its SP-27 worker still doing admitted work. Originally paused tasks remain paused.
+
+Behavior Triage's missing historical index was reconstructed privately from its last complete recorded file Read and 41 subsequent validated in-memory file edits, through August 25. Historical shell commands were not executed. The reconstructed YAML contains all six original finding IDs and later scope/rollback rulings. Current planning reads confirm five owner-closed findings and one blocked/fix-ready finding (BEH-002); the working index reconciles those statuses, archives five retained branch NOTES, and does not advance monitoring counters. The original reconstruction and operation/hash proof remain separate from the reconciled copy. The previous cycle log is not claimed fully recovered. The continuous definition's bytes are unchanged, and its task remains paused with no session. Current artifacts/metrics must still be reconfirmed when the owner resumes productive work.
+
+Artifact review also exposed an inherited Perf Triage memory syntax error: cycle-199 appendix mappings followed a YAML sequence without a mapping header. A minimal header insertion makes the whole file parse while preserving every prior content line and all 38 issue entries. The idle task's original file and before/after hashes are backed up. This is a memory-format repair, not a scope or task-state change.
+
+Scraper-creation seq 385's two original staged UUIDs map to recorded terminal outcomes: `diariocambio22.mx` received bounded investigation and a structural Cloudflare rejection (SC-146, clean retained branch with zero commits); `derwesten.de` was rejected under the existing recurring-value gate given the dedicated resolver and stronger pending source. No code was merged or deployed from those outcomes. Bug/Perf/Scraper triages' subsequent cycles legitimately found no new qualifying issue and preserved their review queues. API scheduled/full-cadence observation, a second nonempty Momentum batch, completion/review of the second Structured batch, and productive Code Bughunt observations on its original 72-hour schedule remain future gates. Runtime milestone notifications do not waive artifact or operator review.
+
+Private closeout evidence lives under `health-watch-install/` in the migration archive, including cron backups, merged prompt hashes, worker reconciliation, historical/reconciled memory proofs and quota/runtime snapshots. No credentials, transcripts, private memory or queue payloads were committed.
 
 ### Closeout and permanent monitoring, September 7, 19:16 UTC
 
