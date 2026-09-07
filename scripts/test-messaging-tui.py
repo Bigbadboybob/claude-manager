@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Isolated release TUI smoke test; no live sessions or messages are touched.
+"""Isolated TUI smoke test; no live sessions or messages are touched.
 
 Requires pyte and Pillow in the test interpreter. Build the release TUI/daemon
-first. Screenshots and logs are written under /tmp/cm-chat-B-* and
+first, or set CM_CHAT_BIN_DIR to a debug build directory. Screenshots and logs are written under /tmp/cm-chat-B-* and
 /tmp/cm-messaging-B-preview*. The test owns a temporary HOME and private sockets.
 """
 
@@ -11,7 +11,7 @@ import pyte
 from PIL import Image, ImageDraw, ImageFont
 
 root = pathlib.Path(__file__).resolve().parents[1]
-release = pathlib.Path.home() / ".cm/shared-target/release"
+release = pathlib.Path(os.environ.get("CM_CHAT_BIN_DIR", str(pathlib.Path.home() / ".cm/shared-target/release")))
 with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
     home = pathlib.Path(tmp)
     (home / ".cm").mkdir()
@@ -199,7 +199,62 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             key(b"P", 0.6)
             wait_text("Pinned reference for the release.")
             shot("cm-chat-channel-renamed")
-            key(b"\t" + b"k" * 30 + b"j" * 5 + b"\r", 0.7)
+            key(b"bgeneral\r", 0.7)
+            wait_text("Second paragraph stays visible.")
+            # Public channel preview does not join; Owner joins/leaves explicitly.
+            rpc("tui.update_sessions_snapshot", {"sessions": fixtures}, raw=True)
+            rpc("channels", {"action": "create", "path": "membership-test", "description": "Membership and mentions", "request_id": "member-create"}, session="alpha")
+            rpc("channels", {"action": "join", "path": "membership-test", "request_id": "beta-join"}, session="beta")
+            key(b"g", 0.6)
+            key(b"bmembership\r", 0.6)
+            wait_text("Preview")
+            assert rpc("channels", {"action": "get", "path": "membership-test"})["joined"] is False
+            key(b"c", 0.3)
+            assert "Join before posting" in visible(), visible()
+            key(b"J", 0.8)
+            wait_text("Joined")
+            assert rpc("channels", {"action": "get", "path": "membership-test"})["joined"] is True
+            key(b"u", 0.5)
+            wait_text("Channel members")
+            assert "Alpha" in visible() and "Beta" in visible() and "Owner" in visible(), visible()
+            key(b"\x1b", 0.3)
+            key(b"c@Al", 0.4)
+            wait_text("@Alpha")
+            shot("cm-chat-mention-completion")
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 16, 48, 0, 0))
+            screen.resize(16, 48)
+            os.kill(tui.pid, signal.SIGWINCH)
+            drain(0.4)
+            wait_text("@Alpha")
+            shot("cm-chat-mention-narrow")
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+            screen.resize(24, 80)
+            os.kill(tui.pid, signal.SIGWINCH)
+            drain(0.4)
+            key(b"\rplease review.\x13", 0.8)
+            wait_text("1 messages")
+            direct = rpc("read", {"channel": "membership-test"})["items"][-1]
+            assert direct["data"]["mentions"] == [people["alpha"]], direct
+            key(b"c@here", 0.4)
+            wait_text("all joined")
+            key(b"\rready for review.\x13", 0.8)
+            wait_text("2 messages")
+            broadcast = rpc("read", {"channel": "membership-test"})["items"][-1]
+            assert broadcast["data"]["mention_here"] is True, broadcast
+            assert set(broadcast["data"]["mention_recipients"]) == {"owner", people["alpha"], people["beta"]}
+            # Editing the visible mention removes its notification target.
+            key(b"c@Al\r\x7f\x7f\x13", 0.8)
+            wait_text("3 messages")
+            edited = rpc("read", {"channel": "membership-test"})["items"][-1]
+            assert edited["data"]["mentions"] == [], edited
+            key(b"L", 0.8)
+            wait_text("Preview")
+            assert rpc("channels", {"action": "get", "path": "membership-test"})["joined"] is False
+            shot("cm-chat-channel-preview")
+            key(b"bmembership", 0.4)
+            shot("cm-chat-channel-browser")
+            key(b"\x1b", 0.2)
+            key(b"bgeneral\r", 0.7)
             wait_text("Second paragraph stays visible.")
             # Go beyond a read page, navigate with k, and keep live updates
             # while reading earlier history without jumping to the newest post.
@@ -359,7 +414,7 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             tui.wait(timeout=5)
             assert tui.returncode == 0
             print(
-                "PASS: channel creation/settings/admins, stable-name edits, pin/unpin and pins view; timeline full messages/order/unread, searchable group creation/reply/collapse, real release TUI norms acknowledge/publish/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
+                "PASS: channel browser/preview/join/leave, direct and @here completion/recipients, edited mentions no longer notify; channel creation/settings/admins, stable-name edits, pin/unpin and pins view; timeline full messages/order/unread, searchable group creation/reply/collapse, real TUI norms acknowledge/publish/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
                 flush=True,
             )
         except Exception:

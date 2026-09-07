@@ -16,16 +16,13 @@ impl Store {
             .cloned()
             .collect();
         actors.insert("owner".into());
+        actors.extend(self.memberships.values().flatten().cloned());
         for members in self.conversations.values() {
             actors.extend(members.iter().cloned());
         }
         for e in &self.events {
             actors.extend(
-                e.event["data"]["mentions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
+                mention_recipients(&e.event).into_iter()
                     .map(str::to_owned),
             );
         }
@@ -46,11 +43,7 @@ impl Store {
         }
         for e in &self.events {
             actors.extend(
-                e.event["data"]["mentions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
+                mention_recipients(&e.event).into_iter()
                     .map(str::to_owned),
             );
         }

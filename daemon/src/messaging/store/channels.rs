@@ -7,7 +7,7 @@ mod tests;
 impl Store {
     pub(super) fn channel_at(&self, path: &str, id: &str, high: u64) -> Value {
         let mut channel = json!({"path":path,"id":id,"name":path,"revision":id,
-            "kind":"channel","description":"","created_by":"owner","admins":[],"allow_agent_edits":false});
+            "kind":"channel","description":"","created_by":"owner","admins":[],"allow_agent_edits":false,"default_join":false});
         for published in self.events.iter().filter(|e| e.position <= high) {
             let e = &published.event;
             if let Some(created) = e["data"]["channels"]
@@ -25,7 +25,7 @@ impl Store {
                 } else {
                     json!([creator])
                 };
-                for key in ["name", "description", "admins", "allow_agent_edits"] {
+                for key in ["name", "description", "admins", "allow_agent_edits", "default_join"] {
                     if let Some(value) = created.get(key) {
                         channel[key] = value.clone();
                     }
@@ -33,6 +33,9 @@ impl Store {
             }
             if e["type"] == "channel.update" && e["data"]["channel"]["id"] == id {
                 channel = e["data"]["channel"].clone();
+            }
+            if e["type"] == "channel.membership.initialize" && e["data"]["channel_id"] == id {
+                channel["default_join"] = e["data"]["default_join"].clone();
             }
         }
         channel
@@ -47,6 +50,7 @@ impl Store {
         let admin = self.channel_admin(actor, c);
         c["can_manage"] = json!(admin);
         c["can_edit"] = json!(admin || c["allow_agent_edits"] == true);
+        c["joined"] = json!(self.joined(actor, strv(c, "id")));
     }
     fn validate_channel_fields(
         &self,
@@ -73,11 +77,13 @@ impl Store {
                 fields[key] = json!(if key == "name" { text.trim() } else { text });
             }
         }
-        if let Some(value) = p.get("allow_agent_edits") {
+        for key in ["allow_agent_edits", "default_join"] {
+        if let Some(value) = p.get(key) {
             if !value.is_boolean() {
-                return Err(err("invalid_params", "allow_agent_edits must be a boolean"));
+                return Err(err("invalid_params", format!("{key} must be a boolean")));
             }
-            fields["allow_agent_edits"] = value.clone();
+            fields[key] = value.clone();
+        }
         }
         if let Some(value) = p.get("admins") {
             let admins = value
@@ -197,7 +203,7 @@ impl Store {
             "channel.create",
             None,
             &format!("Created #{path}"),
-            json!({"channels":items}),
+            json!({"channels":items,"membership_version":1}),
             actor,
             &self.channel_actor_name(actor),
             if actor == "owner" { "owner" } else { "agent" },
@@ -208,18 +214,28 @@ impl Store {
         Ok(self.channel_result(actor, &e))
     }
     pub fn channel_action(&mut self, actor: &str, p: &Value, people: &[Person]) -> Result<Value> {
+        if self.degraded.is_none() { self.enroll_participant(actor)?; }
         let action = p["action"].as_str().unwrap_or("list");
         if action == "list" {
-            let channels = self.channels_for(actor)?;
+            if p.get("joined_only").is_some_and(|v| !v.is_boolean())
+                || p.get("query").is_some_and(|v| !v.is_string()) {
+                return Err(err("invalid_params", "joined_only must be a boolean and query must be text"));
+            }
+            let channels = self.channels_for(actor)?.into_iter().filter(|c| {
+                (p["joined_only"] != true || c["joined"] == true)
+                    && p["query"].as_str().is_none_or(|q| ["path","name","description"].iter()
+                        .any(|k| normalize(strv(c,k)).contains(&normalize(q))))
+            }).collect();
             return self.directory_page(actor, p, channels);
         }
+        if ["join", "leave"].contains(&action) { return self.change_membership(actor, p, people); }
         if action == "create" {
             return self.create_channel_with_people(actor, p, people);
         }
-        if !["get", "update"].contains(&action) {
+        if !["get", "update", "members"].contains(&action) {
             return Err(err(
                 "unsupported_feature",
-                "Channel actions: list, get, create, update",
+                "Channel actions: list, get, create, update, join, leave, members",
             ));
         }
         let request = if action == "update" {
@@ -245,11 +261,19 @@ impl Store {
             .ok_or_else(|| err("not_found", "Channel not found"))?;
         let mut current = self.channel_info(path, &id);
         self.channel_permissions(actor, &mut current);
+        if action == "members" {
+            let roster = self.people(people).as_array().cloned().unwrap_or_default();
+            let members = self.memberships.get(&id).into_iter().flatten().map(|member| {
+                roster.iter().find(|p| p["id"] == *member).cloned().unwrap_or_else(||
+                    json!({"id":member,"name":member,"present":false}))
+            }).collect();
+            return self.directory_page(actor,p,members);
+        }
         if action == "get" {
             return Ok(current);
         }
         if current["can_edit"] != true
-            || ((p.get("admins").is_some() || p.get("allow_agent_edits").is_some())
+            || ((p.get("admins").is_some() || p.get("allow_agent_edits").is_some() || p.get("default_join").is_some())
                 && current["can_manage"] != true)
         {
             return Err(err("unauthorized", "Only channel admins can change access; channel editing is restricted by its policy"));
@@ -280,6 +304,7 @@ impl Store {
         }
         current.as_object_mut().unwrap().remove("can_edit");
         current.as_object_mut().unwrap().remove("can_manage");
+        for key in ["joined","member_count","membership_revision"] { current.as_object_mut().unwrap().remove(key); }
         current["revision"] = json!(uuid());
         let (key, digest, _) = request.unwrap();
         let e = self.publish(

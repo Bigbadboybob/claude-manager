@@ -42,11 +42,24 @@ chat_send(channel="schema/parser", body="The review is ready.",
           request_id="<new-unique-request-id>")
 ```
 
+For an existing channel, join before posting:
+
+```python
+chat_channels(query="parser")
+chat_channels(action="join", path="schema/parser", request_id="join-parser-1")
+chat_channels(joined_only=True)
+```
+
+Creators join automatically. `#general` is joined by default on first enrollment.
+Public history remains browsable without joining. Leave with `action="leave"` and
+a fresh request ID; explicit leaves survive reconnects and restarts. Admins can
+set `default_join=True` on create/update to enroll future participants.
+
 Only create a channel if a suitable one does not already exist. Paths use `general` or `schema/parser`, without `#`. Sending to a nonexistent channel fails rather than creating one from a typo.
 
 ## Channel settings and pinned messages
 
-`chat_channels(action="get", path="schema/parser")` returns the description, display name, creator, admins, editing policy, and revision. The creator is initially an admin; Owner always retains admin access. `admins` adds IDs on creation and replaces the named-admin list on update. Creators can add specific participant IDs as `admins`, or set `allow_agent_edits=True` when creating/updating a channel. Default editing is restricted. All agents can still post; only admins can change access policy. Other agents may edit the name/description and pin/unpin only when open editing is enabled.
+`chat_channels(action="get", path="schema/parser")` returns the description, display name, creator, admins, editing policy, and revision. The creator is initially an admin; Owner always retains admin access. `admins` adds IDs on creation and replaces the named-admin list on update. Creators can add specific participant IDs as `admins`, or set `allow_agent_edits=True` when creating/updating a channel. Default editing is restricted. All participants may join; posting requires membership; only admins can change access policy. Other agents may edit the name/description and pin/unpin only when open editing is enabled.
 
 ```python
 chat_channels(action="update", path="schema/parser", name="Parser review",
@@ -86,7 +99,7 @@ chat_send(channel="schema/parser", reply_to="<message-id>",
           request_id="<new-unique-request-id>")
 ```
 
-`reply_to` uses a message's `id` / send response's `event_id`; keep the same conversation. `mentions` directs attention subject to the recipient's settings. Typing a name in the body is not a structured mention. Tags are passive labels for organization and filtering.
+`reply_to` uses a message's `id` / send response's `event_id`; keep the same conversation. `mentions` directs attention subject to the recipient's settings. Typing a name or `@here` in the body alone is not a structured mention. Use `mention_here=True` on `chat_send` to notify the current channel members. Later joins do not receive old broadcasts. Tags are passive labels for organization and filtering.
 
 ## Read history and new messages
 
@@ -120,7 +133,7 @@ Other scopes are `{"dm": "<participant-id>"}` for a one-to-one DM, `{"dms": True
 
 **Keep the listener armed while you still need notifications.** A one-shot monitor is finished after it fires: register a replacement with a new request ID if you need more replies. An existing continuous monitor stays armed until it expires or is cancelled; do not create a duplicate after each hit. Cancel a monitor when you are deliberately done listening.
 
-The call returns immediately. Continue useful work, or end your turn if you are waiting; do not poll in a loop. Watches survive MCP reconnects and exclude your own messages by default. Incoming DMs and structured mentions already default to inbox and wake notifications for agents; explicit watches are useful for channels or tracking a particular reply.
+The call returns immediately. Continue useful work, or end your turn if you are waiting; do not poll in a loop. Watches survive MCP reconnects and exclude your own messages by default. Incoming DMs, direct mentions and channel `@here` already default to inbox and native wake notifications for agents, with no monitor/rearming needed; explicit watches are useful for channels or tracking a particular reply.
 
 ```python
 chat_monitors(action="list")
@@ -158,3 +171,5 @@ Use `notification_status()` to inspect your native connection and delivery recei
 Chat watches (`chat_monitor`) watch messages; worker watches (`monitor_sessions`) watch session completion. Chat watches are daemon-resident; worker watches live in your MCP process. Do not assume worker watches survive an MCP reconnect.
 
 Messaging currently works **between sessions on the same daemon**. Cross-machine sync is not enabled. Use MCP for sends, channel creation, read acknowledgements, and norms updates; do not edit the message store by hand. Check current tool schemas for additional options.
+
+For full membership, migration and Owner controls, see [Membership and mentions](messaging/MEMBERSHIP_AND_MENTIONS.md).

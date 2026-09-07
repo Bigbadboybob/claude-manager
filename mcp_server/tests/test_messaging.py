@@ -23,6 +23,29 @@ class MessagingToolsTests(unittest.TestCase):
             with patch.dict("os.environ", {"CM_DAEMON_SOCKET": "/tmp/test-daemon", "CM_TUI_SOCKET": "/tmp/test-tui"}):
                 self.assertEqual(str(control_client.resolve_socket_for_method("messaging.read")), "/tmp/test-daemon")
 
+    def test_membership_and_mentions_keep_structured_fields_and_retry_identity(self):
+        with patch.object(control_client, "call", return_value={"ok": True}) as call:
+            server.chat_send("Plain @here text", "plain", channel="general")
+            self.assertNotIn("mention_here", call.call_args.args[1])
+            server.chat_send("Please check", "broadcast", channel="general",
+                             mentions=["agent-id"], mention_here=True)
+            first = copy.deepcopy(call.call_args.args)
+            self.assertTrue(first[1]["mention_here"])
+            self.assertEqual(first[1]["mentions"], ["agent-id"])
+            server.chat_send("Please check", "broadcast", channel="general",
+                             mentions=["agent-id"], mention_here=True)
+            self.assertEqual(call.call_args.args, first)
+            for action in ("join", "leave", "members"):
+                server.chat_channels(action=action, path="work", request_id=action)
+                self.assertEqual(call.call_args.args[0], "messaging.channels")
+                self.assertEqual(call.call_args.args[1]["action"], action)
+            server.chat_channels(joined_only=True, query="parser")
+            self.assertTrue(call.call_args.args[1]["joined_only"])
+            self.assertEqual(call.call_args.args[1]["query"], "parser")
+            server.chat_channels(action="update", path="welcome", default_join=True,
+                                 expected_revision="r1", request_id="defaults")
+            self.assertTrue(call.call_args.args[1]["default_join"])
+
     def run_wait(self, binding, sessions):
         clock = [0.0]
         async def sleep(_):

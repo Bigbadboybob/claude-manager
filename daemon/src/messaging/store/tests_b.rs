@@ -98,6 +98,7 @@ fn messaging_monitors_once_descendants_threads_expiry_and_tombstones() {
             &people,
         )
         .unwrap();
+    s.channel_action(&a.id, &json!({"action":"join","path":"work/sub","request_id":"join"}), &people).unwrap();
     let root = post(&mut s, &a, json!({"channel":"work/sub"}), "root", &people);
     let thread=s.register_monitor("owner",&json!({"scope":{"thread":root["event_id"]},"mode":"continuous","expires_in":"10m","request_id":"thread"}),&people).unwrap();
     post(

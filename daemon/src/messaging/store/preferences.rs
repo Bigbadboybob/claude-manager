@@ -53,9 +53,7 @@ impl Store {
             return (false, false, false);
         }
         let dm = self.conversations.contains_key(strv(v, "conversation_id"));
-        let mention = v["data"]["mentions"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|v| v == actor));
+        let mention = mention_recipients(v).contains(&actor);
         let mut inbox = dm || mention;
         let mut wake = actor != "owner" && inbox;
         let mut muted = false;

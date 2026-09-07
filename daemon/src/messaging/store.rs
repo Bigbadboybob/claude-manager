@@ -27,6 +27,8 @@ pub use norms::textual_diff as norms_diff;
 mod watches;
 mod preferences;
 mod channels;
+mod membership;
+use membership::mention_recipients;
 use personal::Personal;
 
 pub fn now() -> String {
@@ -210,6 +212,9 @@ pub struct Store {
     _lock: File,
     events: Vec<Published>,
     channels: BTreeMap<String, String>,
+    memberships: BTreeMap<String, BTreeSet<String>>,
+    membership_revisions: BTreeMap<String, String>,
+    enrolled: BTreeSet<String>,
     conversations: BTreeMap<String, Vec<String>>,
     requests: BTreeMap<String, (String, String, String)>,
     position: u64,
@@ -278,6 +283,9 @@ impl Store {
             _lock: lock,
             events: Vec::new(),
             channels: BTreeMap::new(),
+            memberships: BTreeMap::new(),
+            membership_revisions: BTreeMap::new(),
+            enrolled: BTreeSet::new(),
             conversations: BTreeMap::new(),
             requests: BTreeMap::new(),
             position: 0,
@@ -318,7 +326,7 @@ impl Store {
             return Ok(s);
         }
         if !s.channels.contains_key("general") {
-            s.publish("channel.create",None,"System created #general",json!({"channels":[{"path":"general","id":uuid(),"description":"Shared discussion"}]}),"system","System","system","bootstrap-general","")?;
+            s.publish("channel.create",None,"System created #general",json!({"membership_version":1,"channels":[{"path":"general","id":uuid(),"description":"Shared discussion","default_join":true}]}),"system","System","system","bootstrap-general","")?;
         }
         if s.norms["revision"].is_null() {
             s.publish(
@@ -333,7 +341,7 @@ impl Store {
                 "",
             )?;
         }
-        if let Err(e) = s.repair_attestations().and_then(|_| s.project()) {
+        if let Err(e) = s.initialize_memberships().and_then(|_| s.enroll_participants(&[])).and_then(|_| s.repair_attestations()).and_then(|_| s.project()) {
             s.degraded = Some(format!("Projection recovery failed: {e}"));
         }
         Ok(s)
@@ -512,6 +520,7 @@ impl Store {
                 self.channels.insert(path, required(item, "id")?);
             }
         }
+        self.reduce_membership(e)?;
         if let Some(c) = e["data"].get("conversation_create") {
             let id = required(c, "id")?;
             let members: Vec<String> = serde_json::from_value(c["members"].clone())?;
@@ -943,6 +952,13 @@ impl Store {
             }
         }
         let (conv, create) = self.resolve(actor, p, people, true)?;
+        if p.get("mention_here").is_some_and(|v| !v.is_boolean()) {
+            return Err(err("invalid_params", "mention_here must be a boolean"));
+        }
+        self.enroll_participant(actor)?;
+        if self.channels.values().any(|id| id == &conv) && !self.joined(actor, &conv) {
+            return Err(err("join_required", "Join this channel before posting: chat_channels(action=\"join\", conversation=<channel_id>, request_id=<new_id>). Public history remains browsable."));
+        }
         let reply = p["reply_to"].as_str();
         let root = if let Some(id) = reply {
             let parent = self
@@ -973,9 +989,10 @@ impl Store {
                     .collect::<Vec<_>>()
             })
             .or_else(|| self.conversations.get(&conv).cloned());
-        let mentions = p["mentions"].as_array().cloned().unwrap_or_default();
+        let mentions: BTreeSet<String> = p["mentions"].as_array().into_iter().flatten()
+            .filter_map(Value::as_str).map(str::to_owned).collect();
         for m in &mentions {
-            let id = m.as_str().unwrap();
+            let id = m.as_str();
             if !people.iter().any(|x| x.id == id) && !self.names.contains_key(id) && id != "owner" {
                 return Err(err("not_found", "Mention participant not found"));
             }
@@ -985,6 +1002,14 @@ impl Store {
                     "DM mentions are restricted to its members",
                 ));
             }
+        }
+        let mention_here = p["mention_here"] == true;
+        if mention_here && members.is_some() {
+            return Err(err("invalid_mention", "@here is available in channels; DMs already notify their members"));
+        }
+        let mut recipients = mentions.clone();
+        if mention_here {
+            recipients.extend(self.memberships.get(&conv).into_iter().flatten().cloned());
         }
         let links = p["links"].as_array().cloned().unwrap_or_default();
         for l in &links {
@@ -1020,6 +1045,8 @@ impl Store {
             .map(|n| n.revision_id.as_str())
             .unwrap_or(&self.owner_identity_revision);
         let mut data = json!({"reply_to":reply,"thread_root":root,"mentions":mentions,"tags":p.get("tags").cloned().unwrap_or(json!([])),"links":links,"norms_seen":p.get("norms_seen").cloned().unwrap_or(json!({})),"metadata_seen":{"identity":identity_revision,"conversation":conv,"enrollment":self.enrollment_revision}});
+        data["mention_here"] = json!(mention_here);
+        data["mention_recipients"] = json!(recipients);
         if let Some(c) = create {
             data["conversation_create"] = c;
         }
@@ -1133,7 +1160,10 @@ impl Store {
             .collect::<Vec<_>>())
     }
     pub fn channel_info(&self, path: &str, id: &str) -> Value {
-        self.channel_at(path, id, self.position)
+        let mut channel = self.channel_at(path, id, self.position);
+        channel["member_count"] = json!(self.memberships.get(id).map_or(0, BTreeSet::len));
+        channel["membership_revision"] = json!(self.membership_revisions.get(id));
+        channel
     }
     pub fn channels(&self) -> Value {
         json!(self
@@ -1151,8 +1181,7 @@ impl Store {
                 && !self.reads[actor].ids.contains(strv(&e.event, "id"))).collect();
             self.channel_permissions(actor, channel);
             channel["unread"] = json!(unread.len());
-            channel["mentions"] = json!(unread.iter().filter(|e| e.event["data"]["mentions"].as_array()
-                .is_some_and(|ids| ids.iter().any(|id| id == actor))).count());
+            channel["mentions"] = json!(unread.iter().filter(|e| mention_recipients(&e.event).contains(&actor)).count());
         }
         Ok(channels)
     }
@@ -1314,7 +1343,7 @@ impl Store {
             .filter(|e| {
                 let v = &e.event;
                 let cid = strv(v, "conversation_id");
-                if v["type"] == "conversation.pin"
+                if v["type"] == "conversation.pin" || v["type"] == "channel.membership"
                     || (p["pinned_only"] == true && !pin_states.contains_key(strv(v, "id")))
                     || v["conversation_id"].is_null()
                     || e.position > high

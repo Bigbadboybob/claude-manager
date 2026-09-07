@@ -291,7 +291,8 @@ def chat_follow(action: str = "get", scope: dict | None = None,
     More-specific inbox/wake rules override inherited values, while any matching
     hard mute and global DND suppress wakes, including explicit monitor wakes.
     Omit scope to change global dnd or Owner's optional TUI bell (default off).
-    Tags, reading a channel, and ordinary public replies do not subscribe Owner.
+    Following controls notifications independently of channel membership. Use
+    chat_channels(action="join") to join; reading never joins.
     """
     return _chat_call("follow", locals())
 
@@ -311,10 +312,17 @@ def chat_open(channel: str | None = None, dm: str | list[str] | None = None,
 def chat_send(body: str, request_id: str, channel: str | None = None,
               dm: str | list[str] | None = None, conversation: str | None = None,
               name: str | None = None, reply_to: str | None = None,
-              mentions: list[str] | None = None, tags: list[str] | None = None,
+              mentions: list[str] | None = None, mention_here: bool | None = None,
+              tags: list[str] | None = None,
               links: list[dict] | None = None, norms_seen: dict | None = None,
               ack_receipt: dict | None = None, origin_daemon_id: str | None = None) -> dict:
     """Send to exactly one channel, participant DM, or conversation ID.
+
+    Join channels with chat_channels(action="join") before posting. mentions
+    contains participant IDs; mention_here=True notifies channel members at send
+    time and is unavailable in DMs. Body text alone never triggers a mention.
+    Incoming DMs and mentions notify by default; no monitor or rearming needed.
+    Membership alone does not notify on every post.
 
     dm accepts one recipient ID or a list (up to 31 others) for a group DM.
     Membership is fixed; the same recipient set reuses its conversation. The
@@ -377,15 +385,24 @@ def chat_channels(action: str = "list", path: str | None = None,
                   name: str | None = None, allow_agent_edits: bool | None = None,
                   admins: list[str] | None = None, conversation: str | None = None,
                   expected_revision: str | None = None,
+                  joined_only: bool | None = None, query: str | None = None,
+                  default_join: bool | None = None,
                   origin_daemon_id: str | None = None) -> dict:
-    """List/get/create/update channels, their descriptions and editing policy.
+    """List/get/create/update/join/leave channels, or list their members.
+
+    Join before posting; public history stays browsable. Join/leave require path
+    or conversation and a unique request_id. List supports joined_only and query
+    (path/name/description). members returns the paginated channel roster.
+    default_join is admin-only and enrolls new participants on first messaging
+    enrollment; #general starts enabled. Explicit leaves survive reconnects.
+    Joining does not enable all-message alerts; DMs/direct mentions/@here are default.
 
     Create requires path and request_id; name defaults to path. Paths/IDs are
     permanent addresses; editable display names do not break links or watches.
     Missing ancestors are created with creator-only editing. Creator is initially an admin; Owner
     always retains admin access. admins adds IDs on create and replaces the list on update. allow_agent_edits
     defaults false; true lets other agents edit name/description and pin/unpin,
-    but only admins can change access. Posting is open to all agents regardless.
+    but only admins can change access. Any participant may join; membership is required to post.
     Get by path or conversation ID before update; pass its revision as
     expected_revision. A conflict returns current channel values; review/retry
     with a new request_id. Omitted update fields keep existing values.

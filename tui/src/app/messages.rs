@@ -2,6 +2,8 @@
 mod manage;
 mod conversation;
 mod channel;
+mod membership;
+mod mentions;
 use super::*;
 use ratatui::widgets::Wrap;
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,8 @@ pub struct Draft {
     reply_to: Option<String>,
     tags: Vec<String>,
     mentions: Vec<String>,
+    #[serde(default)]
+    entities: Vec<mentions::Mention>,
     links: Vec<Value>,
     origin: Option<String>,
 }
@@ -38,6 +42,7 @@ pub struct Messages {
     target: Value,
     channels: Vec<Value>,
     people: Vec<Value>,
+    channel_members: Vec<Value>,
     dms: Vec<Value>,
     items: Vec<Value>,
     selected: usize,
@@ -65,6 +70,8 @@ pub struct Messages {
     timeline_size: (u16, u16),
     reveal_selection: bool,
     picker_selected: usize,
+    mention_selected: usize,
+    mention_dismissed: bool,
     picker_members: Vec<String>,
     append_older: bool,
     select_older: bool,
@@ -168,7 +175,8 @@ impl Messages {
             ),
             ("Preferences".into(), json!({"preferences":true})),
         ];
-        let mut channels: Vec<_> = self.channels.iter().collect();
+        out.push(("Browse channels · b".into(), json!({"channel_browser":true})));
+        let mut channels: Vec<_> = self.channels.iter().filter(|c| c["joined"] != false).collect();
         channels.sort_by(|a,b| a["path"].as_str().cmp(&b["path"].as_str()));
         out.extend(channels.into_iter().map(|c| {
             let unread = c["unread"].as_u64().unwrap_or(0);
@@ -256,12 +264,14 @@ impl Messages {
                 .unwrap_or(d.body.len()),
             KeyCode::Delete if d.request_id.is_empty() => {
                 if let Some(c) = d.body[at..].chars().next() {
-                    d.body.replace_range(at..at + c.len_utf8(), "");
+                    d.replace_text(at..at + c.len_utf8(), "");
                 }
                 at
             }
             _ => at,
         };
+        self.mention_dismissed = false;
+        self.mention_selected = 0;
         self.set_draft(d);
     }
     fn edit_text(&mut self, text: &str, backspace: bool) {
@@ -277,12 +287,12 @@ impl Messages {
                     .last()
                     .map(|(i, _)| i)
                     .unwrap_or(0);
-                d.body.replace_range(previous..at, "");
-                d.cursor = previous;
+                d.replace_text(previous..at, "");
             } else {
-                d.body.insert_str(at, text);
-                d.cursor = at + text.len();
+                d.replace_text(at..at, text);
             }
+            self.mention_selected = 0;
+            self.mention_dismissed = false;
             self.set_draft(d);
         } else if !self.fields.is_empty() {
             let field = &mut self.fields[self.field];
@@ -372,6 +382,7 @@ impl App {
                                 "reserved_name:",
                                 "not_found:",
                                 "invalid_mention:",
+                                "join_required:",
                                 "invalid_link:",
                                 "event_too_large:",
                             ];
@@ -452,6 +463,9 @@ impl App {
                             self.messages.page_cursor = Value::Null;
                             self.messages.loaded_target = Value::Null;
                             self.messaging_request("messaging.read", self.messages.query());
+                        }
+                        "channel_members" => {
+                            self.messages.channel_members = v["items"].as_array().cloned().unwrap_or_default();
                         }
                         "pin_prepare" => self.messaging_pin_prepared(&v),
                         "session.set_name" => {
@@ -543,6 +557,8 @@ impl App {
                     if let Ok(people) = directory("messaging.people", json!({"include_exited":true})) { value["_people"] = people["items"].clone(); }
                     Ok(value)
                 })()
+            } else if method == "channel_members" {
+                directory("messaging.channels", params)
             } else if method == "pin_prepare" {
                 (|| { let mut value = call("messaging.pins", json!({"conversation":params["conversation"],"limit":1}))?;
                     value["intent"] = params; Ok(value) })()
@@ -615,6 +631,9 @@ impl App {
             return true;
         }
         if self.messages.mode.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+        if self.messaging_channel_browser_key(key) || self.messages.mention_key(key) {
             return true;
         }
         if self.messaging_picker_key(key) {
@@ -722,6 +741,10 @@ impl App {
                     if let Some((_, target)) =
                         self.messages.menu_items().get(self.messages.menu).cloned()
                     {
+                        if target["channel_browser"] == true {
+                            self.messages.browse_channels();
+                            return true;
+                        }
                         if target["dm_section"] == true {
                             self.messages.saved.dms_collapsed = !self.messages.saved.dms_collapsed;
                             self.messages.persist();
@@ -739,7 +762,12 @@ impl App {
                     self.messaging_ack_selected();
                 }
             }
+            KeyCode::Char('b') => self.messages.browse_channels(),
+            KeyCode::Char('u') => self.messaging_channel_members(),
+            KeyCode::Char('J') => self.messaging_membership(true),
+            KeyCode::Char('L') => self.messaging_membership(false),
             KeyCode::Char('c') => {
+                if !self.messages.can_post() { return true; }
                 if self.messages.space_id.is_empty() {
                     self.messages.error = "Connect with g before composing".into();
                 } else if self.messages.target["channel"] != "*"
@@ -755,6 +783,7 @@ impl App {
             KeyCode::Char('r') => {
                 if let Some(v) = self.messages.items.get(self.messages.selected).cloned() {
                     self.messages.target = json!({"conversation":v["conversation_id"]});
+                    if !self.messages.can_post() || !self.messages.can_edit() { return true; }
                     let mut d = self.messages.draft();
                     d.reply_to = v["id"].as_str().map(str::to_owned);
                     self.messages.filter = json!({});
@@ -872,6 +901,7 @@ impl App {
         if self.messages.busy {
             return;
         }
+        if self.messages.draft().request_id.is_empty() && !self.messages.can_post() { return; }
         let mut d = self.messages.draft();
         if d.body.chars().count() > 3000 {
             self.messages.error =
@@ -893,7 +923,9 @@ impl App {
         p["origin_daemon_id"] = json!(d.origin);
         p["reply_to"] = json!(d.reply_to);
         p["tags"] = json!(d.tags);
-        p["mentions"] = json!(d.mentions);
+        let (mentions, here) = d.mention_payload();
+        p["mentions"] = json!(mentions);
+        if here { p["mention_here"] = json!(true); }
         p["links"] = json!(d.links);
         self.messages.pending_send = Some((self.messages.key(), d.request_id.clone()));
         self.messaging_request("messaging.send", p);
@@ -1168,7 +1200,9 @@ impl App {
             );
         }
         if !narrow || self.messages.pane == 1 || !self.messages.mode.is_empty() {
-            if self.messages.mode == "dm_picker" {
+            if matches!(self.messages.mode.as_str(), "channel_browser" | "channel_roster") {
+                self.draw_channel_browser(frame, cols[1]);
+            } else if self.messages.mode == "dm_picker" {
                 self.draw_messaging_picker(frame, cols[1]);
             } else if matches!(self.messages.mode.as_str(), "channel" | "channel_edit") {
                 self.draw_messaging_channel_form(frame, cols[1]);
@@ -1178,9 +1212,16 @@ impl App {
                 let composer_height = if self.messages.mode.is_empty() {
                     if self.messages.draft().body.is_empty() { 0 } else { 3 }
                 } else if matches!(self.messages.mode.as_str(), "filter" | "channel" | "channel_edit") { 10 } else { 7 };
-                let content = Layout::vertical([Constraint::Min(3), Constraint::Length(composer_height)])
+                let mention_height = if self.messages.mention_options().is_empty() { 0 } else {
+                    (self.messages.mention_options().len().min(5) as u16 + 2).min(cols[1].height.saturating_sub(6))
+                };
+                let composer_height = if mention_height > 0 {
+                    composer_height.min(cols[1].height.saturating_sub(mention_height + 3))
+                } else { composer_height };
+                let content = Layout::vertical([Constraint::Min(3), Constraint::Length(composer_height), Constraint::Length(mention_height)])
                     .split(cols[1]);
                 self.draw_messaging_timeline(frame, content[0], messages_focused);
+                self.draw_mention_options(frame, content[2]);
                 let d = self.messages.draft();
                 let text = if self.messages.mode.is_empty() || self.messages.mode == "compose" {
                     d.body
@@ -1220,8 +1261,12 @@ impl App {
                     self.messages.text.clone()
                 };
                 let title = if self.messages.mode.is_empty() || self.messages.mode == "compose" {
+                    let (mentions, here) = self.messages.draft().mention_payload();
+                    let audience = if here { " · @here".into() } else if !mentions.is_empty() {
+                        format!(" · {} mention{}", mentions.len(), if mentions.len() == 1 { "" } else { "s" })
+                    } else { String::new() };
                     format!(
-                        "Owner → {} · {}/3000 · Ctrl+s sends",
+                        "Owner → {}{audience} · {}/3000 · Ctrl+s sends",
                         self.messages.target_label(),
                         text.chars().count()
                     )
@@ -1294,16 +1339,17 @@ impl App {
             Paragraph::new(vec![
                 chat_help(&[
                     ("c", "compose"),
-                    ("r", "reply"),
-                    ("t", "thread"),
-                    ("d", "new DM/group"),
-                    ("e", "metadata"),
+                    ("@", "mention"),
+                    ("d", "DM/group"),
+                    ("b", "channels"),
+                    ("J/L", "join/leave"),
                 ]),
                 chat_help(&[
-                    ("n", "new channel"),
-                    ("S", "settings"),
+                    ("r/t", "reply/thread"),
+                    ("n/S", "new/settings"),
                     ("p/P", "pin/pins"),
                     ("/", "filter"),
+                    ("e", "metadata"),
                 ]),
                 chat_help(&[
                     ("]", "older"),

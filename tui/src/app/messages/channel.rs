@@ -18,7 +18,7 @@ impl Messages {
         self.channel_selection_pending = false;
     }
 
-    fn current_channel(&self) -> Option<&Value> {
+    pub(super) fn current_channel(&self) -> Option<&Value> {
         self.channels
             .iter()
             .find(|c| c["path"] == self.target["channel"] || c["id"] == self.target["conversation"])
@@ -77,7 +77,8 @@ mod tests {
                 "Review room",
                 "Coordinate parser reviews here.",
                 "no",
-                "Creator, Reviewer"
+                "Creator, Reviewer",
+                "no"
             ]
         );
         assert_eq!(app.messages.channel_edit_base["revision"], "r1");
@@ -139,6 +140,7 @@ impl App {
                 "Description",
                 "All agents may edit (yes/no)",
                 "Admin names or IDs",
+                "Join by default (yes/no)",
             ]
         } else {
             vec![
@@ -147,6 +149,7 @@ impl App {
                 "Description",
                 "All agents may edit (yes/no)",
                 "Additional admin names or IDs",
+                "Join by default (yes/no)",
             ]
         };
         let mut lines = Vec::new();
@@ -262,6 +265,7 @@ impl App {
                     }
                     .into(),
                     admins,
+                    if c["default_join"] == true { "yes" } else { "no" }.into(),
                 ],
             );
             self.messages.channel_edit_base = c;
@@ -274,6 +278,7 @@ impl App {
                     String::new(),
                     "no".into(),
                     String::new(),
+                    "no".into(),
                 ],
             );
             self.messages.channel_edit_base = Value::Null;
@@ -290,6 +295,11 @@ impl App {
                 self.messages.error = "All agents may edit: enter yes or no".into();
                 return;
             }
+        };
+        let default_join = match fields[offset + 4].trim().to_lowercase().as_str() {
+            "yes" | "true" => true,
+            "no" | "false" => false,
+            _ => { self.messages.error = "Join by default: enter yes or no".into(); return; }
         };
         let mut admins = Vec::new();
         for name in fields[offset + 3]
@@ -325,7 +335,7 @@ impl App {
             }
             admins.push(hits[0]["id"].clone());
         }
-        let mut p = json!({"action":if edit { "update" } else { "create" },"description":fields[offset+1],"allow_agent_edits":open,"admins":admins});
+        let mut p = json!({"action":if edit { "update" } else { "create" },"description":fields[offset+1],"allow_agent_edits":open,"admins":admins,"default_join":default_join});
         if edit {
             p["conversation"] = self.messages.channel_edit_base["id"].clone();
             p["expected_revision"] = self.messages.channel_edit_base["revision"].clone();
@@ -401,9 +411,14 @@ impl App {
         self.messages.fields.clear();
         self.messages.error.clear();
         if method == "messaging.channels" {
-            self.messages.status = "Channel settings saved".into();
+            self.messages.status = if value["membership"]["joined"] == true { "Joined channel" }
+                else if value["membership"]["joined"] == false { "Left channel · history remains browsable" }
+                else { "Channel settings saved" }.into();
             self.messages.channel_selection_pending = true;
-            self.messages.target = json!({"conversation":value["channel"]["id"]});
+            // Joining/leaving must preserve the draft's address (path or ID).
+            if value.get("membership").is_none() {
+                self.messages.target = json!({"conversation":value["channel"]["id"]});
+            }
             self.messages.filter = json!({});
             self.messages.loaded_target = Value::Null;
             self.messages.page_cursor = Value::Null;
@@ -452,6 +467,11 @@ impl App {
                 Style::default().fg(theme::CHAT_MUTED),
             ));
         }
+        lines.push(Line::styled(format!("{} · {} members · u list{}",
+            if c["joined"] == false { "Preview · J join to post" } else { "Joined · L leave" },
+            c["member_count"].as_u64().unwrap_or(0),
+            if c["default_join"] == true { " · joined by default" } else { "" }),
+            Style::default().fg(theme::CHAT_FOCUS)));
         let parts = Layout::vertical([
             Constraint::Length(lines.len() as u16 + 2),
             Constraint::Min(3),

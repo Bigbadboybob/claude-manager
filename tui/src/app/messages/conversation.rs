@@ -131,7 +131,7 @@ impl Messages {
         if m["read"] == true || m["actor"]["id"] == "owner" {
             return ("", muted);
         }
-        let mentioned = m["data"]["mentions"]
+        let mentioned = m["data"].get("mention_recipients").unwrap_or(&m["data"]["mentions"])
             .as_array()
             .is_some_and(|a| a.iter().any(|id| id == "owner"));
         let dm = m["conversation_kind"] == "dm"

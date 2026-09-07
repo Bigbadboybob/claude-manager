@@ -278,6 +278,7 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             message: "Sender is authenticated; do not supply from".into(),
         });
     }
+    store.enroll_participants(&people)?;
     let result = match req.method.as_str() {
         "messaging.send" => {
             if kind != "owner" && !store.names.contains_key(&actor) {
@@ -336,7 +337,7 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
@@ -551,6 +552,7 @@ mod tests {
         )
         .unwrap();
         let a=call(&state,"a","send",json!({"channel":"work/parser","name":"Parser Scout","body":"Ready.","tags":["needs-owner"],"request_id":"one"})).unwrap();
+        call(&state,"b","channels",json!({"action":"join","path":"work/parser","request_id":"join"})).unwrap();
         call(&state,"b","send",json!({"channel":"work/parser","name":"parser scout","body":"Checking.","request_id":"two"})).unwrap();
         let dm = call(
             &state,
@@ -588,6 +590,7 @@ mod tests {
         {
             let mut slot = handle.lock().unwrap();
             let store = slot.as_mut().unwrap();
+            store.channel_action("owner", &json!({"action":"join","path":"work/parser","request_id":"owner-join"}), &[]).unwrap();
             store
                 .send(
                     "owner",

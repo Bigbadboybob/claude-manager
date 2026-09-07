@@ -423,6 +423,38 @@ mod tests {
         }
     }
     #[test]
+    fn messaging_default_dm_direct_and_here_reach_native_queue_for_both_engines() {
+        for engine in ["claude-code", "codex"] {
+            let t = tempfile::tempdir().unwrap();
+            let mut store = Store::open(t.path()).unwrap();
+            let actor = store.participant_id(engine);
+            let people = vec![super::super::Person { id: actor.clone(), name: engine.into(),
+                session_uid: engine.into(), kind: "agent".into(), present: true, task: None }];
+            store.enroll_participants(&people).unwrap();
+            for (key, mut params) in [
+                ("dm", json!({"dm":actor})),
+                ("direct", json!({"channel":"general","mentions":[actor]})),
+                ("here", json!({"channel":"general","mention_here":true})),
+            ] {
+                params["body"] = json!("Work ready"); params["request_id"] = json!(key);
+                store.send("owner", "", "owner", &params, &people).unwrap();
+            }
+            let intents = store.wake_intents()[engine].clone();
+            assert_eq!(intents.len(), 3);
+            assert!(intents.iter().all(|i| i.monitor.is_none()));
+            deliver_intents(t.path(), t.path(), engine, intents.clone(), &recipient(engine)).unwrap();
+            drop(store);
+            let store = Store::open(t.path()).unwrap();
+            deliver_intents(t.path(), t.path(), engine, store.wake_intents()[engine].clone(), &recipient(engine)).unwrap();
+            let queue = load(&queue_path(t.path(), engine)).unwrap();
+            assert_eq!(queue.batches.len(), 1);
+            assert_eq!(queue.batches[0].ids.len(), 3);
+            let event = crate::notifications::get(t.path(), engine, &format!("chat:{}",queue.batches[0].wake_id)).unwrap().unwrap();
+            assert_eq!(event["recipient"], engine);
+            assert!(!t.path().join("inbox").exists());
+        }
+    }
+    #[test]
     fn messaging_cancel_retracts_native_hint_without_erasing_monitor_hit() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = Store::open(tmp.path()).unwrap();

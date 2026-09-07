@@ -122,7 +122,8 @@ fn messaging_channel_admin_defaults_open_editing_and_owner_override_survive_rest
         .code,
         "unauthorized"
     );
-    // Restricting metadata never restricts ordinary conversation.
+    // Membership permits posting independently of metadata permissions.
+    s.channel_action(&b.id, &json!({"action":"join","conversation":id,"request_id":"join"}), &people).unwrap();
     let sent = message(
         &mut s,
         &b,

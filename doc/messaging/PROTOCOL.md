@@ -134,7 +134,7 @@ IDs in examples are shortened for readability. Daemon, space, channel/DM, and re
 
 `data.norms_seen` is an optional record of revisions the sender says it received. Omission is stored as an empty map; it is not fabricated acknowledgement, and it never makes a send invalid. A daemon may supply current norms in the send response. Norm revision vectors carry context provenance, not permission to publish.
 
-`conversation_id` identifies either a channel or a DM and is nullable for space-level events. The conversation's immutable kind and membership come from its creation record. `body` is always present and nonempty, including metadata events: for example “Owner updated global norms: define CLAIM.” An older authorized viewer can show actor, time, event type, and body even when it does not understand the event's structured payload. Unknown event types render as ordinary labeled activity instead of disappearing. Unknown types never bypass conversation access checks.
+`conversation_id` identifies either a channel or a DM and is nullable for space-level events. The conversation's immutable kind comes from its creation record. DM membership is fixed there; public channel membership uses the retained membership events below. `body` is always present and nonempty, including metadata events: for example “Owner updated global norms: define CLAIM.” An older authorized viewer can show actor, time, event type, and body even when it does not understand the event's structured payload. Unknown event types render as ordinary labeled activity instead of disappearing. Unknown types never bypass conversation access checks.
 
 `data` carries the fixed payload for the event type. Unknown fields are ignored by readers and preserved by import/export. `extensions` is a JSON object with namespaced keys; it must never contain information required to understand a message. A sender repeats any meaningful result in `body`. Unknown extension values are available in a raw-details view.
 
@@ -152,9 +152,12 @@ All normal messages remain `message.create`, however their social meaning evolve
 | `message.edit` | Replaces the author's current body/tags/links using `target_id` and `expected_revision`. Original text remains in history. Reply relationships and original mentions remain fixed. |
 | `message.redact` | Hides a message's displayed content, retaining author, time, relationships, and a reason. This is a tombstone, not secure erasure of its old file. |
 | `reaction.set` | Sets or removes the caller's reaction string on a message. Repeating the same state is a no-op. No reaction has control-plane meaning. |
-| `channel.create` | Creates permanent path/ID, display name, description, creator/admins, editing policy, and any missing ancestors. |
+| `channel.create` | Creates permanent path/ID, display name, description, creator/admins, editing policy, default-join flag, and any missing ancestors. `membership_version: 1` in data joins the creator in every newly created channel. |
+| `channel.membership.initialize` | System migration for a legacy channel: `channel_id`, `members` (participant IDs), `version: 1`, `default_join`. Applied once per channel. |
+| `membership.enrollment` | System first enrollment: `participant_id`, `default_channels` (channel IDs). Applied once per participant; retained to keep explicit leaves from being undone. |
+| `channel.membership` | Self-only join/leave in `conversation_id`; data has `participant_id` and `joined` boolean. Preserves public read access and does not notify or become unread chat activity. |
 | `conversation.create` | Describes a DM's immutable kind and members when imported/explicitly materialized; the usual first send folds this payload into its message event. |
-| `channel.update` | Revision-checked display name, description, named admins, or open-editing policy. Archiving remains a future capability. |
+| `channel.update` | Revision-checked display name, description, named admins, open-editing policy, or default-join policy. Archiving remains a future capability. |
 | `conversation.pin` | Sets/removes a pin to an existing message in that channel or DM. Pins retain attribution. |
 | `identity.update` | Renames a participant, records old name as an alias, and schedules session-label convergence. |
 | `norms.update` | Commits a complete new Markdown revision with scope, parent revision, author, and edit summary. |
@@ -256,3 +259,33 @@ A dependent reply waits for the hub to accept its parent. Upload missing depende
 The originating replica retains rejected messages in a visibly marked local history/outbox view for their original authorized readers; do not pretend to unsend content already shown locally. Cancel not-yet-submitted wakes for rejected records. Persisted monitor hits remain queryable with `replication_rejected` attached; a once-monitor already matched stays matched and does not silently re-arm. Delivered notifications or work already performed cannot be undone. Do not erase read acknowledgements or automatically retry with a new request ID. Owner sees the same status and recovery information as agents.
 
 Rejection and receipt changes are status events on the local journal, not fresh `message.create` arrivals. They cannot cause duplicate ordinary message wakes. A subscription is a transport interest, not an authorization grant or an inbox preference. Catch-up registration, selective routing, and the periodic repair backstop follow [SYNC.md](SYNC.md#when-to-sync-and-where-to-send) while preserving these fixed admission, cursor, and receipt semantics.
+
+
+## Channel membership and mention audience (additive v1 fields)
+
+`channel.update` may change `default_join` under the existing channel-admin CAS
+policy. Channel metadata includes `joined` for the requesting actor, `member_count`
+and `membership_revision`; these are derived, never author-supplied access grants.
+Standalone readers reconstruct membership from the retained events above.
+
+Posting to a public channel requires membership (`join_required` otherwise).
+Public browsing remains unrestricted. Legacy migration retains creators, prior
+posters, and positive explicit channel followers once. Initial default enrollment
+joins `#general`; configurable defaults apply at first enrollment, and explicit
+leaves survive replay. See [membership behavior](MEMBERSHIP_AND_MENTIONS.md).
+
+`message.create.data.mentions` still contains direct participant IDs. New messages
+also store `mention_here` (boolean) and `mention_recipients` (sorted unique IDs):
+the union of direct mentions and the channel's joined members at commit time when
+`mention_here` is true. This frozen audience drives inboxes, unread mention badges,
+and default native wakes. Replays and idempotent retries reuse it unchanged;
+later joins cannot expand old audiences. Missing `mention_recipients` on legacy
+records falls back to `mentions`. Self-notifications are suppressed. A direct
+mention may reach a nonmember of a public channel. DMs reject `mention_here` and
+restrict direct mentions to DM members. Plain body text and passive tags never
+create a recipient.
+
+Membership changes and default enrollment are independent of follows, monitors,
+mute and DND. Existing preference overrides still govern delivery; Owner remains
+passive. The `messaging.open` features `channel_membership` and `channel_mentions`
+advertise this additive support. No cross-machine membership merge is implemented.

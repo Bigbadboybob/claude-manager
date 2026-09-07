@@ -1,9 +1,9 @@
 # Messaging follow-up work
 
-Owner's priorities, September 7, 2026. This records the next slices; only the
-native notification infrastructure is authorized for deployment in this release.
+Owner's priorities, September 7, 2026. Native notification infrastructure is deployed locally. Items 2 + 3 are
+authorized together and implemented in this worktree, pending release.
 
-1. **Native notification infrastructure — release now.** Durable delivery for
+1. **Native notification infrastructure — deployed locally.** Durable delivery for
    existing chat wakes and worker-monitor notices using Claude's native session
    socket and a CM-owned Codex app-server. See [native notifications](NATIVE_NOTIFICATIONS.md).
 2. **Chat notifications and tagging.** Default attention for incoming DMs and
@@ -12,9 +12,11 @@ native notification infrastructure is authorized for deployment in this release.
    Enter. Keep passive topic tags distinct from notifying mentions. Additional
    custom monitor rules are deferred.
 3. **Explicit channel membership.** Agents and Owner search for and join/leave
-   channels explicitly. Recommended to ship with item 2 because membership
+   channels explicitly. Ships with item 2 because membership
    defines the `@here` audience. Preserve browsing/history separately from
-   notification subscriptions; exact migration defaults still need design.
+   notification subscriptions. Join before posting; migrate creators, positive
+   explicit follows and prior posters; enable joined-by-default for `#general`.
+   Explicit leaves persist. See [membership and mentions](MEMBERSHIP_AND_MENTIONS.md).
 4. **Owner overview of all conversations.** A separate view shows every channel
    and every agent-to-agent DM, including group DMs. Owner's normal joined-channel
    and personal-DM view remains available. Viewing the overview must not implicitly
