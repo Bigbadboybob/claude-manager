@@ -46,7 +46,15 @@ pub(super) enum InputMode {
         /// changes — the picker filtered to a specific engine, and we
         /// can't carry a Codex snapshot across to a Claude session.
         seed_from: Option<String>,
-        /// 0 = session type (j/k cycles), 1 = seed-from (Enter picks).
+        /// proper-resume: `Some(transcript_id)` when the session should
+        /// RESUME an existing conversation of this worktree (`claude
+        /// --resume <id>` / `codex resume <id>`), with the row bound to
+        /// it from the start. Mutually exclusive with `seed_from` (a
+        /// seed is itself a resume of a cloned snapshot); picking one
+        /// clears the other, and a `session_type` change clears both.
+        resume_from: Option<String>,
+        /// 0 = session type (j/k cycles), 1 = seed-from (Enter picks),
+        /// 2 = resume-from (Enter picks a transcript, Esc clears).
         active_field: u8,
     },
     /// Editing session settings.
@@ -68,9 +76,27 @@ pub(super) enum InputMode {
         /// session was cloned from, if any. Surfaced at the bottom of the
         /// dialog when `Some`. Not editable from settings.
         seeded_from_snapshot: Option<String>,
+        /// proper-resume: the row's current transcript binding (display
+        /// only — Enter on the Transcript field opens the picker, which
+        /// applies the bind itself).
+        transcript_id: Option<String>,
+        /// The row's engine, so the Transcript field can read `[N/A]`
+        /// for bash.
+        session_type: String,
         /// 0 = name, 1 = idle timeout, 2 = burst threshold, 3 = hidden,
-        /// 4 = notify on idle, 5 = global perms, 6 = color
+        /// 4 = notify on idle, 5 = global perms, 6 = color,
+        /// 7 = transcript (Enter opens the picker)
         active_field: u8,
+    },
+    /// proper-resume: pick a transcript of the target's worktree —
+    /// either to BIND an existing row to it (A-e → Transcript) or to
+    /// RESUME a new session from it (A-s → Resume). Candidates are
+    /// listed once at open (newest first); `target` says where the pick
+    /// lands.
+    TranscriptPicker {
+        candidates: Vec<TranscriptCandidate>,
+        selected: usize,
+        target: TranscriptPickTarget,
     },
     /// Workspace settings: display label (branch and worktree path stay
     /// the same), accent color, and the pinned flag.
@@ -390,6 +416,9 @@ pub(crate) enum SubmitAction {
         session_type: String,
         task_id: Option<String>,
         seed_from: Option<String>,
+        /// proper-resume: resume this transcript instead of starting a
+        /// fresh conversation (see `InputMode::NewTerminalSession`).
+        resume_from: Option<String>,
     },
     /// Open the snapshot catalog in picker mode from the A-n form. Carries
     /// the form state so the catalog can re-open the form (with seed_from
@@ -411,6 +440,30 @@ pub(crate) enum SubmitAction {
         session_type: String,
         task_id: Option<String>,
         existing_seed_from: Option<String>,
+        existing_resume_from: Option<String>,
+    },
+    /// proper-resume: open the transcript picker from the A-s form's
+    /// Resume field.
+    OpenTranscriptPickerForNewTerminalSession {
+        workspace_id: String,
+        session_type: String,
+        task_id: Option<String>,
+        existing_seed_from: Option<String>,
+        existing_resume_from: Option<String>,
+    },
+    /// proper-resume: open the transcript picker from the A-e form's
+    /// Transcript field, to rebind the focused row. Indices are the
+    /// form's own (resolved to stable ids at open, like every other
+    /// A-e submit).
+    OpenTranscriptPickerForSession {
+        ws_index: usize,
+        session_index: usize,
+    },
+    /// proper-resume: Enter on a `TranscriptPicker` row. The dispatch
+    /// pairs it with the picker's `target` (bind the row / return to the
+    /// A-s form); reaching `apply_submit_action` without one is a no-op.
+    TranscriptPicked {
+        id: String,
     },
     SaveSessionSettings {
         ws_index: usize,
@@ -502,6 +555,7 @@ pub(crate) struct NewTerminalSessionMut<'a> {
     pub session_type: &'a mut String,
     pub task_id: &'a Option<String>,
     pub seed_from: &'a mut Option<String>,
+    pub resume_from: &'a mut Option<String>,
     pub active_field: &'a mut u8,
 }
 
@@ -564,7 +618,60 @@ pub enum PickerTarget {
         session_type: String,
         task_id: Option<String>,
         existing_seed_from: Option<String>,
+        /// proper-resume: preserved across the snapshot-picker round
+        /// trip on cancel; a PICKED snapshot clears it (the two are
+        /// mutually exclusive).
+        existing_resume_from: Option<String>,
     },
+}
+
+/// proper-resume: where a `TranscriptPicker` pick lands.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TranscriptPickTarget {
+    /// A-e → Transcript: rebind the identified row. Stable ids, not
+    /// indices — the sidebar can reorder while the picker is open.
+    BindSession {
+        workspace_id: String,
+        session_uid: String,
+    },
+    /// A-s → Resume: return to the Add Session form with `resume_from`
+    /// set. Carries the form's other state so a pick/cancel round-trip
+    /// preserves it (same shape as `PickerTarget::NewTerminalSession`).
+    NewTerminalSession {
+        workspace_id: String,
+        session_type: String,
+        task_id: Option<String>,
+        existing_seed_from: Option<String>,
+        existing_resume_from: Option<String>,
+    },
+}
+
+/// Rebuild the A-s form after a transcript-picker round-trip.
+/// `id = Some(picked)` sets `resume_from` and clears any snapshot seed
+/// (mutually exclusive); `None` (cancel) restores both as captured.
+/// Pure so the round-trip is unit-testable without an `App`.
+pub(crate) fn rebuild_form_from_transcript_pick(
+    target: TranscriptPickTarget,
+    id: Option<String>,
+) -> InputMode {
+    match target {
+        TranscriptPickTarget::NewTerminalSession {
+            workspace_id,
+            session_type,
+            task_id,
+            existing_seed_from,
+            existing_resume_from,
+        } => InputMode::NewTerminalSession {
+            workspace_id,
+            session_type,
+            task_id,
+            seed_from: if id.is_some() { None } else { existing_seed_from },
+            resume_from: id.or(existing_resume_from),
+            active_field: 2,
+        },
+        // A bind target has no form to return to.
+        TranscriptPickTarget::BindSession { .. } => InputMode::Normal,
+    }
 }
 
 /// Compute the next `InputMode` and optional status toast for an
@@ -654,10 +761,14 @@ fn rebuild_form_from_picker(target: PickerTarget, name: Option<String>) -> Input
             session_type,
             task_id,
             existing_seed_from,
+            existing_resume_from,
         } => InputMode::NewTerminalSession {
             workspace_id,
             session_type,
             task_id,
+            // A picked snapshot supersedes a resume-from (mutually
+            // exclusive); a cancel keeps both as they were.
+            resume_from: if name.is_some() { None } else { existing_resume_from },
             seed_from: name.or(existing_seed_from),
             active_field: 1,
         },
@@ -928,18 +1039,26 @@ pub(crate) fn handle_new_terminal_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    // Two fields: 0 = session type, 1 = seed-from. Tab/BackTab cycle
-    // between them; j/k cycle the session type when field 0 is active
-    // (within-field). j/k on the seed-from field are no-ops (would
-    // conflict with the picker selection later).
+    // Three fields: 0 = session type, 1 = seed-from, 2 = resume-from.
+    // Tab/BackTab cycle between them; j/k cycle the session type when
+    // field 0 is active (within-field). j/k on the picker fields are
+    // no-ops (would conflict with the picker selection later).
     match (key.code, *state.active_field) {
         (KeyCode::Esc, 1) if state.seed_from.is_some() => {
             *state.seed_from = None;
             InputOutcome::Consumed
         }
+        (KeyCode::Esc, 2) if state.resume_from.is_some() => {
+            *state.resume_from = None;
+            InputOutcome::Consumed
+        }
         (KeyCode::Esc, _) => InputOutcome::Cancel,
-        (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
-            *state.active_field = (*state.active_field + 1) % 2;
+        (KeyCode::Tab, _) => {
+            *state.active_field = (*state.active_field + 1) % 3;
+            InputOutcome::Consumed
+        }
+        (KeyCode::BackTab, _) => {
+            *state.active_field = (*state.active_field + 2) % 3;
             InputOutcome::Consumed
         }
         (KeyCode::Char('j') | KeyCode::Down, 0) => {
@@ -948,9 +1067,11 @@ pub(crate) fn handle_new_terminal_session(
                 "codex" => "bash".to_string(),
                 _ => "claude".to_string(),
             };
-            // Engine changed — any previously-picked snapshot was
-            // engine-filtered for the OLD value and no longer applies.
+            // Engine changed — any previously-picked snapshot or
+            // transcript was engine-filtered for the OLD value and no
+            // longer applies.
             *state.seed_from = None;
+            *state.resume_from = None;
             InputOutcome::Consumed
         }
         (KeyCode::Char('k') | KeyCode::Up, 0) => {
@@ -960,6 +1081,7 @@ pub(crate) fn handle_new_terminal_session(
                 _ => "claude".to_string(),
             };
             *state.seed_from = None;
+            *state.resume_from = None;
             InputOutcome::Consumed
         }
         (KeyCode::Enter, 1) => {
@@ -975,6 +1097,21 @@ pub(crate) fn handle_new_terminal_session(
                     session_type: state.session_type.clone(),
                     task_id: state.task_id.clone(),
                     existing_seed_from: state.seed_from.clone(),
+                    existing_resume_from: state.resume_from.clone(),
+                },
+            )
+        }
+        (KeyCode::Enter, 2) => {
+            if state.session_type == "bash" {
+                return InputOutcome::Consumed;
+            }
+            InputOutcome::Submit(
+                SubmitAction::OpenTranscriptPickerForNewTerminalSession {
+                    workspace_id: state.workspace_id.to_string(),
+                    session_type: state.session_type.clone(),
+                    task_id: state.task_id.clone(),
+                    existing_seed_from: state.seed_from.clone(),
+                    existing_resume_from: state.resume_from.clone(),
                 },
             )
         }
@@ -984,6 +1121,7 @@ pub(crate) fn handle_new_terminal_session(
                 session_type: state.session_type.clone(),
                 task_id: state.task_id.clone(),
                 seed_from: state.seed_from.clone(),
+                resume_from: state.resume_from.clone(),
             })
         }
         _ => InputOutcome::Consumed,
@@ -1000,9 +1138,23 @@ pub(crate) fn handle_session_settings(
     };
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
-        KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 7;
+        KeyCode::Tab => {
+            *state.active_field = (*state.active_field + 1) % 8;
             InputOutcome::Consumed
+        }
+        KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + 7) % 8;
+            InputOutcome::Consumed
+        }
+        // proper-resume: the Transcript field opens the picker; the
+        // pick applies the bind itself (the form's other edits are
+        // saved on the form's own Enter — save first if you changed
+        // them).
+        KeyCode::Enter if *state.active_field == 7 => {
+            InputOutcome::Submit(SubmitAction::OpenTranscriptPickerForSession {
+                ws_index: state.ws_index,
+                session_index: state.session_index,
+            })
         }
         KeyCode::Char(' ') if *state.active_field == 3 => {
             *state.hidden = !*state.hidden;
@@ -1770,6 +1922,44 @@ pub(crate) fn handle_past_workspace_picker(
     }
 }
 
+/// proper-resume: the transcript picker. Same keys as the past-workspace
+/// picker; Enter submits the selected row's id and the dispatch pairs it
+/// with the picker's target.
+pub(crate) fn handle_transcript_picker(
+    candidates: &[TranscriptCandidate],
+    selected: &mut usize,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => InputOutcome::Cancel,
+        KeyCode::Enter => match candidates.get(*selected) {
+            Some(c) => InputOutcome::Submit(SubmitAction::TranscriptPicked { id: c.id.clone() }),
+            None => InputOutcome::Cancel,
+        },
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+            if !candidates.is_empty() {
+                *selected = (*selected + 1) % candidates.len();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+            if !candidates.is_empty() {
+                *selected = if *selected == 0 {
+                    candidates.len() - 1
+                } else {
+                    *selected - 1
+                };
+            }
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
 /// A-p fuzzy-find palette. Plain typed chars edit the query (this is a
 /// text filter — j/k must NOT move the selection), so selection movement
 /// rides Up/Down, Tab/BackTab, and Ctrl-j/Ctrl-k. Enter submits the
@@ -2195,6 +2385,8 @@ impl App {
                             global_perms: ts.global_perms,
                             color: ts.color.clone(),
                             seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
+                            transcript_id: ts.transcript_id.clone(),
+                            session_type: ts.session_type.clone(),
                             active_field: 0,
                         };
                     }
@@ -3106,6 +3298,7 @@ impl App {
                 session_type,
                 task_id,
                 seed_from,
+                resume_from,
                 active_field,
             } => handle_new_terminal_session(
                 NewTerminalSessionMut {
@@ -3113,6 +3306,7 @@ impl App {
                     session_type,
                     task_id,
                     seed_from,
+                    resume_from,
                     active_field,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids },
@@ -3129,6 +3323,8 @@ impl App {
                 global_perms,
                 color,
                 seeded_from_snapshot: _,
+                transcript_id: _,
+                session_type: _,
                 active_field,
             } => handle_session_settings(
                 SessionSettingsMut {
@@ -3269,6 +3465,14 @@ impl App {
             InputMode::Confirm { action, .. } => {
                 handle_confirm(action, InputCtx { repo_urls: &urls, host_ids: &host_ids }, event)
             }
+            InputMode::TranscriptPicker { candidates, selected, .. } => {
+                handle_transcript_picker(
+                    candidates,
+                    selected,
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    event,
+                )
+            }
         };
         self.apply_input_outcome(outcome)
     }
@@ -3287,12 +3491,20 @@ impl App {
                 // unchanged (None on first open). Otherwise the user's
                 // form input would be silently lost on a picker Esc.
                 let old = std::mem::replace(&mut self.input_mode, InputMode::Normal);
-                if let InputMode::SnapshotCatalog {
-                    picker_target: Some(target),
-                    ..
-                } = old
-                {
-                    self.reopen_form_from_picker(target, None);
+                match old {
+                    InputMode::SnapshotCatalog {
+                        picker_target: Some(target),
+                        ..
+                    } => self.reopen_form_from_picker(target, None),
+                    // proper-resume: a cancelled transcript picker opened
+                    // from the A-s form returns to the form unchanged.
+                    InputMode::TranscriptPicker {
+                        target: target @ TranscriptPickTarget::NewTerminalSession { .. },
+                        ..
+                    } => {
+                        self.input_mode = rebuild_form_from_transcript_pick(target, None);
+                    }
+                    _ => {}
                 }
                 true
             }
@@ -3315,6 +3527,25 @@ impl App {
                     // (shouldn't happen given the catalog handler, but
                     // safe-fall back to reopening the form unchanged).
                     self.reopen_form_from_picker(target, None);
+                    return true;
+                }
+                // proper-resume: a transcript pick lands per its target.
+                if let InputMode::TranscriptPicker { target, .. } = old {
+                    match (action, target) {
+                        (
+                            SubmitAction::TranscriptPicked { id },
+                            TranscriptPickTarget::BindSession { workspace_id, session_uid },
+                        ) => {
+                            self.bind_session_transcript(&workspace_id, &session_uid, &id);
+                        }
+                        (SubmitAction::TranscriptPicked { id }, target) => {
+                            self.input_mode = rebuild_form_from_transcript_pick(target, Some(id));
+                        }
+                        (_, target @ TranscriptPickTarget::NewTerminalSession { .. }) => {
+                            self.input_mode = rebuild_form_from_transcript_pick(target, None);
+                        }
+                        (_, TranscriptPickTarget::BindSession { .. }) => {}
+                    }
                     return true;
                 }
                 self.apply_submit_action(action);
@@ -3365,12 +3596,14 @@ impl App {
                 session_type,
                 task_id,
                 seed_from,
+                resume_from,
             } => {
                 self.spawn_session_on_workspace(
                     &workspace_id,
                     &session_type,
                     task_id,
                     seed_from.as_deref(),
+                    resume_from.as_deref(),
                 );
             }
             SubmitAction::OpenSnapshotPickerForNewSession {
@@ -3395,6 +3628,7 @@ impl App {
                 session_type,
                 task_id,
                 existing_seed_from,
+                existing_resume_from,
             } => {
                 self.open_snapshot_catalog(Some(
                     PickerTarget::NewTerminalSession {
@@ -3402,8 +3636,31 @@ impl App {
                         session_type,
                         task_id,
                         existing_seed_from,
+                        existing_resume_from,
                     },
                 ));
+            }
+            SubmitAction::OpenTranscriptPickerForNewTerminalSession {
+                workspace_id,
+                session_type,
+                task_id,
+                existing_seed_from,
+                existing_resume_from,
+            } => {
+                self.open_transcript_picker(TranscriptPickTarget::NewTerminalSession {
+                    workspace_id,
+                    session_type,
+                    task_id,
+                    existing_seed_from,
+                    existing_resume_from,
+                });
+            }
+            SubmitAction::OpenTranscriptPickerForSession { ws_index, session_index } => {
+                self.open_transcript_picker_for_session(ws_index, session_index);
+            }
+            SubmitAction::TranscriptPicked { .. } => {
+                // Only meaningful paired with a `TranscriptPicker` target
+                // (handled in `apply_input_outcome`).
             }
             SubmitAction::SaveSessionSettings {
                 ws_index,
@@ -4320,6 +4577,7 @@ mod input_handler_tests {
                 session_type: &mut session_type,
                 task_id: &task_id,
                 seed_from: &mut seed,
+                resume_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -4341,6 +4599,7 @@ mod input_handler_tests {
                 session_type: &mut session_type,
                 task_id: &task_id,
                 seed_from: &mut seed,
+                resume_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -4352,6 +4611,7 @@ mod input_handler_tests {
                 session_type,
                 task_id,
                 seed_from,
+                ..
             }) => {
                 assert_eq!(workspace_id, "ws-4");
                 assert_eq!(session_type, "bash");
@@ -4374,6 +4634,7 @@ mod input_handler_tests {
                 session_type: &mut session_type,
                 task_id: &task_id,
                 seed_from: &mut seed,
+                resume_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -4399,6 +4660,7 @@ mod input_handler_tests {
                 session_type: &mut session_type,
                 task_id: &task_id,
                 seed_from: &mut seed,
+                resume_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -4414,13 +4676,15 @@ mod input_handler_tests {
         let task_id = None;
         let mut seed: Option<String> = None;
         let mut active = 0u8;
-        for expected in [1u8, 0] {
+        // proper-resume: three fields now (type, seed, resume).
+        for expected in [1u8, 2, 0] {
             handle_new_terminal_session(
                 NewTerminalSessionMut {
                     workspace_id: "ws-0",
                     session_type: &mut session_type,
                     task_id: &task_id,
                     seed_from: &mut seed,
+                    resume_from: &mut None,
                     active_field: &mut active,
                 },
                 ctx_no_repos(),
@@ -4442,6 +4706,7 @@ mod input_handler_tests {
                 session_type: &mut session_type,
                 task_id: &task_id,
                 seed_from: &mut seed,
+                resume_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -4462,6 +4727,7 @@ mod input_handler_tests {
                 session_type: &mut session_type,
                 task_id: &task_id,
                 seed_from: &mut seed,
+                resume_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -4474,6 +4740,7 @@ mod input_handler_tests {
                     session_type,
                     task_id,
                     existing_seed_from,
+                    ..
                 },
             ) => {
                 assert_eq!(workspace_id, "ws-9");
@@ -4499,6 +4766,7 @@ mod input_handler_tests {
                 session_type: &mut session_type,
                 task_id: &task_id,
                 seed_from: &mut seed,
+                resume_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -4520,6 +4788,7 @@ mod input_handler_tests {
                 session_type: &mut session_type,
                 task_id: &task_id,
                 seed_from: &mut seed,
+                resume_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -4531,6 +4800,193 @@ mod input_handler_tests {
             }) => assert_eq!(seed_from.as_deref(), Some("reviewer")),
             other => panic!("expected SpawnSessionOnWorkspace, got {other:?}"),
         }
+    }
+
+    /// proper-resume: the A-s form's Resume field round-trips through
+    /// the transcript picker — a pick sets `resume_from` (and clears a
+    /// snapshot seed, the two being mutually exclusive), a cancel keeps
+    /// both as captured.
+    #[test]
+    fn transcript_pick_sets_resume_from_and_clears_seed() {
+        let target = || TranscriptPickTarget::NewTerminalSession {
+            workspace_id: "ws-9".into(),
+            session_type: "claude".into(),
+            task_id: Some("t-9".into()),
+            existing_seed_from: Some("snap-A".into()),
+            existing_resume_from: Some("old-id".into()),
+        };
+        match super::rebuild_form_from_transcript_pick(target(), Some("new-id".into())) {
+            InputMode::NewTerminalSession { seed_from, resume_from, active_field, task_id, .. } => {
+                assert_eq!(resume_from.as_deref(), Some("new-id"));
+                assert!(seed_from.is_none(), "a picked transcript supersedes the seed");
+                assert_eq!(active_field, 2);
+                assert_eq!(task_id.as_deref(), Some("t-9"));
+            }
+            _ => panic!("expected NewTerminalSession"),
+        }
+        match super::rebuild_form_from_transcript_pick(target(), None) {
+            InputMode::NewTerminalSession { seed_from, resume_from, .. } => {
+                assert_eq!(resume_from.as_deref(), Some("old-id"));
+                assert_eq!(seed_from.as_deref(), Some("snap-A"));
+            }
+            _ => panic!("expected NewTerminalSession"),
+        }
+        // A bind target has no form to return to.
+        assert!(matches!(
+            super::rebuild_form_from_transcript_pick(
+                TranscriptPickTarget::BindSession { workspace_id: "w".into(), session_uid: "u".into() },
+                None,
+            ),
+            InputMode::Normal
+        ));
+        // And the snapshot picker's own round-trip clears resume_from
+        // on a PICK but keeps it on cancel.
+        let ptarget = || PickerTarget::NewTerminalSession {
+            workspace_id: "ws-9".into(),
+            session_type: "claude".into(),
+            task_id: None,
+            existing_seed_from: None,
+            existing_resume_from: Some("old-id".into()),
+        };
+        match super::rebuild_form_from_picker(ptarget(), Some("snap-B".into())) {
+            InputMode::NewTerminalSession { seed_from, resume_from, .. } => {
+                assert_eq!(seed_from.as_deref(), Some("snap-B"));
+                assert!(resume_from.is_none());
+            }
+            _ => panic!("expected NewTerminalSession"),
+        }
+        match super::rebuild_form_from_picker(ptarget(), None) {
+            InputMode::NewTerminalSession { resume_from, .. } => {
+                assert_eq!(resume_from.as_deref(), Some("old-id"));
+            }
+            _ => panic!("expected NewTerminalSession"),
+        }
+    }
+
+    /// proper-resume: the A-s form's Resume field — Enter opens the
+    /// transcript picker (never for bash), Esc clears a pick, a type
+    /// change clears it, and the spawn submit carries it.
+    #[test]
+    fn new_terminal_session_resume_field_keys() {
+        let mut st = "claude".to_string();
+        let mut seed: Option<String> = None;
+        let mut resume: Option<String> = Some("abc".into());
+        let mut field = 2u8;
+        macro_rules! st {
+            () => {
+                NewTerminalSessionMut {
+                    workspace_id: "ws-1",
+                    session_type: &mut st,
+                    task_id: &None,
+                    seed_from: &mut seed,
+                    resume_from: &mut resume,
+                    active_field: &mut field,
+                }
+            };
+        }
+        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        // Enter on the Resume field with a pick present still opens the
+        // picker (to change it), carrying the existing value.
+        match handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Enter)) {
+            InputOutcome::Submit(SubmitAction::OpenTranscriptPickerForNewTerminalSession { existing_resume_from, session_type, .. }) => {
+                assert_eq!(existing_resume_from.as_deref(), Some("abc"));
+                assert_eq!(session_type, "claude");
+            }
+            other => panic!("expected OpenTranscriptPickerForNewTerminalSession, got {other:?}"),
+        }
+        // Esc clears the pick instead of cancelling the form.
+        assert!(matches!(
+            handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Esc)),
+            InputOutcome::Consumed
+        ));
+        assert!(resume.is_none());
+        // Enter on a spawn field carries resume_from.
+        resume = Some("abc".into());
+        field = 0;
+        match handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Enter)) {
+            InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace { resume_from, .. }) => {
+                assert_eq!(resume_from.as_deref(), Some("abc"));
+            }
+            other => panic!("expected SpawnSessionOnWorkspace, got {other:?}"),
+        }
+        // A type change drops the pick (it was engine-filtered).
+        handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Char('j')));
+        assert_eq!(st, "codex");
+        assert!(resume.is_none());
+        // Bash: Enter on the Resume field is a no-op.
+        st = "bash".into();
+        field = 2;
+        assert!(matches!(
+            handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Enter)),
+            InputOutcome::Consumed
+        ));
+        // Tab wraps over three fields.
+        field = 2;
+        handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Tab));
+        assert_eq!(field, 0);
+    }
+
+    /// proper-resume: the transcript picker's keys, and A-e's Transcript
+    /// field opening it.
+    #[test]
+    fn transcript_picker_keys_and_settings_entry() {
+        let cands = vec![
+            TranscriptCandidate { id: "id-a".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: None },
+            TranscriptCandidate { id: "id-b".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: Some(String::new()) },
+        ];
+        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        let mut sel = 0usize;
+        handle_transcript_picker(&cands, &mut sel, ctx_no_repos(), &key(KeyCode::Char('j')));
+        assert_eq!(sel, 1);
+        handle_transcript_picker(&cands, &mut sel, ctx_no_repos(), &key(KeyCode::Char('j')));
+        assert_eq!(sel, 0, "wraps");
+        handle_transcript_picker(&cands, &mut sel, ctx_no_repos(), &key(KeyCode::Char('k')));
+        assert_eq!(sel, 1, "wraps backwards");
+        match handle_transcript_picker(&cands, &mut sel, ctx_no_repos(), &key(KeyCode::Enter)) {
+            InputOutcome::Submit(SubmitAction::TranscriptPicked { id }) => assert_eq!(id, "id-b"),
+            other => panic!("expected TranscriptPicked, got {other:?}"),
+        }
+        assert!(matches!(handle_transcript_picker(&cands, &mut sel, ctx_no_repos(), &key(KeyCode::Esc)), InputOutcome::Cancel));
+        assert!(matches!(handle_transcript_picker(&[], &mut sel, ctx_no_repos(), &key(KeyCode::Enter)), InputOutcome::Cancel));
+
+        // A-e: Tab reaches field 7 and Enter there opens the picker for
+        // the form's row.
+        let mut name = "n".to_string();
+        let mut idle = "2".to_string();
+        let mut burst = "3".to_string();
+        let mut hidden = false;
+        let mut notify = false;
+        let mut gp = false;
+        let mut color: Option<String> = None;
+        let mut field = 6u8;
+        macro_rules! ss {
+            () => {
+                SessionSettingsMut {
+                    ws_index: 3,
+                    session_index: 1,
+                    name: &mut name,
+                    idle_timeout: &mut idle,
+                    burst_threshold: &mut burst,
+                    hidden: &mut hidden,
+                    notify_on_idle: &mut notify,
+                    global_perms: &mut gp,
+                    color: &mut color,
+                    active_field: &mut field,
+                }
+            };
+        }
+        handle_session_settings(ss!(), ctx_no_repos(), &key(KeyCode::Tab));
+        assert_eq!(field, 7);
+        match handle_session_settings(ss!(), ctx_no_repos(), &key(KeyCode::Enter)) {
+            InputOutcome::Submit(SubmitAction::OpenTranscriptPickerForSession { ws_index, session_index }) => {
+                assert_eq!((ws_index, session_index), (3, 1));
+            }
+            other => panic!("expected OpenTranscriptPickerForSession, got {other:?}"),
+        }
+        handle_session_settings(ss!(), ctx_no_repos(), &key(KeyCode::Tab));
+        assert_eq!(field, 0, "wraps after the transcript field");
+        handle_session_settings(ss!(), ctx_no_repos(), &key(KeyCode::BackTab));
+        assert_eq!(field, 7);
     }
 
     #[test]
@@ -4563,6 +5019,7 @@ mod input_handler_tests {
             session_type: "claude".into(),
             task_id: None,
             existing_seed_from: Some("snap-A".into()),
+            existing_resume_from: None,
         };
         let mode = super::rebuild_form_from_picker(
             target,
@@ -4887,6 +5344,7 @@ mod input_handler_tests {
             session_type: "codex".into(),
             task_id: None,
             existing_seed_from: None,
+            existing_resume_from: None,
         };
         let (mode, _) = super::catalog_open_outcome(Ok(snaps), Some(target));
         match mode {
@@ -4977,6 +5435,7 @@ mod input_handler_tests {
             session_type: "claude".into(),
             task_id: Some("t-1".into()),
             existing_seed_from: None,
+            existing_resume_from: None,
         };
 
         // Simulate: workspaces were [A, B, C] when picker opened; while
@@ -5047,6 +5506,7 @@ mod input_handler_tests {
                 session_type: "claude".into(),
                 task_id: None,
                 existing_seed_from: None,
+                existing_resume_from: None,
             }),
             Some(Engine::ClaudeCode)
         );
@@ -5056,6 +5516,7 @@ mod input_handler_tests {
                 session_type: "codex".into(),
                 task_id: None,
                 existing_seed_from: None,
+                existing_resume_from: None,
             }),
             Some(Engine::Codex)
         );
@@ -5065,6 +5526,7 @@ mod input_handler_tests {
                 session_type: "bash".into(),
                 task_id: None,
                 existing_seed_from: None,
+                existing_resume_from: None,
             }),
             None
         );
