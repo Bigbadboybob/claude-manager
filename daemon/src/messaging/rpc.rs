@@ -20,6 +20,12 @@ pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         (s.messaging.clone(), s.messaging_root.clone())
     };
+    let delivery_gate = state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .messaging_delivery
+        .clone();
+    let _delivery_guard = delivery_gate.lock().unwrap_or_else(|p| p.into_inner());
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
     if slot.is_none() {
         *slot = Some(Store::open(&root)?);
@@ -204,6 +210,27 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             message: "Daemon is restarting; retry the same request".into(),
         });
     }
+    // Only recipient-affecting mutations serialize with PTY submission.
+    // Ordinary reads/sends never wait through the adapter's paste delay.
+    let coordinates_delivery = kind != "owner"
+        && (req.method == "messaging.follow"
+            && matches!(req.params["action"].as_str(), Some("set" | "remove"))
+            || req.method == "messaging.monitors"
+                && matches!(
+                    req.params["action"].as_str(),
+                    Some("ack" | "cancel" | "cancel_all" | "dismiss")
+                )
+            || matches!(
+                req.method.as_str(),
+                "messaging.read" | "messaging.dms" | "messaging.send"
+            ) && req.params["ack_receipt"].is_object());
+    let delivery_gate = state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .messaging_delivery
+        .clone();
+    let _delivery_guard =
+        coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
     if slot.is_none() {
         *slot = Some(Store::open(&root)?);
@@ -256,6 +283,28 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
         }
         "messaging.read" => store.read(&actor, p, &people),
         "messaging.dms" => store.dms_page(&actor, p),
+        "messaging.norms" => {
+            if matches!(p["action"].as_str(), Some("publish" | "revert")) {
+                let name = store
+                    .names
+                    .get(&actor)
+                    .map(|n| n.name.as_str())
+                    .or_else(|| {
+                        people
+                            .iter()
+                            .find(|person| person.id == actor)
+                            .map(|person| person.name.as_str())
+                    })
+                    .unwrap_or("Participant")
+                    .to_owned();
+                store.change_norms(&actor, kind, &name, p)
+            } else {
+                store.norms_document(&actor, p)
+            }
+        }
+        "messaging.monitor" => store.register_monitor(&actor, p, &people),
+        "messaging.monitors" => store.monitors(&actor, p),
+        "messaging.follow" => store.follow(&actor, p, &people),
         "messaging.people" => {
             let mut value = store.people(&people);
             if let Some(items) = value.as_array_mut() {
@@ -296,7 +345,7 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":store.channels().as_array().and_then(|a|a.iter().find(|v|v["path"]==query["channel"]).cloned()),"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels"],"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":store.channels().as_array().and_then(|a|a.iter().find(|v|v["path"]==query["channel"]).cloned()),"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow"],"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
@@ -319,7 +368,32 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
         }),
     };
     project_names(state, store, true);
-    result
+    let mut retraction_note = None;
+    if coordinates_delivery {
+        if let Err(error) = super::delivery::reconcile(&root, store) {
+            eprintln!("cm messaging: pending wake reconciliation: {error}");
+            retraction_note = Some(format!(
+                "Change saved, but a queued hook could not yet be retracted: {error}"
+            ));
+        }
+    }
+    result.map(|value| {
+        if !req.method.starts_with("messaging.") {
+            return value;
+        }
+        let mut value = store.context_response(&actor, p, value, req.method == "messaging.open");
+        value["monitor_status"] = store.monitor_status(&actor);
+        if let Some(note) = retraction_note {
+            value["delivery_note"] = json!(note);
+        }
+        if kind == "owner" {
+            match store.attention(&actor, p["claim_bell"] == true) {
+                Ok(attention) => value["attention"] = attention,
+                Err(error) => value["attention"] = json!({"error":error.to_string()}),
+            }
+        }
+        value
+    })
 }
 
 #[cfg(test)]
@@ -354,6 +428,99 @@ mod tests {
                 params: p,
             },
         )
+    }
+    #[test]
+    fn messaging_cancel_serializes_at_delivery_boundary_but_reads_and_sends_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let monitor = call(
+            &state,
+            "b",
+            "monitor",
+            json!({"scope":{"channel":"general"},"request_id":"watch"}),
+        )
+        .unwrap();
+        let gate = state.lock().unwrap().messaging_delivery.clone();
+        let guard = gate.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clone = state.clone();
+        let reader = std::thread::spawn(move || {
+            tx.send(call(&clone, "a", "read", json!({"channel":"general"})))
+                .unwrap();
+        });
+        let read = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("A read waited for PTY delivery");
+        assert!(read.is_ok());
+        reader.join().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clone = state.clone();
+        let sender = std::thread::spawn(move || {
+            tx.send(call(&clone,"a","send",json!({"channel":"general","name":"Boundary Builder","body":"Ready","request_id":"send"}))).unwrap();
+        });
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("A send waited for PTY delivery")
+            .is_ok());
+        sender.join().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clone = state.clone();
+        let canceller = std::thread::spawn(move || {
+            tx.send(call(
+                &clone,
+                "b",
+                "monitors",
+                json!({"action":"cancel","monitor_id":monitor["id"],"request_id":"cancel"}),
+            ))
+            .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "Cancellation crossed an in-progress delivery boundary"
+        );
+        drop(guard);
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        canceller.join().unwrap();
+    }
+    #[test]
+    fn messaging_b_registration_race_catches_every_arrival_after_read_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let after =
+            call(&state, "b", "read", json!({"channel":"general"})).unwrap()["position"].clone();
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let mut threads = vec![];
+        for n in 0..8 {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move ||{barrier.wait();call(&state,"a","send",json!({"channel":"general","name":"Race Builder","body":format!("message {n}"),"request_id":format!("message-{n}")})).unwrap();}));
+        }
+        barrier.wait();
+        let monitor=call(&state,"b","monitor",json!({"scope":{"channel":"general"},"mode":"continuous","after":after,"request_id":"watch"})).unwrap();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let result = call(
+            &state,
+            "b",
+            "monitors",
+            json!({"action":"get","monitor_id":monitor["id"]}),
+        )
+        .unwrap();
+        assert_eq!(result["monitor"]["hits"], 8);
+        assert_eq!(result["items"].as_array().unwrap().len(), 8);
+        assert!(call(
+            &state,
+            "outsider",
+            "monitors",
+            json!({"action":"get","monitor_id":monitor["id"]})
+        )
+        .is_err());
+        assert!(call(&state,"b","send",json!({"channel":"general","name":"Race Reader","body":"Stale context still sends","request_id":"stale","norms_seen":{"global":"missing"}})).unwrap()["event_id"].is_string());
     }
     #[test]
     fn messaging_two_sessions_and_owner_vertical_slice_auth_and_name_convergence() {

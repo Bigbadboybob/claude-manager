@@ -17,6 +17,17 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
+mod personal;
+#[cfg(test)]
+mod tests_b;
+mod wake_intents;
+pub use wake_intents::WakeIntent;
+mod norms;
+pub use norms::textual_diff as norms_diff;
+mod watches;
+mod preferences;
+use personal::Personal;
+
 pub fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -203,6 +214,7 @@ pub struct Store {
     position: u64,
     clock: u64,
     reads: BTreeMap<String, ReadState>,
+    personal: BTreeMap<String, Personal>,
     pub norms: Value,
     enrollment_revision: String,
     owner_identity_revision: String,
@@ -270,6 +282,7 @@ impl Store {
             position: 0,
             clock: 0,
             reads: BTreeMap::new(),
+            personal: BTreeMap::new(),
             norms: json!({}),
             enrollment_revision: required(&meta, "enrollment_revision")?,
             owner_identity_revision: required(&meta, "owner_identity_revision")?,
@@ -289,6 +302,10 @@ impl Store {
         }
         mkdir(&s.journal_dir())?;
         if let Err(e) = s.rebuild() {
+            s.degraded = Some(e.to_string());
+            return Ok(s);
+        }
+        if let Err(e) = s.load_personal().and_then(|_|s.load_known_reads()) {
             s.degraded = Some(e.to_string());
             return Ok(s);
         }
@@ -630,6 +647,9 @@ impl Store {
         if let Some(reason) = &self.degraded {
             return Err(err("store_read_only", reason.clone()));
         }
+        // Expiry and message publication share this writer lock. A closed
+        // watch retains the arrival fence captured before a later publication.
+        self.advance_monitors_at(Utc::now())?;
         let path = self.event_path(&event)?;
         let bytes = serde_json::to_vec_pretty(&event)?;
         if bytes.len() > 65536 {
@@ -664,6 +684,11 @@ impl Store {
             position: pos,
             received_at: received,
         });
+        // A durable message stays successful if a derived checkpoint fails;
+        // restart replays from the prior saved monitor scan position.
+        if let Err(e) = self.advance_monitors_at(Utc::now()) {
+            self.degraded = Some(format!("Monitor checkpoint requires reconciliation: {e}"));
+        }
         Ok(event)
     }
     fn publish(
@@ -835,6 +860,9 @@ impl Store {
             return Err(err("invalid_params", "Expected an object"));
         }
         let key = required(p, "request_id")?;
+        if self.personal.get(actor).is_some_and(|s| s.operations.contains_key(&key)) {
+            return Err(err("idempotency_conflict", "This request_id belongs to a personal-state operation"));
+        }
         if key.len() > 160 || key.chars().any(char::is_control) {
             return Err(err("invalid_params", "Invalid request_id"));
         }
@@ -1344,11 +1372,12 @@ impl Store {
                 }
                 if broad {
                     let incoming = v["actor"]["id"] != actor;
-                    let dm = self.conversations.contains_key(cid);
-                    let mention = v["data"]["mentions"]
-                        .as_array()
-                        .is_some_and(|a| a.iter().any(|v| v == actor));
-                    if !incoming || !(dm || p["inbox"] == true && mention) {
+                    let eligible = if p["inbox"] == true {
+                        self.preference_for_event(actor, e).0 || self.monitor_inbox(actor,e)
+                    } else {
+                        self.conversations.contains_key(cid)
+                    };
+                    if (!incoming && !(p["inbox"] == true && self.monitor_inbox(actor,e))) || !eligible {
                         return false;
                     }
                 }
@@ -1539,13 +1568,16 @@ impl Store {
         items.retain(|v| v["id"].as_str().unwrap_or("") > last);
         let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
         let mut bytes = 0;
+        let mut chars = 0;
         let mut count = 0;
         for item in items.iter().take(limit) {
             let size = serde_json::to_vec(item)?.len();
-            if count > 0 && bytes + size > 450000 {
+            let text_size = item.to_string().chars().count();
+            if count > 0 && (bytes + size > 450000 || chars + text_size > 14000) {
                 break;
             }
             bytes += size;
+            chars += text_size;
             count += 1;
         }
         let more = items.len() > count;
@@ -1571,42 +1603,9 @@ impl Store {
         json!(statuses)
     }
     pub fn notifications(&self) -> Vec<(String, String, String)> {
-        let mut out = vec![];
-        for e in &self.events {
-            let v = &e.event;
-            if v["type"] != "message.create" {
-                continue;
-            }
-            let mut recipients: BTreeSet<String> = v["data"]["mentions"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect();
-            if let Some(m) = self.conversations.get(strv(v, "conversation_id")) {
-                recipients.extend(m.iter().cloned());
-            }
-            for id in recipients {
-                if id == "owner" || v["actor"]["id"] == id {
-                    continue;
-                }
-                if let Some(n) = self.names.get(&id) {
-                    out.push((n.session_uid.clone(),strv(v,"id").into(),format!("[cm-chat {}] New message from {}. Use chat_read(conversation=\"{}\") to read it.",strv(v,"id"),strv(&v["actor"],"name"),strv(v,"conversation_id"))));
-                } else if let Some(uid) = id.strip_prefix(&format!("agent:{}:", self.daemon_id)) {
-                    out.push((
-                        uid.into(),
-                        strv(v, "id").into(),
-                        format!(
-                            "[cm-chat {}] New DM. Use chat_read(dms=true, unread_only=true).",
-                            strv(v, "id")
-                        ),
-                    ));
-                }
-            }
-        }
-        out
+        self.wake_intents().into_iter().flat_map(|(uid,items)| items.into_iter().map(move |i|(uid.clone(),i.event_id,String::new()))).collect()
     }
+
 }
 fn parse_time(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)

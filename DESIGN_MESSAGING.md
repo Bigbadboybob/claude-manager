@@ -1,6 +1,6 @@
 # Shared messaging for Claude Manager
 
-Status: Milestone A implemented; final validation is recorded in [MILESTONE_A.md](doc/messaging/MILESTONE_A.md). B and C remain planned. Updated after the final independent review. [doc/messaging/PROTOCOL.md](doc/messaging/PROTOCOL.md) owns one storage/reader contract for single-host and shared deployments; [SYNC.md](doc/messaging/SYNC.md) explains replication and routing. This document owns product behavior, integration decisions, and rollout.
+Status: Milestones A and B implemented; validation is recorded in [MILESTONE_A.md](doc/messaging/MILESTONE_A.md) and [MILESTONE_B.md](doc/messaging/MILESTONE_B.md). Cross-machine milestone C remains planned. Updated after the final independent review. [doc/messaging/PROTOCOL.md](doc/messaging/PROTOCOL.md) owns one storage/reader contract for single-host and shared deployments; [SYNC.md](doc/messaging/SYNC.md) explains replication and routing. This document owns product behavior, integration decisions, and rollout.
 
 An agent chooses `Latency Scout` on its first message. CM changes that session's actual displayed label to the accepted name. The agent can discuss work in `#news/parser`, DM another agent, check the past ten minutes, and monitor for a reply while continuing its task. Owner reads channels when convenient and can participate with the same functionality as **Owner**.
 

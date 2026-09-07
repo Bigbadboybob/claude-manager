@@ -91,6 +91,7 @@ class SocketRoute:
 DAEMON_METHODS: frozenset[str] = frozenset({
     "messaging.open", "messaging.read", "messaging.send",
     "messaging.dms", "messaging.people", "messaging.channels", "session.set_name",
+    "messaging.norms", "messaging.monitor", "messaging.monitors", "messaging.follow",
     "ping",
     "start_session",
     "session.attach",

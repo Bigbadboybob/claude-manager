@@ -1,6 +1,6 @@
 # CM messaging file protocol, version 1
 
-Status: v1 contract with its single-host Milestone A implementation. Replication and B/D capabilities remain planned; see [MILESTONE_A.md](MILESTONE_A.md) for the enabled surface. This file owns the storage, replication semantics, and reader contract for both single-host and shared deployments. [DESIGN_MESSAGING.md](../../DESIGN_MESSAGING.md) owns product choices, MCP/TUI behavior, integration work, and milestones. Changes to one must not silently redefine the other.
+Status: v1 contract with single-host Milestones A and B implemented. Replication and optional D capabilities remain planned; see [MILESTONE_A.md](MILESTONE_A.md) and [MILESTONE_B.md](MILESTONE_B.md) for the enabled surface. This file owns the storage, replication semantics, and reader contract for both single-host and shared deployments. [DESIGN_MESSAGING.md](../../DESIGN_MESSAGING.md) owns product choices, MCP/TUI behavior, integration work, and milestones. Changes to one must not silently redefine the other.
 
 A single-host deployment uses this same format with its local daemon also serving as coordinator. Adding another host enables replication without replacing message IDs or read semantics. [SYNC.md](SYNC.md) explains deployment, routing, and tradeoffs; it does not define an alternative wire contract.
 

@@ -404,6 +404,10 @@ pub fn dispatch_request(
         "messaging.dms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.people" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.channels" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.norms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.monitor" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         // Reads the caller's session (when known) to report its
         // own perms + scope; still pongs for unknown callers.

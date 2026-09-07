@@ -1,4 +1,5 @@
 //! Owner messaging view. Network work runs off the terminal event loop.
+mod manage;
 use super::*;
 use ratatui::widgets::Wrap;
 use serde::{Deserialize, Serialize};
@@ -20,13 +21,16 @@ pub struct Draft {
     origin: Option<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Saved {
+    management: manage::SavedManagement,
     drafts: BTreeMap<String, Draft>,
     names: BTreeMap<String, (u64, String)>,
 }
 #[derive(Default)]
 pub struct Messages {
     pub visible: bool,
+    management: manage::Management,
     saved: Saved,
     target: Value,
     channels: Vec<Value>,
@@ -49,6 +53,7 @@ pub struct Messages {
     next: Value,
     rx: Option<Receiver<(String, Result<Value, String>)>>,
     busy: bool,
+    queued_events: std::collections::VecDeque<CrosstermEvent>,
     last_refresh: Option<Instant>,
     daemon_id: String,
     space_id: String,
@@ -89,6 +94,19 @@ impl Messages {
         format!("{}:{}", self.space_id, self.target)
     }
     fn draft(&self) -> Draft {
+        if self.mode == "norm_edit" {
+            return self
+                .saved
+                .management
+                .norms
+                .get(&self.space_id)
+                .map(|n| Draft {
+                    body: n.text.clone(),
+                    cursor: n.cursor,
+                    ..Draft::default()
+                })
+                .unwrap_or_default();
+        }
         self.saved
             .drafts
             .get(&self.key())
@@ -96,6 +114,20 @@ impl Messages {
             .unwrap_or_default()
     }
     fn set_draft(&mut self, draft: Draft) -> bool {
+        if self.mode == "norm_edit" {
+            let n = self
+                .saved
+                .management
+                .norms
+                .entry(self.space_id.clone())
+                .or_default();
+            if n.text != draft.body {
+                n.revert = None;
+            }
+            n.text = draft.body;
+            n.cursor = draft.cursor;
+            return self.persist();
+        }
         self.saved.drafts.insert(self.key(), draft);
         self.persist()
     }
@@ -107,7 +139,22 @@ impl Messages {
                 "Needs Owner".into(),
                 json!({"channel":"*","tags":["needs-owner"]}),
             ),
-            ("Shared norms".into(), json!({"norms":true})),
+            (
+                format!(
+                    "Shared norms{}",
+                    if self.management.context["changed"] == true {
+                        " · changed"
+                    } else {
+                        ""
+                    }
+                ),
+                json!({"norms":true}),
+            ),
+            (
+                format!("Monitors{}", self.management.badge_label()),
+                json!({"monitors":true}),
+            ),
+            ("Preferences".into(), json!({"preferences":true})),
         ];
         out.extend(self.channels.iter().map(|c| {
             (
@@ -175,6 +222,10 @@ impl Messages {
         "Conversation".into()
     }
     fn can_edit(&mut self) -> bool {
+        if self.mode.starts_with("norm_") && self.saved.management.pending.is_some() {
+            self.error = "An operation is pending. R retries its saved contents.".into();
+            return false;
+        }
         if !self.draft().request_id.is_empty() {
             self.error="Send outcome is pending. Ctrl+s retries the saved message; keep its contents until resolved.".into();
             false
@@ -208,7 +259,7 @@ impl Messages {
         self.set_draft(d);
     }
     fn edit_text(&mut self, text: &str, backspace: bool) {
-        if self.mode == "compose" {
+        if matches!(self.mode.as_str(), "compose" | "norm_edit") {
             if !self.can_edit() {
                 return;
             }
@@ -274,11 +325,27 @@ impl Messages {
         }
         p["limit"] = json!(20);
         p["newest_first"] = json!(true);
+        p["claim_bell"] = json!(true);
         p
     }
 }
 impl App {
     pub fn messaging_tick(&mut self) {
+        // Refreshes run off-thread, but input still belongs to the operator.
+        // Replay it in order before starting another refresh. Closing the panel
+        // hides rendering while queued edits finish saving to their draft.
+        while !self.messages.busy {
+            let Some(event) = self.messages.queued_events.pop_front() else {
+                break;
+            };
+            let visible = self.messages.visible;
+            self.messages.visible = true;
+            self.messaging_event(&event);
+            if !visible {
+                self.messages.visible = false;
+            }
+            self.needs_redraw = true;
+        }
         let result = self.messages.rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some((method, result)) = result {
             self.messages.busy = false;
@@ -286,6 +353,7 @@ impl App {
             self.needs_redraw = true;
             match result {
                 Err(e) => {
+                    self.messaging_management_error(&method, &e);
                     if method == "messaging.send" {
                         if let Some((key, request)) = self.messages.pending_send.take() {
                             // Only explicit pre-commit rejections permit changing the intent.
@@ -316,6 +384,10 @@ impl App {
                 }
                 Ok(v) => {
                     self.messages.error.clear();
+                    self.messaging_context(&v);
+                    if self.messaging_management_result(&method, &v) {
+                        return;
+                    }
                     match method.as_str() {
                         "bootstrap" => {
                             self.messages.channels = v["channels"]["items"]
@@ -328,13 +400,14 @@ impl App {
                                 v["people"]["daemon_id"].as_str().unwrap_or("").into();
                             self.messages.space_id =
                                 v["people"]["space_id"].as_str().unwrap_or("").into();
+                            self.messaging_context(&v["open"]);
                             self.messages.norms =
                                 v["open"]["norms"]["text"].as_str().unwrap_or("").into();
                             self.messages.dms = v["open"]["dms"]["items"]
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default();
-                            self.messaging_request("messaging.read", self.messages.query());
+                            self.messaging_refresh_target();
                         }
                         "messaging.read" => {
                             let old = self
@@ -344,6 +417,14 @@ impl App {
                                 .map(|v| v["id"].clone());
                             self.messages.items =
                                 v["items"].as_array().cloned().unwrap_or_default();
+                            self.messages.management.last_position = v["position"].clone();
+                            if self.messages.target["inbox"] == true {
+                                self.messages.items.sort_by(|a, b| {
+                                    a["conversation_id"]
+                                        .as_str()
+                                        .cmp(&b["conversation_id"].as_str())
+                                });
+                            }
                             self.messages.selected = old
                                 .and_then(|id| {
                                     self.messages.items.iter().position(|v| v["id"] == id)
@@ -399,9 +480,8 @@ impl App {
                 .messages
                 .last_refresh
                 .is_none_or(|t| t.elapsed() > Duration::from_secs(3))
-            && self.messages.target["norms"] != true
         {
-            self.messaging_request("messaging.read", self.messages.query());
+            self.messaging_refresh_target();
         }
     }
     fn messaging_request(&mut self, method: &str, params: Value) {
@@ -414,6 +494,7 @@ impl App {
             return;
         };
         let token = self.host_pool.operator_token_for(&host);
+        self.messages.management.request = params.clone();
         let method = method.to_owned();
         let (tx, rx) = mpsc::channel();
         self.messages.rx = Some(rx);
@@ -440,8 +521,23 @@ impl App {
             let result = if method == "bootstrap" {
                 (|| {
                     Ok(
-                        json!({"channels":directory("messaging.channels",json!({"action":"list"}))?,"people":directory("messaging.people",json!({"include_exited":true}))?,"open":call("messaging.open",json!({"channel":"general"}))?}),
+                        json!({"channels":directory("messaging.channels",json!({"action":"list"}))?,"people":directory("messaging.people",json!({"include_exited":true}))?,"open":call("messaging.open",json!({"channel":"general","claim_bell":true}))?}),
                     )
+                })()
+            } else if method == "norms_document" {
+                (|| {
+                    let mut p = params;
+                    let mut text = String::new();
+                    loop {
+                        let mut page = call("messaging.norms", p.clone())?;
+                        text.push_str(page["text"].as_str().unwrap_or(""));
+                        if page["next_cursor"].is_null() {
+                            page["text"] = json!(text);
+                            page["offset"] = json!(0);
+                            return Ok(page);
+                        }
+                        p["cursor"] = page["next_cursor"].clone();
+                    }
                 })()
             } else {
                 call(&method, params)
@@ -451,8 +547,19 @@ impl App {
     }
     pub(super) fn messaging_event(&mut self, event: &CrosstermEvent) -> bool {
         if let CrosstermEvent::Paste(text) = event {
+            if self.messages.visible && self.messages.busy {
+                self.messages.queued_events.push_back(event.clone());
+                return true;
+            }
             if self.messages.visible && !self.messages.busy && !self.messages.mode.is_empty() {
-                self.messages.edit_text(&text.replace("\r\n", "\n"), false);
+                if self.messages.management_view()
+                    && self.messages.saved.management.pending.is_some()
+                {
+                    self.messages.error = "A saved operation is pending; R retries it".into();
+                } else {
+                    self.messages.edit_text(&text.replace("\r\n", "\n"), false);
+                    self.messages.keep_management_form();
+                }
             }
             return self.messages.visible;
         }
@@ -476,7 +583,19 @@ impl App {
         if self.messages.busy {
             if key.code == KeyCode::Esc {
                 self.messages.visible = false;
+            } else if !(key.code == KeyCode::Char('s')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && (self.messages.pending_send.is_some()
+                    || self.messages.saved.management.pending.is_some()))
+            {
+                self.messages.queued_events.push_back(event.clone());
             }
+            return true;
+        }
+        if self.messages.mode.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+        if self.messaging_management_key(key) {
             return true;
         }
         if !self.messages.mode.is_empty() {
@@ -558,9 +677,8 @@ impl App {
                         self.messages.page_cursor = Value::Null;
                         self.messages.pane = 1;
                         self.messages.selected = 0;
-                        if self.messages.target["norms"] != true {
-                            self.messaging_request("messaging.read", self.messages.query());
-                        }
+                        self.messages.body_scroll = 0;
+                        self.messaging_refresh_target();
                     }
                 } else {
                     self.messaging_ack_selected();
@@ -920,14 +1038,15 @@ impl App {
         let editing = !self.messages.mode.is_empty();
         let conversations_focused = self.messages.pane == 0 && !editing;
         let messages_focused = self.messages.pane == 1 && !editing;
-        frame.render_widget(
-            Block::default().style(text_style.bg(theme::CHAT_BG)),
-            area,
-        );
+        frame.render_widget(Block::default().style(text_style.bg(theme::CHAT_BG)), area);
         let rows = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(if self.messages.management_view() {
+                4
+            } else {
+                3
+            }),
         ])
         .split(area);
         frame.render_widget(
@@ -966,12 +1085,13 @@ impl App {
                 };
                 let selected = i == self.messages.menu;
                 let style = Style::default().fg(color);
-                Line::from(format!("{} {}", if selected { "›" } else { " " }, label))
-                    .style(if selected {
+                Line::from(format!("{} {}", if selected { "›" } else { " " }, label)).style(
+                    if selected {
                         style.bg(theme::CHAT_SELECTION).add_modifier(Modifier::BOLD)
                     } else {
                         style
-                    })
+                    },
+                )
             })
             .collect::<Vec<_>>();
         if !narrow || self.messages.pane == 0 && self.messages.mode.is_empty() {
@@ -990,15 +1110,8 @@ impl App {
             );
         }
         if !narrow || self.messages.pane == 1 || !self.messages.mode.is_empty() {
-            if self.messages.target["norms"] == true {
-                frame.render_widget(
-                    Paragraph::new(self.messages.norms.as_str())
-                        .style(text_style.bg(theme::CHAT_PANEL))
-                        .wrap(Wrap { trim: false })
-                        .scroll((self.messages.body_scroll, 0))
-                        .block(chat_block("Shared norms", messages_focused)),
-                    cols[1],
-                );
+            if self.messages.management_view() {
+                self.draw_messaging_management(frame, cols[1], messages_focused);
             } else {
                 let content = Layout::vertical([
                     Constraint::Length(if self.messages.mode.is_empty() { 6 } else { 3 }),
@@ -1022,12 +1135,28 @@ impl App {
                         Line::from(vec![
                             Span::styled(if selected { "› " } else { "  " }, accent),
                             Span::styled(
+                                if self.messages.target["inbox"] == true {
+                                    format!(
+                                        "{} · ",
+                                        self.messages.conversation_label(&v["conversation_id"])
+                                    )
+                                } else {
+                                    String::new()
+                                },
+                                Style::default().fg(theme::CHAT_FOCUS),
+                            ),
+                            Span::styled(
                                 v["actor"]["name"].as_str().unwrap_or("?"),
                                 chat_actor_style(v).add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(": ", muted),
                             Span::styled(
-                                v["body"].as_str().unwrap_or("").lines().next().unwrap_or(""),
+                                v["body"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .lines()
+                                    .next()
+                                    .unwrap_or(""),
                                 text_style,
                             ),
                         ])
@@ -1094,16 +1223,28 @@ impl App {
                             ),
                             Span::styled(
                                 if read { "read" } else { "unread" },
-                                if read { muted } else { Style::default().fg(theme::CHAT_TAG) },
+                                if read {
+                                    muted
+                                } else {
+                                    Style::default().fg(theme::CHAT_TAG)
+                                },
                             ),
                         ])];
-                        lines.extend(v["body"].as_str().unwrap_or("").lines().map(|line| {
-                            Line::styled(line.to_owned(), text_style)
-                        }));
+                        lines.extend(
+                            v["body"]
+                                .as_str()
+                                .unwrap_or("")
+                                .lines()
+                                .map(|line| Line::styled(line.to_owned(), text_style)),
+                        );
                         if !tags.is_empty() {
                             lines.push(Line::styled(tags, Style::default().fg(theme::CHAT_TAG)));
                         }
-                        lines.extend(links.lines().map(|line| Line::styled(line.to_owned(), accent)));
+                        lines.extend(
+                            links
+                                .lines()
+                                .map(|line| Line::styled(line.to_owned(), accent)),
+                        );
                         if !delivery.is_empty() {
                             lines.push(Line::styled(delivery, muted));
                         }
@@ -1215,11 +1356,55 @@ impl App {
         } else {
             theme::CHAT_OWNER
         });
+        if self.messages.management_view() {
+            let mut help: Vec<_> =
+                manage::wrap_readable(&self.messages.management_help(), rows[2].width as usize)
+                    .into_iter()
+                    .take(3)
+                    .map(|s| Line::styled(s, muted))
+                    .collect();
+            help.push(Line::styled(
+                if self.messages.saved.management.pending.is_some() {
+                    format!("{status} · R retries pending operation")
+                } else {
+                    status.into()
+                },
+                status_style,
+            ));
+            frame.render_widget(Paragraph::new(help), rows[2]);
+            return;
+        }
         frame.render_widget(
             Paragraph::new(vec![
-                chat_help(&[("c", "compose"), ("r", "reply"), ("t", "thread"), ("n", "channel"), ("/", "filter"), ("e", "tags/mentions/links")]),
-                chat_help(&[("s", "DM session"), ("N", "rename session"), ("]", "older"), ("g", "refresh"), ("w", "save draft to file")]),
-                Line::styled(format!("{}{}", if self.messages.busy { "Working… " } else { "" }, status), status_style),
+                chat_help(&[
+                    ("c", "compose"),
+                    ("r", "reply"),
+                    ("t", "thread"),
+                    ("n", "channel"),
+                    ("/", "filter"),
+                    ("e", "tags/mentions/links"),
+                ]),
+                chat_help(&[
+                    ("s", "DM session"),
+                    ("N", "rename session"),
+                    ("]", "older"),
+                    ("g", "refresh"),
+                    ("W", "monitor"),
+                    ("f", "preferences"),
+                    ("w", "save draft"),
+                ]),
+                Line::styled(
+                    format!(
+                        "{}{}",
+                        if self.messages.busy {
+                            "Working… "
+                        } else {
+                            ""
+                        },
+                        status
+                    ),
+                    status_style,
+                ),
             ]),
             rows[2],
         );
@@ -1229,8 +1414,15 @@ impl App {
 fn chat_block(title: impl Into<String>, focused: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused { theme::CHAT_FOCUS } else { theme::CHAT_BORDER }))
-        .title(Span::styled(title.into(), Style::default().fg(theme::CHAT_FOCUS)))
+        .border_style(Style::default().fg(if focused {
+            theme::CHAT_FOCUS
+        } else {
+            theme::CHAT_BORDER
+        }))
+        .title(Span::styled(
+            title.into(),
+            Style::default().fg(theme::CHAT_FOCUS),
+        ))
 }
 
 fn chat_actor_style(message: &Value) -> Style {
@@ -1249,8 +1441,14 @@ fn chat_help(items: &[(&str, &str)]) -> Line<'static> {
         if i > 0 {
             spans.push(Span::styled(" · ", Style::default().fg(theme::CHAT_MUTED)));
         }
-        spans.push(Span::styled(key.to_string(), Style::default().fg(theme::CHAT_FOCUS)));
-        spans.push(Span::styled(format!(" {label}"), Style::default().fg(theme::CHAT_MUTED)));
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default().fg(theme::CHAT_FOCUS),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(theme::CHAT_MUTED),
+        ));
     }
     Line::from(spans)
 }
@@ -1289,13 +1487,13 @@ fn wrap_draft(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Home {
+    pub(super) struct Home {
         old: Option<std::ffi::OsString>,
         _temp: tempfile::TempDir,
         sockets: Vec<(String, Option<std::ffi::OsString>)>,
     }
     impl Home {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let t = tempfile::tempdir().unwrap();
             let old = std::env::var_os("HOME");
             let sockets = ["CM_DAEMON_SOCKET", "CM_TUI_SOCKET"]

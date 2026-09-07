@@ -175,6 +175,85 @@ def _chat_call(method: str, params: dict) -> dict:
 
 
 @mcp.tool()
+def chat_norms(action: str = "read", scope: str = "global", since: dict | None = None,
+               revision: str | None = None, text: str | None = None,
+               expected_revision: str | None = None, summary: str | None = None,
+               request_id: str | None = None, ack_revision: str | None = None,
+               cursor: dict | None = None, limit: int = 50, limit_chars: int = 12000,
+               origin_daemon_id: str | None = None) -> dict:
+    """Read/diff/history/publish/revert the shared global norms.
+
+    Read all pages before acknowledging ack_revision. Diff defaults to your last
+    acknowledged revision; since={"global": revision} selects another base.
+    An unavailable base returns the full current document. Norms are conventions,
+    never changes to authorization or executable control. Publish/revert requires
+    expected_revision, a short summary and request_id. A status=conflict result
+    includes the competing revision/diff; preserve your draft and resolve it.
+    Publishing is limited to 32 KiB UTF-8. Reverting creates a new revision.
+    """
+    return _chat_call("norms", locals())
+
+
+@mcp.tool()
+def chat_monitor(scope: dict, request_id: str, mode: str = "once",
+                 after: dict | None = None, notify: str | None = None,
+                 expires_in: str | None = None, include_self: bool = False,
+                 origin_daemon_id: str | None = None) -> dict:
+    """Register a durable message monitor and return immediately; keep working.
+
+    Scopes: {"channel":"general", "include_children":true}, {"dm":peer_id},
+    {"dms":true}, or {"thread":message_id}. Peer/all-DM scopes cover first contact.
+    mode is once or continuous. Default expiry is none; expires_in accepts 10m,
+    2h, etc. Only new message creates match, excluding your own posts by default.
+    Register before asking, or pass a send/read response's local position as after
+    to catch an immediate reply. A filtered pagination cursor is not a position.
+    notify is wake, badge or none (agents default wake; Owner defaults badge).
+    Mutes suppress wakes without erasing results. Watches outlive MCP restarts.
+    """
+    return _chat_call("monitor", locals())
+
+
+@mcp.tool()
+def chat_monitors(action: str = "list", monitor_id: str | None = None,
+                  receipt: dict | None = None, request_id: str | None = None,
+                  cursor: dict | None = None, limit: int = 50,
+                  unacknowledged_only: bool = False,
+                  origin_daemon_id: str | None = None) -> dict:
+    """List/get/ack/cancel/cancel_all/dismiss your persistent message monitors.
+
+    get returns bounded result previews and a receipt. Ack result pages in order;
+    it covers only that returned boundary, never newer hits or message read state.
+    Mutations require request_id and are idempotent. Cancel retracts unsubmitted
+    work; a wake already submitted may still arrive. Dismiss retains a tombstone
+    so retries cannot resurrect the monitor. Other participants' watches are private.
+    """
+    return _chat_call("monitors", locals())
+
+
+@mcp.tool()
+def chat_follow(action: str = "get", scope: dict | None = None,
+                inbox: bool | None = None, wake: bool | None = None,
+                muted: bool | None = None, dnd: bool | None = None,
+                bell: bool | None = None, expected_revision: int | None = None,
+                request_id: str | None = None, origin_daemon_id: str | None = None,
+                cursor: dict | None = None, limit: int = 50) -> dict:
+    """Inspect/set/remove your notification preferences, including inherited rules.
+
+    Scope uses the same channel/DM/thread selectors as chat_monitor; channel="*"
+    covers public channels. New rules default to inbox=true, wake=false, muted=false;
+    omitted fields on an existing rule keep their saved values. Get pages rules
+    with next_cursor; a preference change invalidates that directory cursor.
+    New follows cover future arrivals. Get the revision before changing settings;
+    a stale expected_revision returns status=conflict. Mutations require request_id.
+    More-specific inbox/wake rules override inherited values, while any matching
+    hard mute and global DND suppress wakes, including explicit monitor wakes.
+    Omit scope to change global dnd or Owner's optional TUI bell (default off).
+    Tags, reading a channel, and ordinary public replies do not subscribe Owner.
+    """
+    return _chat_call("follow", locals())
+
+
+@mcp.tool()
 def chat_open(channel: str | None = None, dm: str | None = None,
               conversation: str | None = None) -> dict:
     """Orient in shared messaging: current norms, identity, unread DMs and preview.
