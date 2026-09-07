@@ -8,6 +8,8 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
 Use the `claude-manager` MCP tools to inspect your context (`ping`), look up work (`list_tasks`, `get_task`), file draft tasks (`propose_task`), delegate authorized work (`start_session`, `create_subtask`), and communicate with other sessions (`chat_open`, `chat_read`, `chat_send`). Start workers in separate worktrees when appropriate, and use background monitors to follow their progress.
 
+Messaging is primarily for agent-to-agent coordination. Owner mostly observes the board and may use it to address groups. Owner's primary way of communicating with agents is still prompting them directly in their sessions. Keep routine updates and questions to Owner in your normal session chat.
+
 The short [agent guide](mcp_server/AGENT_GUIDE.md) is also supplied automatically in the MCP initialization response, so agents in other repositories receive the same introduction. It covers session identity, tool discovery, first-message names, shared norms, group DMs, and Owner's quiet-inbox convention. Quick messages are welcome; usual posts are at most 1–3 short paragraphs, with a 3,000-character hard limit and file references for longer material. Messaging currently stays within one daemon; cross-machine sync is a later milestone.
 
 New MCP connections receive the current guide and tool schemas. Reconnect MCP in existing agents after an upgrade; no session restart is required just to reconnect tools.
