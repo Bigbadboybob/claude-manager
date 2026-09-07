@@ -4,6 +4,14 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
 > **Note:** This project started out cloud-first, but in practice local + worktrees turned out to be much smoother and is now the default mode. Cloud support is retained but secondary. When working on this project, assume local usage unless the user explicitly mentions cloud.
 
+## If you are running inside CM
+
+Use the `claude-manager` MCP tools to inspect your context (`ping`), look up work (`list_tasks`, `get_task`), file draft tasks (`propose_task`), delegate authorized work (`start_session`, `create_subtask`), and communicate with other sessions (`chat_open`, `chat_read`, `chat_send`). Start workers in separate worktrees when appropriate, and use background monitors to follow their progress.
+
+The short [agent guide](mcp_server/AGENT_GUIDE.md) is also supplied automatically in the MCP initialization response, so agents in other repositories receive the same introduction. It covers session identity, tool discovery, first-message names, shared norms, group DMs, and Owner's quiet-inbox convention. Quick messages are welcome; usual posts are at most 1–3 short paragraphs, with a 3,000-character hard limit and file references for longer material. Messaging currently stays within one daemon; cross-machine sync is a later milestone.
+
+New MCP connections receive the current guide and tool schemas. Reconnect MCP in existing agents after an upgrade; no session restart is required just to reconnect tools.
+
 ## Project overview
 
 - **`tui/`** — Rust TUI client. The user-facing entry point. Workflow orchestration, planning board rendering, API communication, and the attach-stream side of session I/O. Build with `cargo build --workspace` (the TUI binary lives in `tui/` and depends on `daemon/`).
@@ -245,18 +253,7 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
 - `/home/lucas/.cm/daemon.toml` — daemon config (mode 0600). Sets `mcp_server_path`, `api_url = "http://localhost:8000"`, `api_token`, `log_path`, `workflows_dir`, and `[auth] mode = "ssh-trust"` (the SSH session IS the auth — no separate operator token over SSH-unix).
 - `/etc/systemd/system/cm-daemon.service` — `Restart=always`, runs as user `lucas`, `Environment=PATH=/opt/cm-daemon/mcp_server/.venv/bin:...`. Being a **system** unit run as `lucas`, it has no user-session bus, so `systemd-run --user --scope` (memory caps) can't create scopes: the daemon's capability probe degrades every fire to **uncapped** by default. To enable per-session memory caps, install `deploy/cm-daemon.service.d/user-scope-cap.conf` (adds `XDG_RUNTIME_DIR=/run/user/%U`) + `loginctl enable-linger lucas`. See `DESIGN_MEMORY_CAP.md` → "Daemon-side (headless) capping".
 
-Deploying daemon-side changes:
-
-```bash
-# Binary
-cargo build --release -p cm-daemon  # locally
-gcloud compute scp target/release/cm-daemon cm-manager:/tmp/cm-daemon --zone=us-east4-a --project=claude-manager-prod
-ssh cm-manager 'sudo cp /tmp/cm-daemon /opt/cm-daemon/cm-daemon && sudo systemctl restart cm-daemon'
-
-# MCP server / workflows
-gcloud compute scp --recurse mcp_server/ cm-manager:/tmp/ --zone=us-east4-a --project=claude-manager-prod
-ssh cm-manager 'sudo cp -r /tmp/mcp_server/* /opt/cm-daemon/mcp_server/ && sudo systemctl restart cm-daemon'
-```
+Deploy daemon and MCP changes using [HOWTO_HOLDER_BRAIN_SPLIT.md §3](HOWTO_HOLDER_BRAIN_SPLIT.md#3-routine-deploys-brain-code--the-weekly-case). Stage the binary and the complete `mcp_server/` payload (including `AGENT_GUIDE.md`), preflight, then call `daemon.restart` to rotate only the brain. Do not use `systemctl restart` or the legacy `cm-redeploy --manager` path for routine deploys: they kill sessions.
 
 `claude` (npm `@anthropic-ai/claude-code`) and `codex` (npm `@openai/codex`) are installed system-wide so the daemon can spawn them from any session.
 

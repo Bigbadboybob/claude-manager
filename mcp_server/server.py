@@ -1,8 +1,9 @@
-"""MCP server for Claude instances to propose tasks to the backlog."""
+"""Claude Manager MCP tools for agent sessions, tasks, and messaging."""
 
 import asyncio
 import json
 import os
+from pathlib import Path
 import re
 import socket
 import sys
@@ -62,7 +63,10 @@ from mcp_server.monitor import (
 )
 from mcp_server import async_monitor
 
-mcp = FastMCP("claude-manager")
+# Supplied in the MCP initialization response, independent of the agent's
+# project. Keep the short introduction with the deployed MCP server.
+AGENT_GUIDE = Path(__file__).with_name("AGENT_GUIDE.md").read_text(encoding="utf-8")
+mcp = FastMCP("claude-manager", instructions=AGENT_GUIDE)
 
 # 11g-2 (A2): the `_append_event` direct file-write helper and the
 # `_workflow_run_dir` accessor have been retired. Pre-11g-2 the
