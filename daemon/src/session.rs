@@ -1247,7 +1247,7 @@ pub struct DaemonSession {
 /// which rebuild a path from the id. Returns `None` for a pathless or
 /// extension-less value so the manifest records "no transcript yet"
 /// honestly rather than guessing.
-pub(crate) fn transcript_id_from_path(path: &str) -> Option<String> {
+pub fn transcript_id_from_path(path: &str) -> Option<String> {
     let stem = std::path::Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())?;
@@ -1267,7 +1267,7 @@ pub(crate) fn transcript_id_from_path(path: &str) -> Option<String> {
 /// `compose_restore_params` to persisted resume ids so legacy
 /// manifest rows that stored the full stem (pre-phase-4f) are
 /// normalized at restore time instead of resuming a phantom id.
-pub(crate) fn codex_rollout_uuid_from_stem(stem: &str) -> Option<String> {
+pub fn codex_rollout_uuid_from_stem(stem: &str) -> Option<String> {
     let rest = stem.strip_prefix("rollout-")?;
     if rest.len() < 36 {
         return None;

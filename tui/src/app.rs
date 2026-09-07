@@ -45,6 +45,8 @@ mod lifecycle;
 use lifecycle::*;
 mod input;
 use input::*;
+mod transcripts;
+use transcripts::*;
 mod draw;
 mod messages;
 

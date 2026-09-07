@@ -2860,15 +2860,23 @@ pub fn session_turn_ended(
             && session.transcript_path.as_deref() != Some(reported);
         if changed {
             let reported = reported.to_string();
+            let mut entry = None;
             if let Some(session) = state.sessions.get_mut(&p.session_uid) {
                 // Mirror `set_transcript_path`: a real rotation bumps the
                 // generation so an agent's read cursor is invalidated.
                 session.generation = session.generation.saturating_add(1);
                 session.transcript_path = Some(reported);
+                entry = Some(transcript_updated_entry(session));
             }
             // Persist so a restart resumes the conversation the session is
             // in RIGHT NOW, not the one it started in.
             state.persist_sessions_best_effort();
+            // proper-resume: and tell every watcher, so the TUI's
+            // manifest row (what A-R and a user-owned restore resume
+            // from) follows the in-pane `/resume` within one turn.
+            if let Some(entry) = entry {
+                broadcast_transcript_updated(&state, &p.session_uid, entry);
+            }
         }
     }
     Ok(json!({ "ok": true }))
@@ -3029,17 +3037,66 @@ pub fn set_transcript_path(
     }
     session.transcript_path = Some(p.transcript_path);
     let generation = session.generation;
+    let entry = transcript_updated_entry(session);
     // P0 session durability (S1): a freshly-resolved transcript is the
     // resume key — persist so a restart can `--resume` this session's
     // history. The read of `generation` above ends the `&mut session`
     // borrow, freeing `state` for the immutable persist call.
     if changed {
         state.persist_sessions_best_effort();
+        broadcast_transcript_updated(&state, &p.session_uid, entry);
     }
     Ok(json!({
         "ok": true,
         "generation": generation,
     }))
+}
+
+/// The `manifest.watch` `Updated` payload for a transcript rebind: the
+/// identity fields the `Added` broadcast carries plus the resume key
+/// (`transcript_path` and its derived `transcript_id`) and the
+/// generation the rebind bumped to. A consumer can locate the row and
+/// converge on the daemon's truth without a re-query.
+///
+/// proper-resume: the daemon is the ONLY party that learns about an
+/// in-pane `/resume` (the Stop hook reports the live path every turn)
+/// or a codex rollout rotation (the `/proc` watcher). Pre-fix that
+/// knowledge stopped at `persist_sessions_best_effort`, so the TUI's
+/// manifest row kept the id detected at spawn and every TUI-driven
+/// respawn (A-R, startup restore of a user-owned row) resumed the
+/// wrong conversation — the "I have to /resume again after every
+/// restart" complaint.
+pub(crate) fn transcript_updated_entry(s: &crate::session::DaemonSession) -> Value {
+    json!({
+        "uid": s.uid,
+        "workspace_id": s.workspace_id,
+        "label": s.title,
+        "session_type": s.session_type,
+        "workflow_run_id": s.workflow_run_id,
+        "workflow_role": s.workflow_role,
+        "continuous_task_id": s.continuous_task_id,
+        "task_id": s.task_id,
+        "transcript_path": s.transcript_path,
+        "transcript_id": s
+            .transcript_path
+            .as_deref()
+            .and_then(crate::session::transcript_id_from_path),
+        "generation": s.generation,
+    })
+}
+
+/// Broadcast a transcript rebind to every `manifest.watch` subscriber.
+/// Takes the locked state so callers broadcast from inside their
+/// critical section — `ManifestWatcher::broadcast` is non-blocking
+/// (bounded channels, drops on a stalled consumer), so holding the
+/// lock across it is the same cost as the existing `Exited` path.
+fn broadcast_transcript_updated(state: &DaemonState, uid: &str, entry: Value) {
+    state
+        .manifest_watcher
+        .broadcast(crate::manifest::ManifestDiff::Updated {
+            uid: uid.to_string(),
+            entry,
+        });
 }
 
 // ============================================================
@@ -16542,6 +16599,10 @@ mod tests {
             .expect("transcript dir");
         let fresh = own_dir.join("new-conversation.jsonl");
 
+        let (rx, _guard) = {
+            let s = state.lock().unwrap();
+            s.manifest_watcher.subscribe()
+        };
         session_turn_ended(
             &state,
             &json!({
@@ -16559,6 +16620,35 @@ mod tests {
                 "a rotation must re-stamp the resume key",
             );
         }
+        // proper-resume: the re-stamp is BROADCAST so the TUI's manifest
+        // row (what A-R / a user-owned restore resume from) converges on
+        // the daemon's resume key instead of the id detected at spawn.
+        match rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("a transcript rotation must broadcast a manifest Updated")
+        {
+            crate::manifest::ManifestDiff::Updated { uid: got, entry } => {
+                assert_eq!(got, uid);
+                assert_eq!(entry["transcript_path"], json!(fresh.to_string_lossy()));
+                assert_eq!(entry["transcript_id"], json!("new-conversation"));
+                assert_eq!(entry["workspace_id"], json!("ws-t"));
+            }
+            other => panic!("expected ManifestDiff::Updated, got {:?}", other),
+        }
+        // Re-reporting the same path is a no-op: no bump, no broadcast.
+        session_turn_ended(
+            &state,
+            &json!({
+                "session_uid": uid,
+                "transcript_path": fresh.to_string_lossy(),
+            }),
+            None,
+        )
+        .expect("turn_ended ok");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "an unchanged path must not broadcast",
+        );
 
         // A path outside the session's own transcript dir is refused.
         session_turn_ended(
@@ -23149,6 +23239,71 @@ mod tests {
     /// revoked) and BROADCAST as a manifest `Updated` carrying the
     /// grant, so a diverged watcher converges. A no-op re-assert
     /// reports `changed: false` but still broadcasts.
+    /// proper-resume: `session.set_transcript_path` is the funnel for
+    /// the TUI's own detector push AND the codex `/proc` rollout
+    /// watcher. A real rotation broadcasts a manifest `Updated`
+    /// carrying the new resume key (path + derived id) so every
+    /// watcher converges; a same-path re-push stays silent.
+    #[test]
+    fn set_transcript_path_broadcasts_updated_on_rotation_only() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let wt = std::env::temp_dir();
+            start_session(
+                &state,
+                &json!({
+                    "uid": "ts-1a2b3c4d5e6f0031-0",
+                    "session_type": "codex",
+                    "workspace_id": "ws-tp",
+                    "working_dir": wt.to_str().unwrap(),
+                    "worktree_path": wt.to_str().unwrap(),
+                    "label": "esmisc",
+                    "argv": ["/bin/sleep", "120"],
+                }),
+            )
+            .expect("start_session ok");
+            let (rx, _guard) = {
+                let s = state.lock().unwrap();
+                s.manifest_watcher.subscribe()
+            };
+            let rollout = "/home/u/.codex/sessions/2026/09/06/\
+                           rollout-2026-09-06T13-15-34-01a077ee-d12c-7611-a855-440c37783e88.jsonl";
+            set_transcript_path(
+                &state,
+                &json!({ "session_uid": "ts-1a2b3c4d5e6f0031-0", "transcript_path": rollout }),
+            )
+            .expect("stamp ok");
+            match rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("a rotation must broadcast")
+            {
+                crate::manifest::ManifestDiff::Updated { uid, entry } => {
+                    assert_eq!(uid, "ts-1a2b3c4d5e6f0031-0");
+                    assert_eq!(entry["transcript_path"], json!(rollout));
+                    // The id is the codex thread uuid (the `codex resume`
+                    // key), not the full rollout stem.
+                    assert_eq!(
+                        entry["transcript_id"],
+                        json!("01a077ee-d12c-7611-a855-440c37783e88")
+                    );
+                    assert_eq!(entry["session_type"], json!("codex"));
+                    assert_eq!(entry["generation"], json!(1));
+                }
+                other => panic!("expected ManifestDiff::Updated, got {:?}", other),
+            }
+            // Same path again: idempotent, silent.
+            set_transcript_path(
+                &state,
+                &json!({ "session_uid": "ts-1a2b3c4d5e6f0031-0", "transcript_path": rollout }),
+            )
+            .expect("re-push ok");
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+                "a same-path re-push must not broadcast",
+            );
+        });
+    }
+
     #[test]
     fn set_global_perms_persists_grant_and_broadcasts_updated() {
         let _tmp = with_temp_home(|| {
