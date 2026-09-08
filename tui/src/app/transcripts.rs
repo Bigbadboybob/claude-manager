@@ -102,7 +102,7 @@ impl App {
                 self.set_status_msg("Workspace host is unavailable"); return;
             };
             let token = self.host_pool.operator_token_for(&ws.host_id);
-            match crate::client_session::rpc_continuous_control(&socket, &token, "session.list_transcripts",
+            match crate::client_session::rpc_catalog_control(&socket, &token, "session.list_transcripts",
                 serde_json::json!({"workspace_id": workspace_id, "engine": engine}))
                 .and_then(|value| Ok(serde_json::from_value::<Vec<TranscriptCandidate>>(value)?)) {
                 Ok(candidates) => candidates,

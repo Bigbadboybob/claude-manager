@@ -637,6 +637,15 @@ pub(crate) fn rpc_continuous_control(daemon_socket: &Path, token: &str, method: 
     response.result.ok_or_else(|| anyhow::anyhow!("daemon returned no result"))
 }
 
+/// Catalog requests use the host's operator channel, independent of continuous tasks.
+pub(crate) fn rpc_catalog_control(
+    socket: &Path, token: &str, method: &str, params: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    anyhow::ensure!(matches!(method, "session.list_transcripts" | "snapshot.control"), "unsupported catalog method");
+    let request = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
+    rpc_round_trip(socket, &request)?.result.context("catalog response missing result")
+}
+
 fn rpc_round_trip_with_read_timeout(
     daemon_socket: &Path,
     req: &Request,
@@ -3907,6 +3916,34 @@ mod tests {
     }
 
     // --- Initial PTY size plumbing (slice-10c-e-2 review-3 fix) -----------
+
+    #[test]
+    fn remote_catalog_client_routes_snapshot_and_transcript_requests() {
+        use cm_daemon::control::{wire, protocol::Response};
+        use std::os::unix::net::UnixListener;
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("catalog.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = wire::read_request(&mut stream).unwrap().unwrap();
+                wire::write_response(&mut stream, &Response::ok(req.id.clone(), serde_json::json!([]))).unwrap();
+                requests.push(req);
+            }
+            requests
+        });
+        let store = crate::agent_memory::SnapshotStore::Remote { socket:socket.clone(), token:"op-catalog".into() };
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(rpc_catalog_control(&socket, "op-catalog", "session.list_transcripts",
+            serde_json::json!({"workspace_id":"ws-remote", "engine":"codex"})).unwrap(), serde_json::json!([]));
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].method, "snapshot.control");
+        assert_eq!(requests[0].params["action"], "list");
+        assert_eq!(requests[1].method, "session.list_transcripts");
+        assert_eq!(requests[1].params["workspace_id"], "ws-remote");
+    }
 
     #[test]
     fn remote_launch_wire_preserves_seed_resume_and_in_place() {

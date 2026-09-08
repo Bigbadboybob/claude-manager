@@ -17,7 +17,7 @@ impl SnapshotStore {
     pub fn request<T: serde::de::DeserializeOwned>(&self, params: serde_json::Value) -> Result<T> {
         let value = match self {
             Self::Local => catalog(&params)?,
-            Self::Remote { socket, token } => crate::client_session::rpc_continuous_control(
+            Self::Remote { socket, token } => crate::client_session::rpc_catalog_control(
                 socket,
                 token,
                 "snapshot.control",
