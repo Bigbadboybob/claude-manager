@@ -59,7 +59,6 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::Term;
 use anyhow::Context;
 use cm_daemon::control::protocol::{Caller, ErrorCode, Request, Response};
@@ -445,8 +444,7 @@ impl ClientSession {
         // downstream callers.
         let (event_tx, event_rx) = mpsc::channel();
         let event_proxy = EventProxy::new(event_tx);
-        let mut term_config = TermConfig::default();
-        term_config.kitty_keyboard = true;
+        let term_config = crate::session::terminal_config();
 
         let size = TermSize {
             columns: config.cols as usize,

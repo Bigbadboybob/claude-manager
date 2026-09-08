@@ -439,10 +439,6 @@ impl App {
         // user isn't looking at it). Without this gate, a chatty agent
         // running in a non-focused pane drives the redraw loop at PTY-
         // batch frequency and starves keystroke→paint latency.
-        let focused_idx: Option<(usize, usize)> = match &self.cursor {
-            Cursor::Session(wi, si) => Some((*wi, *si)),
-            _ => None,
-        };
         let mut visible_dirty = false;
         struct DetectedSid {
             ws_id: String,
@@ -525,7 +521,9 @@ impl App {
         let reconnecting_snapshot = self.reconnecting_sessions.clone();
         for (wi, ws) in self.workspaces.iter_mut().enumerate() {
             for (si, ts) in ws.sessions.iter_mut().enumerate() {
-                let is_focused = focused_idx == Some((wi, si));
+                // A workspace/task with one session also displays a terminal.
+                // Match drawing/input's active_session(), including those rows.
+                let is_focused = visible_uid.as_deref() == Some(ts.uid.as_str());
                 // True while this remote session's PTY I/O stream is dead and
                 // awaiting reattach. Seeded from the snapshot (sessions already
                 // reconnecting from a prior tick) and flipped on below if THIS
@@ -681,17 +679,9 @@ impl App {
                             );
                             let _ = std::io::Write::flush(&mut std::io::stdout());
                         }
-                        TermEvent::ClipboardLoad(_, formatter) => {
-                            // Read clipboard via OSC 52 is unreliable; try xclip/xsel.
-                            if let Ok(output) = std::process::Command::new("xclip")
-                                .args(["-selection", "clipboard", "-o"])
-                                .output()
-                            {
-                                if output.status.success() {
-                                    let text = String::from_utf8_lossy(&output.stdout);
-                                    let response = formatter(&text);
-                                    let _ = ts.session.write(response.as_bytes());
-                                }
+                        TermEvent::ClipboardLoad(selection, formatter) => {
+                            if is_focused {
+                                crate::clipboard::request(selection, formatter, ts.session.sender.clone());
                             }
                         }
                         _ => {}
@@ -3195,6 +3185,22 @@ mod apply_manifest_diff_tests {
         // `try_recv` only needs the queued event, so dropping here is
         // fine too — but be explicit.
         std::mem::forget(tx);
+    }
+
+    #[test]
+    fn single_session_workspace_and_task_rows_repaint_terminal_output() {
+        let mut app = build_app_with_session("ts-visible");
+        app.workspaces[0].sessions[0].task_id = Some("task-visible".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.workspaces[0].sessions[0].session.event_rx = rx;
+        for cursor in [Cursor::Workspace(0), Cursor::Task { ws_idx: 0, task_id: "task-visible".into() }] {
+            app.cursor = cursor;
+            app.drain_terminal_events();
+            app.needs_redraw = false;
+            tx.send(TermEvent::Wakeup).unwrap();
+            app.drain_terminal_events();
+            assert!(app.needs_redraw, "the displayed terminal must repaint without another keypress");
+        }
     }
 
     /// An agent-spawned, non-workflow row whose exit arrives on the

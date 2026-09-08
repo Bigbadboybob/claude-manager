@@ -7,6 +7,7 @@ mod attach_writer;
 mod attached_pty;
 mod backend;
 mod client_session;
+mod clipboard;
 mod config;
 mod control;
 mod daemon_launch;

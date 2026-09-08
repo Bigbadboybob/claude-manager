@@ -16,6 +16,17 @@ use std::sync::mpsc;
 
 use crate::memory_cap::MemoryCap;
 
+pub(crate) fn terminal_config() -> TermConfig {
+    TermConfig {
+        kitty_keyboard: true,
+        scrolling_history: 1500,
+        // Neovim's OSC 52 provider queries the viewing machine's clipboard.
+        // The app services reads only for the focused pane, off its UI thread.
+        osc52: alacritty_terminal::term::Osc52::CopyPaste,
+        ..TermConfig::default()
+    }
+}
+
 /// Proxy that forwards alacritty terminal events to a channel.
 #[derive(Clone)]
 pub struct EventProxy {
@@ -136,14 +147,12 @@ impl Session {
         // records `\x1b[>Nu` push/pop sequences from agents like codex —
         // otherwise `term.mode()` never reflects DISAMBIGUATE_ESC_CODES
         // and our Enter encoding logic in app.rs has nothing to react to.
-        let mut config = TermConfig::default();
-        config.kitty_keyboard = true;
+        let config = terminal_config();
         // Alacritty defaults to 10_000 lines of scrollback per Term. With
         // many sessions open this dominates RAM in practice (each line
         // holds `num_cols` cells, ~28 bytes each → ~56 MB per session at
         // 200 cols when fully populated). We keep transcripts on disk for
         // long history, so a much smaller in-memory window is fine here.
-        config.scrolling_history = 1500;
 
         let size = TermSize {
             columns: cols as usize,

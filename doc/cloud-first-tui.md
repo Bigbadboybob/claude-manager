@@ -24,13 +24,22 @@ A missing explicitly selected resume transcript is an error, not a fresh launch.
 Deploy matching daemons before the TUI. Brain-only deployment and the ten-minute
 stability gate follow [the holder guide](../HOWTO_HOLDER_BRAIN_SPLIT.md).
 
-Validation: 852 TUI tests and 1,364 daemon library tests passed (four daemon tests
+Validation: 858 TUI tests and 1,364 daemon library tests passed (four daemon tests
 ignored), including remote wire options, host defaults, host switching, catalog
 authorization, in-place preservation, seed rollback and resume composition.
 Snapshot storage's existing 32 tests now run in the daemon library.
 The remote catalog client has its own method gate; the actual cloud snapshot
 picker was verified in Kitty after correcting the continuous-control gate it
 previously called.
+
+Cloud Neovim uses OSC 52 through the TUI for the viewing machine's clipboard.
+Clipboard reads support Wayland and X11, run on a bounded background worker,
+and reply to the requesting attachment. Reads are served for the visible
+terminal, including single-session workspace/task rows. Those rows also repaint
+on terminal output; previously only an explicit session row passed that gate.
+Local and attached terminals share the 1,500-line scrollback setting.
+Actual cloud Neovim edit/save, copy/paste in both directions, and unchanged
+editor process identities across a TUI restart were verified in Kitty.
 
 This implementation record does not certify the data/session migration. Its
 cutover and verification are tracked separately in
