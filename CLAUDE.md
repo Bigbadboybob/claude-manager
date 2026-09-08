@@ -4,6 +4,10 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
 > **Note:** This project started out cloud-first, but in practice local + worktrees turned out to be much smoother and is now the default mode. Cloud support is retained but secondary. When working on this project, assume local usage unless the user explicitly mentions cloud.
 
+## Repository workflow
+
+Work on branches and merge tested changes directly into `main`. Owner does not use pull requests in this repository; do not create them.
+
 ## If you are running inside CM
 
 Use the `claude-manager` MCP tools to inspect your context (`ping`), look up work (`list_tasks`, `get_task`), file draft tasks (`propose_task`), delegate authorized work (`start_session`, `create_subtask`), and communicate with other sessions (`chat_open`, `chat_read`, `chat_send`). Start workers in separate worktrees when appropriate, and use background monitors to follow their progress.
