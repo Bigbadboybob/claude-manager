@@ -11734,6 +11734,7 @@ pub fn trigger(
             trigger_source: trigger_source.clone(),
         });
         t.current_session_uid = Some(session_uid.clone());
+        if let Some(binding)=&mut t.messaging {binding.handover(&session_uid);}
         t.run_count = t.run_count.saturating_add(1);
         t.last_fired_at = started_at;
         t.in_flight = None;
@@ -12929,6 +12930,8 @@ struct ContinuousCreateParams {
     /// Durable task id (planning slug, e.g. `"bug-triage"`). Doubles as the
     /// default worktree slug + workspace key. Validated by `validate_task_id`.
     task_id: String,
+    #[serde(default)]
+    messaging: Option<Value>,
     /// Optional backing planning-task UUID. When set, the spawned session's
     /// `task_id` is this UUID (not the slug above), so an orchestrator that
     /// spawns subtasks via `create_subtask` has a real planning parent. The
@@ -13020,6 +13023,8 @@ pub fn continuous_create(
     let p: ContinuousCreateParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.create params: {}", e)))?;
 
+    let messaging=crate::messaging::tasks::configuration(state_arc,p.messaging.as_ref().unwrap_or(&Value::Null))
+        .map_err(|e|(ErrorCode::InvalidParams,e.to_string()))?;
     // Containment-safe task_id allowlist BEFORE any path build — it keys the
     // worktree slug, the workspace, and the `~/.cm/continuous-tasks/<id>` dir.
     crate::continuous::task::validate_task_id(&p.task_id)
@@ -13150,6 +13155,7 @@ pub fn continuous_create(
         p.default_prompt.clone(),
     );
     task.planning_task_id = p.planning_task_id.clone();
+    task.messaging = messaging;
     task.project = p.project.clone();
     task.repo = Some(p.repo_url.clone());
     if let Some(host) = p.host.clone() {
@@ -13313,8 +13319,20 @@ pub fn continuous_update(
             .map_err(|e| (ErrorCode::InvalidParams, format!("mem_cap_bytes: {}", e)))?;
     }
 
+    let messaging=if let Some(value)=params.get("messaging") {
+        Some(crate::messaging::tasks::configuration(_state_arc,value).map_err(|e|(ErrorCode::InvalidParams,e.to_string()))?)
+    } else {None};
     let mut updated: Vec<&'static str> = Vec::new();
     crate::continuous::task::modify(&p.task_id, |t| {
+        if let Some(config)=&messaging {
+            let unchanged = t.messaging.as_ref().zip(config.as_ref()).is_some_and(|(old, next)|
+                old.space_id == next.space_id && old.channel_id == next.channel_id);
+            if !unchanged { t.messaging = config.clone(); }
+            if let (Some(binding), Some(uid)) = (&mut t.messaging, &t.current_session_uid) {
+                binding.handover(uid);
+            }
+            updated.push("messaging");
+        }
         if let Some(v) = &p.default_prompt {
             t.default_prompt = v.clone();
             updated.push("default_prompt");
@@ -29681,6 +29699,21 @@ mod tests {
                 crate::continuous::task::load_one("ct-up").unwrap().compact_every,
                 None,
             );
+
+            // A channel subscription is scheduler-owned and repeated config
+            // updates preserve its identity/checkpoint; null explicitly clears it.
+            crate::messaging::rpc::initialize(&state).unwrap();
+            let channel = {
+                let handle = state.lock().unwrap().messaging.clone();
+                let slot = handle.lock().unwrap();
+                slot.as_ref().unwrap().channels()[0]["id"].clone()
+            };
+            continuous_update(&state, &json!({"task_id":"ct-up","messaging":{"channel_id":channel}})).unwrap();
+            let bound = crate::continuous::task::load_one("ct-up").unwrap().messaging.unwrap();
+            continuous_update(&state, &json!({"task_id":"ct-up","messaging":{"channel_id":channel}})).unwrap();
+            assert_eq!(crate::continuous::task::load_one("ct-up").unwrap().messaging.unwrap().subscription_id, bound.subscription_id);
+            continuous_update(&state, &json!({"task_id":"ct-up","messaging":null})).unwrap();
+            assert!(crate::continuous::task::load_one("ct-up").unwrap().messaging.is_none());
 
             // Missing task → NotFound.
             let err = continuous_update(&state, &json!({"task_id":"ct-missing","label":"x"}))

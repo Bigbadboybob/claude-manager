@@ -6,6 +6,7 @@ use super::*;
 #[serde(default)]
 pub(super) struct Personal {
     pub actor: String,
+    pub revision: u64,
     pub bell_position: u64,
     pub bell_monitors: BTreeMap<String, u64>,
     pub norms_ack: Option<String>,
@@ -34,7 +35,7 @@ pub(super) struct Operation {
 }
 
 impl Store {
-    fn personal_path(&self, actor: &str) -> PathBuf {
+    pub(super) fn personal_path(&self, actor: &str) -> PathBuf {
         self.root
             .join("_state/participants")
             .join(format!("{}.json", hash(actor.as_bytes())))
@@ -70,10 +71,18 @@ impl Store {
             })
     }
 
-    pub(super) fn save_personal(&mut self, state: Personal) -> Result<()> {
+    pub(super) fn save_personal(&mut self, mut state: Personal) -> Result<()> {
+        self.ensure_messaging_writable()?;
         if let Some(reason) = &self.degraded {
             return Err(err("store_read_only", reason.clone()));
         }
+        state.revision = self
+            .personal
+            .get(&state.actor)
+            .map(|s| s.revision)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| err("counter_overflow", "Personal state revision exhausted"))?;
         if let Err(e) = atomic_replace(
             &self.personal_path(&state.actor),
             &serde_json::to_value(&state)?,
@@ -86,6 +95,7 @@ impl Store {
             return Err(err("outcome_unknown", self.degraded.clone().unwrap()));
         }
         self.personal.insert(state.actor.clone(), state);
+        self.replication.signal.signal();
         Ok(())
     }
 
@@ -101,7 +111,7 @@ impl Store {
         }
         if p["origin_daemon_id"]
             .as_str()
-            .is_some_and(|o| o != self.daemon_id)
+            .is_some_and(|o| o != self.operation_origin())
         {
             return Err(err(
                 "retry_origin_unavailable",

@@ -66,6 +66,13 @@ impl Messages {
         matches
     }
     pub(super) fn can_post(&mut self) -> bool {
+        if self
+            .current_channel()
+            .is_some_and(|c| c["archived"] == true)
+        {
+            self.error = "Channel archived · S opens channel settings. Your draft is saved.".into();
+            return false;
+        }
         if self.current_channel().is_some_and(|c| c["joined"] == false) {
             self.error =
                 "Join before posting · J joins (Esc first from composer). Your draft is saved."

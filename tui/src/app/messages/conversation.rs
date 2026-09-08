@@ -89,11 +89,32 @@ impl Messages {
                 incoming = std::mem::take(&mut self.items);
             }
         }
+        // Cross-host backlog may arrive behind the visible tail. Stable event
+        // ordering keeps every replica's timeline consistent and selection by ID.
+        incoming.sort_by(|a, b| {
+            let clock = |e: &Value| {
+                e["logical_time"]
+                    .as_str()
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            clock(a)
+                .cmp(&clock(b))
+                .then_with(|| {
+                    a["origin_daemon_id"]
+                        .as_str()
+                        .cmp(&b["origin_daemon_id"].as_str())
+                })
+                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+        });
         self.items = incoming;
         if let Some(pins) = value["pins"].as_object() {
             for item in &mut self.items {
                 item["pinned"] = json!(pins.contains_key(item["id"].as_str().unwrap_or("")));
-                item["pin"] = pins.get(item["id"].as_str().unwrap_or("")).cloned().unwrap_or(Value::Null);
+                item["pin"] = pins
+                    .get(item["id"].as_str().unwrap_or(""))
+                    .cloned()
+                    .unwrap_or(Value::Null);
             }
         }
         self.selected = if at_bottom && !self.append_older {
@@ -377,10 +398,51 @@ impl App {
                         chat_actor_style(m).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(format!("  {stamp}"), muted),
-                    Span::styled(if m["pinned"] == true { "  ◆ pinned" } else { "" }, Style::default().fg(theme::CHAT_TAG)),
+                    Span::styled(
+                        match m["replication"]["status"].as_str() {
+                            Some("pending_sync") => {
+                                if self.messages.sync["connected"] == false {
+                                    "  saved · offline"
+                                } else {
+                                    "  syncing"
+                                }
+                            }
+                            Some("replication_rejected") => "  sync rejected",
+                            Some("replication_blocked") => "  sync blocked",
+                            _ => "",
+                        },
+                        Style::default().fg(theme::CHAT_TAG),
+                    ),
+                    Span::styled(
+                        if m["replication"]["receipt"]["accepted_from_stale_revision"] == true {
+                            "  delayed · pre-archive"
+                        } else {
+                            ""
+                        },
+                        muted,
+                    ),
+                    Span::styled(
+                        if m["pinned"] == true {
+                            "  ◆ pinned"
+                        } else {
+                            ""
+                        },
+                        Style::default().fg(theme::CHAT_TAG),
+                    ),
                 ])
                 .style(Style::default().bg(bg)),
             );
+            if m["replication"]["status"] == "replication_rejected" {
+                lines.push(Line::styled(
+                    format!(
+                        "  Retained locally: {}",
+                        m["replication"]["decision"]["reason"]
+                            .as_str()
+                            .unwrap_or("hub rejected this upload")
+                    ),
+                    Style::default().fg(theme::ERROR).bg(bg),
+                ));
+            }
             if self.messages.target["inbox"] == true
                 || self.messages.target["dms"] == true
                 || self.messages.target["channel"] == "*"
@@ -467,8 +529,12 @@ impl App {
         // Paragraph line styles stop at the final glyph. Fill the selected
         // message's visible rows too, including empty lines and trailing space.
         frame.buffer_mut().set_style(
-            Rect::new(inner.x, inner.y + selected_top as u16, inner.width,
-                (selected_bottom - selected_top) as u16),
+            Rect::new(
+                inner.x,
+                inner.y + selected_top as u16,
+                inner.width,
+                (selected_bottom - selected_top) as u16,
+            ),
             Style::default().bg(theme::CHAT_SELECTION),
         );
     }
@@ -479,7 +545,7 @@ mod tests {
     use super::*;
     fn message(id: &str, body: &str, kind: &str, mentions: Value) -> Value {
         json!({"id":id,"body":body,"conversation_id":"chat","conversation_kind":kind,"read":false,
-            "actor":{"id":"agent:a","name":"Scout"},"data":{"mentions":mentions},"created_at":"2026-09-07T12:00:00Z"})
+            "actor":{"id":"agent:a","name":"Scout"},"data":{"mentions":mentions},"created_at":"2026-09-07T12:00:00Z","logical_time":match id {"before"=>"0","zero"=>"1","one"=>"2","two"=>"3",_=>"4"},"origin_daemon_id":"fixture"})
     }
     fn app() -> App {
         App::new(crate::config::Config {
@@ -538,9 +604,14 @@ mod tests {
         assert_eq!(a.messages.items[0]["id"], "zero");
         a.messages.selected = 0;
         a.messages.next = json!({"page":2});
-        a.messaging_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)));
+        a.messaging_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::NONE,
+        )));
         assert!(a.messages.select_older);
-        a.messages.accept_messages(&json!({"items":[message("before", "Fetched by k", "channel", json!([]))]}));
+        a.messages.accept_messages(
+            &json!({"items":[message("before", "Fetched by k", "channel", json!([]))]}),
+        );
         assert_eq!(a.messages.items[a.messages.selected]["id"], "before");
         let oldest_cursor = a.messages.next.clone();
         a.messages.accept_messages(&json!({"items":[message("new", "Arrived while reading history", "channel", json!([]))], "next_cursor":{"newer_page":1}}));

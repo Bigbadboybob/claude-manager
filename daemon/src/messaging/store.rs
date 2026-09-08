@@ -17,6 +17,13 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
+mod operations;
+mod owner_sync;
+mod private_sync;
+mod replication;
+mod task_subscriptions;
+pub use replication::ChangeSignal;
+pub use task_subscriptions::TaskBinding;
 mod personal;
 #[cfg(test)]
 mod tests_b;
@@ -24,10 +31,10 @@ mod wake_intents;
 pub use wake_intents::WakeIntent;
 mod norms;
 pub use norms::textual_diff as norms_diff;
-mod watches;
-mod preferences;
 mod channels;
 mod membership;
+mod preferences;
+mod watches;
 use membership::mention_recipients;
 use personal::Personal;
 
@@ -127,6 +134,23 @@ fn write_file(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
 pub fn atomic_replace(path: &Path, value: &Value) -> io::Result<()> {
     write_file(path, &serde_json::to_vec_pretty(value)?, true)
 }
+// Projections are disposable. Avoid fsyncing identical directory/name/norm
+// copies on every ordinary message, while retaining repair on the next write.
+fn project_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    mkdir(
+        path.parent()
+            .ok_or_else(|| io::Error::other("Missing projection directory"))?,
+    )?;
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+        && fs::read(path).is_ok_and(|old| old == bytes)
+    {
+        return Ok(());
+    }
+    write_file(path, bytes, true)
+}
+fn project_json(path: &Path, value: &Value) -> io::Result<()> {
+    project_file(path, &serde_json::to_vec_pretty(value)?)
+}
 fn load(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
@@ -215,6 +239,8 @@ pub struct Store {
     pub generation: String,
     pub names: BTreeMap<String, Name>,
     pub degraded: Option<String>,
+    replication: replication::Replication,
+    task_bindings: BTreeMap<String, TaskBinding>,
     _lock: File,
     events: Vec<Published>,
     channels: BTreeMap<String, String>,
@@ -247,6 +273,10 @@ impl Store {
                 "Another messaging writer owns this CM state root",
             ));
         }
+        Self::open_locked(cm_root, lock)
+    }
+    fn open_locked(cm_root: &Path, lock: File) -> Result<Self> {
+        operations::finish_install(cm_root)?;
         let root = cm_root.join("messages/main");
         let id_path = cm_root.join("daemon-id");
         let daemon_id = if id_path.exists() {
@@ -272,11 +302,12 @@ impl Store {
         let meta = load(&space_path)?;
         if meta["protocol"] != 1
             || meta["replica_id"] != daemon_id
-            || meta["coordinator_id"] != daemon_id
+            || (meta["coordinator_id"] != daemon_id
+                && !cm_root.join("messaging-sync.json").exists())
         {
             return Err(err(
                 "unsupported_space",
-                "Milestone A serves a single local coordinator only",
+                "Replica identity needs an explicit messaging sync configuration",
             ));
         }
         let mut s = Self {
@@ -285,7 +316,12 @@ impl Store {
             space_id: required(&meta, "space_id")?,
             generation: required(&meta, "generation")?,
             names: BTreeMap::new(),
+            task_bindings: BTreeMap::new(),
             degraded: None,
+            replication: replication::Replication::new(
+                &meta,
+                cm_root.join("messaging-sync.json").exists(),
+            )?,
             _lock: lock,
             events: Vec::new(),
             channels: BTreeMap::new(),
@@ -320,9 +356,23 @@ impl Store {
             s.degraded = Some(e.to_string());
             return Ok(s);
         }
-        if let Err(e) = s.load_personal().and_then(|_|s.load_known_reads()) {
+        if let Err(e) = s
+            .load_personal()
+            .and_then(|_| s.load_task_bindings())
+            .and_then(|_| s.load_known_reads())
+        {
             s.degraded = Some(e.to_string());
             return Ok(s);
+        }
+        let owner_snapshot = s.root.join("_state/owner-sync.json");
+        if owner_snapshot.exists() && !s.is_coordinator() {
+            match load(&owner_snapshot) {
+                Ok(v) => s.replication.owner_snapshot = Some(v),
+                Err(e) => {
+                    s.degraded = Some(e.to_string());
+                    return Ok(s);
+                }
+            }
         }
         if let Err(e) = s
             .quarantine_staged()
@@ -331,30 +381,43 @@ impl Store {
             s.degraded = Some(format!("Recovery reconciliation failed: {e}"));
             return Ok(s);
         }
-        for (path, description) in [
-            ("general", "Shared discussion"),
-            ("cm-general", "Claude Manager usage, coordination, upcoming changes and release notes"),
-        ] {
-            if !s.channels.contains_key(path) {
-                s.publish("channel.create", None, &format!("System created #{path}"),
+        if s.is_coordinator() && !s.messaging_frozen() {
+            for (path, description) in [
+                ("general", "Shared discussion"),
+                (
+                    "cm-general",
+                    "Claude Manager usage, coordination, upcoming changes and release notes",
+                ),
+            ] {
+                if !s.channels.contains_key(path) {
+                    s.publish("channel.create", None, &format!("System created #{path}"),
                     json!({"membership_version":1,"channels":[{"path":path,"id":uuid(),"description":description,"default_join":true}]}),
                     "system", "System", "system", &format!("bootstrap-{path}"), "")?;
+                }
+            }
+            if s.norms["revision"].is_null() {
+                s.publish(
+                    "norms.update",
+                    None,
+                    "System initialized shared norms",
+                    json!({"scope":"global","revision":uuid(),"text":super::NORMS}),
+                    "system",
+                    "System",
+                    "system",
+                    "bootstrap-norms",
+                    "",
+                )?;
             }
         }
-        if s.norms["revision"].is_null() {
-            s.publish(
-                "norms.update",
-                None,
-                "System initialized shared norms",
-                json!({"scope":"global","revision":uuid(),"text":super::NORMS}),
-                "system",
-                "System",
-                "system",
-                "bootstrap-norms",
-                "",
-            )?;
-        }
-        if let Err(e) = s.initialize_memberships().and_then(|_| s.enroll_participants(&[])).and_then(|_| s.repair_attestations()).and_then(|_| s.normalize_existing_names()).and_then(|_| s.project()) {
+        let recovered = if s.is_coordinator() && !s.messaging_frozen() {
+            s.initialize_memberships()
+                .and_then(|_| s.enroll_participants(&[]))
+                .and_then(|_| s.repair_attestations())
+                .and_then(|_| s.normalize_existing_names())
+        } else {
+            Ok(())
+        };
+        if let Err(e) = recovered.and_then(|_| s.project()) {
             s.degraded = Some(format!("Projection recovery failed: {e}"));
         }
         Ok(s)
@@ -455,12 +518,16 @@ impl Store {
                     != Some(format!("{pos:020}.json").as_str())
                 || j["replica_id"] != self.daemon_id
                 || j["generation"] != self.generation
-                || j["kind"] != "publish"
             {
                 return Err(err(
                     "invalid_record",
                     "Conflicting or unsupported journal record",
                 ));
+            }
+            if j["kind"] != "publish" {
+                self.apply_replication_journal(&j)?;
+                self.position = pos;
+                continue;
             }
             let rel = required(&j["data"], "event_path")?;
             if Path::new(&rel).is_absolute()
@@ -516,6 +583,7 @@ impl Store {
                 .clock
                 .max(j["data"]["logical_clock"].as_u64().unwrap_or(0));
             self.position = pos;
+            self.apply_replication_journal(&j)?;
             self.reduce(&event)?;
             self.events.push(Published {
                 event,
@@ -534,6 +602,8 @@ impl Store {
             }
         }
         self.reduce_membership(e)?;
+        self.reduce_replication(e)?;
+        self.reduce_private_sync(e)?;
         if let Some(c) = e["data"].get("conversation_create") {
             let id = required(c, "id")?;
             let members: Vec<String> = serde_json::from_value(c["members"].clone())?;
@@ -541,9 +611,15 @@ impl Store {
                 || members.windows(2).any(|pair| pair[0] >= pair[1])
                 || !members.iter().any(|m| m == strv(&e["actor"], "id"))
                 || members.iter().any(|m| m.is_empty() || m == "system")
-                || self.conversations.get(&id).is_some_and(|old| old != &members)
+                || self
+                    .conversations
+                    .get(&id)
+                    .is_some_and(|old| old != &members)
             {
-                return Err(err("invalid_record", "DM needs 2–32 sorted, distinct, immutable members including its sender"));
+                return Err(err(
+                    "invalid_record",
+                    "DM needs 2–32 sorted, distinct, immutable members including its sender",
+                ));
             }
             self.conversations.insert(id, members);
         }
@@ -595,30 +671,25 @@ impl Store {
         Ok(())
     }
     fn project(&self) -> Result<()> {
-        write_file(
-            &self.root.join("PROTOCOL.md"),
-            super::PROTOCOL.as_bytes(),
-            true,
-        )?;
-        write_file(
+        project_file(&self.root.join("PROTOCOL.md"), super::PROTOCOL.as_bytes())?;
+        project_file(
             &self.root.join("NORMS.md"),
             strv(&self.norms, "text").as_bytes(),
-            true,
         )?;
         for (path, id) in &self.channels {
-            atomic_replace(
+            project_json(
                 &self.root.join("channels").join(path).join("CHANNEL.json"),
                 &self.channel_info(path, id),
             )?;
         }
         for (id, members) in &self.conversations {
-            atomic_replace(
+            project_json(
                 &self.root.join("direct").join(id).join("CONVERSATION.json"),
                 &json!({"id":id,"kind":"dm","members":members}),
             )?;
         }
         for (id, n) in &self.names {
-            atomic_replace(
+            project_json(
                 &self
                     .root
                     .join("participants")
@@ -668,10 +739,30 @@ impl Store {
             .checked_add(1)
             .ok_or_else(|| err("clock_overflow", "Logical clock exhausted"))?;
         Ok(
-            json!({"protocol":1,"space_id":self.space_id,"id":format!("{}:{}",self.daemon_id,uuid()),"origin_daemon_id":self.daemon_id,"logical_time":self.clock.to_string(),"type":ty,"created_at":now(),"actor":{"id":actor,"name":name,"kind":kind},"conversation_id":conv,"body":body,"data":data,"extensions":{},"request":{"key":key,"sha256":digest,"origin_daemon_id":self.daemon_id}}),
+            json!({"protocol":1,"space_id":self.space_id,"id":format!("{}:{}",self.daemon_id,uuid()),"origin_daemon_id":self.daemon_id,"logical_time":self.clock.to_string(),"type":ty,"created_at":now(),"actor":{"id":actor,"name":name,"kind":kind},"conversation_id":conv,"body":body,"data":data,"extensions":{},"request":{"key":key,"sha256":digest,"origin_daemon_id":if actor == "system" {&self.daemon_id} else {self.operation_origin()}}}),
         )
     }
     fn commit(&mut self, event: Value) -> Result<Value> {
+        let bytes = serde_json::to_vec_pretty(&event)?;
+        self.commit_bytes(
+            event,
+            bytes,
+            if self.is_coordinator() {
+                "coordinated"
+            } else {
+                "local"
+            },
+            None,
+        )
+    }
+    fn commit_bytes(
+        &mut self,
+        event: Value,
+        bytes: Vec<u8>,
+        source: &str,
+        receipt: Option<Value>,
+    ) -> Result<Value> {
+        self.ensure_messaging_writable()?;
         if let Some(reason) = &self.degraded {
             return Err(err("store_read_only", reason.clone()));
         }
@@ -679,7 +770,6 @@ impl Store {
         // watch retains the arrival fence captured before a later publication.
         self.advance_monitors_at(Utc::now())?;
         let path = self.event_path(&event)?;
-        let bytes = serde_json::to_vec_pretty(&event)?;
         if bytes.len() > 65536 {
             return Err(err("event_too_large", "Serialized event exceeds 64 KiB"));
         }
@@ -688,7 +778,13 @@ impl Store {
             .checked_add(1)
             .ok_or_else(|| err("position_overflow", "Journal exhausted"))?;
         let received = now();
-        let j = json!({"protocol":1,"replica_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"recorded_at":received,"kind":"publish","event_id":event["id"],"event_sha256":hash(&bytes),"data":{"source":"coordinated","received_at":received,"logical_clock":self.clock,"event_path":path.strip_prefix(&self.root).unwrap().to_string_lossy(),"hub_receipt":{"space_id":self.space_id,"coordinator_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"event_id":event["id"],"event_sha256":hash(&bytes)}}});
+        self.clock = self.clock.max(
+            required(&event, "logical_time")?
+                .parse::<u64>()
+                .map_err(|_| err("invalid_record", "Bad logical time"))?,
+        );
+        let receipt = receipt.or_else(|| self.is_coordinator().then(|| json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"event_id":event["id"],"event_sha256":hash(&bytes)})));
+        let j = json!({"protocol":1,"replica_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"recorded_at":received,"kind":"publish","event_id":event["id"],"event_sha256":hash(&bytes),"data":{"source":source,"received_at":received,"logical_clock":self.clock,"event_path":path.strip_prefix(&self.root).unwrap().to_string_lossy(),"hub_receipt":receipt}});
         // No reader sees the body until the durable publication record exists.
         let result = (|| -> io::Result<()> {
             write_file(&path, &bytes, false)?;
@@ -703,6 +799,7 @@ impl Store {
             return Err(err("outcome_unknown", self.degraded.clone().unwrap()));
         }
         self.position = pos;
+        self.apply_replication_journal(&j)?;
         if let Err(e) = self.reduce(&event) {
             self.degraded = Some(e.to_string());
             return Err(e);
@@ -717,6 +814,7 @@ impl Store {
         if let Err(e) = self.advance_monitors_at(Utc::now()) {
             self.degraded = Some(format!("Monitor checkpoint requires reconciliation: {e}"));
         }
+        self.replication.signal.signal();
         Ok(event)
     }
     fn publish(
@@ -731,6 +829,9 @@ impl Store {
         key: &str,
         digest: &str,
     ) -> Result<Value> {
+        if !matches!(ty, "message.create" | "read.ack") {
+            self.shared_mutation_allowed()?;
+        }
         let e = self.event(ty, conv, body, data, actor, name, kind, key, digest)?;
         self.commit(e)
     }
@@ -863,37 +964,74 @@ impl Store {
         }
         let peers: Vec<String> = match &p["dm"] {
             Value::String(peer) => vec![peer.clone()],
-            Value::Array(peers) => peers.iter().map(|v| v.as_str().filter(|s| !s.is_empty())
-                .map(str::to_owned).ok_or_else(|| err("invalid_target", "DM recipients must be participant IDs or names"))).collect::<Result<_>>()?,
-            _ => return Err(err("invalid_target", "dm must be a participant or a list of recipients")),
+            Value::Array(peers) => peers
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            err(
+                                "invalid_target",
+                                "DM recipients must be participant IDs or names",
+                            )
+                        })
+                })
+                .collect::<Result<_>>()?,
+            _ => {
+                return Err(err(
+                    "invalid_target",
+                    "dm must be a participant or a list of recipients",
+                ))
+            }
         };
         if peers.is_empty() || peers.len() > 31 {
-            return Err(err("invalid_target", "Choose 1–31 DM recipients; the sender is included automatically"));
+            return Err(err(
+                "invalid_target",
+                "Choose 1–31 DM recipients; the sender is included automatically",
+            ));
         }
         let mut members = vec![actor.to_owned()];
         for peer in peers {
-            let peer = if peer == "owner" || self.names.contains_key(&peer) || people.iter().any(|x| x.id == peer) {
+            let peer = if peer == "owner"
+                || self.names.contains_key(&peer)
+                || people.iter().any(|x| x.id == peer)
+            {
                 peer
             } else {
-                let mut hits: Vec<_> = self.names.iter().filter(|(_, n)| {
-                    normalize(&n.name) == normalize(&peer)
-                        || n.aliases.iter().any(|a| normalize(a) == normalize(&peer))
-                }).collect();
+                let mut hits: Vec<_> = self
+                    .names
+                    .iter()
+                    .filter(|(_, n)| {
+                        normalize(&n.name) == normalize(&peer)
+                            || n.aliases.iter().any(|a| normalize(a) == normalize(&peer))
+                    })
+                    .collect();
                 // Honor exact legacy names/aliases first: before this policy,
                 // "Build Scout" and "Build-Scout" could belong to different IDs.
                 if hits.is_empty() {
-                    hits = self.names.iter().filter(|(_, n)| {
-                        name_key(&n.name) == name_key(&peer)
-                            || n.aliases.iter().any(|a| name_key(a) == name_key(&peer))
-                    }).collect();
+                    hits = self
+                        .names
+                        .iter()
+                        .filter(|(_, n)| {
+                            name_key(&n.name) == name_key(&peer)
+                                || n.aliases.iter().any(|a| name_key(a) == name_key(&peer))
+                        })
+                        .collect();
                 }
                 if hits.len() != 1 {
-                    return Err(err("not_found", "Peer not found; use chat_people to resolve a participant ID"));
+                    return Err(err(
+                        "not_found",
+                        "Peer not found; use chat_people to resolve a participant ID",
+                    ));
                 }
                 hits[0].0.clone()
             };
             if members.contains(&peer) {
-                return Err(err("invalid_target", "Choose distinct recipients and omit yourself"));
+                return Err(err(
+                    "invalid_target",
+                    "Choose distinct recipients and omit yourself",
+                ));
             }
             members.push(peer);
         }
@@ -920,15 +1058,22 @@ impl Store {
             return Err(err("invalid_params", "Expected an object"));
         }
         let key = required(p, "request_id")?;
-        if self.personal.get(actor).is_some_and(|s| s.operations.contains_key(&key)) {
-            return Err(err("idempotency_conflict", "This request_id belongs to a personal-state operation"));
+        if self
+            .personal
+            .get(actor)
+            .is_some_and(|s| s.operations.contains_key(&key))
+        {
+            return Err(err(
+                "idempotency_conflict",
+                "This request_id belongs to a personal-state operation",
+            ));
         }
         if key.len() > 160 || key.chars().any(char::is_control) {
             return Err(err("invalid_params", "Invalid request_id"));
         }
         if p["origin_daemon_id"]
             .as_str()
-            .is_some_and(|o| o != self.daemon_id)
+            .is_some_and(|o| o != self.operation_origin())
         {
             return Err(err(
                 "retry_origin_unavailable",
@@ -972,6 +1117,16 @@ impl Store {
         if let Some(e) = prior {
             return Ok(self.send_response(&e));
         }
+        if !self.is_coordinator()
+            && self
+                .host_info(&self.daemon_id)
+                .is_some_and(|h| h["active"] == false)
+        {
+            return Err(err(
+                "host_revoked",
+                "This host's messaging enrollment was revoked; retain the draft",
+            ));
+        }
         let body = required(p, "body")?.replace("\r\n", "\n");
         if body.trim().is_empty() {
             return Err(err("invalid_message", "Message must contain text"));
@@ -998,12 +1153,23 @@ impl Store {
             }
         }
         let (conv, create) = self.resolve(actor, p, people, true)?;
+        if create.is_some() || actor != "owner" && !self.names.contains_key(actor) {
+            self.shared_mutation_allowed()?;
+        }
         if p.get("mention_here").is_some_and(|v| !v.is_boolean()) {
             return Err(err("invalid_params", "mention_here must be a boolean"));
         }
         self.enroll_participant(actor)?;
         if self.channels.values().any(|id| id == &conv) && !self.joined(actor, &conv) {
             return Err(err("join_required", "Join this channel before posting: chat_channels(action=\"join\", conversation=<channel_id>, request_id=<new_id>). Public history remains browsable."));
+        }
+        if let Some((path, id)) = self.channels.iter().find(|(_, id)| *id == &conv) {
+            if self.channel_info(path, id)["archived"] == true {
+                return Err(err(
+                    "conversation_archived",
+                    "This channel is archived; retain the draft until an admin reopens it",
+                ));
+            }
         }
         let reply = p["reply_to"].as_str();
         let root = if let Some(id) = reply {
@@ -1051,7 +1217,10 @@ impl Store {
         }
         let mention_here = p["mention_here"] == true;
         if mention_here && members.is_some() {
-            return Err(err("invalid_mention", "@here is available in channels; DMs already notify their members"));
+            return Err(err(
+                "invalid_mention",
+                "@here is available in channels; DMs already notify their members",
+            ));
         }
         let mut recipients = mentions.clone();
         if mention_here {
@@ -1090,7 +1259,20 @@ impl Store {
             .or_else(|| self.names.get(actor))
             .map(|n| n.revision_id.as_str())
             .unwrap_or(&self.owner_identity_revision);
-        let mut data = json!({"reply_to":reply,"thread_root":root,"mentions":mentions,"tags":p.get("tags").cloned().unwrap_or(json!([])),"links":links,"norms_seen":p.get("norms_seen").cloned().unwrap_or(json!({})),"metadata_seen":{"identity":identity_revision,"conversation":conv,"enrollment":self.enrollment_revision}});
+        let enrollment_revision = self
+            .replication
+            .hosts
+            .get(self.operation_origin())
+            .and_then(|h| h["enrollment_revision"].as_str())
+            .unwrap_or(&self.enrollment_revision);
+        let conversation_revision = self
+            .channels
+            .iter()
+            .find(|(_, id)| *id == &conv)
+            .map(|(path, id)| self.channel_info(path, id)["revision"].clone())
+            .unwrap_or(json!(conv));
+        let mut data = json!({"reply_to":reply,"thread_root":root,"mentions":mentions,"tags":p.get("tags").cloned().unwrap_or(json!([])),"links":links,"norms_seen":p.get("norms_seen").cloned().unwrap_or(json!({})),"metadata_seen":{"identity":identity_revision,"conversation":conversation_revision,"enrollment":enrollment_revision}});
+        data["metadata_seen"]["membership"] = json!(self.membership_revisions.get(&conv));
         data["mention_here"] = json!(mention_here);
         data["mention_recipients"] = json!(recipients);
         if let Some(c) = create {
@@ -1132,7 +1314,7 @@ impl Store {
         Ok(result)
     }
     fn send_response(&self, e: &Value) -> Value {
-        json!({"event":e,"event_id":e["id"],"name":e["actor"]["name"],"operation":{"space_id":self.space_id,"actor_id":e["actor"]["id"],"origin_daemon_id":e["request"]["origin_daemon_id"],"request_id":e["request"]["key"]},"position":self.position_token(self.position),"replication":"replicated","notification":self.notification_status(e),"name_publication":if e["data"]["identity_claim"].is_null() || self.events.iter().any(|v|v.event["type"]=="identity.update" && v.event["data"]["identity"]==e["data"]["identity_claim"]){"published"}else{"pending"},"norms":self.norms})
+        json!({"event":e,"event_id":e["id"],"name":e["actor"]["name"],"operation":{"space_id":self.space_id,"actor_id":e["actor"]["id"],"origin_daemon_id":e["request"]["origin_daemon_id"],"request_id":e["request"]["key"]},"position":self.position_token(self.position),"replication":self.event_replication(strv(e,"id"))["status"],"sync":self.sync_status(),"notification":self.notification_status(e),"name_publication":if e["data"]["identity_claim"].is_null() || self.events.iter().any(|v|v.event["type"]=="identity.update" && v.event["data"]["identity"]==e["data"]["identity_claim"]){"published"}else{"pending"},"norms":self.norms})
     }
     pub fn rename(&mut self, actor: &str, uid: &str, p: &Value) -> Result<Value> {
         let initiator = p["_authenticated_actor"].as_str().unwrap_or(actor);
@@ -1222,16 +1404,26 @@ impl Store {
         self.load_read(actor)?;
         let mut channels = self.channels().as_array().cloned().unwrap_or_default();
         for channel in &mut channels {
-            let unread: Vec<_> = self.events.iter().filter(|e| e.event["type"] == "message.create"
-                && e.event["conversation_id"] == channel["id"] && e.event["actor"]["id"] != actor
-                && !self.reads[actor].ids.contains(strv(&e.event, "id"))).collect();
+            let unread: Vec<_> = self
+                .events
+                .iter()
+                .filter(|e| {
+                    e.event["type"] == "message.create"
+                        && e.event["conversation_id"] == channel["id"]
+                        && e.event["actor"]["id"] != actor
+                        && !self.reads[actor].ids.contains(strv(&e.event, "id"))
+                })
+                .collect();
             self.channel_permissions(actor, channel);
             channel["unread"] = json!(unread.len());
-            channel["mentions"] = json!(unread.iter().filter(|e| mention_recipients(&e.event).contains(&actor)).count());
+            channel["mentions"] = json!(unread
+                .iter()
+                .filter(|e| mention_recipients(&e.event).contains(&actor))
+                .count());
         }
         Ok(channels)
     }
-    fn position_token(&self, pos: u64) -> Value {
+    pub(super) fn position_token(&self, pos: u64) -> Value {
         json!({"space_id":self.space_id,"replica_id":self.daemon_id,"generation":self.generation,"position":pos})
     }
     fn check_position(&self, v: &Value) -> Result<u64> {
@@ -1283,18 +1475,32 @@ impl Store {
                 return Err(err("not_found", "Receipt message not found"));
             }
         }
-        let mut next = self.reads[actor].ids.clone();
-        next.extend(ids);
-        atomic_replace(
-            &self
-                .root
-                .join("_state")
-                .join(format!("{}.json", hash(actor.as_bytes()))),
-            &json!({"ids":next}),
-        )?;
-        self.reads.get_mut(actor).unwrap().ids = next;
-        Ok(())
+        let unseen: BTreeSet<_> = ids
+            .into_iter()
+            .filter(|id| !self.reads[actor].ids.contains(id))
+            .collect();
+        if unseen.is_empty() {
+            return Ok(());
+        }
+        self.ensure_messaging_writable()?;
+        if actor == "owner" && self.sync_enabled() {
+            self.publish(
+                "read.ack",
+                None,
+                "Owner acknowledged messages",
+                json!({"ids":unseen}),
+                "owner",
+                "Owner",
+                "owner",
+                &uuid(),
+                "",
+            )?;
+            Ok(())
+        } else {
+            self.merge_read_ids(actor, unseen)
+        }
     }
+
     pub fn read(&mut self, actor: &str, p: &Value, people: &[Person]) -> Result<Value> {
         if !p.is_object() {
             return Err(err("invalid_params", "Expected an object"));
@@ -1307,7 +1513,13 @@ impl Store {
                 .all(|k| p.get(*k).is_none_or(Value::is_null))
         {
             normalized = p.clone();
-            normalized["channel"] = json!("general");
+            if let Some(thread) = p["thread"].as_str() {
+                let event = self.events.iter().find(|e| e.event["id"] == thread)
+                    .ok_or_else(|| err("not_found", "Thread is not available in the local cache; request hub freshness to fetch it"))?;
+                normalized["conversation"] = event.event["conversation_id"].clone();
+            } else {
+                normalized["channel"] = json!("general");
+            }
             &normalized
         } else {
             p
@@ -1544,12 +1756,26 @@ impl Store {
                 }
             }
         }
-        let target = conv.as_deref().and_then(|id| self.channels.iter().find(|(_, cid)| cid.as_str() == id))
-            .map(|(path, id)| { let mut c = self.channel_at(path, id, high); self.channel_permissions(actor, &mut c); c });
+        let target = conv
+            .as_deref()
+            .and_then(|id| self.channels.iter().find(|(_, cid)| cid.as_str() == id))
+            .map(|(path, id)| {
+                let mut c = self.channel_at(path, id, high);
+                self.channel_permissions(actor, &mut c);
+                c
+            });
         let pins_revision = conv.as_deref().map(|id| self.pins_revision(id, high));
-        let pins: Option<BTreeMap<_,_>> = conv.as_deref().map(|cid| self.events.iter()
-            .filter(|e| e.event["conversation_id"] == cid)
-            .filter_map(|e| pin_states.get(strv(&e.event,"id")).map(|pin| (strv(&e.event,"id"), pin.clone()))).collect());
+        let pins: Option<BTreeMap<_, _>> = conv.as_deref().map(|cid| {
+            self.events
+                .iter()
+                .filter(|e| e.event["conversation_id"] == cid)
+                .filter_map(|e| {
+                    pin_states
+                        .get(strv(&e.event, "id"))
+                        .map(|pin| (strv(&e.event, "id"), pin.clone()))
+                })
+                .collect()
+        });
         Ok(
             json!({"target":target,"pins_revision":pins_revision,"pins":pins,"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded}),
         )
@@ -1649,9 +1875,15 @@ impl Store {
         json!(statuses)
     }
     pub fn notifications(&self) -> Vec<(String, String, String)> {
-        self.wake_intents().into_iter().flat_map(|(uid,items)| items.into_iter().map(move |i|(uid.clone(),i.event_id,String::new()))).collect()
+        self.wake_intents()
+            .into_iter()
+            .flat_map(|(uid, items)| {
+                items
+                    .into_iter()
+                    .map(move |i| (uid.clone(), i.event_id, String::new()))
+            })
+            .collect()
     }
-
 }
 fn parse_time(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
@@ -1770,13 +2002,33 @@ mod tests {
         let mut s = Store::open(tmp.path()).unwrap();
         let a = person(&s, "a");
         let b = person(&s, "b");
-        assert_eq!(send(&mut s, &a, "Hi", "one", "  Build\u{a0}  Scout  ")["name"], "Build-Scout");
+        assert_eq!(
+            send(&mut s, &a, "Hi", "one", "  Build\u{a0}  Scout  ")["name"],
+            "Build-Scout"
+        );
         let second = send(&mut s, &b, "Hi", "two", "ＢＵＩＬＤ-ＳＣＯＵＴ");
         assert!(second["name"].as_str().unwrap().contains('-'));
-        assert_ne!(name_key(second["name"].as_str().unwrap()), name_key("Build-Scout"));
-        assert_eq!(s.resolve("owner", &json!({"dm":"build scout"}), &[], true).unwrap().1.unwrap()["members"], json!([a.id, "owner"]));
-        s.rename(&a.id, "a", &json!({"name":"Gardener","request_id":"rename","expected_name_revision":1})).unwrap();
-        assert_ne!(s.allocate(&b.id, "Build Scout", "b").unwrap().name, "Build-Scout");
+        assert_ne!(
+            name_key(second["name"].as_str().unwrap()),
+            name_key("Build-Scout")
+        );
+        assert_eq!(
+            s.resolve("owner", &json!({"dm":"build scout"}), &[], true)
+                .unwrap()
+                .1
+                .unwrap()["members"],
+            json!([a.id, "owner"])
+        );
+        s.rename(
+            &a.id,
+            "a",
+            &json!({"name":"Gardener","request_id":"rename","expected_name_revision":1}),
+        )
+        .unwrap();
+        assert_ne!(
+            s.allocate(&b.id, "Build Scout", "b").unwrap().name,
+            "Build-Scout"
+        );
         for invalid in ["OＷNER", "system", "x", "\tScout", "Scout\nName"] {
             assert!(s.allocate(&b.id, invalid, "b").is_err(), "{invalid:?}");
         }
@@ -1800,9 +2052,28 @@ mod tests {
             n.name = old.into();
             let mut identity = serde_json::to_value(n).unwrap();
             identity["participant_id"] = json!(p.id);
-            s.publish("identity.update", None, "Legacy name", json!({"identity":identity}), "system", "System", "system", &format!("legacy-{}", p.session_uid), "").unwrap();
+            s.publish(
+                "identity.update",
+                None,
+                "Legacy name",
+                json!({"identity":identity}),
+                "system",
+                "System",
+                "system",
+                &format!("legacy-{}", p.session_uid),
+                "",
+            )
+            .unwrap();
         }
-        let dm = s.send("owner", "", "owner", &json!({"dm":a.id,"body":"Hello","request_id":"hello"}), &[]).unwrap();
+        let dm = s
+            .send(
+                "owner",
+                "",
+                "owner",
+                &json!({"dm":a.id,"body":"Hello","request_id":"hello"}),
+                &[],
+            )
+            .unwrap();
         drop(s);
         let mut s = Store::open(tmp.path()).unwrap();
         assert!(s.names[&a.id].name.starts_with("Build-Scout-"));

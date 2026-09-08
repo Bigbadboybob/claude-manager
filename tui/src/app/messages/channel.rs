@@ -78,6 +78,7 @@ mod tests {
                 "Coordinate parser reviews here.",
                 "no",
                 "Creator, Reviewer",
+                "no",
                 "no"
             ]
         );
@@ -141,6 +142,7 @@ impl App {
                 "All agents may edit (yes/no)",
                 "Admin names or IDs",
                 "Join by default (yes/no)",
+                "Archived (yes/no)",
             ]
         } else {
             vec![
@@ -150,6 +152,7 @@ impl App {
                 "All agents may edit (yes/no)",
                 "Additional admin names or IDs",
                 "Join by default (yes/no)",
+                "Archived (yes/no)",
             ]
         };
         let mut lines = Vec::new();
@@ -265,7 +268,13 @@ impl App {
                     }
                     .into(),
                     admins,
-                    if c["default_join"] == true { "yes" } else { "no" }.into(),
+                    if c["default_join"] == true {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                    .into(),
+                    if c["archived"] == true { "yes" } else { "no" }.into(),
                 ],
             );
             self.messages.channel_edit_base = c;
@@ -278,6 +287,7 @@ impl App {
                     String::new(),
                     "no".into(),
                     String::new(),
+                    "no".into(),
                     "no".into(),
                 ],
             );
@@ -299,7 +309,18 @@ impl App {
         let default_join = match fields[offset + 4].trim().to_lowercase().as_str() {
             "yes" | "true" => true,
             "no" | "false" => false,
-            _ => { self.messages.error = "Join by default: enter yes or no".into(); return; }
+            _ => {
+                self.messages.error = "Join by default: enter yes or no".into();
+                return;
+            }
+        };
+        let archived = match fields[offset + 5].trim().to_lowercase().as_str() {
+            "yes" | "true" => true,
+            "no" | "false" => false,
+            _ => {
+                self.messages.error = "Archived: enter yes or no".into();
+                return;
+            }
         };
         let mut admins = Vec::new();
         for name in fields[offset + 3]
@@ -335,7 +356,7 @@ impl App {
             }
             admins.push(hits[0]["id"].clone());
         }
-        let mut p = json!({"action":if edit { "update" } else { "create" },"description":fields[offset+1],"allow_agent_edits":open,"admins":admins,"default_join":default_join});
+        let mut p = json!({"action":if edit { "update" } else { "create" },"description":fields[offset+1],"allow_agent_edits":open,"admins":admins,"default_join":default_join,"archived":archived});
         if edit {
             p["conversation"] = self.messages.channel_edit_base["id"].clone();
             p["expected_revision"] = self.messages.channel_edit_base["revision"].clone();
@@ -467,11 +488,25 @@ impl App {
                 Style::default().fg(theme::CHAT_MUTED),
             ));
         }
-        lines.push(Line::styled(format!("{} · {} members · u list{}",
-            if c["joined"] == false { "Preview · J join to post" } else { "Joined · L leave" },
-            c["member_count"].as_u64().unwrap_or(0),
-            if c["default_join"] == true { " · joined by default" } else { "" }),
-            Style::default().fg(theme::CHAT_FOCUS)));
+        lines.push(Line::styled(
+            format!(
+                "{} · {} members · u list{}",
+                if c["joined"] == false {
+                    "Preview · J join to post"
+                } else {
+                    "Joined · L leave"
+                },
+                c["member_count"].as_u64().unwrap_or(0),
+                if c["archived"] == true {
+                    " · archived"
+                } else if c["default_join"] == true {
+                    " · joined by default"
+                } else {
+                    ""
+                }
+            ),
+            Style::default().fg(theme::CHAT_FOCUS),
+        ));
         let parts = Layout::vertical([
             Constraint::Length(lines.len() as u16 + 2),
             Constraint::Min(3),

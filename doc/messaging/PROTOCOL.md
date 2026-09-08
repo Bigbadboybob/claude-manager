@@ -1,6 +1,6 @@
 # CM messaging file protocol, version 1
 
-Status: v1 contract with single-host Milestones A and B implemented. Channel administration and pins are also implemented (see [channel controls](CHANNELS_AND_PINS.md)). Replication and other optional D capabilities remain planned; see [MILESTONE_A.md](MILESTONE_A.md) and [MILESTONE_B.md](MILESTONE_B.md) for the enabled surface. This file owns the storage, replication semantics, and reader contract for both single-host and shared deployments. [DESIGN_MESSAGING.md](../../DESIGN_MESSAGING.md) owns product choices, MCP/TUI behavior, integration work, and milestones. Changes to one must not silently redefine the other.
+Status: v1 contract with single-host Milestones A and B implemented. Channel administration and pins are also implemented (see [channel controls](CHANNELS_AND_PINS.md)). Milestone C adds opt-in replication; see [CROSS_MACHINE.md](CROSS_MACHINE.md). Other optional D capabilities remain planned; see [MILESTONE_A.md](MILESTONE_A.md) and [MILESTONE_B.md](MILESTONE_B.md) for the enabled surface. This file owns the storage, replication semantics, and reader contract for both single-host and shared deployments. [DESIGN_MESSAGING.md](../../DESIGN_MESSAGING.md) owns product choices, MCP/TUI behavior, integration work, and milestones. Changes to one must not silently redefine the other.
 
 A single-host deployment uses this same format with its local daemon also serving as coordinator. Adding another host enables replication without replacing message IDs or read semantics. [SYNC.md](SYNC.md) explains deployment, routing, and tradeoffs; it does not define an alternative wire contract.
 
@@ -223,9 +223,9 @@ Backups cover the retained event/journal tree, `space.json`, daemon identity, pe
 
 There are two orderings: the local arrival/event feed used for catch-up and monitors, and the deterministic conversation order from §3. A response includes an opaque scope-neutral **position token** naming space, replica UUID, journal generation and last scanned arrival position. A **pagination cursor** additionally binds the filter, ordering, fixed snapshot high-water, resolved time bounds and last returned/scanned position. These are separate concepts: a filtered cursor cannot be reused as a broader watch position.
 
-Capture the local publication high-water at a read's start. Limit every page, including latest message revisions/status, to that snapshot. Advancing a feed cursor cannot skip omitted matching records; a conversation page carries its display-order anchor within the same frozen set. Response item/byte limits may end either page. Status-only journal entries advance feed scanning but do not become new messages. A cursor from another replica/generation returns `resync_required`, never a guessed numerical conversion. Portable message IDs can locate context; they cannot certify what another replica had already received.
+Capture the local publication high-water at a read's start. Limit every page, including latest message revisions/status, to that snapshot. Advancing a feed cursor cannot skip omitted matching records; a conversation page carries its display-order anchor within the same frozen set. Response item/byte limits may end either page. Status-only journal entries advance feed scanning but do not become new messages. A cursor from another replica/generation returns `resync_required`, never a guessed numerical conversion. Portable message IDs can locate context; they cannot certify what another replica had already received. A send coordinated on another machine returns the caller replica's pre-submission `position`, preserving a safe `after` fence for immediate replies arriving during coordination. Its hub boundary is labeled separately as `coordinator_position`.
 
-Each query reports coverage for its authorized scope/range, connection state, last successful hub reconciliation, and pending local replication. Default reads return cached results promptly with `coverage="partial"` where applicable and start/request bounded missing-history fetches. `freshness="hub"` waits for that scope's coordinated catch-up barrier and then captures a new local snapshot; timeout/offline returns an explicit incomplete result or error, never a false empty result. Even full hub coverage cannot include unuploaded records on a disconnected origin. Partial pages/ranges never certify complete channel history.
+Each query reports coverage for its authorized scope/range, connection state, last successful hub reconciliation, and pending local replication. Default reads return cached results promptly with `coverage="partial"` where applicable and start/request bounded missing-history fetches. `freshness="hub"` waits for that scope's coordinated catch-up barrier and then captures a new local snapshot; timeout/offline returns an explicit incomplete result or error, never a false empty result. Even full hub coverage cannot include unuploaded records on a disconnected origin. Partial pages/ranges never certify complete channel history. Bounded priority delivery may publish a new DM/mention and its dependencies ahead of bulk history; these arrivals never advance the certified coverage cursor. Replaying them through bulk does not create new arrivals.
 
 Personal reads are **acknowledged message-ID sets**, not a maximum timestamp or maximum foreign sequence. Implementations may compact only against proven complete retained ranges without marking missing IDs read. Agent reads return receipts for fully supplied IDs; an `ack_receipt` on a later `chat_read` or `chat_send` marks exactly those messages read. There is no required `chat_mark` tool. Previews, time/tag queries, notification attempts and partial bodies do not consume unread state without an explicit receipt acknowledgement. TUI reads acknowledge displayed/opened content; opening one thread does not acknowledge unrelated channel messages.
 
@@ -294,4 +294,47 @@ create a recipient.
 Membership changes and default enrollment are independent of follows, monitors,
 mute and DND. Existing preference overrides still govern delivery; Owner remains
 passive. The `messaging.open` features `channel_membership` and `channel_mentions`
-advertise this additive support. No cross-machine membership merge is implemented.
+advertise this additive support. Cross-machine membership is coordinator-owned. Offline messages retain the last complete membership revision observed locally; their frozen audience remains valid at that revision.
+
+
+## Shared-machine implementation fields (additive v1)
+
+`space.json.coordinator_lineage` lists previous coordinator UUIDs retained during
+an explicit handoff. It permits validation of old acceptance receipts; it never
+grants a replica authority to issue new names, membership, norms or other metadata.
+The handoff preserves space/participant/conversation/event IDs and exact event
+bytes. The new coordinator has a distinct journal generation; pagination remains
+replica/generation scoped.
+
+`host.update` is coordinator-issued system metadata. Its `data` records `host_id`,
+`active`, `owner_access`, `enrollment_revision`, and the host's participant directory.
+Presence refreshes retain enrollment; revocation/re-enrollment changes its revision.
+Peer assertions are restricted to `agent:<authenticated host UUID>:<session UID>`.
+Ordinary replicas can originate message creates and their authorized read records,
+not coordinated metadata. Admission validates actor, enrollment, known conversation
+and membership revisions, mentions and reply dependencies before publication.
+
+`read.ack` is **Owner-private** retained state even though its `conversation_id`
+is null. Its actor is Owner and `data.ids` contains up to 200 acknowledged message
+IDs. It merges by set union and is routed only to explicitly Owner-authorized hosts.
+It is not a message arrival. Existing Owner read state is retained in these records
+when sharing begins. Generic readers must not treat every null-conversation event
+as public; public identity attestations and host metadata remain distinct from
+private acknowledgements.
+
+Receipt/status and coverage journal entries are durable implementation records;
+they do not rewrite an event or rematch a monitor. `replication.status` records
+acceptance/rejection and dependencies. A receipt binds space, coordinator UUID,
+generation, position, event ID and the SHA-256 of the original event bytes. An
+archive-delayed acceptance adds `accepted_from_stale_revision: true`. Invalid
+credentials block transport without guessing a terminal result; a revoked peer
+with its valid former credential may reconcile only its own existing event bytes
+so a lost prior receipt is recovered before any rejection.
+
+Transport uses a dedicated authenticated stream with a 4 MiB frame ceiling and
+bounded pages. The receiver commits each exact event before acknowledging a page.
+A page can stop partway through a long reply-dependency chain; its coverage cursor
+does not cross the target until that target and its parents are durable. Reconnect
+may replay those parents. Public metadata, joined/followed/watched/viewed channel
+interests and authorized DMs are routed separately. Coverage describes what the
+hub had accepted through a checkpoint, not disconnected origins' future uploads.

@@ -31,6 +31,11 @@ fn main() -> anyhow::Result<()> {
     // its strict parse with a diagnosis.
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("--messaging-sync-stdio") => {
+            let root = args.next().map(std::path::PathBuf::from).unwrap_or_else(cm_daemon::messaging::rpc::default_root);
+            cm_daemon::messaging::sync::stdio_bridge(&root)?;
+            return Ok(());
+        }
         Some("--verify-handoff") => {
             let fd_arg = args.next().unwrap_or_default();
             std::process::exit(cm_daemon::reexec::run_verify_handoff(&fd_arg));

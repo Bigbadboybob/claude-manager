@@ -1,7 +1,7 @@
 //! Owner messaging view. Network work runs off the terminal event loop.
-mod manage;
-mod conversation;
 mod channel;
+mod conversation;
+mod manage;
 mod membership;
 mod mentions;
 use super::*;
@@ -56,6 +56,8 @@ pub struct Messages {
     page_cursor: Value,
     pub error: String,
     status: String,
+    sync: Value,
+    cache: Value,
     norms: String,
     filter: Value,
     next: Value,
@@ -175,28 +177,76 @@ impl Messages {
             ),
             ("Preferences".into(), json!({"preferences":true})),
         ];
-        out.push(("Browse channels · b".into(), json!({"channel_browser":true})));
-        let mut channels: Vec<_> = self.channels.iter().filter(|c| c["joined"] != false).collect();
-        channels.sort_by(|a,b| a["path"].as_str().cmp(&b["path"].as_str()));
+        out.push((
+            "Browse channels · b".into(),
+            json!({"channel_browser":true}),
+        ));
+        let mut channels: Vec<_> = self
+            .channels
+            .iter()
+            .filter(|c| c["joined"] != false)
+            .collect();
+        channels.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
         out.extend(channels.into_iter().map(|c| {
             let unread = c["unread"].as_u64().unwrap_or(0);
             let mentions = c["mentions"].as_u64().unwrap_or(0);
-            let badge = if mentions > 0 { format!(" @ {mentions}") }
-                else if unread > 0 { " ·".into() } else { String::new() };
-            (format!("#{}{badge}", c["name"].as_str().or_else(|| c["path"].as_str()).unwrap_or("?")),
-                json!({"channel":c["path"]}))
+            let badge = if mentions > 0 {
+                format!(" @ {mentions}")
+            } else if unread > 0 {
+                " ·".into()
+            } else {
+                String::new()
+            };
+            (
+                format!(
+                    "#{}{badge}",
+                    c["name"]
+                        .as_str()
+                        .or_else(|| c["path"].as_str())
+                        .unwrap_or("?")
+                ),
+                json!({"channel":c["path"]}),
+            )
         }));
         let count: u64 = self.dms.iter().filter_map(|d| d["unread"].as_u64()).sum();
-        out.push((format!("{} DMs{}", if self.saved.dms_collapsed { "▸" } else { "▾" },
-            if count > 0 { format!(" ● {count}") } else { String::new() }), json!({"dm_section":true})));
+        out.push((
+            format!(
+                "{} DMs{}",
+                if self.saved.dms_collapsed {
+                    "▸"
+                } else {
+                    "▾"
+                },
+                if count > 0 {
+                    format!(" ● {count}")
+                } else {
+                    String::new()
+                }
+            ),
+            json!({"dm_section":true}),
+        ));
         if !self.saved.dms_collapsed {
             let mut dms: Vec<_> = self.dms.iter().collect();
-            dms.sort_by(|a,b| b["last"]["created_at"].as_str().cmp(&a["last"]["created_at"].as_str())
-                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+            dms.sort_by(|a, b| {
+                b["last"]["created_at"]
+                    .as_str()
+                    .cmp(&a["last"]["created_at"].as_str())
+                    .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+            });
             out.extend(dms.into_iter().map(|d| {
                 let unread = d["unread"].as_u64().unwrap_or(0);
-                (format!("  {}{}", if unread > 0 { format!("●{unread} ") } else { String::new() }, self.dm_label(d)),
-                    json!({"conversation":d["id"]}))
+                (
+                    format!(
+                        "  {}{}",
+                        if unread > 0 {
+                            format!("●{unread} ")
+                        } else {
+                            String::new()
+                        },
+                        self.dm_label(d)
+                    ),
+                    json!({"conversation":d["id"]}),
+                )
             }));
         }
         out
@@ -332,6 +382,22 @@ impl Messages {
             self.status = format!("Matches: {}", matches.join(", "));
         }
     }
+    fn sync_label(&self) -> String {
+        if self.sync["enabled"] != true {
+            return String::new();
+        }
+        let pending = self.sync["pending"].as_u64().unwrap_or(0);
+        let connection = if self.sync["connected"] == true {
+            "online"
+        } else {
+            "offline"
+        };
+        if pending > 0 {
+            format!(" · {connection} · {pending} syncing")
+        } else {
+            format!(" · {connection}")
+        }
+    }
     fn query(&self) -> Value {
         let mut p = self.target.clone();
         if let Some(f) = self.filter.as_object() {
@@ -383,6 +449,7 @@ impl App {
                                 "not_found:",
                                 "invalid_mention:",
                                 "join_required:",
+                                "conversation_archived:",
                                 "invalid_link:",
                                 "event_too_large:",
                             ];
@@ -401,6 +468,17 @@ impl App {
                 }
                 Ok(v) => {
                     self.messages.error.clear();
+                    let status = if method == "bootstrap" {
+                        &v["open"]
+                    } else {
+                        &v
+                    };
+                    if status["sync"].is_object() {
+                        self.messages.sync = status["sync"].clone();
+                    }
+                    if status["cache"].is_object() {
+                        self.messages.cache = status["cache"].clone();
+                    }
                     self.messaging_context(&v);
                     if self.messaging_management_result(&method, &v) {
                         return;
@@ -433,7 +511,11 @@ impl App {
                                 self.messages.error = format!("Storage is read only: {reason}");
                             }
                             self.messages.status = if self.messages.items.is_empty() {
-                                "No messages".into()
+                                if v["coverage"] == "partial" {
+                                    "History not cached · G fetches from hub".into()
+                                } else {
+                                    "No messages in cached history".into()
+                                }
                             } else {
                                 format!(
                                     "{} messages · {}",
@@ -456,7 +538,16 @@ impl App {
                                 }
                             }
                             self.messages.mode.clear();
-                            self.messages.status = "Sent · stored locally".into();
+                            self.messages.status = if v["sync"]["enabled"] == true {
+                                if v["replication"] == "replicated" {
+                                    "Saved · synced"
+                                } else {
+                                    "Saved locally · syncing"
+                                }
+                            } else {
+                                "Sent · stored locally"
+                            }
+                            .into();
                             if let Some(cid) = v["event"]["conversation_id"].as_str() {
                                 self.messages.target = json!({"conversation":cid});
                             }
@@ -534,34 +625,63 @@ impl App {
                         json!({"channels":directory("messaging.channels",json!({"action":"list"}))?,"people":directory("messaging.people",json!({"include_exited":true}))?,"open":call("messaging.open",json!({"channel":"general","claim_bell":true}))?,"dms":directory("messaging.dms",json!({}))?}),
                     )
                 })()
-            } else if method == "messaging.read" {
+            } else if method == "messaging.read" || method == "hub_refresh" {
                 (|| {
-                    let mut value = call(&method, params.clone())?;
+                    if method == "hub_refresh" {
+                        let mut fresh = params.clone();
+                        fresh["freshness"] = json!("hub");
+                        call("messaging.read", fresh)?;
+                    }
+                    let mut value = call("messaging.read", params.clone())?;
                     // A burst can exceed a read page. Catch up to the last known
                     // message before merging, using the first page's frozen cursor.
                     if let Some(anchor) = catch_up_to {
-                        while !value["items"].as_array().is_some_and(|items| items.iter().any(|m| m["id"] == anchor))
+                        while !value["items"]
+                            .as_array()
+                            .is_some_and(|items| items.iter().any(|m| m["id"] == anchor))
                             && !value["next_cursor"].is_null()
                         {
                             let mut older = params.clone();
                             older["cursor"] = value["next_cursor"].clone();
                             let page = call(&method, older)?;
-                            value["items"].as_array_mut().unwrap().extend(page["items"].as_array().cloned().unwrap_or_default());
-                            value["receipt"]["ids"].as_array_mut().unwrap().extend(page["receipt"]["ids"].as_array().cloned().unwrap_or_default());
+                            value["items"]
+                                .as_array_mut()
+                                .unwrap()
+                                .extend(page["items"].as_array().cloned().unwrap_or_default());
+                            value["receipt"]["ids"].as_array_mut().unwrap().extend(
+                                page["receipt"]["ids"]
+                                    .as_array()
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            );
                             value["next_cursor"] = page["next_cursor"].clone();
                         }
                     }
                     // Sidebar failures must not hide successfully read messages.
-                    if let Ok(dms) = directory("messaging.dms", json!({})) { value["_dms"] = dms["items"].clone(); }
-                    if let Ok(channels) = directory("messaging.channels", json!({})) { value["_channels"] = channels["items"].clone(); }
-                    if let Ok(people) = directory("messaging.people", json!({"include_exited":true})) { value["_people"] = people["items"].clone(); }
+                    if let Ok(dms) = directory("messaging.dms", json!({})) {
+                        value["_dms"] = dms["items"].clone();
+                    }
+                    if let Ok(channels) = directory("messaging.channels", json!({})) {
+                        value["_channels"] = channels["items"].clone();
+                    }
+                    if let Ok(people) =
+                        directory("messaging.people", json!({"include_exited":true}))
+                    {
+                        value["_people"] = people["items"].clone();
+                    }
                     Ok(value)
                 })()
             } else if method == "channel_members" {
                 directory("messaging.channels", params)
             } else if method == "pin_prepare" {
-                (|| { let mut value = call("messaging.pins", json!({"conversation":params["conversation"],"limit":1}))?;
-                    value["intent"] = params; Ok(value) })()
+                (|| {
+                    let mut value = call(
+                        "messaging.pins",
+                        json!({"conversation":params["conversation"],"limit":1}),
+                    )?;
+                    value["intent"] = params;
+                    Ok(value)
+                })()
             } else if method == "norms_document" {
                 (|| {
                     let mut p = params;
@@ -580,7 +700,14 @@ impl App {
             } else {
                 call(&method, params)
             };
-            let _ = tx.send((method, result));
+            let _ = tx.send((
+                if method == "hub_refresh" {
+                    "messaging.read".into()
+                } else {
+                    method
+                },
+                result,
+            ));
         });
     }
     pub(super) fn messaging_event(&mut self, event: &CrosstermEvent) -> bool {
@@ -780,10 +907,16 @@ impl App {
                     self.messages.error = "Choose a channel or DM before composing".into();
                 }
             }
+            KeyCode::Char('G') if !self.messages.management_view() => {
+                self.messages.page_cursor = Value::Null;
+                self.messaging_request("hub_refresh", self.messages.query());
+            }
             KeyCode::Char('r') => {
                 if let Some(v) = self.messages.items.get(self.messages.selected).cloned() {
                     self.messages.target = json!({"conversation":v["conversation_id"]});
-                    if !self.messages.can_post() || !self.messages.can_edit() { return true; }
+                    if !self.messages.can_post() || !self.messages.can_edit() {
+                        return true;
+                    }
                     let mut d = self.messages.draft();
                     d.reply_to = v["id"].as_str().map(str::to_owned);
                     self.messages.filter = json!({});
@@ -1143,6 +1276,14 @@ impl App {
             Paragraph::new(Line::from(vec![
                 Span::styled("CM · Messages", accent.add_modifier(Modifier::BOLD)),
                 Span::styled(" · Owner", Style::default().fg(theme::CHAT_OWNER)),
+                Span::styled(
+                    self.messages.sync_label(),
+                    Style::default().fg(if self.messages.sync["connected"] == false {
+                        theme::CHAT_TAG
+                    } else {
+                        theme::CHAT_MUTED
+                    }),
+                ),
                 Span::styled("   j/k move · Tab pane · Alt+m / F8 / Esc return", muted),
             ])),
             rows[0],
@@ -1210,16 +1351,36 @@ impl App {
                 self.draw_messaging_management(frame, cols[1], messages_focused);
             } else {
                 let composer_height = if self.messages.mode.is_empty() {
-                    if self.messages.draft().body.is_empty() { 0 } else { 3 }
-                } else if matches!(self.messages.mode.as_str(), "filter" | "channel" | "channel_edit") { 10 } else { 7 };
-                let mention_height = if self.messages.mention_options().is_empty() { 0 } else {
-                    (self.messages.mention_options().len().min(5) as u16 + 2).min(cols[1].height.saturating_sub(6))
+                    if self.messages.draft().body.is_empty() {
+                        0
+                    } else {
+                        3
+                    }
+                } else if matches!(
+                    self.messages.mode.as_str(),
+                    "filter" | "channel" | "channel_edit"
+                ) {
+                    10
+                } else {
+                    7
+                };
+                let mention_height = if self.messages.mention_options().is_empty() {
+                    0
+                } else {
+                    (self.messages.mention_options().len().min(5) as u16 + 2)
+                        .min(cols[1].height.saturating_sub(6))
                 };
                 let composer_height = if mention_height > 0 {
                     composer_height.min(cols[1].height.saturating_sub(mention_height + 3))
-                } else { composer_height };
-                let content = Layout::vertical([Constraint::Min(3), Constraint::Length(composer_height), Constraint::Length(mention_height)])
-                    .split(cols[1]);
+                } else {
+                    composer_height
+                };
+                let content = Layout::vertical([
+                    Constraint::Min(3),
+                    Constraint::Length(composer_height),
+                    Constraint::Length(mention_height),
+                ])
+                .split(cols[1]);
                 self.draw_messaging_timeline(frame, content[0], messages_focused);
                 self.draw_mention_options(frame, content[2]);
                 let d = self.messages.draft();
@@ -1239,8 +1400,19 @@ impl App {
                             "Mention names (Shift+Tab completes)",
                             "Reference URIs, comma separated",
                         ],
-                        "channel" => vec!["Permanent path", "Display name (optional)", "Description", "All agents may edit (yes/no)", "Additional admin names or IDs"],
-                        "channel_edit" => vec!["Display name", "Description", "All agents may edit (yes/no)", "Additional admin names or IDs"],
+                        "channel" => vec![
+                            "Permanent path",
+                            "Display name (optional)",
+                            "Description",
+                            "All agents may edit (yes/no)",
+                            "Additional admin names or IDs",
+                        ],
+                        "channel_edit" => vec![
+                            "Display name",
+                            "Description",
+                            "All agents may edit (yes/no)",
+                            "Additional admin names or IDs",
+                        ],
                         _ => vec!["Channel path", "Description"],
                     };
                     self.messages
@@ -1353,7 +1525,7 @@ impl App {
                 ]),
                 chat_help(&[
                     ("]", "older"),
-                    ("g", "refresh"),
+                    ("g/G", "refresh/hub"),
                     ("W", "monitor"),
                     ("f", "preferences"),
                 ]),

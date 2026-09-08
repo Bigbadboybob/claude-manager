@@ -1202,6 +1202,8 @@ pub fn run() -> anyhow::Result<()> {
     state.lock().unwrap_or_else(|p| p.into_inner())
         .persist_sessions_best_effort();
     messaging::delivery::spawn(&state);
+    messaging::sync::start(&state);
+    messaging::tasks::spawn(&state);
 
     // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver
     // since Phase 4 (the TUI is a pure observer). It fires transitions,

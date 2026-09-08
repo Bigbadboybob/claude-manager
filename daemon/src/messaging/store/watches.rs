@@ -15,6 +15,8 @@ pub(super) struct Scope {
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Monitor {
     pub id: String,
+    #[serde(default)]
+    pub task_subscription: Option<String>,
     pub scope: Scope,
     pub mode: String,
     pub notify: String,
@@ -178,11 +180,9 @@ impl Store {
             return false;
         }
         if let Some(peer) = &scope.peer {
-            if !self
-                .conversations
-                .get(cid)
-                .is_some_and(|members| members.len() == 2 && members.contains(peer) && members.iter().any(|m| m == actor))
-            {
+            if !self.conversations.get(cid).is_some_and(|members| {
+                members.len() == 2 && members.contains(peer) && members.iter().any(|m| m == actor)
+            }) {
                 return false;
             }
         }
@@ -196,17 +196,20 @@ impl Store {
 
     pub(super) fn monitor_matches(&self, actor: &str, monitor: &Monitor, e: &Published) -> bool {
         e.event["type"] == "message.create"
+            && self.task_monitor_matches(actor, monitor, strv(&e.event, "id"))
             && (monitor.include_self || e.event["actor"]["id"] != actor)
             && self.scope_matches(actor, &monitor.scope, &e.event)
     }
 
-    fn scan_monitor(
+    pub(super) fn scan_monitor(
         &self,
         actor: &str,
         monitor: &mut Monitor,
         clock: DateTime<Utc>,
     ) -> Result<bool> {
-        if monitor.state != "active" {
+        if monitor.state != "active"
+            || actor == "owner" && self.sync_enabled() && !self.is_coordinator()
+        {
             return Ok(false);
         }
         let expired = monitor
@@ -337,6 +340,7 @@ impl Store {
             .unwrap_or(self.position);
         let mut monitor = Monitor {
             id: uuid(),
+            task_subscription: None,
             scope,
             mode: mode.into(),
             notify: notify.into(),
@@ -382,11 +386,10 @@ impl Store {
         }
         if action == "cancel_all" {
             let mut cancelled = 0;
-            for m in state
-                .monitors
-                .values_mut()
-                .filter(|m| !["cancelled", "dismissed"].contains(&m.state.as_str()))
-            {
+            for m in state.monitors.values_mut().filter(|m| {
+                m.task_subscription.is_none()
+                    && !["cancelled", "dismissed"].contains(&m.state.as_str())
+            }) {
                 m.state = "cancelled".into();
                 m.closing_fence.get_or_insert(self.position);
                 cancelled += 1;
@@ -405,6 +408,26 @@ impl Store {
             .get_mut(&id)
             .filter(|m| m.state != "dismissed")
             .ok_or_else(|| err("not_found", "Monitor not found"))?;
+        if mutation && m.task_subscription.is_some() {
+            let binding = m
+                .task_subscription
+                .as_ref()
+                .and_then(|id| self.task_bindings.get(id));
+            if binding.is_none_or(|b| {
+                !b.active || b.actor != actor || m.id != format!("task-{}-{}", b.id, b.revision)
+            }) {
+                return Err(err(
+                    "stale_binding",
+                    "This session no longer owns the task subscription",
+                ));
+            }
+            if action != "ack" {
+                return Err(err(
+                    "scheduler_owned",
+                    "Configure or remove a task subscription through continuous.update",
+                ));
+            }
+        }
         if action == "get" {
             let result = self.monitor_results(actor, m, p)?;
             state
@@ -464,6 +487,9 @@ impl Store {
                     "Supported actions: list, get, ack, cancel, cancel_all, dismiss",
                 ))
             }
+        }
+        if action == "ack" {
+            self.acknowledge_task_monitor(actor, m)?;
         }
         let result = self.monitor_summary(actor, m);
         let (key, digest) = op.unwrap();

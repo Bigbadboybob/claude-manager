@@ -399,6 +399,7 @@ pub fn dispatch_request(
         None
     };
     match req.method.as_str() {
+        "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.read" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.send" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),

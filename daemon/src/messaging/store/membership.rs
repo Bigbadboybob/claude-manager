@@ -148,6 +148,7 @@ impl Store {
         if self.enrolled.contains(actor) {
             return Ok(());
         }
+        self.shared_mutation_allowed()?;
         let channels: Vec<_> = self
             .channels
             .iter()
@@ -169,7 +170,7 @@ impl Store {
     }
 
     pub fn enroll_participants(&mut self, people: &[Person]) -> Result<()> {
-        if self.degraded.is_some() {
+        if self.degraded.is_some() || !self.is_coordinator() {
             return Ok(());
         }
         let mut actors: BTreeSet<_> = self

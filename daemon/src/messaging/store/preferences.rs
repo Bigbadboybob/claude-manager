@@ -18,6 +18,8 @@ pub(super) struct Follow {
     pub muted: bool,
     pub since: u64,
     #[serde(default)]
+    pub hub_since: Option<u64>,
+    #[serde(default)]
     pub wake_since: Option<u64>,
 }
 
@@ -70,7 +72,18 @@ impl Store {
                 muted |= rule.muted;
                 // New follows start at their commit boundary; enabling a
                 // channel never floods an inbox with its entire old history.
-                if event.position > rule.since || !rule.inbox {
+                let later = rule
+                    .hub_since
+                    .and_then(|boundary| {
+                        self.replication
+                            .receipts
+                            .get(strv(v, "id"))
+                            .and_then(|r| r["position"].as_str())
+                            .and_then(|p| p.parse::<u64>().ok())
+                            .map(|p| p > boundary)
+                    })
+                    .unwrap_or(event.position > rule.since);
+                if later || !rule.inbox {
                     inbox = rule.inbox;
                 }
                 if event.position > rule.wake_since.unwrap_or(rule.since) || !rule.wake {
@@ -250,6 +263,7 @@ impl Store {
                         wake,
                         muted,
                         since,
+                        hub_since: None,
                         wake_since,
                     },
                 );

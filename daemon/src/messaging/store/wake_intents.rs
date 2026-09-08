@@ -62,7 +62,7 @@ impl Store {
             for e in self
                 .events
                 .iter()
-                .filter(|e| e.event["type"] == "message.create")
+                .filter(|e| e.event["type"] == "message.create" && !self.replication.rejections.contains_key(strv(&e.event, "id")))
             {
                 let (_, wake, muted) = self.preference_for_event(&actor, e);
                 let id = strv(&e.event, "id");

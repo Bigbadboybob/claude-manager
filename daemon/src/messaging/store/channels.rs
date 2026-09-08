@@ -7,7 +7,7 @@ mod tests;
 impl Store {
     pub(super) fn channel_at(&self, path: &str, id: &str, high: u64) -> Value {
         let mut channel = json!({"path":path,"id":id,"name":path,"revision":id,
-            "kind":"channel","description":"","created_by":"owner","admins":[],"allow_agent_edits":false,"default_join":false});
+            "kind":"channel","description":"","created_by":"owner","admins":[],"allow_agent_edits":false,"default_join":false,"archived":false});
         for published in self.events.iter().filter(|e| e.position <= high) {
             let e = &published.event;
             if let Some(created) = e["data"]["channels"]
@@ -25,7 +25,7 @@ impl Store {
                 } else {
                     json!([creator])
                 };
-                for key in ["name", "description", "admins", "allow_agent_edits", "default_join"] {
+                for key in ["name", "description", "admins", "allow_agent_edits", "default_join", "archived"] {
                     if let Some(value) = created.get(key) {
                         channel[key] = value.clone();
                     }
@@ -77,7 +77,7 @@ impl Store {
                 fields[key] = json!(if key == "name" { text.trim() } else { text });
             }
         }
-        for key in ["allow_agent_edits", "default_join"] {
+        for key in ["allow_agent_edits", "default_join", "archived"] {
         if let Some(value) = p.get(key) {
             if !value.is_boolean() {
                 return Err(err("invalid_params", format!("{key} must be a boolean")));
@@ -273,7 +273,7 @@ impl Store {
             return Ok(current);
         }
         if current["can_edit"] != true
-            || ((p.get("admins").is_some() || p.get("allow_agent_edits").is_some() || p.get("default_join").is_some())
+            || ((p.get("admins").is_some() || p.get("allow_agent_edits").is_some() || p.get("default_join").is_some() || p.get("archived").is_some())
                 && current["can_manage"] != true)
         {
             return Err(err("unauthorized", "Only channel admins can change access; channel editing is restricted by its policy"));
@@ -296,7 +296,7 @@ impl Store {
         if fields.as_object().unwrap().is_empty() {
             return Err(err(
                 "invalid_params",
-                "Supply name, description, admins or allow_agent_edits",
+                "Supply name, description, admins, allow_agent_edits, default_join or archived",
             ));
         }
         for (k, v) in fields.as_object().unwrap() {

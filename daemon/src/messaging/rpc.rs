@@ -36,7 +36,10 @@ pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
 pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bool) {
     let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
     let mut any_changed = false;
-    for n in store.names.values() {
+    for (actor, n) in &store.names {
+        if !actor.starts_with(&format!("agent:{}:", store.daemon_id)) {
+            continue;
+        }
         let name_changed = s
             .messaging_names
             .get(&n.session_uid)
@@ -71,11 +74,14 @@ pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bo
 pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     match execute(state, req) {
         Ok(v) => {
-            if matches!(req.method.as_str(), "messaging.send" | "messaging.follow" | "messaging.monitor" | "messaging.monitors") {
+            if matches!(
+                req.method.as_str(),
+                "messaging.send" | "messaging.follow" | "messaging.monitor" | "messaging.monitors"
+            ) {
                 super::delivery::signal(state);
             }
             Response::ok(req.id.clone(), v)
-        },
+        }
         Err(e) => Response::err(
             req.id.clone(),
             match e.code.as_str() {
@@ -161,6 +167,123 @@ fn repair_legacy_binding(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Result<(
 }
 
 fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, ChatError> {
+    if req.method == "messaging.sync" {
+        return execute_sync_admin(state, req);
+    }
+    // Fence stale task subscription owners before they can acknowledge hits.
+    super::tasks::refresh(state)?;
+    let mut result = execute_with_freshness(state, req, false)?;
+    if matches!(req.caller, Caller::Operator(_)) && req.params["claim_bell"] == true {
+        let (handle, sync) = {
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            (s.messaging.clone(), s.messaging_sync.clone())
+        };
+        let remote_bell = {
+            let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+            slot.as_ref().is_some_and(|s| {
+                !s.is_coordinator()
+                    && s.cached_owner_snapshot()
+                        .is_some_and(|v| v["preferences"]["bell"] == true)
+            })
+        };
+        if remote_bell {
+            if let Some(sync) = sync {
+                match sync.request("owner", "sync.owner_attention", &json!({})) {
+                    Ok(attention) => result["attention"] = attention,
+                    Err(_) => result["attention"] = json!({"bell":false,"pending":true}),
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, ChatError> {
+    if !matches!(req.caller, Caller::Operator(_)) {
+        return Err(ChatError {
+            code: "unauthorized".into(),
+            message: "Messaging host administration is operator-only".into(),
+        });
+    }
+    crate::control::operator::validate_operator(&req.caller).map_err(|e| ChatError {
+        code: "unauthorized".into(),
+        message: e.into(),
+    })?;
+    initialize(state)?;
+    let restart = matches!(
+        req.params["action"].as_str(),
+        Some("enable_hub" | "join_space" | "install_seed" | "activate_replica")
+    );
+    if restart {
+        let runtime = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .messaging_sync
+            .take();
+        if let Some(runtime) = runtime {
+            runtime.stop();
+        }
+    }
+    let (handle, people) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            s.messaging.clone(),
+            s.sessions
+                .values()
+                .map(|s| (s.uid.clone(), s.title.clone(), s.task_id.clone()))
+                .chain(
+                    s.tui_sessions
+                        .values()
+                        .filter(|t| !s.sessions.contains_key(&t.uid))
+                        .map(|t| {
+                            (
+                                t.uid.clone(),
+                                t.label.clone().unwrap_or_else(|| t.uid.clone()),
+                                t.task_id.clone(),
+                            )
+                        }),
+                )
+                .collect::<Vec<_>>(),
+        )
+    };
+    let result = {
+        let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        let store = slot.as_mut().unwrap();
+        let people = people
+            .into_iter()
+            .map(|(uid, name, task)| Person {
+                id: store.participant_id(&uid),
+                name,
+                session_uid: uid,
+                task,
+                present: true,
+                kind: "agent".into(),
+            })
+            .collect::<Vec<_>>();
+        store.sync_admin(&req.params, &people)
+    };
+    if restart {
+        super::sync::start(state);
+    }
+    if matches!(
+        req.params["action"].as_str(),
+        Some("revoke" | "rotate_peer")
+    ) {
+        let sync = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .messaging_sync
+            .clone();
+        if let (Some(sync), Some(host)) = (sync, req.params["host_id"].as_str()) {
+            sync.disconnect_peer(host);
+        }
+    }
+    result
+}
+fn execute_with_freshness(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+    caught_up: bool,
+) -> Result<Value, ChatError> {
     if matches!(req.caller, Caller::Operator(_)) {
         crate::control::operator::validate_operator(&req.caller).map_err(|e| ChatError {
             code: "unauthorized".into(),
@@ -265,6 +388,7 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
         present: true,
         kind: "owner".into(),
     });
+    people.extend(store.remote_people());
     let p = &req.params;
     if !p.is_object() {
         return Err(ChatError {
@@ -278,7 +402,106 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             message: "Sender is authenticated; do not supply from".into(),
         });
     }
+    if kind == "owner"
+        && !store.is_coordinator()
+        && store
+            .host_info(&store.daemon_id)
+            .is_none_or(|h| h["owner_access"] != true || h["active"] != true)
+    {
+        return Err(ChatError {
+            code: "unauthorized".into(),
+            message: "This messaging host is not enrolled to serve Owner".into(),
+        });
+    }
     store.enroll_participants(&people)?;
+    if store.sync_enabled() && store.is_coordinator() {
+        let local = people
+            .iter()
+            .filter(|p| p.id.starts_with(&format!("agent:{}:", store.daemon_id)))
+            .cloned()
+            .collect::<Vec<_>>();
+        store.register_host(&store.daemon_id.clone(), true, true, &local)?;
+    }
+    if req.method == "messaging.send"
+        && p["origin_daemon_id"]
+            .as_str()
+            .is_some_and(|o| o != store.daemon_id)
+    {
+        match store.resolve_pinned_retry(&actor, p, &people) {
+            Ok(mut value) => {
+                store.decorate_sync_response(p, &mut value);
+                return Ok(value);
+            }
+            Err(e) if e.code == "retry_origin_unavailable" && !store.is_coordinator() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let sync = state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .messaging_sync
+        .clone();
+    if !store.is_coordinator() {
+        let forward = store.needs_coordinator(&actor, &req.method, p, &people)?;
+        let fresh = !caught_up && p["freshness"] == "hub" && p["cursor"].is_null();
+        if let Some(sync) = &sync {
+            if matches!(req.method.as_str(), "messaging.open" | "messaging.read") {
+                if let Some(interest) = store.query_interest(p) {
+                    sync.view(&interest);
+                }
+            }
+        }
+        if forward || fresh {
+            let sync = sync.ok_or_else(|| ChatError {
+                code: "coordinator_unavailable".into(),
+                message: "Messaging coordinator is not connected; keep the draft and request ID"
+                    .into(),
+            })?;
+            if kind != "owner"
+                && (req.method == "session.set_name" || !store.names.contains_key(&actor))
+            {
+                repair_legacy_binding(state, &uid)?;
+            }
+            store.acknowledge(&actor, &p["ack_receipt"])?;
+            let interest = store.query_interest(p);
+            let mut forwarded = p.clone();
+            // Local receipts are acknowledged here, never submitted as a hub cursor.
+            if let Some(obj) = forwarded.as_object_mut() {
+                obj.remove("ack_receipt");
+            }
+            if actor == "owner" && req.method == "messaging.monitor" && p["after"].is_object() {
+                forwarded["after"] = store.owner_execution_position(&p["after"])?;
+            }
+            // A coordinated first send still gives this host a usable monitor
+            // fence. Capture it before the round trip so even a fast response
+            // delivered ahead of bulk history cannot be skipped.
+            let submission_position = store.position_token(store.publication_position());
+            drop(slot);
+            drop(_delivery_guard);
+            if forward {
+                let mut result = sync.request(&actor, &req.method, &forwarded)?;
+                let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+                let store = slot.as_mut().unwrap();
+                if req.method == "messaging.send" {
+                    result["coordinator_position"] = result["position"].clone();
+                    result["position"] = submission_position;
+                }
+                if let Some(snapshot) = result.get("owner_snapshot").cloned() {
+                    store.apply_owner_snapshot(&snapshot)?;
+                }
+                project_names(state, store, true);
+                result = store.context_response(&actor, p, result, false);
+                store.decorate_sync_response(p, &mut result);
+                return Ok(result);
+            }
+            sync.request(
+                &actor,
+                "sync.barrier",
+                &json!({"interests":interest.into_iter().collect::<Vec<_>>()}),
+            )?;
+            return execute_with_freshness(state, req, true);
+        }
+    }
     let result = match req.method.as_str() {
         "messaging.send" => {
             if kind != "owner" && !store.names.contains_key(&actor) {
@@ -337,7 +560,7 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
@@ -374,12 +597,23 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
             return value;
         }
         let mut value = store.context_response(&actor, p, value, req.method == "messaging.open");
-        value["monitor_status"] = store.monitor_status(&actor);
+        value["monitor_status"] = if kind == "owner" && !store.is_coordinator() {
+            store
+                .cached_owner_snapshot()
+                .map(|s| s["monitor_status"].clone())
+                .unwrap_or(json!({"state":"uncached","execution_host":store.coordinator_id()}))
+        } else {
+            store.monitor_status(&actor)
+        };
+        store.decorate_sync_response(p, &mut value);
         if let Some(note) = retraction_note {
             value["delivery_note"] = json!(note);
         }
         if kind == "owner" {
-            match store.attention(&actor, p["claim_bell"] == true) {
+            match store.attention(
+                &actor,
+                p["claim_bell"] == true && (store.is_coordinator() || !store.sync_enabled()),
+            ) {
                 Ok(attention) => value["attention"] = attention,
                 Err(error) => value["attention"] = json!({"error":error.to_string()}),
             }
@@ -423,13 +657,24 @@ mod tests {
     }
     #[test]
     fn messaging_channel_admin_uses_authenticated_caller_not_supplied_roles() {
-        let root = tempfile::tempdir().unwrap(); let state = setup(root.path());
-        let channel = call(&state,"a","channels",json!({"action":"create","path":"roles","request_id":"create"})).unwrap()["channel"].clone();
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        let channel = call(
+            &state,
+            "a",
+            "channels",
+            json!({"action":"create","path":"roles","request_id":"create"}),
+        )
+        .unwrap()["channel"]
+            .clone();
         let p = json!({"action":"update","path":"roles","description":"Hijack","admins":[],"created_by":"owner","role":"admin","expected_revision":channel["revision"],"request_id":"bad"});
-        assert_eq!(call(&state,"b","channels",p).unwrap_err().code,"unauthorized");
-        let opened=call(&state,"b","open",json!({"channel":"roles"})).unwrap();
-        assert_eq!(opened["target"]["can_edit"],false);
-        assert_eq!(opened["target"]["created_by"],channel["created_by"]);
+        assert_eq!(
+            call(&state, "b", "channels", p).unwrap_err().code,
+            "unauthorized"
+        );
+        let opened = call(&state, "b", "open", json!({"channel":"roles"})).unwrap();
+        assert_eq!(opened["target"]["can_edit"], false);
+        assert_eq!(opened["target"]["created_by"], channel["created_by"]);
     }
     #[test]
     fn messaging_cancel_serializes_at_delivery_boundary_but_reads_and_sends_do_not() {
@@ -552,7 +797,13 @@ mod tests {
         )
         .unwrap();
         let a=call(&state,"a","send",json!({"channel":"work/parser","name":"Parser Scout","body":"Ready.","tags":["needs-owner"],"request_id":"one"})).unwrap();
-        call(&state,"b","channels",json!({"action":"join","path":"work/parser","request_id":"join"})).unwrap();
+        call(
+            &state,
+            "b",
+            "channels",
+            json!({"action":"join","path":"work/parser","request_id":"join"}),
+        )
+        .unwrap();
         call(&state,"b","send",json!({"channel":"work/parser","name":"parser scout","body":"Checking.","request_id":"two"})).unwrap();
         let dm = call(
             &state,
@@ -590,7 +841,13 @@ mod tests {
         {
             let mut slot = handle.lock().unwrap();
             let store = slot.as_mut().unwrap();
-            store.channel_action("owner", &json!({"action":"join","path":"work/parser","request_id":"owner-join"}), &[]).unwrap();
+            store
+                .channel_action(
+                    "owner",
+                    &json!({"action":"join","path":"work/parser","request_id":"owner-join"}),
+                    &[],
+                )
+                .unwrap();
             store
                 .send(
                     "owner",

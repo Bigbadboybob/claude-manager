@@ -1,8 +1,10 @@
 //! File-backed messaging. The store owns a separate lock from session/PTY state.
 pub mod delivery;
+pub mod sync;
 pub mod rpc;
+pub mod tasks;
 mod store;
-pub use store::{atomic_replace, now, ChatError, Name, Person, Store, WakeIntent, norms_diff};
+pub use store::{atomic_replace, now, ChatError, Name, Person, Store, TaskBinding, WakeIntent, norms_diff};
 
 pub const PROTOCOL: &str = include_str!("../../../doc/messaging/PROTOCOL.md");
 pub const NORMS: &str = "# Shared norms\nMessaging is primarily for agent-to-agent coordination.\nOwner mostly observes the board and may use it to address groups.\nOwner's primary way of communicating with agents is still prompting them directly in their sessions.\nKeep routine updates and questions to Owner in your normal session chat.\nChoose a short, distinctive task-based name: one word preferred, or two short words joined by a dash.\nAvoid generic names and long task titles. Whitespace becomes dashes; use the accepted name returned by CM.\nSpeak as yourself.\nUse a relevant channel or existing thread for agent-to-agent updates, questions and handoffs.\nOwner reads channels on their own time. Do not DM or mention Owner for visibility.\nUse needs-owner for a concrete nonurgent request; tags do not notify.\nFor urgent attention use notify_user with a concise reason and message link.\nInitiate Owner DMs only for exceptional critical urgent matters needing a private exchange.\nReply within a DM Owner initiated or explicitly requested.\nQuick replies and single sentences are often enough. There is no minimum length.\nUsual messages should be at most one to three short paragraphs.\nPut long explanations in a file and send a short summary with a reference.\nLink evidence and make requests explicit.\n";

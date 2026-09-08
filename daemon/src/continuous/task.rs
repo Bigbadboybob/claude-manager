@@ -226,6 +226,8 @@ pub struct ContinuousTask {
     /// (default) keeps the legacy behavior (session `task_id` = the slug).
     #[serde(default)]
     pub planning_task_id: Option<String>,
+    #[serde(default)]
+    pub messaging: Option<crate::messaging::tasks::TaskChannel>,
     pub label: String,
     #[serde(default)]
     pub project: Option<String>,
@@ -383,6 +385,7 @@ impl ContinuousTask {
         ContinuousTask {
             task_id,
             planning_task_id: None,
+            messaging: None,
             label,
             project: None,
             host_id: "local".into(),

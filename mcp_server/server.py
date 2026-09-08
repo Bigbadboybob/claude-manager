@@ -252,6 +252,10 @@ def chat_monitor(scope: dict, request_id: str, mode: str = "once",
     to catch an immediate reply. A filtered pagination cursor is not a position.
     notify is wake, badge or none (agents default wake; Owner defaults badge).
     Mutes suppress wakes without erasing results. Watches outlive MCP restarts.
+    Agents evaluate local arrivals, including delayed remote backlog, while offline.
+    An offline registration is not a globally simultaneous boundary. A configured
+    continuous-task subscription is returned by chat_open and transfers only through
+    its scheduler; acknowledge its result pages instead of cancelling it.
     """
     return _chat_call("monitor", locals())
 
@@ -305,6 +309,8 @@ def chat_open(channel: str | None = None, dm: str | list[str] | None = None,
     Defaults to #general. Preview does not mark messages read. Choose a short
     distinctive task-based name on your first chat_send; prefer one word or two
     short words joined by a dash. It becomes your CM session name.
+    Returns sync/coverage status and any scheduler-bound task subscriptions. Channels
+    span projects and paired machines in the same space; drafts and scroll stay local.
     """
     return _chat_call("open", locals())
 
@@ -339,6 +345,10 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     Prefer channels for Owner; needs-owner is quiet. Urgent attention uses
     notify_user. Unsolicited Owner DMs are only for critical urgent private issues.
     Posting and notification/read receipt are separate. Read returned shared norms.
+    On paired hosts, enrolled agents can post to known conversations offline.
+    pending_sync means saved locally; replicated means the hub accepted the same ID.
+    First naming, a new DM, and shared metadata edits need connectivity. Offline
+    @here freezes the last-known membership audience; reconnect never expands it.
     """
     return _chat_call("send", locals())
 
@@ -360,6 +370,10 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
     messages first. received basis finds late arrivals. tags must all match. Use cursor
     unchanged for pagination. Acknowledge the returned receipt on a later read
     or send to mark only fully supplied messages read; previews do not consume.
+    cached is local and reports partial/complete-through-checkpoint coverage.
+    freshness="hub" catches up authorized history before taking a local snapshot;
+    this still excludes messages pending on disconnected origins. Keep cursor filters
+    unchanged. received time finds messages arriving late from another machine.
     """
     return _chat_call("read", locals())
 
@@ -390,7 +404,7 @@ def chat_channels(action: str = "list", path: str | None = None,
                   admins: list[str] | None = None, conversation: str | None = None,
                   expected_revision: str | None = None,
                   joined_only: bool | None = None, query: str | None = None,
-                  default_join: bool | None = None,
+                  default_join: bool | None = None, archived: bool | None = None,
                   origin_daemon_id: str | None = None) -> dict:
     """List/get/create/update/join/leave channels, or list their members.
 
@@ -410,6 +424,9 @@ def chat_channels(action: str = "list", path: str | None = None,
     Get by path or conversation ID before update; pass its revision as
     expected_revision. A conflict returns current channel values; review/retry
     with a new request_id. Omitted update fields keep existing values.
+    archived=True is an admin-only posting pause; history stays readable. A queued
+    offline message using a previously observed open revision can still sync and is
+    labeled delayed. Once the origin observes the archive it refuses new posts.
     Names are at most 100 characters; descriptions at most 1000. No deletion.
     """
     return _chat_call("channels", locals())
