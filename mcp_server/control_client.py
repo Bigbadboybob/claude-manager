@@ -89,7 +89,7 @@ class SocketRoute:
 # included for correctness — the resolver gives the right
 # answer regardless of who's calling.
 DAEMON_METHODS: frozenset[str] = frozenset({
-    "messaging.open", "messaging.read", "messaging.send",
+    "messaging.open", "messaging.read", "messaging.send", "messaging.sync",
     "messaging.dms", "messaging.people", "messaging.channels", "messaging.pins", "session.set_name",
     "messaging.norms", "messaging.monitor", "messaging.monitors", "messaging.follow",
     "ping",
