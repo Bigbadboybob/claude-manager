@@ -147,7 +147,7 @@ Sessions view:
 - `A-s` — add a session to the focused task (defaults to Codex). The form has a **Resume** field (Tab to it, Enter opens a picker of the worktree's claude/codex transcripts, newest first with age, size, and the first prompt): the new session spawns `claude --resume <id>` / `codex resume <id>` with its row bound to that transcript from the start. This is the native replacement for "A-s, then `/resume` inside the pane". Mutually exclusive with the Seed field.
 - `A-a` — attach
 - `A-w` — close session
-- `A-H` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden). Moved from `A-h`; the old `A-H` active-host switcher is retired (global host is being removed — new sessions use the `local` default).
+- `A-H` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden). Moved from `A-h`; the old `A-H` active-host switcher is retired (new work uses the configured default host).
 - `A-h` / `A-l` — move the sidebar cursor LEFT / RIGHT between the main column and the **continuous column** (when the continuous column is shown; see `A-c`). `A-j`/`A-k` stay vertical within the focused column. See `DESIGN_CONTINUOUS_PANEL.md`.
 - `A-c` — toggle the dedicated **continuous column** (orchestrators with their spawned subtasks nested) on/off. This is the single continuous control: ON = a third pane splits off the right (terminal | main | continuous) showing the continuous tree; OFF = continuous tasks are hidden entirely. Continuous tasks (an orchestrator + its subtasks, matched by `managed_by_uid` **or** task-tree `parent_task_id` **or** — for same-task workers like momentum-detective's ephemeral `detective-*` spawns, which carry the orchestrator's own `task_id` and no subtask — `managed_by_uid.is_some() && task_id == orchestrator.task_id`, so they group correctly across orchestrator respawns; pre-fix a prior instance's worker fell into the main sidebar the moment the scheduler respawned its parent) render **only** in this column — never in the main sidebar. Persisted. (The old `A-C` column toggle + the separate `A-c` master-hide were merged into this one key.)
 - `A-N` — **new sidebar section** (doc/sidebar-sections.md). Sections are Owner-created, collapsible groups of workspaces in the Task sub-view, stored in the local manifest (`sections` + `workspace_sections` sidecars) — pure display, orthogonal to subtasks, never visible to agents or the planning API. Sections render first (in display order), loose workspaces after. On a section header: `Space`/`Enter` fold/unfold, `A-e` rename/recolor, `A-x` delete (members become loose), `A-J`/`A-K` reorder, `A-i` peek members, and `A-n` creates the new workspace INSIDE the section. Membership: the **Section** field on the workspace / task `A-e` forms (`auto` = inherit, `none` = explicitly loose, or a section); a workspace with no explicit choice inherits its parent task's section through `parent_task_id` (so an agent's `create_subtask` lands under its parent's project) or, for `propose_task` rows, through `metadata.filer.task_id`. `A-n` while focused on any row inside a section also joins it. Status sub-view is unchanged (flat).
@@ -196,9 +196,11 @@ under their parent). Task-level ops (`A-d` done, `A-s/S` status,
 `A-e` edit, `A-x` delete, `A-f` launch) work on subtasks normally
 since they go through the slug, not the raw layout.
 
-## Cloud mode (optional, secondary)
+## Persistent cloud sessions
 
-The GCP path is fully functional but used less. All infra is in GCP project **`claude-manager-prod`**, zone **`us-east4-a`**.
+Fresh work defaults to `cm-sessions`; the TUI connects as a viewer. Continuous
+orchestrators and the planning API remain on `cm-manager`. Infrastructure is in
+GCP project **`claude-manager-prod`**, zone **`us-east4-a`**.
 
 ### VMs
 
@@ -236,13 +238,18 @@ Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + r
 
 ### GCS
 
-- `gs://cm-sessions` — cloud session JSONL files for push/pull and preemption recovery.
+- `gs://cm-sessions` — session archives and ephemeral-worker recovery data.
 
 ## Multi-host (`hosts.toml`)
 
-The TUI can drive sessions on multiple host daemons declared in `~/.cm/hosts.toml`. `local` is always present (synthesized when the file is missing or doesn't declare it). Each entry has `name`, `transport` (`unix` or `ssh-unix`), and transport-specific fields. The sidebar groups sessions by host.
+The TUI can drive sessions on multiple host daemons declared in `~/.cm/hosts.toml`. `local` is always present (synthesized when the file is missing or doesn't declare it). Each entry has `name`, `transport` (`unix` or `ssh-unix`), and transport-specific fields. Remote sessions use the normal sidebar layout; an inline `⌂` marks local work. The detail view shows the exact host.
 
-**Host is a per-workspace attribute, not a global mode** (`DESIGN_REMOVE_GLOBAL_HOST.md`). There is no global "active host" switcher — the retired `A-H` host-cycler is gone (`A-H` now toggles session-hidden). A session's host comes from the workspace it was created in: the A-n form carries a host field (←/→ to pick a configured host; defaults to `local`), and every other create path (A-s add-session, workflow respawn, MCP spawn) inherits the workspace's / caller's host. New sessions default to `local`; non-local hosts are a per-task pick.
+**Host belongs to each workspace** (`DESIGN_REMOVE_GLOBAL_HOST.md`). Fresh
+work uses the configured default host (`sessions` after migration). Launch dialogs
+expose an explicit local option. Add-session, restart and workflow operations
+inherit the existing workspace's host. Selecting another host launches a separate
+workspace there; it does not transfer running sessions or working files. Exceptional
+host migrations are operator-managed; the old session push/pull shortcuts are retired.
 
 Example `~/.cm/hosts.toml`:
 
@@ -251,6 +258,13 @@ Example `~/.cm/hosts.toml`:
 name = "local"
 transport = "unix"
 socket = "~/.cm/daemon.sock"
+
+[[host]]
+name = "sessions"
+transport = "ssh-unix"
+ssh_host = "cm-sessions"
+ssh_user = "lucas"
+remote_socket = "/home/lucas/.cm/daemon.sock"
 default = true
 
 [[host]]

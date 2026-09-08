@@ -2,10 +2,16 @@
 
 Status: Owner approved the overall plan and requested the additions below:
 retire session push/pull, expose local explicitly in launch dialogs with cloud
-as the default, and investigate stale-workspace cleanup before transfer. Bulk
-transfer and session cutover have not begun. Owner will leave the laptop powered
-on and connected during the work.
+as the default, and investigate stale-workspace cleanup before transfer. The
+cloud-first TUI is merged, pushed and installed, including verified Bash,
+Neovim, clipboard and reconnect behavior. Required workspaces are transferring;
+the development database is restoring into inspected staging. The 26 remaining
+CM sessions stay local until checksum, database and conversation checks pass.
+Owner is leaving the laptop powered on and connected during the work.
 The execution host is ready; see [cloud-session-host.md](cloud-session-host.md).
+The Codex pool is already cloud-owned; its old local database must never be
+copied over the live cloud pool. Eight ongoing orchestrators on `cm-manager`
+now subscribe to `#orchestrators`, with their schedules and sessions preserved.
 
 ## Requested outcome
 
