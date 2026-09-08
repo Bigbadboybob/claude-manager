@@ -8,6 +8,15 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
 Work on branches and merge tested changes directly into `main`. Owner does not use pull requests in this repository; do not create them.
 
+## Running tests beside a live CM instance
+
+Use `scripts/cm-test-isolated` (Linux + bubblewrap) for Rust tests. Existing
+fixtures can restore `HOME` before a later callback saves, so unsandboxed tests
+can overwrite the live TUI manifest. The runner isolates CM storage, runtime
+sockets, temporary files and networking while keeping the source read-only.
+Use a private `CARGO_TARGET_DIR`; the shared target also serves live binaries.
+See [cloud responsiveness verification](doc/cloud-responsiveness-fixes.md).
+
 ## If you are running inside CM
 
 Use the `claude-manager` MCP tools to inspect your context (`ping`), look up work (`list_tasks`, `get_task`), file draft tasks (`propose_task`), delegate authorized work (`start_session`, `create_subtask`), and communicate with other sessions (`chat_open`, `chat_read`, `chat_send`). Start workers in separate worktrees when appropriate, and use background monitors to follow their progress.

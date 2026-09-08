@@ -222,6 +222,9 @@ pub enum StreamKind {
     /// Client → server: terminal-size update. Payload
     /// `{"cols": <u16>, "rows": <u16>}`.
     Resize,
+    /// Client → server: batch hidden terminal output (every byte is retained).
+    /// Negotiated by `output_flow: true` in the attach response.
+    OutputFlow,
     /// Server → client: normal stream termination. Last frame the
     /// daemon sends on a session exit.
     End,

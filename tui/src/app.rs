@@ -283,6 +283,7 @@ pub struct App {
     /// main loop and dispatched to method handlers. The server thread
     /// pushes; the main loop pops + replies. See `tui/src/control/`.
     control_queue: crate::control::queue::Queue,
+    subtask_flight: Option<events::SubtaskFlight>,
     /// Whether THIS TUI currently owns the control socket (`tui.sock`).
     /// False when another instance held it at bind time. Drives the
     /// degraded-mode banner in the status bar and gates the rebind retry.
@@ -831,6 +832,7 @@ impl App {
         // Tests use the SYNCHRONOUS inline reattach path (no worker) so the
         // deferred-reattach assertions stay deterministic — no real background
         // attach thread to race.
+        if !cfg!(test) { crate::network_watch::spawn(&host_pool); }
         let attach_worker = if cfg!(test) {
             None
         } else {
@@ -873,6 +875,7 @@ impl App {
             pending_rotations: Vec::new(),
             mouse_capture_enabled: true,
             control_queue,
+            subtask_flight: None,
             control_bound,
             control_conflict_pid,
             control_socket_path,

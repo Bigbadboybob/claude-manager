@@ -123,92 +123,9 @@ pub(crate) fn try_attach_via_daemon_with_deps(
         // grant; nothing is spawned here so the field is inert.
         global_perms: false,
     };
-    let session = crate::session::Session::new_attached_existing(cs_config)?;
-    // Kick a resize so a session whose daemon PTY was spawned at a different
-    // size (e.g. an 80×24 headless workflow spawn) immediately matches this
-    // terminal and repaints — same rationale as the respawn-path kick. The
-    // attach itself never resizes the daemon PTY (it only sizes the local
-    // grid), so without this a small-spawned session renders cut off forever.
+    let session = crate::session::Session::new_attached_existing_with_context(cs_config, true)?;
+    // Legacy daemons may ignore attach dimensions; keep the asynchronous kick.
     session.resize(cols, rows);
-
-    // migrate-tui-local Issue D: the `session.attach` RPC only
-    // takes `{ uid }` — the daemon doesn't read transcript_path
-    // / workflow tags from its params. The spawn branch threads
-    // those via `start_session`'s param shape, but the attach
-    // branch has to push them through the existing setter
-    // channels AFTER attach succeeds. Without these pushes the
-    // restored session stays `pending` for
-    // `resolve_authorized_session` and MCP `read_session_output`
-    // serves nothing.
-    //
-    // Conditional: only push fields the manifest carries. The
-    // daemon already has whatever values were set on the
-    // surviving session, and the setters are idempotent — a
-    // no-change push is harmless.
-    //
-    // `task_id` has no setter RPC. That's fine: the attach
-    // branch only fires when the daemon's `state.sessions` map
-    // already has this UID, which means the daemon's
-    // `task_id` field is whatever it was set to at the original
-    // `start_session` time (preserved across TUI restart since
-    // the daemon owns it).
-    let operator_token_id = operator_token_id.as_str();
-    if let Some(tp) = transcript_path {
-        if let Err(e) = crate::client_session::rpc_set_transcript_path(
-            &daemon_socket,
-            operator_token_id,
-            session_uid,
-            tp,
-        ) {
-            eprintln!(
-                "cm-tui: attach({}) set_transcript_path failed: {} \
-                 (daemon's resolve_authorized_session may stay \
-                 pending until next rebind retries)",
-                session_uid, e,
-            );
-        }
-    }
-    // migrate-tui-local Issue E: push the manifest's workflow
-    // state in BOTH directions, not just the set direction.
-    //   - (Some, Some) → set the daemon-side tags.
-    //   - (None, None) → CLEAR. `restore_sessions` runs
-    //     `untag_stale_workflow` against the manifest entry
-    //     before reaching this helper, so a manifest with
-    //     `(None, None)` is the authoritative "this session is
-    //     no longer a workflow participant" signal. Without the
-    //     clear, the daemon's `lookup_session_any` keeps
-    //     returning the old (Detached/Done) run id and
-    //     `workflow_transition` / `workflow_done` authorize
-    //     against the wrong run.
-    //   - half-tagged (Some/None or None/Some) → log + skip.
-    //     Represents a corrupted manifest entry; the daemon
-    //     rejects half-tagged pushes by contract.
-    match (workflow_run_id, workflow_role) {
-        (Some(_), Some(_)) | (None, None) => {
-            if let Err(e) = crate::client_session::rpc_set_workflow_context(
-                &daemon_socket,
-                operator_token_id,
-                session_uid,
-                workflow_run_id,
-                workflow_role,
-            ) {
-                eprintln!(
-                    "cm-tui: attach({}) set_workflow_context failed: {} \
-                     (workflow auth from this role may target the \
-                     wrong run until next push)",
-                    session_uid, e,
-                );
-            }
-        }
-        _ => {
-            eprintln!(
-                "cm-tui: attach({}) half-tagged workflow state \
-                 (run_id={:?}, role={:?}), skipping push — \
-                 daemon rejects partial workflow tuples",
-                session_uid, workflow_run_id, workflow_role,
-            );
-        }
-    }
 
     Ok(session)
 }
@@ -1700,7 +1617,20 @@ impl App {
     pub(crate) fn tombstone_and_remove(
         &mut self,
         ws_index: usize,
-        mut should_drop: impl FnMut(&TerminalSession) -> bool,
+        should_drop: impl FnMut(&TerminalSession) -> bool,
+    ) -> usize {
+        self.tombstone_and_remove_inner(ws_index, should_drop, true)
+    }
+
+    pub(crate) fn tombstone_exited_and_remove(
+        &mut self, ws_index: usize, should_drop: impl FnMut(&TerminalSession) -> bool,
+    ) -> usize {
+        self.tombstone_and_remove_inner(ws_index, should_drop, false)
+    }
+
+    fn tombstone_and_remove_inner(
+        &mut self, ws_index: usize, mut should_drop: impl FnMut(&TerminalSession) -> bool,
+        kill: bool,
     ) -> usize {
         // 12e: snapshot the pool Arc so we can call
         // `kill_daemon_session_if_attached` while `ws` holds a
@@ -1721,7 +1651,9 @@ impl App {
                     // before drop. See `kill_daemon_session_if_attached`
                     // for rationale. Bulk-cleanup paths (task close,
                     // workspace teardown) flow through here too.
-                    Self::kill_daemon_session_if_attached(&pool, &ws.sessions[i]);
+                    if kill {
+                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[i]);
+                    }
                     Self::tombstone_session(ws, i);
                     ws.sessions[i].session.exited = true;
                     removed_uids.push(ws.sessions[i].uid.clone());
@@ -7770,148 +7702,6 @@ mod migrate_tui_local_tests {
 
         // Phase 4 §E: controller's spawn_workflow_session is deleted — the
         // daemon spawns workflow participants now (see daemon start_workflow).
-    }
-
-    /// migrate-tui-local Issue D: when `spawn_restored_session`
-    /// takes the ATTACH branch (daemon already has the UID), the
-    /// daemon-side `DaemonSession` may be missing the manifest's
-    /// `transcript_path` / workflow tags (e.g. the post-spawn
-    /// detector hadn't fired before the original TUI exited).
-    /// The shared `try_attach_via_daemon_with_deps` helper MUST
-    /// push those fields via the existing setter RPCs after the
-    /// attach succeeds — otherwise `resolve_authorized_session`
-    /// keeps returning `pending` and MCP `read_session_output`
-    /// fails.
-    ///
-    /// `task_id` has no setter and is intentionally not pushed
-    /// (the daemon preserves it across TUI restart since
-    /// `state.sessions` is daemon-owned).
-    #[test]
-    fn t_migrate_attach_branch_pushes_manifest_metadata() {
-        let src = crate::app::APP_SRC_FOR_SCAN;
-        let sig = "pub(crate) fn try_attach_via_daemon_with_deps(";
-        let start = src.find(sig).expect("must find try_attach_via_daemon_with_deps");
-        let rest = &src[start..];
-        let end = rest[1..]
-            .find("\npub ")
-            .or_else(|| rest[1..].find("\nfn "))
-            .or_else(|| rest[1..].find("\nimpl "))
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-
-        // After the attach call, the helper must invoke the
-        // existing setter RPCs.
-        let attach_idx = body
-            .find("Session::new_attached_existing(")
-            .expect("attach RPC call site missing");
-        let set_transcript_idx = body
-            .find("rpc_set_transcript_path(")
-            .expect(
-                "try_attach_via_daemon_with_deps MUST call \
-                 rpc_set_transcript_path after attach (Issue D)",
-            );
-        let set_workflow_idx = body
-            .find("rpc_set_workflow_context(")
-            .expect(
-                "try_attach_via_daemon_with_deps MUST call \
-                 rpc_set_workflow_context after attach (Issue D)",
-            );
-        assert!(
-            attach_idx < set_transcript_idx,
-            "rpc_set_transcript_path MUST be invoked AFTER the \
-             attach call (Issue D); attach at {}, push at {}",
-            attach_idx,
-            set_transcript_idx,
-        );
-        assert!(
-            attach_idx < set_workflow_idx,
-            "rpc_set_workflow_context MUST be invoked AFTER the \
-             attach call (Issue D); attach at {}, push at {}",
-            attach_idx,
-            set_workflow_idx,
-        );
-
-        // Transcript-path push: conditional, gated on Some so
-        // the daemon's existing value isn't clobbered (Issue D).
-        let set_tp_slice =
-            &body[set_transcript_idx.saturating_sub(200)..set_transcript_idx];
-        assert!(
-            set_tp_slice.contains("if let Some(tp) = transcript_path"),
-            "rpc_set_transcript_path MUST be gated on \
-             `transcript_path.is_some()` so the daemon's existing \
-             value isn't clobbered with None (Issue D); slice:\n{}",
-            set_tp_slice,
-        );
-
-        // migrate-tui-local Issue E: workflow-context push must
-        // cover BOTH the set direction `(Some, Some)` AND the
-        // clear direction `(None, None)`. Pre-fix only `(Some,
-        // Some)` pushed and stale daemon-side workflow tags
-        // kept authorizing workflow operations against the
-        // wrong (Detached/Done) run. Half-tagged inputs MUST
-        // early-skip and log — daemon contract rejects partial
-        // tuples.
-        //
-        // Pin shape: the push lives inside a `match
-        // (workflow_run_id, workflow_role)` whose set/clear
-        // arms call `rpc_set_workflow_context` and whose `_`
-        // arm logs + skips.
-        let wf_match_idx = body
-            .find("match (workflow_run_id, workflow_role)")
-            .expect(
-                "try_attach_via_daemon_with_deps MUST dispatch \
-                 the workflow push via `match (workflow_run_id, \
-                 workflow_role)` (Issue E)",
-            );
-        // Slice from the match through the rpc_set call (gives
-        // us all four arms — they're packed tight).
-        let wf_match_end = body[wf_match_idx..]
-            .find("}\n    }\n")
-            .map(|i| wf_match_idx + i + 8)
-            .unwrap_or(body.len());
-        let wf_match_slice = &body[wf_match_idx..wf_match_end];
-        assert!(
-            wf_match_slice.contains("(Some(_), Some(_)) | (None, None)"),
-            "the workflow match MUST include both the set arm \
-             `(Some(_), Some(_))` AND the clear arm `(None, \
-             None)` so a `restore_sessions` untag (manifest \
-             None, daemon Some) clears the stale tags (Issue \
-             E); slice:\n{}",
-            wf_match_slice,
-        );
-        // Half-tagged arm: must NOT push, must log.
-        assert!(
-            wf_match_slice.contains("_ =>"),
-            "the workflow match MUST have a half-tagged catch-\
-             all arm that skips the push (Issue E); slice:\n{}",
-            wf_match_slice,
-        );
-        // Count: rpc_set_workflow_context must appear ONCE
-        // inside the match (in the set/clear arm). The catch-
-        // all arm must NOT call the setter.
-        let push_count = wf_match_slice.matches("rpc_set_workflow_context(").count();
-        assert_eq!(
-            push_count, 1,
-            "rpc_set_workflow_context MUST be invoked exactly \
-             once inside the workflow match — only the \
-             (Some,Some)|(None,None) arm pushes; the half-tagged \
-             arm logs and skips (Issue E). got count: {}",
-            push_count,
-        );
-        // The half-tagged arm carries a skip-and-log message —
-        // pin its presence so future refactors can't silently
-        // swallow the half-tagged signal.
-        let half_marker = body[wf_match_idx..]
-            .find("half-tagged workflow state");
-        assert!(
-            half_marker.is_some(),
-            "the half-tagged catch-all arm MUST log \
-             `half-tagged workflow state` so an operator can \
-             diagnose a corrupted manifest entry (Issue E); \
-             slice:\n{}",
-            wf_match_slice,
-        );
     }
 
     /// migrate-tui-local Issue F: the live-daemon-UID set

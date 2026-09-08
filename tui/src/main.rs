@@ -11,6 +11,7 @@ mod config;
 mod control;
 mod daemon_launch;
 mod host_pool;
+mod network_watch;
 mod hosts;
 mod input;
 mod manifest_watch;

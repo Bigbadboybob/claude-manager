@@ -73,24 +73,7 @@ pub fn write_response<W: Write>(
     writer: &mut W,
     resp: &Response,
 ) -> std::io::Result<()> {
-    let body = serde_json::to_vec(resp).map_err(std::io::Error::other)?;
-    if body.len() > MAX_REQUEST_BYTES as usize {
-        // The dispatcher shouldn't produce responses this large,
-        // but defend against the case rather than silently truncating.
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "response body length {} exceeds cap of {} bytes",
-                body.len(),
-                MAX_REQUEST_BYTES
-            ),
-        ));
-    }
-    let len = (body.len() as u32).to_be_bytes();
-    writer.write_all(&len)?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
+    write_json_frame(writer, resp, "response")
 }
 
 /// Write a normal one-shot response, replacing a pre-write serialization/size
@@ -130,22 +113,7 @@ pub fn write_request<W: Write>(
     writer: &mut W,
     req: &Request,
 ) -> std::io::Result<()> {
-    let body = serde_json::to_vec(req).map_err(std::io::Error::other)?;
-    if body.len() > MAX_REQUEST_BYTES as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "request body length {} exceeds cap of {} bytes",
-                body.len(),
-                MAX_REQUEST_BYTES
-            ),
-        ));
-    }
-    let len = (body.len() as u32).to_be_bytes();
-    writer.write_all(&len)?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
+    write_json_frame(writer, req, "request")
 }
 
 /// Read a length-prefixed JSON `Response` from `reader`. The client-
@@ -262,22 +230,24 @@ pub fn write_stream_frame<W: Write>(
     writer: &mut W,
     frame: &StreamFrame,
 ) -> std::io::Result<()> {
-    let body = serde_json::to_vec(frame).map_err(std::io::Error::other)?;
-    if body.len() > MAX_REQUEST_BYTES as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "stream frame body length {} exceeds cap of {} bytes",
-                body.len(),
-                MAX_REQUEST_BYTES
-            ),
-        ));
+    write_json_frame(writer, frame, "stream frame")
+}
+
+/// Serialize directly behind the prefix. A single write avoids a separate
+/// four-byte SSH packet/wakeup for every small terminal update or RPC.
+fn write_json_frame<W: Write, T: serde::Serialize>(
+    writer: &mut W, value: &T, label: &str,
+) -> std::io::Result<()> {
+    let mut bytes = vec![0; 4];
+    serde_json::to_writer(&mut bytes, value).map_err(std::io::Error::other)?;
+    let len = bytes.len() - 4;
+    if len > MAX_REQUEST_BYTES as usize {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("{label} body length {len} exceeds cap of {MAX_REQUEST_BYTES} bytes")));
     }
-    let len = (body.len() as u32).to_be_bytes();
-    writer.write_all(&len)?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
+    bytes[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    writer.write_all(&bytes)?;
+    writer.flush()
 }
 
 #[cfg(test)]

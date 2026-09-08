@@ -96,6 +96,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "start_session",
     "session.attach",
     "attach.open",
+    "attach.direct",
     "kill_session",
     "read_session_output",
     "list_sessions",

@@ -1028,7 +1028,7 @@ impl App {
     /// adoptee, so it can ride `pending_remote_reattach` → the deferred-reattach
     /// drain (which attaches off the main thread). Mirrors
     /// `TerminalSession::to_manifest_entry`'s field mapping.
-    fn manifest_entry_from_summary(
+    pub(super) fn manifest_entry_from_summary(
         s: &crate::client_session::DaemonSessionSummary,
         host: &cm_daemon::host_id::HostId,
     ) -> cm_daemon::manifest::ManifestEntry {

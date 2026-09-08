@@ -10,14 +10,11 @@
 //! orchestrates the full RPC dance:
 //!
 //!   1. `start_session` over a fresh control connection → uid.
-//!   2. `session.attach` over a fresh control connection →
-//!      ticket + attach_addr.
-//!   3. Dial a fresh socket to `attach_addr`.
-//!   4. Send `attach.open` as the first frame on that socket.
-//!      The daemon's `handle_connection` writes the response and
-//!      *morphs the same socket* into a one-way PTY stream (per
-//!      slice 10c-c's `handle_attach_stream`). Subsequent frames
-//!      are `StreamFrame`s carrying base64-encoded PTY bytes.
+//!   2. `attach.direct` authenticates and binds a fresh socket in one RPC.
+//!      Restores can include transcript/workflow context in that request.
+//!      UnknownMethod falls back to `session.attach` → `attach.open` for
+//!      older daemons. Both paths dial the configured per-host socket.
+//!   3. After the OK response the same socket carries framed PTY bytes.
 //!   5. Wrap the now-streaming socket as
 //!      [`crate::attached_pty::AttachedPty`] — the alacritty
 //!      `EventedReadWrite`/`EventedPty` impl from slice 10c-e-1.
@@ -302,6 +299,7 @@ pub struct ClientSession {
     /// description with the socket alacritty owns, so it reflects the real
     /// state without touching alacritty's fd. `None` if the dup failed.
     pub hup_fd: Option<std::os::fd::OwnedFd>,
+    pub output_control: Option<crate::attach_writer::OutputControl>,
 }
 
 // Post-review #15 (deferred): a `Drop` impl that calls
@@ -332,7 +330,7 @@ impl ClientSession {
         let start_result = rpc_start_session_full(&config)
             .context("RPC start_session")?;
 
-        match Self::build_after_start(&config, &start_result) {
+        match Self::build_after_start(&config, &start_result, false) {
             Ok(session) => Ok(session),
             Err(e) => {
                 // Best-effort cleanup. We log the cleanup error
@@ -370,6 +368,13 @@ impl ClientSession {
     /// don't own it. The pre-fix `new()` cleanup arm only fires
     /// on `start_session`-driven failures.
     pub fn attach_existing(config: ClientSessionConfig) -> anyhow::Result<Self> {
+        Self::attach_existing_with_context(config, false)
+    }
+
+    pub(crate) fn attach_existing_with_context(
+        config: ClientSessionConfig,
+        restore_context: bool,
+    ) -> anyhow::Result<Self> {
         // Step 1 skipped: the daemon already has the session.
         // The wire shape for steps 2–6 is identical to `new()`
         // — `build_after_start` only consumes
@@ -380,7 +385,7 @@ impl ClientSession {
             session_uid: config.uid.to_string(),
             cgroup_path: None,
         };
-        Self::build_after_start(&config, &synthetic_start)
+        Self::build_after_start(&config, &synthetic_start, restore_context)
     }
 
     /// Steps 2–6 of the dance. Factored out so the outer `new`
@@ -388,54 +393,11 @@ impl ClientSession {
     fn build_after_start(
         config: &ClientSessionConfig,
         start_result: &StartSessionResult,
+        restore_context: bool,
     ) -> anyhow::Result<Self> {
         let session_uid = &start_result.session_uid;
-        // Step 2: session.attach → ticket + attach_addr.
-        let attach_resp = rpc_session_attach(config, session_uid)
-            .context("RPC session.attach")?;
-
-        // Step 3: dial a fresh socket and send `attach.open` on it.
-        // That socket morphs into the PTY stream after attach.open's
-        // response; no re-dial after.
-        //
-        // Dial `config.daemon_socket` — the SAME per-host socket the
-        // `session.attach` RPC above used (the SSH-tunnel's local
-        // forwarded socket for a remote host; `~/.cm/daemon.sock` for
-        // local). We deliberately do NOT dial `attach_resp.attach_addr`:
-        // the daemon sets that to its OWN listen-socket path
-        // (daemon/src/lib.rs sets `attach_addr = <listen socket path>`),
-        // which is only meaningful on the daemon's own filesystem. For a
-        // remote host that exact path usually ALSO exists locally
-        // (`~/.cm/daemon.sock`), so dialing it would connect to the LOCAL
-        // daemon and `attach.open` would fail ("RPC attach.open") because
-        // the local daemon never allocated the remote ticket. Since
-        // `attach_addr` is always the daemon's control socket — the same
-        // socket that handles `attach.open` as a stream-morph first frame
-        // — dialing `config.daemon_socket` reaches the daemon that issued
-        // the ticket for BOTH local (same path, no behavior change) and
-        // remote (through the tunnel). `attach_resp.attach_addr` is left
-        // unused on purpose; a remote client must never dial it.
-        let _ = &attach_resp.attach_addr; // daemon-local path; not dialable by a remote client
-        let mut attach_socket = UnixStream::connect(config.daemon_socket)
-            .with_context(|| {
-                format!(
-                    "dial attach socket at {}",
-                    config.daemon_socket.display()
-                )
-            })?;
-
-        // Step 4: attach.open on the same socket. The response
-        // confirms attach success and echoes session_uid; verify
-        // it matches what start_session gave us — a mismatch
-        // would be a serious daemon-side bug, surface loudly.
-        let open_resp = rpc_attach_open(
-            &mut attach_socket,
-            config.operator_token_id,
-            &attach_resp.attach_ticket,
-            config.cols,
-            config.rows,
-        )
-        .context("RPC attach.open")?;
+        let (attach_socket, open_resp) = open_attach_socket(config, session_uid, restore_context)
+            .context("open daemon attach stream")?;
         if &open_resp.session_uid != session_uid {
             anyhow::bail!(
                 "attach.open uid mismatch: requested {}, daemon returned {}",
@@ -467,6 +429,7 @@ impl ClientSession {
         // on `AttachedPty`/`ReaderHalf`; we just expose the Arc
         // out so the TUI's exit handler can observe and clear it
         // post-spawn.
+        let output_control = open_resp.output_flow.then(|| pty.output_control());
         let memory_cap_kill = pty.memory_cap_kill_handle();
         // Same as `memory_cap_kill`: grab the latched-by-reader
         // `transport_eof` Arc BEFORE the EventLoop takes ownership of
@@ -524,6 +487,7 @@ impl ClientSession {
             memory_cap_kill,
             transport_eof,
             hup_fd,
+            output_control,
         })
     }
 
@@ -995,8 +959,84 @@ fn rpc_session_attach(
     })
 }
 
+/// Bound every handshake, including the legacy attach.open read. An SSH
+/// listener can stay alive while the remote daemon stops answering.
+fn dial_attach_socket(path: &Path) -> anyhow::Result<UnixStream> {
+    let socket = UnixStream::connect(path)?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(socket)
+}
+
+fn open_attach_socket(
+    config: &ClientSessionConfig,
+    uid: &str,
+    restore_context: bool,
+) -> anyhow::Result<(UnixStream, AttachOpenResp)> {
+    let mut socket = dial_attach_socket(config.daemon_socket)?;
+    let mut params = serde_json::json!({ "uid": uid, "cols": config.cols, "rows": config.rows });
+    if restore_context {
+        params["context"] = serde_json::json!({
+            "transcript_path": config.transcript_path,
+            "workflow_run_id": config.workflow_run_id,
+            "workflow_role": config.workflow_role,
+        });
+    }
+    let req = Request {
+        id: next_request_id(), caller: Caller::operator(config.operator_token_id),
+        method: "attach.direct".into(), params,
+    };
+    wire::write_request(&mut socket, &req)?;
+    let response = wire::read_response(&mut socket)?
+        .context("daemon closed direct attach before responding")?;
+    let open = if response.ok {
+        let result = response.result.context("attach.direct response missing result")?;
+        if let Some(errors) = result["context_errors"].as_array() {
+            for error in errors {
+                eprintln!("cm-tui: attach({uid}) context update failed: {error}");
+            }
+        }
+        AttachOpenResp {
+            output_flow: result["output_flow"].as_bool().unwrap_or(false),
+            session_uid: result["session_uid"].as_str()
+                .context("attach.direct result missing session_uid")?.to_string(),
+        }
+    } else {
+        let error = response.error.context("attach.direct error missing body")?;
+        if error.code != ErrorCode::UnknownMethod {
+            return Err(anyhow::Error::new(DaemonRpcError {
+                method: "attach.direct".into(), code: error.code, message: error.message,
+            }));
+        }
+        // Older daemon: keep the identity-bound, single-use ticket protocol.
+        drop(socket);
+        let ticket = rpc_session_attach(config, uid)?;
+        socket = dial_attach_socket(config.daemon_socket)?;
+        let open = rpc_attach_open(&mut socket, config.operator_token_id,
+            &ticket.attach_ticket, config.cols, config.rows)?;
+        if restore_context {
+            if let Some(path) = config.transcript_path {
+                if let Err(e) = rpc_set_transcript_path(config.daemon_socket,
+                    config.operator_token_id, uid, path) {
+                    eprintln!("cm-tui: attach({uid}) set_transcript_path failed: {e}");
+                }
+            }
+            if let Err(e) = rpc_set_workflow_context(config.daemon_socket,
+                config.operator_token_id, uid, config.workflow_run_id, config.workflow_role) {
+                eprintln!("cm-tui: attach({uid}) set_workflow_context failed: {e}");
+            }
+        }
+        open
+    };
+    // Streaming is nonblocking and may be idle indefinitely.
+    socket.set_read_timeout(None)?;
+    socket.set_write_timeout(None)?;
+    Ok((socket, open))
+}
+
 struct AttachOpenResp {
     session_uid: String,
+    output_flow: bool,
 }
 
 /// `attach.open` over an *already-dialed* `UnixStream`. The same
@@ -1042,6 +1082,7 @@ fn rpc_attach_open(
     }
     let result = resp.result.context("attach.open response missing result")?;
     Ok(AttachOpenResp {
+        output_flow: result["output_flow"].as_bool().unwrap_or(false),
         session_uid: result["session_uid"]
             .as_str()
             .context("attach.open result missing session_uid")?
@@ -2250,6 +2291,67 @@ mod tests {
         // Kick the accept loop out of WouldBlock.
         let _ = std::os::unix::net::UnixStream::connect(socket_path);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn direct_attach_restores_and_clears_metadata_over_real_socket() {
+        let (socket, working_dir, state, stop, handle) = start_test_daemon("ws-context");
+        let uid = test_uid();
+        let argv = vec!["/bin/cat".to_string()];
+        let mut config = bash_config(&socket, &working_dir, "op-default", &uid,
+            "ws-context", "context", &argv, 100, 40);
+        rpc_start_session_full(&config).unwrap();
+        config.transcript_path = Some("/tmp/cm-test-transcript.jsonl");
+        config.workflow_run_id = Some("wf-context");
+        config.workflow_role = Some("worker");
+        let (stream, _) = open_attach_socket(&config, &uid, true).unwrap();
+        drop(stream);
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.sessions[&uid].workflow_run_id.as_deref(), Some("wf-context"));
+        }
+        config.workflow_run_id = None;
+        config.workflow_role = None;
+        config.transcript_path = None;
+        let (stream, _) = open_attach_socket(&config, &uid, true).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert_eq!(stream.write_timeout().unwrap(), None);
+        assert!(state.lock().unwrap().sessions[&uid].workflow_run_id.is_none());
+        drop(stream);
+        rpc_kill_session(&socket, "op-default", &uid).unwrap();
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    #[test]
+    fn direct_attach_falls_back_only_for_unknown_method() {
+        for code in [ErrorCode::UnknownMethod, ErrorCode::Unauthorized] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("daemon.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = wire::read_request(&mut stream).unwrap().unwrap();
+                assert_eq!(req.method, "attach.direct");
+                wire::write_response(&mut stream, &Response::err(req.id, code, "test")).unwrap();
+                if code == ErrorCode::Unauthorized { return; }
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = wire::read_request(&mut stream).unwrap().unwrap();
+                assert_eq!(req.method, "session.attach");
+                wire::write_response(&mut stream, &Response::ok(req.id, serde_json::json!({
+                    "attach_ticket": "one-use", "attach_addr": "/remote/path/must/not/be/dialed",
+                }))).unwrap();
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = wire::read_request(&mut stream).unwrap().unwrap();
+                assert_eq!(req.method, "attach.open");
+                assert_eq!(req.params["ticket"], "one-use");
+                wire::write_response(&mut stream, &Response::ok(req.id,
+                    serde_json::json!({"session_uid": "test"}))).unwrap();
+            });
+            let config = bash_config(&path, dir.path(), "token", "test", "ws", "test", &[], 80, 24);
+            let result = open_attach_socket(&config, "test", false);
+            assert_eq!(result.is_ok(), code == ErrorCode::UnknownMethod);
+            server.join().unwrap();
+        }
     }
 
     #[test]

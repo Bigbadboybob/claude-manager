@@ -16,11 +16,35 @@ struct State {
     writer: StreamWriter<UnixStream>,
     stopped: bool,
     error: Option<io::ErrorKind>,
+    background_update: Option<bool>,
 }
 
 pub struct AttachWriter {
     state: Arc<(Mutex<State>, Condvar)>,
     socket: UnixStream,
+}
+
+/// UI-side flow updates are coalesced in the writer state and sent by its
+/// worker. Never write a socket or wait for backpressure on the UI thread.
+pub struct OutputControl {
+    state: Arc<(Mutex<State>, Condvar)>,
+    last_visible: std::time::Instant,
+    background: bool,
+}
+
+impl OutputControl {
+    pub fn set_visible(&mut self, visible: bool) {
+        if visible { self.last_visible = std::time::Instant::now(); }
+        let background = !visible && self.last_visible.elapsed() >= std::time::Duration::from_secs(2);
+        if self.background == background { return; }
+        // The critical section contains only nonblocking writes of one frame.
+        // Contention simply retries next tick, never stalls keyboard handling.
+        let Ok(mut s) = self.state.0.try_lock() else { return; };
+        if s.stopped || s.error.is_some() { return; }
+        s.background_update = Some(background);
+        self.background = background;
+        self.state.1.notify_one();
+    }
 }
 
 impl AttachWriter {
@@ -32,6 +56,7 @@ impl AttachWriter {
                 writer,
                 stopped: false,
                 error: None,
+                background_update: None,
             }),
             Condvar::new(),
         ));
@@ -42,11 +67,20 @@ impl AttachWriter {
                 let (lock, ready) = &*shared;
                 loop {
                     let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
-                    while !state.stopped && state.writer.pending_bytes() == 0 {
+                    while !state.stopped && state.writer.pending_bytes() == 0 && state.background_update.is_none() {
                         state = ready.wait(state).unwrap_or_else(|p| p.into_inner());
                     }
                     if state.stopped {
                         return;
+                    }
+                    if state.writer.pending_bytes() == 0 {
+                        if let Some(background) = state.background_update.take() {
+                            if let Err(e) = state.writer.send_output_flow(background) {
+                                state.error = Some(e.kind());
+                                let _ = worker_socket.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
                     }
                     match state.writer.flush_pending() {
                         Ok(true) => continue,
@@ -73,6 +107,10 @@ impl AttachWriter {
                 }
             })?;
         Ok(Self { state, socket })
+    }
+
+    pub fn output_control(&self) -> OutputControl {
+        OutputControl { state: self.state.clone(), last_visible: std::time::Instant::now(), background: false }
     }
 
     fn with_writer<T>(

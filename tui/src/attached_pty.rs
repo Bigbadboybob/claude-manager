@@ -305,6 +305,10 @@ impl AttachedPty {
         self.memory_cap_kill.swap(false, Ordering::SeqCst)
     }
 
+    pub fn output_control(&self) -> crate::attach_writer::OutputControl {
+        self.writer.output_control()
+    }
+
     /// Hand out a clone of the latched `memory_cap_kill` Arc so
     /// callers (specifically `Session::new_attached`) can
     /// observe the flag AFTER alacritty's EventLoop has taken

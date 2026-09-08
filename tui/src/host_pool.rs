@@ -822,13 +822,13 @@ impl SshTunnel {
                     // through it hangs into a dead pipe → `read response frame`.
                     // Auto-reconnect only ever fired on tunnel *death* (ssh
                     // exits → socket EOF); a *hang* was invisible. ServerAlive
-                    // 5s×3 makes ssh detect the dead peer and EXIT within ~15s,
+                    // 3s×2 makes ssh detect the dead peer and EXIT within ~6s,
                     // converting the undetectable hang into the death the
                     // existing dead-tunnel respawn already heals.
                     "-o".into(),
-                    "ServerAliveInterval=5".into(),
+                    "ServerAliveInterval=3".into(),
                     "-o".into(),
-                    "ServerAliveCountMax=3".into(),
+                    "ServerAliveCountMax=2".into(),
                     // Exit immediately if the forward can't be established
                     // (don't linger with a useless connection the readiness
                     // probe would still pass once the socket binds).
@@ -1450,6 +1450,22 @@ impl HostPool {
             .get(host_id)
             .map(|h| h.tunnel_generation())
             .unwrap_or(0)
+    }
+
+    /// Called only by the background network monitor. Retire CM-owned SSH
+    /// forwards on route change/resume, leaving local transports untouched.
+    pub(crate) fn reset_ssh_after_network_change(&self) {
+        for handle in self.entries.values() {
+            let mut state = handle.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let HandleState::SshUnix { tunnel, .. } = &mut *state {
+                if tunnel.take().is_some() {
+                    handle.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+            }
+        }
+        // An overnight offline backoff must not delay fresh state pushes by
+        // up to five minutes after the laptop regains its route.
+        self.reachability.state.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// Test-only: force a host's tunnel generation, so watchdog tests can

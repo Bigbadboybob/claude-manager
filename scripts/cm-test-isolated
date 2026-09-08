@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Run Rust tests with a private CM state directory, filesystem and network.
+# Tests historically restore HOME before later App callbacks persist, so merely
+# using tempdirs inside individual tests does not protect a live TUI manifest.
+set -euo pipefail
+
+command -v bwrap >/dev/null || { echo 'cm-test-isolated requires bubblewrap' >&2; exit 1; }
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+test_dir=$(mktemp -d /tmp/cm-test-XXXXXXXX)
+trap 'rm -rf -- "$test_dir"' EXIT
+test_target=${CARGO_TARGET_DIR:-/tmp/cm-isolated-cargo-target}
+mkdir -p -- "$test_target" "$test_dir/state" "$test_dir/cargo" "$test_dir/runtime"
+test_target=$(cd -- "$test_target" && pwd)
+chmod 700 "$test_dir/runtime"
+ln -s "$HOME/.cargo/registry" "$test_dir/cargo/registry"
+if [[ -d "$HOME/.cargo/git" ]]; then ln -s "$HOME/.cargo/git" "$test_dir/cargo/git"; fi
+
+if [[ $# -eq 0 ]]; then set -- cargo test -p claude-manager-tui -p cm-daemon -- --test-threads=2; fi
+bwrap --die-with-parent --unshare-pid --unshare-net \
+  --ro-bind / / --dev-bind /dev /dev --proc /proc \
+  --tmpfs /tmp --ro-bind "$repo_dir" /tmp/cm-test-source \
+  --bind "$test_target" /tmp/cm-test-target \
+  --bind "$test_dir/cargo" /tmp/cm-test-cargo \
+  --bind "$test_dir/state" "$HOME/.cm" \
+  --bind "$test_dir/runtime" /tmp/cm-test-runtime \
+  --setenv XDG_RUNTIME_DIR /tmp/cm-test-runtime \
+  --setenv CARGO_HOME /tmp/cm-test-cargo \
+  --setenv CARGO_TARGET_DIR /tmp/cm-test-target \
+  --chdir /tmp/cm-test-source -- "$@"

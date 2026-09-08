@@ -1543,7 +1543,43 @@ fn default_subtask_worktree_mode() -> String {
     "inherit".to_string()
 }
 
+pub(crate) struct CreatedSubtask {
+    workspace: Option<Workspace>,
+    task: crate::app::TaskEntry,
+    result: Value,
+}
+
+pub(crate) type SubtaskJob = Box<dyn FnOnce() -> Result<CreatedSubtask, (ErrorCode, String)> + Send>;
+
 pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
+    let created = prepare_create_subtask(app, caller_uid, params)?()?;
+    finish_create_subtask(app, created)
+}
+
+pub(crate) fn finish_create_subtask(app: &mut App, created: CreatedSubtask) -> MethodResult {
+    if let Some(workspace) = created.workspace {
+        if !app.workspaces.iter().any(|w| w.id == workspace.id) {
+            app.workspaces.push(workspace);
+        }
+    }
+    if let Some(task) = app.tasks.iter_mut().find(|t| t.task_id == created.task.task_id) {
+        // API refresh may have learned about the task during the git work.
+        // Preserve its newer status, but install the local workspace binding.
+        task.workspace_id = created.task.workspace_id;
+    } else {
+        app.tasks.push(created.task);
+    }
+    app.save_session_manifest();
+    app.push_task_tree_to_daemon();
+    Ok(created.result)
+}
+
+/// Snapshot caller scope on the UI thread; all API/git/daemon I/O happens in
+/// the returned job. Completion installs only the newly created rows, never a
+/// stale copy of the App, and persists before acknowledging success.
+pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value)
+    -> Result<SubtaskJob, (ErrorCode, String)>
+{
     let p: CreateSubtaskParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
     if !matches!(p.worktree_mode.as_str(), "inherit" | "branch" | "in-place") {
@@ -1651,349 +1687,312 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
     let request_short_id = make_request_short_id();
     let unique_slug = format!("{}-{}", slug_chain, request_short_id);
 
-    // Step 1: validate ALL preconditions BEFORE touching the API.
-    // Earlier this version called `create_task` first and produced
-    // orphan tasks if the worktree precheck failed — the rollback is
-    // a separate API call that may itself fail. Front-loading the
-    // checks reduces the orphan window to "the git command itself
-    // racing or failing on disk", which we then handle with an
-    // explicit DELETE on the failure path below.
-    let inherit_worktree_path: Option<std::path::PathBuf> = if p.worktree_mode == "inherit" {
-        let path = app.workspaces[parent_wi]
-            .worktree_path
-            .clone()
-            .ok_or((
+    let parent_worktree = app.workspaces[parent_wi].worktree_path.clone();
+    let subtask_host = if p.worktree_mode == "inherit" {
+        app.workspaces[parent_wi].host_id.clone()
+    } else {
+        cm_daemon::host_id::HostId::local()
+    };
+    let host_pool = std::sync::Arc::clone(&app.host_pool);
+    Ok(Box::new(move || {
+        let mut new_workspace = None;
+        // Step 1: validate ALL preconditions BEFORE touching the API.
+        // Earlier this version called `create_task` first and produced
+        // orphan tasks if the worktree precheck failed — the rollback is
+        // a separate API call that may itself fail. Front-loading the
+        // checks reduces the orphan window to "the git command itself
+        // racing or failing on disk", which we then handle with an
+        // explicit DELETE on the failure path below.
+        let inherit_worktree_path: Option<std::path::PathBuf> = if p.worktree_mode == "inherit" {
+            let path = parent_worktree.clone()
+                .ok_or((
+                    ErrorCode::Conflict,
+                    "parent workspace has no worktree path (cloud workspace?)".into(),
+                ))?;
+            Some(path)
+        } else {
+            None
+        };
+        let branch_main_repo: Option<std::path::PathBuf> = if p.worktree_mode == "branch" {
+            Some(parent_main_repo.clone().ok_or((
                 ErrorCode::Conflict,
-                "parent workspace has no worktree path (cloud workspace?)".into(),
-            ))?;
-        Some(path)
-    } else {
-        None
-    };
-    let branch_main_repo: Option<std::path::PathBuf> = if p.worktree_mode == "branch" {
-        Some(parent_main_repo.clone().ok_or((
-            ErrorCode::Conflict,
-            "parent workspace has no main_repo_path; cannot branch".into(),
-        ))?)
-    } else {
-        None
-    };
-    // In-place mode: the subtask runs directly in the parent's MAIN repo
-    // checkout — no worktree, no branch. Resolve that path upfront so the
-    // worktree-production step below is infallible.
-    let in_place_main_repo: Option<std::path::PathBuf> = if p.worktree_mode == "in-place" {
-        Some(parent_main_repo.clone().ok_or((
-            ErrorCode::Conflict,
-            "parent workspace has no main_repo_path; cannot launch in-place".into(),
-        ))?)
-    } else {
-        None
-    };
-    // An explicit `base` is a precondition like any other: resolve it to a
-    // concrete commit HERE, before the API create, so a typo'd ref fails
-    // as invalid_params instead of minting a `running` row that then has
-    // to be rolled back. The cut below reuses the resolved sha. (Daemon
-    // twin does the same at the same point in its Step 1.)
-    let resolved_base: Option<String> = match (base.as_deref(), branch_main_repo.as_deref()) {
-        (Some(b), Some(main_repo)) => Some(
-            cm_daemon::worktree::resolve_base_commit(main_repo, b)
-                .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?,
-        ),
-        _ => None,
-    };
-    // Resolve the parent's actual branch UPFRONT. Tasks launched into
-    // existing workspaces commonly have `wip_branch: None` because
-    // the system never had reason to set it; the source of truth in
-    // that case is the parent worktree's actual HEAD. Order of
-    // preference:
-    //   1. parent.wip_branch (canonical when set)
-    //   2. parent worktree's `git rev-parse --abbrev-ref HEAD`
-    //   3. None (handled per-mode below)
-    //
-    // Branch-mode REQUIRES this to be Some — we don't fall back to
-    // "main" because the user may not have a main branch at all, and
-    // silently forking from the wrong base loses the parent's work.
-    // Inherit-mode treats None as soft: the new task's wip_branch
-    // inherits the resolution if available, so future grandchildren
-    // can branch from it.
-    //
-    // An explicit `base` replaces this resolution outright, so it also
-    // lifts the branch-mode requirement: the caller named the cut point.
-    let parent_branch_resolved: Option<String> = parent.wip_branch.clone().or_else(|| {
-        app.workspaces[parent_wi]
-            .worktree_path
-            .as_deref()
-            .and_then(cm_daemon::worktree::worktree_current_branch)
-    });
-    if p.worktree_mode == "branch" && base.is_none() && parent_branch_resolved.is_none() {
-        return Err((
-            ErrorCode::Conflict,
-            "cannot determine parent's base branch (no wip_branch and worktree HEAD is detached or unreadable)".into(),
-        ));
-    }
-
-    // Compute the new task's `wip_branch` upfront — both modes need
-    // this baked into the API row. Without it, the next reconcile
-    // (which copies API state into the local TaskEntry) would null
-    // out wip_branch for inherit-mode subtasks, and a branch-mode
-    // grandchild would then fall back to "main" as its start ref.
-    //
-    // Inherit mode → same branch as parent (sessions live in the
-    // parent's worktree, which is on the parent's branch).
-    // Branch mode → the freshly-built `cm-sub/<chain>-<short>` name.
-    let branch_name_for_new: Option<String> = match p.worktree_mode.as_str() {
-        // Inherit: subtask's wip_branch IS the parent's resolved branch,
-        // not just its (possibly-None) `wip_branch` field. Without
-        // this fallback through worktree HEAD, an inherit-mode subtask
-        // with parent.wip_branch=None would store None in the API,
-        // and a future branch-mode grandchild would hit the same
-        // base-branch problem.
-        "inherit" => parent_branch_resolved.clone(),
-        "branch" => Some(format!("cm-sub/{}-{}", slug_chain, request_short_id)),
-        // In-place: the session runs in the MAIN repo checkout, NOT the
-        // parent's worktree — so its branch is the main repo's CURRENT
-        // branch, not `parent_branch_resolved` (which could be the parent's
-        // `cm/...` worktree branch). Reading it from `in_place_main_repo`
-        // mirrors the planning launch path (app.rs `launch_from_plan`).
-        // Recording the parent's branch here would mislead branch-mode
-        // grandchildren (wrong fork base) and let reconcile mis-map this
-        // task onto a `cm/...` worktree dir after a manifest loss.
-        "in-place" => in_place_main_repo
-            .as_deref()
-            .and_then(cm_daemon::worktree::worktree_current_branch),
-        _ => None,
-    };
-
-    // Step 2: ask the API to create the task. Server assigns the UUID,
-    // which we need for the short_id in branch-mode names.
-    let api_client = api_client_or_err()?;
-    let body = crate::api::TaskCreateBody {
-        repo_url: parent_repo_url.clone(),
-        repo_branch: "main".to_string(),
-        name: Some(p.name.clone()),
-        prompt: p.prompt.clone(),
-        priority: 0,
-        status: Some("running".to_string()),
-        project,
-        slug: Some(unique_slug.clone()),
-        description: None,
-        difficulty: None,
-        depends: None,
-        source: Some("claude".to_string()),
-        is_cloud: Some(false),
-        parent_task_id: Some(parent_task_id.clone()),
-        worktree_mode: Some(p.worktree_mode.clone()),
-        wip_branch: branch_name_for_new.clone(),
-        metadata: Some(json!({ "filer": filer })),
-    };
-    let new_task = api_client
-        .create_task(&body)
-        .map_err(|e| (ErrorCode::Internal, format!("api create_task: {}", e)))?;
-    let new_task_id = new_task.id.clone();
-
-    // Step 3: produce a worktree. Anything that errors after the API
-    // create succeeded triggers a rollback DELETE so we don't leave an
-    // orphan task in `running` state with no usable workspace.
-    let (worktree_path, workspace_id_for_new) = match p.worktree_mode.as_str() {
-        "inherit" => {
-            // Path was validated upfront; safe to unwrap.
-            let path = inherit_worktree_path.expect("validated above");
-            (path, parent_workspace_id.clone())
-        }
-        "branch" => {
-            let main_repo = branch_main_repo.expect("validated above");
-            // Explicit `base` (already resolved to a sha above) replaces
-            // the parent-branch resolution as the cut point — and is the
-            // only thing that makes an unresolvable parent branch
-            // survive the check above.
-            let start_ref = resolved_base
-                .clone()
-                .or_else(|| parent_branch_resolved.clone())
-                .expect("validated above");
-            let start = if resolved_base.is_some() {
-                cm_daemon::worktree::SubtaskStart::Base(&start_ref)
-            } else {
-                cm_daemon::worktree::SubtaskStart::ParentBranch(&start_ref)
-            };
-            // Branch name was computed upfront and sent in the
-            // create_task body — no post-create PATCH needed.
-            let branch_name = branch_name_for_new
-                .clone()
-                .expect("branch_name_for_new is Some in branch mode");
-            let worktree_path = match cm_daemon::worktree::create_subtask_worktree(
-                &main_repo,
-                &branch_name,
-                start,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    // Rollback: delete the API task so we don't leak
-                    // a `running` row that points at nothing on disk.
-                    // Best-effort — if the DELETE fails too the user
-                    // has to clean up by hand, but we surface the
-                    // original git error which is what they care about.
-                    let _ = api_client.delete_task(&new_task_id);
-                    return Err((
-                        ErrorCode::Internal,
-                        format!(
-                            "create worktree failed for branch '{}'; api task {} rolled back: {}",
-                            branch_name, new_task_id, e
-                        ),
-                    ));
-                }
-            };
-            cm_daemon::worktree::setup_worktree(&main_repo, &worktree_path);
-
-            // Register a fresh workspace for this subtask.
-            let new_ws_id = crate::app::new_workspace_id();
-            let new_ws = Workspace {
-                color: None,
-                pinned: false,
-                id: new_ws_id.clone(),
-                name: leaf_slug.clone(),
-                is_closed: false,
-                is_cloud: false,
-                repo_url: Some(parent_repo_url.clone()),
-                worktree_path: Some(worktree_path.clone()),
-                main_repo_path: Some(main_repo.clone()),
-                worker_vm: None,
-                worker_zone: None,
-                host_id: cm_daemon::host_id::HostId::local(),
-                sessions: vec![],
-                tombstones: vec![],
-                is_pushing: false,
-            };
-            app.workspaces.push(new_ws);
-            (worktree_path, new_ws_id)
-        }
-        "in-place" => {
-            // No worktree, no branch — the subtask's cwd IS the parent's
-            // main repo. We still register a SEPARATE workspace (distinct
-            // id) pointing at the main repo, rather than reusing the
-            // parent's workspace the way "inherit" does: the common case
-            // is a subtask of a *worktree-backed* parent that wants to run
-            // in the main repo instead. Setting `worktree_path` ==
-            // `main_repo_path` makes `Workspace::is_in_place()` true, so
-            // teardown (delete, mark_subtask_done) never touches git.
-            let main_repo = in_place_main_repo.expect("validated above");
-            let new_ws_id = crate::app::new_workspace_id();
-            let new_ws = Workspace {
-                color: None,
-                pinned: false,
-                id: new_ws_id.clone(),
-                name: leaf_slug.clone(),
-                is_closed: false,
-                is_cloud: false,
-                repo_url: Some(parent_repo_url.clone()),
-                worktree_path: Some(main_repo.clone()),
-                main_repo_path: Some(main_repo.clone()),
-                worker_vm: None,
-                worker_zone: None,
-                host_id: cm_daemon::host_id::HostId::local(),
-                sessions: vec![],
-                tombstones: vec![],
-                is_pushing: false,
-            };
-            app.workspaces.push(new_ws);
-            (main_repo, new_ws_id)
-        }
-        _ => unreachable!(),
-    };
-
-    // Step 4: insert the TaskEntry locally so it's visible immediately,
-    // pre-empting the next API reconcile (which would also pick it up
-    // a few seconds later).
-    let already_present = app
-        .tasks
-        .iter()
-        .any(|t| t.task_id.as_deref() == Some(new_task_id.as_str()));
-    if !already_present {
-        app.tasks.push(crate::app::TaskEntry {
-            task_id: Some(new_task_id.clone()),
-            name: p.name.clone(),
-            api_status: crate::app::TaskStatus::Running,
-            repo_url: Some(parent_repo_url),
-            prompt: p.prompt.clone(),
-            // Same value we baked into the API row — survives the
-            // next reconcile.
-            wip_branch: branch_name_for_new.clone(),
-            session_id: None,
-            blocked_at: None,
-            is_cloud: false,
-            is_continuous: false,
-            workspace_id: Some(workspace_id_for_new.clone()),
-            project: project_for_local.clone(),
-            parent_task_id: Some(parent_task_id.clone()),
-            worktree_mode: crate::app::parse_worktree_mode(&p.worktree_mode),
-            metadata: None,
+                "parent workspace has no main_repo_path; cannot branch".into(),
+            ))?)
+        } else {
+            None
+        };
+        // In-place mode: the subtask runs directly in the parent's MAIN repo
+        // checkout — no worktree, no branch. Resolve that path upfront so the
+        // worktree-production step below is infallible.
+        let in_place_main_repo: Option<std::path::PathBuf> = if p.worktree_mode == "in-place" {
+            Some(parent_main_repo.clone().ok_or((
+                ErrorCode::Conflict,
+                "parent workspace has no main_repo_path; cannot launch in-place".into(),
+            ))?)
+        } else {
+            None
+        };
+        // An explicit `base` is a precondition like any other: resolve it to a
+        // concrete commit HERE, before the API create, so a typo'd ref fails
+        // as invalid_params instead of minting a `running` row that then has
+        // to be rolled back. The cut below reuses the resolved sha. (Daemon
+        // twin does the same at the same point in its Step 1.)
+        let resolved_base: Option<String> = match (base.as_deref(), branch_main_repo.as_deref()) {
+            (Some(b), Some(main_repo)) => Some(
+                cm_daemon::worktree::resolve_base_commit(main_repo, b)
+                    .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?,
+            ),
+            _ => None,
+        };
+        // Resolve the parent's actual branch UPFRONT. Tasks launched into
+        // existing workspaces commonly have `wip_branch: None` because
+        // the system never had reason to set it; the source of truth in
+        // that case is the parent worktree's actual HEAD. Order of
+        // preference:
+        //   1. parent.wip_branch (canonical when set)
+        //   2. parent worktree's `git rev-parse --abbrev-ref HEAD`
+        //   3. None (handled per-mode below)
+        //
+        // Branch-mode REQUIRES this to be Some — we don't fall back to
+        // "main" because the user may not have a main branch at all, and
+        // silently forking from the wrong base loses the parent's work.
+        // Inherit-mode treats None as soft: the new task's wip_branch
+        // inherits the resolution if available, so future grandchildren
+        // can branch from it.
+        //
+        // An explicit `base` replaces this resolution outright, so it also
+        // lifts the branch-mode requirement: the caller named the cut point.
+        let parent_branch_resolved: Option<String> = parent.wip_branch.clone().or_else(|| {
+            parent_worktree.as_deref()
+                .and_then(cm_daemon::worktree::worktree_current_branch)
         });
-    }
+        if p.worktree_mode == "branch" && base.is_none() && parent_branch_resolved.is_none() {
+            return Err((
+                ErrorCode::Conflict,
+                "cannot determine parent's base branch (no wip_branch and worktree HEAD is detached or unreadable)".into(),
+            ));
+        }
 
-    app.save_session_manifest();
-    // Sub-2a Finding (round 3) #2: the local TaskEntry above
-    // adds a fresh parent-task edge; without an immediate
-    // `push_task_tree_to_daemon` the daemon's `task_tree`
-    // doesn't see the new subtask until the next API reconcile
-    // fires (typically seconds later). Until then, a tasked
-    // agent acting on the subtask's session — which is exactly
-    // what `create_subtask` is for — would fail the
-    // descendant-task auth walk because the parent edge isn't
-    // visible. Pre-fix: subtask spawn-then-act races reconcile.
-    // Post-fix: edge is live the moment `create_subtask`
-    // returns. Mirrors the launch_* paths which call this at
-    // the tail for the same reason.
-    //
-    // fix-launch-mcmp: that push is FIRE-AND-FORGET (a channel send to
-    // `PushWorker`), so "the moment `create_subtask` returns" was never
-    // true for the tightest caller — `mcp_start_session(isolated=true)`
-    // calls `create_subtask` here and `mcp_start_session` on the DAEMON
-    // socket microseconds later, beating the push and bouncing with
-    // `unauthorized: task '<id>' is not the caller's task or a
-    // descendant`. The synchronous registration below seeds the same
-    // state the daemon's own `create_subtask` seeds inline (auth edge +
-    // task→workspace binding + worktree path), so the spawn resolves both
-    // its scope and its working directory. It is recorded as an
-    // `agent_task_edges` overlay entry, which survives the replace-not-
-    // merge pushes and daemon restarts — the async push alone would be
-    // undone by the next reconcile that doesn't know the parent link yet.
-    let subtask_host = app
-        .workspaces
-        .iter()
-        .find(|w| w.id == workspace_id_for_new)
-        .map(|w| w.host_id.clone())
-        .unwrap_or_else(cm_daemon::host_id::HostId::local);
-    if let Err(e) = app.register_agent_subtask_with_daemon(
-        &subtask_host,
-        &new_task_id,
-        &parent_task_id,
-        &workspace_id_for_new,
-        Some(worktree_path.as_path()),
-    ) {
-        // Non-fatal: the API row and the worktree both exist, so failing
-        // the call would strand them. The agent is back to racing the
-        // async push (today's behavior), which is worse than the fix but
-        // better than a spurious error on a subtask that was created.
-        eprintln!(
-            "cm-tui: create_subtask: synchronous daemon registration for task {} failed: {} \
-             (falling back to the async task-tree push)",
-            new_task_id, e,
-        );
-    }
-    app.push_task_tree_to_daemon();
-    // The commit the subtask's checkout actually sits on. In branch mode
-    // that's the resolved `base` (or the parent branch's tip); in
-    // inherit / in-place it's the shared checkout's current HEAD — either
-    // way it answers "what am I working on top of" without a follow-up
-    // shell call. `null` when the path isn't readable as a git checkout.
-    let base_sha = cm_daemon::worktree::worktree_head_sha(&worktree_path);
-    Ok(json!({
-        "task_id": new_task_id,
-        "worktree_path": worktree_path.to_string_lossy(),
-        "base_sha": base_sha,
-        // create_subtask mints a task + (maybe) a worktree and stops.
-        // Stated explicitly so an agent doesn't assume a worker is
-        // already running on it — nothing runs until start_session.
-        "launched": false,
+        // Compute the new task's `wip_branch` upfront — both modes need
+        // this baked into the API row. Without it, the next reconcile
+        // (which copies API state into the local TaskEntry) would null
+        // out wip_branch for inherit-mode subtasks, and a branch-mode
+        // grandchild would then fall back to "main" as its start ref.
+        //
+        // Inherit mode → same branch as parent (sessions live in the
+        // parent's worktree, which is on the parent's branch).
+        // Branch mode → the freshly-built `cm-sub/<chain>-<short>` name.
+        let branch_name_for_new: Option<String> = match p.worktree_mode.as_str() {
+            // Inherit: subtask's wip_branch IS the parent's resolved branch,
+            // not just its (possibly-None) `wip_branch` field. Without
+            // this fallback through worktree HEAD, an inherit-mode subtask
+            // with parent.wip_branch=None would store None in the API,
+            // and a future branch-mode grandchild would hit the same
+            // base-branch problem.
+            "inherit" => parent_branch_resolved.clone(),
+            "branch" => Some(format!("cm-sub/{}-{}", slug_chain, request_short_id)),
+            // In-place: the session runs in the MAIN repo checkout, NOT the
+            // parent's worktree — so its branch is the main repo's CURRENT
+            // branch, not `parent_branch_resolved` (which could be the parent's
+            // `cm/...` worktree branch). Reading it from `in_place_main_repo`
+            // mirrors the planning launch path (app.rs `launch_from_plan`).
+            // Recording the parent's branch here would mislead branch-mode
+            // grandchildren (wrong fork base) and let reconcile mis-map this
+            // task onto a `cm/...` worktree dir after a manifest loss.
+            "in-place" => in_place_main_repo
+                .as_deref()
+                .and_then(cm_daemon::worktree::worktree_current_branch),
+            _ => None,
+        };
+
+        // Step 2: ask the API to create the task. Server assigns the UUID,
+        // which we need for the short_id in branch-mode names.
+        let api_client = api_client_or_err()?;
+        let body = crate::api::TaskCreateBody {
+            repo_url: parent_repo_url.clone(),
+            repo_branch: "main".to_string(),
+            name: Some(p.name.clone()),
+            prompt: p.prompt.clone(),
+            priority: 0,
+            status: Some("running".to_string()),
+            project,
+            slug: Some(unique_slug.clone()),
+            description: None,
+            difficulty: None,
+            depends: None,
+            source: Some("claude".to_string()),
+            is_cloud: Some(false),
+            parent_task_id: Some(parent_task_id.clone()),
+            worktree_mode: Some(p.worktree_mode.clone()),
+            wip_branch: branch_name_for_new.clone(),
+            metadata: Some(json!({ "filer": filer })),
+        };
+        let new_task = api_client
+            .create_task(&body)
+            .map_err(|e| (ErrorCode::Internal, format!("api create_task: {}", e)))?;
+        let new_task_id = new_task.id.clone();
+
+        // Step 3: produce a worktree. Anything that errors after the API
+        // create succeeded triggers a rollback DELETE so we don't leave an
+        // orphan task in `running` state with no usable workspace.
+        let (worktree_path, workspace_id_for_new) = match p.worktree_mode.as_str() {
+            "inherit" => {
+                // Path was validated upfront; safe to unwrap.
+                let path = inherit_worktree_path.expect("validated above");
+                (path, parent_workspace_id.clone())
+            }
+            "branch" => {
+                let main_repo = branch_main_repo.expect("validated above");
+                // Explicit `base` (already resolved to a sha above) replaces
+                // the parent-branch resolution as the cut point — and is the
+                // only thing that makes an unresolvable parent branch
+                // survive the check above.
+                let start_ref = resolved_base
+                    .clone()
+                    .or_else(|| parent_branch_resolved.clone())
+                    .expect("validated above");
+                let start = if resolved_base.is_some() {
+                    cm_daemon::worktree::SubtaskStart::Base(&start_ref)
+                } else {
+                    cm_daemon::worktree::SubtaskStart::ParentBranch(&start_ref)
+                };
+                // Branch name was computed upfront and sent in the
+                // create_task body — no post-create PATCH needed.
+                let branch_name = branch_name_for_new
+                    .clone()
+                    .expect("branch_name_for_new is Some in branch mode");
+                let worktree_path = match cm_daemon::worktree::create_subtask_worktree(
+                    &main_repo,
+                    &branch_name,
+                    start,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Rollback: delete the API task so we don't leak
+                        // a `running` row that points at nothing on disk.
+                        // Best-effort — if the DELETE fails too the user
+                        // has to clean up by hand, but we surface the
+                        // original git error which is what they care about.
+                        let _ = api_client.delete_task(&new_task_id);
+                        return Err((
+                            ErrorCode::Internal,
+                            format!(
+                                "create worktree failed for branch '{}'; api task {} rolled back: {}",
+                                branch_name, new_task_id, e
+                            ),
+                        ));
+                    }
+                };
+                cm_daemon::worktree::setup_worktree(&main_repo, &worktree_path);
+
+                // Register a fresh workspace for this subtask.
+                let new_ws_id = crate::app::new_workspace_id();
+                let new_ws = Workspace {
+                    color: None,
+                    pinned: false,
+                    id: new_ws_id.clone(),
+                    name: leaf_slug.clone(),
+                    is_closed: false,
+                    is_cloud: false,
+                    repo_url: Some(parent_repo_url.clone()),
+                    worktree_path: Some(worktree_path.clone()),
+                    main_repo_path: Some(main_repo.clone()),
+                    worker_vm: None,
+                    worker_zone: None,
+                    host_id: cm_daemon::host_id::HostId::local(),
+                    sessions: vec![],
+                    tombstones: vec![],
+                    is_pushing: false,
+                };
+                new_workspace = Some(new_ws);
+                (worktree_path, new_ws_id)
+            }
+            "in-place" => {
+                // No worktree, no branch — the subtask's cwd IS the parent's
+                // main repo. We still register a SEPARATE workspace (distinct
+                // id) pointing at the main repo, rather than reusing the
+                // parent's workspace the way "inherit" does: the common case
+                // is a subtask of a *worktree-backed* parent that wants to run
+                // in the main repo instead. Setting `worktree_path` ==
+                // `main_repo_path` makes `Workspace::is_in_place()` true, so
+                // teardown (delete, mark_subtask_done) never touches git.
+                let main_repo = in_place_main_repo.expect("validated above");
+                let new_ws_id = crate::app::new_workspace_id();
+                let new_ws = Workspace {
+                    color: None,
+                    pinned: false,
+                    id: new_ws_id.clone(),
+                    name: leaf_slug.clone(),
+                    is_closed: false,
+                    is_cloud: false,
+                    repo_url: Some(parent_repo_url.clone()),
+                    worktree_path: Some(main_repo.clone()),
+                    main_repo_path: Some(main_repo.clone()),
+                    worker_vm: None,
+                    worker_zone: None,
+                    host_id: cm_daemon::host_id::HostId::local(),
+                    sessions: vec![],
+                    tombstones: vec![],
+                    is_pushing: false,
+                };
+                new_workspace = Some(new_ws);
+                (main_repo, new_ws_id)
+            }
+            _ => unreachable!(),
+        };
+
+        // Step 4: insert the TaskEntry locally so it's visible immediately,
+        // pre-empting the next API reconcile (which would also pick it up
+        // a few seconds later).
+        let task = crate::app::TaskEntry {
+                task_id: Some(new_task_id.clone()),
+                name: p.name.clone(),
+                api_status: crate::app::TaskStatus::Running,
+                repo_url: Some(parent_repo_url),
+                prompt: p.prompt.clone(),
+                // Same value we baked into the API row — survives the
+                // next reconcile.
+                wip_branch: branch_name_for_new.clone(),
+                session_id: None,
+                blocked_at: None,
+                is_cloud: false,
+                is_continuous: false,
+                workspace_id: Some(workspace_id_for_new.clone()),
+                project: project_for_local.clone(),
+                parent_task_id: Some(parent_task_id.clone()),
+                worktree_mode: crate::app::parse_worktree_mode(&p.worktree_mode),
+                metadata: None,
+            };
+
+        // Register scope before replying so an immediate spawn sees the new edge.
+        // Keep the former best-effort fallback; the API task/worktree already exist.
+        let host = subtask_host;
+        let registration = (|| -> anyhow::Result<()> {
+            let socket = host_pool.for_host(&host)?.socket_path()
+                .ok_or_else(|| anyhow::anyhow!("daemon socket unavailable"))?;
+            crate::client_session::rpc_register_agent_subtask(&socket,
+                &host_pool.operator_token_for(&host), &new_task_id, &parent_task_id,
+                &workspace_id_for_new, Some(&worktree_path))
+        })();
+        if let Err(e) = registration {
+            eprintln!("cm-tui: create_subtask registration failed: {e} (async push will retry)");
+        }
+        // The commit the subtask's checkout actually sits on. In branch mode
+        // that's the resolved `base` (or the parent branch's tip); in
+        // inherit / in-place it's the shared checkout's current HEAD — either
+        // way it answers "what am I working on top of" without a follow-up
+        // shell call. `null` when the path isn't readable as a git checkout.
+        let base_sha = cm_daemon::worktree::worktree_head_sha(&worktree_path);
+        let result = json!({
+            "task_id": new_task_id,
+            "worktree_path": worktree_path.to_string_lossy(),
+            "base_sha": base_sha,
+            // create_subtask mints a task + (maybe) a worktree and stops.
+            // Stated explicitly so an agent doesn't assume a worker is
+            // already running on it — nothing runs until start_session.
+            "launched": false,
+        });
+        Ok(CreatedSubtask { workspace: new_workspace, task, result })
     }))
 }
 

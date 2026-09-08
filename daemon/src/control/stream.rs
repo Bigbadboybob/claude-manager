@@ -122,6 +122,7 @@ pub fn handle_attach_stream(
     // thread out of its `recv_timeout` loop on client disconnect.
     let stop = Arc::new(AtomicBool::new(false));
 
+    let output_flow = fanout_rx.flow_control();
     let writer_request_id = request_id.clone();
     let writer_session_uid = session_uid.clone();
     let writer_stop = stop.clone();
@@ -151,7 +152,7 @@ pub fn handle_attach_stream(
 
     // Run the inbound loop on this thread. Returns on EOF or
     // unrecoverable read error.
-    run_inbound(stream, state, &session_uid);
+    run_inbound(stream, state, &session_uid, &output_flow);
 
     // Inbound has returned — client disconnected or read errored.
     // Signal the writer thread to exit on its next tick, and
@@ -460,7 +461,7 @@ pub fn handle_manifest_watch_stream(
 ///     dropped the stream.
 fn run_outbound(
     mut write_socket: UnixStream,
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    rx: crate::attach_output::OutputSubscription,
     request_id: &str,
     session_uid: &str,
     stop: Arc<AtomicBool>,
@@ -492,10 +493,22 @@ fn run_outbound(
                     return;
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(crate::attach_output::RecvError::Overflow) => {
+                // A byte gap cannot be fed into an existing terminal parser.
+                // Tear down the transport explicitly; the TUI reattaches from
+                // replay, without treating this as an agent exit.
+                let _ = wire::write_stream_frame(&mut write_socket, &StreamFrame {
+                    id: request_id.into(), kind: StreamKind::Error,
+                    payload: serde_json::json!({"message": "terminal viewer fell behind; reconnect required"}),
+                });
+                stop.store(true, Ordering::SeqCst);
+                let _ = write_socket.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            Err(crate::attach_output::RecvError::Timeout) => {
                 // Liveness tick — loop, recheck stop flag, re-poll.
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(crate::attach_output::RecvError::Closed) => {
                 // Fanout closed cleanly. Build End-frame payload
                 // from the reaper-recorded kernel exit + a
                 // consume-time kill-log scan (slice-10c-e-2
@@ -566,6 +579,7 @@ fn run_inbound(
     stream: &mut UnixStream,
     state: Arc<Mutex<DaemonState>>,
     session_uid: &str,
+    output_flow: &crate::attach_output::OutputSender,
 ) {
     loop {
         let frame = match wire::read_stream_frame(stream) {
@@ -590,7 +604,15 @@ fn run_inbound(
         };
 
         match frame.kind {
+            StreamKind::OutputFlow => {
+                if let Some(background) = frame.payload["background"].as_bool() {
+                    output_flow.set_background(background);
+                }
+            }
             StreamKind::Input => {
+                // Input always restores immediate echo, even if focus and
+                // typing reached this socket in the same UI tick.
+                output_flow.note_input();
                 let Some(b64) = frame.payload.get("bytes").and_then(|v| v.as_str()) else {
                     eprintln!(
                         "cm-daemon: attach stream {} inbound Input frame missing 'bytes' field",
@@ -742,7 +764,7 @@ mod tests {
             .expect("session must be in registry for handle build");
         AttachStreamHandle {
             session_uid: session_uid.to_string(),
-            fanout_rx: session.fanout.subscribe(),
+            fanout_rx: session.fanout.subscribe_output(),
             last_exit: session.last_exit.clone(),
             request_id: request_id.to_string(),
         }

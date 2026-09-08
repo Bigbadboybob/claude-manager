@@ -125,7 +125,7 @@ pub struct AttachStreamHandle {
     /// the subscriber still observes `Disconnected` on producer
     /// close (via `PtyByteFanout::close`) and the End frame fires
     /// with whatever LastExit the reaper recorded.
-    pub fanout_rx: mpsc::Receiver<Vec<u8>>,
+    pub fanout_rx: crate::attach_output::OutputSubscription,
     /// Shared exit slot. Populated by the reaper thread on
     /// `waitpid` return; read by the stream module on End-frame
     /// emission to encode `{exit_code, memory_cap_kill}` into the
@@ -434,6 +434,7 @@ pub fn dispatch_request(
         // outcome on success — the slice-10c-e-2 review-2 fix
         // moves the session live-check + fanout subscription
         // inside the same critical section as ticket consume.
+        "attach.direct" => dispatch_attach_direct(state, req),
         "attach.open" => {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             dispatch_attach_open(&mut s, req)
@@ -2238,6 +2239,77 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
         }
     };
 
+    bind_attach_stream(state, req, session_uid, params.cols, params.rows)
+}
+
+/// An authenticated operator can bind the current socket directly, avoiding
+/// a ticket RPC and a second SSH channel open. The ticket path stays available
+/// for older clients. Optional restore context has the same best-effort setter
+/// semantics as the old TUI's post-attach calls, including clearing stale tags.
+fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> DispatchOutcome {
+    if let Err(resp) = require_operator(req, "attach.direct is Operator-only") {
+        return DispatchOutcome::Done(resp);
+    }
+    #[derive(serde::Deserialize)]
+    struct Params {
+        uid: String,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        context: Option<Context>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Context {
+        transcript_path: Option<String>,
+        workflow_run_id: Option<String>,
+        workflow_role: Option<String>,
+    }
+    let params: Params = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return DispatchOutcome::Done(Response::err(
+            req.id.clone(), ErrorCode::InvalidParams, format!("attach.direct params: {e}"),
+        )),
+    };
+    {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if !s.sessions.contains_key(&params.uid) {
+            return DispatchOutcome::Done(Response::err(
+                req.id.clone(), ErrorCode::NotFound, "session not in daemon registry",
+            ));
+        }
+    }
+    let mut context_errors = Vec::new();
+    if let Some(context) = params.context {
+        if let Some(path) = context.transcript_path {
+            if let Err((_, message)) = methods::set_transcript_path(state, &serde_json::json!({
+                "session_uid": params.uid, "transcript_path": path,
+            })) {
+                context_errors.push(message);
+            }
+        }
+        if let Err((_, message)) = methods::set_workflow_context(state, &serde_json::json!({
+            "uid": params.uid,
+            "workflow_run_id": context.workflow_run_id,
+            "workflow_role": context.workflow_role,
+        })) {
+            context_errors.push(message);
+        }
+    }
+    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut outcome = bind_attach_stream(&mut s, req, params.uid, params.cols, params.rows);
+    if let DispatchOutcome::AttachStream { response, .. } = &mut outcome {
+        response.result.as_mut().expect("attach result")["context_errors"] =
+            serde_json::json!(context_errors);
+    }
+    outcome
+}
+
+fn bind_attach_stream(
+    state: &mut DaemonState,
+    req: &Request,
+    session_uid: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> DispatchOutcome {
     // Subscribe + clone last_exit inside the same critical
     // section as the ticket consume above (`state` is &mut and
     // we still hold the dispatch-arm lock from `dispatch_request`).
@@ -2260,7 +2332,7 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
             // any PTY byte flows and resizes in-process, so it can't
             // hit a dead socket. `cols`/`rows` are absent only for
             // older TUIs, which keep the legacy frame-only behavior.
-            if let (Some(c), Some(r)) = (params.cols, params.rows) {
+            if let (Some(c), Some(r)) = (cols, rows) {
                 if let Err(e) = session.resize(c, r) {
                     eprintln!(
                         "cm-daemon: attach.open resize {}x{} for {} failed: {} \
@@ -2269,7 +2341,7 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
                     );
                 }
             }
-            (session.fanout.subscribe(), session.last_exit.clone())
+            (session.fanout.subscribe_output(), session.last_exit.clone())
         }
         None => {
             return DispatchOutcome::Done(Response::err(
@@ -2285,7 +2357,7 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
 
     let response = Response::ok(
         req.id.clone(),
-        serde_json::json!({ "session_uid": session_uid.clone() }),
+        serde_json::json!({ "session_uid": session_uid.clone(), "output_flow": true }),
     );
     let handle = AttachStreamHandle {
         session_uid,
@@ -3631,6 +3703,56 @@ mod tests {
             resp.error.expect("error body").code,
             ErrorCode::InvalidParams,
         );
+    }
+
+    #[test]
+    fn direct_attach_preserves_stream_auth_and_restores_context() {
+        let state = state_with_session("ts-live");
+        let denied = dispatch_request(&state, &session_request(
+            "attach.direct", serde_json::json!({"uid": "ts-live"}), "agent",
+        )).into_response();
+        assert_eq!(denied.error.unwrap().code, ErrorCode::Unauthorized);
+        let absent = dispatch_request(&state, &operator_request(
+            "attach.direct", serde_json::json!({"uid": "absent"}),
+        )).into_response();
+        assert_eq!(absent.error.unwrap().code, ErrorCode::NotFound);
+        for (run, role) in [(Some("run"), Some("worker")), (None, None)] {
+            let outcome = dispatch_request(&state, &operator_request("attach.direct", serde_json::json!({
+                "uid": "ts-live", "cols": 123, "rows": 45,
+                "context": {"workflow_run_id": run, "workflow_role": role},
+            })));
+            let DispatchOutcome::AttachStream { response, handle } = outcome else {
+                panic!("expected live stream");
+            };
+            assert!(response.ok);
+            assert_eq!(response.result.unwrap()["context_errors"], serde_json::json!([]));
+            let s = state.lock().unwrap();
+            let session = s.sessions.get("ts-live").unwrap();
+            assert_eq!(session.workflow_run_id.as_deref(), run);
+            assert_eq!(session.workflow_role.as_deref(), role);
+            if run.is_none() {
+                assert_eq!(handle.fanout_rx.recv().unwrap(), b"stream survives context update");
+            }
+            session.fanout.push(b"stream survives context update");
+            assert_eq!(handle.fanout_rx.recv().unwrap(), b"stream survives context update");
+        }
+    }
+
+    #[test]
+    fn direct_attach_rejects_partial_context_without_clearing_existing_tags() {
+        let state = state_with_session("ts-live");
+        {
+            let mut s = state.lock().unwrap();
+            let session = s.sessions.get_mut("ts-live").unwrap();
+            session.workflow_run_id = Some("original".into());
+            session.workflow_role = Some("worker".into());
+        }
+        let response = dispatch_request(&state, &operator_request("attach.direct", serde_json::json!({
+            "uid": "ts-live", "context": {"workflow_run_id": "partial"},
+        }))).into_response();
+        assert!(response.ok, "metadata failure must not kill a live attachment");
+        assert_eq!(response.result.unwrap()["context_errors"].as_array().unwrap().len(), 1);
+        assert_eq!(state.lock().unwrap().sessions["ts-live"].workflow_run_id.as_deref(), Some("original"));
     }
 
     #[test]

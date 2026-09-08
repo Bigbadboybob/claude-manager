@@ -44,3 +44,87 @@ These are snapshots; normal agent work can change session counts later.
 Apply the changes with one TUI relaunch. Keep the current interface running until a convenient break so an unfinished prompt or ongoing interaction is not interrupted. Existing daemon-owned agents continue through the UI relaunch. Do not use a daemon/holder restart or `cm-redeploy --manager` for this client-only batch.
 
 After activation, use the new `control:<method>` timing entries and existing phase timings to identify residual stalls. This pass does not eliminate every synchronous control handler, manifest fsync, or the transmission/parsing of hidden terminals. It also does not claim a measured production latency improvement before the updated TUI is running. The next architectural step remains lightweight fleet status with full terminal subscriptions limited to visible/recent panes.
+
+## Second batch: attachment, background output, UI stalls, recovery
+
+2026-09-08 UTC. This batch changes the TUI and daemon brain. It does not change
+or restart the holder, and it adds no local prompt editor.
+
+- **One-request attachment.** `attach.direct` authenticates the operator, applies
+  terminal dimensions, optionally restores transcript/workflow metadata, and
+  binds the same socket to terminal output. Restores include clearing stale
+  workflow tags; partial tag pairs are refused by the existing setter without
+  breaking attachment. Old clients retain the ticket path. New clients fall
+  back only on `unknown_method`, never on authorization failure. Both direct
+  and legacy attachment sockets now have handshake timeouts; an accepted but
+  silent socket previously occupied an attach worker indefinitely.
+- **Bounded, lossless output batching.** Network viewers have a 2 MiB queue;
+  ordinary output and initial replay are framed in batches up to 64 KiB.
+  Adjacent chunks can share a frame. Hidden panes batch small updates every
+  250 ms; the focused pane and panes seen in the last two seconds remain
+  immediate. Input temporarily forces immediate output, including programmatic
+  input into hidden panes. Large output flushes at the batch-size threshold.
+  The producer never waits for a viewer. Overflow produces an explicit stream
+  error and reconnect, rather than silently dropping bytes into a live parser
+  or accumulating unbounded memory. The old internal fanout subscriptions used
+  by daemon consumers remain unchanged. RPC/stream framing writes the prefix
+  and payload together, removing the separate four-byte write.
+- **Measured UI stalls.** `slow-ticks.log` recorded a 5.964-second manifest drain
+  and a 5.282-second `create_subtask` handler. Manifest adoption now uses the
+  prioritized attach workers, with duplicate suppression while queued/in flight.
+  Manifest drains yield after a four-millisecond budget between events.
+  Daemon-confirmed exits remove/tombstone rows without a redundant kill RPC.
+  Subtask creation snapshots caller scope on the UI thread, performs API/Git/
+  daemon registration in a worker, then applies only the newly created rows.
+  Completion preserves newer planning state and saves the manifest before the
+  success response. The direct synchronous helper remains for internal callers
+  and tests; normal control requests use the worker.
+- **Recovery.** A server `Error` frame now delivers transport EOF to Alacritty,
+  which notifies the UI and reconnects. Previously it returned a read error and
+  Alacritty stopped without delivering an exit event, leaving a frozen pane.
+  SSH keepalives are three seconds with two unanswered probes (roughly six
+  seconds rather than fifteen). On Linux a background monitor watches default
+  routes and wall-clock gaps after sleep; it retires only CM-owned SSH forwards
+  and clears the old host push backoff. Local daemon transports are untouched.
+  Existing reconnect tests verify queued prompts and session metadata survive.
+
+Hidden output is batched, **not suppressed**: terminal escape sequences and
+parser modes still need every byte. This reduces framing, wakeups and small
+network writes, not the raw amount of terminal output. Full suspension would
+need a validated terminal-state checkpoint/resume protocol. Overflow still uses
+CM's existing bounded replay/repaint recovery, not an exact terminal snapshot.
+Individual manifest fsyncs and other unconverted synchronous UI commands can
+still take time; the per-phase timing remains available to identify them.
+Neither batching nor a shorter handshake removes the physical network RTT.
+
+### Verification and test isolation
+
+The isolated full run passed **2,237 Rust tests** (880 TUI tests, 1,306 daemon
+unit tests, and 51 integration tests); four existing Rust tests were ignored.
+All **27 Python socket-routing tests** passed. Focused subtask tests also passed
+after preserving the inherited workspace's host in the worker registration.
+Checks cover authentication, old-daemon fallback through the correct host
+socket, metadata restore/clear, output ordering, overflow isolation, focus
+flushes, manifest adoption deduplication, and UI progress while a subtask waits.
+
+The first full run exposed an existing fixture-isolation bug: an App test
+restores `HOME` before later callbacks save its manifest, and wrote `ws-test`
+into the real TUI manifest. The running TUI and daemon sessions were intact.
+Reasserting an enrolled session's **unchanged name** generated a normal metadata
+diff and made the live TUI repersist its full state: 2,444 workspaces / 38 session
+rows at that instant. A private recovery copy was saved before further tests.
+
+Use `scripts/cm-test-isolated` for subsequent Rust tests. It runs bubblewrap
+with a read-only source/root, private writable CM/runtime state and temporary
+files, a private PID namespace, and an isolated network namespace. Tests can
+use loopback sockets but cannot reach live daemon sockets or external services.
+It keeps the caller's HOME value, so the tests exercise the actual path logic
+without writing to the user's directory. The Cargo target remains private:
+
+```
+CARGO_TARGET_DIR=/tmp/cm-cloud-responsiveness-target CARGO_BUILD_JOBS=2 \
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+nice -n 10 scripts/cm-test-isolated
+```
+
+Rollout measurements and verified host epochs are recorded below after deployment.

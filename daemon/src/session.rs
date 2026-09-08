@@ -143,6 +143,7 @@ struct FanoutInner {
     buffer: VecDeque<u8>,
     capacity: usize,
     subscribers: Vec<mpsc::Sender<Vec<u8>>>,
+    output_subscribers: Vec<crate::attach_output::OutputSender>,
     /// Set once the producer has signalled "no more data coming"
     /// (typically: the reader thread saw EOF / read-error on the
     /// PTY master). Subscribers detect this by observing
@@ -192,6 +193,7 @@ impl PtyByteFanout {
                 buffer: VecDeque::with_capacity(capacity),
                 capacity,
                 subscribers: Vec::new(),
+                output_subscribers: Vec::new(),
                 closed: false,
                 bytes_written: 0,
             }),
@@ -244,6 +246,7 @@ impl PtyByteFanout {
         // see Disconnected. The recv loop's next wakeup observes
         // the transition.
         inner.subscribers.clear();
+        for tx in inner.output_subscribers.drain(..) { tx.close(); }
     }
 
     /// Append `bytes` to the ring (FIFO-evicting if needed) and
@@ -279,6 +282,7 @@ impl PtyByteFanout {
         // subscribers. `retain` drops senders whose receiver has been
         // closed — that's how a dropped attach connection cleans up.
         inner.subscribers.retain(|tx| tx.send(bytes.to_vec()).is_ok());
+        inner.output_subscribers.retain(|tx| tx.push(bytes));
 
         // Sub-2b-1 review-r#2 #1: stamp shared activity AFTER the
         // fanout's own lock is released to avoid lock-order
@@ -388,6 +392,17 @@ impl PtyByteFanout {
             return rx;
         }
         inner.subscribers.push(tx);
+        rx
+    }
+
+    /// Bounded subscription for network viewers. Replay and subscription are
+    /// captured under one lock, so no PTY output can fall between them.
+    pub fn subscribe_output(&self) -> crate::attach_output::OutputSubscription {
+        let (tx, rx) = crate::attach_output::channel();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let replay: Vec<u8> = inner.buffer.iter().copied().collect();
+        tx.push(&replay);
+        if inner.closed { tx.close(); } else { inner.output_subscribers.push(tx); }
         rx
     }
 

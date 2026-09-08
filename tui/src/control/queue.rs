@@ -53,6 +53,10 @@ impl Queue {
 
     /// Take one request without removing the rest of the FIFO. Lets the UI
     /// yield between expensive requests while preserving submission order.
+    pub fn push_front(&self, pending: Pending) {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).push_front(pending);
+    }
+
     pub fn pop(&self) -> Option<Pending> {
         self.inner.lock().ok()?.pop_front()
     }

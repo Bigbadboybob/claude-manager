@@ -467,15 +467,19 @@ impl<R: Read> Read for StreamReader<R> {
                         .and_then(Value::as_str)
                         .unwrap_or("attach stream error")
                         .to_string();
-                    self.eof = true;
-                    return Err(io::Error::other(msg));
+                    // Alacritty exits its read loop on Err without delivering
+                    // an exit event. Use the transport-EOF path so an explicit
+                    // server error reconnects instead of leaving a frozen pane.
+                    eprintln!("cm-tui: attach stream error: {msg}");
+                    self.synthesize_transport_death_eof();
+                    return Ok(0);
                 }
                 // `Input` and `Resize` are CLIENT→SERVER kinds
                 // (slice 10c-e-2 review fix). The client should
                 // never see them on the inbound side; treat as a
                 // wire-protocol bug. Defensive: log via
                 // io::Error and close.
-                StreamKind::Input | StreamKind::Resize => {
+                StreamKind::Input | StreamKind::Resize | StreamKind::OutputFlow => {
                     self.eof = true;
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,
@@ -563,6 +567,11 @@ impl<W: Write> StreamWriter<W> {
     /// queueing; if the sink returns `WouldBlock`, the frame stays
     /// in the queue and a later `flush_pending` (or another
     /// `write`) finishes it.
+    pub fn send_output_flow(&mut self, background: bool) -> io::Result<()> {
+        self.queue_frame(StreamKind::OutputFlow, serde_json::json!({"background": background}))?;
+        self.flush_pending().map(|_| ())
+    }
+
     pub fn send_resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
         self.queue_frame(
             StreamKind::Resize,
@@ -1043,15 +1052,15 @@ mod tests {
     }
 
     #[test]
-    fn reader_error_frame_returns_io_error_other() {
+    fn reader_error_frame_signals_transport_reconnect() {
         let wire = frame_bytes(
             StreamKind::Error,
             serde_json::json!({ "message": "daemon closed the stream" }),
         );
         let mut r = StreamReader::new(Cursor::new(wire));
         let mut buf = [0u8; 16];
-        let err = r.read(&mut buf).expect_err("error frame must surface");
-        assert!(err.to_string().contains("daemon closed the stream"));
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+        assert!(matches!(r.take_child_event(), Some(ChildEvent::Exited { transport_eof: true, .. })));
         assert_eq!(r.read(&mut buf).unwrap(), 0);
     }
 

@@ -298,6 +298,12 @@ fn format_body_for_delivery(body: &str, term_mode: TermMode) -> Vec<u8> {
     }
 }
 
+pub(super) struct SubtaskFlight {
+    pending: crate::control::queue::Pending,
+    result: std::sync::mpsc::Receiver<Result<crate::control::methods::CreatedSubtask,
+        (crate::control::protocol::ErrorCode, String)>>,
+}
+
 impl App {
     /// Append a Phase 6 activity-feed entry. `caller_uid` is resolved to
     /// a friendly label (workflow role, else session label, else uid
@@ -416,6 +422,12 @@ impl App {
 
     /// Process all pending terminal events (non-blocking).
     pub fn drain_terminal_events(&mut self) {
+        let visible_uid = self.active_session().map(|(_, ts)| ts.uid.clone());
+        for ts in self.workspaces.iter_mut().flat_map(|ws| &mut ws.sessions) {
+            if let Some(control) = &mut ts.session.output_control {
+                control.set_visible(visible_uid.as_deref() == Some(&ts.uid));
+            }
+        }
         let now = Instant::now();
         let should_check_session_ids =
             now.duration_since(self.last_session_id_check) >= SESSION_ID_CHECK_INTERVAL;
@@ -1105,7 +1117,7 @@ impl App {
                     uid,
                 );
                 let target = uid.clone();
-                self.tombstone_and_remove(wi, |ts| ts.uid == target);
+                self.tombstone_exited_and_remove(wi, |ts| ts.uid == target);
                 self.close_agent_marker_if_empty(wi);
             }
             self.clamp_cursor();
@@ -1271,8 +1283,56 @@ impl App {
     /// Handlers run on the main loop so they have free `&mut self` access
     /// to App state without any extra locking.
     pub fn drain_control_events(&mut self) {
+        if let Some(flight) = self.subtask_flight.take() {
+            use std::sync::mpsc::TryRecvError;
+            match flight.result.try_recv() {
+                Err(TryRecvError::Empty) => self.subtask_flight = Some(flight),
+                result => {
+                    let result = match result {
+                        Ok(Ok(created)) => crate::control::methods::finish_create_subtask(self, created),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err((crate::control::protocol::ErrorCode::Internal,
+                            "subtask worker exited before returning a result".into())),
+                    };
+                    let req = &flight.pending.request;
+                    let response = match result {
+                        Ok(value) => {
+                            if let Some(summary) = activity_summary_for(&req.method, &req.params, &value) {
+                                self.log_activity(req.caller.session_uid().unwrap_or(""), summary);
+                            }
+                            crate::control::protocol::Response::ok(req.id.clone(), value)
+                        }
+                        Err((code, message)) => crate::control::protocol::Response::err(req.id.clone(), code, message),
+                    };
+                    let _ = flight.pending.reply.send(response);
+                    self.needs_redraw = true;
+                }
+            }
+        }
         let deadline = Instant::now() + Duration::from_millis(4);
         while let Some(entry) = self.control_queue.pop() {
+            if entry.request.method == "create_subtask" {
+                if self.subtask_flight.is_some() {
+                    self.control_queue.push_front(entry);
+                    break;
+                }
+                if let Some(caller) = entry.request.caller.session_uid() {
+                    match crate::control::methods::prepare_create_subtask(self, caller, &entry.request.params) {
+                        Ok(job) => {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            match std::thread::Builder::new().name("cm-create-subtask".into())
+                                .spawn(move || { let _ = tx.send(job()); }) {
+                                Ok(_) => self.subtask_flight = Some(SubtaskFlight { pending: entry, result: rx }),
+                                Err(e) => { let _ = entry.reply.send(crate::control::protocol::Response::err(
+                                    entry.request.id, crate::control::protocol::ErrorCode::Internal, e.to_string())); }
+                            }
+                        }
+                        Err((code, message)) => { let _ = entry.reply.send(crate::control::protocol::Response::err(
+                            entry.request.id, code, message)); }
+                    }
+                    continue;
+                }
+            }
             let started = Instant::now();
             let resp = self.dispatch_control(&entry.request);
             crate::log_slow_phase(
@@ -1677,44 +1737,23 @@ impl App {
     /// spawned (legacy single-process mode — `manifest_watch_rx`
     /// is `None`).
     pub fn drain_manifest_watch_events(&mut self) {
-        // Collect first so we can `&mut self` apply without
-        // holding the immutable `Receiver` borrow across the
-        // mutating call. mpsc::Receiver doesn't lend itself to
-        // splitting borrows; the drain → buffer → apply shape
-        // is the canonical Rust workaround.
-        let mut events: Vec<crate::manifest_watch::ManifestEvent> = Vec::new();
-        if let Some(rx) = self.manifest_watch_rx.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(ev) => events.push(ev),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // Consumer thread exited (App being
-                        // dropped, or the consumer hit its own
-                        // SendError exit path — though that
-                        // fires on OUR side dropping the rx, so
-                        // this branch is mostly "consumer died
-                        // for some reason"). Either way, no more
-                        // events incoming; stop draining.
-                        break;
-                    }
-                }
-            }
-        }
-        for ev in events {
-            match ev {
-                crate::manifest_watch::ManifestEvent::Diff { host, diff } => {
+        let deadline = Instant::now() + Duration::from_millis(4);
+        loop {
+            let event = self.manifest_watch_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            match event {
+                Some(crate::manifest_watch::ManifestEvent::Diff { host, diff }) => {
                     self.apply_manifest_diff_from_host(host, diff);
                 }
-                crate::manifest_watch::ManifestEvent::Snapshot(payload) => {
+                Some(crate::manifest_watch::ManifestEvent::Snapshot(payload)) => {
                     self.apply_manifest_snapshot(payload);
                 }
-                crate::manifest_watch::ManifestEvent::StreamEstablished {
-                    host,
-                } => {
+                Some(crate::manifest_watch::ManifestEvent::StreamEstablished { host }) => {
                     self.on_manifest_stream_established(host);
                 }
+                None => break,
             }
+            // Leave excess work in the channel, preserving order across ticks.
+            if Instant::now() >= deadline { break; }
         }
     }
 
@@ -1999,7 +2038,7 @@ impl App {
         );
         for (wi, uid) in prunes {
             let target = uid.clone();
-            self.tombstone_and_remove(wi, |ts| ts.uid == target);
+            self.tombstone_exited_and_remove(wi, |ts| ts.uid == target);
             self.close_agent_marker_if_empty(wi);
         }
         self.clamp_cursor();
@@ -2141,7 +2180,7 @@ impl App {
                     // persists the manifest. Re-clamp the cursor in case it
                     // sat on the removed row (the bulk helper doesn't).
                     let target = uid.clone();
-                    self.tombstone_and_remove(wi, |ts| ts.uid == target);
+                    self.tombstone_exited_and_remove(wi, |ts| ts.uid == target);
                     self.clamp_cursor();
                     // Kill-time close of an adoption-minted `agent:` marker
                     // that just lost its last session (user workspaces are
@@ -2340,6 +2379,23 @@ impl App {
                     existing.workflow_role = role;
                     self.needs_redraw = true;
                 }
+            }
+            return;
+        }
+
+        if self.attach_worker.is_some() {
+            if self.attaching.contains_key(uid)
+                || self.pending_remote_reattach.iter().any(|p| p.entry.uid == uid)
+            {
+                return;
+            }
+            let mut value = entry.clone();
+            value["session_uid"] = serde_json::json!(uid);
+            value["type"] = serde_json::json!(session_type);
+            if let Some(summary) = crate::client_session::parse_daemon_session_summary(&value) {
+                let manifest_entry = Self::manifest_entry_from_summary(&summary, host);
+                self.pending_remote_reattach.push(PendingRemoteReattach::new(ws_id, manifest_entry));
+                self.needs_redraw = true;
             }
             return;
         }
@@ -3670,6 +3726,51 @@ mod apply_manifest_diff_tests {
             entry: serde_json::json!({ "global_perms": false }),
         });
         assert!(!app.workspaces[0].sessions[0].global_perms, "revoke mirrored");
+    }
+
+    #[test]
+    fn pending_subtask_work_does_not_block_control_ping() {
+        use crate::control::protocol::{Caller, Request};
+        let mut app = build_app_with_session("ts-job");
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        app.subtask_flight = Some(SubtaskFlight {
+            pending: crate::control::queue::Pending {
+                request: Request { id: "slow".into(), method: "create_subtask".into(),
+                    caller: Caller::session("ts-job"), params: serde_json::json!({}) }, reply,
+            },
+            result: job_rx,
+        });
+        let ping = app.control_queue.submit(Request { id: "ping".into(), method: "ping".into(),
+            caller: Caller::session("ts-job"), params: serde_json::json!({}) });
+        let start = Instant::now();
+        app.drain_control_events();
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(ping.try_recv().unwrap().ok);
+        assert!(result.try_recv().is_err(), "slow work has not been acknowledged");
+        drop(job_tx);
+        app.drain_control_events();
+        assert!(!result.try_recv().unwrap().ok, "a failed worker returns an error");
+        assert!(app.subtask_flight.is_none());
+    }
+
+    #[test]
+    fn manifest_adoption_queues_once_without_dialing() {
+        let mut app = build_app_with_session("ts-existing");
+        app.attach_worker = Some(crate::attach_worker::AttachWorker::spawn(app.host_pool.clone()));
+        let host = cm_daemon::host_id::HostId::local();
+        let entry = serde_json::json!({
+            "workspace_id": app.workspaces[0].id, "workflow_run_id": "wf",
+            "workflow_role": "worker", "session_type": "claude-code", "label": "new",
+        });
+        let start = Instant::now();
+        app.adopt_daemon_workflow_participant_on_host(&host, "ts-new", &entry);
+        app.adopt_daemon_workflow_participant_on_host(&host, "ts-new", &entry);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(app.pending_remote_reattach.len(), 1);
+        assert_eq!(app.pending_remote_reattach[0].entry.uid, "ts-new");
+        assert_eq!(app.pending_remote_reattach[0].entry.workflow_role.as_deref(), Some("worker"));
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "no synchronous attach");
     }
 
     /// proper-resume: a transcript `Updated` from the daemon (the Stop

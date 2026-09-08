@@ -40,6 +40,7 @@ impl EventListener for EventProxy {
 
 /// A terminal session wrapping alacritty's Term + PTY + EventLoop.
 pub struct Session {
+    pub output_control: Option<crate::attach_writer::OutputControl>,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub sender: EventLoopSender,
     /// Direct fd to PTY master for low-latency input writes. `Some`
@@ -275,6 +276,7 @@ impl Session {
             daemon_transport_eof: None,
             // Local PTY session — no attach socket to watch for HUP.
             attach_hup_fd: None,
+            output_control: None,
         })
     }
 
@@ -301,8 +303,15 @@ impl Session {
     pub fn new_attached_existing(
         config: crate::client_session::ClientSessionConfig,
     ) -> anyhow::Result<Self> {
+        Self::new_attached_existing_with_context(config, false)
+    }
+
+    pub(crate) fn new_attached_existing_with_context(
+        config: crate::client_session::ClientSessionConfig,
+        restore_context: bool,
+    ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
-        let cs = crate::client_session::ClientSession::attach_existing(config)?;
+        let cs = crate::client_session::ClientSession::attach_existing_with_context(config, restore_context)?;
         let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
         Ok(Session {
             term: cs.term,
@@ -321,6 +330,7 @@ impl Session {
             // session triggers reconnect, not teardown.
             daemon_transport_eof: Some(cs.transport_eof),
             attach_hup_fd: cs.hup_fd,
+            output_control: cs.output_control,
         })
     }
 
@@ -373,6 +383,7 @@ impl Session {
             // session reconnects instead of tearing down.
             daemon_transport_eof: Some(cs.transport_eof),
             attach_hup_fd: cs.hup_fd,
+            output_control: cs.output_control,
         })
     }
 
