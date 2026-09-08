@@ -55,6 +55,10 @@ impl App {
         if !self.sessions_restored {
             return;
         }
+        if self.defer_manifest_save.get() {
+            self.manifest_save_pending.set(true);
+            return;
+        }
         let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
         for ws in &self.workspaces {
             let mut entries: Vec<ManifestEntry> = ws

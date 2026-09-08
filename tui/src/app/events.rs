@@ -1330,6 +1330,7 @@ impl App {
                         Err((code, message)) => { let _ = entry.reply.send(crate::control::protocol::Response::err(
                             entry.request.id, code, message)); }
                     }
+                    if Instant::now() >= deadline { break; }
                     continue;
                 }
             }
@@ -1737,6 +1738,7 @@ impl App {
     /// spawned (legacy single-process mode — `manifest_watch_rx`
     /// is `None`).
     pub fn drain_manifest_watch_events(&mut self) {
+        self.defer_manifest_save.set(true);
         let deadline = Instant::now() + Duration::from_millis(4);
         loop {
             let event = self.manifest_watch_rx.as_ref().and_then(|rx| rx.try_recv().ok());
@@ -1754,6 +1756,12 @@ impl App {
             }
             // Leave excess work in the channel, preserving order across ticks.
             if Instant::now() >= deadline { break; }
+        }
+        self.defer_manifest_save.set(false);
+        if self.manifest_save_pending.replace(false) {
+            // A reconnect sends many name/session diffs. Clone/serialize/fsync
+            // the full manifest once for this tick, with all applied changes.
+            self.save_session_manifest();
         }
     }
 

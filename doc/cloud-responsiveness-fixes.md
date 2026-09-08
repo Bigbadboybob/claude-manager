@@ -128,3 +128,20 @@ nice -n 10 scripts/cm-test-isolated
 ```
 
 Rollout measurements and verified host epochs are recorded below after deployment.
+
+
+### Final recovery check
+
+A socket-backpressure regression reproduced another pre-existing silent-stream
+failure: the daemon's outbound writer timed out and returned while its inbound
+socket clone remained open. The TUI consequently received neither data nor EOF.
+The daemon now shuts down both halves on an outbound write failure, and refuses
+to leave a stream open if its writer thread cannot start. The test fills a Unix
+socket's 4 KiB send buffer while the peer stays connected but unread; it failed
+before the fix and passes after it. All 37 stream tests passed afterward.
+
+Manifest-watch batches also coalesce saves: apply the queued changes, then
+clone/serialize/fsync the complete manifest once before returning to input.
+This avoids rewriting thousands of workspace rows once per name/session diff
+in a reconnect burst. Control-request success acknowledgments retain their
+synchronous save. The control budget also covers quickly rejected subtask calls.

@@ -284,6 +284,10 @@ pub struct App {
     /// pushes; the main loop pops + replies. See `tui/src/control/`.
     control_queue: crate::control::queue::Queue,
     subtask_flight: Option<events::SubtaskFlight>,
+    // Manifest-watch bursts persist their final state once before returning
+    // to input. Control-request acknowledgments keep synchronous persistence.
+    defer_manifest_save: std::cell::Cell<bool>,
+    manifest_save_pending: std::cell::Cell<bool>,
     /// Whether THIS TUI currently owns the control socket (`tui.sock`).
     /// False when another instance held it at bind time. Drives the
     /// degraded-mode banner in the status bar and gates the rebind retry.
@@ -876,6 +880,8 @@ impl App {
             mouse_capture_enabled: true,
             control_queue,
             subtask_flight: None,
+            defer_manifest_save: std::cell::Cell::new(false),
+            manifest_save_pending: std::cell::Cell::new(false),
             control_bound,
             control_conflict_pid,
             control_socket_path,

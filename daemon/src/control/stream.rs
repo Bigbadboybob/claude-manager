@@ -146,7 +146,8 @@ pub fn handle_attach_stream(
                 "cm-daemon: attach stream {} writer-thread spawn failed: {}",
                 session_uid, e,
             );
-            None
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
         }
     };
 
@@ -490,6 +491,10 @@ fn run_outbound(
                         "cm-daemon: attach stream {} outbound write error: {} (client disconnected)",
                         session_uid, e,
                     );
+                    // A write timeout does not close the peer's input half.
+                    // Explicitly wake both the inbound handler and the TUI.
+                    stop.store(true, Ordering::SeqCst);
+                    let _ = write_socket.shutdown(std::net::Shutdown::Both);
                     return;
                 }
             }
@@ -768,6 +773,33 @@ mod tests {
             last_exit: session.last_exit.clone(),
             request_id: request_id.to_string(),
         }
+    }
+
+    #[test]
+    fn outbound_write_timeout_closes_both_halves_and_signals_reconnect() {
+        use std::os::fd::AsRawFd;
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let size: libc::c_int = 4096;
+        assert_eq!(unsafe { libc::setsockopt(server.as_raw_fd(), libc::SOL_SOCKET,
+            libc::SO_SNDBUF, &size as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&size) as libc::socklen_t) }, 0);
+        server.set_write_timeout(Some(Duration::from_millis(50))).unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let writer = server.try_clone().unwrap();
+        let (tx, rx) = crate::attach_output::channel();
+        tx.push(&vec![b'x'; 64 * 1024]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || run_outbound(writer, rx, "request", "session",
+            worker_stop, Arc::new(crate::session::LastExitProbe::new("session".into(), None, 0))));
+        // Leave the peer unread so the writer exhausts the kernel send buffer.
+        worker.join().unwrap();
+        assert!(stop.load(Ordering::SeqCst), "writer failure must stop the connection");
+        assert_eq!(server.read(&mut [0]).unwrap(), 0, "inbound handler must wake");
+        let mut partial = Vec::new();
+        client.read_to_end(&mut partial).unwrap();
+        assert!(!partial.is_empty(), "test must exercise a partial frame write");
     }
 
     #[test]
