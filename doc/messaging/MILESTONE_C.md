@@ -1,9 +1,11 @@
 # Milestone C — shared machines and continuous-task continuity
 
-Status: implemented and validated on `cm/messaging-sync`, ready for review and
-an explicit rollout. Validation is recorded below.
-Implementation commit: `83c703b`. The deployed A/B release remains the live release. Owner requested an overnight build after
-a day of successful membership/mention use. This milestone implements the
+Status: merged to main, pushed and deployed locally and on cm-manager on
+September 8, 2026. Shared messaging is enabled, with cm-manager coordinating
+the preserved local space. Release commit: `28aa1ec`; live verification and
+session-preservation evidence are in [ROLLOUT_C.md](ROLLOUT_C.md).
+Owner requested an overnight build after a day of successful membership/mention
+use. This milestone implements the
 reviewed [sync design](SYNC.md), preserving the [v1 protocol](PROTOCOL.md).
 
 ## Implementation sequence and acceptance

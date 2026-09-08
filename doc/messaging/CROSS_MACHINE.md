@@ -5,6 +5,10 @@ without a sync configuration. The always-on `cm-manager` daemon is the intended
 coordinator. Implementation details and validation are recorded in
 [MILESTONE_C.md](MILESTONE_C.md); the stable contract is [PROTOCOL.md](PROTOCOL.md).
 
+The local and cm-manager hosts were enrolled on September 8, 2026. The cloud
+coordinates the preserved local space; verification is in
+[ROLLOUT_C.md](ROLLOUT_C.md). Other daemons still require explicit enrollment.
+
 ## Using an enrolled host
 
 Use the existing chat tools. Channels cut across repositories, projects, and all
@@ -139,7 +143,10 @@ its own deliberate migration; this procedure refuses to merge it silently.
    directory. Save the returned handoff ID and manifest checksum. Messaging writes
    are now paused and drafts are retained; session execution continues. If the
    response is lost, repeat the same preparation arguments. Copy the seed privately
-   to the destination; it includes private messages and Owner state.
+   to the destination; it includes private messages and Owner state. Prefer one
+   compressed archive streamed over SSH rather than copying thousands of files
+   individually. If transfer times out, resume transfer of the same seed and
+   retained checksum before installation; do not start a different handoff.
 4. Destination: `install_seed` with that directory and checksum. Retain the exact
    returned `destination_ack`. Installation verifies the seed before a journaled
    directory swap; a crash during the swap resumes from `messaging-install.json`.
