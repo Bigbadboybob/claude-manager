@@ -245,6 +245,8 @@ pub struct App {
     /// "fix my screen" escape hatch).
     pub force_clear: bool,
     input_mode: InputMode,
+    snapshot_store: agent_memory::SnapshotStore,
+    session_form_host: Option<cm_daemon::host_id::HostId>,
     start_time: Instant,
     sessions_restored: bool,
     /// Task→workspace bindings loaded from the manifest at startup. Consulted
@@ -867,6 +869,8 @@ impl App {
             needs_redraw: true,
             force_clear: false,
             input_mode: InputMode::Normal,
+            snapshot_store: agent_memory::SnapshotStore::Local,
+            session_form_host: None,
             start_time: Instant::now(),
             sessions_restored: false,
             manifest_bindings,

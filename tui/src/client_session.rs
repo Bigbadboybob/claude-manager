@@ -805,6 +805,9 @@ pub(crate) fn rpc_start_session_full(
 /// daemon resolves the repo + creates the worktree on its OWN filesystem
 /// and returns identity-only.
 pub(crate) struct CreateSessionResult {
+    pub resume_id: Option<String>,
+    pub main_repo_path: Option<String>,
+    pub branch: Option<String>,
     pub session_uid: String,
     pub worktree_path: String,
     pub workspace_id: String,
@@ -830,6 +833,27 @@ pub fn rpc_create_session(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<CreateSessionResult> {
+    rpc_create_session_with_options(daemon_socket, operator_token_id, uid, workspace_id,
+        label, engine, repo_url, start_branch, slug, task_id, cols, rows, false, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rpc_create_session_with_options(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    engine: &str,
+    repo_url: &str,
+    start_branch: Option<&str>,
+    slug: &str,
+    task_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+    in_place: bool,
+    seed_from: Option<&str>,
+) -> anyhow::Result<CreateSessionResult> {
     let mut params = serde_json::json!({
         "uid": uid,
         "workspace_id": workspace_id,
@@ -846,6 +870,12 @@ pub fn rpc_create_session(
     if let Some(tid) = task_id {
         params["task_id"] = serde_json::Value::String(tid.to_string());
     }
+    if let Some(name) = seed_from {
+        params["seed_from"] = serde_json::json!(name);
+    }
+    if in_place {
+        params["in_place"] = serde_json::json!(true);
+    }
     let req = Request {
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
@@ -853,8 +883,13 @@ pub fn rpc_create_session(
         params,
     };
     let resp = rpc_round_trip(daemon_socket, &req)?;
-    let result = resp.result.context("create_session response missing result")?;
+    let result = resp
+        .result
+        .context("create_session response missing result")?;
     Ok(CreateSessionResult {
+        resume_id: result["resume_id"].as_str().map(str::to_owned),
+        main_repo_path: result["main_repo_path"].as_str().map(str::to_owned),
+        branch: result["branch"].as_str().map(str::to_owned),
         session_uid: result["session_uid"]
             .as_str()
             .context("create_session result missing session_uid")?
@@ -874,6 +909,7 @@ pub fn rpc_create_session(
 
 /// `add_session` response (remote-session-execution Phase 1/3).
 pub(crate) struct AddSessionResult {
+    pub resume_id: Option<String>,
     pub session_uid: String,
     pub worktree_path: String,
 }
@@ -894,6 +930,35 @@ pub fn rpc_add_session(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<AddSessionResult> {
+    rpc_add_session_with_resume(
+        daemon_socket,
+        operator_token_id,
+        uid,
+        workspace_id,
+        label,
+        engine,
+        task_id,
+        cols,
+        rows,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rpc_add_session_with_resume(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    engine: &str,
+    task_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+    resume_id: Option<&str>,
+    seed_from: Option<&str>,
+) -> anyhow::Result<AddSessionResult> {
     let mut params = serde_json::json!({
         "uid": uid,
         "workspace_id": workspace_id,
@@ -905,6 +970,12 @@ pub fn rpc_add_session(
     if let Some(tid) = task_id {
         params["task_id"] = serde_json::Value::String(tid.to_string());
     }
+    if let Some(name) = seed_from {
+        params["seed_from"] = serde_json::json!(name);
+    }
+    if let Some(id) = resume_id {
+        params["resume_id"] = serde_json::json!(id);
+    }
     let req = Request {
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
@@ -914,6 +985,7 @@ pub fn rpc_add_session(
     let resp = rpc_round_trip(daemon_socket, &req)?;
     let result = resp.result.context("add_session response missing result")?;
     Ok(AddSessionResult {
+        resume_id: result["resume_id"].as_str().map(str::to_owned),
         session_uid: result["session_uid"]
             .as_str()
             .context("add_session result missing session_uid")?
@@ -3835,6 +3907,42 @@ mod tests {
     }
 
     // --- Initial PTY size plumbing (slice-10c-e-2 review-3 fix) -----------
+
+    #[test]
+    fn remote_launch_wire_preserves_seed_resume_and_in_place() {
+        use cm_daemon::control::{wire, protocol::Response};
+        use std::os::unix::net::UnixListener;
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("launch.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = wire::read_request(&mut stream).unwrap().unwrap();
+                wire::write_response(&mut stream, &Response::ok(req.id.clone(), serde_json::json!({
+                    "session_uid": "ts-abcd-0", "workspace_id":"ws-test", "worktree_path":"/remote/worktree",
+                    "resume_id":"conversation-id", "main_repo_path":"/remote/repo", "branch":"main"
+                }))).unwrap();
+                requests.push(req);
+            }
+            requests
+        });
+        let created = rpc_create_session_with_options(&socket, "op-test", "ts-abcd-0", "ws-test", "agent",
+            "claude-code", "repo", None, "label", None, 100, 30, true, Some("reviewer")).unwrap();
+        assert_eq!(created.main_repo_path.as_deref(), Some("/remote/repo"));
+        assert_eq!(created.resume_id.as_deref(), Some("conversation-id"));
+        let added = rpc_add_session_with_resume(&socket, "op-test", "ts-abcd-0", "ws-test", "agent",
+            "claude-code", None, 100, 30, Some("conversation-id"), None).unwrap();
+        assert_eq!(added.resume_id.as_deref(), Some("conversation-id"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].method, "create_session");
+        assert_eq!(requests[0].params["in_place"], true);
+        assert_eq!(requests[0].params["seed_from"], "reviewer");
+        assert_eq!(requests[1].method, "add_session");
+        assert_eq!(requests[1].params["resume_id"], "conversation-id");
+        assert!(requests.iter().all(|r| r.params.get("argv").is_none() && r.params.get("env").is_none()));
+    }
 
     #[test]
     fn rpc_start_session_request_carries_cols_and_rows() {

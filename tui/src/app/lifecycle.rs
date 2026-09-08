@@ -1,4 +1,4 @@
-//! Session + workspace lifecycle: daemon spawn/attach plumbing, create/close/tombstone, planning launch, push/pull, daemon state pushes.
+//! Session + workspace lifecycle: daemon spawn/attach plumbing, create/close/tombstone, planning launch, daemon state pushes.
 
 use super::*;
 
@@ -1202,7 +1202,7 @@ impl App {
             // rather than a global mode the operator has to remember to set —
             // the global active_host is retired (DESIGN_REMOVE_GLOBAL_HOST.md).
             // ←/→ on the host field still picks any configured host per-task.
-            host_id: cm_daemon::host_id::HostId::local(),
+            host_id: self.default_launch_host(),
             active_field: 0,
         };
     }
@@ -1218,20 +1218,13 @@ impl App {
                 return;
             }
         };
-        // A push in flight will tombstone every live session on the
-        // workspace when `PushComplete` lands, so a session added now
-        // would silently disappear seconds later — confusing enough
-        // that we bounce the user with an explicit message instead.
-        if self.workspaces[wi].is_pushing {
-            self.set_status_msg("Workspace is being pushed to cloud, retry after");
-            return;
-        }
         let task_id = self.cursor_task_id();
         // Capture workspace_id (stable) instead of the index — backend
         // events fired while the form is open can reorder workspaces,
         // and a stored index would silently target the wrong workspace
         // by submit time.
         let workspace_id = self.workspaces[wi].id.clone();
+        self.session_form_host = Some(self.workspaces[wi].host_id.clone());
         self.input_mode = InputMode::NewTerminalSession {
             workspace_id,
             session_type: LaunchEngine::default().as_session_type().to_string(),
@@ -2086,7 +2079,6 @@ impl App {
             host_id: active_host.clone(),
             sessions: vec![ts],
             tombstones: Vec::new(),
-            is_pushing: false,
         };
         let new_wi = self.workspaces.len();
         let new_ws_id = ws.id.clone();
@@ -2128,10 +2120,7 @@ impl App {
     /// `try_attach_via_daemon_with_deps` and builds a `TerminalSession`
     /// pinned to that host.
     ///
-    /// `in_place` and `seed_from` are rejected up front (Non-goals): both
-    /// need cross-host machinery (spawning in the repo root / materializing
-    /// + resuming a snapshot on the remote) out of scope here. Rejected with
-    /// a status message and NO RPC — never silently downgraded.
+    /// In-place work and snapshot materialization are resolved by the host.
     fn create_remote_session(
         &mut self,
         host: &cm_daemon::host_id::HostId,
@@ -2143,20 +2132,6 @@ impl App {
         seed_from: Option<&str>,
         in_place: bool,
     ) {
-        // Non-goals: reject (no RPC) before any work.
-        if in_place {
-            self.set_status_msg(
-                "Remote A-n: in-place (repo-root) sessions aren't supported on a remote host",
-            );
-            return;
-        }
-        if seed_from.is_some() {
-            self.set_status_msg(
-                "Remote A-n: seeding from a snapshot isn't supported on a remote host",
-            );
-            return;
-        }
-
         let slug = worktree::slugify(label);
         if slug.is_empty() {
             self.set_status_msg("Invalid name");
@@ -2194,7 +2169,7 @@ impl App {
             LaunchEngine::Codex => "codex",
         };
         // The daemon resolves repo → worktree → argv/env. A-n is taskless.
-        let res = match crate::client_session::rpc_create_session(
+        let res = match crate::client_session::rpc_create_session_with_options(
             &socket,
             op_token,
             &session_uid,
@@ -2207,6 +2182,8 @@ impl App {
             None,
             cols,
             rows,
+            in_place,
+            seed_from,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -2264,7 +2241,7 @@ impl App {
             status: SessionStatus::Running,
             idle_since: None,
             last_write_at: None,
-            transcript_id: None,
+            transcript_id: if session_type == "claude" { res.resume_id } else { None },
             generation: 0,
             // Remote: the worktree lives on the daemon's filesystem, so the
             // TUI can't run local JSONL detection. Transcript-path resolution
@@ -2286,7 +2263,7 @@ impl App {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
-            seeded_from_snapshot: None,
+            seeded_from_snapshot: seed_from.map(str::to_owned),
             preserved_last_exit: None,
             host_id: host.clone(),
         };
@@ -2301,13 +2278,12 @@ impl App {
             worktree_path: Some(worktree_path),
             // The main checkout lives on the remote host; there is no local
             // main repo path for a remote workspace.
-            main_repo_path: None,
+            main_repo_path: res.main_repo_path.map(PathBuf::from),
             worker_vm: None,
             worker_zone: None,
             host_id: host.clone(),
             sessions: vec![ts],
             tombstones: Vec::new(),
-            is_pushing: false,
         };
         let new_wi = self.workspaces.len();
         let new_ws_id = ws.id.clone();
@@ -2817,7 +2793,6 @@ impl App {
                     host_id: cm_daemon::host_id::HostId::local(),
                     sessions: vec![],
                     tombstones: Vec::new(),
-                    is_pushing: false,
                 };
                 self.workspaces.push(ws);
                 self.workspaces.len() - 1
@@ -2909,11 +2884,7 @@ impl App {
         // global active_host (which only seeds NEW workspaces). Remote spawns
         // from the TUI aren't supported yet (doc/remote-session-execution.md);
         // guard with a clear message rather than mistag/misroute.
-        let spawn_host = self.workspaces[ws_index]
-            .sessions
-            .first()
-            .map(|s| s.host_id.clone())
-            .unwrap_or_else(|| crate::hosts::HostId::local());
+        let spawn_host = self.workspaces[ws_index].sessions.first().map(|session| session.host_id.clone()).unwrap_or_else(|| self.workspaces[ws_index].host_id.clone());
         // Phase 3 (remote-session-execution): a remote-hosted workspace routes
         // A-s to the daemon-resolved `add_session` path (reuses the remote
         // worktree). Local A-s runs the existing path below, unchanged (it
@@ -2925,6 +2896,7 @@ impl App {
                 session_type,
                 task_id,
                 seed_from,
+                resume_from,
             );
             return;
         }
@@ -3132,9 +3104,7 @@ impl App {
     /// the daemon looks up the workspace's worktree), then attaches over the
     /// host's socket and builds a `TerminalSession` pinned to that host.
     ///
-    /// `seed_from` is rejected up front (Non-goals): resuming an agent-memory
-    /// snapshot on a remote host needs cross-host materialization out of
-    /// scope here. Rejected with a status message and NO RPC.
+    /// Snapshot seeding and transcript resumes use files on this host.
     pub(super) fn add_remote_session(
         &mut self,
         host: &cm_daemon::host_id::HostId,
@@ -3142,14 +3112,8 @@ impl App {
         session_type: &str,
         task_id: Option<String>,
         seed_from: Option<&str>,
+        resume_from: Option<&str>,
     ) {
-        if seed_from.is_some() {
-            self.set_status_msg(
-                "Remote A-s: seeding from a snapshot isn't supported on a remote host",
-            );
-            return;
-        }
-
         let socket = match self
             .host_pool
             .for_host(host)
@@ -3177,7 +3141,7 @@ impl App {
             other => other,
         };
 
-        let res = match crate::client_session::rpc_add_session(
+        let res = match crate::client_session::rpc_add_session_with_resume(
             &socket,
             op_token,
             &session_uid,
@@ -3187,6 +3151,8 @@ impl App {
             task_id.as_deref(),
             cols,
             rows,
+            resume_from,
+            seed_from,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3242,178 +3208,14 @@ impl App {
             None,
         );
         ts.task_id = task_id;
+        ts.transcript_id = if session_type == "claude" || seed_from.is_none() { res.resume_id } else { None };
+        ts.seeded_from_snapshot = seed_from.map(str::to_owned);
         ts.host_id = host.clone();
         let si = self.workspaces[ws_index].sessions.len();
         self.workspaces[ws_index].sessions.push(ts);
         self.cursor = Cursor::Session(ws_index, si);
         self.save_session_manifest();
         self.set_status_msg(&format!("Started {} session on `{}`", session_type, host.as_str()));
-    }
-
-    /// Spawn a local claude --resume session after a pull completes.
-    pub(super) fn spawn_resumed_session(
-        &mut self,
-        task_id: Option<String>,
-        worktree_path: PathBuf,
-        main_repo: PathBuf,
-        session_id: String,
-        repo_url: String,
-        prompt: String,
-    ) {
-        let (cols, rows) = self.last_term_size;
-        // migrate-tui-local Issue B: cloud-pull A-l always
-        // materializes the resumed workspace from a locally-
-        // pulled worktree onto the local filesystem. Pin the
-        // host snapshot to `HostId::local()` — NOT
-        // `self.active_host` — so a concurrent A-H cycle between
-        // pull-start and PullComplete can't send the local
-        // filesystem path to a remote daemon (and tag the new
-        // workspace with the wrong host_id).
-        let host_snapshot = cm_daemon::host_id::HostId::local();
-        let workspace_id_pre = new_workspace_id();
-        // Pre-generate the session UID so the per-session MCP config
-        // bakes the matching CM_TUI_SESSION_ID. Without this, a pulled
-        // session can spawn but its agent has no MCP config and any
-        // tool call would fail auth as `not_found`.
-        let session_uid = new_session_uid();
-
-        // migrate-tui-local: route the resume through
-        // `try_spawn_via_daemon` with `--resume <session_id>`
-        // threaded as `resume_session_id`. The daemon then spawns
-        // `claude --resume <id>` and registers the session in
-        // `state.sessions` with the resumed transcript bound at
-        // spawn time — no post-spawn `/resume` workaround.
-        //
-        // migrate-tui-local Issue 3: we already know the
-        // transcript_id (session_id) AND the worktree, so the
-        // claude transcript path is deterministic — hand it to
-        // the daemon up front so `resolve_authorized_session`
-        // resolves immediately for MCP `read_session_output`.
-        let pre_spawn_transcript =
-            pre_spawn_transcript_path("claude", &worktree_path, session_id.as_str());
-        let new_sess = match self.try_spawn_via_daemon(
-            &session_uid,
-            &workspace_id_pre,
-            &worktree_path,
-            "claude",
-            "claude",
-            Some(session_id.as_str()),
-            cols,
-            rows,
-            task_id.as_deref(),
-            None,
-            None,
-            &host_snapshot,
-            pre_spawn_transcript.as_deref(),
-            false, // global_perms
-        ) {
-            Some(Ok(s)) => s,
-            Some(Err(e)) => {
-                self.set_status_msg(&format!("Resume (daemon spawn): {}", e));
-                return;
-            }
-            None => {
-                self.set_status_msg(
-                    "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
-                );
-                return;
-            }
-        };
-
-        {
-            let mut ts = make_simple_session_with_uid(
-                session_uid,
-                "claude",
-                "claude",
-                new_sess,
-                None,
-            );
-            ts.transcript_id = Some(session_id.clone());
-            ts.task_id = task_id.clone();
-            // migrate-tui-local Issue B: tag with the local host
-            // snapshot (same value used in the daemon dial above).
-            // A concurrent A-H cycle MUST NOT influence the new
-            // local workspace's host_id.
-            ts.host_id = host_snapshot.clone();
-
-                // If we have a task_id, find the TaskEntry and its (cloud)
-                // workspace; replace that workspace with a local one.
-                let target_ti = task_id
-                    .as_ref()
-                    .and_then(|id| {
-                        self.tasks
-                            .iter()
-                            .position(|t| t.task_id.as_deref() == Some(id))
-                    });
-
-            // migrate-tui-local: workspace id was pre-generated
-            // above so the daemon auto-registered it on
-            // start_session; carry the same value through here.
-            let local_ws = Workspace {
-                color: None,
-                pinned: false,
-                id: workspace_id_pre,
-                name: task_id
-                    .as_deref()
-                    .and_then(|id| {
-                        self.tasks
-                            .iter()
-                            .find(|t| t.task_id.as_deref() == Some(id))
-                            .map(|t| t.name.clone())
-                    })
-                    .unwrap_or_else(|| prompt.chars().take(60).collect()),
-                is_closed: false,
-                is_cloud: false,
-                repo_url: Some(repo_url.clone()),
-                worktree_path: Some(worktree_path.clone()),
-                main_repo_path: Some(main_repo.clone()),
-                worker_vm: None,
-                worker_zone: None,
-                // The cloud-pull replacement worktree is always local.
-                host_id: cm_daemon::host_id::HostId::local(),
-                sessions: vec![ts],
-                tombstones: Vec::new(),
-                is_pushing: false,
-            };
-            let ws_id = local_ws.id.clone();
-
-            if let Some(ti) = target_ti {
-                // Remove the old (cloud) workspace if one was linked.
-                if let Some(old_id) = self.tasks[ti].workspace_id.clone() {
-                    self.workspaces.retain(|w| w.id != old_id);
-                }
-                self.tasks[ti].is_cloud = false;
-                self.tasks[ti].session_id = Some(session_id);
-                self.tasks[ti].workspace_id = Some(ws_id.clone());
-            } else {
-                // No matching task — create one.
-                self.tasks.push(TaskEntry {
-                    task_id,
-                    name: local_ws.name.clone(),
-                    api_status: TaskStatus::Running,
-                    repo_url: Some(repo_url),
-                    prompt: Some(prompt),
-                    wip_branch: None,
-                    session_id: Some(session_id),
-                    blocked_at: None,
-                    is_cloud: false,
-                    is_continuous: false,
-                    workspace_id: Some(ws_id.clone()),
-                    project: None,
-                    parent_task_id: None,
-                    worktree_mode: WorktreeMode::Inherit,
-                    metadata: None,
-                });
-            }
-            self.workspaces.push(local_ws);
-            let new_wi = self.workspaces.len() - 1;
-            self.cursor = Cursor::Session(new_wi, 0);
-            self.save_session_manifest();
-            // Sub-2a Finding #1: a resume_locally may have
-            // inserted a new TaskEntry above.
-            self.push_state_to_daemon();
-            self.set_status_msg("Resumed locally");
-        }
     }
 
     /// Mark the first task bound to the active workspace as done via the API.
@@ -3812,142 +3614,6 @@ impl App {
         self.set_status_msg("Deleted");
     }
 
-    /// Push the active local workspace to the cloud. If a task is bound to
-    /// the workspace, its id is included so the cloud side can reuse it;
-    /// otherwise a new cloud task is created from the workspace's name.
-    ///
-    /// **Invariant**: this function does NOT mutate local workspace state
-    /// (no tombstones, no clearing `worktree_path`, no flipping
-    /// `is_cloud`). All destructive cleanup is deferred to
-    /// `BackendEvent::PushComplete` in `drain_backend_events`. A failed
-    /// push (`PushFailed`) just clears `is_pushing` and surfaces the
-    /// error — the user can retry without reconstructing the worktree.
-    pub(super) fn push_active(&mut self) {
-        let Some(wi) = self.active_workspace_index() else {
-            return;
-        };
-        if self.workspaces[wi].is_cloud {
-            self.set_status_msg("Can only push local workspaces");
-            return;
-        }
-        if self.workspaces[wi].is_pushing {
-            self.set_status_msg("Push already in progress");
-            return;
-        }
-        // In-place workspaces have no dedicated worktree to upload — their
-        // path IS the main repo. Pushing would convert the main checkout
-        // into a cloud workspace (clearing the local row), which is
-        // confusing and almost never intended. Block it explicitly.
-        if self.workspaces[wi].is_in_place() {
-            self.set_status_msg("Can't push an in-place workspace (no worktree to upload)");
-            return;
-        }
-        let worktree_path = match &self.workspaces[wi].worktree_path {
-            Some(p) => p.clone(),
-            None => {
-                self.set_status_msg("No worktree to push");
-                return;
-            }
-        };
-        let repo_url = match &self.workspaces[wi].repo_url {
-            Some(u) => u.clone(),
-            None => {
-                self.set_status_msg("No repo URL");
-                return;
-            }
-        };
-        let ws_id = self.workspaces[wi].id.clone();
-        let ws_name = self.workspaces[wi].name.clone();
-        let first = self.first_task_for_ws(&ws_id);
-        let name = first.and_then(|t| t.prompt.clone()).unwrap_or(ws_name);
-        let task_id = first.and_then(|t| t.task_id.clone());
-
-        self.workspaces[wi].is_pushing = true;
-        self.backend.push(worktree_path, repo_url, name, task_id, ws_id);
-        self.cursor = Cursor::Workspace(wi);
-        self.set_status_msg("Pushing to cloud...");
-    }
-
-    /// Apply the destructive local-cleanup half of a push, gated on a
-    /// `PushComplete` event from the backend. Tombstones live sessions,
-    /// drops `worktree_path`, flips `is_cloud` on the workspace and any
-    /// bound task, and persists the new state. If `cloud_task_id` was
-    /// returned (always set for now, but kept Optional in the event),
-    /// no extra task binding work is done — `do_refresh` will pull the
-    /// authoritative cloud row in the next refresh tick.
-    pub(super) fn finish_push(&mut self, workspace_id: &str, _cloud_task_id: Option<String>) {
-        let Some(wi) = self.workspaces.iter().position(|w| w.id == workspace_id) else {
-            return;
-        };
-        // Tombstone first — the helper saves the manifest with each
-        // tombstone's `worktree_path` snapshotted at the current value.
-        // We then mutate workspace + task state and save AGAIN so the
-        // post-push state (no worktree, is_cloud=true) is durable too.
-        // Without the second save, a crash here would leave the manifest
-        // with valid tombstones but the workspace still flagged local
-        // with a stale `worktree_path` — the worst kind of half-state
-        // because it looks valid on restart.
-        self.tombstone_and_remove(wi, |_| true);
-        let ws_id = self.workspaces[wi].id.clone();
-        self.workspaces[wi].worktree_path = None;
-        self.workspaces[wi].is_cloud = true;
-        self.workspaces[wi].is_pushing = false;
-        if let Some(task) = self
-            .tasks
-            .iter_mut()
-            .find(|t| t.workspace_id.as_deref() == Some(&ws_id))
-        {
-            task.is_cloud = true;
-        }
-        self.save_session_manifest();
-        // Sub-2b-3 review-5 #2: push the cleared worktree_path
-        // to the daemon. Without this, the daemon retains the
-        // stale local path until the next reconcile_tasks
-        // (which could be seconds later, or never if the API
-        // isn't refreshing), and a concurrent `mcp_start_session`
-        // would spawn into the deleted worktree.
-        self.push_state_to_daemon();
-    }
-
-    /// Pull the active cloud workspace to local (uses the first bound task).
-    pub(super) fn pull_active(&mut self) {
-        let Some(wi) = self.active_workspace_index() else {
-            return;
-        };
-        let ws_id = self.workspaces[wi].id.clone();
-        let Some(task) = self
-            .tasks
-            .iter()
-            .find(|t| t.workspace_id.as_deref() == Some(&ws_id))
-        else {
-            self.set_status_msg("No task bound to pull");
-            return;
-        };
-        let task_id = match task.task_id.clone() {
-            Some(id) => id,
-            None => {
-                self.set_status_msg("Task has no id");
-                return;
-            }
-        };
-        let repo_url = match task.repo_url.clone() {
-            Some(u) => u,
-            None => {
-                self.set_status_msg("No repo URL on task");
-                return;
-            }
-        };
-        let main_repo = match worktree::find_local_repo(&repo_url) {
-            Some(p) => p,
-            None => {
-                self.set_status_msg("Repo not found locally");
-                return;
-            }
-        };
-        self.backend.pull(task_id, main_repo);
-        self.set_status_msg("Pulling to local...");
-    }
-
     /// Launch a task from the planning view.
     pub(super) fn launch_from_plan(
         &mut self,
@@ -3973,20 +3639,9 @@ impl App {
         // "codex" in the UI; never "bash" (a planning launch always
         // delivers the task prompt to an agent).
         engine: &str,
+        chosen_host: &cm_daemon::host_id::HostId,
     ) {
-        // Planning A-l creates a local worktree + spawns a session into it, so
-        // the host is local (the global active_host is retired —
-        // DESIGN_REMOVE_GLOBAL_HOST.md). The guard is now a structural
-        // invariant (always local) kept for symmetry with the other spawn
-        // paths until remote TUI-launch lands.
-        let active_host = cm_daemon::host_id::HostId::local();
-        if let Err(e) = guard_local_host_only(
-            &active_host,
-            "A-l launch-from-plan",
-        ) {
-            self.set_status_msg(&format!("{}", e));
-            return;
-        }
+        let active_host = chosen_host.clone();
         let repo_url = match self.config.repos.get(project) {
             Some(url) => url.clone(),
             None => {
@@ -3995,6 +3650,11 @@ impl App {
             }
         };
 
+        let session_uid = new_session_uid();
+        let workspace_id_pre = new_workspace_id();
+        let (cols, rows) = self.last_term_size;
+        let (main_repo, worktree_path, new_sess, pending, remote_branch) =
+            if active_host == cm_daemon::host_id::HostId::local() {
         let main_repo = match worktree::find_local_repo(&repo_url) {
             Some(p) => p,
             None => {
@@ -4023,14 +3683,14 @@ impl App {
             worktree::setup_worktree(&main_repo, &worktree_path);
         }
 
-        let (cols, rows) = self.last_term_size;
+
         // migrate-tui-local: pre-generate UID + workspace id so the
         // daemon can auto-register the workspace at start_session.
         // Route the spawn through the daemon RPC so the planning-
         // launched agent's session lands in state.sessions, not
         // state.tui_sessions.
-        let session_uid = new_session_uid();
-        let workspace_id_pre = new_workspace_id();
+
+
         // Transcript-detection baseline is engine-specific: Claude writes
         // ~/.claude/projects/<encoded>/*.jsonl, Codex ~/.codex/sessions/…
         // Taking the wrong one leaves the session without a transcript id.
@@ -4072,6 +3732,36 @@ impl App {
             }
         };
 
+                (Some(main_repo), worktree_path, new_sess, Some(pending), None)
+            } else {
+                let socket = match self.host_pool.live_socket_path(&active_host) {
+                    Some(path) => path,
+                    None => { self.set_status_msg(&format!("Host `{}` is unavailable", active_host)); return; }
+                };
+                let token = self.host_pool.operator_token_for(&active_host);
+                let result = match crate::client_session::rpc_create_session_with_options(
+                    &socket, &token, &session_uid, &workspace_id_pre, slug,
+                    if engine == "claude" { "claude-code" } else { engine },
+                    &repo_url, start_branch, slug, Some(task_id), cols, rows, in_place, None,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => { self.set_status_msg(&format!("Launch on {}: {}", active_host, e)); return; }
+                };
+                let path = PathBuf::from(&result.worktree_path);
+                let session = match try_attach_via_daemon_with_deps(
+                    &self.host_pool, &session_uid, &workspace_id_pre, &path, engine, slug,
+                    cols, rows, Some(task_id), None, None, &active_host, None,
+                ) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        // A failed viewer attach must not orphan the just-created agent.
+                        let _ = crate::client_session::rpc_kill_session(&socket, &token, &session_uid);
+                        self.set_status_msg(&format!("Attach: {}", e)); return;
+                    }
+                };
+                (result.main_repo_path.map(PathBuf::from), path, session, None, result.branch)
+            };
+
         // For a normal launch the WIP branch is the freshly-created
         // `cm/<slug>`. For in-place there's no new branch — record the main
         // repo's ACTUAL current branch (e.g. `main`), or `None` on detached
@@ -4079,7 +3769,9 @@ impl App {
         // returns `None` for it and reconcile can't mis-map an in-place task
         // onto a `<repo>-<slug>` worktree dir.
         let branch: Option<String> = if in_place {
-            worktree::worktree_current_branch(&main_repo)
+            if active_host == cm_daemon::host_id::HostId::local() {
+                main_repo.as_deref().and_then(worktree::worktree_current_branch)
+            } else { remote_branch }
         } else {
             Some(format!("cm/{}", slug))
         };
@@ -4088,7 +3780,7 @@ impl App {
             slug,
             engine,
             new_sess,
-            Some(pending),
+            pending,
         );
         ts.task_id = Some(task_id.to_string());
         ts.host_id = active_host.clone();
@@ -4111,14 +3803,13 @@ impl App {
             is_cloud: false,
             repo_url: Some(repo_url.clone()),
             worktree_path: Some(worktree_path),
-            main_repo_path: Some(main_repo),
+            main_repo_path: main_repo,
             worker_vm: None,
             worker_zone: None,
             // Same host the subtask session was spawned on.
             host_id: active_host.clone(),
             sessions: vec![ts],
             tombstones: Vec::new(),
-            is_pushing: false,
         };
         let ws_id = ws.id.clone();
         self.workspaces.push(ws);
@@ -4196,6 +3887,73 @@ impl App {
 
     /// Open workspaces the planning picker can target. Skips closed workspaces
     /// and cloud workspaces (those have no worktree to share).
+    /// Explicit cross-host launches create a separate checkout and session.
+    /// No files, task binding, or running conversation are moved by this action.
+    pub(super) fn new_workspace_on_host(&mut self, source_id: &str, host: &cm_daemon::host_id::HostId, engine: &str, seed_from: Option<&str>) -> Option<String> {
+        let source = self.workspaces.iter().find(|ws| ws.id == source_id)?;
+        let Some(repo) = source.repo_url.clone() else {
+            self.set_status_msg("Workspace has no repository configured"); return None;
+        };
+        let name = format!("{}-{}", source.name, host);
+        let section = self.workspace_sections.get(source_id).cloned();
+        let uid = new_session_uid();
+        let ws_id = new_workspace_id();
+        let slug = format!("{}-{}", worktree::slugify(&name), ws_id.trim_start_matches("ws-"));
+        let Some(socket) = self.host_pool.live_socket_path(host) else {
+            self.set_status_msg(&format!("Host `{}` is unavailable", host)); return None;
+        };
+        let token = self.host_pool.operator_token_for(host);
+        let (cols, rows) = self.last_term_size;
+        let result = match crate::client_session::rpc_create_session_with_options(&socket, &token,
+            &uid, &ws_id, engine, if engine == "claude" { "claude-code" } else { engine },
+            &repo, None, &slug, None, cols, rows, false, seed_from) {
+            Ok(result) => result,
+            Err(e) => { self.set_status_msg(&format!("New workspace: {}", e)); return None; }
+        };
+        let path = PathBuf::from(&result.worktree_path);
+        let session = match try_attach_via_daemon_with_deps(&self.host_pool, &uid, &ws_id,
+            &path, engine, engine, cols, rows, None, None, None, host, None) {
+            Ok(session) => session,
+            Err(e) => {
+                let _ = crate::client_session::rpc_kill_session(&socket, &token, &uid);
+                self.set_status_msg(&format!("Attach: {}", e)); return None;
+            }
+        };
+        let mut ts = make_simple_session_with_uid(uid, engine, engine, session, None);
+        ts.host_id = host.clone();
+        ts.seeded_from_snapshot = seed_from.map(str::to_owned);
+        if engine == "claude" { ts.transcript_id = result.resume_id; }
+        let wi = self.workspaces.len();
+        self.workspaces.push(Workspace {
+            id: ws_id.clone(), name, color: None, pinned: false, is_closed: false,
+            is_cloud: false, repo_url: Some(repo), worktree_path: Some(path),
+            main_repo_path: result.main_repo_path.map(PathBuf::from), worker_vm: None,
+            worker_zone: None, host_id: host.clone(), sessions: vec![ts], tombstones: vec![],
+        });
+        if let Some(section) = section { self.workspace_sections.insert(ws_id.clone(), section); }
+        self.cursor = Cursor::Session(wi, 0);
+        self.save_session_manifest();
+        self.set_status_msg(&format!("Created new workspace on {}", host));
+        Some(ws_id)
+    }
+
+    pub(super) fn alternate_form_host(&self, workspace_id: &str) -> Option<cm_daemon::host_id::HostId> {
+        let chosen = self.session_form_host.as_ref()?;
+        let ws = self.workspaces.iter().find(|ws| ws.id == workspace_id)?;
+        (chosen != &ws.host_id).then(|| chosen.clone())
+    }
+
+    pub(super) fn form_host_label(&self, workspace_id: &str) -> String {
+        let host = self.session_form_host.as_ref().or_else(|| self.workspaces.iter()
+            .find(|ws| ws.id == workspace_id).map(|ws| &ws.host_id));
+        format!("Host: {}{} (Alt+h)", host.map(|h| h.as_str()).unwrap_or("?"),
+            if self.alternate_form_host(workspace_id).is_some() { " · new workspace" } else { "" })
+    }
+
+    pub(super) fn default_launch_host(&self) -> cm_daemon::host_id::HostId {
+        self.hosts.default_host().expect("validated hosts config").id.clone()
+    }
+
     pub(super) fn collect_workspace_candidates(&self) -> Vec<WorkspaceCandidate> {
         self.workspaces
             .iter()
@@ -4493,7 +4251,6 @@ impl App {
                     host_id: cm_daemon::host_id::HostId::local(),
                     sessions: vec![],
                     tombstones: Vec::new(),
-                    is_pushing: false,
                 };
                 let new_ws_id = ws.id.clone();
                 self.workspaces.push(ws);
@@ -4739,10 +4496,7 @@ mod slice_12e_tests {
     // `launch_into_workspace_guards_on_workspace_host_not_global` and
     // `a_n_form_defaults_host_to_local`.)
 
-    /// Global-host removal: `start_new_session` seeds the form's `host_id` to
-    /// `local` — the overwhelmingly common case — rather than a global mode the
-    /// operator must remember to set. A non-local host is a per-task pick via
-    /// ←/→ on the host field.
+    /// An explicitly configured local default remains supported.
     #[test]
     fn a_n_form_defaults_host_to_local() {
         let guard = crate::test_support::home_lock();
@@ -4766,6 +4520,34 @@ mod slice_12e_tests {
             }
             _ => panic!("expected NewSession form open"),
         }
+    }
+
+    #[test]
+    fn cloud_default_and_existing_workspace_host_choices_are_independent() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(&[("local", false), ("manager", true)], &guard);
+        app.config.repos.insert("r".into(), "https://github.com/a/b".into());
+        app.start_new_session();
+        assert!(matches!(&app.input_mode, InputMode::NewSession { host_id, .. } if *host_id == HostId::new("manager")));
+        app.workspaces.push(Workspace {
+            id:"ws-remote".into(), name:"remote".into(), color:None, pinned:false, is_closed:false, is_cloud:false,
+            repo_url:Some("https://github.com/a/b".into()), worktree_path:Some(PathBuf::from("/remote/worktree")),
+            main_repo_path:None, worker_vm:None, worker_zone:None, host_id:HostId::new("manager"),
+            sessions:vec![], tombstones:vec![],
+        });
+        app.cursor = Cursor::Workspace(0);
+        app.start_new_terminal_session();
+        assert_eq!(app.session_form_host, Some(HostId::new("manager")));
+        assert!(app.alternate_form_host("ws-remote").is_none());
+        if let InputMode::NewTerminalSession { seed_from, resume_from, .. } = &mut app.input_mode {
+            *seed_from = Some("snapshot".into()); *resume_from = Some("conversation".into());
+        }
+        app.handle_input_event(&CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)));
+        assert_eq!(app.alternate_form_host("ws-remote"), Some(HostId::local()));
+        assert!(app.form_host_label("ws-remote").contains("new workspace"));
+        assert!(matches!(&app.input_mode, InputMode::NewTerminalSession { seed_from:None, resume_from:None, .. }));
+        assert_eq!(app.workspaces[0].host_id, HostId::new("manager"));
     }
 
     /// Host picker: the offered host list the dispatcher feeds the form is
@@ -4813,13 +4595,9 @@ mod slice_12e_tests {
     // `launch_into_workspace_guards_on_workspace_host_not_global` and
     // `a_n_submit_routes_by_chosen_host`.)
 
-    /// T_g3e_sidebar_groups_per_host (named acceptance test).
-    ///
-    /// `visual_items_status` emits a `HostHeader` per host
-    /// when `hosts.toml` has >1 entry, and groups sessions by
-    /// host. Single-host setups render unchanged.
+    /// Hosting does not add rows or reorder sessions in the status view.
     #[test]
-    fn t_g3e_sidebar_groups_per_host() {
+    fn sidebar_keeps_sessions_together_across_hosts() {
         let guard = crate::test_support::home_lock();
         let (mut app, _tmp) = build_app_with_hosts(
             &[("local", true), ("manager", false)],
@@ -4861,30 +4639,13 @@ mod slice_12e_tests {
                 host_id: cm_daemon::host_id::HostId::local(),
                 sessions: vec![ts],
                 tombstones: Vec::new(),
-                is_pushing: false,
             };
             app.workspaces.push(ws);
         }
         let items = app.visual_items_status();
-        let host_headers: Vec<_> = items
-            .iter()
-            .filter_map(|i| {
-                if let VisualItem::HostHeader(h) = i {
-                    Some(h.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(
-            host_headers,
-            vec![HostId::local(), HostId::new("manager")],
-            "multi-host sidebar MUST emit one HostHeader per \
-             configured host (in hosts.toml order); got items: {:?}",
-            items,
-        );
+        assert!(matches!(items.as_slice(), [VisualItem::Session(0, 0), VisualItem::Session(1, 0)]));
 
-        // Single-host case: no HostHeader.
+        // The same compact layout applies with one host.
         // Drop the first guard BEFORE acquiring a second —
         // std::sync::Mutex isn't reentrant and `home_lock()`
         // uses one static mutex.
@@ -4907,7 +4668,6 @@ mod slice_12e_tests {
             worker_vm: None,
             worker_zone: None,
             host_id: cm_daemon::host_id::HostId::local(),
-            is_pushing: false,
             sessions: vec![{
                 let mut ts = make_simple_session_with_uid(
                     "uid-only".into(),
@@ -4931,15 +4691,7 @@ mod slice_12e_tests {
             tombstones: Vec::new(),
         });
         let single_items = single_app.visual_items_status();
-        let has_host_header = single_items
-            .iter()
-            .any(|i| matches!(i, VisualItem::HostHeader(_)));
-        assert!(
-            !has_host_header,
-            "single-host setup MUST NOT emit HostHeader rows; \
-             got: {:?}",
-            single_items,
-        );
+        assert!(matches!(single_items.as_slice(), [VisualItem::Session(0, 0)]));
     }
 
     /// Continuous members (orchestrators + their subtasks) are excluded from
@@ -4989,7 +4741,6 @@ mod slice_12e_tests {
                 worker_vm: None,
                 worker_zone: None,
                 host_id: cm_daemon::host_id::HostId::local(),
-                is_pushing: false,
                 sessions: vec![
                     mk("uid-normal", "normal", None, None), // Session(0,0) — stays
                     mk("uid-orch", "orch", Some("ct-1"), None), // Session(0,1) — orchestrator
@@ -5034,7 +4785,7 @@ mod slice_12e_tests {
             app.workspaces.push(mk_ws());
             app.continuous_column_on = on;
             assert_excluded(
-                &app.visual_items_status_multihost(),
+                &app.visual_items_status(),
                 "visual_items_status_multihost",
             );
         }
@@ -5526,7 +5277,6 @@ mod slice_12e_tests {
             worker_vm: None,
             worker_zone: None,
             host_id: cm_daemon::host_id::HostId::local(),
-            is_pushing: false,
             sessions: vec![caller_ts],
             tombstones: Vec::new(),
         });
@@ -5790,7 +5540,6 @@ mod slice_12e_tests {
             worker_vm: None,
             worker_zone: None,
             host_id: cm_daemon::host_id::HostId::local(),
-            is_pushing: false,
             sessions: vec![caller_ts],
             tombstones: Vec::new(),
         });
@@ -6408,7 +6157,6 @@ remote_socket = "/remote/manager.sock"
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![],
             tombstones: vec![],
-            is_pushing: false,
         });
         app.save_session_manifest();
 
@@ -6454,54 +6202,16 @@ remote_socket = "/remote/manager.sock"
     /// guard BEFORE worktree creation. Same orphan-disk
     /// rationale as round-6 F1 for `create_local_session`.
     #[test]
-    fn launch_from_plan_fails_fast_before_worktree_for_non_local_active_host() {
-        let src = crate::app::APP_SRC_FOR_SCAN;
-        let sig = "fn launch_from_plan(";
-        let start = src.find(sig).expect("must find sig");
-        let rest = &src[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .into_iter()
-            .chain(rest[1..].find("\n    pub fn "))
-            .chain(rest[1..].find("\n    pub(crate) fn "))
-            .chain(rest[1..].find("\n    pub(super) fn "))
-            .chain(rest[1..].find("\n#[cfg(test)]"))
-            .min()
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-
-        // Structural pin: shared-helper call.
-        assert!(
-            body.contains(
-                "guard_local_host_only(\n            &active_host,\n            \"A-l launch-from-plan\",\n        )",
-            ) || body.contains(
-                "guard_local_host_only(&active_host, \"A-l launch-from-plan\")",
-            ),
-            "launch_from_plan must call guard_local_host_only \
-             at the top (12e-r7 F2); body:\n{}",
-            body,
-        );
-
-        // Ordering: guard MUST precede worktree creation +
-        // try_spawn_via_daemon (the function uses
-        // `spawn_agent_session` directly, not
-        // `try_spawn_via_daemon`, but the orphan-dir concern
-        // is the same).
-        let guard_idx = body
-            .find("guard_local_host_only(")
-            .expect("guard call not found");
-        let worktree_idx = body
-            .find("worktree::create_worktree(")
-            .expect("create_worktree call not found");
-        assert!(
-            guard_idx < worktree_idx,
-            "guard (at byte {}) MUST precede \
-             worktree::create_worktree (at byte {}) — \
-             otherwise a remote-host A-l leaves an orphan dir",
-            guard_idx,
-            worktree_idx,
-        );
+    fn planning_remote_launch_does_not_touch_local_files_when_offline() {
+        let guard = crate::test_support::home_lock();
+        let (mut app, tmp) = build_app_with_hosts(&[("local", false), ("manager", true)], &guard);
+        app.config.repos.insert("example".into(), "https://github.com/example/example.git".into());
+        app.launch_from_plan("example", "fresh-task", "prompt", None, false, "task-1", None,
+            false, "codex", &HostId::new("manager"));
+        assert!(app.workspaces.is_empty());
+        assert!(!tmp.path().join(".cm/worktrees").exists());
+        app.start_new_session();
+        assert!(matches!(&app.input_mode, InputMode::NewSession { host_id, .. } if *host_id == HostId::new("manager")));
     }
 
     /// 12e-r7 F2: `launch_into_workspace` (planning A-l,
@@ -7018,43 +6728,7 @@ mod migrate_tui_local_tests {
     /// spawns `claude --resume <id>` so the daemon-registered
     /// session's transcript_id matches the resumed id at
     /// registration time.
-    #[test]
-    fn t_migrate_spawn_resumed_session_passes_resume_arg() {
-        let src = crate::app::APP_SRC_FOR_SCAN;
-        let sig = "fn spawn_resumed_session(";
-        let start = src.find(sig).expect("must find sig");
-        let rest = &src[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .into_iter()
-            .chain(rest[1..].find("\n    pub fn "))
-            .chain(rest[1..].find("\n    pub(crate) fn "))
-            .chain(rest[1..].find("\n    pub(super) fn "))
-            .chain(rest[1..].find("\n#[cfg(test)]"))
-            .min()
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-        // Daemon-routed.
-        assert!(
-            body.contains("self.try_spawn_via_daemon("),
-            "spawn_resumed_session MUST call \
-             self.try_spawn_via_daemon (migrate-tui-local); \
-             body:\n{}",
-            body,
-        );
-        // Threads `Some(session_id.as_str())` as the resume
-        // argument.
-        assert!(
-            body.contains("Some(session_id.as_str())"),
-            "spawn_resumed_session MUST thread \
-             `Some(session_id.as_str())` to \
-             try_spawn_via_daemon's resume_session_id slot so \
-             the daemon spawns `claude --resume <id>` (no \
-             post-spawn /resume workaround); body:\n{}",
-            body,
-        );
-    }
+
 
     /// T_migrate_bash_session_is_daemon_owned: A-s spawning a
     /// `bash` session also routes through the daemon (the
@@ -7350,126 +7024,7 @@ mod migrate_tui_local_tests {
     /// to the daemon (not `None`), so the daemon's
     /// `resolve_authorized_session` resolves immediately and MCP
     /// `read_session_output` can read the restored transcript.
-    #[test]
-    fn t_migrate_resume_path_registers_transcript_with_daemon() {
-        let src = crate::app::APP_SRC_FOR_SCAN;
 
-        // pre_spawn_transcript_path helper exists with the
-        // claude-deterministic-path semantics.
-        assert!(
-            src.contains("fn pre_spawn_transcript_path("),
-            "pre_spawn_transcript_path helper must exist so \
-             resume/restore sites can pass the daemon a known \
-             path at spawn time (Issue 3)",
-        );
-
-        // spawn_resumed_session body computes the path and
-        // threads it.
-        let sig = "fn spawn_resumed_session(";
-        let start = src.find(sig).expect("must find spawn_resumed_session");
-        let rest = &src[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .into_iter()
-            .chain(rest[1..].find("\n    pub fn "))
-            .chain(rest[1..].find("\n    pub(crate) fn "))
-            .chain(rest[1..].find("\n    pub(super) fn "))
-            .chain(rest[1..].find("\n#[cfg(test)]"))
-            .min()
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-        assert!(
-            body.contains("let pre_spawn_transcript ="),
-            "spawn_resumed_session MUST compute `pre_spawn_transcript` \
-             before try_spawn_via_daemon (Issue 3); body excerpt:\n{}",
-            &body[..body.len().min(1500)],
-        );
-        assert!(
-            body.contains("pre_spawn_transcript_path(\"claude\", &worktree_path,"),
-            "spawn_resumed_session MUST call pre_spawn_transcript_path \
-             with \"claude\" + worktree + session_id (Issue 3); body \
-             excerpt:\n{}",
-            &body[..body.len().min(1500)],
-        );
-        assert!(
-            body.contains("pre_spawn_transcript.as_deref()"),
-            "spawn_resumed_session MUST thread the computed \
-             transcript path through to try_spawn_via_daemon \
-             (Issue 3); body excerpt:\n{}",
-            &body[..body.len().min(1500)],
-        );
-
-        // spawn_restored_session for known transcript_ids does
-        // the same.
-        let sig2 = "fn spawn_restored_session(";
-        let start2 = src.find(sig2).expect("must find spawn_restored_session");
-        let rest2 = &src[start2..];
-        let end2 = rest2[1..]
-            .find("\n    fn ")
-            .into_iter()
-            .chain(rest2[1..].find("\n    pub fn "))
-            .chain(rest2[1..].find("\n    pub(crate) fn "))
-            .chain(rest2[1..].find("\n    pub(super) fn "))
-            .chain(rest2[1..].find("\n#[cfg(test)]"))
-            .min()
-            .map(|i| 1 + i)
-            .unwrap_or(rest2.len());
-        let body2 = &rest2[..end2];
-        assert!(
-            body2.contains("pre_spawn_transcript_path(&entry.session_type"),
-            "spawn_restored_session MUST call pre_spawn_transcript_path \
-             with the entry's session_type when the manifest entry has a \
-             known transcript_id (Issue 3); body excerpt:\n{}",
-            &body2[..body2.len().min(1500)],
-        );
-        assert!(
-            body2.contains("pre_spawn_transcript.as_deref()"),
-            "spawn_restored_session MUST thread the computed path \
-             through to BOTH the attach and spawn branches (Issue \
-             3); body excerpt:\n{}",
-            &body2[..body2.len().min(1500)],
-        );
-
-        // The helper's signature MUST end with the transcript_path arg.
-        let helper_sig_idx = src
-            .find("pub(crate) fn try_spawn_via_daemon_with_deps(")
-            .expect("helper must exist");
-        let helper_rest = &src[helper_sig_idx..];
-        let helper_open = helper_rest.find('{').expect("helper body open");
-        let helper_header = &helper_rest[..helper_open];
-        assert!(
-            helper_header.contains("transcript_path: Option<&str>"),
-            "try_spawn_via_daemon_with_deps MUST accept a \
-             `transcript_path: Option<&str>` argument (Issue 3); \
-             signature header:\n{}",
-            helper_header,
-        );
-
-        // And the helper forwards it (not `None`) into the
-        // ClientSessionConfig.
-        let helper_end = helper_rest[1..]
-            .find("\npub ")
-            .or_else(|| helper_rest[1..].find("\nfn "))
-            .or_else(|| helper_rest[1..].find("\nimpl "))
-            .map(|i| 1 + i)
-            .unwrap_or(helper_rest.len());
-        let helper_body = &helper_rest[..helper_end];
-        assert!(
-            !helper_body.contains("transcript_path: None,"),
-            "try_spawn_via_daemon_with_deps MUST NOT hardcode \
-             `transcript_path: None` in the ClientSessionConfig \
-             — that was the Issue 3 regression. The helper must \
-             forward the caller-supplied `transcript_path` arg.",
-        );
-        assert!(
-            helper_body.contains("transcript_path,\n        workflow_run_id,")
-                || helper_body.contains("transcript_path,"),
-            "try_spawn_via_daemon_with_deps MUST forward \
-             `transcript_path` into the ClientSessionConfig \
-             (Issue 3)",
-        );
-    }
 
     /// migrate-tui-local Issue A: the live-daemon-UID probe MUST
     /// filter out rows backed only by `state.tui_sessions`. Pre-
@@ -7566,70 +7121,7 @@ mod migrate_tui_local_tests {
     /// between pull-start and PullComplete sends the local
     /// filesystem path to a remote daemon and mistags the new
     /// workspace.
-    #[test]
-    fn t_migrate_spawn_resumed_session_pins_local_host() {
-        let src = crate::app::APP_SRC_FOR_SCAN;
-        let sig = "fn spawn_resumed_session(";
-        let start = src.find(sig).expect("must find spawn_resumed_session");
-        let rest = &src[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .into_iter()
-            .chain(rest[1..].find("\n    pub fn "))
-            .chain(rest[1..].find("\n    pub(crate) fn "))
-            .chain(rest[1..].find("\n    pub(super) fn "))
-            .chain(rest[1..].find("\n#[cfg(test)]"))
-            .min()
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
 
-        // The host snapshot MUST be HostId::local(), not
-        // self.active_host.
-        assert!(
-            body.contains("let host_snapshot = cm_daemon::host_id::HostId::local();"),
-            "spawn_resumed_session MUST pin its host snapshot to \
-             `HostId::local()` because the cloud-pull replacement \
-             workspace is always local-side (Issue B); body \
-             excerpt:\n{}",
-            &body[..body.len().min(2000)],
-        );
-        // And MUST NOT bind `self.active_host` to the host
-        // snapshot — that's the pre-fix race-prone form.
-        assert!(
-            !body.contains("let active_host = self.active_host.clone();"),
-            "spawn_resumed_session MUST NOT snapshot \
-             `self.active_host` (Issue B regression pin) — a \
-             concurrent A-H cycle between pull-start and \
-             PullComplete would otherwise mistag the new local \
-             workspace. body excerpt:\n{}",
-            &body[..body.len().min(2000)],
-        );
-        // And the daemon dial + ts.host_id assignment MUST use
-        // host_snapshot.
-        assert!(
-            body.contains("&host_snapshot,"),
-            "spawn_resumed_session MUST pass `&host_snapshot` to \
-             try_spawn_via_daemon (Issue B); body excerpt:\n{}",
-            &body[..body.len().min(2000)],
-        );
-        assert!(
-            body.contains("ts.host_id = host_snapshot.clone();"),
-            "spawn_resumed_session MUST tag the new \
-             TerminalSession with `host_snapshot` (Issue B); body \
-             excerpt:\n{}",
-            &body[..body.len().min(2000)],
-        );
-        // Doc-comment pin: the why is on-record so a future
-        // refactor doesn't reintroduce the active_host form.
-        assert!(
-            body.contains("cloud-pull"),
-            "spawn_resumed_session MUST document why the host is \
-             pinned local (cloud-pull replacement workspace is \
-             always local-side, Issue B); body excerpt:\n{}",
-            &body[..body.len().min(2000)],
-        );
-    }
 
     /// migrate-tui-local Issue C: every daemon-routed spawn site
     /// that builds local-only paths (worktree from local
@@ -8601,7 +8093,6 @@ mod revive_session_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![ts],
             tombstones: Vec::new(),
-            is_pushing: false,
         });
         app.cursor = Cursor::Session(0, 0);
         // Manifest saves no-op (no disk writes) — in-memory asserts only.
@@ -8760,7 +8251,6 @@ mod spent_workspace_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![],
             tombstones: vec![],
-            is_pushing: false,
         }
     }
 

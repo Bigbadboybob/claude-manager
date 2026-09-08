@@ -1778,7 +1778,6 @@ mod tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![ts],
             tombstones: vec![],
-            is_pushing: false,
         });
         let host = cm_daemon::host_id::HostId::local();
         app.apply_messaging_name(&host, "a", &json!({"name_revision":1,"label":"Scout"}));

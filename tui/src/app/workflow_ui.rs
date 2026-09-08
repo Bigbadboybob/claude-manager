@@ -580,14 +580,6 @@ impl App {
         // `workspaces` while the modal is open, so the launch/draw consumers
         // re-resolve from this id rather than trusting a frozen raw index.
         let ws_id = self.workspaces[wi].id.clone();
-        // Same reason as `start_new_terminal_session`: workflow
-        // participants are sibling sessions on the workspace, and a
-        // push in flight will tombstone them on `PushComplete`.
-        if self.workspaces[wi].is_pushing {
-            self.set_status_msg("Workspace is being pushed to cloud, retry after");
-            return;
-        }
-
         let mut names: Vec<String> = self.workflows.keys().cloned().collect();
         names.sort();
         let has_load_errors = !self.workflow_load_errors.is_empty();
@@ -694,6 +686,7 @@ impl App {
                 option_index: 0,
             });
         }
+        self.session_form_host = self.workspaces.iter().find(|ws| ws.id == ws_id).map(|ws| ws.host_id.clone());
         self.input_mode = InputMode::WorkflowLaunchConfirm {
             ws_id,
             workflow_name: wf_name,
@@ -753,11 +746,7 @@ impl App {
         // workspace while active_host=manager fired a doomed cross-host launch
         // (local worktree path + local uids sent to the remote daemon) and froze
         // the UI on the 150s start_workflow RPC over the flaky tunnel.
-        let host_id = ws
-            .sessions
-            .first()
-            .map(|s| s.host_id.clone())
-            .unwrap_or_else(|| crate::hosts::HostId::local());
+        let host_id = ws.sessions.first().map(|session| session.host_id.clone()).unwrap_or_else(|| ws.host_id.clone());
         let role_sessions = slots_to_role_sessions(slots, &session_uids);
         // Per-role "new claude" vs "new codex" overrides for fresh-spawned roles
         // (only the ones the operator cycled off their TOML default).
@@ -1344,7 +1333,6 @@ mod rotation_binding_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions,
             tombstones: vec![],
-            is_pushing: false,
         }
     }
 

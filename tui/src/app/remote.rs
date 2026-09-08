@@ -1424,7 +1424,6 @@ mod remote_reconnect_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![ts],
             tombstones: Vec::new(),
-            is_pushing: false,
         }
     }
 

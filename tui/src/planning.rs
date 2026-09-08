@@ -526,6 +526,7 @@ pub enum PlanAction {
         /// Agent to spawn into the new worktree (launch-dialog choice,
         /// Claude by default).
         engine: LaunchEngine,
+        host_id: crate::hosts::HostId,
     },
     /// Bind a task to an existing workspace and spawn a session there
     /// (no new worktree, no branch input).
@@ -1092,6 +1093,9 @@ fn repo_url_for_project(project: &str) -> String {
 // ── PlanningView ────────────────────────────────────────────
 
 pub struct PlanningView {
+    pub launch_host: crate::hosts::HostId,
+    launch_hosts: Vec<crate::hosts::HostId>,
+    default_launch_host: crate::hosts::HostId,
     projects: Vec<PlanProject>,
     project_data: Vec<ProjectData>,
     /// None = show all projects, Some(idx) = show one project.
@@ -1163,6 +1167,9 @@ pub struct PlanningView {
 impl PlanningView {
     pub fn new() -> Self {
         PlanningView {
+            launch_host: crate::hosts::HostId::local(),
+            launch_hosts: vec![crate::hosts::HostId::local()],
+            default_launch_host: crate::hosts::HostId::local(),
             projects: vec![],
             project_data: vec![],
             project_filter: None,
@@ -2575,6 +2582,11 @@ impl PlanningView {
         let total = num_candidates + 1;
 
         if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
+                self.cycle_launch_host();
+                return PlanAction::Consumed;
+            }
+
             match key.code {
                 KeyCode::Esc => {
                     self.input_mode = PlanInputMode::Normal;
@@ -2667,6 +2679,11 @@ impl PlanningView {
 
     fn handle_launch_confirm_event(&mut self, event: &CrosstermEvent) -> PlanAction {
         if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
+                self.cycle_launch_host();
+                return PlanAction::Consumed;
+            }
+
             let (project_idx, task_idx, mut branch_text, mut engine) = match &self.input_mode {
                 PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine } => {
                     (*project_idx, *task_idx, branch_text.clone(), *engine)
@@ -2710,6 +2727,7 @@ impl PlanningView {
                                 parent_task_id,
                                 in_place,
                                 engine,
+                                host_id: self.launch_host.clone(),
                             };
                         }
                     }
@@ -3523,7 +3541,23 @@ impl PlanningView {
             .collect()
     }
 
+    pub fn set_launch_hosts(&mut self, hosts: Vec<crate::hosts::HostId>, default: crate::hosts::HostId) {
+        self.launch_hosts = hosts;
+        self.default_launch_host = default;
+    }
+
+    fn cycle_launch_host(&mut self) {
+        if self.launch_hosts.is_empty() { return; }
+        let i = self.launch_hosts.iter().position(|h| h == &self.launch_host).unwrap_or(0);
+        self.launch_host = self.launch_hosts[(i + 1) % self.launch_hosts.len()].clone();
+    }
+
+    fn launch_host_line(&self) -> Line<'static> {
+        Line::from(Span::styled(format!("  Host: {}  (Alt+h change; new workspace)", self.launch_host), Style::default().fg(theme::MUTED)))
+    }
+
     fn start_launch(&mut self) -> PlanAction {
+        self.launch_host = self.default_launch_host.clone();
         if let Some((pi, ti)) = self.selected_task_loc() {
             self.input_mode = PlanInputMode::WorkspacePicker {
                 project_idx: pi,
@@ -4615,7 +4649,7 @@ impl PlanningView {
             .unwrap_or("?");
         let candidates = self.candidates_for(project_idx, task_idx);
         // +2 for the engine row and its blank separator.
-        let rows = 5 + candidates.len() as u16 + 2 + 2;
+        let rows = 5 + candidates.len() as u16 + 2 + 3;
         let (w, h) = (60u16.min(area.width.saturating_sub(4)), rows);
         let dialog = Rect::new(
             (area.width - w) / 2,
@@ -4669,6 +4703,7 @@ impl PlanningView {
         }
         lines.push(Line::from(""));
         lines.push(engine_line(engine));
+        lines.push(self.launch_host_line());
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  j/k navigate \u{00b7} \u{2190}/\u{2192} engine \u{00b7} Enter select \u{00b7} Esc cancel",
@@ -4706,7 +4741,7 @@ impl PlanningView {
             .map(|t| t.title.as_str())
             .unwrap_or("?");
         // +2 rows for the engine line and its blank separator.
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 11u16);
+        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 12u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
         let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
@@ -4736,6 +4771,7 @@ impl PlanningView {
             ]),
             Line::from(""),
             engine_line(engine),
+            self.launch_host_line(),
             Line::from(""),
             Line::from(Span::styled("  \u{2190}/\u{2192} engine \u{00b7} Enter launch \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);

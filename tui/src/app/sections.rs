@@ -340,7 +340,6 @@ mod layout_tests {
             pinned: false,
             sessions: vec![],
             tombstones: vec![],
-            is_pushing: false,
         }
     }
 

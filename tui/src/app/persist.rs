@@ -423,7 +423,6 @@ impl App {
                 pinned: mw.pinned,
                 sessions: vec![],
                 tombstones: restored_tombstones,
-                is_pushing: false,
             };
             if !ws.is_closed {
                 for entry in &mw.sessions {
@@ -975,7 +974,6 @@ impl App {
                         host_id: host.clone(),
                         sessions: Vec::new(),
                         tombstones: Vec::new(),
-                        is_pushing: false,
                     });
                     new_id
                 }

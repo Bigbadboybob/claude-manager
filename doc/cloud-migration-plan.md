@@ -177,7 +177,7 @@ conversation; allow its owned backend to exit before resuming.
 ```sh
 scripts/cm-op kill_session '{"session_uid":"ts-18d32b77ffec4909-0"}'
 sleep 5
-codex resume 01a07e0e-7821-7ce2-b906-56d5add424fc
+codex --yolo resume 01a07e0e-7821-7ce2-b906-56d5add424fc
 ```
 
 Once resumed, tell the standalone session to begin the migration. Do not restart

@@ -735,7 +735,7 @@ impl App {
     ) {
         let width = 50u16.min(area.width.saturating_sub(4));
         // +2 rows for the seed-from line, +1 for resume-from.
-        let height = 12u16;
+        let height = 13u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -797,6 +797,7 @@ impl App {
                 st,
             )));
         }
+        lines.push(Line::from(Span::styled(self.form_host_label(workspace_id), dim)));
         lines.push(Line::from(""));
         let seed_label = sanitize_for_display(seed_from.unwrap_or(
             if session_type == "bash" { "[N/A]" } else { "[none]" },
@@ -1569,9 +1570,9 @@ impl App {
             ("A-o    stop wf", "A-c  cont-col"),
             ("A-C    cont-stop", ""),
             ("A-b    snapshot", "A-g  attention"),
-            ("A-O    reopen ws", "A-9  push"),
+            ("A-O    reopen ws", ""),
             ("A-N    +section", "A-J/K sect order"),
-            ("PgUp/Dn scroll", "A-0  pull"),
+            ("PgUp/Dn scroll", ""),
             ("A-Ent  newline", "A-;  recent"),
             ("A-p    find", "A-i  info"),
             ("A-'    yank", "A-M  mouse"),
@@ -1616,21 +1617,11 @@ impl App {
                         _ => false,
                     };
 
-                    // Remote-host indicator. The host is workspace-scoped (all
-                    // sessions in a workspace share one host, by invariant) but
-                    // it lives per-session as `ts.host_id`, so derive it from the
-                    // first non-local session. An all-local or session-less
-                    // workspace shows nothing. Status view surfaces remoteness via
-                    // `HostHeader` grouping instead; this tag is what makes the
-                    // Task sub-view (which has no host headers) legible.
-                    let remote_host = ws
-                        .sessions
-                        .iter()
-                        .map(|s| &s.host_id)
-                        .find(|h| **h != cm_daemon::host_id::HostId::local());
-                    let host_tag = remote_host
-                        .map(|h| format!(" @{}", h.as_str()))
-                        .unwrap_or_default();
+                    let host_tag = if ws.host_id == cm_daemon::host_id::HostId::local() {
+                        " ⌂"
+                    } else {
+                        ""
+                    };
 
                     // Reserve room for the tags so the name truncates before
                     // them (the pin glyph 📌 is double-width + a space).
@@ -1650,13 +1641,7 @@ impl App {
                     }
                     header_spans.push(Span::raw(name));
                     if !host_tag.is_empty() {
-                        // Magenta keeps it distinct from the Yellow/DarkGray host
-                        // headers and Cyan task/workflow headers. The span keeps
-                        // its color through selection (the name still highlights).
-                        header_spans.push(Span::styled(
-                            host_tag,
-                            Style::default().fg(theme::REMOTE),
-                        ));
+                        header_spans.push(Span::styled(host_tag, Style::default().fg(theme::DIM)));
                     }
                     let header_line = Line::from(header_spans);
 
@@ -1807,6 +1792,9 @@ impl App {
                         spans.push(Span::styled(badge, style));
                     }
                     spans.push(Span::raw(display));
+                    if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
+                        spans.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
+                    }
                     let line = Line::from(spans);
 
                     // Session accent falls back to the workspace accent so a
@@ -1971,24 +1959,7 @@ impl App {
                     ]);
                     items.push(ListItem::new(line).style(base_style));
                 }
-                // 12e: host header rendered as a non-selectable
-                // bold-ish row, one per configured host.
-                VisualItem::HostHeader(host_id) => {
-                    // Global-host removal: there is no "active" host anymore —
-                    // every host header renders identically. The sidebar shows
-                    // all configured hosts; "which host" is a per-workspace
-                    // attribute, not a global mode.
-                    let line = Line::from(vec![Span::styled(
-                        format!("  {}", host_id.as_str()),
-                        Style::default()
-                            .fg(theme::DIM)
-                            .add_modifier(Modifier::BOLD),
-                    )]);
-                    items.push(ListItem::new(line));
-                }
-                // Continuous-tasks section header, styled like the
-                // (inactive) `HostHeader` arm. The count badge reflects
-                // the continuous sessions across all visible workspaces.
+                // Continuous count spans all visible hosts.
                 VisualItem::ContinuousHeader => {
                     let count = self
                         .workspaces
@@ -3332,7 +3303,7 @@ impl App {
             .unwrap_or(usize::MAX);
         let width = area.width.min(72).max(44);
         // +10 leaves room for the goal field row and the hint footer.
-        let height = (slots.len() as u16 + 10).min(area.height.saturating_sub(2));
+        let height = (slots.len() as u16 + 11).min(area.height.saturating_sub(2));
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let dialog = Rect { x, y, width, height };
@@ -3351,6 +3322,7 @@ impl App {
             format!("Workspace: {}", ws_name),
             Style::default().fg(theme::TEXT),
         )));
+        lines.push(Line::from(Span::styled(self.form_host_label(ws_id), Style::default().fg(theme::DIM))));
         lines.push(Line::from(""));
         for (idx, slot) in slots.iter().enumerate() {
             let is_active = idx == active_slot;

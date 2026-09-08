@@ -892,6 +892,7 @@ pub enum CatalogMode {
 }
 
 pub(crate) struct SnapshotCatalogMut<'a> {
+    pub store: &'a agent_memory::SnapshotStore,
     pub snapshots: &'a mut Vec<agent_memory::Snapshot>,
     pub selected: &'a mut usize,
     pub mode: &'a mut CatalogMode,
@@ -999,6 +1000,7 @@ pub(crate) fn handle_new_session(
                     (cur + n - 1) % n
                 };
                 *state.host_id = ctx.host_ids[next].clone();
+                *state.seed_from = None;
             }
             InputOutcome::Consumed
         }
@@ -1410,7 +1412,14 @@ fn handle_catalog_browse(
                     name: snap.name.clone(),
                 });
             }
-            let (head, tail) = read_transcript_head_tail(&snap.dir, 5);
+            let preview = match state.store {
+                agent_memory::SnapshotStore::Local => Ok(cm_daemon::agent_memory::read_transcript_head_tail(&snap.dir, 5)),
+                _ => state.store.preview(&snap.name),
+            };
+            let (head, tail) = match preview {
+                Ok(preview) => preview,
+                Err(e) => { *state.status_msg = Some(format!("Preview failed: {e}")); return InputOutcome::Consumed; }
+            };
             *state.mode = CatalogMode::Detail { head, tail };
             InputOutcome::Consumed
         }
@@ -1469,8 +1478,8 @@ fn handle_catalog_rename(
                 *state.mode = CatalogMode::Browse;
                 return InputOutcome::Consumed;
             }
-            match agent_memory::rename(&old, &new) {
-                Ok(()) => match agent_memory::list() {
+            match state.store.rename(&old, &new) {
+                Ok(()) => match state.store.list() {
                     Ok(fresh) => {
                         // Move selection to the renamed entry so the
                         // cursor doesn't appear to jump arbitrarily.
@@ -1528,7 +1537,7 @@ fn handle_catalog_delete(
                 return InputOutcome::Consumed;
             };
             let name = snap.name.clone();
-            match agent_memory::delete(&name) {
+            match state.store.delete(&name) {
                 Err(e) => {
                     // Keep list + selection as-is and surface the error.
                     // The previous code discarded the result and then
@@ -1538,7 +1547,7 @@ fn handle_catalog_delete(
                     *state.status_msg = Some(format!("Delete failed: {e}"));
                     *state.mode = CatalogMode::Browse;
                 }
-                Ok(()) => match agent_memory::list() {
+                Ok(()) => match state.store.list() {
                     Ok(fresh) => {
                         let len = fresh.len();
                         *state.snapshots = fresh;
@@ -1580,45 +1589,8 @@ fn handle_catalog_delete(
 /// rest of the iterator drains into. Earlier implementation slurped the
 /// whole transcript into memory just to take 5 lines from each end —
 /// for multi-MB transcripts that stalled the UI on Detail open.
-fn read_transcript_head_tail(
-    snapshot_dir: &Path,
-    n: usize,
-) -> (Vec<String>, Vec<String>) {
-    use std::collections::VecDeque;
-    use std::io::{BufRead, BufReader};
-
-    let path = snapshot_dir.join("transcript.jsonl");
-    let file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(_) => return (Vec::new(), Vec::new()),
-    };
-    let reader = BufReader::new(file);
-
-    let mut head: Vec<String> = Vec::with_capacity(n);
-    let mut tail: VecDeque<String> = VecDeque::with_capacity(n.saturating_add(1));
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            // Skip unreadable lines (e.g. invalid UTF-8 in the middle) but
-            // keep the loop going so we still get a usable head/tail.
-            Err(_) => continue,
-        };
-        if head.len() < n {
-            head.push(line);
-            continue;
-        }
-        if n == 0 {
-            break;
-        }
-        if tail.len() == n {
-            tail.pop_front();
-        }
-        tail.push_back(line);
-    }
-
-    (head, tail.into_iter().collect())
-}
+#[cfg(test)]
+use cm_daemon::agent_memory::read_transcript_head_tail;
 
 /// Build the body lines of the catalog Rename overlay. Pure function so
 /// unit tests can drive it without spinning up a Terminal/TestBackend.
@@ -2356,6 +2328,17 @@ impl App {
         let ws = &self.workspaces[_wi];
         let ts = &ws.sessions[_si];
 
+        if ts.host_id != cm_daemon::host_id::HostId::local() {
+            let result: agent_memory::Result<agent_memory::Snapshot> = self.snapshot_store_for_host(&ts.host_id).request(
+                serde_json::json!({"action":"save", "session_uid":session_uid,
+                    "transcript_id":ts.transcript_id, "name":name, "description":description}));
+            match result {
+                Ok(snap) => self.set_status_msg(&format!("Snapshot saved: {}", snap.name)),
+                Err(e) => reopen(self, e.to_string()),
+            }
+            return;
+        }
+
         let engine = match ts.session_type.as_str() {
             "claude" => Engine::ClaudeCode,
             "codex" => Engine::Codex,
@@ -2441,9 +2424,25 @@ impl App {
     /// cancel — including when `list()` fails before the catalog can
     /// even render. Without that restoration, a list() error would
     /// silently drop the user's typed form state.
+    fn snapshot_store_for_host(&self, host: &cm_daemon::host_id::HostId) -> agent_memory::SnapshotStore {
+        if *host == cm_daemon::host_id::HostId::local() { return agent_memory::SnapshotStore::Local; }
+        match self.host_pool.live_socket_path(host) {
+            Some(socket) => agent_memory::SnapshotStore::Remote { socket, token: self.host_pool.operator_token_for(host) },
+            None => agent_memory::SnapshotStore::Unavailable(host.to_string()),
+        }
+    }
+
     fn open_snapshot_catalog(&mut self, picker_target: Option<PickerTarget>) {
-        let (mode, status) =
-            catalog_open_outcome(agent_memory::list(), picker_target);
+        let host = match &picker_target {
+            Some(PickerTarget::NewSession { host_id, .. }) => host_id.clone(),
+            Some(PickerTarget::NewTerminalSession { workspace_id, .. }) => self.session_form_host.clone()
+                .or_else(|| self.workspaces.iter().find(|ws| ws.id == *workspace_id).map(|ws| ws.host_id.clone()))
+                .unwrap_or_else(|| self.default_launch_host()),
+            None => self.active_workspace_index().and_then(|wi| self.workspaces.get(wi)).map(|ws| ws.host_id.clone())
+                .unwrap_or_else(|| self.default_launch_host()),
+        };
+        self.snapshot_store = self.snapshot_store_for_host(&host);
+        let (mode, status) = catalog_open_outcome(self.snapshot_store.list(), picker_target);
         self.input_mode = mode;
         if let Some(msg) = status {
             self.set_status_msg(&msg);
@@ -2803,6 +2802,10 @@ impl App {
             // Keep planning's workspace picker in sync with the current
             // set of open workspaces before it sees the event.
             let candidates = self.collect_workspace_candidates();
+            self.planning.set_launch_hosts(
+                self.hosts.hosts.iter().map(|h| h.id.clone()).collect(),
+                self.default_launch_host(),
+            );
             self.planning.set_workspace_candidates(candidates);
             let action = self.planning.handle_event(event);
             match action {
@@ -2818,6 +2821,7 @@ impl App {
                     parent_task_id,
                     in_place,
                     engine,
+                    host_id,
                 } => {
                     self.launch_from_plan(
                         &project,
@@ -2829,6 +2833,7 @@ impl App {
                         parent_task_id.as_deref(),
                         in_place,
                         engine.as_session_type(),
+                        &host_id,
                     );
                     return true;
                 }
@@ -3174,18 +3179,6 @@ impl App {
                         self.reorder_section_key(-1);
                         return true;
                     }
-                    // Cloud push/pull moved off A-p / A-l (freed for the
-                    // continuous-panel column nav, S4) to A-9 / A-0 — digits
-                    // deliver cleanly (unlike Alt+[, which can collide with the
-                    // CSI escape introducer). Rarely-used cloud ops.
-                    KeyCode::Char('9') => {
-                        self.push_active();
-                        return true;
-                    }
-                    KeyCode::Char('0') => {
-                        self.pull_active();
-                        return true;
-                    }
                     KeyCode::Char('f') => {
                         self.open_workflow_launch();
                         return true;
@@ -3504,6 +3497,36 @@ impl App {
         // (1-3 entries) so the cost is negligible.
         let host_ids: Vec<cm_daemon::host_id::HostId> =
             self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
+                let workspace_id = match &self.input_mode {
+                    InputMode::NewTerminalSession { workspace_id, .. } => Some(workspace_id.clone()),
+                    InputMode::WorkflowLaunchConfirm { ws_id, .. } => Some(ws_id.clone()),
+                    _ => None,
+                };
+                if let Some(workspace_id) = workspace_id {
+                    let current = self.session_form_host.clone().or_else(|| self.workspaces.iter()
+                        .find(|ws| ws.id == workspace_id).map(|ws| ws.host_id.clone()));
+                    if !host_ids.is_empty() {
+                        let i = host_ids.iter().position(|h| Some(h) == current.as_ref()).unwrap_or(0);
+                        self.session_form_host = Some(host_ids[(i + 1) % host_ids.len()].clone());
+                    }
+                    match &mut self.input_mode {
+                        InputMode::NewTerminalSession { seed_from, resume_from, .. } => {
+                            *seed_from = None; *resume_from = None;
+                        }
+                        InputMode::WorkflowLaunchConfirm { slots, .. } => {
+                            for slot in slots {
+                                slot.options.retain(|option| matches!(option, WorkflowSlotSource::New(_)));
+                                slot.option_index = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                    return true;
+                }
+            }
+        }
         // Section ids for the workspace / task settings pickers.
         let section_ids: Vec<String> = self.section_ids();
         let outcome = match &mut self.input_mode {
@@ -3642,6 +3665,7 @@ impl App {
                 status_msg,
             } => handle_snapshot_catalog(
                 SnapshotCatalogMut {
+                    store: &self.snapshot_store,
                     snapshots,
                     selected,
                     mode,
@@ -3861,6 +3885,10 @@ impl App {
                 seed_from,
                 resume_from,
             } => {
+                if let Some(host) = self.alternate_form_host(&workspace_id) {
+                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref());
+                    return;
+                }
                 self.spawn_session_on_workspace(
                     &workspace_id,
                     &session_type,
@@ -4125,6 +4153,13 @@ impl App {
                 goal,
                 cursor_task_id,
             } => {
+                if let Some(host) = self.alternate_form_host(&ws_id) {
+                    if let Some(new_id) = self.new_workspace_on_host(&ws_id, &host, "bash", None) {
+                        self.launch_workflow_via_daemon(&new_id, &workflow_name, &slots, goal, None);
+                    }
+                    return;
+                }
+
                 // migrate-tui-local Issue G: UI A-f launches now
                 // carry the cursor's task scope (captured at
                 // observation time in `open_workflow_launch` per
@@ -6412,7 +6447,6 @@ mod input_handler_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: Vec::new(),
             tombstones: Vec::new(),
-            is_pushing: false,
         };
         for (uid, ty) in sessions {
             let session = crate::session::Session::new(
@@ -6512,6 +6546,7 @@ mod input_handler_tests {
         for _ in 0..3 {
             handle_snapshot_catalog(
                 SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                     snapshots: &mut snaps,
                     selected: &mut selected,
                     mode: &mut mode,
@@ -6527,6 +6562,7 @@ mod input_handler_tests {
         // k → wraps to last
         handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6546,6 +6582,7 @@ mod input_handler_tests {
         let mut mode = CatalogMode::Browse;
         let outcome = handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6566,6 +6603,7 @@ mod input_handler_tests {
         let mut mode = CatalogMode::Browse;
         let outcome = handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6598,6 +6636,7 @@ mod input_handler_tests {
         let mut mode = CatalogMode::Browse;
         handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6623,6 +6662,7 @@ mod input_handler_tests {
         let mut mode = CatalogMode::Browse;
         handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6644,6 +6684,7 @@ mod input_handler_tests {
             let mut mode = CatalogMode::Browse;
             handle_snapshot_catalog(
                 SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                     snapshots: &mut snaps,
                     selected: &mut selected,
                     mode: &mut mode,
@@ -6688,6 +6729,7 @@ mod input_handler_tests {
             let mut mode = start;
             let outcome = handle_snapshot_catalog(
                 SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                     snapshots: &mut snaps,
                     selected: &mut selected,
                     mode: &mut mode,
@@ -6711,6 +6753,7 @@ mod input_handler_tests {
         };
         handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6733,6 +6776,7 @@ mod input_handler_tests {
         };
         handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6752,6 +6796,7 @@ mod input_handler_tests {
 
         handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6777,6 +6822,7 @@ mod input_handler_tests {
         };
         handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -6796,6 +6842,7 @@ mod input_handler_tests {
         let mut mode = CatalogMode::ConfirmDelete;
         handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
@@ -7009,6 +7056,7 @@ mod input_handler_tests {
         unsafe { std::env::set_var("HOME", fake_home) };
         let outcome = handle_snapshot_catalog(
             SnapshotCatalogMut {
+                    store: &agent_memory::SnapshotStore::Local,
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,

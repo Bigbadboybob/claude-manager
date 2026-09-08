@@ -306,6 +306,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "list_sessions",
     "read_session_output",
     "resolve_authorized_session",
+    "session.list_transcripts",
     "get_workflow_state",
     "workflow.get_state",
     "list_workflows",
@@ -758,6 +759,22 @@ pub fn dispatch_request(
         // agents use the Session-callable `mcp_start_session`.
         "create_session" => {
             DispatchOutcome::Done(dispatch_create_session(state, req))
+        }
+        "snapshot.control" => DispatchOutcome::Done(
+            if let Err(response) = require_operator(req, "Snapshot catalog is Operator-only") { response }
+            else { match methods::snapshot_control(state, &req.params) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+            }}),
+        "session.list_transcripts" => {
+            DispatchOutcome::Done(if let Err(response) = require_operator(req, "Transcript catalog is Operator-only") {
+                response
+            } else {
+                match methods::list_workspace_transcripts(state, &req.params) {
+                    Ok(value) => Response::ok(req.id.clone(), value),
+                    Err((code, message)) => Response::err(req.id.clone(), code, message),
+                }
+            })
         }
         "add_session" => {
             DispatchOutcome::Done(dispatch_add_session(state, req))
@@ -4125,6 +4142,16 @@ mod tests {
     // (worktree create/reuse, argv/env resolution, no-orphan) lives in
     // `crate::control::methods::tests`. Tests here pin the auth gate +
     // routing.
+
+    #[test]
+    fn remote_catalogs_are_operator_only() {
+        let state = make_state();
+        for method in ["session.list_transcripts", "snapshot.control"] {
+            let req = session_request(method, serde_json::json!({"action":"list"}), "ts-agent");
+            let resp = dispatch_request(&state, &req).into_response();
+            assert_eq!(resp.error.unwrap().code, ErrorCode::Unauthorized, "{method}");
+        }
+    }
 
     #[test]
     fn create_session_session_caller_is_unauthorized() {

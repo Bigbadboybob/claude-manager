@@ -1431,7 +1431,6 @@ fn mint_workspace_for_task(
         host_id: app.workspaces[caller_wi].host_id.clone(),
         sessions: vec![],
         tombstones: vec![],
-        is_pushing: false,
     });
     let target_wi = app.workspaces.len() - 1;
 
@@ -1902,7 +1901,6 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
                     host_id: cm_daemon::host_id::HostId::local(),
                     sessions: vec![],
                     tombstones: vec![],
-                    is_pushing: false,
                 };
                 new_workspace = Some(new_ws);
                 (worktree_path, new_ws_id)
@@ -1933,7 +1931,6 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
                     host_id: cm_daemon::host_id::HostId::local(),
                     sessions: vec![],
                     tombstones: vec![],
-                    is_pushing: false,
                 };
                 new_workspace = Some(new_ws);
                 (main_repo, new_ws_id)
@@ -2766,7 +2763,6 @@ mod tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions,
             tombstones,
-            is_pushing: false,
         }
     }
 
@@ -3588,7 +3584,6 @@ mod tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![],
             tombstones: vec![],
-            is_pushing: false,
         });
 
         f(&mut app, &repo);
@@ -3646,7 +3641,6 @@ mod tests {
                 host_id: cm_daemon::host_id::HostId::local(),
                 sessions: vec![],
                 tombstones: vec![],
-                is_pushing: false,
             });
             let mut task = task_with_parent("task-sub", Some("task-parent"), "Fix the parser");
             task.workspace_id = Some("ws-sub".into());

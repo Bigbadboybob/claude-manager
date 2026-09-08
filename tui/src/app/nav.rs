@@ -355,16 +355,11 @@ pub(super) enum VisualItem {
     Separator,
     /// Header row for a workflow grouping, followed by its participant Sessions.
     WorkflowHeader { ws_idx: usize, run_id: String },
-    /// 12e: header row for a host group. Emitted only when
-    /// `HostsConfig.hosts.len() > 1`. Sessions tagged with this
-    /// host's `host_id` follow until the next `HostHeader` or
-    /// the end of the list.
-    HostHeader(cm_daemon::host_id::HostId),
     /// Continuous Tasks: header row for the continuous-session
     /// group, sorted to the bottom of the sidebar. Emitted only
     /// when at least one session carries a `continuous_task_id`.
     /// Sessions tagged continuous follow until the end of the
-    /// group. Non-selectable, like `HostHeader`. See
+    /// group. Non-selectable. See
     /// DESIGN_CONTINUOUS_TASKS.md §12.
     ContinuousHeader,
     /// Cloud-backtests group header, appended at the bottom of BOTH
@@ -756,15 +751,7 @@ impl App {
     /// Past workspaces (closed / all-tasks-done) are hidden — open the
     /// A-O picker to reach them.
     ///
-    /// 12e: when `hosts.hosts.len() > 1`, the list is partitioned
-    /// by host (in `HostsConfig` order); each host's section is
-    /// preceded by a `HostHeader` row. Single-host (the
-    /// synthesized local default) renders unchanged — no host
-    /// header, identical to pre-12e.
     pub(super) fn visual_items_status(&self) -> Vec<VisualItem> {
-        if self.hosts.hosts.len() > 1 {
-            return self.visual_items_status_multihost();
-        }
         let members = self.continuous_members();
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
@@ -806,84 +793,6 @@ impl App {
             if !matches!(items.last(), Some(VisualItem::Separator)) {
                 items.push(VisualItem::Separator);
             }
-        }
-        items.extend(no_session);
-        items
-    }
-
-    /// 12e multi-host status view: emit a `HostHeader` per
-    /// configured host, then the running + idle sessions
-    /// belonging to that host. Workspaces with no sessions
-    /// can't be host-tagged (workspace itself has no host) —
-    /// they go in a single tail section after all host groups.
-    pub(super) fn visual_items_status_multihost(&self) -> Vec<VisualItem> {
-        // Per host: (running, idle). Continuous-orchestrator sessions + their
-        // subtasks are EXCLUDED here — they render only in the dedicated
-        // continuous column (or are hidden when it's off), never in the main
-        // per-host groups.
-        let members = self.continuous_members();
-        let mut by_host: std::collections::HashMap<
-            cm_daemon::host_id::HostId,
-            (Vec<VisualItem>, Vec<VisualItem>),
-        > = std::collections::HashMap::new();
-        let mut no_session: Vec<VisualItem> = Vec::new();
-        for (wi, ws) in self.workspaces.iter().enumerate() {
-            if ws.is_closed || self.is_past_workspace(wi) {
-                continue;
-            }
-            if ws.sessions.is_empty() {
-                no_session.push(VisualItem::WorkspaceHeader(wi));
-                continue;
-            }
-            for (si, ts) in ws.sessions.iter().enumerate() {
-                if members.contains(&(wi, si)) {
-                    continue;
-                }
-                let entry = by_host
-                    .entry(ts.host_id.clone())
-                    .or_insert_with(|| (Vec::new(), Vec::new()));
-                let item = VisualItem::Session(wi, si);
-                match ts.status {
-                    SessionStatus::Running => entry.0.push(item),
-                    SessionStatus::Idle => entry.1.push(item),
-                }
-            }
-        }
-        // Emit a host group (header + running + idle). A host group with no
-        // non-continuous sessions is dropped (no bare header).
-        let push_host_group = |items: &mut Vec<VisualItem>,
-                               id: cm_daemon::host_id::HostId,
-                               group: (Vec<VisualItem>, Vec<VisualItem>)| {
-            if !items.is_empty() {
-                items.push(VisualItem::Separator);
-            }
-            items.push(VisualItem::HostHeader(id));
-            items.extend(group.0); // running
-            items.extend(group.1); // idle
-        };
-        let mut items: Vec<VisualItem> = Vec::new();
-        for host in &self.hosts.hosts {
-            let group = by_host.remove(&host.id).unwrap_or_default();
-            if group.0.is_empty() && group.1.is_empty() {
-                continue;
-            }
-            push_host_group(&mut items, host.id.clone(), group);
-        }
-        // Sessions on hosts NO LONGER in hosts.toml (rare —
-        // operator removed an entry; existing sessions remain
-        // pinned). Surface them under a synthetic header so
-        // they don't silently vanish.
-        let mut orphan_ids: Vec<_> = by_host.keys().cloned().collect();
-        orphan_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        for id in orphan_ids {
-            let group = by_host.remove(&id).unwrap();
-            if group.0.is_empty() && group.1.is_empty() {
-                continue;
-            }
-            push_host_group(&mut items, id, group);
-        }
-        if !items.is_empty() && !no_session.is_empty() {
-            items.push(VisualItem::Separator);
         }
         items.extend(no_session);
         items
@@ -1387,9 +1296,8 @@ impl App {
             VisualItem::WorkflowHeader { .. } => false,
             // 12e: host headers are presentation-only; skip
             // them in cursor navigation.
-            VisualItem::HostHeader(_) => false,
             // Continuous header is presentation-only, like
-            // `HostHeader`; skip it in cursor navigation.
+            // other decorative headers; skip it in cursor navigation.
             VisualItem::ContinuousHeader => false,
             // Backtest rows are all selectable — the header and fleet rows
             // for the Space/Enter fold toggle, run rows for the A-i peek.
@@ -2133,7 +2041,6 @@ mod pinned_sort_tests {
             pinned,
             sessions: vec![],
             tombstones: vec![],
-            is_pushing: false,
         }
     }
 

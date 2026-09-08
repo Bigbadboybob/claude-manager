@@ -1176,47 +1176,6 @@ impl App {
                 BackendEvent::Progress(msg) => {
                     self.set_status_msg(&msg);
                 }
-                BackendEvent::PullComplete {
-                    task_id,
-                    worktree_path,
-                    main_repo,
-                    session_id,
-                    repo_url,
-                    prompt,
-                } => {
-                    self.spawn_resumed_session(
-                        Some(task_id),
-                        worktree_path,
-                        main_repo,
-                        session_id,
-                        repo_url,
-                        prompt,
-                    );
-                }
-                BackendEvent::PushComplete {
-                    workspace_id,
-                    task_id,
-                } => {
-                    // Local mutation gated on PushComplete: see
-                    // `push_active` for the invariant. Reaching here
-                    // means git push + GCS upload + API write all
-                    // succeeded, so it's now safe to drop the local
-                    // worktree state and flip to cloud.
-                    self.finish_push(&workspace_id, task_id);
-                }
-                BackendEvent::PushFailed {
-                    workspace_id,
-                    error,
-                } => {
-                    if let Some(ws) = self
-                        .workspaces
-                        .iter_mut()
-                        .find(|w| w.id == workspace_id)
-                    {
-                        ws.is_pushing = false;
-                    }
-                    self.set_status_msg(&format!("Push failed: {}", error));
-                }
                 BackendEvent::PlanTasksUpdated(tasks) => {
                     self.planning.update_from_api(tasks);
                 }
@@ -2707,7 +2666,6 @@ impl App {
                     host_id: cm_daemon::host_id::HostId::local(),
                     sessions: vec![],
                     tombstones: Vec::new(),
-                    is_pushing: false,
                 };
                 let id = ws.id.clone();
                 self.workspaces.push(ws);
@@ -2931,7 +2889,6 @@ mod apply_manifest_diff_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![ts],
             tombstones: Vec::new(),
-            is_pushing: false,
         };
 
         // Build App via the standard ctor THEN inject the
@@ -4940,7 +4897,6 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: Vec::new(),
             tombstones: Vec::new(),
-            is_pushing: false,
         }
     }
 
@@ -5348,7 +5304,7 @@ pub(super) mod pending_workflow_events_tests {
     /// message and issues NO RPC (the rejection precedes any host_pool /
     /// daemon access), and creates no workspace.
     #[test]
-    fn remote_a_n_rejects_in_place_no_rpc() {
+    fn remote_a_n_in_place_does_not_fall_back_when_host_is_offline() {
         let mut app = build_app_for_buffer_tests();
         // Routing keys off the CHOSEN host param, not the global active_host
         // (which stays local here) — proving the host-picker choice drives it.
@@ -5358,8 +5314,8 @@ pub(super) mod pending_workflow_events_tests {
             &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, None, true,
         );
         assert!(
-            status_text(&app).contains("in-place"),
-            "remote in_place must be rejected with a clear message; got {:?}",
+            status_text(&app).contains("not reachable"),
+            "offline remote in_place must report the host failure; got {:?}",
             status_text(&app),
         );
         assert_eq!(app.workspaces.len(), before, "no workspace created on rejection");
@@ -5368,7 +5324,7 @@ pub(super) mod pending_workflow_events_tests {
     /// Criterion: a remote A-n with `seed_from` is rejected, no RPC, no
     /// workspace.
     #[test]
-    fn remote_a_n_rejects_seed_from_no_rpc() {
+    fn remote_a_n_seed_from_uses_remote_host() {
         let mut app = build_app_for_buffer_tests();
         let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
@@ -5376,8 +5332,8 @@ pub(super) mod pending_workflow_events_tests {
             &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, Some("snap-1"), false,
         );
         assert!(
-            status_text(&app).contains("snapshot"),
-            "remote seed_from must be rejected with a clear message; got {:?}",
+            status_text(&app).contains("not reachable"),
+            "remote seeding must reach the host readiness check; got {:?}",
             status_text(&app),
         );
         assert_eq!(app.workspaces.len(), before, "no workspace created on rejection");
@@ -5428,9 +5384,8 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         });
         assert!(
-            status_text(&app).contains("in-place"),
-            "remote chosen host must route to the remote path (in-place \
-             rejection); got {:?}",
+            status_text(&app).contains("not reachable"),
+            "remote chosen host must report the remote host failure; got {:?}",
             status_text(&app),
         );
         assert_eq!(app.workspaces.len(), before, "no workspace on remote rejection");
@@ -5458,7 +5413,7 @@ pub(super) mod pending_workflow_events_tests {
     /// session. Tested directly on `add_remote_session` (the rejection
     /// precedes any host_pool / daemon access).
     #[test]
-    fn remote_a_s_rejects_seed_from_no_rpc() {
+    fn remote_a_s_seed_from_uses_remote_host() {
         let mut app = build_app_for_buffer_tests();
         let tmp = tempfile::tempdir().unwrap();
         app.workspaces.push(test_workspace("ws-rs", tmp.path().to_path_buf()));
@@ -5469,10 +5424,11 @@ pub(super) mod pending_workflow_events_tests {
             "claude",
             None,
             Some("snap-2"),
+            None,
         );
         assert!(
-            status_text(&app).contains("snapshot"),
-            "remote A-s seed_from must be rejected; got {:?}",
+            status_text(&app).contains("not reachable"),
+            "remote seeding must reach the host readiness check; got {:?}",
             status_text(&app),
         );
         assert_eq!(
@@ -6871,7 +6827,6 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: Vec::new(),
             tombstones: Vec::new(),
-            is_pushing: false,
         });
         let entry = ManifestEntry {
             transcript_path: None,
@@ -7025,7 +6980,6 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![local_sess],
             tombstones: Vec::new(),
-            is_pushing: false,
         });
 
         // Remote-hosted workspace (its session pinned to host "manager").
@@ -7052,7 +7006,6 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![remote_sess],
             tombstones: Vec::new(),
-            is_pushing: false,
         });
 
         // A-f on each workspace (empty slots → fresh-spawn launch; the
@@ -7582,7 +7535,6 @@ mod backtest_group_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![],
             tombstones: Vec::new(),
-            is_pushing: false,
         }
     }
 

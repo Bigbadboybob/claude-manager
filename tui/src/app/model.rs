@@ -317,12 +317,7 @@ pub struct Workspace {
     /// already-exited session — its last-known transcript file remains
     /// on disk and the `last_transcript_id` field gives us the path.
     pub tombstones: Vec<SessionTombstone>,
-    /// True between `push_active` and the matching `PushComplete` /
-    /// `PushFailed` event from the backend. Transient — not persisted
-    /// in `ManifestWorkspace`, so a TUI restart mid-push surfaces as
-    /// "not pushing" rather than wedging on a stuck flag (the user can
-    /// retry; the worst case is a duplicate `cm/push-*` branch).
-    pub is_pushing: bool,
+
 }
 
 impl Workspace {
@@ -1080,7 +1075,6 @@ mod worktree_mode_tests {
             host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![],
             tombstones: vec![],
-            is_pushing: false,
         }
     }
 

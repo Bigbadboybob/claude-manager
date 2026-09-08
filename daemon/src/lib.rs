@@ -83,6 +83,7 @@ pub mod session_watch;
 pub mod state;
 pub mod notifications;
 pub mod transcript_detect;
+pub mod transcript_catalog;
 pub mod workflow;
 pub mod worktree;
 pub mod writer_gate;
@@ -1787,3 +1788,5 @@ mod tests {
         );
     }
 }
+
+pub mod agent_memory;

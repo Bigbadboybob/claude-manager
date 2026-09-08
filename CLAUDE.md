@@ -1,8 +1,10 @@
 # Claude Manager
 
-Task orchestration system for planning and running Claude coding sessions. Primarily used **locally with git worktrees** for day-to-day work; cloud dispatch to ephemeral GCP VMs is still supported for cases where it's useful (long-running tasks, isolation, running things away from the local machine).
-
-> **Note:** This project started out cloud-first, but in practice local + worktrees turned out to be much smoother and is now the default mode. Cloud support is retained but secondary. When working on this project, assume local usage unless the user explicitly mentions cloud.
+Task orchestration system for planning and running coding sessions in persistent
+cloud workspaces. The TUI is a viewer: sessions keep running when it disconnects.
+Fresh work uses the configured default host (`sessions`); launch dialogs also
+allow explicit local execution. Existing workspaces retain their owning host.
+Continuous orchestrators remain on `manager`.
 
 ## Repository workflow
 
@@ -156,7 +158,6 @@ Sessions view:
 - `A-p` — fuzzy-find palette: type-to-filter across all workspaces/sessions (case-insensitive substring, prefix matches ranked first; Up/Down/Tab/C-j/C-k select, Enter jumps). Sessions view only — planning keeps `A-p` as project picker.
 - `A-i` — detail peek: read-only overlay with the focused row's bound task (name, status, full prompt — "what was this agent asked to do"), or workspace/session info when unbound. j/k / PgUp/PgDn scroll.
 - `A-'` — yank the focused session's last assistant message to the clipboard (OSC 52, works over SSH; ~100KB cap with truncation notice)
-- `A-9` — push (cloud) · `A-0` — pull (cloud)  *(moved off `A-p`/`A-l`)*
 - `A-r` — refresh
 - `A-R` — **revive / restart** the focused session in place: same uid, label, and task binding, with the conversation resumed (claude `--resume` / codex `resume`; bash respawns fresh). On a **dead** session it's a revive; on a **live** session it's a forced restart — the TUI kills the daemon child, waits (bounded ~2s) for the reaper to clear the uid, then runs the same revive flow (use case: pick up an updated agent binary/model without losing the conversation). Local sessions re-run the startup-restore primitive for one slot (re-attach if the daemon still holds the uid live, else respawn-resumed); remote sessions go through the daemon's `session.revive` RPC (argv/env composed daemon-side) and then auto-reattach via the deferred-reattach flow. Workflow participants are refused (the workflow engine owns their lifecycle — `A-u` resumes the run), as are continuous sessions (scheduler-owned).
 
