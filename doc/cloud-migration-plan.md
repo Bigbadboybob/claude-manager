@@ -61,10 +61,13 @@ work. Owner requested the plan before execution starts.
 
 ## Execution sequence
 
-1. **Move the migration controller outside CM.** Owner resumes this conversation
-   in a separate local Kitty terminal after the planning turn ends. Confirm that
-   takeover before retiring the old CM copy. Avoid concurrently running two
-   writers for the same conversation. The standalone controller has source-file
+1. **Move the migration controller outside CM.** After the planning turn ends,
+   Owner stops this specific CM session from a separate local Kitty terminal,
+   then resumes its saved conversation there. Closing the TUI is insufficient:
+   the CM-owned Codex backend keeps the conversation's active-writer lock even
+   while idle. The attempted resume-before-stop order failed with `already has
+   an active writer`; do not repeat it or delete lock files. Avoid concurrently
+   running two writers for the same conversation. The standalone controller has source-file
    access and can close/relaunch CM without killing itself. Keep transfer jobs
    supervised independently of the TUI and inhibit laptop sleep during copying.
 
@@ -167,8 +170,18 @@ work. Owner requested the plan before execution starts.
 
 Controller conversation ID: `01a07e0e-7821-7ce2-b906-56d5add424fc`.
 Working directory: `/home/lucas/.cm/worktrees/claude-manager-cloud-execution-proposals`.
-Resume with `codex resume 01a07e0e-7821-7ce2-b906-56d5add424fc` from that directory
-in a separate terminal. The original CM copy must remain idle after takeover.
+After the current reply finishes, run the following from that directory in a
+separate terminal. The kill targets only this CM session and retains its saved
+conversation; allow its owned backend to exit before resuming.
+
+```sh
+scripts/cm-op kill_session '{"session_uid":"ts-18d32b77ffec4909-0"}'
+sleep 5
+codex resume 01a07e0e-7821-7ce2-b906-56d5add424fc
+```
+
+Once resumed, tell the standalone session to begin the migration. Do not restart
+the old CM row while the standalone controller owns this conversation.
 
 The one-hour window is a target, not a transfer-time guarantee. Active workspace
 readiness takes priority while the complete archive transfer progresses. Report
