@@ -6,6 +6,7 @@
 //! server thread blocks naturally until the main loop processes the
 //! request — avoiding an unbounded buffer of unanswered replies.
 
+use std::collections::VecDeque;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -17,12 +18,11 @@ pub struct Pending {
     pub reply: mpsc::SyncSender<Response>,
 }
 
-/// Shared queue between the server thread and the main loop. The queue
-/// is `Arc<Mutex<Vec<...>>>` rather than a channel so the main loop can
-/// drain everything in one swap and process without holding the lock.
+/// Shared FIFO between server threads and the main loop. The main loop pops
+/// requests within a per-tick time budget and dispatches without the lock.
 #[derive(Clone, Default)]
 pub struct Queue {
-    inner: Arc<Mutex<Vec<Pending>>>,
+    inner: Arc<Mutex<VecDeque<Pending>>>,
 }
 
 impl Queue {
@@ -36,7 +36,7 @@ impl Queue {
     pub fn submit(&self, request: Request) -> mpsc::Receiver<Response> {
         let (tx, rx) = mpsc::sync_channel::<Response>(1);
         if let Ok(mut q) = self.inner.lock() {
-            q.push(Pending { request, reply: tx });
+            q.push_back(Pending { request, reply: tx });
         }
         rx
     }
@@ -46,9 +46,15 @@ impl Queue {
     /// uses each entry's `reply` to send a response back.
     pub fn drain(&self) -> Vec<Pending> {
         match self.inner.lock() {
-            Ok(mut q) => std::mem::take(&mut *q),
+            Ok(mut q) => q.drain(..).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Take one request without removing the rest of the FIFO. Lets the UI
+    /// yield between expensive requests while preserving submission order.
+    pub fn pop(&self) -> Option<Pending> {
+        self.inner.lock().ok()?.pop_front()
     }
 }
 

@@ -3,6 +3,7 @@ mod agent_memory;
 mod api;
 mod app;
 mod attach_worker;
+mod attach_writer;
 mod attached_pty;
 mod backend;
 mod client_session;

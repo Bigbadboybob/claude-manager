@@ -401,7 +401,7 @@ pub struct App {
     /// Same lifecycle convention as `_manifest_watch_threads`.
     /// 12e-r2 F2: per-host (Vec).
     pub _workflow_watch_threads: Vec<std::thread::JoinHandle<()>>,
-    /// Background per-remote-host `list_sessions` poller channel. Drained per
+    /// Background per-host `list_sessions` poller channel. Drained per
     /// tick into `remote_session_lists`; the adopt scan reads that cache so the
     /// MAIN thread never does a synchronous remote `list_sessions` RPC (that
     /// every-5s round-trip over a slow tunnel was the "TUI freezes" regression).
@@ -411,10 +411,10 @@ pub struct App {
             Vec<crate::client_session::DaemonSessionSummary>,
         )>,
     >,
-    /// Thread handles for the per-remote-host session pollers (lifecycle like
+    /// Thread handles for the per-host session pollers (lifecycle like
     /// `_manifest_watch_threads`).
     pub _session_poll_threads: Vec<std::thread::JoinHandle<()>>,
-    /// Latest daemon session list per REMOTE host, fed off-thread by the
+    /// Latest daemon session list per host, fed off-thread by the
     /// session pollers. The adopt scan reads this instead of a synchronous RPC.
     pub remote_session_lists: std::collections::HashMap<
         cm_daemon::host_id::HostId,
@@ -804,10 +804,13 @@ impl App {
         // delivers WorkflowEvent broadcasts to the main loop.
         let (workflow_watch_rx, _workflow_watch_threads) =
             crate::workflow_watch::spawn_per_host(&host_pool, &hosts);
-        // Per-remote-host session-list pollers: fetch `list_sessions` OFF the
+        // Per-host session-list pollers: fetch `list_sessions` OFF the
         // main thread so the adopt scan never blocks the UI on a remote RPC.
-        let (session_poll_rx, _session_poll_threads) =
-            crate::client_session::spawn_session_pollers(&host_pool, &hosts);
+        let (session_poll_rx, _session_poll_threads) = if cfg!(test) {
+            (None, Vec::new())
+        } else {
+            crate::client_session::spawn_session_pollers(&host_pool, &hosts)
+        };
         // Per-host dispatch-pending pollers (Continuous panel's ○ indicator).
         // Skipped under cfg(test) — like `attach_worker` — so unit tests never
         // spawn a thread that dials the developer's real local daemon socket.

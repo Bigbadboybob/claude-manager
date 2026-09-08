@@ -713,6 +713,36 @@ impl App {
     /// Reuses the restore-path attach machinery
     /// (`try_attach_via_daemon_with_deps`) wholesale.
     fn adopt_untracked_daemon_sessions(&mut self) {
+        if self.attach_worker.is_some() {
+            // Production: even a LOCAL RPC can wait on a busy daemon mutex
+            // until its five-second timeout. Use the poller cache and send
+            // size corrections through each session's nonblocking channel.
+            let local = cm_daemon::host_id::HostId::local();
+            if let Some(summaries) = self.remote_session_lists.get(&local) {
+                let tracked = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| w.sessions.iter())
+                    .filter(|s| s.host_id == local)
+                    .map(|s| s.uid.as_str())
+                    .collect();
+                let drift = Self::select_size_drift_uids(summaries, &tracked, self.last_term_size);
+                for session in self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|w| w.sessions.iter_mut())
+                {
+                    if session.host_id == local && drift.contains(&session.uid) {
+                        session
+                            .session
+                            .resize(self.last_term_size.0, self.last_term_size.1);
+                    }
+                }
+            }
+            self.adopt_cached_via_deferred_reattach(&local);
+            return;
+        }
+        // Synchronous fallback for isolated tests without background workers.
         // Surface daemon-spawned sessions (MCP agents + continuous-task
         // sessions like the bug-triage orchestrator) on EVERY configured host,
         // but NEVER block the main thread on a remote host:
@@ -814,16 +844,16 @@ impl App {
         }
 
         // ============== REMOTE hosts (off-thread cache + defer) ==============
-        self.adopt_remote_via_deferred_reattach(&local);
+        self.adopt_cached_via_deferred_reattach(&local);
     }
 
-    /// Queue untracked REMOTE daemon sessions for deferred attach. Reads the
+    /// Queue untracked daemon sessions for deferred attach. Reads the
     /// off-thread session-poller cache (never a synchronous remote RPC) and
     /// pushes each new adoptee into `pending_remote_reattach`, which
     /// `drain_deferred_remote_reattach` attaches off the blocking path (gated
     /// on tunnel warmth, throttled). The workspace slot is created here (cheap,
     /// local) so the drain has somewhere to land the session.
-    fn adopt_remote_via_deferred_reattach(&mut self, local: &cm_daemon::host_id::HostId) {
+    fn adopt_cached_via_deferred_reattach(&mut self, local: &cm_daemon::host_id::HostId) {
         // Snapshot the cache (cloned) so the per-adoptee `&mut self` workspace
         // work below doesn't conflict with borrowing `remote_session_lists`.
         let remote: Vec<(
@@ -832,7 +862,7 @@ impl App {
         )> = self
             .remote_session_lists
             .iter()
-            .filter(|(h, _)| *h != local)
+            .filter(|(h, _)| *h != local || self.attach_worker.is_some())
             .map(|(h, s)| (h.clone(), s.clone()))
             .collect();
         if remote.is_empty() {

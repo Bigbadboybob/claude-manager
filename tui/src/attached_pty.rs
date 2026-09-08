@@ -35,7 +35,7 @@
 //! `ClientSession::new`; the opt-in branch in `A-n` / `A-s` lives in
 //! 10c-e-3. Until those land this type is reachable only from tests.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +45,8 @@ use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{ChildEvent, EventedPty, EventedReadWrite};
 use polling::{Event, PollMode, Poller};
 
-use crate::term_shim::{ChildEvent as ShimChildEvent, StreamReader, StreamWriter};
+use crate::attach_writer::AttachWriter;
+use crate::term_shim::{ChildEvent as ShimChildEvent, StreamReader};
 
 /// Mirrors `alacritty_terminal::tty::unix::PTY_READ_WRITE_TOKEN`,
 /// which is `pub(crate)` and not importable. Hardcoding the same
@@ -92,7 +93,7 @@ pub struct AttachedPty {
     /// signals child-exit through `child_pipe_write`.
     reader: ReaderHalf,
     /// Client→server side: encodes keystrokes into data frames.
-    writer: StreamWriter<UnixStream>,
+    writer: AttachWriter,
     /// Read end of the child-event self-pipe. Registered under
     /// `PTY_CHILD_EVENT_TOKEN` in `register`. `next_child_event`
     /// drains a byte from this and returns the cached
@@ -277,7 +278,7 @@ impl AttachedPty {
             memory_cap_kill: memory_cap_kill.clone(),
             transport_eof: transport_eof.clone(),
         };
-        let writer = StreamWriter::new(writer_socket, stream_id);
+        let writer = AttachWriter::new(writer_socket, stream_id)?;
 
         Ok(Self {
             socket,
@@ -336,67 +337,10 @@ impl AttachedPty {
     pub fn transport_eof_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.transport_eof)
     }
-
-    /// Opportunistically drain pending writer bytes. Slice-10c-e-2
-    /// review-7 (Shape B).
-    ///
-    /// The bug being fixed: `StreamWriter::write` may report
-    /// `Ok(buf.len())` after a partial drain — its outbound
-    /// queue keeps the remainder, but alacritty's EventLoop
-    /// sees "all bytes written" and clears its own
-    /// `state.write_buffer`. The writable-interest override on
-    /// `register`/`reregister` keeps kernel EPOLLOUT firing, but
-    /// alacritty's writable handler short-circuits when its own
-    /// buffer is empty — so those queued bytes wait until the
-    /// next user keystroke fortuitously triggers another
-    /// `write()`.
-    ///
-    /// Architectural truth: alacritty's `EventLoop` has no hook
-    /// that lets us say "I have pending bytes, please call my
-    /// flush method." Whatever fix we land has to either (a) drive
-    /// the drain ourselves on writable readiness via a separate
-    /// writer thread, or (b) piggyback on the natural TUI rhythm
-    /// of inbound EventLoop calls.
-    ///
-    /// We picked (b) — Shape B in the review's terminology —
-    /// because the steady traffic during any active session is
-    /// daemon→client bytes, so any inbound EventLoop call
-    /// (`reader()`, `register`/`reregister`, `next_child_event`)
-    /// implies a drain cycle. The cost is one no-op call when
-    /// the queue is empty (a `VecDeque::is_empty()` check).
-    ///
-    /// Quiescent-session caveat: if the daemon is silent AND the
-    /// user is not typing AND polling reregister doesn't fire,
-    /// this hook doesn't drain. But a quiescent session has no
-    /// input pressure either — the queue only grows when the user
-    /// types, and typing guarantees another inbound event will
-    /// follow soon. We document the pathological case here but
-    /// don't engineer around it. If the smoke test surfaces a
-    /// case Shape B doesn't cover, escalate to Shape A (writer
-    /// thread that owns the socket write-half) in a follow-up.
-    ///
-    /// ## Do NOT "fix" this preemptively
-    ///
-    /// **Standing rejection from review round 26.** This Shape B
-    /// vs Shape A tradeoff was debated explicitly at the time
-    /// the hook landed; the decision was to ship Shape B with the
-    /// quiescent-session caveat above and escalate to Shape A
-    /// (per-attach writer thread) only on smoke evidence of stuck
-    /// input in practice. The realistic paths keep the reader hot:
-    ///
-    /// - Claude/Codex sessions stream tokens continuously →
-    ///   reader hot → drain fires.
-    /// - Bash sessions echo input characters → reader hot →
-    ///   drain fires.
-    /// - Raw-mode + no-echo (password prompts, paste into
-    ///   `vim` insert mode) is the edge case. Hasn't surfaced
-    ///   as a real smoke failure.
-    ///
-    /// If a future review surfaces "the queue tail might not
-    /// drain in quiescent sessions" again: reject in place,
-    /// point at this comment. The decision is made on smoke
-    /// evidence (visible stuck-paste with no follow-up event),
-    /// not static analysis. Don't re-litigate it round by round.
+    /// Opportunistic low-latency flush. AttachWriter also drives queued bytes
+    /// on writable readiness, independently of inbound traffic. The former
+    /// inbound-only drain stalled a real Alacritty loop against a silent peer
+    /// after a partial frame (see idle_peer_receives_backpressured_input...).
     fn drain_pending(&mut self) {
         // Errors are swallowed: a failed drain leaves bytes
         // queued, which the next inbound hook will retry. A
@@ -408,7 +352,7 @@ impl AttachedPty {
 
 impl EventedReadWrite for AttachedPty {
     type Reader = ReaderHalf;
-    type Writer = StreamWriter<UnixStream>;
+    type Writer = AttachWriter;
 
     /// Register the data socket under `PTY_READ_WRITE_TOKEN` and
     /// the child-event self-pipe read end under
@@ -435,16 +379,6 @@ impl EventedReadWrite for AttachedPty {
         // before any other work. See `drain_pending` for the
         // full why.
         self.drain_pending();
-        // Slice-10c-e-2 review-5 fix #1: keep writable interest
-        // set while OUR outbound queue has pending bytes, even
-        // when alacritty's `state.write` thinks the write
-        // completed. Without this the kernel stops delivering
-        // writable events once alacritty's buffer empties, and
-        // our partially-queued bytes sit until the next user
-        // keystroke triggers another write() call.
-        if self.writer.pending_bytes() > 0 {
-            interest.writable = true;
-        }
         unsafe {
             poll.add_with_mode(&self.socket, interest, mode)?;
         }
@@ -466,12 +400,6 @@ impl EventedReadWrite for AttachedPty {
         interest.key = PTY_READ_WRITE_TOKEN;
         // Slice-10c-e-2 review-7 (Shape B): opportunistic drain.
         self.drain_pending();
-        // Same writable-interest override as in `register` —
-        // override alacritty's "I think writes are done" view
-        // when our queue still has pending bytes.
-        if self.writer.pending_bytes() > 0 {
-            interest.writable = true;
-        }
         poll.modify_with_mode(&self.socket, interest, mode)?;
         poll.modify_with_mode(
             &self.child_pipe_read,
@@ -592,6 +520,80 @@ mod tests {
     use super::*;
     use cm_daemon::control::protocol::{StreamFrame, StreamKind};
     use std::io::Write as _;
+
+    #[test]
+    fn idle_peer_receives_backpressured_input_without_followup_event() {
+        backpressured_paste_round_trip(crate::term_shim::MAX_INPUT_FRAME_BYTES);
+    }
+
+    #[test]
+    fn large_paste_preserves_bytes_across_backpressured_frames() {
+        backpressured_paste_round_trip(3 * crate::term_shim::MAX_INPUT_FRAME_BYTES + 37);
+    }
+
+    fn backpressured_paste_round_trip(bytes: usize) {
+        use alacritty_terminal::{
+            event_loop::{EventLoop, Msg},
+            sync::FairMutex,
+            Term,
+        };
+        use base64::Engine;
+        let (client, mut server) = socket_pair();
+        let size: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    client.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &size as *const _ as *const _,
+                    std::mem::size_of_val(&size) as _,
+                )
+            },
+            0
+        );
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let pty = AttachedPty::from_socket(client, "backpressure-smoke").unwrap();
+        let (tx, _events) = std::sync::mpsc::channel();
+        let proxy = crate::session::EventProxy::new(tx);
+        let term = Arc::new(FairMutex::new(Term::new(
+            Default::default(),
+            &crate::session::TermSize {
+                columns: 80,
+                screen_lines: 24,
+            },
+            proxy.clone(),
+        )));
+        let event_loop = EventLoop::new(term, proxy, pty, false, false).unwrap();
+        let sender = event_loop.channel();
+        let worker = event_loop.spawn();
+        let payload: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+        sender
+            .send(Msg::Input(std::borrow::Cow::Owned(payload.clone())))
+            .unwrap();
+        // Let the socket fill before the peer starts draining. The peer sends
+        // NO output: it cannot echo an input frame it has not fully received.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let received = (|| -> io::Result<Vec<u8>> {
+            let mut received = Vec::new();
+            while received.len() < payload.len() {
+                let frame = cm_daemon::control::wire::read_stream_frame(&mut server)?
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+                assert_eq!(frame.kind, StreamKind::Input);
+                received.extend(base64::engine::general_purpose::STANDARD
+                    .decode(frame.payload["bytes"].as_str().unwrap()).unwrap());
+            }
+            Ok(received)
+        })();
+        sender.send(Msg::Shutdown).unwrap();
+        let _ = worker.join().unwrap();
+        assert_eq!(
+            received.expect("paste stalled waiting for another keystroke or output"),
+            payload
+        );
+    }
 
     /// Encode one length-prefixed `StreamFrame` into a Vec for
     /// wire-shape tests.

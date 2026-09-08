@@ -1271,15 +1271,20 @@ impl App {
     /// Handlers run on the main loop so they have free `&mut self` access
     /// to App state without any extra locking.
     pub fn drain_control_events(&mut self) {
-        let pending = self.control_queue.drain();
-        if pending.is_empty() {
-            return;
-        }
-        for entry in pending {
+        let deadline = Instant::now() + Duration::from_millis(4);
+        while let Some(entry) = self.control_queue.pop() {
+            let started = Instant::now();
             let resp = self.dispatch_control(&entry.request);
+            crate::log_slow_phase(
+                &format!("control:{}", entry.request.method),
+                started.elapsed(),
+            );
             let _ = entry.reply.send(resp);
+            self.needs_redraw = true;
+            if Instant::now() >= deadline {
+                break;
+            }
         }
-        self.needs_redraw = true;
     }
 
     /// Dispatch a single control-socket request to its method handler.

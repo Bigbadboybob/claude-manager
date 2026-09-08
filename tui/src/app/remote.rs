@@ -28,6 +28,7 @@ use super::*;
 /// `drain_deferred_remote_reattach` reattaches once it's connectable.
 #[derive(Clone)]
 pub(super) struct PendingRemoteReattach {
+    request_id: u64,
     ws_id: String,
     pub(super) entry: cm_daemon::manifest::ManifestEntry,
     /// Remote auto-reconnect bound: consecutive failed reattach attempts made
@@ -54,7 +55,9 @@ pub(super) struct PendingRemoteReattach {
 impl PendingRemoteReattach {
     /// Fresh worklist item — no reattach attempts yet.
     pub(super) fn new(ws_id: String, entry: cm_daemon::manifest::ManifestEntry) -> Self {
+        static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            request_id: NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ws_id,
             entry,
             attempts: 0,
@@ -232,19 +235,20 @@ impl App {
             .iter()
             .map(|r| r.run_id.clone())
             .collect();
-        let pending = std::mem::take(&mut self.pending_remote_reattach);
+        let mut pending = std::mem::take(&mut self.pending_remote_reattach);
+        let focused = self.cursor_session_uid();
+        pending.sort_by_key(|p| focused.as_deref() != Some(p.entry.uid.as_str()));
         let mut still_pending: Vec<PendingRemoteReattach> = Vec::new();
-        // At most one dispatch per host per tick. The attach WORKER re-warms a
-        // dead/respawning tunnel itself (`try_attach_via_daemon_with_deps` →
-        // `host_pool.for_host` → `ensure_alive`), and its `SshTunnel::spawn`
-        // blocks ~1-3s; capping to one in-flight attach per host means an
-        // outage triggers ONE respawn attempt per tick rather than one per
-        // pending session (a genuinely-offline host would otherwise queue a
-        // spawn storm on the single worker thread). Remaining sessions on the
-        // same host ride the next tick.
-        let mut dispatched_hosts: std::collections::HashSet<cm_daemon::host_id::HostId> =
-            std::collections::HashSet::new();
+        // Count unfinished work ACROSS ticks, not just this tick's dispatches.
+        // Remaining requests stay here so focus changes can reprioritize them.
+        let mut in_flight = std::collections::HashMap::new();
+        for p in self.attaching.values() {
+            *in_flight.entry(p.entry.host_id.clone()).or_insert(0usize) += 1;
+        }
         for p in pending {
+            if self.attaching.contains_key(&p.entry.uid) {
+                continue;
+            }
             // NOTE: no `live_socket_path` gate here (removed in
             // `cm/fix-frozen-remote-session`). That non-blocking probe never
             // respawns a dead tunnel, and the only code that does
@@ -276,14 +280,17 @@ impl App {
                 still_pending.push(p);
                 continue;
             };
-            // One dispatch per host per tick (see `dispatched_hosts`).
-            if !dispatched_hosts.insert(p.entry.host_id.clone()) {
+            if self.attaching.len() >= crate::attach_worker::ATTACH_WORKERS
+                || in_flight.get(&p.entry.host_id).copied().unwrap_or(0)
+                    >= crate::attach_worker::ATTACHES_PER_HOST
+            {
                 still_pending.push(p);
                 continue;
             }
             let cleaned = untag_stale_workflow(&p.entry, &active_run_ids);
             let entry_for_attach = cleaned.unwrap_or_else(|| p.entry.clone());
             let req = crate::attach_worker::AttachRequest {
+                request_id: p.request_id,
                 ws_id: p.ws_id.clone(),
                 entry: entry_for_attach,
                 worktree,
@@ -297,6 +304,7 @@ impl App {
                 .map(|w| w.request(req))
                 .unwrap_or(false);
             if dispatched {
+                *in_flight.entry(p.entry.host_id.clone()).or_insert(0) += 1;
                 self.attaching.insert(p.entry.uid.clone(), p);
             } else {
                 still_pending.push(p); // worker gone — retry next tick
@@ -320,7 +328,24 @@ impl App {
         }
         let mut changed = false;
         for result in results {
+            // Closing/reopening a pane can leave an old worker finishing after
+            // a NEW request for the same UID. Never remove or bind that request.
+            if !self
+                .attaching
+                .get(&result.entry.uid)
+                .is_some_and(|p| p.request_id == result.request_id)
+            {
+                continue;
+            }
             let queued = self.attaching.remove(&result.entry.uid);
+            if !self
+                .workspaces
+                .iter()
+                .any(|w| w.id == result.ws_id && !w.is_closed)
+            {
+                self.reconnecting_sessions.remove(&result.entry.uid);
+                continue;
+            }
             match result.session {
                 Some(session) => {
                     // Record the tunnel generation this stream was dialed under
@@ -462,6 +487,7 @@ impl App {
             .pending_remote_reattach
             .iter()
             .any(|p| p.entry.uid == entry.uid)
+            || self.attaching.contains_key(&entry.uid)
         {
             return false;
         }
@@ -940,24 +966,14 @@ impl App {
         }
     }
 
-    /// Remote auto-reconnect: drop any reconnect bookkeeping for `uid` when its
-    /// session is closed/removed. Without this, closing a session during the
-    /// offline window (when `kill_session` can't even reach the daemon because
-    /// the tunnel is down) would leave the queued reattach work item behind,
-    /// and `drain_deferred_remote_reattach` would RESURRECT the session — re-
-    /// creating something the user explicitly removed — once the tunnel
-    /// returns. We only touch `pending_remote_reattach` when the uid was
-    /// actually reconnecting: a restore-deferred entry (queued but never
-    /// surfaced as a live slot) never reaches a close path, so its work item is
-    /// left intact. No-op for the common (non-reconnecting) close.
-    ///
-    /// `pub(crate)` so the control-socket `kill_session` handler
-    /// (`control::methods`) routes its removal through here too — same
-    /// resurrection guard as the operator close paths.
+    /// Cancel queued/in-flight viewing requests when a session is removed.
+    /// Late worker results carry their request identity and are discarded;
+    /// they must not resurrect a closed pane or replace a newer attach.
     pub(crate) fn forget_reconnect_state(&mut self, uid: &str) {
-        if self.reconnecting_sessions.remove(uid) {
-            self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
-        }
+        self.reconnecting_sessions.remove(uid);
+        self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
+        self.attaching.remove(uid);
+        self.attached_tunnel_generation.remove(uid);
     }
 
     /// Manual "reconnect now" lever, invoked by `A-r` (refresh). The auto-
@@ -1128,6 +1144,143 @@ mod remote_reconnect_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn local_adoption_uses_cached_poll_without_blocking_the_ui() {
+        let _guard = crate::test_support::home_lock();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let socket = home.path().join("stalled-daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut app = app_with_manager_host(&socket);
+        let (worker, _requests, _results) = crate::attach_worker::AttachWorker::for_test();
+        app.attach_worker = Some(worker);
+        app.sessions_restored = true;
+        let summary = crate::client_session::parse_daemon_session_summary(&serde_json::json!({
+            "session_uid": "cached-local", "type": "claude", "label": "cached local",
+            "managed_by_uid": "parent", "worktree_path": home.path(),
+        }))
+        .unwrap();
+        app.remote_session_lists
+            .insert(cm_daemon::host_id::HostId::local(), vec![summary]);
+        let started = Instant::now();
+        app.maybe_adopt_daemon_sessions();
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "UI adoption must not dial even a local daemon"
+        );
+        assert!(app
+            .pending_remote_reattach
+            .iter()
+            .any(|p| p.entry.uid == "cached-local"));
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn attach_queue_prioritizes_focus_and_bounds_work_across_ticks() {
+        let _guard = crate::test_support::home_lock();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let mut app = app_with_manager_host(&home.path().join("daemon.sock"));
+        let (worker, requests, _results) = crate::attach_worker::AttachWorker::for_test();
+        app.attach_worker = Some(worker);
+        let (ts, _tx, _) = session_with_injected_exit("focused", manager_host(), false);
+        let mut ws = workspace_with(ts);
+        ws.worktree_path = Some(home.path().to_path_buf());
+        for i in 0..70 {
+            let mut entry = ws.sessions[0].to_manifest_entry();
+            entry.uid = format!("background-{i}");
+            app.pending_remote_reattach
+                .push(PendingRemoteReattach::new(ws.id.clone(), entry));
+        }
+        app.pending_remote_reattach.push(PendingRemoteReattach::new(
+            ws.id.clone(),
+            ws.sessions[0].to_manifest_entry(),
+        ));
+        app.workspaces = vec![ws];
+        app.cursor = Cursor::Session(0, 0);
+        for _ in 0..100 {
+            app.dispatch_deferred_remote_attaches();
+        }
+        let sent: Vec<_> = requests.try_iter().collect();
+        assert_eq!(sent.len(), crate::attach_worker::ATTACHES_PER_HOST);
+        assert_eq!(sent[0].entry.uid, "focused");
+        assert_eq!(app.pending_remote_reattach.len(), 69);
+        // Switching focus before the next completion reprioritizes remaining work.
+        app.workspaces[0].sessions[0].uid = "background-69".into();
+        app.attaching.remove(&sent[0].entry.uid);
+        app.dispatch_deferred_remote_attaches();
+        assert_eq!(requests.try_recv().unwrap().entry.uid, "background-69");
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn cancelled_attach_result_cannot_replace_a_new_request_or_reopen_workspace() {
+        let _guard = crate::test_support::home_lock();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let mut app = app_with_manager_host(&home.path().join("daemon.sock"));
+        let (worker, _requests, results) = crate::attach_worker::AttachWorker::for_test();
+        app.attach_worker = Some(worker);
+        let (ts, _tx, _) = session_with_injected_exit("cancelled", manager_host(), false);
+        let ws = workspace_with(ts);
+        let entry = ws.sessions[0].to_manifest_entry();
+        let old = PendingRemoteReattach::new(ws.id.clone(), entry.clone());
+        let old_id = old.request_id;
+        app.attaching.insert(entry.uid.clone(), old);
+        app.workspaces = vec![ws];
+        app.forget_reconnect_state(&entry.uid);
+        let fresh = PendingRemoteReattach::new("ws-remote".into(), entry.clone());
+        let fresh_id = fresh.request_id;
+        app.attaching.insert(entry.uid.clone(), fresh);
+        results
+            .send(crate::attach_worker::AttachResult {
+                request_id: old_id,
+                ws_id: "ws-remote".into(),
+                entry: entry.clone(),
+                attempts: 0,
+                session: None,
+                failure: Some(crate::attach_worker::AttachFailureKind::TransportDown),
+                tunnel_generation: None,
+            })
+            .unwrap();
+        app.drain_attach_results();
+        assert_eq!(app.attaching[&entry.uid].request_id, fresh_id);
+        assert!(app.pending_remote_reattach.is_empty());
+
+        app.workspaces[0].is_closed = true;
+        let (returned, _tx, _) = session_with_injected_exit("returned", manager_host(), false);
+        results
+            .send(crate::attach_worker::AttachResult {
+                request_id: fresh_id,
+                ws_id: "ws-remote".into(),
+                entry,
+                attempts: 0,
+                session: Some(returned.session),
+                failure: None,
+                tunnel_generation: Some(0),
+            })
+            .unwrap();
+        app.workspaces[0].sessions.clear();
+        app.drain_attach_results();
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert!(app.attaching.is_empty());
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 
     fn manager_host() -> cm_daemon::host_id::HostId {
         cm_daemon::host_id::HostId::new("manager")

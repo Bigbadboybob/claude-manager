@@ -24,8 +24,9 @@
 //!   the operator may never click into.
 //! - **RAII drop**: `SshTunnel` Drop kills the ssh child;
 //!   `ConnectionHandle` Drop additionally unlinks the local
-//!   socket file. On TUI crash the kernel reaps the child but
-//!   the socket file can persist; `SshTunnel::spawn` cleans up
+//!   socket file. A lifetime thread arms Linux parent-death cleanup,
+//!   including abrupt TUI termination. The socket file can persist;
+//!   `SshTunnel::spawn` cleans up
 //!   any pre-existing socket at the resolved path on each call
 //!   to recover from those crashes.
 //! - **Dead-child detection + lazy respawn**: each `for_host`
@@ -706,6 +707,9 @@ impl SshTunnelSpec {
 /// the child and unlinks `local_socket`.
 pub struct SshTunnel {
     child: std::process::Child,
+    // Keep the spawning thread alive: Linux PDEATHSIG follows that THREAD,
+    // not just its process. A short-lived RPC caller must not kill the tunnel.
+    _lifetime: Option<std::sync::mpsc::Sender<()>>,
     /// The PER-SPAWN local socket path. For
     /// `LocalSocketConfig::RandomPerSpawn` this carries the
     /// fresh `<dir>/cm-host-<host_name>-<16-hex>.sock` chosen
@@ -723,6 +727,50 @@ pub struct SshTunnel {
     /// child's stderr pipe closing when the child dies; we
     /// don't explicitly join here (best-effort cleanup).
     _stderr_thread: Option<JoinHandle<()>>,
+}
+
+fn spawn_tunnel_child(
+    mut cmd: std::process::Command,
+) -> io::Result<(std::process::Child, std::sync::mpsc::Sender<()>)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent_pid = unsafe { libc::getpid() };
+        // SAFETY: only async-signal-safe syscalls in the post-fork child.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // Parent may have died between fork and arming PDEATHSIG.
+                if libc::getppid() != parent_pid {
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let (lifetime_tx, lifetime_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cm-tui-ssh-owner".into())
+        .spawn(move || match cmd.spawn() {
+            Ok(child) => {
+                if let Err(std::sync::mpsc::SendError(Ok(mut child))) = result_tx.send(Ok(child)) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                let _ = lifetime_rx.recv();
+            }
+            Err(e) => {
+                let _ = result_tx.send(Err(e));
+            }
+        })?;
+    let child = result_rx
+        .recv()
+        .map_err(|_| io::Error::other("SSH owner thread stopped"))??;
+    Ok((child, lifetime_tx))
 }
 
 impl SshTunnel {
@@ -791,6 +839,14 @@ impl SshTunnel {
                     // readiness timeout kills it. Fail fast instead.
                     "-o".into(),
                     "BatchMode=yes".into(),
+                    // Keep the managed child in the foreground even if the
+                    // user's SSH config normally backgrounds or shares it.
+                    "-o".into(),
+                    "ForkAfterAuthentication=no".into(),
+                    "-o".into(),
+                    "ControlMaster=no".into(),
+                    "-o".into(),
+                    "ControlPath=none".into(),
                     "-N".into(),
                     "-L".into(),
                     forward.into(),
@@ -819,7 +875,7 @@ impl SshTunnel {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| {
+        let (child, lifetime) = spawn_tunnel_child(cmd).map_err(|e| {
             io::Error::other(format!(
                 "failed to spawn `{}`: {}. (host: {}, local_socket: {})",
                 spec.command.display(),
@@ -831,7 +887,16 @@ impl SshTunnel {
 
         let recent_stderr: Arc<Mutex<VecDeque<String>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_RING_CAP)));
-        let stderr_thread = if let Some(stderr) = child.stderr.take() {
+        // Own the child before any fallible setup so thread-creation errors
+        // and readiness failures also kill/reap it and remove its socket.
+        let mut tunnel = SshTunnel {
+            child,
+            _lifetime: Some(lifetime),
+            local_socket,
+            recent_stderr: Arc::clone(&recent_stderr),
+            _stderr_thread: None,
+        };
+        tunnel._stderr_thread = if let Some(stderr) = tunnel.child.stderr.take() {
             let buf = Arc::clone(&recent_stderr);
             let t = std::thread::Builder::new()
                 .name("cm-tui-ssh-stderr".to_string())
@@ -863,26 +928,21 @@ impl SshTunnel {
         // themselves in the cleanup → ssh-bind window.
         let deadline = Instant::now() + SPAWN_SOCKET_WAIT;
         while Instant::now() < deadline {
-            if let Ok(Some(status)) = child.try_wait() {
+            if let Ok(Some(status)) = tunnel.child.try_wait() {
                 let stderr_dump = format_stderr_dump(&recent_stderr);
                 return Err(io::Error::other(format!(
                     "ssh tunnel exited prematurely with status {} \
                      (local_socket={}, remote_socket={}, ssh_host={}). \
                      recent stderr:\n  {}",
                     status,
-                    local_socket.display(),
+                    tunnel.local_socket.display(),
                     spec.remote_socket.display(),
                     spec.ssh_host,
                     stderr_dump,
                 )));
             }
-            if std::os::unix::net::UnixStream::connect(&local_socket).is_ok() {
-                return Ok(SshTunnel {
-                    child,
-                    local_socket,
-                    recent_stderr,
-                    _stderr_thread: stderr_thread,
-                });
+            if std::os::unix::net::UnixStream::connect(&tunnel.local_socket).is_ok() {
+                return Ok(tunnel);
             }
             std::thread::sleep(SPAWN_POLL_INTERVAL);
         }
@@ -890,13 +950,11 @@ impl SshTunnel {
         // Timeout. Kill the child + surface stderr in the error
         // message so the operator can tell what actually went
         // wrong.
-        let _ = child.kill();
-        let _ = child.wait();
         let stderr_dump = format_stderr_dump(&recent_stderr);
         Err(io::Error::other(format!(
             "ssh tunnel did not become ready (UnixStream::connect to {}) \
              within {:?} (remote_socket={}, ssh_host={}). recent stderr:\n  {}",
-            local_socket.display(),
+            tunnel.local_socket.display(),
             SPAWN_SOCKET_WAIT,
             spec.remote_socket.display(),
             spec.ssh_host,
@@ -914,6 +972,7 @@ impl SshTunnel {
     ) -> Self {
         SshTunnel {
             child,
+            _lifetime: None,
             local_socket,
             recent_stderr: Arc::new(Mutex::new(VecDeque::new())),
             _stderr_thread: None,
@@ -1646,6 +1705,87 @@ fn build_handle(host: &HostConfig) -> io::Result<ConnectionHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_survives_short_lived_spawn_caller() {
+        let (mut child, lifetime) = std::thread::spawn(|| {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            spawn_tunnel_child(cmd).unwrap()
+        })
+        .join()
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(lifetime);
+        assert!(
+            alive,
+            "a caller thread exiting must not kill a shared tunnel"
+        );
+    }
+
+    // A separate test process represents a TUI killed without running Drop.
+    #[test]
+    fn tunnel_crash_subprocess() {
+        let Some(path) = std::env::var_os("CM_TEST_TUNNEL_CRASH_PID") else {
+            return;
+        };
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let (child, lifetime) = spawn_tunnel_child(cmd).unwrap();
+        std::fs::write(path, child.id().to_string()).unwrap();
+        std::mem::forget((child, lifetime));
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn tunnel_dies_when_client_is_killed_without_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("child-pid");
+        let mut client = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host_pool::tests::tunnel_crash_subprocess",
+                "--nocapture",
+            ])
+            .env("CM_TEST_TUNNEL_CRASH_PID", &path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = pid.parse::<u32>() {
+                    break Some(pid);
+                }
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        client.kill().unwrap();
+        client.wait().unwrap();
+        let pid = pid.expect("test client must publish the tunnel pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // PID 1 may not reap immediately; a zombie has already exited.
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            if stat.as_ref().map_or(true, |s| s.contains(") Z ")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tunnel survived its client crash"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     use crate::hosts::HostsConfig;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};

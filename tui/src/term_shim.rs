@@ -637,13 +637,9 @@ impl<W: Write> StreamWriter<W> {
 // `reregister` / `next_child_event`. See `attached_pty.rs::
 // drain_pending`'s long doc for the full Shape B vs Shape A
 // debate and the standing rejection (rounds 26, 30, 31, 33).
-// This is intentional, not a missing piece. Quiescent-session
-// caveat is the documented tradeoff — escalate to Shape A
-// (per-attach writer thread) only on smoke evidence of stuck
-// input in practice. Do not "fix" preemptively. If you're a
-// future reviewer pattern-matching on the `Ok(buf.len())`
-// shape, read `drain_pending`'s doc and the NOTES.md
-// "Rejected findings" subsection before flagging.
+// AttachedPty uses AttachWriter to flush queued wire bytes independently of
+// alacritty's raw-input buffer. A partial frame must not wait for remote output:
+// the remote cannot echo input until it has received the complete frame.
 impl<W: Write> Write for StreamWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Empty writes are a no-op rather than triggering an empty
@@ -732,12 +728,6 @@ impl<W: Write> Write for StreamWriter<W> {
             Err(e) if e.kind() == ErrorKind::WouldBlock => {}
             Err(e) => return Err(e),
         }
-        // STATIC-ANALYSIS-FYI: yes, this returns Ok(buf.len())
-        // without guaranteeing the queue fully drained. The tail
-        // is drained opportunistically on inbound EventLoop calls
-        // — see `attached_pty.rs::drain_pending` (Shape B) and
-        // its standing rejection comment (rounds 26, 30, 31, 33).
-        // Rejected five times; sixth pass should reject in place.
         Ok(buf.len())
     }
 

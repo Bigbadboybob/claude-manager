@@ -1213,7 +1213,7 @@ pub fn rpc_list_daemon_sessions(
     Ok(arr.iter().filter_map(parse_daemon_session_summary).collect())
 }
 
-/// Background per-remote-host session-list poller. One thread per non-local
+/// Background per-host session-list poller. One thread per configured
 /// host that, every `SESSION_POLL_INTERVAL`, fetches the daemon's session list
 /// over the (already-warmed) tunnel and posts `(host_id, summaries)` on the
 /// returned channel. Mirrors `manifest_watch::spawn_per_host`.
@@ -1223,8 +1223,8 @@ pub fn rpc_list_daemon_sessions(
 /// every-5s main-thread round-trip that, over a slow/flaky WAN tunnel, stalled
 /// the UI ("can't type"). The blocking RPC is fine HERE because it's off the
 /// main thread; the main loop only does a non-blocking `try_recv` on the
-/// channel + caches the latest list per host. Local host is excluded — the
-/// adopt scan fetches it synchronously (cheap local socket).
+/// channel + caches the latest list per host. Local calls also run here:
+/// daemon contention can make a local RPC wait its full timeout.
 ///
 /// `live_socket_path` (non-blocking, never spawns a tunnel) gates each poll so
 /// a cold/unreachable host is silently skipped; the per-host `manifest.watch`
@@ -1239,11 +1239,7 @@ pub fn spawn_session_pollers(
     const SESSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
     let (tx, rx) = std::sync::mpsc::channel();
     let mut threads = Vec::new();
-    let local = cm_daemon::host_id::HostId::local();
     for host in &hosts.hosts {
-        if host.id == local {
-            continue;
-        }
         let pool = std::sync::Arc::clone(host_pool);
         let host_id = host.id.clone();
         let tx = tx.clone();
