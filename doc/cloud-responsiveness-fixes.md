@@ -181,3 +181,40 @@ Final stability verification completed **2026-09-08 02:50:11 UTC**, after 602 se
 observation. Epochs stayed at 17 / 14 with no additional brain restarts,
 `breaker_state=running`, successful MCP checks, and matching session counts
 (27 local / 20 cloud) throughout. No required rollout checks remain.
+
+### Blank panes after the first cloud upgrade
+
+2026-09-08 UTC. The owner's Bug Triage pane was mostly blank after the rollout.
+The local fix (`43c4414`, replay-ring persistence) was already in the new cloud
+binary, but the **outgoing** cloud brain predated it. At 02:26:40 the old brain
+exited without saving its screen buffers. The next deploy at 02:38:38 logged
+`0 replay ring(s) persisted`: the new code had inherited empty rings from the
+old generation. Reconnecting or relaunching the TUI could only replay those
+empty buffers and subsequent incremental draws.
+
+Diagnosis found 17 empty cloud buffers, two with only small incremental updates
+(Bug Triage had 370 bytes), and one already repainted session. A brief one-column
+PTY resize and restoration recovered the other 19 sessions without sending
+prompts or restarting agents. Bug Triage regenerated 531,157 bytes; replaying
+them through the TUI's Alacritty terminal emulator produced 89 nonblank rows.
+All 20 sessions then had nonblank rendered screens. No daemon source change was
+needed: the persistence fix was already installed on both hosts.
+
+The existing isolated `brain_deploy_via_daemon_restart_rides_sessions_through`
+regression passed. A single cloud brain restart then checked the recovered
+production screens: at 03:03:37, 20 rings were persisted, and at 03:03:38 all 20
+were restored. Every buffer matched byte for byte and every rendered screen
+hash matched before/after. Fresh `attach.direct` streams through the TUI's
+existing SSH tunnel also delivered all 4,656,547 bytes across 82 frames intact,
+without input, resize, or metadata changes. The recovery and reconnect produced
+no new entries in the TUI's log of phases taking more than 200 ms.
+Holder PID 1826861 and all 20 agent PID/start-time
+pairs stayed unchanged. Cloud epoch advanced 14 → 15, brain PID 3591662; the
+local daemon was untouched. Verification artifacts are private under
+`~/.cm/releases/blank-pane-recovery-578f7c0/`.
+
+The ten-minute stability check completed at **2026-09-08 03:13:49 UTC** after
+612 seconds. Cloud epoch stayed at 15 with no extra brain restarts, all 20
+sessions present, matching holder/brain counts, and healthy MCP throughout.
+The final screen and process snapshots still matched the pre-restart snapshots.
+No TUI relaunch or further deployment is needed for this recovery.

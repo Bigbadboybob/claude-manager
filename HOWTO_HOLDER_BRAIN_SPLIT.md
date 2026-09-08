@@ -100,6 +100,36 @@ binary by fd at exec time, so an in-flight `cp` can never half-apply.
 `scripts/cm-op daemon.reload_config` or `kill -HUP <brain_pid>` (the holder
 ignores HUP).
 
+### Screen replay across deploys
+
+Check screen preservation as well as process health. A healthy holder and
+unchanged agent PIDs do not prove the next TUI attachment has anything to draw.
+The outgoing brain logs `N replay ring(s) persisted`; the incoming brain logs
+`N replay ring(s) restored`. For a session that was producing output before the
+deploy, `read_session_output {"session_uid":"..."}` should still return a
+nonempty replay afterward. Its `bytes` field is base64 terminal output; inspect
+byte counts or hashes without printing the session's contents into deploy logs.
+An empty `~/.cm/daemon-rings/` after startup is normal: adoption reads and unlinks
+each file. The directory is a handoff, not a standing backup.
+
+**First upgrade from a brain predating replay persistence:** installing the fix
+cannot make the outgoing old binary save its in-memory buffers. The first
+upgraded brain can therefore inherit empty screens, and later deploys faithfully
+preserve those empty buffers. This happened on cm-manager on 2026-09-08; see
+[the recovery record](doc/cloud-responsiveness-fixes.md#blank-panes-after-the-first-cloud-upgrade).
+Brain crashes and replay-file errors can also leave buffers missing.
+
+For an affected running Codex session, a brief PTY width change followed by
+restoring its original dimensions made Codex redraw its history and composer
+without restarting the agent or sending input. Use `list_sessions` to capture
+the current `cols`/`rows`, then `session.resize` with `session_uid`, `cols`, and
+`rows`. Let the temporary size take effect, restore it even on diagnostic
+failure, and avoid overwriting a newer user resize. Repaint output can arrive
+asynchronously; wait for it before judging recovery. Reattaching to an empty
+ring alone cannot reconstruct the lost screen. This is a recovery for the
+application's repaintable state, not a way to recover arbitrary shell output
+or scrollback beyond the bounded replay ring.
+
 ## 4. When a deploy goes wrong
 
 | Symptom | What happens | You do |
