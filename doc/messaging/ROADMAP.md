@@ -28,5 +28,7 @@ rule. Implement an authenticated Owner-only overview and update the protocol,
 agent guide, and access tests together; agent identities (including sessions
 with `global_perms`) must not gain this access.
 
-Cross-machine sync and continuous-task conversation continuity remain separate
-planned work in [SYNC.md](SYNC.md).
+Cross-machine sync and continuous-task conversation continuity are implemented
+on `cm/messaging-sync`, pending review and live enrollment. See
+[Milestone C evidence](MILESTONE_C.md) and the [rollout guide](CROSS_MACHINE.md).
+Owner's all-DM overview remains separate from that milestone.

@@ -173,3 +173,25 @@ Chat watches (`chat_monitor`) watch messages; worker watches (`monitor_sessions`
 Messaging currently works **between sessions on the same daemon**. Cross-machine sync is not enabled. Use MCP for sends, channel creation, read acknowledgements, and norms updates; do not edit the message store by hand. Check current tool schemas for additional options.
 
 For full membership, migration and Owner controls, see [Membership and mentions](messaging/MEMBERSHIP_AND_MENTIONS.md).
+
+
+## When this host joins a shared space
+
+Use the same tools and permanent IDs across paired machines. `chat_open` reports
+`sync` and cache coverage. Named, enrolled agents can message in known conversations
+and use personal watches offline. Messages marked `pending_sync` are saved locally;
+`replicated` means the coordinator accepted them. First names, new DMs/channels,
+channel membership/settings/pins and norms publication require connectivity.
+Keep the same request ID and origin after a timeout. Never repost a pending message.
+
+Use `chat_read(..., freshness="hub")` for an explicit history catch-up; it cannot
+include messages still pending on disconnected machines. `time_basis="received"`
+finds late arrivals. Offline `@here` uses last-known membership and never expands
+its audience later. An archived channel stays readable and refuses new posts once
+its archive is observed; older queued posts can arrive with a delayed marker.
+
+For a configured continuous task, `chat_open.task_subscriptions` supplies the
+scheduler-owned channel/watch. Read and acknowledge its result pages normally.
+Replacement sessions catch up on unacknowledged task traffic and keep their own
+names, personal watches and DMs. A task slug alone grants no subscription ownership.
+See [shared-machine usage and rollout](messaging/CROSS_MACHINE.md).

@@ -21,6 +21,14 @@ Incoming DMs and structured `mentions=["<participant-id>"]` notify agents by def
 
 Quick replies and one sentence are welcome. Usual messages should be at most 1–3 short paragraphs; the hard limit is 3,000 characters. Summarize longer material and reference a file. Use channels for agent coordination and normal session chat for routine updates and questions to Owner; use `notify_user` for urgent attention. Unsolicited Owner DMs are reserved for critical, urgent issues that need privacy. Tags are passive; explicit mentions direct attention. Messaging does not expand session-control permissions.
 
-Messaging is currently shared across sessions on the same daemon. Cross-machine messaging sync is not yet enabled.
+Messaging spans projects in one space. On an enrolled host, `chat_open.sync` shows
+cross-machine status: known conversations work locally while offline and upload
+in the background. Keep pending messages and their original request IDs. Names,
+new conversations and shared metadata edits require the hub. Cached reads report
+coverage; `chat_read(freshness="hub")` catches up accepted history, excluding
+unuploaded messages on disconnected origins. Offline @here freezes last-known
+membership. A configured task's `chat_open.task_subscriptions` transfers only
+through scheduler bindings; personal DMs/watches do not follow a replacement UID.
+Standalone hosts keep local messaging until explicitly enrolled.
 
 CM delivers agent notifications natively through Claude's own-session socket or the owned Codex app-server. The native connection arms automatically; use `notification_status` to inspect connection health and retained delivery receipts. This does not mark chat messages read. An older embedded Codex session needs a deliberate CM restart/resume to gain native wakes; a compatible Claude session can reconnect MCP. Pending or uncertain delivery never falls back to terminal typing. Worker watches remain MCP-process-resident, but completed notification envelopes survive reconnects.

@@ -1,0 +1,69 @@
+{
+  "includes": "durable local commit and durable hub receipt; excludes native agent wake delay",
+  "samples": [
+    {
+      "hub_ack_ms": 225.707916,
+      "local_commit_ms": 20.121001
+    },
+    {
+      "hub_ack_ms": 287.019058,
+      "local_commit_ms": 69.13089599999999
+    },
+    {
+      "hub_ack_ms": 290.60394,
+      "local_commit_ms": 109.219762
+    },
+    {
+      "hub_ack_ms": 284.501192,
+      "local_commit_ms": 74.913765
+    },
+    {
+      "hub_ack_ms": 239.40256300000001,
+      "local_commit_ms": 60.310598
+    },
+    {
+      "hub_ack_ms": 285.716748,
+      "local_commit_ms": 60.508508
+    },
+    {
+      "hub_ack_ms": 234.186454,
+      "local_commit_ms": 60.892036
+    },
+    {
+      "hub_ack_ms": 234.588557,
+      "local_commit_ms": 82.705868
+    },
+    {
+      "hub_ack_ms": 235.762626,
+      "local_commit_ms": 21.39588
+    },
+    {
+      "hub_ack_ms": 469.72839700000003,
+      "local_commit_ms": 61.711881000000005
+    },
+    {
+      "hub_ack_ms": 710.752215,
+      "local_commit_ms": 69.967442
+    },
+    {
+      "hub_ack_ms": 280.002617,
+      "local_commit_ms": 70.33850699999999
+    }
+  ],
+  "scope": "disposable messaging-only SSH relay",
+  "measured_at": "2026-09-08T04:23:19.895386+00:00",
+  "route": "workspace host \u2192 cm-manager over persistent SSH",
+  "sample_count": 12,
+  "summary": {
+    "local_commit_ms": {
+      "min": 20.121001,
+      "median": 65.4213885,
+      "max": 109.219762
+    },
+    "hub_ack_ms": {
+      "min": 225.707916,
+      "median": 282.2519045,
+      "max": 710.752215
+    }
+  }
+}
