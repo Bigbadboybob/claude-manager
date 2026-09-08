@@ -115,6 +115,25 @@ with zero pending publications and no errors.
 Continuous tasks remain on `cm-manager` with the existing layout and schedules.
 Eight ongoing orchestrators and Owner are subscribed to `#orchestrators`.
 
+Other project schedules moved from the laptop to `cm-sessions`:
+
+- `nightly-test-suite.timer` retains 09:10 UTC plus up to ten minutes of jitter,
+  its existing 20 GiB limit, idle I/O priority and three-hour timeout. It uses
+  the dedicated `~/.cache/predictionTrading-nightly-cloud` checkout. The original
+  timer stamp was preserved, so migration did not launch a catch-up test run.
+- `cm-worktree-reaper-migrated.timer` runs the existing cleanup command daily
+  at 12:55 America/Chicago. The laptop cron entry was removed so retained local
+  data stays at the paths used by `cm-fetch-local`.
+- `prediction-glossary-migrated.timer` preserves glossary pruning at midnight
+  America/Chicago on days 1, 8, 15, 22 and 29 of each month (the original cron).
+
+The latter two timers do not catch up missed runs, matching cron behavior.
+A stale Perf chat cron was retired: its target session was absent from both
+execution hosts and the source cutover inventory, and it was already failing
+before migration. Desktop usage notifications, disk alerts and dictation
+maintenance remain on the laptop. No cleanup or full test suite was manually
+started as part of this schedule handoff.
+
 Host-to-hub sync uses the private VPC route and a dedicated SSH key. The manager's
 authorized-key entry forces only the messaging stdio bridge, with SSH forwarding
 and interactive shell access disabled. Its host key was pinned from the existing
