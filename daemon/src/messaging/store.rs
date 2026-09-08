@@ -411,6 +411,7 @@ impl Store {
         }
         let recovered = if s.is_coordinator() && !s.messaging_frozen() {
             s.initialize_memberships()
+                .and_then(|_| s.retain_legacy_receipts())
                 .and_then(|_| s.enroll_participants(&[]))
                 .and_then(|_| s.repair_attestations())
                 .and_then(|_| s.normalize_existing_names())

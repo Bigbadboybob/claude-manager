@@ -73,6 +73,41 @@ impl Replication {
 }
 
 impl Store {
+    /// A/B committed locally before receipts existed. The original coordinator
+    /// may attest those verified publications, preserving bytes, IDs, arrival
+    /// positions and its original journal generation. Never invent acceptance
+    /// for a replica's pending uploads.
+    pub(super) fn retain_legacy_receipts(&mut self) -> Result<()> {
+        if !self.is_coordinator() {
+            return Ok(());
+        }
+        let missing = self
+            .events
+            .iter()
+            .filter(|e| {
+                !self.replication.receipts.contains_key(strv(&e.event, "id"))
+                    && !self
+                        .replication
+                        .rejections
+                        .contains_key(strv(&e.event, "id"))
+            })
+            .map(|e| (e.event.clone(), e.position))
+            .collect::<Vec<_>>();
+        for (event, position) in missing {
+            if event["origin_daemon_id"] != self.daemon_id {
+                return Err(err(
+                    "invalid_receipt",
+                    "Foreign publication has no retained acceptance",
+                ));
+            }
+            let bytes = fs::read(self.event_path(&event)?)?;
+            let receipt = json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,
+                "generation":self.generation,"position":format!("{position:020}"),
+                "event_id":event["id"],"event_sha256":hash(&bytes)});
+            self.record_receipt(&receipt)?;
+        }
+        Ok(())
+    }
     pub fn is_coordinator(&self) -> bool {
         self.replication.coordinator_id == self.daemon_id
     }

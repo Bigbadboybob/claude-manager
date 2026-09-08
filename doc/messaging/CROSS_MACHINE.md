@@ -167,7 +167,8 @@ an explicit coordinated migration/restore, not a binary downgrade or directory c
 
 This worktree's Cargo default and `.venv` are shared with the deployed checkout.
 Use `CARGO_TARGET_DIR=/home/lucas/.cm/builds/messaging-sync` for **all** builds.
-Use an isolated Python test environment; do not run `uv run` against the symlinked
+Run Rust tests through `scripts/cm-test-isolated` to keep callbacks away from
+live CM storage and sockets. Use an isolated Python test environment; do not run `uv run` against the symlinked
 `.venv` (it can repoint the shared editable install). The development test invocation
 used `/tmp/cm-native-pytest-venv/bin/python -m pytest …` with this checkout as cwd.
 

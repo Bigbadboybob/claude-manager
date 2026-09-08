@@ -568,6 +568,99 @@ impl Store {
 mod tests {
     use super::*;
     #[test]
+    fn messaging_legacy_history_gains_receipts_before_handoff_without_rewriting_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("source");
+        let mut source = Store::open(&root).unwrap();
+        source
+            .send(
+                "owner",
+                "",
+                "owner",
+                &json!({"channel":"general","body":"Old retained post","request_id":"old"}),
+                &[],
+            )
+            .unwrap();
+        let events = source
+            .events
+            .iter()
+            .map(|e| {
+                (
+                    required(&e.event, "id").unwrap(),
+                    fs::read(source.event_path(&e.event).unwrap()).unwrap(),
+                    e.position,
+                )
+            })
+            .collect::<Vec<_>>();
+        let generation = source.generation.clone();
+        let journal = source.journal_dir();
+        drop(source);
+        // Reproduce A/B's canonical journal exactly: no C acceptance receipts.
+        for entry in fs::read_dir(journal).unwrap() {
+            let path = entry.unwrap().path();
+            let mut record = load(&path).unwrap();
+            record["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("hub_receipt");
+            atomic_replace(&path, &record).unwrap();
+        }
+        let mut source = Store::open(&root).unwrap();
+        assert!(source.degraded.is_none(), "{:?}", source.degraded);
+        assert_eq!(source.sync_status()["pending"], 0);
+        for (id, bytes, pos) in &events {
+            let wire = source.wire_event(id).unwrap();
+            assert_eq!(wire["event"].as_str().unwrap().as_bytes(), bytes);
+            assert_eq!(wire["receipt"]["position"], format!("{pos:020}"));
+            assert_eq!(wire["receipt"]["generation"], generation);
+        }
+        let count = source.position;
+        drop(source);
+        source = Store::open(&root).unwrap();
+        assert_eq!(
+            source.position, count,
+            "receipt migration is restart-idempotent"
+        );
+        let mut hub = Store::open(&tmp.path().join("hub")).unwrap();
+        let seed = tmp.path().join("seed");
+        let prepare = source
+            .sync_admin(
+                &json!({"action":"prepare_handoff","target_id":hub.daemon_id,"output":seed}),
+                &[],
+            )
+            .unwrap();
+        hub.sync_admin(
+            &json!({"action":"install_seed","seed":seed,"seed_sha256":prepare["seed_sha256"]}),
+            &[],
+        )
+        .unwrap();
+        let mut replica =
+            Store::provision_replica(&tmp.path().join("third"), &hub.space_descriptor()).unwrap();
+        hub.register_host(&replica.daemon_id, true, true, &[])
+            .unwrap();
+        let page = hub
+            .export_page(
+                &replica.daemon_id,
+                &BTreeSet::from(["*".into()]),
+                0,
+                hub.position,
+            )
+            .unwrap();
+        assert_eq!(page["complete"], true);
+        for wire in page["items"].as_array().unwrap() {
+            replica.ingest_replica(wire).unwrap();
+        }
+        for (id, bytes, _) in events {
+            assert_eq!(
+                replica.wire_event(&id).unwrap()["event"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+                bytes
+            );
+        }
+    }
+    #[test]
     fn messaging_install_recovers_at_each_directory_swap_boundary() {
         for phase in 0..3 {
             let tmp = tempfile::tempdir().unwrap();
