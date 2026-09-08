@@ -145,3 +145,39 @@ clone/serialize/fsync the complete manifest once before returning to input.
 This avoids rewriting thousands of workspace rows once per name/session diff
 in a reconnect burst. Control-request success acknowledgments retain their
 synchronous save. The control budget also covers quickly rejected subtask calls.
+
+### Rollout and measurements
+
+Changes landed directly on `main` through the branch workflow: `a4e0c33`,
+merge `67ffc4a` (including the owner's concurrent planning fix), and the final
+recovery/persistence correction `578f7c0`. No PR was created.
+
+Five alternating warm probes through the existing SSH tunnel measured median
+attachment times of **199.1 ms for the legacy two-request path** and **76.6 ms
+for direct attachment** on the updated daemon. Probes opened and immediately
+closed read-only viewer connections without input, resize, metadata changes,
+or session restarts. These small samples measure attachment setup, not ongoing
+keystroke RTT. Earlier separate before/after samples measured 229.3 / 128.3 ms;
+the alternating run reduces the effect of changing network conditions.
+
+The first deployment reached local holder epoch 16 and cloud epoch 13 and
+passed its full ten-minute stability check. The final socket-timeout correction
+required a second short brain reconnect; final epochs are **17 locally** and
+**14 on cm-manager**. Both final deploys preserved the holder PID and every
+agent child PID/start-time pair: **27 local and 20 cloud agents**, with matching
+brain/holder session counts and successful MCP preflights. Neither holder nor
+any agent was restarted. The final ten-minute verification is recorded after
+its observation window below.
+
+Final release backups, binary hashes, before/after health and process snapshots:
+`~/.cm/releases/cloud-responsiveness-578f7c0/`. The TUI is installed at the normal
+shared release path; running interfaces keep the previous inode until relaunched.
+Relaunch the TUI once at a convenient moment to activate the client changes.
+Agents continue running independently. The final follow-up passed all **884 TUI
+tests**, all **37 daemon stream tests**, and an additional control-worker check;
+the preceding broader integration and Python checks are recorded above.
+
+Final stability verification completed **2026-09-08 02:50:11 UTC**, after 602 seconds of
+observation. Epochs stayed at 17 / 14 with no additional brain restarts,
+`breaker_state=running`, successful MCP checks, and matching session counts
+(27 local / 20 cloud) throughout. No required rollout checks remain.
