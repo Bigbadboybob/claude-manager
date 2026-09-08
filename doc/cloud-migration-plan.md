@@ -1,17 +1,30 @@
 # Local-to-cloud migration plan — 2026-09-08
 
-Status: Owner approved the overall plan and requested the additions below:
-retire session push/pull, expose local explicitly in launch dialogs with cloud
-as the default, and investigate stale-workspace cleanup before transfer. The
-cloud-first TUI is merged, pushed and installed, including verified Bash,
-Neovim, clipboard and reconnect behavior. Required workspaces are transferring;
-the development database is restoring into inspected staging. The 26 remaining
-CM sessions stay local until checksum, database and conversation checks pass.
-Owner is leaving the laptop powered on and connected during the work.
-The execution host is ready; see [cloud-session-host.md](cloud-session-host.md).
-The Codex pool is already cloud-owned; its old local database must never be
-copied over the live cloud pool. Eight ongoing orchestrators on `cm-manager`
-now subscribe to `#orchestrators`, with their schedules and sessions preserved.
+Status: the controlled cutover succeeded on September 8. All 26 original CM
+sessions (9 Codex, 7 Claude, 10 Bash) now run on `cm-sessions`; their conversation
+IDs, workspaces, labels and permissions were preserved. The laptop daemon owns
+no sessions, and fresh work defaults to `sessions`. Software is merged, pushed
+and installed. The cloud development database is restored and verified.
+
+The ten-minute stability observation passed. A post-cutover shell continued
+through a deliberately disconnected TUI tunnel; reconnect and a full TUI
+close/reopen accepted input with all 26 session processes and both editors
+unchanged. All 134 archive/code copies are checksum-verified, including three
+ordinary directories whose inherited Git context required separate verification.
+All 28 pre-existing archive paths are reconciled without overwriting cloud
+files, 3,845 non-omitted symlinks resolve, and seven additional native Python
+environments match the source. The migration is complete. Live cloud work must
+never be overwritten by the old source.
+
+Owner amended the data policy during execution: keep large research data and
+other bulky workspace files on the laptop. The exact omission manifest and
+`cm-fetch-local` helper let agents fetch only what they need. No source data was
+deleted. See [the execution host runbook](cloud-session-host.md).
+
+The Codex pool is cloud-owned; its old local database must never be copied over
+the live pool. Eight ongoing orchestrators on `cm-manager` now subscribe to
+`#orchestrators`, with their schedules and sessions preserved. The remaining
+sections record the approved plan and the historical pre-cutover inventory.
 
 ## Requested outcome
 
@@ -26,7 +39,7 @@ Keep the existing resource-management approach. No PRs: test on the working
 branch, merge to main and push. No delegation/subagents are authorized for this
 work. Owner requested the plan before execution starts.
 
-## Verified starting point
+## Historical starting point
 
 - 27 local CM sessions: prior inventory classified 17 agents and 10 shells,
   across 14 active worktrees. Refresh engine/transcript/process inventory before
@@ -85,7 +98,13 @@ work. Owner requested the plan before execution starts.
    Inventory cloud projects, SSH aliases, DB endpoints, local services, MCP
    wrappers, OAuth/API credentials, environment files and tool versions privately.
 
-3. **Reduce the payload, then copy the environment.** First audit inactive
+3. **Reduce the payload, then copy the environment.** Execution amendment:
+   retain large data locally, per Owner’s later instruction. Individual workspace
+   files >=10 MiB and semantic bulk-data directories >=100 MiB are omitted;
+   Git history, agent state, credentials and installed tools are exempt. Build
+   caches are excluded and native environments rebuilt. Preserve source files
+   and use the recorded manifest for deliberate, selective retrieval.
+   The original cleanup audit follows: first audit inactive
    workspaces by disk use, active process/session references, task state, pinned
    state, Git changes, unpublished commits, and ignored/untracked files. A clean
    Git status alone does not make a checkout disposable: ignored datasets and

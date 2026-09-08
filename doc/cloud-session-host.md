@@ -3,7 +3,10 @@
 Provisioned September 8, 2026. Owner selected a separate 16-vCPU machine and
 asked to retain the existing resource-management approach. There is no new
 scheduler, compute-request workflow, or CPU/memory policy. Existing sessions
-and worktree data have not been moved.
+were migrated later that day: all 26 original CM sessions now run here, and
+fresh work defaults to this host. Large workspace data remains on the laptop
+under the selective-fetch policy below. The laptop is a viewer; its connectivity
+does not control cloud session lifetime.
 
 ## Machine and storage
 
@@ -35,29 +38,51 @@ controls and runaway-child watcher remain available; no new caps were enabled.
 
 - `/etc/systemd/system/cm-daemon.service` runs as `lucas`, under systemd, with
   `/opt/cm-daemon/cm-holder --brain /opt/cm-daemon/cm-daemon`.
-- The tested messaging/responsiveness release was copied from `cm-manager`.
-  Daemon SHA256:
-  `b19076d04b972b2284fddea393cffa5ed7fcf42a4ed2cfb6d3c0cef5e4912325`.
-  The build label is `0.1.0+dbecd27`; Python includes the later routing fix.
+- The cloud-first daemon release is `0.1.0+7dcae0a`. The installed laptop TUI
+  also includes `9eca337` and `c4c062c` for remote catalogs, redraw and clipboard.
 - MCP lives at `/opt/cm-daemon/mcp_server`, with its own virtual environment.
   Preflight registered all 56 tools. Workflows are installed alongside it.
-- Claude Code 2.1.263 and Codex 0.153.4 match the existing user installation.
-  Both login-status checks passed. Rust 1.98.1, Cargo, uv 0.10.12, Google Cloud
+- Claude Code 2.1.265 and Codex 0.153.4 match the source at cutover.
+  Both login-status checks passed. Rust 1.94.1, Cargo, uv 0.10.12, Google Cloud
   CLI 583.0.0, Git, Python, Node, tmux and the native build dependencies are installed.
-- Both `claude-manager` and `predictionTrading` have fresh Git clones under
-  `/home/lucas/code/projects`. These are base checkouts, not migrated worktrees,
-  ignored data, project virtual environments or session histories.
+- Both main repositories and required worktrees retain their original
+  `/home/lucas` paths, Git state and small working files. Conversations, skills,
+  agent configuration, shell configuration and Neovim plugins/config were copied.
+  Both primary Python environments exactly match the source's Python 3.12.3
+  and installed package versions (53 CM packages, 276 predictionTrading packages).
+  Seven additional workspace environments were also rebuilt to exact parity.
 - Git access to both private repositories passed. Google Compute API reads passed
-  using the same existing project service account as `cm-manager`; no new IAM
-  grants were made. Cross-project trader/backtest access has not been migrated.
-- Operator credentials are independently generated for this daemon. Auth files
-  and pairing tokens are private, mode 0600. Personal SSH private keys were not
-  copied to the host. The daemon log is `/home/lucas/.cm/daemon.log`; holder output
+  during setup. The migration then copied the source's required authentication
+  and SSH configuration privately. SSH into all 11 running trading instances
+  passed; authenticated production and read-replica queries passed through
+  persistent tunnels on ports 5433 and 5434. Biglab timed out from both hosts.
+- Operator credentials remain distinct between the cloud host and laptop.
+  Auth files and pairing tokens are private, mode 0600.
+  The daemon log is `/home/lucas/.cm/daemon.log`; holder output
   is available through `journalctl -u cm-daemon`.
 - The planning API uses the manager's private DNS address on port 8000. The
   manager's own `localhost:8000` configuration cannot be copied unchanged to a
   different VM. Config reload applied this address without a brain restart;
   an authenticated `list_projects` request through the daemon then passed.
+- The Codex pool is cloud-owned on port 2455. The laptop's `cm-codex-lb.service`
+  is only a persistent SSH forward to it. Never reseed the live pool using the
+  old laptop database. Keep its HTTP response session bridge disabled as configured.
+- The original absolute `node_repl` runtime path is provided by
+  `/usr/lib/chatgpt/resources/cua_node` pointing to `~/.local/share/cm-node-repl`.
+  All nine migrated Codex app servers reloaded MCP configuration successfully,
+  exposing the Node REPL tools without changing loaded conversations.
+- `cm`, `git-filter-repo`, `pre-commit`, `py-spy`, Bash and Neovim work here.
+  Rust tests still require `scripts/cm-test-isolated` and a private target.
+  A scoped AppArmor profile permits the bubblewrap runner; its smoke test passed.
+
+The laptop development `predictiondb` was restored into the cloud's local
+PostgreSQL instance, not redirected to production. Verification covered 4,406
+physical tables, 326 hypertables and 1,312 foreign keys. The source had existing
+Timescale metadata corruption: destination-only repair removed metadata for
+12 already-missing chunks and cleared one dangling compressed-hypertable pointer.
+The source and original dump were preserved. Maintain PostgreSQL's narrow
+traversal ACL on `/home/lucas`; copying source home permissions over it can stop
+the database from accessing its data directory.
 
 Routine deployments must use the brain-only procedure in
 [the holder/brain runbook](../HOWTO_HOLDER_BRAIN_SPLIT.md), substituting
@@ -72,17 +97,23 @@ scripts/cm-op --ssh cm-sessions messaging.sync '{"action":"status"}'
 ## TUI and messaging
 
 The local `~/.cm/hosts.toml` now includes `sessions`, using the `cm-sessions`
-SSH alias and `/home/lucas/.cm/daemon.sock`. The existing local default is retained.
-The TUI reads this file at startup: relaunch the TUI when convenient to expose
-the new host in the workspace-creation form, then select **sessions**. Relaunching
-the client does not require restarting the remote daemon or its agents.
+SSH alias and `/home/lucas/.cm/daemon.sock`. The default is now **sessions**.
+Relaunch the TUI normally to view the migrated sessions. Launch dialogs expose
+an explicit local option; existing workspaces
+inherit their owning host. Remote rows use the usual layout, while local rows
+have a subtle inline marker. Session push/pull shortcuts are retired.
+Relaunching the client does not restart the remote daemon or its agents.
 
-The new daemon has its own identity,
-`83bce20a-1f8e-4dd0-82e1-084fca0881c2`, enrolled as an Owner-authorized replica of
-the existing shared space `15b7d0a4-ddcc-4f69-9526-3678e3cadc70`. The coordinator
-remains `cm-manager`. Enrollment used the empty destination and the supported
-`pair`/`join_space` operations. Sync connected, reconciled, and reported zero
-pending publications and no errors.
+The cutover fenced source execution before transferring its daemon identity
+`37db72a8-da6c-444c-b0d0-64daa6dc6fb3` to the cloud. The empty laptop viewer uses
+the former bootstrap identity `83bce20a-1f8e-4dd0-82e1-084fca0881c2`.
+This preserves session messaging identities, DMs and retained notification state
+in shared space `15b7d0a4-ddcc-4f69-9526-3678e3cadc70`. Never run a second copy
+of either identity. `cm-manager` remains the coordinator; sync is connected
+with zero pending publications and no errors.
+
+Continuous tasks remain on `cm-manager` with the existing layout and schedules.
+Eight ongoing orchestrators and Owner are subscribed to `#orchestrators`.
 
 Host-to-hub sync uses the private VPC route and a dedicated SSH key. The manager's
 authorized-key entry forces only the messaging stdio bridge, with SSH forwarding
@@ -90,6 +121,27 @@ and interactive shell access disabled. Its host key was pinned from the existing
 authenticated manager connection. No test messages were sent to existing agents.
 
 ## Validation
+
+Post-cutover validation preserved all 26 original session UIDs: nine Codex,
+seven Claude and ten Bash. All 16 agent conversations retained their exact
+conversation IDs and permissions. A ten-minute observation kept every original
+session live with unchanged brain PID, holder epoch and restart count.
+
+A shell loop completed during deliberate loss of the laptop TUI's SSH tunnel.
+The TUI reconnected and accepted shell input. Closing and reopening the TUI
+also accepted input with all 26 process identities and both restored editors
+unchanged. The two Neovim views reopened their original files with unmodified
+buffers; old source swap files were archived intact to prevent stale swap dialogs.
+
+File verification covered 19 required roots and 134 archive roots, with the
+recorded data/cache exclusions. The 28 pre-existing archive paths were reconciled
+by filling missing files while preserving cloud contents. All 3,845 inventoried,
+source-existing, non-omitted symlinks resolve. Three ordinary directories inherited
+their parent's Git context on the laptop; separate checksum verification resolved
+those initial Git-status false positives. Seven additional native environments
+match source Python/package versions and pass dependency checks.
+
+The following measurements record the earlier, disposable setup probe:
 
 A disposable Bash session exercised direct attachment, streamed input/output,
 output continuing after viewer disconnect, and a brain-only restart. The restart
@@ -100,8 +152,8 @@ replayed the screen and accepted new input.
 
 The ten-minute stability gate passed: 21 samples over 600 seconds retained
 epoch 2, one expected brain restart, a running breaker, healthy MCP and the
-same live session count. The disposable session was then removed; the final
-daemon and holder session counts are both zero. The existing local and manager
+same live session count. Removing the disposable session left the destination
+daemon and holder empty at that stage. The existing local and manager
 brains retained their prior PIDs/epochs and their 27/20 session counts.
 
 A separate laptop-to-host probe used one persistent SSH Unix-socket tunnel and
@@ -109,7 +161,47 @@ the real attach stream. Twelve command/output round trips measured a 42.29 ms
 median, with a 37.33–249.56 ms range. This small sample excludes tunnel setup,
 TUI drawing and model processing; it is not a latency guarantee or a load test.
 
-## Cost and migration boundary
+## Large data and recovery
+
+Owner requested that large research datasets, experiment outputs and other
+bulky workspace files stay on the laptop. The recorded policy omits individual
+workspace files at least 10 MiB and semantic bulk-data directories at least
+100 MiB. Git history, sessions, credentials and installed tools are exempt;
+build caches and native environment directories were excluded separately.
+About 191 GiB of worktree data, or 247 GiB across selected roots, stayed local.
+No source data was deleted. A general notice was posted to `#cm-general`.
+
+On `cm-sessions`:
+
+```sh
+cm-fetch-local /home/lucas/path/to/needed-file --dry-run
+cm-fetch-local /home/lucas/path/to/needed-file
+```
+
+The helper permits only manifest-listed paths or descendants of listed
+directories, restores the original absolute cloud path, and preserves existing
+cloud files unless `--replace-existing` is explicit. It uses an authenticated,
+read-only laptop export through persistent SSH. The laptop must be online for
+fetches; cloud sessions remain independent of it. Details and the exact inventory
+are in `~/.cm/migrations/cloud-20260908/LOCAL-DATA.md` and
+`local-only-data-manifest.json` on both hosts.
+
+Intentionally missing tracked data is marked `skip-worktree` to prevent accidental
+mass deletion commits. Clear that bit before editing a fetched tracked file:
+`git update-index --no-skip-worktree -- path/to/file`.
+
+The migration controller remains standalone locally. Its old CM row
+`ts-18d32b77ffec4909-0` must remain exited while standalone conversation
+`01a07e0e-7821-7ce2-b906-56d5add424fc` owns its writer lock. An unrelated desktop
+Claude session in `~/whisper-typer` was also left running locally.
+
+Recovery evidence lives under `~/.cm/migrations/cloud-20260908/`, especially
+`CURRENT-RECOVERY.md` and `session-cutover/`. Do not rerun the seed, final-delta
+or cutover scripts against cloud-owned state. Older archive code is copied
+through staging and never streamed over active cloud work. Source swap files,
+database dumps and recovery state remain available.
+
+## Cost
 
 At the previously quoted us-east4 rates and 730 hours/month: compute is about
 $440.75/month and the data disk $112.64/month. A $30 allowance for boot disk,
@@ -121,19 +213,6 @@ Run on demand for a few days before reconsidering sizing and a one-year CUD.
 
 Pricing references: [Compute](https://cloud.google.com/products/compute/pricing/general-purpose)
 and [disks](https://cloud.google.com/compute/disks-image-pricing).
-
-The source inventory measured 27 local sessions and 14 active worktrees; active
-worktrees occupied 73.26 GiB and the broader selected source roughly 376 GiB.
-Migration still needs a staged file transfer preserving dirty/ignored files,
-symlinks and Git common directories, followed by one coordinated final delta and
-conversation resume. Do not use the old ephemeral-worker push button.
-
-Agent personal messaging identities, DMs and watches do not automatically move
-with a conversation. Continuous-task scheduler ownership also needs an explicit
-handoff; cloning a live daemon identity is not a supported shortcut. These are
-cutover work, along with project-specific credentials/settings, dependencies and
-external data access. The requested orchestrator channel and UI work remain
-follow-ups. Existing local and manager agents were not interrupted by this setup.
 
 Private setup scripts, inventories and verification evidence are under
 `~/.cm/migrations/cloud-20260908/` on the source machine; credentials in that
