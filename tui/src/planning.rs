@@ -3001,22 +3001,45 @@ impl PlanningView {
         None
     }
 
-    fn move_visual_block(&mut self, pi: usize, ci: usize, start: usize, end: usize, direction: i32) {
-        // Visual block move operates on a contiguous run of raw layout
-        // items. If any row in [start..=end] is a synthetic subtask
-        // (or a parented task hidden from raw view), the run isn't
-        // contiguous in raw space and the operation can't be defined
-        // unambiguously — bail. Translate visible bounds to raw.
+    /// Raw layout indices behind the visible rows `start..=end` of a
+    /// column, in visible order. `None` when any row in the range is a
+    /// synthetic subtask row (no raw slot of its own), which is the one
+    /// case a block operation genuinely can't be defined for.
+    ///
+    /// The raw run is NOT required to be contiguous: hidden slots
+    /// (archived tasks with A-V off, parented tasks rendered under their
+    /// parent instead of in their own slot) may sit between the selected
+    /// rows. They have no visible position, so where they land relative
+    /// to the block is immaterial. Pre-fix this required
+    /// `raw_end - raw_start == end - start` and silently bailed the
+    /// moment a selection straddled one hidden slot — which, with
+    /// hundreds of archived rows still occupying slots, was almost every
+    /// selection longer than a handful of rows ("I select them and they
+    /// won't move; a few at a time and they do").
+    fn visual_raw_indices(&self, pi: usize, ci: usize, start: usize, end: usize) -> Option<Vec<usize>> {
         let rows = self.visible_rows_for_column(pi, ci);
-        let raw_start = match rows.get(start).map(|r| &r.kind) {
-            Some(VisibleRowKind::Layout { raw_idx, .. }) => *raw_idx,
-            _ => return,
+        let mut out = Vec::with_capacity(end.saturating_sub(start) + 1);
+        for row in rows.get(start..=end)? {
+            match &row.kind {
+                VisibleRowKind::Layout { raw_idx, .. } => out.push(*raw_idx),
+                _ => return None,
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    fn move_visual_block(&mut self, pi: usize, ci: usize, start: usize, end: usize, direction: i32) {
+        // Translate the visible selection to raw slots (hidden slots in
+        // between are fine — see `visual_raw_indices`). The block moves
+        // by hopping the next VISIBLE item past the block's edge over to
+        // its other side, so hidden slots inside the block stay put and
+        // the visible order shifts by exactly one row.
+        let raws = match self.visual_raw_indices(pi, ci, start, end) {
+            Some(r) => r,
+            None => return,
         };
-        let raw_end = match rows.get(end).map(|r| &r.kind) {
-            Some(VisibleRowKind::Layout { raw_idx, .. }) => *raw_idx,
-            _ => return,
-        };
-        if raw_end - raw_start != end - start { return; }
+        let raw_start = *raws.iter().min().unwrap();
+        let raw_end = *raws.iter().max().unwrap();
         if direction > 0 {
             let below = match self.next_visible_row(pi, ci, raw_end, 1) {
                 Some(b) => b,
@@ -3061,24 +3084,26 @@ impl PlanningView {
         if src_pi != dst_pi { return; }
 
         if let Some((range_start, range_end)) = self.visual_range() {
-            // Translate visible-row visual range to raw indices. Bail
-            // if any row is a synthetic subtask or the raw indices
-            // aren't contiguous.
-            let rows = self.visible_rows_for_column(src_pi, src_ci);
-            let raw_start = match rows.get(range_start).map(|r| &r.kind) {
-                Some(VisibleRowKind::Layout { raw_idx, .. }) => *raw_idx,
-                _ => return,
+            // Translate the visible selection to raw slots. Only the
+            // SELECTED (visible) items move; hidden slots interleaved with
+            // them stay in the source column — dragging them along would
+            // silently relocate archived/parented tasks the user never saw.
+            let raws = match self.visual_raw_indices(src_pi, src_ci, range_start, range_end) {
+                Some(r) => r,
+                None => return,
             };
-            let raw_end = match rows.get(range_end).map(|r| &r.kind) {
-                Some(VisibleRowKind::Layout { raw_idx, .. }) => *raw_idx,
-                _ => return,
-            };
-            if raw_end - raw_start != range_end - range_start { return; }
+            let raw_start = *raws.iter().min().unwrap();
             let src_len = self.project_data[src_pi].layout.columns[src_ci].len();
-            if raw_end >= src_len { return; }
-            let items: Vec<GridItem> = self.project_data[src_pi].layout.columns[src_ci]
-                .drain(raw_start..=raw_end)
-                .collect();
+            if raws.iter().any(|&r| r >= src_len) { return; }
+            // Remove from the highest raw index down so earlier indices
+            // stay valid; re-reverse to restore visible order.
+            let mut sorted = raws.clone();
+            sorted.sort_unstable();
+            let mut items: Vec<GridItem> = Vec::with_capacity(sorted.len());
+            for &r in sorted.iter().rev() {
+                items.push(self.project_data[src_pi].layout.columns[src_ci].remove(r));
+            }
+            items.reverse();
             let dst_len = self.project_data[dst_pi].layout.columns[dst_ci].len();
             let insert_at = raw_start.min(dst_len);
             for (offset, item) in items.into_iter().enumerate() {
@@ -6130,6 +6155,92 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Column with a HIDDEN slot (archived task, A-V off) between two
+    /// visible tasks: [top, a, <archived>, b, c]. Visible rows: [top, a, b, c].
+    fn setup_hidden_slot_view() -> PlanningView {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        let mut archived = make_task("x", "x", None);
+        archived.status = PlanStatus::Archived;
+        pd.tasks = vec![
+            make_task("top", "top", None),
+            make_task("a", "a", None),
+            archived,
+            make_task("b", "b", None),
+            make_task("c", "c", None),
+        ];
+        pd.layout.columns = vec![vec![
+            GridItem::Task("top".to_string()),
+            GridItem::Task("a".to_string()),
+            GridItem::Task("x".to_string()),
+            GridItem::Task("b".to_string()),
+            GridItem::Task("c".to_string()),
+        ], vec![]];
+        view.project_data.push(pd);
+        view.rebuild_unified_cols();
+        view.show_archived = false;
+        view
+    }
+
+    fn visible_slugs(view: &PlanningView, pi: usize, ci: usize) -> Vec<String> {
+        view.visible_rows_for_column(pi, ci)
+            .iter()
+            .filter_map(|r| visible_row_slug(r).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn visual_block_move_up_crosses_a_hidden_slot() {
+        // Select visible rows a..c (raw 1..=4, with the archived x hidden
+        // at raw 2) and move the block up past `top`. Pre-fix this bailed
+        // because the raw span (4) != visible span (3).
+        let mut view = setup_hidden_slot_view();
+        view.visual_anchor = Some(1);
+        view.cursor = GridCursor { col: 0, row: 3 };
+        view.reorder_task(-1);
+        assert_eq!(visible_slugs(&view, 0, 0), vec!["a", "b", "c", "top"]);
+        // Selection followed the block.
+        assert_eq!(view.visual_range(), Some((0, 2)));
+        // The hidden slot is still in the column, still hidden.
+        assert!(column_slugs(&view, 0, 0).contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn visual_block_move_down_crosses_a_hidden_slot() {
+        // Select top..a and move down: b hops over the block; x stays hidden.
+        let mut view = setup_hidden_slot_view();
+        view.visual_anchor = Some(0);
+        view.cursor = GridCursor { col: 0, row: 1 };
+        view.reorder_task(1);
+        assert_eq!(visible_slugs(&view, 0, 0), vec!["b", "top", "a", "c"]);
+        assert_eq!(view.visual_range(), Some((1, 2)));
+    }
+
+    #[test]
+    fn visual_block_column_move_leaves_hidden_slots_behind() {
+        // Select a..c across the hidden x and move right: only a, b, c
+        // travel; x (archived) stays in the source column.
+        let mut view = setup_hidden_slot_view();
+        view.visual_anchor = Some(1);
+        view.cursor = GridCursor { col: 0, row: 3 };
+        view.move_task_to_column(1);
+        assert_eq!(column_slugs(&view, 0, 1), vec!["a", "b", "c"]);
+        assert_eq!(column_slugs(&view, 0, 0), vec!["top", "x"]);
+        assert_eq!(view.cursor.col, 1);
+    }
+
+    #[test]
+    fn visual_block_with_a_synthetic_subtask_row_still_bails() {
+        // A selection that includes a nested subtask row has no raw
+        // shape — it must remain a no-op (the one legitimate bail).
+        let mut view = setup_subtask_reorder_view();
+        let before = column_slugs(&view, 0, 0);
+        view.visual_anchor = Some(0); // parent row
+        view.cursor = GridCursor { col: 0, row: 1 }; // c1 (synthetic)
+        view.reorder_task(1);
+        assert_eq!(column_slugs(&view, 0, 0), before);
     }
 
     #[test]
