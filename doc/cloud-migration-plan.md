@@ -6,6 +6,13 @@ IDs, workspaces, labels and permissions were preserved. The laptop daemon owns
 no sessions, and fresh work defaults to `sessions`. Software is merged, pushed
 and installed. The cloud development database is restored and verified.
 
+The migration controller subsequently completed its same-conversation handoff
+from the standalone laptop terminal into cloud CM, bringing the verified total
+to 27 sessions (10 Codex, 7 Claude, 10 Bash). The source writer was released;
+the final history, workspace and YOLO mode were preserved. See
+`~/.cm/migrations/cloud-20260908/controller-handoff/complete.json`. Do not repeat
+the historical controller stop/resume instructions below.
+
 The ten-minute stability observation passed. A post-cutover shell continued
 through a deliberately disconnected TUI tunnel; reconnect and a full TUI
 close/reopen accepted input with all 26 session processes and both editors
@@ -191,7 +198,10 @@ work. Owner requested the plan before execution starts.
    Use brain-only deployments and the required ten-minute stability check for
    daemon code changes. Merge tested changes directly to main and push.
 
-## Handoff and timing
+## Historical pre-migration handoff and timing — completed
+
+These instructions record the initial move out of CM before migration. The
+controller now runs in cloud CM; replaying them would interrupt the live session.
 
 Controller conversation ID: `01a07e0e-7821-7ce2-b906-56d5add424fc`.
 Working directory: `/home/lucas/.cm/worktrees/claude-manager-cloud-execution-proposals`.

@@ -3,10 +3,10 @@
 Provisioned September 8, 2026. Owner selected a separate 16-vCPU machine and
 asked to retain the existing resource-management approach. There is no new
 scheduler, compute-request workflow, or CPU/memory policy. Existing sessions
-were migrated later that day: all 26 original CM sessions now run here, and
-fresh work defaults to this host. Large workspace data remains on the laptop
-under the selective-fetch policy below. The laptop is a viewer; its connectivity
-does not control cloud session lifetime.
+were migrated later that day: all 26 original CM sessions plus the migration
+controller now run here, and fresh work defaults to this host. Large workspace
+data remains on the laptop under the selective-fetch policy below. The laptop
+is a viewer; its connectivity does not control cloud session lifetime.
 
 ## Machine and storage
 
@@ -209,10 +209,14 @@ Intentionally missing tracked data is marked `skip-worktree` to prevent accident
 mass deletion commits. Clear that bit before editing a fetched tracked file:
 `git update-index --no-skip-worktree -- path/to/file`.
 
-The migration controller remains standalone locally. Its old CM row
-`ts-18d32b77ffec4909-0` must remain exited while standalone conversation
-`01a07e0e-7821-7ce2-b906-56d5add424fc` owns its writer lock. An unrelated desktop
-Claude session in `~/whisper-typer` was also left running locally.
+The migration controller also completed its handoff into cloud CM, bringing the
+verified total to 27 sessions (10 Codex, 7 Claude, 10 Bash). Session
+`ts-18d32b77ffec4909-0` retained conversation
+`01a07e0e-7821-7ce2-b906-56d5add424fc`, its workspace and YOLO mode after the
+source client exited and released its writer. The receipt is
+`controller-handoff/complete.json` in the migration evidence directory. Do not
+repeat the handoff or resume another writer for this live conversation. An
+unrelated desktop Claude session in `~/whisper-typer` remains local.
 
 Recovery evidence lives under `~/.cm/migrations/cloud-20260908/`, especially
 `CURRENT-RECOVERY.md` and `session-cutover/`. Do not rerun the seed, final-delta
