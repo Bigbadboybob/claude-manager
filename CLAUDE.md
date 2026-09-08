@@ -204,6 +204,7 @@ The GCP path is fully functional but used less. All infra is in GCP project **`c
 | VM | Role | IP | Notes |
 |----|------|----|-------|
 | `cm-manager` | API server + remote daemon host | `35.186.186.160` (static) | Runs uvicorn on port 8000 and `cm-daemon` (see Multi-host) |
+| `cm-sessions` | Persistent session host | `35.245.98.146` (static) | 16 vCPU / 64 GiB, 1 TiB data disk; [setup and operations](doc/cloud-session-host.md) |
 | `cm-db` | PostgreSQL | `10.150.0.2` (internal) | Database: `claude_manager`, user: `cmuser` |
 | `cm-worker-*` | Ephemeral workers | Dynamic | Launched by dispatch daemon from `cm-worker-base` image family |
 
@@ -222,7 +223,7 @@ gcloud compute ssh cm-manager --zone=us-east4-a --project=claude-manager-prod \
   --command="sudo systemctl restart claude-manager"
 ```
 
-Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + restart. The MCP server is installed both on user machines (for local sessions) and at `/opt/cm-daemon/mcp_server/` on cm-manager (for sessions running against the remote daemon). Local edits take effect on next local MCP spawn; remote edits need an scp + `systemctl restart cm-daemon` (see Multi-host). The TUI and local `workflows/` are built and run locally — no deploy needed.
+Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + restart. The MCP server is installed both on user machines (for local sessions) and at `/opt/cm-daemon/mcp_server/` on cm-manager and cm-sessions (for sessions running against those daemons). Local edits take effect on next local MCP spawn; remote edits need the complete MCP payload copied and a brain-only `daemon.restart` through `scripts/cm-op --ssh <host>` (see Multi-host and HOWTO_HOLDER_BRAIN_SPLIT.md). The TUI and local `workflows/` are built and run locally — no deploy needed.
 
 **Don't `pkill -f uvicorn`** — the systemd unit auto-respawns immediately, so a manual nohup launch fights the systemd-spawned one for port 8000. Also, `pkill -f uvicorn` over `gcloud ssh` self-matches on the SSH command line (which contains "uvicorn") and kills its own shell, returning exit 255. Use `systemctl restart` instead.
 

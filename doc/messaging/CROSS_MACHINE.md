@@ -7,7 +7,9 @@ coordinator. Implementation details and validation are recorded in
 
 The local and cm-manager hosts were enrolled on September 8, 2026. The cloud
 coordinates the preserved local space; verification is in
-[ROLLOUT_C.md](ROLLOUT_C.md). Other daemons still require explicit enrollment.
+[ROLLOUT_C.md](ROLLOUT_C.md). The new `cm-sessions` host subsequently joined as
+another replica; see [its setup record](../cloud-session-host.md). Other daemons
+still require explicit enrollment.
 
 ## Using an enrolled host
 
