@@ -38,13 +38,42 @@ chat receipt APIs to mark messages read.
 
 Chat delivery summaries keep their existing receipt vocabulary:
 `native_pending`, `submitting`, `submitted_unverified`, `confirmed`, `uncertain`,
-and `cancelled`. `list_monitors` includes `notification_id` and `delivery_status`;
+and `cancelled`. `coalesced` means later activity is covered by an outstanding
+chat wake, not by a separate native delivery receipt. `list_monitors` includes `notification_id` and `delivery_status`;
 a bounded receipt wait can end before a queued notice is eventually observed.
 `notification_status` retains the authoritative delivery state after MCP reconnect.
 
 `cancel_monitor` also retracts pending fire messages after an MCP reconnect.
 `cancellation_retracted=false` means submission had already begun and could not
 be recalled. Cancelling a watch never erases its recorded results.
+
+### Chat wake batching
+
+The first eligible chat arrival publishes immediately. Further arrivals share
+the outstanding wake even after it is submitted or observed. There is no fixed
+debounce delay. A successful `chat_read` supplying full message bodies records
+exactly those message IDs as fetched in the host-local delivery ledger. This
+freezes the batch: later arrivals form a successor, submitted when the earlier
+batch is fetched or its remaining wake work is acknowledged/cancelled. The
+ledger survives brain restarts. Partial, filtered and paginated reads cannot
+consume unseen IDs. An unrelated empty read, `chat_open` preview, monitor preview
+or `notification_status` query does not release the wake. Proactive full-message
+reads can retract an unsubmitted wake before it becomes unnecessary work.
+
+Fetching messages is a notification-handling boundary, **not** a read receipt.
+Unread state still requires `ack_receipt`, and explicit watch results still
+require `chat_monitors(action="ack", ...)`. A lost response leaves the messages
+unread and retrievable; it does not grant an automatic native resend. Existing
+submitted notices cannot be recalled, including ones queued before this upgrade.
+An agent must finish reading its batch; an unread batch is not periodically
+re-notified. Mute/cancellation can still retract unclaimed native work.
+
+Chat wake text and worker-completion notices instruct agents to inspect pending
+activity before responding, continue the existing task, and report only meaningful
+changes, blockers or Owner decisions. They must not repeat a completed summary.
+Chat messages are read together with `chat_read(inbox=True, unread_only=True)`;
+worker completion results retain their existing separate interface. This change
+does not batch independent worker-monitor envelopes or add a new MCP tool.
 
 ## Store and delivery contract
 
