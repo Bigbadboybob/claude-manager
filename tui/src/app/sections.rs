@@ -104,7 +104,7 @@ impl App {
                 sections[i]
             };
             section.and_then(|id| self.section_by_id(id))
-                .map(|s| theme::sidebar_section_bg(s.color.as_deref()))
+                .map(|s| theme::sidebar_section_bg(s.color.as_deref(), self.global_settings.tint_strength()))
         }).collect()
     }
 
@@ -538,7 +538,7 @@ mod layout_tests {
         add_task_session(&mut app, 1, "tb");
         app.cursor = Cursor::Task { ws_idx: 1, task_id: "tb".into() };
         let buffer = sidebar_buffer(&mut app, 24);
-        let blue = theme::sidebar_section_bg(Some("blue"));
+        let blue = theme::sidebar_section_bg(Some("blue"), 2.0);
         // Header, workspace, task, session, internal gap, inherited workspace/task/session.
         for y in 1..=8 {
             for x in 1..=38 {
@@ -576,7 +576,7 @@ mod layout_tests {
         add_task_session(&mut app, 0, "ta");
         add_task_session(&mut app, 1, "tb");
         app.cursor = Cursor::Session(1, 0);
-        let neutral = theme::sidebar_section_bg(None);
+        let neutral = theme::sidebar_section_bg(None, 2.0);
         let buffer = sidebar_buffer(&mut app, 5);
         assert!(app.sidebar_list_state.offset() > 0, "section heading scrolled away");
         assert_eq!(buffer[(38, 3)].bg, neutral, "selected inherited session keeps tint");
@@ -603,6 +603,47 @@ mod layout_tests {
         app.sections[0].folded = true;
         let buffer = sidebar_buffer(&mut app, 10);
         assert_eq!(buffer[(2, 2)].symbol(), "━", "folded final section also closes");
+    }
+
+    #[test]
+    fn global_settings_preview_changes_sidebar_and_cancel_restores_saved_tint() {
+        use crossterm::event::{Event, KeyEvent};
+        let mut app = sectioned_app();
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let original = sidebar_buffer(&mut app, 20)[(38, 1)].bg;
+        assert_eq!(original, Color::Rgb(50, 58, 76), "default is twice the original neutral tint");
+        assert!(app.handle_event(&key(KeyCode::F(9))));
+        app.handle_event(&key(KeyCode::Right));
+        assert_ne!(sidebar_buffer(&mut app, 20)[(38, 1)].bg, original);
+        for _ in 0..30 { app.handle_event(&key(KeyCode::Left)); }
+        let buffer = sidebar_buffer(&mut app, 20);
+        assert_eq!(buffer[(38, 1)].bg, Color::Reset, "zero disables tint");
+        assert_eq!(buffer[(2, 5)].symbol(), "━", "closing rule survives tint off");
+        app.handle_event(&key(KeyCode::Esc));
+        assert_eq!(sidebar_buffer(&mut app, 20)[(38, 1)].bg, original);
+    }
+
+    #[test]
+    fn global_settings_opens_above_every_view_and_consumes_modal_keys() {
+        use crossterm::event::{Event, KeyEvent};
+        let mut app = test_app();
+        for (mode, messaging) in [(ViewMode::Sessions, false), (ViewMode::Planning, false),
+            (ViewMode::Sessions, true)] {
+            app.view_mode = mode.clone();
+            app.messages.visible = messaging;
+            assert!(app.handle_event(&Event::Key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE))));
+            assert!(app.is_input_mode());
+            app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT)));
+            assert_eq!(app.view_mode, mode, "global modal consumes view-switch keys");
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let text: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("Global Settings"));
+            assert!(text.contains("2.00×"));
+            app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+            assert!(!app.is_input_mode());
+            assert_eq!(app.messages.visible, messaging, "cancel preserves underlying view");
+        }
     }
 
     #[test]

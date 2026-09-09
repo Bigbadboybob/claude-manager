@@ -78,8 +78,27 @@ its default background and the initiative coordinator `◆` glyph.
 
 Select a section heading and press **Alt+E** to change its color. The palette is
 red, orange, yellow, green, cyan, blue, magenta, and pink, plus the neutral default.
-The choice controls both the heading accent and its background tint. The tint
-uses three times the original RGB intensity; this does not change terminal alpha.
+The choice controls both the heading accent and its background tint.
+
+**F9** opens **Global Settings** from Sessions, Planning, or Messages. The section
+tint defaults to **2×** the original RGB intensity. Use **←/→** (or **-/+**) to
+preview changes in steps of 0.25, **Enter** to save, **Esc** to cancel, or **Home**
+to restore the 2× default. The range is 0–5; **0 turns the tint off**, retaining
+section headings and closing rules. The dialog includes color samples and leaves
+the task sidebar visible when space permits.
+
+The preference applies across all projects in that laptop's TUI and persists in
+`~/.cm/tui-settings.toml`, separate from session and daemon state. Saving applies
+immediately: no rebuild, deployment, or TUI restart. Direct file edits are read
+at the next TUI launch. A missing setting defaults to 2×:
+
+```toml
+sidebar_tint_strength = 2.0
+```
+
+Invalid settings fall back to 2× and show an error in Global Settings. A malformed
+TOML file is preserved rather than overwritten on save; fix it before saving.
+Other settings keys are preserved when saving (TOML comments/formatting are not).
 
 Terminal colors do not include alpha. Whether these colored cells inherit the
 window's transparency is controlled by the terminal emulator; CM does not change
@@ -98,6 +117,7 @@ New `Cursor::Section(String)`. It is selectable; `active_workspace_index`, `acti
 |---|---|---|
 | `A-N` | new section | new section |
 | `A-e` | Section settings: name, color | Workspace/Task settings gain a **Section** field (←/→ cycles none + sections) |
+| `F9` | Global Settings: section tint strength | Applies across projects; live preview and persistent save |
 | `A-x` | delete section (confirm; workspaces become loose) | unchanged |
 | `Space` / `Enter` | fold / unfold | unchanged |
 | `A-J` / `A-K` | move section down / up | unchanged |

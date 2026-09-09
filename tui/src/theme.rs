@@ -139,11 +139,13 @@ pub(crate) fn cycle_user_color(current: Option<&str>, forward: bool) -> Option<S
 /// Task-sidebar section surfaces, with optional user-color accents.
 /// Keep a neutral base so missing colors are visible rather than near black.
 /// Terminal opacity is applied by the terminal emulator; ANSI colors have no alpha.
-pub(crate) fn sidebar_section_bg(color: Option<&str>) -> Color {
+pub(crate) fn sidebar_section_bg(color: Option<&str>, strength: f64) -> Color {
+    if strength <= 0.0 { return Color::Reset; }
     let (r, g, b) = match color.and_then(user_color) {
         Some(Color::Rgb(r, g, b)) => (16 + r / 12, 18 + g / 12, 22 + b / 12),
         _ => (25, 29, 38),
     };
-    // Three times the original RGB intensity; terminal alpha stays untouched.
-    Color::Rgb(r * 3, g * 3, b * 3)
+    // Float-to-u8 conversion saturates, keeping large intensities in range.
+    Color::Rgb((r as f64 * strength).round() as u8,
+        (g as f64 * strength).round() as u8, (b as f64 * strength).round() as u8)
 }

@@ -19,6 +19,13 @@ sockets, temporary files and networking while keeping the source read-only.
 Use a private `CARGO_TARGET_DIR`; the shared target also serves live binaries.
 See [cloud responsiveness verification](doc/cloud-responsiveness-fixes.md).
 
+## Global TUI settings
+
+**F9** opens Global Settings in any view. Section tint strength defaults to 2×;
+arrow keys preview adjustments, Enter saves, and Esc cancels. Preferences live
+on the laptop in `~/.cm/tui-settings.toml` and apply immediately when saved.
+See [sidebar appearance settings](doc/sidebar-sections.md#layout).
+
 ## If you are running inside CM
 
 Use the `claude-manager` MCP tools to inspect your context (`ping`), look up work (`list_tasks`, `get_task`), file draft tasks (`propose_task`), delegate authorized work (`start_session`, `create_subtask`), and communicate with other sessions (`chat_open`, `chat_read`, `chat_send`). Start workers in separate worktrees when appropriate, and use background monitors to follow their progress.

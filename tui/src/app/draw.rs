@@ -134,7 +134,11 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        if self.messages.visible { self.draw_messages(frame); return; }
+        if self.messages.visible {
+            self.draw_messages(frame);
+            self.global_settings.draw(frame, frame.area());
+            return;
+        }
         let area = frame.area();
 
         // Phase 6: bottom layout — content / [activity strip] / status bar.
@@ -420,6 +424,13 @@ impl App {
                 }
             }
         }
+        // Leave the task sidebar visible beside the live appearance preview.
+        let terminal_width = area.width.saturating_sub(SIDEBAR_WIDTH
+            * if self.continuous_column_on { 2 } else { 1 });
+        let settings_area = if self.view_mode == ViewMode::Sessions && terminal_width >= 40 {
+            Rect { width: terminal_width, ..area }
+        } else { area };
+        self.global_settings.draw(frame, settings_area);
     }
 
     /// Minimal dialog for renaming a task from the sidebar.
@@ -1772,11 +1783,11 @@ impl App {
             ("A-s    +session", "A-q  quit"),
             ("A-w    close sess", "A-y  history"),
             ("A-W    close ws", "A-u  resume"),
-            ("A-e    settings", "A-,  activity"),
+            ("A-e    settings", "F9   global"),
             ("A-H    hide", "A-z  catalog"),
             ("A-f    workflow", "A-t  planning"),
             ("A-o    stop wf", "A-c  cont-col"),
-            ("A-C    cont-stop", ""),
+            ("A-C    cont-stop", "A-,  activity"),
             ("A-b    snapshot", "A-g  attention"),
             ("A-O    reopen ws", ""),
             ("A-N    +section", "A-J/K sect order"),
