@@ -278,3 +278,21 @@ Rollback copies, binary hashes, before/after health and process evidence are in
 `~/.cm/backups/native-notifications-20260907T204029Z`. Use the holder's
 `daemon.rollback_brain` procedure if the deployed brain must be reverted;
 restore the matching MCP files and viewer artifact from that backup as needed.
+
+### Chat wake batching cloud rollout — September 9, 2026
+
+Commits `159834e` and `0a8bf21` were installed on both cloud hosts using
+brain-only `daemon.restart`, after daemon preflight and the 56-tool MCP selftest.
+`cm-manager` advanced epoch 17→18 with 40 sessions; `cm-sessions` advanced 1→2
+with 28. Every one of the 68 held session processes retained its PID and start
+time. Both brains remained at the new epoch/PID beyond the ten-minute stability
+horizon, with MCP healthy, breakers running, holder/registry counts equal, and
+connected messaging sync reporting zero pending events and no error.
+
+The rollout changed no holder or TUI binary. Chat batching applies immediately;
+existing MCP processes pick up the updated worker-completion wording on reconnect.
+No unrelated agents were prompted for a live wake smoke test. Isolated validation
+passed 73 messaging unit tests and 84 Python tests before deployment. Private
+binary/MCP backups, checksums, activation and stability evidence are under
+`~/.cm/deployments/chat-wake-batching-20260909T181428Z` on `cm-sessions`, with
+matching pre-deploy file backups on `cm-manager`.
