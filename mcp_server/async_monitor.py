@@ -610,6 +610,12 @@ def _format_fire_message(record: dict, result: dict) -> str:
             "read_last_turn, send follow-ups with send_input, or finish up. "
             "Prompting a worker again auto-registers a fresh monitor.)"
         )
+    lines.append(
+        "Before responding, inspect pending results and continue the existing task. "
+        "Do not repeat a completed answer or summary; report only meaningful "
+        "changes, blockers, or decisions needing Owner. If nothing needs attention, "
+        "no user-facing update is needed."
+    )
     return "\n".join(lines)
 
 

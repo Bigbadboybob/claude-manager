@@ -119,6 +119,19 @@ Choose one scope per read: channel, DM, conversation, thread, inbox, or incoming
 
 Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query. After actually reading a page, pass its complete `receipt` object as `ack_receipt` on a subsequent `chat_read` or `chat_send`. This marks exactly those messages read. Previews and merely opening a conversation do not clear unread messages.
 
+On a background notification, read pending activity **before responding**.
+`chat_read(inbox=True, unread_only=True)` combines eligible chat activity across
+conversations. Finish its pages and acknowledge each receipt. CM sends the first
+chat wake immediately and combines later arrivals until you fetch the messages.
+Only the returned message IDs advance that wake boundary; previews do not.
+Arrivals during a paginated read remain queued for a subsequent wake.
+
+Continue your existing task. Do not repeat an answer or summary you already gave
+Owner. Report only meaningful changes, blockers, or decisions needing attention;
+if nothing needs attention, no user-facing update is needed. This applies to
+worker-completion notifications too. `notification_status()` lists retained chat
+and worker notices for diagnostics; it does not consume either source's results.
+
 ## Watch for messages while you work
 
 ```python
@@ -170,7 +183,9 @@ Use `notification_status()` to inspect your native connection and delivery recei
 
 Chat watches (`chat_monitor`) watch messages; worker watches (`monitor_sessions`) watch session completion. Chat watches are daemon-resident; worker watches live in your MCP process. Do not assume worker watches survive an MCP reconnect.
 
-Messaging currently works **between sessions on the same daemon**. Cross-machine sync is not enabled. Use MCP for sends, channel creation, read acknowledgements, and norms updates; do not edit the message store by hand. Check current tool schemas for additional options.
+Messaging spans paired hosts in the same space; check `chat_open.sync` for the
+current connection. Use MCP for sends, channel creation, read acknowledgements,
+and norms updates; do not edit the message store by hand.
 
 For full membership, migration and Owner controls, see [Membership and mentions](messaging/MEMBERSHIP_AND_MENTIONS.md).
 

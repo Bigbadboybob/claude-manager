@@ -76,7 +76,11 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         Ok(v) => {
             if matches!(
                 req.method.as_str(),
-                "messaging.send" | "messaging.follow" | "messaging.monitor" | "messaging.monitors"
+                "messaging.send"
+                    | "messaging.read"
+                    | "messaging.follow"
+                    | "messaging.monitor"
+                    | "messaging.monitors"
             ) {
                 super::delivery::signal(state);
             }
@@ -338,11 +342,12 @@ fn execute_with_freshness(
             message: "Daemon is restarting; retry the same request".into(),
         });
     }
-    // Only recipient-affecting mutations serialize with PTY submission.
-    // Ordinary reads/sends never wait through the adapter's paste delay.
+    // Full-message reads advance the wake batch boundary. Serialize their
+    // snapshot with publication; native adapter I/O runs outside this gate.
     let coordinates_delivery = kind != "owner"
-        && (req.method == "messaging.follow"
-            && matches!(req.params["action"].as_str(), Some("set" | "remove"))
+        && (req.method == "messaging.read"
+            || req.method == "messaging.follow"
+                && matches!(req.params["action"].as_str(), Some("set" | "remove"))
             || req.method == "messaging.monitors"
                 && matches!(
                     req.params["action"].as_str(),
@@ -510,7 +515,12 @@ fn execute_with_freshness(
             store.acknowledge(&actor, &p["ack_receipt"])?;
             store.send(&actor, &uid, kind, p, &people)
         }
-        "messaging.read" => store.read(&actor, p, &people),
+        "messaging.read" => {
+            // A proactive read may beat the maintenance scan. Include watch
+            // hits in this snapshot so they cannot create a later duplicate wake.
+            store.advance_monitors_at(chrono::Utc::now())?;
+            store.read(&actor, p, &people)
+        }
         "messaging.dms" => store.dms_page(&actor, p),
         "messaging.norms" => {
             if matches!(p["action"].as_str(), Some("publish" | "revert")) {
@@ -584,6 +594,14 @@ fn execute_with_freshness(
     };
     project_names(state, store, true);
     let mut retraction_note = None;
+    if kind != "owner" && req.method == "messaging.read" {
+        if let Ok(value) = &result {
+            if let Err(error) = super::delivery::read_boundary(store, &uid, value) {
+                eprintln!("cm messaging: wake read boundary: {error}");
+                retraction_note = Some("Messages supplied, but the notification boundary could not be saved; retry the read.".into());
+            }
+        }
+    }
     if coordinates_delivery {
         if let Err(error) = super::delivery::reconcile(&root, store) {
             eprintln!("cm messaging: pending wake reconciliation: {error}");
@@ -656,6 +674,75 @@ mod tests {
         )
     }
     #[test]
+    fn messaging_full_read_covers_unscanned_watch_but_preview_and_invalid_read_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        call(
+            &state,
+            "b",
+            "monitor",
+            json!({"scope":{"channel":"general"},"mode":"continuous","request_id":"watch"}),
+        )
+        .unwrap();
+        call(
+            &state,
+            "a",
+            "send",
+            json!({"channel":"general","name":"Publisher","body":"Ready","request_id":"one"}),
+        )
+        .unwrap();
+        call(&state, "b", "open", json!({"channel":"general"})).unwrap();
+        assert!(call(
+            &state,
+            "b",
+            "read",
+            json!({"channel":"general","cursor":{"invalid":true}})
+        )
+        .is_err());
+        use sha2::Digest;
+        let uid_hash = format!("{:x}", sha2::Sha256::digest(b"b"));
+        let ledger = root
+            .path()
+            .join("messages/main/_delivery")
+            .join(format!("{uid_hash}.json"));
+        // Neither a preview nor a failed read releases a wake.
+        if ledger.exists() {
+            let q: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+            assert!(q["batches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b["checked"].as_array().unwrap().is_empty()));
+        }
+        let page = call(
+            &state,
+            "b",
+            "read",
+            json!({"inbox":true,"unread_only":true}),
+        )
+        .unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["read"], false);
+        let q: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        assert_eq!(q["batches"][0]["released"], true);
+        assert_eq!(q["batches"][0]["checked"].as_array().unwrap().len(), 1);
+        // The watch result and unread message survive the notification boundary.
+        assert_eq!(page["monitor_status"]["unacknowledged"], 1);
+        assert_eq!(
+            call(
+                &state,
+                "b",
+                "read",
+                json!({"inbox":true,"unread_only":true})
+            )
+            .unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[test]
     fn messaging_channel_admin_uses_authenticated_caller_not_supplied_roles() {
         let root = tempfile::tempdir().unwrap();
         let state = setup(root.path());
@@ -677,7 +764,7 @@ mod tests {
         assert_eq!(opened["target"]["created_by"], channel["created_by"]);
     }
     #[test]
-    fn messaging_cancel_serializes_at_delivery_boundary_but_reads_and_sends_do_not() {
+    fn messaging_reads_and_cancellation_serialize_with_wake_publication_but_sends_do_not() {
         let tmp = tempfile::tempdir().unwrap();
         let state = setup(tmp.path());
         let monitor = call(
@@ -695,11 +782,12 @@ mod tests {
             tx.send(call(&clone, "a", "read", json!({"channel":"general"})))
                 .unwrap();
         });
-        let read = rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("A read waited for PTY delivery");
-        assert!(read.is_ok());
-        reader.join().unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "Read crossed an in-progress wake publication boundary"
+        );
+        let read_rx = rx;
         let (tx, rx) = std::sync::mpsc::channel();
         let clone = state.clone();
         let sender = std::thread::spawn(move || {
@@ -727,6 +815,11 @@ mod tests {
             "Cancellation crossed an in-progress delivery boundary"
         );
         drop(guard);
+        assert!(read_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        reader.join().unwrap();
         assert!(rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap()
