@@ -93,16 +93,22 @@ September 9, 2026: 78 isolated daemon messaging tests, 15 TUI messaging tests an
 checks, open editing and Owner access; coordinator replication without changing
 global norms; conflicts/revert/empty documents; scoped paging and acknowledgement
 across restarts; bounded context notices; independent Owner drafts; retry scope
-preservation; and the channel update indicator. The feature is committed on
-`cm/messaging-sync`; its coordinated deployment is still pending.
+preservation; and the channel update indicator. The feature is merged into main
+and deployed (see the follow-up below).
 
 
 Release verification on September 9 also passed the real daemon/TUI terminal
 smoke test, including channel norms publish/diff and unchanged global text.
 Prebuilt runtime revision `be56bce` is staged and preflighted on `cm-sessions`
 and `cm-manager` under `~/.cm/deployments/channel-norms-20260909T185044Z`.
-The laptop replica (`83bce20a-1f8e-4dd0-82e1-084fca0881c2`) still needs updating;
-its available cloud connection is a read-only file export. No live channel-norm
-binary activation has happened. A pinned `install-laptop.py` is staged alongside
-the payload as an alternative to providing laptop SSH access. Keep the coordinator
-on the old release until both replicas have the new reducer.
+That rollout initially awaited laptop access. The laptop replica
+(`83bce20a-1f8e-4dd0-82e1-084fca0881c2`) subsequently installed `be56bce` and
+uploaded activation and ten-minute stability receipts at 19:41 and 19:51 UTC.
+The later initiatives deployment installed descendant `8ea5b30` on both cloud
+hosts, superseding the staged cloud payload. At 21:10 UTC, both live hosts were
+healthy and returned the correct separate channel/global norms scopes; the global
+revision remained `fd17281b-5668-42be-8667-a3b5f0d6d471`. Evidence is in
+`superseding-deployment-verified.json` beside those laptop receipts and
+`~/.cm/deployments/initiatives-20260909T204155Z/final-health.json`.
+Do not activate the obsolete staged cloud payload. Channel norms are available;
+reconnect MCP if its tool schema is stale, and restart the Owner TUI for **N**.
