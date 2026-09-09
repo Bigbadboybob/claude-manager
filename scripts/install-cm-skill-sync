@@ -38,9 +38,20 @@ def main():
     script = Path(__file__).resolve().parent / "cm-sync-skills"
     (unit / "cm-sync-skills.service").write_text("[Unit]\nDescription=Sync personal Claude and Codex skills\n\n[Service]\nType=oneshot\nExecStart=" + str(script) + "\n")
     (unit / "cm-sync-skills.timer").write_text("[Unit]\nDescription=Periodic personal skill sync\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "--now", "cm-sync-skills.timer"], check=True)
-    print("enabled cm-sync-skills.timer")
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "cm-sync-skills.timer"], check=True)
+        print("enabled cm-sync-skills.timer")
+    except (OSError, subprocess.CalledProcessError):
+        # Headless SSH sessions may have no user DBus even when linger is enabled.
+        # Cron is the equivalent persistent fallback and is installed idempotently.
+        marker = "# cm-sync-skills"
+        existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+        lines = [line for line in existing.splitlines() if marker not in line]
+        log = Path.home() / ".cm/skill-sync/cron.log"
+        lines.append(f"*/5 * * * * {marker} /usr/bin/flock -n {Path.home() / '.cm/skill-sync/sync.lock'} {script} >> {log} 2>&1")
+        subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, check=True)
+        print("user systemd unavailable; installed crontab fallback")
     return 0
 
 if __name__ == "__main__":
