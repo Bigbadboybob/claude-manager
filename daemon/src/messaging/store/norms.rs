@@ -168,7 +168,11 @@ impl Store {
         for scope in scopes {
             current[scope] = self.current_norms(scope)["revision"].clone();
             acknowledged[scope] = json!(state.norms_ack_for(scope));
-            if current[scope] != acknowledged[scope] {
+            // An optional channel document has nothing to acknowledge until
+            // its first publication. Its empty revision still supports creation.
+            if current[scope] != acknowledged[scope]
+                && (scope == "global" || self.channel_norms.contains_key(scope))
+            {
                 stale.push(scope.clone());
             }
         }
@@ -655,6 +659,12 @@ mod tests {
         assert_eq!(first["channel_norms"]["text"], "");
         assert!(first["context_status"]["current"].get(&sp).is_none());
         assert_eq!(first["norms"]["scope"], "global");
+        s.acknowledge_norms("reader", first["norms"]["revision"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            s.scoped_norms_status("reader", &["global".into(), sc.clone()])["changed"],
+            false
+        );
         let ack = json!({"channel":"parent/child","norms_seen":{"global":first["norms"]["revision"],(sc.clone()):first["channel_norms"]["revision"]}});
         assert_eq!(
             s.context_response("reader", &ack, json!({}), false)["context_status"]["changed"],

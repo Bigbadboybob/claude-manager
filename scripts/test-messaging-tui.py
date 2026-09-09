@@ -199,6 +199,24 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             key(b"P", 0.6)
             wait_text("Pinned reference for the release.")
             shot("cm-chat-channel-renamed")
+            # Channel norms use the same editor, with their own history and scope.
+            key(b"N", 0.6)
+            wait_text("#release-notes norms")
+            wait_text("No channel norms yet")
+            key(b"\r", 0.4)
+            key(b"pUse short release notes.\x13", 0.4)
+            wait_text("Explain norms change")
+            key(b"Define channel conventions\r", 0.3)
+            wait_text("Review norms change")
+            key(b"\x13", 0.7)
+            local_norms = rpc("norms", {"channel": "release-notes"})
+            assert local_norms["text"] == "Use short release notes.", local_norms
+            assert rpc("norms")["text"] == initial_text
+            key(b"d", 0.5)
+            wait_text("+Use short release notes.")
+            shot("cm-chat-channel-norms")
+            key(b"b", 0.5)
+            wait_text("#Release review")
             key(b"bgeneral\r", 0.7)
             wait_text("Second paragraph stays visible.")
             # Public channel preview does not join; Owner joins/leaves explicitly.

@@ -67,7 +67,11 @@ impl Messages {
     }
     fn norms_changed(&self) -> bool {
         let scope = self.norms_scope();
-        self.management.context["current"][scope] != self.management.context["acknowledged"][scope]
+        if let Some(stale) = self.management.context["stale_scopes"].as_array() {
+            stale.iter().any(|s| s == scope)
+        } else {
+            self.management.context["current"][scope] != self.management.context["acknowledged"][scope]
+        }
     }
     pub(super) fn management_view(&self) -> bool {
         self.target["norms"] == true
