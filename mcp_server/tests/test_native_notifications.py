@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from mcp_server.native_claude import ClaudeSocket
-from mcp_server.native_codex import Relay
+from mcp_server.native_codex import Relay, configure_external_editor
 from mcp_server.notifications import (
     NotSubmitted,
     Queue,
@@ -52,6 +52,39 @@ class Adapter:
 
     async def observed(self, event):
         return event["id"] in self.seen
+
+
+class ExternalEditorTests(unittest.TestCase):
+    def test_headless_launch_uses_available_neovim(self):
+        with mock.patch.dict(os.environ, {"VISUAL": " ", "EDITOR": ""}, clear=True), mock.patch(
+            "mcp_server.native_codex.shutil.which", return_value="/usr/local/bin/nvim"
+        ) as which:
+            configure_external_editor()
+            self.assertEqual(os.environ["VISUAL"], "/usr/local/bin/nvim")
+            self.assertEqual(os.environ["EDITOR"], "/usr/local/bin/nvim")
+            which.assert_called_once_with("nvim")
+
+    def test_explicit_editor_or_visual_is_preserved_including_arguments(self):
+        for env in ({"EDITOR": "vim -f"}, {"VISUAL": "code --wait"},
+                    {"VISUAL": "nvim", "EDITOR": "vi"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True), mock.patch(
+                "mcp_server.native_codex.shutil.which"
+            ) as which:
+                configure_external_editor()
+                self.assertEqual(dict(os.environ), env)
+                which.assert_not_called()
+
+    def test_fallback_requires_an_installed_editor(self):
+        for available in ("vim", "vi", None):
+            with self.subTest(available=available), mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+                "mcp_server.native_codex.shutil.which",
+                side_effect=lambda name: f"/usr/bin/{name}" if name == available else None,
+            ):
+                configure_external_editor()
+                expected = {} if available is None else {
+                    "EDITOR": f"/usr/bin/{available}", "VISUAL": f"/usr/bin/{available}"
+                }
+                self.assertEqual(dict(os.environ), expected)
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):

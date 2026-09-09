@@ -45,6 +45,15 @@ controls and runaway-child watcher remain available; no new caps were enabled.
 - Claude Code 2.1.265 and Codex 0.153.4 match the source at cutover.
   Both login-status checks passed. Rust 1.94.1, Cargo, uv 0.10.12, Google Cloud
   CLI 583.0.0, Git, Python, Node, tmux and the native build dependencies are installed.
+- Fresh CM Codex launches choose an installed terminal editor when both `VISUAL`
+  and `EDITOR` are unset: Neovim first, then Vim/vi. Explicit editor choices are
+  preserved. This is configured in the native launcher because the systemd daemon
+  does not source interactive Bash configuration. On `cm-sessions`, the fallback
+  is `/usr/local/bin/nvim` with the migrated Neovim config. Already-running Codex
+  processes retain their startup environment: save any unsent draft before using
+  `Alt+Shift+R` to restart/resume that session. Reopening only the CM TUI does not
+  change an agent's environment. Updating the Python launcher file takes effect
+  at the next session launch and does not require restarting the daemon.
 - Both main repositories and required worktrees retain their original
   `/home/lucas` paths, Git state and small working files. Conversations, skills,
   agent configuration, shell configuration and Neovim plugins/config were copied.

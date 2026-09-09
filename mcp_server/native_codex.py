@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -421,8 +422,20 @@ async def terminate(child):
         await child.wait()
 
 
+def configure_external_editor():
+    """Headless CM spawns do not source the operator's interactive shell config."""
+    if any(os.environ.get(key, "").strip() for key in ("VISUAL", "EDITOR")):
+        return
+    for name in ("nvim", "vim", "vi"):
+        if editor := shutil.which(name):
+            os.environ["VISUAL"] = editor
+            os.environ["EDITOR"] = editor
+            return
+
+
 async def launch(args):
     os.environ.update(json.loads(args.cm_env))
+    configure_external_editor()
     os.environ["CM_TUI_SESSION_ID"] = args.session_uid
     os.environ["CM_AGENT_ENGINE"] = "codex"
     for key in (
