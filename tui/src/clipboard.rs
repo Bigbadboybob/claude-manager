@@ -1,7 +1,7 @@
 //! Read the viewing machine's clipboard without blocking terminal rendering.
 
 use std::borrow::Cow;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -82,67 +82,207 @@ fn read_clipboard(selection: ClipboardType) -> Option<String> {
 }
 
 fn read_command(args: &[&str], budget: Duration) -> io::Result<String> {
-    const MAX_BYTES: usize = 1024 * 1024;
-    let mut child = Command::new(args[0])
-        .args(&args[1..])
-        .stdin(Stdio::null())
+    let mut command = Command::new(args[0]);
+    command.args(&args[1..]);
+    String::from_utf8(run_command(command, &[], budget, 1024 * 1024)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Bound reads AND writes: a disconnected SSH child must not leave clipboard
+/// input blocked in a pipe indefinitely. Only the background worker calls this.
+fn run_command(
+    mut command: Command,
+    input: &[u8],
+    budget: Duration,
+    max_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    let mut child = command
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
     let result = (|| {
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let fd = stdout.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let mut stdin = child.stdin.take();
+        let nonblocking = |fd| -> io::Result<()> {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        nonblocking(stdout.as_raw_fd())?;
+        nonblocking(stdin.as_ref().unwrap().as_raw_fd())?;
         let deadline = Instant::now() + budget;
         let mut bytes = Vec::new();
         let mut buf = [0; 8192];
         let mut eof = false;
+        let mut written = 0;
         loop {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "clipboard provider timed out",
+                    "clipboard operation timed out",
                 ));
+            }
+            if written == input.len() {
+                stdin.take();
+            }
+            if let Some(pipe) = stdin.as_mut() {
+                match pipe.write(&input[written..]) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => written += n,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
             }
             if !eof {
                 match stdout.read(&mut buf) {
                     Ok(0) => eof = true,
                     Ok(n) => {
-                        if bytes.len() + n > MAX_BYTES {
+                        if bytes.len() + n > max_bytes {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "clipboard exceeds 1 MiB",
+                                "clipboard exceeds size limit",
                             ));
                         }
                         bytes.extend_from_slice(&buf[..n]);
                         continue;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
                     Err(e) => return Err(e),
                 }
             }
             if eof {
                 if let Some(status) = child.try_wait()? {
                     if !status.success() {
-                        return Err(io::Error::other("clipboard provider failed"));
+                        return Err(io::Error::other("clipboard command failed"));
                     }
-                    return String::from_utf8(bytes)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+                    return Ok(bytes);
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
         }
     })();
-    // A stuck provider must not accumulate children or monopolize this worker.
     if result.is_err() {
         let _ = child.kill();
     }
     let _ = child.wait();
     result
+}
+
+pub(crate) struct PasteResult {
+    pub text: String,
+    pub image: bool,
+}
+
+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// Called only on an explicit paste shortcut, on the viewing machine.
+pub(crate) fn prepare_paste(
+    transport: &crate::hosts::HostTransport,
+) -> io::Result<Option<PasteResult>> {
+    let mut providers: Vec<Vec<&str>> = Vec::new();
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        providers.push(vec!["wl-paste", "--no-newline", "--type", "image/png"]);
+    }
+    providers.push(vec![
+        "xclip",
+        "-selection",
+        "clipboard",
+        "-target",
+        "image/png",
+        "-o",
+    ]);
+    for args in providers {
+        let mut command = Command::new(args[0]);
+        command.args(&args[1..]);
+        match run_command(command, &[], Duration::from_millis(1500), MAX_IMAGE_BYTES) {
+            Ok(bytes) if bytes.starts_with(PNG_MAGIC) => {
+                return save_image(transport, &bytes).map(|path| {
+                    Some(PasteResult {
+                        text: path,
+                        image: true,
+                    })
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(read_clipboard(ClipboardType::Clipboard)
+        .filter(|s| !s.is_empty())
+        .map(|text| PasteResult { text, image: false }))
+}
+
+// All executable text is constant. Clipboard bytes travel only over stdin;
+// neither their contents nor a clipboard filename can become shell syntax.
+const SAVE_IMAGE_SCRIPT: &str = r#"
+import os, sys, tempfile
+expected = int(sys.stdin.buffer.readline())
+assert 0 < expected <= 32 * 1024 * 1024
+image = sys.stdin.buffer.read(expected + 1)
+assert len(image) == expected and image.startswith(b'\x89PNG\r\n\x1a\n')
+os.umask(0o077)
+directory = os.path.expanduser('~/.cm/attachments')
+os.makedirs(directory, mode=0o700, exist_ok=True)
+fd, path = tempfile.mkstemp(prefix='paste-', suffix='.png', dir=directory)
+with os.fdopen(fd, 'wb') as out:
+    out.write(image)
+print(path)
+"#;
+
+fn save_image(transport: &crate::hosts::HostTransport, bytes: &[u8]) -> io::Result<String> {
+    use crate::hosts::HostTransport;
+    let command = match transport {
+        HostTransport::Unix { .. } => {
+            let mut c = Command::new("python3");
+            c.args(["-c", SAVE_IMAGE_SCRIPT]);
+            c
+        }
+        HostTransport::SshUnix {
+            ssh_host, ssh_user, ..
+        } => {
+            let mut c = Command::new("ssh");
+            c.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
+            if let Some(user) = ssh_user {
+                c.arg("-l").arg(user);
+            }
+            c.arg("--").arg(ssh_host);
+            c.arg(format!(
+                "python3 -c '{}'",
+                SAVE_IMAGE_SCRIPT.replace('\'', "'\"'\"'")
+            ));
+            c
+        }
+        HostTransport::TcpTls { .. } => {
+            return Err(io::Error::other(
+                "Image paste currently requires an SSH or local host",
+            ))
+        }
+    };
+    // Prefixing the exact length prevents a broken upload from publishing a
+    // truncated image. Files persist across reconnect/resume, like transcripts.
+    let mut input = format!("{}\n", bytes.len()).into_bytes();
+    input.extend_from_slice(bytes);
+    let output = run_command(command, &input, Duration::from_secs(30), 16 * 1024)?;
+    let path =
+        String::from_utf8(output).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let path = path.trim();
+    if !path.starts_with('/') || path.chars().any(char::is_control) {
+        return Err(io::Error::other("Image upload returned an invalid path"));
+    }
+    Ok(path.to_string())
 }
 
 #[cfg(test)]
@@ -153,8 +293,15 @@ mod tests {
     fn terminal_accepts_neovim_clipboard_queries() {
         use alacritty_terminal::{event::Event, vte::ansi::Handler, Term};
         let (tx, rx) = mpsc::channel();
-        let size = crate::session::TermSize { columns: 80, screen_lines: 24 };
-        let mut term = Term::new(crate::session::terminal_config(), &size, crate::session::EventProxy::new(tx));
+        let size = crate::session::TermSize {
+            columns: 80,
+            screen_lines: 24,
+        };
+        let mut term = Term::new(
+            crate::session::terminal_config(),
+            &size,
+            crate::session::EventProxy::new(tx),
+        );
         term.clipboard_load(b'c', "\x07");
         match rx.try_recv().expect("terminal must forward OSC 52 reads") {
             Event::ClipboardLoad(ClipboardType::Clipboard, formatter) => {
@@ -209,5 +356,54 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn stalled_upload_times_out_instead_of_blocking_on_stdin() {
+        let mut command = Command::new("sleep");
+        command.arg("20");
+        let started = Instant::now();
+        let err = run_command(
+            command,
+            &vec![0; 1024 * 1024],
+            Duration::from_millis(40),
+            1024,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn image_upload_is_exact_private_unique_and_rejects_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        // Binary bytes and shell metacharacters are payload, never executable text.
+        let bytes = [PNG_MAGIC, b"\0\xff\n'$(touch unwanted)`touch unwanted`"].concat();
+        let mut input = format!("{}\n", bytes.len()).into_bytes();
+        input.extend_from_slice(&bytes);
+        let upload = |input: &[u8]| {
+            let mut command = Command::new("python3");
+            command
+                .args(["-c", SAVE_IMAGE_SCRIPT])
+                .env("HOME", home.path());
+            run_command(command, input, Duration::from_secs(3), 16384)
+        };
+        let path = String::from_utf8(upload(&input).unwrap()).unwrap();
+        let path = std::path::Path::new(path.trim());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let second = String::from_utf8(upload(&input).unwrap()).unwrap();
+        assert_ne!(path, std::path::Path::new(second.trim()));
+        assert!(upload(&input[..input.len() - 1]).is_err());
+        assert_eq!(
+            std::fs::read_dir(home.path().join(".cm/attachments"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
 }

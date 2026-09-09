@@ -44,6 +44,8 @@ use remote::*;
 mod events;
 use events::*;
 mod lifecycle;
+mod plan_launch;
+mod image_paste;
 use lifecycle::*;
 mod input;
 mod continuous_control;
@@ -464,6 +466,8 @@ pub struct App {
     /// entry, kept so a failed attach can be re-queued / capped). Prevents
     /// re-dispatching an attach that's already running.
     pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
+    plan_launches: Vec<plan_launch::PlanLaunchFlight>,
+    image_pastes: Vec<image_paste::ImagePasteFlight>,
     /// 10e-d: per-process de-dup set for cap-kill toasts. A given
     /// session's cap-kill event can reach the TUI through two
     /// side-channels — the attach-stream End frame (immediate,
@@ -921,6 +925,8 @@ impl App {
             pending_remote_reattach: Vec::new(),
             attach_worker,
             attaching: HashMap::new(),
+            plan_launches: Vec::new(),
+            image_pastes: Vec::new(),
             push_worker,
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,

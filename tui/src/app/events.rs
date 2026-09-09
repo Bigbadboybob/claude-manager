@@ -2599,15 +2599,15 @@ impl App {
             // auto-provision a local workspace. Remote task launches can
             // legitimately have no planning wip_branch/is_cloud value yet,
             // while their live session already carries the task_id.
-            if let Some(ws_id) = self
+            if let Some(ws) = self
                 .workspaces
-                .iter()
+                .iter_mut()
                 .find(|w| w.sessions.iter().any(|s| {
                     s.task_id.as_deref() == Some(task.id.as_str())
                 }))
-                .map(|w| w.id.clone())
             {
-                self.tasks[task_idx].workspace_id = Some(ws_id);
+                ws.repo_url.get_or_insert_with(|| task.repo_url.clone());
+                self.tasks[task_idx].workspace_id = Some(ws.id.clone());
                 continue;
             }
 
@@ -2932,6 +2932,23 @@ mod apply_manifest_diff_tests {
         std::mem::forget(tmp);
         app.workspaces.push(ws);
         app
+    }
+
+    #[test]
+    fn reconcile_binds_remote_session_without_branch_metadata() {
+        let mut app = build_app_with_session("lost-launch");
+        app.workspaces[0].host_id = cm_daemon::host_id::HostId::new("sessions");
+        app.workspaces[0].sessions[0].task_id = Some("new-task".into());
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id":"new-task", "repo_url":"https://github.com/example/repo", "status":"running",
+            "repo_branch":"main",
+            "name":"New task", "kind":"oneshot", "source":"user", "is_cloud":false,
+            "created_at":"2026-09-09T07:59:15Z", "updated_at":"2026-09-09T07:59:15Z"
+        })).unwrap();
+        app.reconcile_tasks(vec![task]);
+        assert_eq!(app.tasks.iter().find(|t| t.task_id.as_deref() == Some("new-task"))
+            .unwrap().workspace_id.as_deref(), Some("ws-test"));
+        assert_eq!(app.workspaces.len(), 1, "must recover the existing workspace");
     }
 
     /// T15 — `apply_manifest_diff` with `ManifestDiff::Exited`

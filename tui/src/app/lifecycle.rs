@@ -3652,9 +3652,18 @@ impl App {
 
         let session_uid = new_session_uid();
         let workspace_id_pre = new_workspace_id();
+        let spec = super::plan_launch::PlanLaunchSpec {
+            project: project.into(), slug: slug.into(), prompt: prompt.into(),
+            task_id: task_id.into(), parent_task_id: parent_task_id.map(str::to_owned),
+            in_place, engine: engine.into(), host: active_host.clone(),
+            repo_url: repo_url.clone(), uid: session_uid.clone(),
+            workspace_id: workspace_id_pre.clone(), start_branch: start_branch.map(str::to_owned),
+        };
+        if active_host != cm_daemon::host_id::HostId::local() {
+            self.start_remote_plan_launch(spec);
+            return;
+        }
         let (cols, rows) = self.last_term_size;
-        let (main_repo, worktree_path, new_sess, pending, remote_branch) =
-            if active_host == cm_daemon::host_id::HostId::local() {
         let main_repo = match worktree::find_local_repo(&repo_url) {
             Some(p) => p,
             None => {
@@ -3732,36 +3741,34 @@ impl App {
             }
         };
 
-                (Some(main_repo), worktree_path, new_sess, Some(pending), None)
-            } else {
-                let socket = match self.host_pool.live_socket_path(&active_host) {
-                    Some(path) => path,
-                    None => { self.set_status_msg(&format!("Host `{}` is unavailable", active_host)); return; }
-                };
-                let token = self.host_pool.operator_token_for(&active_host);
-                let result = match crate::client_session::rpc_create_session_with_options(
-                    &socket, &token, &session_uid, &workspace_id_pre, slug,
-                    if engine == "claude" { "claude-code" } else { engine },
-                    &repo_url, start_branch, slug, Some(task_id), cols, rows, in_place, None,
-                ) {
-                    Ok(result) => result,
-                    Err(e) => { self.set_status_msg(&format!("Launch on {}: {}", active_host, e)); return; }
-                };
-                let path = PathBuf::from(&result.worktree_path);
-                let session = match try_attach_via_daemon_with_deps(
-                    &self.host_pool, &session_uid, &workspace_id_pre, &path, engine, slug,
-                    cols, rows, Some(task_id), None, None, &active_host, None,
-                ) {
-                    Ok(session) => session,
-                    Err(e) => {
-                        // A failed viewer attach must not orphan the just-created agent.
-                        let _ = crate::client_session::rpc_kill_session(&socket, &token, &session_uid);
-                        self.set_status_msg(&format!("Attach: {}", e)); return;
-                    }
-                };
-                (result.main_repo_path.map(PathBuf::from), path, session, None, result.branch)
-            };
+        self.finish_plan_launch(spec, super::plan_launch::PreparedPlanLaunch {
+            main_repo: Some(main_repo),
+            worktree_path,
+            session: new_sess,
+            pending: Some(pending),
+            remote_branch: None,
+        });
+    }
 
+    pub(super) fn finish_plan_launch(
+        &mut self,
+        spec: super::plan_launch::PlanLaunchSpec,
+        prepared: super::plan_launch::PreparedPlanLaunch,
+    ) {
+        let super::plan_launch::PreparedPlanLaunch {
+            main_repo, worktree_path, session: new_sess, pending, remote_branch,
+        } = prepared;
+        let project = spec.project.as_str();
+        let slug = spec.slug.as_str();
+        let prompt = spec.prompt.as_str();
+        let task_id = spec.task_id.as_str();
+        let parent_task_id = spec.parent_task_id.as_deref();
+        let in_place = spec.in_place;
+        let engine = spec.engine.as_str();
+        let active_host = spec.host;
+        let repo_url = spec.repo_url;
+        let session_uid = spec.uid;
+        let workspace_id_pre = spec.workspace_id;
         // For a normal launch the WIP branch is the freshly-created
         // `cm/<slug>`. For in-place there's no new branch — record the main
         // repo's ACTUAL current branch (e.g. `main`), or `None` on detached
@@ -3815,6 +3822,10 @@ impl App {
         self.workspaces.push(ws);
         let new_wi = self.workspaces.len() - 1;
 
+        let metadata = self.tasks.iter()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+            .and_then(|t| t.metadata.clone());
+        self.tasks.retain(|t| t.task_id.as_deref() != Some(task_id));
         self.tasks.push(TaskEntry {
             task_id: Some(task_id.to_string()),
             name: slug.to_string(),
@@ -3846,7 +3857,7 @@ impl App {
             } else {
                 WorktreeMode::Inherit
             },
-            metadata: None,
+            metadata,
         });
 
         self.cursor = Cursor::Session(new_wi, 0);

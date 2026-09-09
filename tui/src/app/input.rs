@@ -177,6 +177,7 @@ pub(super) enum InputMode {
     /// plus the accent color (stored TUI-side in `App::task_colors`).
     TaskSettings {
         task_id: String,
+        workspace_id: String,
         name: String,
         /// Accent color (`USER_COLORS` name) for the sidebar task header.
         color: Option<String>,
@@ -535,6 +536,7 @@ pub(crate) enum SubmitAction {
     },
     SaveTaskName {
         task_id: String,
+        workspace_id: String,
         name: String,
         color: Option<String>,
         section: Option<String>,
@@ -908,6 +910,7 @@ impl SnapshotCatalogMut<'_> {
 
 pub(crate) struct TaskSettingsMut<'a> {
     pub task_id: &'a str,
+    pub workspace_id: &'a str,
     pub name: &'a mut String,
     pub color: &'a mut Option<String>,
     pub section: &'a mut Option<String>,
@@ -1784,6 +1787,7 @@ pub(crate) fn handle_task_settings(
         }
         KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveTaskName {
             task_id: state.task_id.to_string(),
+            workspace_id: state.workspace_id.to_string(),
             name: state.name.trim().to_string(),
             color: state.color.clone(),
             section: state.section.clone(),
@@ -2509,7 +2513,7 @@ impl App {
         }
     }
 
-    fn open_session_settings(&mut self) {
+    pub(super) fn open_session_settings(&mut self) {
         match self.cursor.clone() {
             Cursor::Session(wi, si) => {
                 if let Some(ws) = self.workspaces.get(wi) {
@@ -2555,7 +2559,7 @@ impl App {
                     };
                 }
             }
-            Cursor::Task { task_id, .. } => {
+            Cursor::Task { task_id, ws_idx } => {
                 let current_name = self
                     .tasks
                     .iter()
@@ -2563,16 +2567,12 @@ impl App {
                     .map(|t| t.name.clone())
                     .unwrap_or_default();
                 let current_color = self.task_colors.get(&task_id).cloned();
-                // The section rides on the task's WORKSPACE (the cursor's).
-                let current_section = match &self.cursor {
-                    Cursor::Task { ws_idx, .. } => self
-                        .workspaces
-                        .get(*ws_idx)
-                        .and_then(|ws| self.workspace_sections.get(&ws.id).cloned()),
-                    _ => None,
-                };
+                let Some(ws) = self.workspaces.get(ws_idx) else { return; };
+                let workspace_id = ws.id.clone();
+                let current_section = self.workspace_sections.get(&workspace_id).cloned();
                 self.input_mode = InputMode::TaskSettings {
                     task_id,
+                    workspace_id,
                     name: current_name,
                     color: current_color,
                     section: current_section,
@@ -3318,6 +3318,15 @@ impl App {
             None => false,
         };
 
+        if let CrosstermEvent::Key(key) = event {
+            if key.code == KeyCode::Char('v') && key.modifiers == KeyModifiers::CONTROL
+                && self.start_image_paste() { return true; }
+            if key.code == KeyCode::Enter && self.image_paste_pending_for_active() {
+                self.set_status_msg("Image is still uploading; press Enter when it finishes");
+                return true;
+            }
+        }
+
         // Handle bracketed paste — send entire text at once, wrapped in
         // bracket escapes if the inner program has enabled bracketed paste mode.
         if let CrosstermEvent::Paste(text) = event {
@@ -3675,10 +3684,11 @@ impl App {
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
-            InputMode::TaskSettings { task_id, name, color, section, active_field } => {
+            InputMode::TaskSettings { task_id, workspace_id, name, color, section, active_field } => {
                 handle_task_settings(
                     TaskSettingsMut {
                         task_id: task_id.as_str(),
+                        workspace_id: workspace_id.as_str(),
                         name,
                         color,
                         section,
@@ -4083,7 +4093,7 @@ impl App {
                 // emits it.
                 let _ = name;
             }
-            SubmitAction::SaveTaskName { task_id, name, color, section } => {
+            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section } => {
                 // Color rides the local manifest sidecar, not the API row —
                 // apply it regardless of whether the rename half is valid.
                 match color {
@@ -4094,37 +4104,12 @@ impl App {
                         self.task_colors.remove(&task_id);
                     }
                 }
-                // Section applies to the task's bound workspace (the row the
-                // form was opened from, else the binding).
-                let ws_id = self
-                    .workspaces
-                    .iter()
-                    .find(|w| {
-                        w.sessions
-                            .iter()
-                            .any(|s| s.task_id.as_deref() == Some(task_id.as_str()))
-                    })
-                    .map(|w| w.id.clone())
-                    .or_else(|| match &self.cursor {
-                        Cursor::Task { ws_idx, .. } => {
-                            self.workspaces.get(*ws_idx).map(|w| w.id.clone())
-                        }
-                        _ => None,
-                    })
-                .or_else(|| {
-                    self.tasks
-                        .iter()
-                        .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
-                        .and_then(|t| t.workspace_id.clone())
-                });
-                if let Some(ws_id) = ws_id {
+                // Capture the workspace at modal-open: neither cursor movement
+                // nor a delayed task binding may redirect the section change.
+                if self.workspaces.iter().any(|w| w.id == workspace_id) {
                     match section {
-                        Some(sid) => {
-                            self.workspace_sections.insert(ws_id, sid);
-                        }
-                        None => {
-                            self.workspace_sections.remove(&ws_id);
-                        }
+                        Some(sid) => { self.workspace_sections.insert(workspace_id, sid); }
+                        None => { self.workspace_sections.remove(&workspace_id); }
                     }
                 }
                 self.save_session_manifest();
@@ -7102,6 +7087,7 @@ mod input_handler_tests {
         let outcome = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
+                workspace_id: "ws-task",
                 name: &mut name,
                 color: &mut color,
                 section: &mut section,
@@ -7123,6 +7109,7 @@ mod input_handler_tests {
         let outcome = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
+                workspace_id: "ws-task",
                 name: &mut name,
                 color: &mut color,
                 section: &mut section,
@@ -7150,6 +7137,7 @@ mod input_handler_tests {
         let outcome = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
+                workspace_id: "ws-task",
                 name: &mut name,
                 color: &mut color,
                 section: &mut section,

@@ -261,3 +261,49 @@ latency of **545 ms before / 86 ms after** and no-op-command-to-prompt latency o
 used a private copy of the original migrated index. These are cloud-host measurements during the background
 refresh, excluding SSH transport and TUI drawing. Evidence:
 `~/.cm/migrations/cloud-20260908/bash-enter-pty-verification.json`.
+
+## Cloud task recovery, sections, and image paste
+
+2026-09-09 UTC. A planning launch could outlast the ordinary five-second
+control-RPC timeout while the daemon prepared its checkout. The agent then
+existed on `sessions`, but the TUI had neither the launch result nor a saved
+workspace binding. Poll-based adoption excluded task-bound operator sessions,
+so reconnecting the viewer did not recover the row.
+
+Remote planning launches now run on a background worker with a 150-second
+create timeout. A preflight checks for an existing task session; repeated
+clicks cannot start a second in-flight launch. If the create response is lost,
+the worker looks up the original UID before attaching. An attach failure keeps
+the daemon session alive for normal recovery. The adoption pass includes
+task-bound sessions and preserves their daemon workspace IDs, so subsequent
+sessions, Bash actions, and reconnects use the same workspace. Task reconciliation
+recovers missing bindings and repository metadata from those live session edges.
+
+Automatic sidebar sections also follow session-to-task edges while planning
+bindings are missing. Task and workspace settings capture the workspace ID when
+opened, so a background reorder or cursor change cannot redirect the saved
+section to a different row.
+
+In a Codex or Claude pane, **Ctrl+V** reads a PNG image from the viewing machine's
+Wayland/X11 clipboard, copies it to `~/.cm/attachments` on the session's host,
+then pastes the destination path into the agent composer. Text clipboards still
+paste as text. Reading and uploading run off the input thread, with bounded
+sizes/timeouts; images receive unique filenames and mode 0600. Clipboard bytes
+travel over stdin, never as shell commands. Enter is held back during upload
+to avoid submitting a prompt before its image arrives. No prompt is automatically
+submitted. Current image transports are local and SSH; TCP/TLS-only hosts show
+an explicit unsupported-transport message. Files persist for conversation resume.
+
+The unit regressions cover binding and workspace identity recovery, section
+inheritance and settings across reorders, a lost create response with duplicate
+clicks, stalled upload pipes, file permissions and truncated uploads. A standalone
+Codex 0.153.4 composer accepted the transferred PNG as `[Image #1]` without
+submitting; an SSH upload preserved the exact bytes and permissions.
+The full isolated TUI suite passed: **867 tests**, using one test thread and
+the actual system hostname exported as `HOSTNAME` (this VM has no `/etc/hostname`).
+
+Activation requires installing the new **laptop TUI** and reopening the viewer.
+This is a TUI-only change: no daemon or session restart is needed. The cloud
+controller currently has only a read-only laptop export, so preparing a release
+here does not install it on the laptop. Do not duplicate-launch the recovered
+`predictionTrading/openai-and-consistently-recency-filters` session.

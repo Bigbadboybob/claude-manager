@@ -861,6 +861,31 @@ pub fn rpc_create_session_with_options(
     in_place: bool,
     seed_from: Option<&str>,
 ) -> anyhow::Result<CreateSessionResult> {
+    rpc_create_session_with_timeout(daemon_socket, operator_token_id, uid, workspace_id,
+        label, engine, repo_url, start_branch, slug, task_id, cols, rows, in_place,
+        seed_from, DEFAULT_RPC_READ_TIMEOUT)
+}
+
+/// Checkout setup can take longer than ordinary control RPCs. Long budgets
+/// belong only to background launch workers, never the input/render thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rpc_create_session_with_timeout(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    engine: &str,
+    repo_url: &str,
+    start_branch: Option<&str>,
+    slug: &str,
+    task_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+    in_place: bool,
+    seed_from: Option<&str>,
+    timeout: Duration,
+) -> anyhow::Result<CreateSessionResult> {
     let mut params = serde_json::json!({
         "uid": uid,
         "workspace_id": workspace_id,
@@ -889,7 +914,7 @@ pub fn rpc_create_session_with_options(
         method: "create_session".into(),
         params,
     };
-    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let resp = rpc_round_trip_with_read_timeout(daemon_socket, &req, timeout)?;
     let result = resp
         .result
         .context("create_session response missing result")?;
@@ -1249,7 +1274,8 @@ pub struct DaemonSessionSummary {
     /// Wire session type ("claude-code" / "codex" / "bash").
     pub session_type: String,
     /// `Some` = agent-spawned via mcp_start_session; `None` = TUI-/
-    /// operator-spawned. The adoption pass only adopts `Some`.
+    /// operator-spawned. Task-bound and continuous operator sessions are also
+    /// eligible for adoption after a lost launch response or viewer reconnect.
     pub managed_by_uid: Option<String>,
     pub workspace_id: Option<String>,
     pub task_id: Option<String>,

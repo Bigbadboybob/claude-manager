@@ -880,6 +880,7 @@ impl App {
             .pending_remote_reattach
             .iter()
             .map(|p| p.entry.uid.clone())
+            .chain(self.plan_launches.iter().map(|f| f.spec.uid.clone()))
             .collect();
         // In-flight uids: dispatched to the attach worker but not yet bound into
         // a slot (so absent from BOTH `tracked` and `pending`). Without this set
@@ -957,12 +958,13 @@ impl App {
             {
                 Some(wid) => wid.to_string(),
                 None => {
-                    let new_id = new_workspace_id();
+                    let new_id = s.workspace_id.clone().filter(|id| !id.is_empty())
+                        .unwrap_or_else(new_workspace_id);
                     self.workspaces.push(Workspace {
                         color: None,
                         pinned: false,
                         id: new_id.clone(),
-                        name: format!("agent: {}", s.label),
+                        name: s.label.clone(),
                         is_closed: false,
                         is_cloud: false,
                         repo_url: None,
@@ -1064,7 +1066,7 @@ impl App {
     }
 
     /// Gate for the REMOTE deferred-adopt path: a summary is adopted iff it's
-    /// agent-spawned (`managed_by_uid`) or continuous-tagged AND its uid is not
+    /// agent-spawned, continuous-tagged, or task-bound, and its uid is not
     /// already represented ANYWHERE in the adopt pipeline — bound in a slot
     /// (`tracked`), queued for a deferred attach (`pending`), or in-flight in the
     /// off-thread attach worker (`attaching`). The `attaching` check is the one
@@ -1085,10 +1087,10 @@ impl App {
     }
 
     /// Select which daemon-session summaries the adoption pass should take:
-    /// agent-spawned (`managed_by_uid.is_some()`) OR continuous-tagged
+    /// agent-spawned, task-bound, or continuous-tagged
     /// (`continuous_task_id.is_some()` — scheduler/operator spawns whose
     /// `managed_by_uid` is `None`), and not already tracked in any TUI
-    /// workspace. Plain TUI/operator spawns (both fields `None`) are excluded —
+    /// workspace. Unbound TUI/operator spawns are excluded —
     /// they're tracked through the normal spawn path. Pure (no `self`) so the
     /// gate + dedup is unit-testable without a live daemon.
     fn select_daemon_adoptees(
@@ -1098,10 +1100,8 @@ impl App {
         summaries
             .into_iter()
             .filter(|s| {
-                // Agent-spawned (managed_by_uid) OR a continuous-task session
-                // (scheduler/operator-spawned, managed_by_uid=None) — both are
-                // daemon-owned sessions the TUI never launched, so both must be
-                // surfaced. Plain TUI-/operator-spawned sessions stay excluded.
+                // Task-bound operator launches also need recovery when a create
+                // response was lost or a different TUI launched the task.
                 (s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some())
                     && !tracked_uids.contains(s.session_uid.as_str())
             })
@@ -1462,8 +1462,7 @@ impl App {
 #[cfg(test)]
 mod adopt_daemon_session_tests {
     //! Pins the adoption gate that surfaces agent-spawned ("phantom")
-    //! daemon sessions in the sidebar: only `managed_by_uid.is_some()`
-    //! (agent-spawned) AND not-already-tracked sessions are adopted.
+    //! and task-bound daemon sessions without duplicating tracked sessions.
     use super::App;
     use crate::client_session::DaemonSessionSummary;
     use std::collections::HashSet;
@@ -1497,6 +1496,39 @@ mod adopt_daemon_session_tests {
         let picked = App::select_daemon_adoptees(summaries, &tracked);
         let uids: Vec<&str> = picked.iter().map(|s| s.session_uid.as_str()).collect();
         assert_eq!(uids, vec!["agent-1"]);
+    }
+
+    #[test]
+    fn task_bound_operator_spawn_recovers_without_duplicate_attachments() {
+        let mut s = summary("lost-launch", None);
+        s.task_id = Some("task-new".into());
+        assert_eq!(App::select_daemon_adoptees(vec![s.clone()], &HashSet::new()).len(), 1);
+        let none = HashSet::new();
+        let uid = HashSet::from([s.session_uid.clone()]);
+        assert!(App::is_remote_adoptee(&s, &none, &none, &none));
+        assert!(!App::is_remote_adoptee(&s, &uid, &none, &none));
+        assert!(!App::is_remote_adoptee(&s, &none, &uid, &none));
+        assert!(!App::is_remote_adoptee(&s, &none, &none, &uid));
+    }
+
+    #[test]
+    fn recovered_workspace_keeps_daemon_identity_and_groups_sibling_sessions() {
+        let _guard = crate::test_support::home_lock();
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(), api_token: String::new(), gcp_project: String::new(),
+            gcp_zone: String::new(), repos: std::collections::HashMap::new(),
+        });
+        let host = cm_daemon::host_id::HostId::new("sessions");
+        let mut first = summary("lost-launch", None);
+        first.task_id = Some("task-new".into());
+        first.workspace_id = Some("remote-ws".into());
+        first.worktree_path = Some("/remote/checkout".into());
+        assert_eq!(app.resolve_adopt_workspace(&first, &host).0, "remote-ws");
+        let mut second = first.clone();
+        second.session_uid = "sibling".into();
+        assert_eq!(app.resolve_adopt_workspace(&second, &host).0, "remote-ws");
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].host_id, host);
     }
 
     #[test]

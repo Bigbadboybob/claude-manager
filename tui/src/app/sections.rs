@@ -437,6 +437,54 @@ mod layout_tests {
         assert_eq!(app.section_rollup("s1").0, 2);
     }
 
+    fn add_task_session(app: &mut App, wi: usize, tid: &str) {
+        let session = Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None).unwrap();
+        let mut ts = make_simple_session_with_uid(format!("uid-{tid}"), tid, "codex", session, None);
+        ts.task_id = Some(tid.into());
+        app.workspaces[wi].sessions.push(ts);
+    }
+
+    #[test]
+    fn adopted_child_inherits_when_both_task_bindings_are_missing() {
+        let mut app = sectioned_app();
+        app.tasks[0].workspace_id = None;
+        app.tasks[1].workspace_id = None;
+        add_task_session(&mut app, 0, "ta");
+        add_task_session(&mut app, 1, "tb");
+        assert_eq!(app.section_of_workspace(1).as_deref(), Some("s1"));
+        app.workspace_sections.insert("b".into(), SECTION_NONE.into());
+        assert_eq!(app.section_of_workspace(1), None);
+    }
+
+    #[test]
+    fn task_section_save_survives_cursor_change_and_missing_binding() {
+        let mut app = sectioned_app();
+        app.tasks[1].workspace_id = None;
+        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tb".into() };
+        app.open_session_settings();
+        let InputMode::TaskSettings { section, name, .. } = &mut app.input_mode else { panic!("task settings"); };
+        *section = Some("s1".into());
+        name.clear(); // Only the section changes; no API rename is needed.
+        app.workspaces.swap(1, 3);
+        app.cursor = Cursor::Workspace(0);
+        app.handle_input_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(app.workspace_sections.get("b").map(String::as_str), Some("s1"));
+        assert!(!app.workspace_sections.contains_key("d"));
+    }
+
+    #[test]
+    fn workspace_section_save_survives_reorder() {
+        let mut app = sectioned_app();
+        app.cursor = Cursor::Workspace(1);
+        app.open_session_settings();
+        let InputMode::WorkspaceSettings { section, .. } = &mut app.input_mode else { panic!("workspace settings"); };
+        *section = Some("s1".into());
+        app.workspaces.swap(1, 3);
+        app.handle_input_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(app.workspace_sections.get("b").map(String::as_str), Some("s1"));
+        assert!(!app.workspace_sections.contains_key("d"));
+    }
+
     #[test]
     fn folded_section_hides_members_but_keeps_header() {
         let mut app = sectioned_app();

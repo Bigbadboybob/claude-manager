@@ -369,6 +369,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // can land ticks after their request, even when the pending queue is
         // empty.
         let t = Instant::now();
+        app.drain_plan_launches();
+        app.drain_image_pastes();
         app.drain_attach_results();
         log_slow_phase("drain_attach_results", t.elapsed());
 
