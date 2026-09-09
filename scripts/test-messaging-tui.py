@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Isolated TUI smoke test; no live sessions or messages are touched.
 
-Requires pyte and Pillow in the test interpreter. Build the release TUI/daemon
+Requires pyte, Pillow, and DejaVu Sans Mono (or CM_CHAT_FONT pointing to a TTF).
+Build the release TUI/daemon
 first, or set CM_CHAT_BIN_DIR to a debug build directory. Screenshots and logs are written under /tmp/cm-chat-B-* and
 /tmp/cm-messaging-B-preview*. The test owns a temporary HOME and private sockets.
 """
@@ -92,7 +93,7 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
 
     def shot(name):
         font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16
+            os.environ.get("CM_CHAT_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"), 16
         )
         image = Image.new("RGB", (screen.columns * 10, screen.lines * 20), "#101520")
         d = ImageDraw.Draw(image)
@@ -432,7 +433,7 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             tui.wait(timeout=5)
             assert tui.returncode == 0
             print(
-                "PASS: channel browser/preview/join/leave, direct and @here completion/recipients, edited mentions no longer notify; channel creation/settings/admins, stable-name edits, pin/unpin and pins view; timeline full messages/order/unread, searchable group creation/reply/collapse, real TUI norms acknowledge/publish/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
+                "PASS: channel browser/preview/join/leave, direct and @here completion/recipients, edited mentions no longer notify; channel creation/settings/admins, stable-name edits, pin/unpin and pins view; timeline full messages/order/unread, searchable group creation/reply/collapse, real TUI global/channel norms acknowledge/publish/diff/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
                 flush=True,
             )
         except Exception:

@@ -95,3 +95,14 @@ global norms; conflicts/revert/empty documents; scoped paging and acknowledgemen
 across restarts; bounded context notices; independent Owner drafts; retry scope
 preservation; and the channel update indicator. The feature is committed on
 `cm/messaging-sync`; its coordinated deployment is still pending.
+
+
+Release verification on September 9 also passed the real daemon/TUI terminal
+smoke test, including channel norms publish/diff and unchanged global text.
+Prebuilt runtime revision `be56bce` is staged and preflighted on `cm-sessions`
+and `cm-manager` under `~/.cm/deployments/channel-norms-20260909T185044Z`.
+The laptop replica (`83bce20a-1f8e-4dd0-82e1-084fca0881c2`) still needs updating;
+its available cloud connection is a read-only file export. No live channel-norm
+binary activation has happened. A pinned `install-laptop.py` is staged alongside
+the payload as an alternative to providing laptop SSH access. Keep the coordinator
+on the old release until both replicas have the new reducer.
