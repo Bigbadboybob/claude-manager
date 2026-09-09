@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Install the five-minute personal-skill sync timer and fleet inventory."""
 from __future__ import annotations
-import argparse, json, os, socket, subprocess
+import argparse, json, os, shlex, socket, subprocess
 from pathlib import Path
 
 TARGETS = [
@@ -18,6 +18,13 @@ TARGETS = [
 ]
 
 
+def cron_entry(script, config, log):
+    # The sync process owns its own flock. An outer flock on that same file
+    # would make every child conclude another sync was already running.
+    command = shlex.join([str(script), "--config", str(config)])
+    return f"*/5 * * * * {command} >> {shlex.quote(str(log))} 2>&1 # cm-sync-skills"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path.home() / ".cm/skill-sync.json")
@@ -25,18 +32,23 @@ def main():
     parser.add_argument("--force", action="store_true", help="replace an existing inventory")
     args = parser.parse_args()
     args.config.parent.mkdir(parents=True, exist_ok=True)
-    if args.config.exists() and not args.force:
-        raise SystemExit(f"{args.config} exists; edit it or pass --force")
-    config = {"source_hostname": socket.gethostname(), "targets": TARGETS}
-    args.config.write_text(json.dumps(config, indent=2) + "\n")
-    os.chmod(args.config, 0o600)
-    print(f"wrote {args.config} ({len(TARGETS)} targets)")
+    args.config = args.config.resolve()
+    if not args.config.exists() or args.force:
+        config = {"source_hostname": socket.gethostname(), "targets": TARGETS}
+        args.config.write_text(json.dumps(config, indent=2) + "\n")
+        os.chmod(args.config, 0o600)
+        print(f"wrote {args.config} ({len(TARGETS)} targets)")
+    elif json.loads(args.config.read_text()).get("source_hostname") != socket.gethostname():
+        raise SystemExit("This machine is not the configured skill source")
     if args.no_timer:
         return 0
     unit = Path.home() / ".config/systemd/user"
     unit.mkdir(parents=True, exist_ok=True)
     script = Path(__file__).resolve().parent / "cm-sync-skills"
-    (unit / "cm-sync-skills.service").write_text("[Unit]\nDescription=Sync personal Claude and Codex skills\n\n[Service]\nType=oneshot\nExecStart=" + str(script) + "\n")
+    # systemd quoting is not shell quoting: JSON double quotes handle spaces;
+    # escape percent specifiers in paths before handing them to systemd.
+    command = " ".join(json.dumps(str(arg).replace("%", "%%")) for arg in [script, "--config", args.config])
+    (unit / "cm-sync-skills.service").write_text("[Unit]\nDescription=Sync personal Claude and Codex skills\n\n[Service]\nType=oneshot\nExecStart=" + command + "\n")
     (unit / "cm-sync-skills.timer").write_text("[Unit]\nDescription=Periodic personal skill sync\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
     try:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
@@ -49,7 +61,8 @@ def main():
         existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
         lines = [line for line in existing.splitlines() if marker not in line]
         log = Path.home() / ".cm/skill-sync/cron.log"
-        lines.append(f"*/5 * * * * {marker} /usr/bin/flock -n {Path.home() / '.cm/skill-sync/sync.lock'} {script} >> {log} 2>&1")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        lines.append(cron_entry(script, args.config, log))
         subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, check=True)
         print("user systemd unavailable; installed crontab fallback")
     return 0
