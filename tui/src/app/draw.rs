@@ -1523,33 +1523,8 @@ impl App {
             }
             items.push(ListItem::new(lines).style(item_style));
         }
-        // Cloud backtests share this panel with continuous work. They have no
-        // PTY row, so render a compact status tree after the live sessions.
-        for vi in self.continuous_backtest_items() {
-            let selected = |candidate: &VisualItem| self.cursor_column == SidebarColumn::Continuous && match (&self.cursor, candidate) {
-                (Cursor::Backtest(BacktestCursor::Group), VisualItem::BacktestHeader) => true,
-                (Cursor::Backtest(BacktestCursor::Fleet(a)), VisualItem::BacktestFleet(b)) => a == b,
-                (Cursor::Backtest(BacktestCursor::Run(a)), VisualItem::BacktestRun { task_id: b, .. }) => a == b,
-                _ => false,
-            };
-            let (text, style) = match &vi {
-                VisualItem::Separator => ("".to_string(), Style::default().fg(theme::DIM)),
-                VisualItem::BacktestHeader => (" backtests".to_string(), if selected(&vi) { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD) }),
-                VisualItem::BacktestFleet(stem) => (format!("   ▸ {stem}"), if selected(&vi) { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::MUTED) }),
-                VisualItem::BacktestRun { task_id, depth } => {
-                    let Some(row) = self.backtest_rows.iter().find(|r| r.task_id == *task_id) else { continue; };
-                    let glyph = match row.state {
-                        BacktestState::Running { .. } => spinner,
-                        BacktestState::Queued => "·",
-                        BacktestState::Done => "✓",
-                        BacktestState::Failed => "✗",
-                    };
-                    (format!("{}{} {}", "  ".repeat(*depth as usize + 1), glyph, row.label), if selected(&vi) { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::MUTED) })
-                }
-                _ => continue,
-            };
-            items.push(ListItem::new(Line::from(Span::styled(text, style))));
-        }
+        let backtests = self.continuous_backtest_items();
+        items.extend(self.backtest_list_items(&backtests, inner.width, spinner, now));
         if items.is_empty() {
             items.push(ListItem::new(Line::from(Span::styled(
                 "  (no continuous tasks)",
@@ -1560,15 +1535,198 @@ impl App {
         if self.cursor_column == SidebarColumn::Continuous {
             let selected = match &self.cursor {
                 Cursor::Session(wi, si) => rows.iter().position(|r| r.ws_idx == *wi && r.sess_idx == *si),
-                Cursor::Backtest(BacktestCursor::Group) => Some(rows.len() + self.continuous_backtest_items().iter().position(|v| matches!(v, VisualItem::BacktestHeader)).unwrap_or(0)),
-                Cursor::Backtest(BacktestCursor::Fleet(stem)) => Some(rows.len() + self.continuous_backtest_items().iter().position(|v| matches!(v, VisualItem::BacktestFleet(s) if s == stem)).unwrap_or(0)),
-                Cursor::Backtest(BacktestCursor::Run(id)) => Some(rows.len() + self.continuous_backtest_items().iter().position(|v| matches!(v, VisualItem::BacktestRun { task_id, .. } if task_id == id)).unwrap_or(0)),
+                Cursor::Backtest(_) => self
+                    .sidebar_cursor_index(&backtests)
+                    .map(|index| rows.len() + index),
                 _ => None,
             };
             state.select(selected);
         }
         frame.render_stateful_widget(List::new(items).highlight_style(Style::default()), inner, &mut state);
         self.continuous_list_state = state;
+    }
+
+    fn backtest_list_items(
+        &self,
+        visual: &[VisualItem],
+        width: u16,
+        spinner: &str,
+        now: Instant,
+    ) -> Vec<ListItem<'static>> {
+        let mut items = Vec::new();
+        for vi in visual {
+            match vi {
+                // Cloud-backtests group header. Selectable (Space/Enter
+                // folds); always carries the per-state rollup so the
+                // group is legible at a glance even collapsed.
+                VisualItem::BacktestHeader => {
+                    let is_selected =
+                        matches!(&self.cursor, Cursor::Backtest(BacktestCursor::Group));
+                    let arrow = if self.backtests_folded { "\u{25b8}" } else { "\u{25be}" };
+                    let name_style = if is_selected {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD)
+                    };
+                    let mut spans = vec![Span::styled(
+                        format!(" {} backtests", arrow),
+                        name_style,
+                    )];
+                    let count_of = |f: &dyn Fn(&BacktestState) -> bool| {
+                        self.backtest_rows.iter().filter(|r| f(&r.state)).count()
+                    };
+                    let running =
+                        count_of(&|s| matches!(s, BacktestState::Running { .. }));
+                    let queued = count_of(&|s| matches!(s, BacktestState::Queued));
+                    let done = count_of(&|s| matches!(s, BacktestState::Done));
+                    let failed = count_of(&|s| matches!(s, BacktestState::Failed));
+                    for (n, glyph, color) in [
+                        (running, spinner, theme::OK),
+                        (queued, "\u{00b7}", theme::DIM),
+                        (done, "\u{2713}", theme::OK),
+                        (failed, "\u{2717}", theme::ERROR),
+                    ] {
+                        if n > 0 {
+                            spans.push(Span::styled(
+                                format!(" {}{}", glyph, n),
+                                Style::default().fg(color),
+                            ));
+                        }
+                    }
+                    items.push(ListItem::new(Line::from(spans)));
+                }
+                // Fleet row: one line for a set of runs sharing a label
+                // stem. Shows the member rollup; `▸` until unfolded.
+                VisualItem::BacktestFleet(stem) => {
+                    let is_selected = matches!(
+                        &self.cursor,
+                        Cursor::Backtest(BacktestCursor::Fleet(s)) if s == stem
+                    );
+                    let unfolded = self.backtest_unfolded_fleets.contains(stem);
+                    let arrow = if unfolded { "\u{25be}" } else { "\u{25b8}" };
+                    let members: Vec<&BacktestRow> = self
+                        .backtest_rows
+                        .iter()
+                        .filter(|r| fleet_stem(&r.label) == Some(stem.as_str()))
+                        .collect();
+                    let name_style = if is_selected {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::MUTED)
+                    };
+                    let name = crate::planning::truncate_with_ellipsis(
+                        stem,
+                        (width as usize).saturating_sub(14),
+                    );
+                    let mut spans = vec![Span::styled(
+                        format!("   {} {}", arrow, name),
+                        name_style,
+                    )];
+                    let count_of = |f: &dyn Fn(&BacktestState) -> bool| {
+                        members.iter().filter(|r| f(&r.state)).count()
+                    };
+                    for (n, glyph, color) in [
+                        (
+                            count_of(&|s| matches!(s, BacktestState::Running { .. })),
+                            spinner,
+                            theme::OK,
+                        ),
+                        (
+                            count_of(&|s| matches!(s, BacktestState::Queued)),
+                            "\u{00b7}",
+                            theme::DIM,
+                        ),
+                        (
+                            count_of(&|s| matches!(s, BacktestState::Done)),
+                            "\u{2713}",
+                            theme::OK,
+                        ),
+                        (
+                            count_of(&|s| matches!(s, BacktestState::Failed)),
+                            "\u{2717}",
+                            theme::ERROR,
+                        ),
+                    ] {
+                        if n > 0 {
+                            spans.push(Span::styled(
+                                format!(" {}{}", glyph, n),
+                                Style::default().fg(color),
+                            ));
+                        }
+                    }
+                    items.push(ListItem::new(Line::from(spans)));
+                }
+                // One backtest run: state glyph + label (fleet members show
+                // just their distinguishing suffix) + runtime + VM tag.
+                VisualItem::BacktestRun { task_id, depth } => {
+                    let Some(row) =
+                        self.backtest_rows.iter().find(|r| &r.task_id == task_id)
+                    else {
+                        continue;
+                    };
+                    let is_selected = matches!(
+                        &self.cursor,
+                        Cursor::Backtest(BacktestCursor::Run(t)) if t == task_id
+                    );
+                    let (glyph, glyph_style) = match &row.state {
+                        BacktestState::Running { .. } => {
+                            (spinner, Style::default().fg(theme::OK))
+                        }
+                        BacktestState::Queued => {
+                            ("\u{00b7}", Style::default().fg(theme::DIM))
+                        }
+                        BacktestState::Done => {
+                            ("\u{2713}", Style::default().fg(theme::OK))
+                        }
+                        BacktestState::Failed => {
+                            ("\u{2717}", Style::default().fg(theme::ERROR))
+                        }
+                    };
+                    let display = if *depth > 0 {
+                        row.label
+                            .rsplit('-')
+                            .next()
+                            .unwrap_or(row.label.as_str())
+                            .to_string()
+                    } else {
+                        row.label.clone()
+                    };
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let mut tags = String::new();
+                    if let Some(secs) = runtime_secs(row, now, now_ms) {
+                        tags.push_str(&format!(" {}", fmt_runtime(secs)));
+                    }
+                    if let BacktestState::Running { vm: Some(vm) } = &row.state {
+                        tags.push_str(&format!(" @{}", vm));
+                    }
+                    let indent = if *depth > 0 { "     " } else { "   " };
+                    let max_name = (width as usize)
+                        .saturating_sub(indent.len() + 2 + tags.chars().count());
+                    let name =
+                        crate::planning::truncate_with_ellipsis(&display, max_name);
+                    let name_style = if is_selected {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::MUTED)
+                    };
+                    let mut spans = vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(glyph.to_string(), glyph_style),
+                        Span::raw(" "),
+                        Span::styled(name, name_style),
+                    ];
+                    if !tags.is_empty() {
+                        spans.push(Span::styled(tags, Style::default().fg(theme::DIM)));
+                    }
+                    items.push(ListItem::new(Line::from(spans)));
+                }
+                _ => {}
+            }
+        }
+        items
     }
 
     fn draw_session_list(&mut self, frame: &mut Frame, area: Rect) {
@@ -2029,173 +2187,10 @@ impl App {
                     )]);
                     items.push(ListItem::new(line));
                 }
-                // Cloud-backtests group header. Selectable (Space/Enter
-                // folds); always carries the per-state rollup so the
-                // group is legible at a glance even collapsed.
-                VisualItem::BacktestHeader => {
-                    let is_selected =
-                        matches!(&self.cursor, Cursor::Backtest(BacktestCursor::Group));
-                    let arrow = if self.backtests_folded { "\u{25b8}" } else { "\u{25be}" };
-                    let name_style = if is_selected {
-                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD)
-                    };
-                    let mut spans = vec![Span::styled(
-                        format!(" {} backtests", arrow),
-                        name_style,
-                    )];
-                    let count_of = |f: &dyn Fn(&BacktestState) -> bool| {
-                        self.backtest_rows.iter().filter(|r| f(&r.state)).count()
-                    };
-                    let running =
-                        count_of(&|s| matches!(s, BacktestState::Running { .. }));
-                    let queued = count_of(&|s| matches!(s, BacktestState::Queued));
-                    let done = count_of(&|s| matches!(s, BacktestState::Done));
-                    let failed = count_of(&|s| matches!(s, BacktestState::Failed));
-                    for (n, glyph, color) in [
-                        (running, spinner, theme::OK),
-                        (queued, "\u{00b7}", theme::DIM),
-                        (done, "\u{2713}", theme::OK),
-                        (failed, "\u{2717}", theme::ERROR),
-                    ] {
-                        if n > 0 {
-                            spans.push(Span::styled(
-                                format!(" {}{}", glyph, n),
-                                Style::default().fg(color),
-                            ));
-                        }
-                    }
-                    items.push(ListItem::new(Line::from(spans)));
-                }
-                // Fleet row: one line for a set of runs sharing a label
-                // stem. Shows the member rollup; `▸` until unfolded.
-                VisualItem::BacktestFleet(stem) => {
-                    let is_selected = matches!(
-                        &self.cursor,
-                        Cursor::Backtest(BacktestCursor::Fleet(s)) if s == stem
-                    );
-                    let unfolded = self.backtest_unfolded_fleets.contains(stem);
-                    let arrow = if unfolded { "\u{25be}" } else { "\u{25b8}" };
-                    let members: Vec<&BacktestRow> = self
-                        .backtest_rows
-                        .iter()
-                        .filter(|r| fleet_stem(&r.label) == Some(stem.as_str()))
-                        .collect();
-                    let name_style = if is_selected {
-                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme::MUTED)
-                    };
-                    let name = crate::planning::truncate_with_ellipsis(
-                        stem,
-                        (inner.width as usize).saturating_sub(14),
-                    );
-                    let mut spans = vec![Span::styled(
-                        format!("   {} {}", arrow, name),
-                        name_style,
-                    )];
-                    let count_of = |f: &dyn Fn(&BacktestState) -> bool| {
-                        members.iter().filter(|r| f(&r.state)).count()
-                    };
-                    for (n, glyph, color) in [
-                        (
-                            count_of(&|s| matches!(s, BacktestState::Running { .. })),
-                            spinner,
-                            theme::OK,
-                        ),
-                        (
-                            count_of(&|s| matches!(s, BacktestState::Queued)),
-                            "\u{00b7}",
-                            theme::DIM,
-                        ),
-                        (
-                            count_of(&|s| matches!(s, BacktestState::Done)),
-                            "\u{2713}",
-                            theme::OK,
-                        ),
-                        (
-                            count_of(&|s| matches!(s, BacktestState::Failed)),
-                            "\u{2717}",
-                            theme::ERROR,
-                        ),
-                    ] {
-                        if n > 0 {
-                            spans.push(Span::styled(
-                                format!(" {}{}", glyph, n),
-                                Style::default().fg(color),
-                            ));
-                        }
-                    }
-                    items.push(ListItem::new(Line::from(spans)));
-                }
-                // One backtest run: state glyph + label (fleet members show
-                // just their distinguishing suffix) + runtime + VM tag.
-                VisualItem::BacktestRun { task_id, depth } => {
-                    let Some(row) =
-                        self.backtest_rows.iter().find(|r| &r.task_id == task_id)
-                    else {
-                        continue;
-                    };
-                    let is_selected = matches!(
-                        &self.cursor,
-                        Cursor::Backtest(BacktestCursor::Run(t)) if t == task_id
-                    );
-                    let (glyph, glyph_style) = match &row.state {
-                        BacktestState::Running { .. } => {
-                            (spinner, Style::default().fg(theme::OK))
-                        }
-                        BacktestState::Queued => {
-                            ("\u{00b7}", Style::default().fg(theme::DIM))
-                        }
-                        BacktestState::Done => {
-                            ("\u{2713}", Style::default().fg(theme::OK))
-                        }
-                        BacktestState::Failed => {
-                            ("\u{2717}", Style::default().fg(theme::ERROR))
-                        }
-                    };
-                    let display = if *depth > 0 {
-                        row.label
-                            .rsplit('-')
-                            .next()
-                            .unwrap_or(row.label.as_str())
-                            .to_string()
-                    } else {
-                        row.label.clone()
-                    };
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    let mut tags = String::new();
-                    if let Some(secs) = runtime_secs(row, now, now_ms) {
-                        tags.push_str(&format!(" {}", fmt_runtime(secs)));
-                    }
-                    if let BacktestState::Running { vm: Some(vm) } = &row.state {
-                        tags.push_str(&format!(" @{}", vm));
-                    }
-                    let indent = if *depth > 0 { "     " } else { "   " };
-                    let max_name = (inner.width as usize)
-                        .saturating_sub(indent.len() + 2 + tags.chars().count());
-                    let name =
-                        crate::planning::truncate_with_ellipsis(&display, max_name);
-                    let name_style = if is_selected {
-                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme::MUTED)
-                    };
-                    let mut spans = vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled(glyph.to_string(), glyph_style),
-                        Span::raw(" "),
-                        Span::styled(name, name_style),
-                    ];
-                    if !tags.is_empty() {
-                        spans.push(Span::styled(tags, Style::default().fg(theme::DIM)));
-                    }
-                    items.push(ListItem::new(Line::from(spans)));
-                }
+                VisualItem::BacktestHeader
+                | VisualItem::BacktestFleet(_)
+                | VisualItem::BacktestRun { .. } => {}
+
             }
         }
 
@@ -2880,8 +2875,8 @@ impl App {
     }
 
     fn draw_sidebar_search(&self, frame: &mut Frame, area: Rect, query: &str) {
-        let width = area.width.min(72).max(36);
-        let height = 5u16.min(area.height.saturating_sub(2).max(5));
+        let width = area.width.min(72);
+        let height = area.height.min(5);
         let dialog = Rect {
             x: area.x + area.width.saturating_sub(width) / 2,
             y: area.y + area.height.saturating_sub(height) / 2,
