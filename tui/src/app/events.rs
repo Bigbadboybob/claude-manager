@@ -2595,6 +2595,22 @@ impl App {
                 continue;
             }
 
+            // Recover bindings from the daemon session edge before trying to
+            // auto-provision a local workspace. Remote task launches can
+            // legitimately have no planning wip_branch/is_cloud value yet,
+            // while their live session already carries the task_id.
+            if let Some(ws_id) = self
+                .workspaces
+                .iter()
+                .find(|w| w.sessions.iter().any(|s| {
+                    s.task_id.as_deref() == Some(task.id.as_str())
+                }))
+                .map(|w| w.id.clone())
+            {
+                self.tasks[task_idx].workspace_id = Some(ws_id);
+                continue;
+            }
+
             // Honor manifest binding before auto-provisioning. On the first
             // reconcile tick self.workspaces is still empty (restore_sessions
             // runs right after), so without this we'd spawn an orphan that

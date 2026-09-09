@@ -125,29 +125,40 @@ impl App {
             // Dangling assignment (section deleted out from under it) —
             // fall through to inheritance.
         }
-        for task in self
-            .tasks
-            .iter()
-            .filter(|t| t.workspace_id.as_deref() == Some(ws_id))
-        {
+        // A cloud session can be adopted before the planning task's workspace
+        // binding arrives; its retained task_id is still a valid membership
+        // edge.
+        let workspace = self.workspaces.iter().find(|w| w.id == ws_id);
+        for task in self.tasks.iter().filter(|t| {
+            t.workspace_id.as_deref() == Some(ws_id)
+                || t.task_id.as_deref().is_some_and(|tid| {
+                    workspace.is_some_and(|w| {
+                        w.sessions.iter().any(|s| s.task_id.as_deref() == Some(tid))
+                    })
+                })
+        }) {
             let Some(parent_id) = inherited_parent_task(task) else {
                 continue;
             };
-            let Some(parent_ws) = self
+            let bound_parent = self
                 .tasks
                 .iter()
                 .find(|t| t.task_id.as_deref() == Some(parent_id.as_str()))
-                .and_then(|t| t.workspace_id.clone())
-            else {
-                continue;
-            };
-            if parent_ws.as_str() == ws_id {
-                // Inherit-mode subtask sharing its parent's worktree — the
-                // workspace's own resolution above already covered it.
-                continue;
-            }
-            if let Some(sid) = self.section_of_workspace_id(&parent_ws, seen) {
-                return Some(sid);
+                .and_then(|t| t.workspace_id.as_deref());
+            let parent_workspaces = bound_parent.into_iter().chain(
+                self.workspaces.iter().filter(|w| {
+                    w.sessions
+                        .iter()
+                        .any(|s| s.task_id.as_deref() == Some(parent_id.as_str()))
+                }).map(|w| w.id.as_str()),
+            );
+            for parent_ws in parent_workspaces {
+                if parent_ws == ws_id {
+                    continue;
+                }
+                if let Some(sid) = self.section_of_workspace_id(parent_ws, seen) {
+                    return Some(sid);
+                }
             }
         }
         None

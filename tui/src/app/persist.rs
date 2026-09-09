@@ -1078,7 +1078,7 @@ impl App {
         pending: &std::collections::HashSet<String>,
         attaching: &std::collections::HashSet<String>,
     ) -> bool {
-        (s.managed_by_uid.is_some() || s.continuous_task_id.is_some())
+        (s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some())
             && !tracked.contains(&s.session_uid)
             && !pending.contains(&s.session_uid)
             && !attaching.contains(&s.session_uid)
@@ -1102,7 +1102,7 @@ impl App {
                 // (scheduler/operator-spawned, managed_by_uid=None) — both are
                 // daemon-owned sessions the TUI never launched, so both must be
                 // surfaced. Plain TUI-/operator-spawned sessions stay excluded.
-                (s.managed_by_uid.is_some() || s.continuous_task_id.is_some())
+                (s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some())
                     && !tracked_uids.contains(s.session_uid.as_str())
             })
             .collect()

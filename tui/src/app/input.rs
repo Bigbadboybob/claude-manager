@@ -104,7 +104,7 @@ pub(super) enum InputMode {
     /// Workspace settings: display label (branch and worktree path stay
     /// the same), accent color, the pinned flag, and the sidebar section.
     WorkspaceSettings {
-        ws_index: usize,
+        workspace_id: String,
         name: String,
         /// Accent color (`USER_COLORS` name); cascades to the workspace's
         /// sessions unless they set their own.
@@ -504,7 +504,7 @@ pub(crate) enum SubmitAction {
         color: Option<String>,
     },
     SaveWorkspaceSettings {
-        ws_index: usize,
+        workspace_id: String,
         name: String,
         color: Option<String>,
         pinned: bool,
@@ -612,7 +612,7 @@ pub(crate) struct SessionSettingsMut<'a> {
 }
 
 pub(crate) struct WorkspaceSettingsMut<'a> {
-    pub ws_index: usize,
+    pub workspace_id: &'a str,
     pub name: &'a mut String,
     pub color: &'a mut Option<String>,
     pub pinned: &'a mut bool,
@@ -1333,7 +1333,7 @@ pub(crate) fn handle_workspace_settings(
             InputOutcome::Consumed
         }
         KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings {
-            ws_index: state.ws_index,
+            workspace_id: state.workspace_id.to_string(),
             name: state.name.trim().to_string(),
             color: state.color.clone(),
             pinned: *state.pinned,
@@ -2546,7 +2546,7 @@ impl App {
             Cursor::Workspace(wi) => {
                 if let Some(ws) = self.workspaces.get(wi) {
                     self.input_mode = InputMode::WorkspaceSettings {
-                        ws_index: wi,
+                        workspace_id: ws.id.clone(),
                         name: ws.name.clone(),
                         color: ws.color.clone(),
                         pinned: ws.pinned,
@@ -3608,7 +3608,7 @@ impl App {
                 event,
             ),
             InputMode::WorkspaceSettings {
-                ws_index,
+                workspace_id,
                 name,
                 color,
                 pinned,
@@ -3616,7 +3616,7 @@ impl App {
                 active_field,
             } => handle_workspace_settings(
                 WorkspaceSettingsMut {
-                    ws_index: *ws_index,
+                    workspace_id: workspace_id.as_str(),
                     name,
                     color,
                     pinned,
@@ -4030,21 +4030,21 @@ impl App {
                     None => self.set_status_msg("Settings saved"),
                 }
             }
-            SubmitAction::SaveWorkspaceSettings { ws_index, name, color, pinned, section } => {
+            SubmitAction::SaveWorkspaceSettings { workspace_id, name, color, pinned, section } => {
                 let mut pinned_changed = false;
-                if let Some(ws_id) = self.workspaces.get(ws_index).map(|w| w.id.clone()) {
+                if self.workspaces.iter().any(|w| w.id == workspace_id) {
                     // Sidecar map, not a Workspace field — write it before
                     // the save below so one manifest write carries both.
                     match section {
                         Some(sid) => {
-                            self.workspace_sections.insert(ws_id, sid);
+                            self.workspace_sections.insert(workspace_id.clone(), sid);
                         }
                         None => {
-                            self.workspace_sections.remove(&ws_id);
+                            self.workspace_sections.remove(&workspace_id);
                         }
                     }
                 }
-                if let Some(ws) = self.workspaces.get_mut(ws_index) {
+                if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
                     // An emptied name keeps the old one (matches the old
                     // rename-only behavior); color/pinned always apply.
                     if !name.is_empty() {
@@ -4096,12 +4096,21 @@ impl App {
                 }
                 // Section applies to the task's bound workspace (the row the
                 // form was opened from, else the binding).
-                let ws_id = match &self.cursor {
-                    Cursor::Task { ws_idx, .. } => {
-                        self.workspaces.get(*ws_idx).map(|w| w.id.clone())
-                    }
-                    _ => None,
-                }
+                let ws_id = self
+                    .workspaces
+                    .iter()
+                    .find(|w| {
+                        w.sessions
+                            .iter()
+                            .any(|s| s.task_id.as_deref() == Some(task_id.as_str()))
+                    })
+                    .map(|w| w.id.clone())
+                    .or_else(|| match &self.cursor {
+                        Cursor::Task { ws_idx, .. } => {
+                            self.workspaces.get(*ws_idx).map(|w| w.id.clone())
+                        }
+                        _ => None,
+                    })
                 .or_else(|| {
                     self.tasks
                         .iter()
@@ -6187,7 +6196,7 @@ mod input_handler_tests {
         let mut section: Option<String> = None;
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
-                ws_index: 0,
+                workspace_id: "ws-0",
                 name: &mut name,
                 color: &mut color,
                 pinned: &mut pinned,
@@ -6208,7 +6217,7 @@ mod input_handler_tests {
         let mut section: Option<String> = None;
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
-                ws_index: 0,
+                workspace_id: "ws-0",
                 name: &mut name,
                 color: &mut color,
                 pinned: &mut pinned,
@@ -6229,7 +6238,7 @@ mod input_handler_tests {
         let mut section: Option<String> = None;
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
-                ws_index: 3,
+                workspace_id: "ws-3",
                 name: &mut name,
                 color: &mut color,
                 pinned: &mut pinned,
@@ -6241,13 +6250,13 @@ mod input_handler_tests {
         );
         match outcome {
             InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings {
-                ws_index,
+                workspace_id,
                 name,
                 color,
                 pinned,
                 ..
             }) => {
-                assert_eq!(ws_index, 3);
+                assert_eq!(workspace_id, "ws-3");
                 assert_eq!(name, "hello");
                 assert_eq!(color, None);
                 assert!(!pinned);
@@ -6263,7 +6272,7 @@ mod input_handler_tests {
         let mut section: Option<String> = None;
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
-                ws_index: 0,
+                workspace_id: "ws-0",
                 name: &mut name,
                 color: &mut color,
                 pinned: &mut pinned,
