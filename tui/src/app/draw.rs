@@ -402,6 +402,9 @@ impl App {
                 InputMode::SessionPalette { candidates, query, selected } => {
                     self.draw_session_palette(frame, area, candidates, query, *selected);
                 }
+                InputMode::SidebarSearch { query } => {
+                    self.draw_sidebar_search(frame, area, query);
+                }
                 InputMode::TaskPeek { lines, scroll, .. } => {
                     peek_max = Some(self.draw_task_peek(frame, area, lines, *scroll));
                 }
@@ -1341,14 +1344,16 @@ impl App {
         }
     }
 
-    fn draw_continuous_column(&self, frame: &mut Frame, area: Rect) {
+    fn draw_continuous_column(&mut self, frame: &mut Frame, area: Rect) {
+        let title = self
+            .sidebar_filter
+            .as_deref()
+            .map(|q| format!(" Continuous · /{} ", q))
+            .unwrap_or_else(|| " Continuous ".to_string());
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::DIM))
-            .title(Span::styled(
-                " Continuous ",
-                Style::default().fg(theme::TEXT),
-            ));
+            .title(Span::styled(title, Style::default().fg(theme::TEXT)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height < 2 || inner.width < 4 {
@@ -1360,7 +1365,7 @@ impl App {
         let now = Instant::now();
         let rows = self.visual_items_continuous();
         let mut items: Vec<ListItem> = Vec::new();
-        for (i, r) in rows.iter().take(inner.height as usize).enumerate() {
+        for (i, r) in rows.iter().enumerate() {
             let ts = &self.workspaces[r.ws_idx].sessions[r.sess_idx];
             // P3 (Feature 1): a parked operator-question wins the idle glyph and
             // adds a dim inline text line below the row (see the second Line push).
@@ -1518,19 +1523,63 @@ impl App {
             }
             items.push(ListItem::new(lines).style(item_style));
         }
+        // Cloud backtests share this panel with continuous work. They have no
+        // PTY row, so render a compact status tree after the live sessions.
+        for vi in self.continuous_backtest_items() {
+            let selected = |candidate: &VisualItem| self.cursor_column == SidebarColumn::Continuous && match (&self.cursor, candidate) {
+                (Cursor::Backtest(BacktestCursor::Group), VisualItem::BacktestHeader) => true,
+                (Cursor::Backtest(BacktestCursor::Fleet(a)), VisualItem::BacktestFleet(b)) => a == b,
+                (Cursor::Backtest(BacktestCursor::Run(a)), VisualItem::BacktestRun { task_id: b, .. }) => a == b,
+                _ => false,
+            };
+            let (text, style) = match &vi {
+                VisualItem::Separator => ("".to_string(), Style::default().fg(theme::DIM)),
+                VisualItem::BacktestHeader => (" backtests".to_string(), if selected(&vi) { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD) }),
+                VisualItem::BacktestFleet(stem) => (format!("   ▸ {stem}"), if selected(&vi) { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::MUTED) }),
+                VisualItem::BacktestRun { task_id, depth } => {
+                    let Some(row) = self.backtest_rows.iter().find(|r| r.task_id == *task_id) else { continue; };
+                    let glyph = match row.state {
+                        BacktestState::Running { .. } => spinner,
+                        BacktestState::Queued => "·",
+                        BacktestState::Done => "✓",
+                        BacktestState::Failed => "✗",
+                    };
+                    (format!("{}{} {}", "  ".repeat(*depth as usize + 1), glyph, row.label), if selected(&vi) { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::MUTED) })
+                }
+                _ => continue,
+            };
+            items.push(ListItem::new(Line::from(Span::styled(text, style))));
+        }
         if items.is_empty() {
             items.push(ListItem::new(Line::from(Span::styled(
                 "  (no continuous tasks)",
                 Style::default().fg(theme::DIM),
             ))));
         }
-        frame.render_widget(List::new(items), inner);
+        let mut state = std::mem::take(&mut self.continuous_list_state);
+        if self.cursor_column == SidebarColumn::Continuous {
+            let selected = match &self.cursor {
+                Cursor::Session(wi, si) => rows.iter().position(|r| r.ws_idx == *wi && r.sess_idx == *si),
+                Cursor::Backtest(BacktestCursor::Group) => Some(rows.len() + self.continuous_backtest_items().iter().position(|v| matches!(v, VisualItem::BacktestHeader)).unwrap_or(0)),
+                Cursor::Backtest(BacktestCursor::Fleet(stem)) => Some(rows.len() + self.continuous_backtest_items().iter().position(|v| matches!(v, VisualItem::BacktestFleet(s) if s == stem)).unwrap_or(0)),
+                Cursor::Backtest(BacktestCursor::Run(id)) => Some(rows.len() + self.continuous_backtest_items().iter().position(|v| matches!(v, VisualItem::BacktestRun { task_id, .. } if task_id == id)).unwrap_or(0)),
+                _ => None,
+            };
+            state.select(selected);
+        }
+        frame.render_stateful_widget(List::new(items).highlight_style(Style::default()), inner, &mut state);
+        self.continuous_list_state = state;
     }
 
-    fn draw_session_list(&self, frame: &mut Frame, area: Rect) {
+    fn draw_session_list(&mut self, frame: &mut Frame, area: Rect) {
         let view_label = match self.sidebar_view {
             SidebarView::Status => " Sessions ",
             SidebarView::Task => " Tasks ",
+        };
+        let view_label = if let Some(filter) = self.sidebar_filter.as_deref() {
+            format!("{} · /{} ", view_label.trim(), filter)
+        } else {
+            view_label.to_string()
         };
 
         let block = Block::default()
@@ -1556,7 +1605,8 @@ impl App {
         // Help text — two columns. Defined up here so `list_height` can size
         // itself around the help footer (otherwise the help overdraws the
         // bottom rows of the list and indicators vanish).
-        let help_entries: Vec<(&str, &str)> = vec![
+        let help_entries: Vec<(&str, &str)> = if self.keybinding_helper_visible { vec![
+            ("A-/    filter", "A-?  helper"),
             ("A-j/k  nav", "A-d  done"),
             ("A-h/l  column", "A-x  delete"),
             ("A-a    attach", "A-v  view"),
@@ -1577,13 +1627,18 @@ impl App {
             ("A-p    find", "A-i  info"),
             ("A-'    yank", "A-M  mouse"),
             ("F8     messages", "A-m  messages"),
-        ];
-        let help_rows = help_entries.len() as u16;
-        let list_height = inner.height.saturating_sub(help_rows + 1);
+        ] } else { Vec::new() };
+        let helper_height = if self.keybinding_helper_visible {
+            inner.height.saturating_sub(4).min(help_entries.len() as u16 + 1)
+        } else {
+            0
+        };
+        let help_rows = helper_height.saturating_sub(1) as usize;
+        let help_entries = help_entries.into_iter().take(help_rows).collect::<Vec<_>>();
+        let list_height = inner.height.saturating_sub(helper_height);
 
         let visual = self.visual_items();
         let mut items: Vec<ListItem> = Vec::new();
-        let max = list_height as usize;
         // Workspaces rendered inside a section get one extra leading space
         // on every row (header, task subheaders, sessions, workflow
         // headers) so the grouping reads at a glance. Resolved once per
@@ -1606,9 +1661,6 @@ impl App {
         };
 
         for vi in &visual {
-            if items.len() >= max {
-                break;
-            }
             match vi {
                 VisualItem::WorkspaceHeader(wi) => {
                     let ws = &self.workspaces[*wi];
@@ -2147,41 +2199,29 @@ impl App {
             }
         }
 
-        let list = List::new(items);
-        frame.render_widget(
-            list,
-            Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: list_height,
-            },
-        );
-
-        let help_y = inner.y + inner.height.saturating_sub(help_rows + 1);
-        let help_area = Rect {
-            x: inner.x,
-            y: help_y,
-            width: inner.width,
-            height: help_rows + 1,
-        };
-
-        let sep = Line::from(Span::styled(
-            "\u{2500}".repeat(inner.width as usize),
-            dim,
-        ));
-        let col = inner.width / 2;
-
-        let mut lines = vec![sep];
-        for (left, right) in &help_entries {
-            let left_padded = format!("{:<w$}", left, w = col as usize);
-            let line = Line::from(vec![
-                Span::styled(left_padded, dim),
-                Span::styled(*right, dim),
-            ]);
-            lines.push(line);
+        let mut state = std::mem::take(&mut self.sidebar_list_state);
+        if self.cursor_column == SidebarColumn::Main {
+            state.select(self.sidebar_cursor_index(&visual));
         }
-        frame.render_widget(Paragraph::new(lines), help_area);
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default()),
+            Rect { x: inner.x, y: inner.y, width: inner.width, height: list_height },
+            &mut state,
+        );
+        self.sidebar_list_state = state;
+
+        if helper_height > 0 {
+            let help_y = inner.y + inner.height.saturating_sub(helper_height);
+            let help_area = Rect { x: inner.x, y: help_y, width: inner.width, height: helper_height };
+            let sep = Line::from(Span::styled("\u{2500}".repeat(inner.width as usize), dim));
+            let col = inner.width / 2;
+            let mut lines = vec![sep];
+            for (left, right) in &help_entries {
+                let left_padded = format!("{:<w$}", left, w = col as usize);
+                lines.push(Line::from(vec![Span::styled(left_padded, dim), Span::styled(*right, dim)]));
+            }
+            frame.render_widget(Paragraph::new(lines), help_area);
+        }
     }
 
     /// Phase 6: render the activity-feed strip (Alt-, toggle). Shows the
@@ -2837,6 +2877,27 @@ impl App {
             .title(" Find session ")
             .style(Style::default().fg(theme::TEXT));
         frame.render_widget(Paragraph::new(lines).block(block), dialog);
+    }
+
+    fn draw_sidebar_search(&self, frame: &mut Frame, area: Rect, query: &str) {
+        let width = area.width.min(72).max(36);
+        let height = 5u16.min(area.height.saturating_sub(2).max(5));
+        let dialog = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, dialog);
+        let block = Block::default().borders(Borders::ALL).title(" Filter sidebar ");
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+        let lines = vec![
+            Line::from(vec![Span::styled("> ", Style::default().fg(theme::DIM)), Span::raw(query), Span::styled("█", Style::default().fg(theme::TEXT))]),
+            Line::from(""),
+            Line::from(Span::styled("Enter apply · A-/ apply · Esc cancel", Style::default().fg(theme::DIM))),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     /// A-i read-only info overlay — draw_confirm's chrome scaled up
