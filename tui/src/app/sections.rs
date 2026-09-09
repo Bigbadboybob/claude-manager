@@ -10,6 +10,7 @@
 //! renders loose below every section.
 
 use super::*;
+use ratatui::style::Color;
 
 pub(crate) use cm_daemon::manifest::SidebarSection;
 
@@ -71,6 +72,35 @@ fn inherited_parent_task(task: &TaskEntry) -> Option<String> {
 }
 
 impl App {
+    /// Resolve each displayed row independently so filtering or scrolling away
+    /// a section heading cannot lose its tint. Only gaps within the same
+    /// section share the surface; boundaries and loose rows stay transparent.
+    pub(super) fn sidebar_section_backgrounds(&self, rows: &[VisualItem]) -> Vec<Option<Color>> {
+        if self.sidebar_view != SidebarView::Task || self.sections.is_empty() {
+            return vec![None; rows.len()];
+        }
+        let workspace_sections: Vec<_> = (0..self.workspaces.len())
+            .map(|wi| self.section_of_workspace(wi)).collect();
+        let sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
+            VisualItem::SectionHeader(id) => Some(id.as_str()),
+            VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
+            | VisualItem::TaskHeader { ws_idx: wi, .. }
+            | VisualItem::WorkflowHeader { ws_idx: wi, .. } => workspace_sections[*wi].as_deref(),
+            _ => None,
+        }).collect();
+        rows.iter().enumerate().map(|(i, row)| {
+            let section = if matches!(row, VisualItem::Separator) {
+                let before = i.checked_sub(1).and_then(|i| sections[i]);
+                let after = sections.get(i + 1).copied().flatten();
+                before.filter(|_| before == after)
+            } else {
+                sections[i]
+            };
+            section.and_then(|id| self.section_by_id(id))
+                .map(|s| theme::sidebar_section_bg(s.color.as_deref()))
+        }).collect()
+    }
+
     pub(crate) fn section_index(&self, id: &str) -> Option<usize> {
         self.sections.iter().position(|s| s.id == id)
     }
@@ -479,6 +509,70 @@ mod layout_tests {
         let mut ts = make_simple_session_with_uid(format!("uid-{tid}"), tid, "codex", session, None);
         ts.task_id = Some(tid.into());
         app.workspaces[wi].sessions.push(ts);
+    }
+
+    fn sidebar_buffer(app: &mut App, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::{backend::TestBackend, Terminal};
+        app.keybinding_helper_visible = false;
+        let mut terminal = Terminal::new(TestBackend::new(40, height)).unwrap();
+        terminal.draw(|frame| app.draw_session_list(frame, frame.area())).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn sidebar_tint_covers_section_members_but_not_boundaries_or_loose_rows() {
+        let mut app = sectioned_app();
+        app.sections[0].color = Some("blue".into());
+        app.sections.push(SidebarSection {
+            id: "s2".into(), name: "Second".into(), color: Some("blue".into()), folded: false,
+        });
+        app.workspace_sections.insert("c".into(), "s2".into());
+        add_task_session(&mut app, 0, "ta");
+        add_task_session(&mut app, 1, "tb");
+        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tb".into() };
+        let buffer = sidebar_buffer(&mut app, 24);
+        let blue = theme::sidebar_section_bg(Some("blue"));
+        // Header, workspace, task, session, internal gap, inherited workspace/task/session.
+        for y in 1..=8 {
+            for x in 1..=38 {
+                assert_eq!(buffer[(x, y)].bg, blue, "section cell ({x}, {y})");
+            }
+            assert_eq!(buffer[(0, y)].bg, Color::Reset, "border stays clear");
+        }
+        assert!(buffer[(4, 7)].modifier.contains(Modifier::BOLD), "selected task stays bold");
+        for y in [9, 12, 13, 14] {
+            assert_eq!(buffer[(38, y)].bg, Color::Reset, "section boundaries and loose rows");
+        }
+        assert_eq!(buffer[(38, 10)].bg, blue, "same-colored next section still has a clear boundary");
+
+        app.sections[0].folded = true;
+        app.cursor = Cursor::Section("s1".into());
+        let buffer = sidebar_buffer(&mut app, 24);
+        assert_eq!(buffer[(38, 1)].bg, blue, "folded header keeps tint");
+        assert_eq!(buffer[(38, 2)].bg, Color::Reset, "folded group does not bleed");
+
+        app.sidebar_view = SidebarView::Status;
+        let buffer = sidebar_buffer(&mut app, 24);
+        assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn sidebar_tint_survives_filtered_and_scrolled_away_headings() {
+        let mut app = sectioned_app();
+        add_task_session(&mut app, 0, "ta");
+        add_task_session(&mut app, 1, "tb");
+        app.cursor = Cursor::Session(1, 0);
+        let neutral = theme::sidebar_section_bg(None);
+        let buffer = sidebar_buffer(&mut app, 5);
+        assert!(app.sidebar_list_state.offset() > 0, "section heading scrolled away");
+        assert_eq!(buffer[(38, 3)].bg, neutral, "selected inherited session keeps tint");
+
+        app.sidebar_filter = Some("tb".into());
+        app.sidebar_list_state = Default::default();
+        let buffer = sidebar_buffer(&mut app, 10);
+        assert_eq!(buffer[(38, 1)].bg, neutral, "filtered task keeps tint without its heading");
+        assert_eq!(buffer[(38, 2)].bg, neutral, "filtered session keeps tint without its heading");
+        assert_eq!(buffer[(38, 3)].bg, Color::Reset, "empty space stays transparent");
     }
 
     #[test]

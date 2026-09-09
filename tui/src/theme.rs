@@ -133,9 +133,10 @@ pub(crate) fn cycle_user_color(current: Option<&str>, forward: bool) -> Option<S
     }
 }
 
-/// Quiet planning subsection surfaces, with optional user-color accents.
+/// Quiet task-sidebar section surfaces, with optional user-color accents.
 /// Keep a neutral base so missing colors are visible rather than near black.
-pub(crate) fn subsection_bg(color: Option<&str>) -> Color {
+/// Terminal opacity is applied by the terminal emulator; ANSI colors have no alpha.
+pub(crate) fn sidebar_section_bg(color: Option<&str>) -> Color {
     match color.and_then(user_color) {
         Some(Color::Rgb(r, g, b)) => Color::Rgb(16 + r / 12, 18 + g / 12, 22 + b / 12),
         _ => Color::Rgb(25, 29, 38),

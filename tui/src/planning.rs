@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use alacritty_terminal::event::Event as TermEvent;
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+#[cfg(test)]
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
@@ -253,48 +255,14 @@ enum VisibleRowKind {
     InitiativeHeader { id: String, name: String, color: Option<String> },
 }
 
-/// Shading follows the visible headings, including nested members and the
-/// Standalone subsection. Plain layout headings use the same neutral tint.
-fn subsection_backgrounds(rows: &[VisibleRow]) -> Vec<Option<Color>> {
-    let mut current = None;
-    rows.iter().map(|row| {
-        match &row.kind {
-            VisibleRowKind::InitiativeHeader { color, .. } => {
-                current = Some(theme::subsection_bg(color.as_deref()));
-            }
-            VisibleRowKind::Layout { item: GridItem::Header(_), .. } => {
-                current = Some(theme::subsection_bg(None));
-            }
-            VisibleRowKind::Layout { item: GridItem::Separator | GridItem::Empty, .. } => {
-                current = None;
-            }
-            _ => {}
-        }
-        current
-    }).collect()
-}
-
-fn subsection_ends(rows: &[VisibleRow], index: usize, backgrounds: &[Option<Color>]) -> bool {
-    backgrounds[index].is_some()
-        && visible_row_slug(&rows[index]).is_some()
-        && rows.get(index + 1).and_then(visible_row_slug).is_none()
-}
-
-/// Scroll in logical rows, but budget terminal lines: subsection endings
-/// take an extra line without becoming extra keyboard navigation targets.
-fn column_scroll_start(rows: &[VisibleRow], backgrounds: &[Option<Color>], offset: usize,
+/// Planning rows occupy one terminal line, including initiative headings.
+fn column_scroll_start(rows: &[VisibleRow], offset: usize,
     selected: Option<usize>, height: usize) -> usize
 {
     let mut start = offset.min(rows.len().saturating_sub(1));
     let Some(selected) = selected.filter(|&index| index < rows.len()) else { return start; };
     if height == 0 { return start; }
-    start = start.min(selected);
-    let row_height = |index| (1 + usize::from(subsection_ends(rows, index, backgrounds))).min(height);
-    let mut used: usize = (start..=selected).map(row_height).sum();
-    while used > height && start < selected {
-        used -= row_height(start);
-        start += 1;
-    }
+    start = start.min(selected).max(selected.saturating_sub(height - 1));
     start
 }
 
@@ -1880,9 +1848,8 @@ impl PlanningView {
         }
         if self.cursor.col >= self.grid_col_scroll.len() { return; }
         if let Some(rows) = self.cursor_visible_column() {
-            let backgrounds = subsection_backgrounds(&rows);
             self.grid_col_scroll[self.cursor.col] = column_scroll_start(
-                &rows, &backgrounds, self.grid_col_scroll[self.cursor.col],
+                &rows, self.grid_col_scroll[self.cursor.col],
                 Some(self.cursor.row), h,
             );
         }
@@ -4198,15 +4165,11 @@ impl PlanningView {
         let rows = self.visible_rows_for_column(pi, ci);
         let mut items = Vec::new();
         let search_q = self.active_search_query();
-        let backgrounds = subsection_backgrounds(&rows);
         let start = column_scroll_start(
-            &rows, &backgrounds, self.grid_col_scroll.get(col_idx).copied().unwrap_or(0),
+            &rows, self.grid_col_scroll.get(col_idx).copied().unwrap_or(0),
             (self.cursor.col == col_idx).then_some(self.cursor.row), max_rows,
         );
-        let mut used_lines = 0;
-
-        for ri in start..rows.len() {
-            if used_lines >= max_rows { break; }
+        for ri in (start..rows.len()).take(max_rows) {
             let is_selected = self.cursor.col == col_idx && self.cursor.row == ri;
             let in_visual = self.is_in_visual_range(col_idx, ri);
             let row = &rows[ri];
@@ -4288,8 +4251,7 @@ impl PlanningView {
                     let line = Line::from(spans);
                     let conflict = self.is_conflict(project_name, slug);
                     let base_fg = if is_claude { theme::REMOTE } else { theme::MUTED };
-                    let base_style = Style::default().fg(base_fg)
-                        .bg(backgrounds[ri].unwrap_or(Color::Reset));
+                    let base_style = Style::default().fg(base_fg);
                     let style = if is_selected && in_visual {
                         Style::default().fg(theme::TEXT).bg(theme::SELECT_BG).add_modifier(Modifier::BOLD)
                     } else if is_selected {
@@ -4304,14 +4266,7 @@ impl PlanningView {
                     } else if conflict {
                         style.bg(theme::CONFLICT_BG)
                     } else { style };
-                    let mut lines = vec![line];
-                    if subsection_ends(&rows, ri, &backgrounds) && max_rows - used_lines > 1 {
-                        lines.push(Line::from(" ╰──").style(
-                            Style::default().fg(theme::DIM).bg(Color::Reset),
-                        ));
-                    }
-                    used_lines += lines.len().saturating_sub(1);
-                    items.push(ListItem::new(lines).style(style));
+                    items.push(ListItem::new(line).style(style));
                 }
                 (Some(GridItem::Separator), None) => {
                     let ch = if is_selected { "\u{2501}" } else { "\u{2500}" };
@@ -4322,8 +4277,7 @@ impl PlanningView {
                     items.push(ListItem::new(Line::from("")));
                 }
                 (Some(GridItem::Header(text)), None) => {
-                    let base_style = Style::default().fg(theme::TEXT)
-                        .bg(backgrounds[ri].unwrap_or(Color::Reset)).add_modifier(Modifier::BOLD);
+                    let base_style = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
                     let style = if is_selected && in_visual {
                         base_style.bg(theme::SELECT_BG)
                     } else if is_selected {
@@ -4344,10 +4298,9 @@ impl PlanningView {
                 (None, None) => {
                     if let VisibleRowKind::InitiativeHeader { name, color, .. } = &row.kind {
                         let accent = color.as_deref().and_then(theme::user_color).unwrap_or(theme::HEADER);
-                        let tint = theme::subsection_bg(color.as_deref());
                         let prefix = format!("▸ {}", name);
                         let display = truncate_with_ellipsis(&prefix, width.saturating_sub(1));
-                        let mut style = Style::default().fg(accent).bg(tint).add_modifier(Modifier::BOLD);
+                        let mut style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
                         if is_selected && in_visual { style = style.bg(theme::SELECT_BG); }
                         else if is_selected { style = style.bg(theme::HEADER_SELECT_BG); }
                         items.push(ListItem::new(Line::from(display)).style(style));
@@ -4355,7 +4308,6 @@ impl PlanningView {
                 }
                 _ => {}
             }
-            used_lines += 1;
         }
         items
     }
@@ -5170,21 +5122,17 @@ mod tests {
     }
 
     #[test]
-    fn subsection_shading_covers_members_and_leaves_an_unshaded_end() {
+    fn planning_subsections_keep_terminal_background_and_compact_rows() {
         let mut view = subsection_test_view();
-        view.cursor.row = 1; // Selected parent must retain the group background.
+        view.cursor.row = 1;
         let buffer = subsection_buffer(&view, 10);
-        let blue = theme::subsection_bg(Some("blue"));
-        for y in [0, 1, 2] {
-            assert_eq!(buffer[(35, y)].bg, blue, "header/parent/child fill the full width");
+        for cell in buffer.content() {
+            assert_eq!(cell.bg, Color::Reset, "subsections preserve terminal transparency");
         }
-        assert_eq!(buffer[(35, 3)].bg, Color::Reset);
-        assert_eq!(buffer[(1, 3)].symbol(), "╰");
-        for y in [4, 5] {
-            assert_eq!(buffer[(35, y)].bg, theme::subsection_bg(None), "Standalone groups also have a surface");
-        }
-        assert_eq!(buffer[(35, 6)].bg, Color::Reset);
-        assert_eq!(buffer[(1, 6)].symbol(), "╰");
+        let line = |y| (0..36).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(line(2).contains("nested-child"));
+        assert!(line(3).contains("Standalone"));
+        assert!(line(4).contains("independent"));
         view.visual_anchor = Some(1);
         let buffer = subsection_buffer(&view, 10);
         assert_eq!(buffer[(35, 1)].bg, theme::SELECT_BG);
@@ -5192,7 +5140,7 @@ mod tests {
     }
 
     #[test]
-    fn subsection_navigation_accounts_for_endings_and_small_viewports() {
+    fn subsection_navigation_keeps_selection_visible_in_small_viewports() {
         let mut view = subsection_test_view();
         let rows = view.visible_rows_for_column(0, 0);
         for height in [1, 2, 3, 5] {
@@ -5208,7 +5156,7 @@ mod tests {
             }
         }
         view.grid_rows_visible.set(3);
-        view.cursor.row = 2; // Last child, followed by a display-only closing line.
+        view.cursor.row = 2; // Last child, immediately followed by Standalone.
         view.navigate_vertical(1);
         assert_eq!(view.cursor.row, 3, "next navigation lands on Standalone header");
         view.navigate_vertical(1);

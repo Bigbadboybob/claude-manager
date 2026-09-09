@@ -66,6 +66,22 @@ Explicit assignment always wins, so the Owner can pull a subtask out of its pare
 
 Folded header: `▸ Name  (n)` with a running/idle rollup. Unfolded: `▾ Name`. Colored by the section's color, else `theme::HEADER`; selection keeps White+BOLD.
 
+In the Task sidebar, a quiet background tint covers the section heading and its
+workspace, task, workflow, and session rows. The tint follows the section color,
+with a neutral fallback. Internal workspace separators share the tint; section
+boundaries and loose workspaces use the terminal's default background. Filtering
+or scrolling away the heading does not remove a member's tint. Planning keeps
+its default background and the initiative coordinator `◆` glyph.
+
+Terminal colors do not include alpha. Whether these colored cells inherit the
+window's transparency is controlled by the terminal emulator; CM does not change
+the terminal's opacity setting.
+
+For [Ghostty 1.2+](https://ghostty.org/docs/config/reference#background-opacity-cells),
+set `background-opacity-cells = true` to apply your existing
+`background-opacity` to colored cells as well. This affects all explicit cell
+backgrounds in the terminal, including other applications.
+
 ### Cursor and keys
 
 New `Cursor::Section(String)`. It is selectable; `active_workspace_index`, `active_session`, `cursor_task_id` return `None` for it, so task/session actions no-op with a status hint.

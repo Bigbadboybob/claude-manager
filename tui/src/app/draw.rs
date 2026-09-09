@@ -1729,7 +1729,7 @@ impl App {
         items
     }
 
-    fn draw_session_list(&mut self, frame: &mut Frame, area: Rect) {
+    pub(super) fn draw_session_list(&mut self, frame: &mut Frame, area: Rect) {
         let view_label = match self.sidebar_view {
             SidebarView::Status => " Sessions ",
             SidebarView::Task => " Tasks ",
@@ -1818,7 +1818,9 @@ impl App {
             if in_section.contains(&wi) { " " } else { "" }
         };
 
-        for vi in &visual {
+        let section_backgrounds = self.sidebar_section_backgrounds(&visual);
+        for (vi, background) in visual.iter().zip(section_backgrounds) {
+            let first_item = items.len();
             match vi {
                 VisualItem::WorkspaceHeader(wi) => {
                     let ws = &self.workspaces[*wi];
@@ -2194,6 +2196,14 @@ impl App {
                 | VisualItem::BacktestFleet(_)
                 | VisualItem::BacktestRun { .. } => {}
 
+            }
+            // Apply the surface to the whole row, including trailing cells,
+            // while retaining foreground/status colors and selection emphasis.
+            if let Some(bg) = background {
+                use ratatui::style::Stylize;
+                for item in &mut items[first_item..] {
+                    *item = item.clone().bg(bg);
+                }
             }
         }
 
