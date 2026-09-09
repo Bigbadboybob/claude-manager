@@ -126,13 +126,13 @@ async def notification_status() -> dict:
 
 _BRIEF_FIELDS = (
     "id", "slug", "project", "name", "status", "source",
-    "priority", "difficulty", "is_cloud", "kind",
+    "priority", "difficulty", "is_cloud", "kind", "initiative_id",
 )
 _FULL_EXTRA_FIELDS = (
     "description", "prompt", "depends", "repo_url", "repo_branch",
     "wip_branch", "session_id", "ttyd_url", "worker_vm",
     "blocked_at", "created_at", "updated_at",
-    "parent_task_id", "worktree_mode", "metadata",
+    "parent_task_id", "worktree_mode", "initiative_id", "initiative", "metadata",
 )
 
 
@@ -467,6 +467,7 @@ def propose_task(
     prompt: str = "",
     difficulty: int | None = None,
     depends: list[str] | None = None,
+    initiative_id: str | None = None,
 ) -> str:
     """Propose a new task to the project backlog.
 
@@ -498,6 +499,7 @@ def propose_task(
         prompt: Launch instructions delivered to the worker agent
         difficulty: Optional difficulty rating (1-10)
         depends: Optional list of task slugs this depends on
+        initiative_id: Existing initiative UUID or slug to attach this task to
     """
     _check_parameter_confusion("description", description)
     _check_parameter_confusion("prompt", prompt)
@@ -546,6 +548,8 @@ def propose_task(
             params["difficulty"] = difficulty
         if depends:
             params["depends"] = list(depends)
+        if initiative_id:
+            params["initiative_id"] = initiative_id
         try:
             task = control_client.call("propose_task", params, socket_path=route.path)
         except control_client.ControlError as e:
@@ -562,6 +566,7 @@ def propose_task(
             prompt=prompt,
             difficulty=difficulty,
             depends=depends,
+            initiative_id=initiative_id,
             metadata={"filer": filer},
         )
     # Inline round-trip preview so the caller sees what actually landed
@@ -588,10 +593,99 @@ def list_projects() -> list[dict]:
 
 
 @mcp.tool()
+def list_initiatives(
+    status: str | None = None,
+    project: str | None = None,
+    include_archived: bool = False,
+) -> list[dict]:
+    """List first-class initiatives and their project memberships."""
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        return control_client.call("list_initiatives", {
+            key: value for key, value in {
+                "status": status, "project": project,
+                "include_archived": include_archived,
+            }.items() if value is not None
+        }, socket_path=route.path)
+    return PlanningClient().list_initiatives(
+        status=status, project=project, include_archived=include_archived,
+    )
+
+
+@mcp.tool()
+def get_initiative(initiative_id: str) -> dict:
+    """Read an initiative by UUID or slug."""
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        return control_client.call("get_initiative", {
+            "initiative_id": initiative_id,
+        }, socket_path=route.path)
+    return PlanningClient().get_initiative(initiative_id)
+
+
+@mcp.tool()
+def propose_initiative(
+    name: str,
+    coordinator_task_id: str,
+    description: str = "",
+    slug: str | None = None,
+    color: str | None = None,
+    coordinator_project: str | None = None,
+    docs_path: str = "cm-initiative",
+) -> dict:
+    """Create a draft initiative around an existing coordinator task.
+
+    This does not activate the initiative or launch any work. Owner approval
+    is required before adding project sides or activating it.
+    """
+    body = {
+        "name": name,
+        "coordinator_task_id": coordinator_task_id,
+        "description": description,
+        "docs_path": docs_path,
+    }
+    for key, value in {
+        "slug": slug, "color": color, "coordinator_project": coordinator_project,
+    }.items():
+        if value is not None:
+            body[key] = value
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        try:
+            return control_client.call("propose_initiative", body, socket_path=route.path)
+        except control_client.ControlError as e:
+            raise RuntimeError(f"propose_initiative failed ({e.code}): {e.message}") from e
+    return PlanningClient().propose_initiative(body)
+
+
+@mcp.tool()
+def add_initiative_project(
+    initiative_id: str, project: str, role: str = "",
+    project_channel: str | None = None,
+) -> dict:
+    """Propose a project membership for an initiative."""
+    body = {"project": project, "role": role}
+    if project_channel is not None:
+        body["project_channel"] = project_channel
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        try:
+            return control_client.call("propose_initiative_project", {
+                "initiative_id": initiative_id, **body,
+            }, socket_path=route.path)
+        except control_client.ControlError as e:
+            raise RuntimeError(
+                f"propose_initiative_project failed ({e.code}): {e.message}"
+            ) from e
+    return PlanningClient().add_initiative_project(initiative_id, body)
+
+
+@mcp.tool()
 def list_tasks(
     project: str | None = None,
     status: str | None = None,
     source: str | None = None,
+    initiative_id: str | None = None,
 ) -> list[dict]:
     """List tasks across the planning system.
 
@@ -616,13 +710,17 @@ def list_tasks(
         # large unfiltered board never has to cross the 4 MiB framed socket.
         filters = {
             key: value
-            for key, value in {"project": project, "status": status}.items()
+            for key, value in {
+                "project": project, "status": status, "initiative_id": initiative_id,
+            }.items()
             if value is not None
         }
         tasks = control_client.call("list_tasks", filters, socket_path=route.path)
     else:
         client = PlanningClient()
-        tasks = client.list_tasks(project=project, status=status)
+        tasks = client.list_tasks(
+            project=project, status=status, initiative_id=initiative_id,
+        )
     if source:
         tasks = [t for t in tasks if t.get("source") == source]
     return [_shape_task(t, full=False) for t in tasks]
@@ -658,6 +756,7 @@ def update_task(
     project: str | None = None,
     depends: list[str] | None = None,
     parent_task_id: str | None = None,
+    initiative_id: str | None = None,
     metadata: dict | None = None,
 ) -> dict:
     """Edit a task's planning fields.
@@ -687,6 +786,8 @@ def update_task(
         depends: Replace the dependency list (task slugs).
         parent_task_id: Reparent this task under another task's UUID,
             or "null" to detach (make it top-level).
+        initiative_id: Attach to an initiative UUID/slug, or "null" to make
+            the task standalone.
         metadata: Free-form JSONB bag for skill/agent attachments. PATCH
             REPLACES the whole object — read the existing `metadata` via
             `get_current_task` (or `get_task`) first and re-send the
@@ -707,8 +808,11 @@ def update_task(
             "project": project,
             "depends": depends,
             "metadata": metadata,
+            "initiative_id": initiative_id if initiative_id != "null" else None,
         }.items() if v is not None
     }
+    if initiative_id == "null":
+        fields["initiative_id"] = None
     if parent_task_id is not None:
         fields["parent_task_id"] = None if parent_task_id == "null" else parent_task_id
     if not fields:

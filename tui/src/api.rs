@@ -50,6 +50,10 @@ pub struct Task {
     /// `parent_task_id` is set. Phase 5 subtask field.
     #[serde(default = "default_worktree_mode")]
     pub worktree_mode: String,
+    #[serde(default)]
+    pub initiative_id: Option<String>,
+    #[serde(default)]
+    pub initiative: Option<serde_json::Value>,
     /// Free-form JSONB bag. Skills attach structured context here (e.g.
     /// `metadata.resume.design_doc_path` for the design-doc bundle) so
     /// the schema doesn't churn for every new shape. None = no bag.
@@ -187,6 +191,8 @@ pub struct TaskCreateBody {
     pub parent_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiative_id: Option<String>,
     /// `wip_branch` at create time. Inherit-mode subtasks need this
     /// to persist their parent's branch through reconcile (without
     /// it the API row's `wip_branch` is NULL and the next reconcile

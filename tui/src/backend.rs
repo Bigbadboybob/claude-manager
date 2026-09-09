@@ -308,6 +308,7 @@ fn do_create_plan_task(
         is_cloud: Some(false),
         parent_task_id: parent_task_id.map(str::to_string),
         worktree_mode: worktree_mode.map(str::to_string),
+        initiative_id: None,
         wip_branch: None,
         metadata: None,
     };

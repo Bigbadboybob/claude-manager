@@ -74,6 +74,7 @@ class PlanningClient:
         difficulty: int | None = None,
         depends: list[str] | None = None,
         metadata: dict | None = None,
+        initiative_id: str | None = None,
     ) -> dict:
         """Create a task with source='claude' in draft status."""
         if not repo_url:
@@ -96,6 +97,8 @@ class PlanningClient:
             body["depends"] = depends
         if metadata:
             body["metadata"] = metadata
+        if initiative_id:
+            body["initiative_id"] = initiative_id
 
         r = self._client.client.post("/tasks", json=body)
         return _response_json(r)
@@ -106,17 +109,49 @@ class PlanningClient:
         return _response_json(r)
 
     def list_tasks(self, project: str | None = None,
-                   status: str | None = None) -> list[dict]:
+                   status: str | None = None,
+                   initiative_id: str | None = None) -> list[dict]:
         params: dict = {}
         if project:
             params["project"] = project
         if status:
             params["status"] = status
+        if initiative_id:
+            params["initiative_id"] = initiative_id
         r = self._client.client.get("/tasks", params=params)
         return _response_json(r)
 
     def get_task(self, task_id: str) -> dict:
         r = self._client.client.get(f"/tasks/{task_id}")
+        return _response_json(r)
+
+    def list_initiatives(self, status: str | None = None,
+                         project: str | None = None,
+                         include_archived: bool = False) -> list[dict]:
+        params = {"include_archived": include_archived}
+        if status:
+            params["status"] = status
+        if project:
+            params["project"] = project
+        r = self._client.client.get("/initiatives", params=params)
+        return _response_json(r)
+
+    def get_initiative(self, initiative_id: str) -> dict:
+        r = self._client.client.get(f"/initiatives/{initiative_id}")
+        return _response_json(r)
+
+    def propose_initiative(self, body: dict) -> dict:
+        r = self._client.client.post("/initiatives", json=body)
+        return _response_json(r)
+
+    def update_initiative(self, initiative_id: str, **fields) -> dict:
+        r = self._client.client.patch(f"/initiatives/{initiative_id}", json=fields)
+        return _response_json(r)
+
+    def add_initiative_project(self, initiative_id: str, body: dict) -> dict:
+        r = self._client.client.post(
+            f"/initiatives/{initiative_id}/projects", json=body,
+        )
         return _response_json(r)
 
     def update_task(self, task_id: str, **fields) -> dict:

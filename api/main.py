@@ -17,7 +17,8 @@ from fastapi.responses import JSONResponse
 from api.auth import verify_token
 from api.models import (
     TaskCreate, TaskUpdate, TaskResponse, ArtifactCreate, ArtifactResponse,
-    BacktestPhaseUpdate,
+    BacktestPhaseUpdate, InitiativeCreate, InitiativeUpdate,
+    InitiativeProjectCreate, InitiativeProjectUpdate, InitiativeResponse,
 )
 from api.dispatch_daemon import dispatch_loop, warm_pool_loop
 from dispatch import db
@@ -176,6 +177,57 @@ def _slugify(text: str) -> str:
     return slug[:50]
 
 
+async def _initiative_or_404(pool, ref: str) -> dict:
+    initiative = await db.get_initiative(pool, ref)
+    if not initiative:
+        raise HTTPException(status_code=404, detail="Initiative not found")
+    return initiative
+
+
+async def _validate_task_initiative(
+    pool, *, initiative_id: str | None, project: str | None,
+    parent_task_id: str | None, task_id: str | None = None,
+) -> str | None:
+    """Validate initiative/project/parent invariants before a task write."""
+    if not initiative_id:
+        if parent_task_id:
+            parent = await db.get_task(pool, parent_task_id)
+            if parent and parent.get("initiative_id"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="a standalone task cannot be a child of an initiative task",
+                )
+        return None
+    initiative = await db.get_initiative(pool, initiative_id)
+    if not initiative:
+        raise HTTPException(status_code=400, detail="initiative does not exist")
+    if initiative["status"] in {"archived", "cancelled"}:
+        raise HTTPException(status_code=400, detail="initiative is not accepting tasks")
+    if not project:
+        raise HTTPException(status_code=400, detail="initiative tasks require a project")
+    if parent_task_id:
+        parent = await db.get_task(pool, parent_task_id)
+        if not parent:
+            raise HTTPException(status_code=400, detail="parent task does not exist")
+        if parent.get("initiative_id") != initiative["id"]:
+            raise HTTPException(
+                status_code=400,
+                detail="a subtask must use the same initiative as its parent",
+            )
+    approved = {
+        row["project"] for row in initiative.get("projects", [])
+        if row.get("status") == "approved"
+    }
+    # The coordinator task is allowed to establish the first project side in
+    # the setup transaction; ordinary tasks require an approved membership.
+    if project not in approved and str(initiative["coordinator_task_id"]) != str(task_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"project '{project}' is not an approved initiative project",
+        )
+    return initiative["id"]
+
+
 # ---------------------------------------------------------------------------
 # Tasks
 # ---------------------------------------------------------------------------
@@ -194,6 +246,7 @@ NULLABLE_TASK_FIELDS = frozenset({
     "blocked_at", "session_id", "wip_branch",
     "project", "slug", "description", "difficulty", "depends",
     "parent_task_id",
+    "initiative_id",
     "metadata",
 })
 
@@ -203,6 +256,14 @@ BACKTEST_DEFAULT_SCRIPT = "analysis.backtests.backtest_actrader_grid"
 @app.post("/tasks", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def create_task(body: TaskCreate, pool=Depends(get_pool)):
     prompt = body.prompt or ""
+    initiative_id = body.initiative_id
+    project = body.project
+    if body.parent_task_id and "initiative_id" not in body.model_fields_set:
+        parent = await db.get_task(pool, body.parent_task_id)
+        if parent:
+            initiative_id = parent.get("initiative_id")
+            if project is None:
+                project = parent.get("project")
 
     # Auto-generate slug from name if not provided
     slug = body.slug
@@ -228,13 +289,19 @@ async def create_task(body: TaskCreate, pool=Depends(get_pool)):
         bt.setdefault("script", BACKTEST_DEFAULT_SCRIPT)
         is_cloud = True  # backtests are cloud-dispatched by definition
 
+    initiative_id = await _validate_task_initiative(
+        pool, initiative_id=initiative_id, project=project,
+        parent_task_id=body.parent_task_id,
+    )
+
     task = await db.add_task(
         pool, body.repo_url, body.repo_branch, prompt, body.priority,
-        status=body.status, project=body.project, slug=slug, name=body.name,
+        status=body.status, project=project, slug=slug, name=body.name,
         description=body.description, difficulty=body.difficulty,
         depends=body.depends, source=body.source, is_cloud=is_cloud,
         kind=body.kind,
         parent_task_id=body.parent_task_id, worktree_mode=body.worktree_mode,
+        initiative_id=initiative_id,
         wip_branch=body.wip_branch, metadata=metadata,
     )
 
@@ -258,11 +325,13 @@ async def create_task(body: TaskCreate, pool=Depends(get_pool)):
 async def list_tasks(
     status: str | None = Query(None),
     project: str | None = Query(None),
+    initiative_id: str | None = Query(None),
     include_archived: bool = Query(False),
     pool=Depends(get_pool),
 ):
     return await db.list_tasks(
-        pool, status=status, project=project, include_archived=include_archived
+        pool, status=status, project=project, initiative_id=initiative_id,
+        include_archived=include_archived
     )
 
 
@@ -621,6 +690,16 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     if not fields:
         return task
 
+    resolved_initiative_id = await _validate_task_initiative(
+        pool,
+        initiative_id=fields.get("initiative_id", task.get("initiative_id")),
+        project=fields.get("project", task.get("project")),
+        parent_task_id=fields.get("parent_task_id", task.get("parent_task_id")),
+        task_id=task_id,
+    )
+    if "initiative_id" in fields:
+        fields["initiative_id"] = resolved_initiative_id
+
     # Side effect: when marking done, handle the worker VM
     if fields.get("status") == "done" and task["worker_vm"]:
         # Check if this is a warm VM — if so, release it back to ready instead of deleting
@@ -681,6 +760,158 @@ async def list_projects(pool=Depends(get_pool)):
     for name, url in REPOS.items():
         seen[name] = url
     return [{"name": name, "repo_url": url} for name, url in seen.items()]
+
+
+# ---------------------------------------------------------------------------
+# Initiatives
+# ---------------------------------------------------------------------------
+
+@app.post("/initiatives", response_model=InitiativeResponse,
+          dependencies=[Depends(verify_token)])
+async def create_initiative(body: InitiativeCreate, pool=Depends(get_pool)):
+    slug = _slugify(body.slug or body.name)
+    if not slug:
+        raise HTTPException(status_code=400, detail="initiative slug is empty")
+    try:
+        return await db.create_initiative(
+            pool, slug=slug, name=body.name, description=body.description,
+            color=body.color, coordinator_task_id=body.coordinator_task_id,
+            coordinator_project=body.coordinator_project, docs_path=body.docs_path,
+            shared_channel=body.shared_channel, metadata=body.metadata,
+        )
+    except db.InvalidTaskId as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except asyncpg.UniqueViolationError as exc:
+        raise HTTPException(status_code=409, detail="initiative slug already exists") from exc
+
+
+@app.get("/initiatives", response_model=list[InitiativeResponse],
+         dependencies=[Depends(verify_token)])
+async def list_initiatives(
+    status: str | None = Query(None),
+    project: str | None = Query(None),
+    include_archived: bool = Query(False),
+    pool=Depends(get_pool),
+):
+    return await db.list_initiatives(
+        pool, status=status, project=project, include_archived=include_archived,
+    )
+
+
+@app.get("/initiatives/{initiative_ref}", response_model=InitiativeResponse,
+         dependencies=[Depends(verify_token)])
+async def get_initiative(initiative_ref: str, pool=Depends(get_pool)):
+    return await _initiative_or_404(pool, initiative_ref)
+
+
+@app.patch("/initiatives/{initiative_ref}", response_model=InitiativeResponse,
+           dependencies=[Depends(verify_token)])
+async def update_initiative(
+    initiative_ref: str, body: InitiativeUpdate, pool=Depends(get_pool),
+):
+    if body.status == "active":
+        initiative = await _initiative_or_404(pool, initiative_ref)
+        if not any(p.get("status") == "approved" for p in initiative["projects"]):
+            raise HTTPException(
+                status_code=400,
+                detail="an initiative needs at least one approved project before activation",
+            )
+    fields = body.model_dump(exclude_unset=True)
+    reason = fields.pop("reason", None)
+    try:
+        updated = await db.update_initiative(
+            pool, initiative_ref, actor="owner", reason=reason, **fields,
+        )
+    except (ValueError, db.InvalidTaskId) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="Initiative not found")
+    return updated
+
+
+@app.post("/initiatives/{initiative_ref}/approve", response_model=InitiativeResponse,
+          dependencies=[Depends(verify_token)])
+async def approve_initiative(initiative_ref: str, pool=Depends(get_pool)):
+    initiative = await _initiative_or_404(pool, initiative_ref)
+    approved = [p for p in initiative["projects"] if p.get("status") == "approved"]
+    if not approved:
+        raise HTTPException(
+            status_code=400,
+            detail="approve at least one initiative project before activation",
+        )
+    return await db.update_initiative(
+        pool, initiative["id"], status="active", actor="owner",
+        reason="Owner approved initiative",
+    )
+
+
+@app.post("/initiatives/{initiative_ref}/pause", response_model=InitiativeResponse,
+          dependencies=[Depends(verify_token)])
+async def pause_initiative(initiative_ref: str, pool=Depends(get_pool)):
+    initiative = await _initiative_or_404(pool, initiative_ref)
+    return await db.update_initiative(
+        pool, initiative["id"], status="paused", actor="owner",
+        reason="Owner paused initiative",
+    )
+
+
+@app.post("/initiatives/{initiative_ref}/complete", response_model=InitiativeResponse,
+          dependencies=[Depends(verify_token)])
+async def complete_initiative(initiative_ref: str, pool=Depends(get_pool)):
+    initiative = await _initiative_or_404(pool, initiative_ref)
+    return await db.update_initiative(
+        pool, initiative["id"], status="completed", actor="owner",
+        reason="Owner completed initiative",
+    )
+
+
+@app.post("/initiatives/{initiative_ref}/projects",
+          dependencies=[Depends(verify_token)])
+async def propose_initiative_project(
+    initiative_ref: str, body: InitiativeProjectCreate, pool=Depends(get_pool),
+):
+    try:
+        return await db.add_initiative_project(
+            pool, initiative_ref, body.project, role=body.role,
+            project_channel=body.project_channel, actor="owner",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/initiatives/{initiative_ref}/projects/{project}",
+           dependencies=[Depends(verify_token)])
+async def update_initiative_project(
+    initiative_ref: str, project: str, body: InitiativeProjectUpdate,
+    pool=Depends(get_pool),
+):
+    fields = body.model_dump(exclude_unset=True)
+    reason = fields.pop("reason", None)
+    try:
+        updated = await db.update_initiative_project(
+            pool, initiative_ref, project, actor="owner", reason=reason, **fields,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="Initiative project not found")
+    return updated
+
+
+@app.get("/initiatives/{initiative_ref}/tasks",
+         response_model=list[TaskResponse], dependencies=[Depends(verify_token)])
+async def list_initiative_tasks(
+    initiative_ref: str, project: str | None = Query(None),
+    status: str | None = Query(None), include_archived: bool = Query(False),
+    pool=Depends(get_pool),
+):
+    initiative = await _initiative_or_404(pool, initiative_ref)
+    return await db.list_tasks(
+        pool, status=status, project=project, initiative_id=initiative["id"],
+        include_archived=include_archived,
+    )
 
 
 # ---------------------------------------------------------------------------

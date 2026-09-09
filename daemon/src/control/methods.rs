@@ -5545,6 +5545,8 @@ struct ProposeTaskParams {
     difficulty: Option<i32>,
     #[serde(default)]
     depends: Option<Vec<String>>,
+    #[serde(default)]
+    initiative_id: Option<String>,
 }
 
 pub fn propose_task(
@@ -5603,6 +5605,7 @@ pub fn propose_task(
         repo_url: &p.repo_url,
         difficulty: p.difficulty,
         depends: p.depends.as_deref(),
+        initiative_id: p.initiative_id.as_deref(),
         metadata: Some(&metadata),
     };
     let api_url_override = if api_url_cfg.is_empty() {
@@ -10064,7 +10067,7 @@ pub fn rehydrate_derived_state(
     let tree_edges: Vec<(String, String)> =
         PlanningApiCreds::from_config(&api_url, &api_token)
             .ok()
-            .and_then(|creds| api_list_tasks(&creds, None, None).ok())
+            .and_then(|creds| api_list_tasks(&creds, None, None, None).ok())
             .map(|rows| {
                 rows.iter()
                     .filter_map(|row| {
@@ -14781,6 +14784,7 @@ fn api_list_tasks(
     creds: &PlanningApiCreds,
     project: Option<&str>,
     status: Option<&str>,
+    initiative_id: Option<&str>,
 ) -> Result<Vec<Value>, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
     let mut request = agent.get(&creds.url("/tasks"));
@@ -14789,6 +14793,9 @@ fn api_list_tasks(
     }
     if let Some(status) = status {
         request = request.query("status", status);
+    }
+    if let Some(initiative_id) = initiative_id {
+        request = request.query("initiative_id", initiative_id);
     }
     let resp = request
         .header("Authorization", &creds.auth())
@@ -14866,6 +14873,55 @@ fn api_list_projects(creds: &PlanningApiCreds) -> Result<Vec<Value>, PlanningCli
         .call()
         .map_err(map_ureq_err)?;
     crate::planning_client::decode_json_response(resp, "list_projects")
+}
+
+/// GET /initiatives with optional filters. Initiative records are small enough
+/// to cross the daemon frame directly and the API includes their memberships
+/// and task counts.
+fn api_list_initiatives(
+    creds: &PlanningApiCreds,
+    status: Option<&str>,
+    project: Option<&str>,
+    include_archived: bool,
+) -> Result<Vec<Value>, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let mut request = agent.get(&creds.url("/initiatives"));
+    if let Some(status) = status { request = request.query("status", status); }
+    if let Some(project) = project { request = request.query("project", project); }
+    request = request.query("include_archived", if include_archived { "true" } else { "false" });
+    let resp = request.header("Authorization", &creds.auth()).call().map_err(map_ureq_err)?;
+    crate::planning_client::decode_json_response(resp, "list_initiatives")
+}
+
+fn api_get_initiative(
+    creds: &PlanningApiCreds,
+    reference: &str,
+) -> Result<Value, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let resp = agent.get(&creds.url(&format!("/initiatives/{}", reference)))
+        .header("Authorization", &creds.auth()).call().map_err(map_ureq_err)?;
+    crate::planning_client::decode_json_response(resp, "get_initiative")
+}
+
+fn api_create_initiative(
+    creds: &PlanningApiCreds,
+    body: &Value,
+) -> Result<Value, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let resp = agent.post(&creds.url("/initiatives"))
+        .header("Authorization", &creds.auth()).send_json(body).map_err(map_ureq_err)?;
+    crate::planning_client::decode_json_response(resp, "propose_initiative")
+}
+
+fn api_add_initiative_project(
+    creds: &PlanningApiCreds,
+    reference: &str,
+    body: &Value,
+) -> Result<Value, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let resp = agent.post(&creds.url(&format!("/initiatives/{}/projects", reference)))
+        .header("Authorization", &creds.auth()).send_json(body).map_err(map_ureq_err)?;
+    crate::planning_client::decode_json_response(resp, "propose_initiative_project")
 }
 
 /// Outcome of the launch-time task-status promotion, for logging.
@@ -15592,7 +15648,7 @@ pub fn list_subtasks(
 
     let creds =
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
-    let all = api_list_tasks(&creds, None, None).map_err(|e| e.to_method_err())?;
+    let all = api_list_tasks(&creds, None, None, None).map_err(|e| e.to_method_err())?;
 
     let mut out: Vec<Value> = Vec::new();
     for task in &all {
@@ -15746,6 +15802,7 @@ pub fn update_task(
         "depends",
         "metadata",
         "parent_task_id",
+        "initiative_id",
     ];
     let mut rejected: Vec<&str> = fields
         .keys()
@@ -15844,9 +15901,84 @@ pub fn list_projects(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ListInitiativesParams {
+    status: Option<String>,
+    project: Option<String>,
+    #[serde(default)]
+    include_archived: bool,
+}
+
+/// Headless initiative discovery. Read-only and callable by Operator or
+/// Session callers, just like list_tasks.
+pub fn list_initiatives(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let filters: ListInitiativesParams = if params.is_null() {
+        ListInitiativesParams::default()
+    } else {
+        serde_json::from_value(params.clone()).map_err(|e| (
+            ErrorCode::InvalidParams, format!("list_initiatives params: {}", e)
+        ))?
+    };
+    let creds = planning_creds(state_arc)?;
+    Ok(Value::Array(api_list_initiatives(
+        &creds, filters.status.as_deref(), filters.project.as_deref(),
+        filters.include_archived,
+    ).map_err(|e| e.to_method_err())?))
+}
+
+/// Headless initiative detail lookup by UUID or slug.
+pub fn get_initiative(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let reference = params.get("initiative_id").and_then(Value::as_str)
+        .ok_or((ErrorCode::InvalidParams, "get_initiative: 'initiative_id' is required".into()))?;
+    let creds = planning_creds(state_arc)?;
+    api_get_initiative(&creds, reference).map_err(|e| e.to_method_err())
+}
+
+/// Headless initiative proposal. Creating a draft is safe for agents; the
+/// planning API still owns the Owner approval transition to active.
+pub fn propose_initiative(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let mut body = params.clone();
+    if !body.is_object() {
+        return Err((ErrorCode::InvalidParams, "propose_initiative params must be an object".into()));
+    }
+    let object = body.as_object_mut().expect("object checked above");
+    if object.get("name").and_then(Value::as_str).map(str::trim).unwrap_or("").is_empty() {
+        return Err((ErrorCode::InvalidParams, "propose_initiative: 'name' is required".into()));
+    }
+    if object.get("coordinator_task_id").and_then(Value::as_str).map(str::trim).unwrap_or("").is_empty() {
+        return Err((ErrorCode::InvalidParams, "propose_initiative: 'coordinator_task_id' is required".into()));
+    }
+    let creds = planning_creds(state_arc)?;
+    api_create_initiative(&creds, &body).map_err(|e| e.to_method_err())
+}
+
+/// Headless proposal of a project membership. The API persists it as
+/// `proposed`; a separate Owner-authorized operation must approve it.
+pub fn propose_initiative_project(
+    state_arc: &Arc<Mutex<DaemonState>>, params: &Value,
+) -> MethodResult {
+    let reference = params.get("initiative_id").and_then(Value::as_str)
+        .ok_or((ErrorCode::InvalidParams, "propose_initiative_project: 'initiative_id' is required".into()))?;
+    let project = params.get("project").and_then(Value::as_str)
+        .ok_or((ErrorCode::InvalidParams, "propose_initiative_project: 'project' is required".into()))?;
+    if project.trim().is_empty() {
+        return Err((ErrorCode::InvalidParams, "propose_initiative_project: 'project' must be non-empty".into()));
+    }
+    let mut body = serde_json::Map::new();
+    body.insert("project".into(), Value::String(project.to_string()));
+    for key in ["role", "project_channel"] {
+        if let Some(value) = params.get(key) { body.insert(key.into(), value.clone()); }
+    }
+    let creds = planning_creds(state_arc)?;
+    api_add_initiative_project(&creds, reference, &Value::Object(body))
+        .map_err(|e| e.to_method_err())
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListTasksParams {
     project: Option<String>,
     status: Option<String>,
+    initiative_id: Option<String>,
 }
 
 // Keep aligned with `mcp_server/server.py::_BRIEF_FIELDS`: daemon-routed and
@@ -15862,6 +15994,7 @@ const MCP_BRIEF_TASK_FIELDS: &[&str] = &[
     "difficulty",
     "is_cloud",
     "kind",
+    "initiative_id",
 ];
 
 /// Daemon-routed `list_tasks` (headless planning read). Project/status filters
@@ -15883,6 +16016,7 @@ pub fn list_tasks(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Method
         &creds,
         filters.project.as_deref(),
         filters.status.as_deref(),
+        filters.initiative_id.as_deref(),
     )
     .map_err(|e| e.to_method_err())?;
     let brief = tasks

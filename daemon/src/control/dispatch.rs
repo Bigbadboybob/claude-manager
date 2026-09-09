@@ -314,6 +314,8 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "list_projects",
     "list_tasks",
     "get_task",
+    "list_initiatives",
+    "get_initiative",
     "backtest.result",
     "continuous.list",
     "continuous.context",
@@ -623,6 +625,10 @@ pub fn dispatch_request(
         // CM_API_TOKEN can call /tasks" — we don't reinvent
         // task-subtree gating here.
         "propose_task" => DispatchOutcome::Done(dispatch_propose_task(state, req)),
+        "list_initiatives" => DispatchOutcome::Done(dispatch_list_initiatives(state, req)),
+        "get_initiative" => DispatchOutcome::Done(dispatch_get_initiative(state, req)),
+        "propose_initiative" => DispatchOutcome::Done(dispatch_propose_initiative(state, req)),
+        "propose_initiative_project" => DispatchOutcome::Done(dispatch_propose_initiative_project(state, req)),
 
         // 10d-2b: workflow_transition / workflow_done relocate
         // from MCP-server-side `_append_event` (direct file write)
@@ -1404,6 +1410,34 @@ fn dispatch_propose_task(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::propose_task(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_list_initiatives(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::list_initiatives(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_get_initiative(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::get_initiative(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_propose_initiative(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::propose_initiative(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_propose_initiative_project(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::propose_initiative_project(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use alacritty_terminal::event::Event as TermEvent;
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
@@ -98,6 +98,11 @@ pub struct PlanTask {
     /// — which is exactly the race the finding describes (local
     /// stub init happens BEFORE the next API reconcile).
     pub parent_task_id: Option<String>,
+    /// First-class initiative membership. `None` means standalone task.
+    pub initiative_id: Option<String>,
+    pub initiative_name: Option<String>,
+    pub initiative_status: Option<String>,
+    pub initiative_color: Option<String>,
     /// Task kind from the API row ("oneshot" | "continuous" | "backtest").
     /// The `A-w` watch action fires only on `"backtest"`.
     pub kind: String,
@@ -140,6 +145,20 @@ fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
         .unwrap_or_default()
 }
 
+/// Initiative subsection tint: deliberately dark so task status/selection
+/// colors remain legible. Named initiative colors use the shared palette;
+/// unknown colors and missing colors get a deterministic quiet blue tint.
+fn initiative_tint(color: Option<&str>, id: &str) -> Color {
+    let rgb = match color.and_then(theme::user_color) {
+        Some(Color::Rgb(r, g, b)) => (r, g, b),
+        _ => {
+            let hash = id.bytes().fold(0u8, |acc, byte| acc.wrapping_add(byte));
+            (35u8.saturating_add(hash % 22), 40u8.saturating_add(hash % 18), 58u8.saturating_add(hash % 28))
+        }
+    };
+    Color::Rgb(rgb.0 / 5, rgb.1 / 5, rgb.2 / 5)
+}
+
 impl PlanTask {
     fn from_api(task: &Task) -> Self {
         PlanTask {
@@ -159,6 +178,13 @@ impl PlanTask {
             is_cloud: task.is_cloud,
             repo_url: task.repo_url.clone(),
             parent_task_id: task.parent_task_id.clone(),
+            initiative_id: task.initiative_id.clone(),
+            initiative_name: task.initiative.as_ref()
+                .and_then(|v| v.get("name")).and_then(|v| v.as_str()).map(str::to_string),
+            initiative_status: task.initiative.as_ref()
+                .and_then(|v| v.get("status")).and_then(|v| v.as_str()).map(str::to_string),
+            initiative_color: task.initiative.as_ref()
+                .and_then(|v| v.get("color")).and_then(|v| v.as_str()).map(str::to_string),
             kind: task.kind.clone(),
             worker_vm: task.worker_vm.clone().filter(|s| !s.is_empty()),
             vm_project: meta_str(&task.metadata, "vm", "project"),
@@ -226,6 +252,9 @@ enum VisibleRowKind {
     /// `pd.layout.columns[ci]` — its persistence is the
     /// `parent_task_id` field on the API row.
     Subtask { slug: String },
+    /// Synthetic subsection heading derived from first-class initiative
+    /// membership. It has no raw-layout slot and is never a task target.
+    InitiativeHeader { id: String, name: String, color: Option<String> },
 }
 
 /// Slug at a visible row, regardless of layout vs. synthetic origin.
@@ -1575,7 +1604,7 @@ impl PlanningView {
     fn cursor_raw_idx(&self) -> Option<usize> {
         match self.cursor_visible_row()?.kind {
             VisibleRowKind::Layout { raw_idx, .. } => Some(raw_idx),
-            VisibleRowKind::Subtask { .. } => None,
+            VisibleRowKind::Subtask { .. } | VisibleRowKind::InitiativeHeader { .. } => None,
         }
     }
 
@@ -1834,6 +1863,7 @@ impl PlanningView {
             None => return Vec::new(),
         };
 
+        let has_initiatives = pd.tasks.iter().any(|t| t.initiative_id.is_some());
         let task_by_id: HashMap<&str, &PlanTask> = pd.tasks.iter()
             .map(|t| (t.id.as_str(), t))
             .collect();
@@ -1900,6 +1930,39 @@ impl PlanningView {
                 let has_children = kids.map_or(false, |v| !v.is_empty());
                 let expanded = force_expand || self.expanded_tasks.contains(&task.id);
                 let dcount = desc_memo.get(&task.id).copied().unwrap_or(0);
+                let previous_initiative = out.last().and_then(|row| match &row.kind {
+                    VisibleRowKind::InitiativeHeader { id, .. } => Some(id.as_str()),
+                    VisibleRowKind::Subtask { slug } | VisibleRowKind::Layout { item: GridItem::Task(slug), .. } =>
+                        task_by_slug.get(slug.as_str()).map(|t| t.initiative_id.as_deref().unwrap_or("__standalone__")),
+                    _ => None,
+                });
+                if let Some(id) = &task.initiative_id {
+                    if previous_initiative != Some(id.as_str()) {
+                        out.push(VisibleRow {
+                            kind: VisibleRowKind::InitiativeHeader {
+                                id: id.clone(),
+                                name: task.initiative_name.clone().unwrap_or_else(|| "Initiative".to_string()),
+                                color: task.initiative_color.clone(),
+                            },
+                            depth: depth.saturating_sub(1),
+                            has_children: false,
+                            expanded: false,
+                            descendant_count: 0,
+                        });
+                    }
+                } else if has_initiatives && previous_initiative != Some("__standalone__") {
+                    out.push(VisibleRow {
+                        kind: VisibleRowKind::InitiativeHeader {
+                            id: "__standalone__".to_string(),
+                            name: "Standalone".to_string(),
+                            color: None,
+                        },
+                        depth: depth.saturating_sub(1),
+                        has_children: false,
+                        expanded: false,
+                        descendant_count: 0,
+                    });
+                }
                 out.push(VisibleRow {
                     kind: VisibleRowKind::Subtask { slug: slug.clone() },
                     depth,
@@ -1944,6 +2007,41 @@ impl PlanningView {
                         ),
                         None => (false, false, 0),
                     };
+                    let previous_initiative = out.last().and_then(|row| match &row.kind {
+                        VisibleRowKind::InitiativeHeader { id, .. } => Some(id.as_str()),
+                        VisibleRowKind::Subtask { slug } | VisibleRowKind::Layout { item: GridItem::Task(slug), .. } =>
+                            task_by_slug.get(slug.as_str()).map(|t| t.initiative_id.as_deref().unwrap_or("__standalone__")),
+                        _ => None,
+                    });
+                    if let Some(t) = task {
+                        if let Some(id) = &t.initiative_id {
+                            if previous_initiative != Some(id.as_str()) {
+                                out.push(VisibleRow {
+                                    kind: VisibleRowKind::InitiativeHeader {
+                                        id: id.clone(),
+                                        name: t.initiative_name.clone().unwrap_or_else(|| "Initiative".to_string()),
+                                        color: t.initiative_color.clone(),
+                                    },
+                                    depth: 0,
+                                    has_children: false,
+                                    expanded: false,
+                                    descendant_count: 0,
+                                });
+                            }
+                        } else if has_initiatives && previous_initiative != Some("__standalone__") {
+                            out.push(VisibleRow {
+                                kind: VisibleRowKind::InitiativeHeader {
+                                    id: "__standalone__".to_string(),
+                                    name: "Standalone".to_string(),
+                                    color: None,
+                                },
+                                depth: 0,
+                                has_children: false,
+                                expanded: false,
+                                descendant_count: 0,
+                            });
+                        }
+                    }
                     out.push(VisibleRow {
                         kind: VisibleRowKind::Layout { raw_idx, item: item.clone() },
                         depth: 0,
@@ -3167,7 +3265,7 @@ impl PlanningView {
         let row = self.cursor_visible_row()?;
         match row.kind {
             VisibleRowKind::Layout { raw_idx, .. } => Some(raw_idx),
-            VisibleRowKind::Subtask { .. } => None,
+            VisibleRowKind::Subtask { .. } | VisibleRowKind::InitiativeHeader { .. } => None,
         }
     }
 
@@ -3184,6 +3282,7 @@ impl PlanningView {
         let slug = match row.kind {
             VisibleRowKind::Layout { raw_idx, .. } => return Some(raw_idx),
             VisibleRowKind::Subtask { slug } => slug,
+            VisibleRowKind::InitiativeHeader { .. } => return None,
         };
         let (pi, ci) = *self.unified_cols.get(self.cursor.col)?;
         let pd = self.project_data.get(pi)?;
@@ -4024,6 +4123,7 @@ impl PlanningView {
                 if archived { format!("Task({}) d{} ARCHIVED", slug, d) } else { format!("Task({}) d{}", slug, d) }
             }
             Some((VisibleRowKind::Subtask { slug }, d)) => format!("Subtask({}) d{}", slug, d),
+            Some((VisibleRowKind::InitiativeHeader { name, .. }, _)) => format!("InitiativeHeader({})", name),
             Some((VisibleRowKind::Layout { item: GridItem::Empty, .. }, _)) => "Empty".to_string(),
             Some((VisibleRowKind::Layout { item: GridItem::Separator, .. }, _)) => "Separator".to_string(),
             Some((VisibleRowKind::Layout { item: GridItem::Header(t), .. }, _)) => format!("Header({})", t),
@@ -4058,7 +4158,7 @@ impl PlanningView {
             // Non-task rows render verbatim from the raw layout side.
             let raw_item_opt: Option<&GridItem> = match &row.kind {
                 VisibleRowKind::Layout { item, .. } => Some(item),
-                VisibleRowKind::Subtask { .. } => None,
+                VisibleRowKind::Subtask { .. } | VisibleRowKind::InitiativeHeader { .. } => None,
             };
 
             match (raw_item_opt, slug_opt) {
@@ -4124,9 +4224,29 @@ impl PlanningView {
                     if !count_suffix.is_empty() {
                         spans.push(Span::styled(count_suffix, Style::default().fg(theme::DIM)));
                     }
+                    // A short rule on the final member makes the subsection
+                    // boundary visible without adding a selectable row.
+                    let group_ends = rows.get(ri + 1).map_or(true, |next| {
+                        let next_slug = match visible_row_slug(next) {
+                            Some(slug) => slug,
+                            None => return true,
+                        };
+                        let next_task = self.project_data.iter().find_map(|pd| {
+                            if pd.project.name == project_name {
+                                pd.tasks.iter().find(|t| t.slug == next_slug)
+                            } else { None }
+                        });
+                        next_task.and_then(|t| t.initiative_id.as_deref())
+                            != task.and_then(|t| t.initiative_id.as_deref())
+                    });
+                    if task.and_then(|t| t.initiative_id.as_ref()).is_some() && group_ends {
+                        spans.push(Span::styled("  ┄", Style::default().fg(theme::DIM)));
+                    }
                     let line = Line::from(spans);
                     let conflict = self.is_conflict(project_name, slug);
                     let base_fg = if is_claude { theme::REMOTE } else { theme::MUTED };
+                    let initiative_bg = task.and_then(|t| t.initiative_id.as_deref())
+                        .map(|id| initiative_tint(task.and_then(|t| t.initiative_color.as_deref()), id));
                     let style = if is_selected && in_visual {
                         Style::default().fg(theme::TEXT).bg(theme::SELECT_BG).add_modifier(Modifier::BOLD)
                     } else if is_selected {
@@ -4134,7 +4254,9 @@ impl PlanningView {
                     } else if in_visual {
                         Style::default().fg(theme::TEXT).bg(theme::SELECT_BG)
                     } else {
-                        Style::default().fg(base_fg)
+                        let mut style = Style::default().fg(base_fg);
+                        if let Some(bg) = initiative_bg { style = style.bg(bg); }
+                        style
                     };
                     let style = if conflict && is_selected {
                         style.bg(theme::ERROR).fg(theme::TEXT)
@@ -4169,6 +4291,18 @@ impl PlanningView {
                         text.clone()
                     };
                     items.push(ListItem::new(Line::from(Span::styled(display, style))));
+                }
+                (None, None) => {
+                    if let VisibleRowKind::InitiativeHeader { id, name, color } = &row.kind {
+                        let accent = color.as_deref().and_then(theme::user_color).unwrap_or(theme::HEADER);
+                        let tint = initiative_tint(color.as_deref(), id);
+                        let prefix = format!("▸ {}", name);
+                        let display = truncate_with_ellipsis(&prefix, width.saturating_sub(1));
+                        let mut style = Style::default().fg(accent).bg(tint).add_modifier(Modifier::BOLD);
+                        if is_selected && in_visual { style = style.bg(theme::SELECT_BG); }
+                        else if is_selected { style = style.bg(theme::HEADER_SELECT_BG); }
+                        items.push(ListItem::new(Line::from(Span::styled(display, style))));
+                    }
                 }
                 _ => {}
             }
@@ -4387,6 +4521,15 @@ impl PlanningView {
                 meta.push(Span::styled(d.to_string(), Style::default().fg(theme::TEXT)));
             }
             lines.push(Line::from(meta));
+
+            if let Some(name) = task.initiative_name.as_deref() {
+                let status = task.initiative_status.as_deref().unwrap_or("unknown");
+                lines.push(Line::from(vec![
+                    Span::styled("  Initiative: ", Style::default().fg(theme::DIM)),
+                    Span::styled(name, Style::default().fg(theme::HEADER)),
+                    Span::styled(format!(" ({})", status), Style::default().fg(theme::DIM)),
+                ]));
+            }
 
             if !task.depends.is_empty() {
                 let dep_color = if self.is_conflict(project_name, &task.slug) { theme::ERROR } else { theme::TEXT };
@@ -4854,6 +4997,10 @@ mod tests {
             is_cloud: false,
             repo_url: String::new(),
             parent_task_id: parent.map(str::to_string),
+            initiative_id: None,
+            initiative_name: None,
+            initiative_status: None,
+            initiative_color: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -4915,6 +5062,28 @@ mod tests {
         let rows = view.visible_rows_for_column(0, 0);
         assert_eq!(rows.len(), 3, "grand should now be visible");
         assert_eq!(rows[2].depth, 2);
+    }
+
+    #[test]
+    fn visible_rows_add_initiative_and_standalone_subsections() {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        let mut initiative_task = make_task("a", "initiative-task", None);
+        initiative_task.initiative_id = Some("init-1".to_string());
+        initiative_task.initiative_name = Some("Initiative One".to_string());
+        let standalone = make_task("b", "standalone", None);
+        pd.tasks = vec![initiative_task, standalone];
+        pd.layout.columns = vec![vec![
+            GridItem::Task("initiative-task".to_string()),
+            GridItem::Task("standalone".to_string()),
+        ]];
+        view.project_data.push(pd);
+
+        let rows = view.visible_rows_for_column(0, 0);
+        assert!(matches!(rows[0].kind, VisibleRowKind::InitiativeHeader { ref name, .. } if name == "Initiative One"));
+        assert!(matches!(&rows[2].kind, VisibleRowKind::InitiativeHeader { name, id, .. } if name == "Standalone" && id == "__standalone__"));
+        assert!(matches!(rows[1].kind, VisibleRowKind::Layout { item: GridItem::Task(ref slug), .. } if slug == "initiative-task"));
+        assert!(matches!(rows[3].kind, VisibleRowKind::Layout { item: GridItem::Task(ref slug), .. } if slug == "standalone"));
     }
 
     #[test]
@@ -5114,6 +5283,8 @@ mod tests {
             is_cloud: false,
             kind: "oneshot".to_string(),
             parent_task_id: None,
+            initiative_id: None,
+            initiative: None,
             worktree_mode: "inherit".to_string(),
             metadata: None,
         }
@@ -5308,6 +5479,10 @@ mod tests {
             is_cloud: false,
             repo_url: stored.to_string(),
             parent_task_id: None,
+            initiative_id: None,
+            initiative_name: None,
+            initiative_status: None,
+            initiative_color: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5360,6 +5535,10 @@ mod tests {
             is_cloud: false,
             repo_url: "git@example.com:org/repo.git".to_string(),
             parent_task_id: Some("parent-id".to_string()),
+            initiative_id: None,
+            initiative_name: None,
+            initiative_status: None,
+            initiative_color: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5420,6 +5599,10 @@ mod tests {
             is_cloud: false,
             repo_url: "git@example.com:org/repo.git".to_string(),
             parent_task_id: None,
+            initiative_id: None,
+            initiative_name: None,
+            initiative_status: None,
+            initiative_color: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5479,6 +5662,10 @@ mod tests {
                 is_cloud: false,
                 repo_url: "git@example.com:org/repo.git".to_string(),
                 parent_task_id: None,
+                initiative_id: None,
+                initiative_name: None,
+                initiative_status: None,
+                initiative_color: None,
                 kind: "oneshot".to_string(),
                 worker_vm: None,
                 vm_project: None,
@@ -5550,6 +5737,10 @@ mod tests {
             is_cloud: false,
             repo_url: "git@example.com:org/repo.git".to_string(),
             parent_task_id: None,
+            initiative_id: None,
+            initiative_name: None,
+            initiative_status: None,
+            initiative_color: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5718,6 +5909,10 @@ mod tests {
             is_cloud: false,
             repo_url: String::new(),
             parent_task_id: None,
+            initiative_id: None,
+            initiative_name: None,
+            initiative_status: None,
+            initiative_color: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,

@@ -1823,6 +1823,7 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
             is_cloud: Some(false),
             parent_task_id: Some(parent_task_id.clone()),
             worktree_mode: Some(p.worktree_mode.clone()),
+            initiative_id: None,
             wip_branch: branch_name_for_new.clone(),
             metadata: Some(json!({ "filer": filer })),
         };

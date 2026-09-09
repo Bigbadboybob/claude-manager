@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TaskCreate(BaseModel):
@@ -23,6 +23,7 @@ class TaskCreate(BaseModel):
     # Subtask fields (Phase 5 of agent orchestration)
     parent_task_id: str | None = None
     worktree_mode: str = "inherit"
+    initiative_id: str | None = None
     # Optional initial wip_branch — set by `create_subtask` for both
     # modes so the API row matches the worktree on disk from the
     # first save (no UPDATE round-trip needed).
@@ -56,6 +57,7 @@ class TaskUpdate(BaseModel):
     # Subtask fields
     parent_task_id: str | None = None
     worktree_mode: str | None = None
+    initiative_id: str | None = None
     # Free-form JSONB bag. PATCH replaces the whole object — callers that
     # want to merge should read first and re-send the merged dict.
     metadata: dict | None = None
@@ -137,8 +139,70 @@ class TaskResponse(BaseModel):
     # Subtask fields (Phase 5)
     parent_task_id: str | None = None
     worktree_mode: str = "inherit"
+    initiative_id: str | None = None
+    initiative: dict | None = None
     # Free-form JSONB bag. Reads come back as a dict (or None).
     metadata: dict | None = None
 
     class Config:
         from_attributes = True
+
+
+class InitiativeCreate(BaseModel):
+    """Create a draft initiative around an existing coordinator task."""
+
+    slug: str | None = None
+    name: str
+    description: str = ""
+    color: str | None = None
+    coordinator_task_id: str
+    coordinator_project: str | None = None
+    docs_path: str = "cm-initiative"
+    shared_channel: str | None = None
+    metadata: dict | None = None
+
+
+class InitiativeUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    color: str | None = None
+    status: str | None = None
+    coordinator_task_id: str | None = None
+    coordinator_project: str | None = None
+    docs_path: str | None = None
+    shared_channel: str | None = None
+    metadata: dict | None = None
+    reason: str | None = None
+
+
+class InitiativeProjectCreate(BaseModel):
+    project: str
+    role: str = ""
+    project_channel: str | None = None
+
+
+class InitiativeProjectUpdate(BaseModel):
+    status: str | None = None
+    role: str | None = None
+    project_channel: str | None = None
+    reason: str | None = None
+
+
+class InitiativeResponse(BaseModel):
+    id: str
+    slug: str
+    name: str
+    description: str
+    status: str
+    color: str | None = None
+    coordinator_task_id: str
+    coordinator_project: str | None = None
+    docs_path: str
+    shared_channel: str | None = None
+    approved_at: datetime | None = None
+    approved_by: str | None = None
+    metadata: dict | None = None
+    created_at: datetime
+    updated_at: datetime
+    projects: list[dict] = Field(default_factory=list)
+    task_counts: dict[str, int] = Field(default_factory=dict)

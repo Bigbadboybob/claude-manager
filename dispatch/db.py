@@ -81,6 +81,7 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                    kind: str = "oneshot",
                    parent_task_id: str | None = None,
                    worktree_mode: str = "inherit",
+                   initiative_id: str | None = None,
                    wip_branch: str | None = None,
                    metadata: dict | None = None) -> dict:
     """Insert a task. If `slug` collides with an existing row in the same
@@ -102,14 +103,14 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                                       status, project, slug, name, description,
                                       difficulty, depends, source, is_cloud,
                                       kind, parent_task_id, worktree_mode,
-                                      wip_branch, metadata)
+                                      initiative_id, wip_branch, metadata)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                           $14, $15, $16, $17, $18)
+                           $14, $15, $16, $17, $18, $19)
                    RETURNING *""",
                 repo_url, repo_branch, prompt, priority,
                 status, project, slug, name, description,
                 difficulty, depends or [], source, is_cloud,
-                kind, parent_task_id, worktree_mode, wip_branch, metadata,
+                kind, parent_task_id, worktree_mode, initiative_id, wip_branch, metadata,
             )
             return _serialize(dict(row))
 
@@ -126,14 +127,14 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                                           status, project, slug, name, description,
                                           difficulty, depends, source, is_cloud,
                                           kind, parent_task_id, worktree_mode,
-                                          wip_branch, metadata)
+                                          initiative_id, wip_branch, metadata)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                               $14, $15, $16, $17, $18)
+                               $14, $15, $16, $17, $18, $19)
                        RETURNING *""",
                     repo_url, repo_branch, prompt, priority,
                     status, project, attempt_slug, name, description,
                     difficulty, depends or [], source, is_cloud,
-                    kind, parent_task_id, worktree_mode, wip_branch, metadata,
+                    kind, parent_task_id, worktree_mode, initiative_id, wip_branch, metadata,
                 )
                 return _serialize(dict(row))
             except asyncpg.UniqueViolationError as e:
@@ -156,6 +157,7 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
 
 async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
                      project: str | None = None,
+                     initiative_id: str | None = None,
                      include_archived: bool = False) -> list[dict]:
     async with pool.acquire() as conn:
         conditions = []
@@ -166,6 +168,9 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
         if project:
             params.append(project)
             conditions.append(f"project = ${len(params)}")
+        if initiative_id:
+            params.append(initiative_id)
+            conditions.append(f"initiative_id = ${len(params)}")
         # Exclude archived rows by default: they're hidden in the TUI behind
         # A-V and bloat the response (e.g. 262 of 431 rows / ~600KB) that the
         # TUI re-fetches over a slow WAN. Callers needing them pass
@@ -174,8 +179,17 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
             conditions.append("status != 'archived'")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         rows = await conn.fetch(
-            f"""SELECT * FROM tasks {where} ORDER BY
-                   CASE status
+            f"""SELECT t.*, i.slug AS initiative_slug, i.name AS initiative_name,
+                          i.status AS initiative_status, i.color AS initiative_color,
+                          CASE WHEN i.id IS NULL THEN NULL ELSE
+                            jsonb_build_object('id', i.id, 'slug', i.slug,
+                                               'name', i.name, 'status', i.status,
+                                               'color', i.color) END AS initiative
+                   FROM tasks t
+                   LEFT JOIN initiatives i ON i.id = t.initiative_id
+                   {where.replace('status', 't.status').replace('project', 't.project').replace('initiative_id', 't.initiative_id')}
+                   ORDER BY
+                   CASE t.status
                        WHEN 'blocked' THEN 0
                        WHEN 'running' THEN 1
                        WHEN 'backlog' THEN 2
@@ -183,10 +197,304 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
                        WHEN 'done' THEN 4
                        WHEN 'archived' THEN 5
                    END,
-                   priority, created_at""",
+                   t.priority, t.created_at""",
             *params,
         )
         return [_serialize(dict(r)) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Initiatives
+# ---------------------------------------------------------------------------
+
+INITIATIVE_STATUSES = frozenset(
+    {"draft", "active", "paused", "completed", "archived", "cancelled"}
+)
+INITIATIVE_PROJECT_STATUSES = frozenset({"proposed", "approved", "removed"})
+
+
+def _initiative_ref(ref: str) -> tuple[str, str]:
+    """Return (column, value) for an initiative UUID or slug reference."""
+    try:
+        parsed = uuid.UUID(ref)
+    except (AttributeError, TypeError, ValueError):
+        if not ref or len(ref) > 80:
+            raise ValueError("initiative_id must be a UUID or non-empty slug")
+        return "slug", ref
+    return "id", str(parsed)
+
+
+async def _initiative_projects_conn(conn, initiative_id: str) -> list[dict]:
+    rows = await conn.fetch(
+        """SELECT initiative_id, project, status, project_channel, role,
+                          proposed_by, approved_at, approved_by, created_at
+                   FROM initiative_projects
+                  WHERE initiative_id = $1 ORDER BY project""",
+        initiative_id,
+    )
+    return [_serialize(dict(row)) for row in rows]
+
+
+async def _initiative_counts_conn(conn, initiative_id: str) -> dict[str, int]:
+    rows = await conn.fetch(
+        "SELECT status, count(*) AS n FROM tasks WHERE initiative_id = $1 GROUP BY status",
+        initiative_id,
+    )
+    return {str(row["status"]): int(row["n"]) for row in rows}
+
+
+async def get_initiative(pool: asyncpg.Pool, ref: str) -> dict | None:
+    column, value = _initiative_ref(ref)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(f"SELECT * FROM initiatives WHERE {column} = $1", value)
+        if not row:
+            return None
+        result = _serialize(dict(row))
+        result["projects"] = await _initiative_projects_conn(conn, result["id"])
+        result["task_counts"] = await _initiative_counts_conn(conn, result["id"])
+        return result
+
+
+async def list_initiatives(
+    pool: asyncpg.Pool, *, status: str | None = None,
+    project: str | None = None, include_archived: bool = False,
+) -> list[dict]:
+    async with pool.acquire() as conn:
+        conditions: list[str] = []
+        params: list[object] = []
+        if status:
+            params.append(status)
+            conditions.append(f"i.status = ${len(params)}")
+        if project:
+            params.append(project)
+            conditions.append(
+                f"EXISTS (SELECT 1 FROM initiative_projects ipf "
+                f"WHERE ipf.initiative_id = i.id AND ipf.project = ${len(params)} "
+                "AND ipf.status != 'removed')"
+            )
+        if not include_archived and status != "archived":
+            conditions.append("i.status != 'archived'")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = await conn.fetch(
+            f"SELECT i.* FROM initiatives i {where} ORDER BY i.updated_at DESC, i.slug",
+            *params,
+        )
+        result: list[dict] = []
+        for row in rows:
+            item = _serialize(dict(row))
+            item["projects"] = await _initiative_projects_conn(conn, item["id"])
+            item["task_counts"] = await _initiative_counts_conn(conn, item["id"])
+            result.append(item)
+        return result
+
+
+async def create_initiative(
+    pool: asyncpg.Pool, *, slug: str, name: str, description: str = "",
+    color: str | None = None, coordinator_task_id: str,
+    coordinator_project: str | None = None, docs_path: str = "cm-initiative",
+    shared_channel: str | None = None, metadata: dict | None = None,
+    actor: str = "owner",
+) -> dict:
+    coordinator_task_id = normalize_task_id(coordinator_task_id)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            task = await conn.fetchrow(
+                "SELECT id, project FROM tasks WHERE id = $1", coordinator_task_id,
+            )
+            if not task:
+                raise ValueError("coordinator task does not exist")
+            row = await conn.fetchrow(
+                """INSERT INTO initiatives
+                    (slug, name, description, color, coordinator_task_id,
+                     coordinator_project, docs_path, shared_channel, metadata)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""",
+                slug, name, description, color, coordinator_task_id,
+                coordinator_project or task["project"], docs_path,
+                shared_channel, metadata,
+            )
+            # The coordinator is a normal task, but it is also the durable
+            # anchor for this initiative. Attach it in the same transaction so
+            # a successfully-created initiative can never lose its coordinator
+            # relationship. Reusing a task already assigned elsewhere would
+            # make the two initiatives ambiguous, so reject it explicitly.
+            attached = await conn.fetchrow(
+                """UPDATE tasks SET initiative_id = $2, updated_at = now()
+                   WHERE id = $1 AND initiative_id IS NULL
+                   RETURNING id""",
+                coordinator_task_id, row["id"],
+            )
+            if not attached:
+                raise ValueError("coordinator task already belongs to an initiative")
+            await conn.execute(
+                """INSERT INTO initiative_events
+                   (initiative_id, actor, event_type, new_value, reason)
+                   VALUES ($1,$2,'created',$3,$4)""",
+                row["id"], actor, {"status": "draft", "slug": slug},
+                "initiative created",
+            )
+        result = _serialize(dict(row))
+        result["projects"] = []
+        result["task_counts"] = {}
+        return result
+
+
+async def update_initiative(
+    pool: asyncpg.Pool, ref: str, *, actor: str = "owner",
+    reason: str | None = None, **fields,
+) -> dict | None:
+    allowed = {"name", "description", "color", "status", "coordinator_task_id",
+               "coordinator_project", "docs_path", "shared_channel", "metadata"}
+    fields = {key: value for key, value in fields.items() if key in allowed}
+    if not fields:
+        return await get_initiative(pool, ref)
+    if "status" in fields and fields["status"] not in INITIATIVE_STATUSES:
+        raise ValueError(f"invalid initiative status: {fields['status']}")
+    if "coordinator_task_id" in fields and fields["coordinator_task_id"]:
+        fields["coordinator_task_id"] = normalize_task_id(fields["coordinator_task_id"])
+    column, value = _initiative_ref(ref)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            current = await conn.fetchrow(
+                f"SELECT * FROM initiatives WHERE {column} = $1 FOR UPDATE", value,
+            )
+            if not current:
+                return None
+            if "coordinator_task_id" in fields:
+                coordinator = await conn.fetchrow(
+                    "SELECT id, initiative_id FROM tasks WHERE id = $1",
+                    fields["coordinator_task_id"],
+                )
+                if not coordinator:
+                    raise ValueError("coordinator task does not exist")
+                if coordinator["initiative_id"] not in (None, current["id"]):
+                    raise ValueError("coordinator task already belongs to another initiative")
+                await conn.execute(
+                    "UPDATE tasks SET initiative_id = $2, updated_at = now() WHERE id = $1",
+                    fields["coordinator_task_id"], current["id"],
+                )
+            if "status" in fields and fields["status"] != current["status"]:
+                allowed_transitions = {
+                    "draft": {"active", "cancelled"},
+                    "active": {"paused", "completed", "cancelled"},
+                    "paused": {"active", "completed", "cancelled"},
+                    "completed": {"archived"},
+                    "archived": set(),
+                    "cancelled": set(),
+                }
+                if fields["status"] not in allowed_transitions[current["status"]]:
+                    raise ValueError(
+                        f"cannot transition initiative from {current['status']} "
+                        f"to {fields['status']}"
+                    )
+                if fields["status"] == "active":
+                    approved = await conn.fetchval(
+                        """SELECT count(*) FROM initiative_projects
+                           WHERE initiative_id = $1 AND status = 'approved'""",
+                        current["id"],
+                    )
+                    if not approved:
+                        raise ValueError(
+                            "an initiative needs at least one approved project before activation"
+                        )
+            sets = ", ".join(f"{key} = ${index + 2}" for index, key in enumerate(fields))
+            row = await conn.fetchrow(
+                f"UPDATE initiatives SET {sets}, updated_at = now() "
+                "WHERE id = $1 RETURNING *", current["id"], *fields.values(),
+            )
+            if fields.get("status") == "active":
+                row = await conn.fetchrow(
+                    """UPDATE initiatives SET approved_at = now(), approved_by = $2
+                       WHERE id = $1 RETURNING *""", current["id"], actor,
+                )
+            await conn.execute(
+                """INSERT INTO initiative_events
+                   (initiative_id, actor, event_type, previous_value, new_value, reason)
+                   VALUES ($1,$2,$3,$4,$5,$6)""",
+                current["id"], actor,
+                "status_changed" if "status" in fields else "updated",
+                {key: current[key] for key in fields}, fields, reason,
+            )
+        result = _serialize(dict(row))
+        result["projects"] = await _initiative_projects_conn(conn, result["id"])
+        result["task_counts"] = await _initiative_counts_conn(conn, result["id"])
+        return result
+
+
+async def add_initiative_project(
+    pool: asyncpg.Pool, ref: str, project: str, *, role: str = "",
+    project_channel: str | None = None, actor: str = "owner",
+) -> dict:
+    initiative = await get_initiative(pool, ref)
+    if not initiative:
+        raise ValueError("initiative does not exist")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """INSERT INTO initiative_projects
+                   (initiative_id, project, status, role, project_channel, proposed_by)
+                   VALUES ($1,$2,'proposed',$3,$4,$5)
+                   ON CONFLICT (initiative_id, project) DO UPDATE SET
+                     status = CASE WHEN initiative_projects.status = 'removed'
+                                   THEN 'proposed' ELSE initiative_projects.status END,
+                     role = EXCLUDED.role,
+                     project_channel = COALESCE(EXCLUDED.project_channel,
+                                                initiative_projects.project_channel)
+                   RETURNING *""",
+                initiative["id"], project, role, project_channel, actor,
+            )
+            await conn.execute(
+                """INSERT INTO initiative_events
+                   (initiative_id, actor, event_type, project, new_value)
+                   VALUES ($1,$2,'project_proposed',$3,$4)""",
+                initiative["id"], actor, project, {"role": role},
+            )
+        return _serialize(dict(row))
+
+
+async def update_initiative_project(
+    pool: asyncpg.Pool, ref: str, project: str, *, actor: str = "owner",
+    reason: str | None = None, **fields,
+) -> dict | None:
+    fields = {key: value for key, value in fields.items()
+              if key in {"status", "role", "project_channel"}}
+    if "status" in fields and fields["status"] not in INITIATIVE_PROJECT_STATUSES:
+        raise ValueError(f"invalid initiative project status: {fields['status']}")
+    initiative = await get_initiative(pool, ref)
+    if not initiative:
+        return None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            current = await conn.fetchrow(
+                """SELECT * FROM initiative_projects
+                   WHERE initiative_id = $1 AND project = $2 FOR UPDATE""",
+                initiative["id"], project,
+            )
+            if not current:
+                return None
+            if not fields:
+                return _serialize(dict(current))
+            sets = ", ".join(f"{key} = ${index + 3}" for index, key in enumerate(fields))
+            row = await conn.fetchrow(
+                f"UPDATE initiative_projects SET {sets} "
+                "WHERE initiative_id = $1 AND project = $2 RETURNING *",
+                initiative["id"], project, *fields.values(),
+            )
+            if fields.get("status") == "approved":
+                row = await conn.fetchrow(
+                    """UPDATE initiative_projects
+                       SET approved_at = now(), approved_by = $3
+                       WHERE initiative_id = $1 AND project = $2 RETURNING *""",
+                    initiative["id"], project, actor,
+                )
+            await conn.execute(
+                """INSERT INTO initiative_events
+                   (initiative_id, actor, event_type, project,
+                    previous_value, new_value, reason)
+                   VALUES ($1,$2,'project_updated',$3,$4,$5,$6)""",
+                initiative["id"], actor, project,
+                {key: current[key] for key in fields}, fields, reason,
+            )
+        return _serialize(dict(row))
 
 
 async def list_subtasks(pool: asyncpg.Pool, parent_task_id: str) -> list[dict]:
@@ -206,7 +514,12 @@ async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
     task_id = normalize_task_id(task_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM tasks WHERE id = $1", task_id,
+            """SELECT t.*, CASE WHEN i.id IS NULL THEN NULL ELSE
+                       jsonb_build_object('id', i.id, 'slug', i.slug,
+                                          'name', i.name, 'status', i.status,
+                                          'color', i.color) END AS initiative
+                  FROM tasks t LEFT JOIN initiatives i ON i.id = t.initiative_id
+                 WHERE t.id = $1""", task_id,
         )
         return _serialize(dict(row)) if row else None
 

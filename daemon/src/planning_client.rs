@@ -93,6 +93,8 @@ struct ProposeTaskBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     depends: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    initiative_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<&'a serde_json::Value>,
 }
 
@@ -106,6 +108,7 @@ pub struct ProposeTaskRequest<'a> {
     pub repo_url: &'a str,
     pub difficulty: Option<i32>,
     pub depends: Option<&'a [String]>,
+    pub initiative_id: Option<&'a str>,
     pub metadata: Option<&'a serde_json::Value>,
 }
 
@@ -322,6 +325,7 @@ pub fn propose_task(
         priority: 0,
         difficulty: req.difficulty,
         depends: req.depends,
+        initiative_id: req.initiative_id,
         metadata: req.metadata,
     };
     let agent = build_agent();
@@ -624,6 +628,7 @@ mod tests {
             repo_url,
             difficulty: None,
             depends: None,
+            initiative_id: None,
             metadata: None,
         }
     }
@@ -688,6 +693,7 @@ mod tests {
             repo_url: "git@x.com:a/b.git",
             difficulty: None,
             depends: None,
+            initiative_id: None,
             metadata: None,
         };
         let _ = propose_task(&req, None, None).expect("ok");

@@ -169,6 +169,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "list_projects",
     "list_tasks",
     "get_task",
+    "list_initiatives",
+    "get_initiative",
+    "propose_initiative",
+    "propose_initiative_project",
     # 10d-2b: workflow_transition / workflow_done flip from
     # MCP-server-side `_append_event` (direct events.jsonl
     # write) to daemon-side writers via 10d-2a's
