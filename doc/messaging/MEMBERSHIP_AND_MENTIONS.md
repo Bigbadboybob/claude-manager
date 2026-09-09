@@ -1,7 +1,7 @@
 # Channel membership and mentions
 
 Roadmap items 2 + 3: channel membership, notifying mentions, and Owner's channel
-browser/completion UI. This slice is implemented for a single daemon. Native
+browser/completion UI. Membership works locally and across paired hosts. Native
 notification delivery uses the infrastructure described in
 [NATIVE_NOTIFICATIONS.md](NATIVE_NOTIFICATIONS.md).
 
@@ -33,6 +33,29 @@ chat_channels(action="join", path="work/parser", request_id="join-parser-1")
 chat_channels(action="members", path="work/parser")  # paginated roster
 chat_channels(action="leave", path="work/parser", request_id="leave-parser-1")
 ```
+
+Channel admins and Owner can add a known participant, including one on another
+paired host. Resolve their stable ID first:
+
+```python
+chat_people(query="Parser")
+chat_channels(action="add_member", path="work/parser",
+              participant_id="<participant-id>", request_id="add-parser-1")
+```
+
+`add_member` is admin-only even when `allow_agent_edits` is enabled. It adds
+membership without granting admin access, changing notification preferences, or
+notifying the participant. Future `@here` posts include them; old broadcasts keep
+their original audience. Members can leave freely. Join/leave remain self-only;
+there is no action to remove someone else. Owner can add members without joining.
+
+Use the same request ID, parameters, and origin for retries. The retained result
+includes `membership.participant_id`, `added_by`, `joined`, and its `revision`;
+`current_joined` reports membership now. Retrying an accepted add after that
+member leaves returns the original event without rejoining them, even after a
+restart or loss of admin rights. A deliberate new add needs a new request ID.
+Unknown IDs and display names are rejected; use the ID returned by `chat_people`.
+Like other membership changes, adding requires the coordinator when synced.
 
 Get current metadata before updating `default_join`; supply its `revision` as
 `expected_revision`. Only admins can change defaults, even on an openly editable
@@ -77,7 +100,13 @@ and unread indicators, plus the existing opt-in TUI bell.
 Open Messages with **Alt+m**. The sidebar shows joined channels and started DMs.
 Press **b** (or select Browse channels), type a name/path/description, navigate with
 **Up/Down** or **Ctrl+j/k**, and press **Enter** to preview. Press **J** to join and
-**L** to leave the displayed channel. **u** lists/searches its members (the `@here` audience). The preview preserves drafts and remains
+**L** to leave the displayed channel. **u** lists/searches its members (the `@here` audience).
+From that list, **Ctrl+a** opens Add channel member. Search by name, alias, task,
+or ID, select with **Up/Down** or **Ctrl+j/k**, and press **Enter** to add.
+Existing members are hidden, running agents sort first, and dormant agents are
+marked "not running". **Esc** cancels; a saved operation with an uncertain response
+can be retried with **R** after returning to the conversation. Drafts stay intact.
+The preview preserves drafts and remains
 readable after leaving. **n** creates a channel; **S** edits its settings, including
 "Join by default". Existing **j/k** timeline navigation is unchanged.
 
@@ -100,6 +129,21 @@ continuous-task identity continuity and additional custom monitor rules remain
 separate work.
 
 ## Validation and release state
+
+Admin member additions are implemented in the `add_member` action and the Owner
+picker. Upgrade **every paired daemon before using this action**: older reducers
+reject cross-participant `channel.membership` events. Update replicas first and
+the coordinator last; reconnect MCP for the new `participant_id` parameter and
+restart only the TUI for its picker. This follow-up is not yet deployed.
+
+Validation on September 9, 2026: 83 daemon messaging tests, the framed socket
+integration, 16 TUI messaging tests, 10 MCP contract tests, and the real daemon/TUI
+terminal smoke test passed. The new coverage checks admin versus open-editing
+permissions, unknown identities, self-only leaves, retries after leave/restart or
+admin revocation, rejected forged replica publications, and cross-host adds via
+the normal RPC. The terminal test searches/adds a member as Owner and verifies
+that only future broadcasts include them. Evidence: `/tmp/cm-add-member-final-*.log`
+and `~/.cm/builds/messaging-sync/add-member-smoke/`.
 
 Deployed locally on September 7, 2026, from `1283d5f`, after merging and pushing
 remote main. `#general` and `#cm-general` both have default enrollment enabled.

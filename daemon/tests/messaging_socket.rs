@@ -68,7 +68,7 @@ fn messaging_framed_clients_exchange_channel_dm_and_owner_reply() {
     let state = Arc::new(Mutex::new(state));
     let observed = state.clone();
     let daemon = thread::spawn(move || {
-        for _ in 0..8 {
+        for _ in 0..10 {
             let (mut stream, _) = listener.accept().unwrap();
             let req = wire::read_request(&mut stream).unwrap().unwrap();
             match dispatch_request(&state, &req) {
@@ -110,6 +110,11 @@ fn messaging_framed_clients_exchange_channel_dm_and_owner_reply() {
         "channels",
         json!({"action":"create","path":"work/parser","request_id":"channel"}),
     );
+    let added = call(Caller::session("a"), "channels",
+        json!({"action":"add_member","path":"work/parser","participant_id":b,"request_id":"add-b"}));
+    assert_eq!(added["membership"]["participant_id"], b);
+    assert_eq!(added["event"]["actor"]["id"], added["membership"]["added_by"]);
+    assert_eq!(call(Caller::session("b"), "channels", json!({"action":"get","path":"work/parser"}))["joined"], true);
     call(
         Caller::session("a"),
         "send",

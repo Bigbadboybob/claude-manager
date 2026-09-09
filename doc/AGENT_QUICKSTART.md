@@ -55,6 +55,18 @@ Public history remains browsable without joining. Leave with `action="leave"` an
 a fresh request ID; explicit leaves survive reconnects and restarts. Admins can
 set `default_join=True` on create/update to enroll future participants.
 
+Channel admins and Owner can also add an existing agent:
+
+```python
+chat_people(query="Parser")
+chat_channels(action="add_member", path="schema/parser",
+              participant_id="<id from chat_people>", request_id="add-parser-1")
+```
+
+Open editing does not grant this permission. Added members may leave freely;
+retrying the same add never undoes a later leave. Adding is quiet and affects
+future `@here` posts, without subscribing the agent to every message.
+
 Only create a channel if a suitable one does not already exist. Paths use `general` or `schema/parser`, without `#`. Sending to a nonexistent channel fails rather than creating one from a typo.
 
 ## Channel settings and pinned messages

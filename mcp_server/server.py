@@ -412,12 +412,19 @@ def chat_channels(action: str = "list", path: str | None = None,
                   expected_revision: str | None = None,
                   joined_only: bool | None = None, query: str | None = None,
                   default_join: bool | None = None, archived: bool | None = None,
-                  origin_daemon_id: str | None = None) -> dict:
-    """List/get/create/update/join/leave channels, or list their members.
+                  origin_daemon_id: str | None = None,
+                  participant_id: str | None = None) -> dict:
+    """List/get/create/update/join/leave channels, list members, or add_member.
 
     Join before posting; public history stays browsable. Join/leave require path
     or conversation and a unique request_id. List supports joined_only and query
     (path/name/description). members returns the paginated channel roster.
+    add_member requires a participant_id from chat_people, path or conversation,
+    and request_id. Only channel admins and Owner can add members; open editing
+    does not grant this permission. Join/leave remain self-only. Added members may
+    leave freely; retrying the same add request never rejoins someone who left.
+    Adding does not notify or enable all-message alerts. Use a new request_id only
+    for an intentional new add. membership.current_joined reports current state.
     default_join is admin-only and enrolls new participants on first messaging
     enrollment; #general and #cm-general start enabled. Explicit leaves survive reconnects.
     Joining does not enable all-message alerts; DMs/direct mentions/@here are default.

@@ -43,6 +43,7 @@ pub struct Messages {
     channels: Vec<Value>,
     people: Vec<Value>,
     channel_members: Vec<Value>,
+    channel_candidates_ready: bool,
     dms: Vec<Value>,
     items: Vec<Value>,
     selected: usize,
@@ -558,6 +559,11 @@ impl App {
                         "channel_members" => {
                             self.messages.channel_members = v["items"].as_array().cloned().unwrap_or_default();
                         }
+                        "channel_add_candidates" => {
+                            self.messages.channel_members = v["members"]["items"].as_array().cloned().unwrap_or_default();
+                            self.messages.people = v["people"]["items"].as_array().cloned().unwrap_or_default();
+                            self.messages.channel_candidates_ready = true;
+                        }
                         "pin_prepare" => self.messaging_pin_prepared(&v),
                         "session.set_name" => {
                             self.messages.status = "Session name updated".into();
@@ -676,6 +682,13 @@ impl App {
                 })()
             } else if method == "channel_members" {
                 directory("messaging.channels", params)
+            } else if method == "channel_add_candidates" {
+                (|| {
+                    Ok(json!({
+                        "members": directory("messaging.channels", params)?,
+                        "people": directory("messaging.people", json!({"include_exited":true}))?
+                    }))
+                })()
             } else if method == "pin_prepare" {
                 (|| {
                     let mut value = call(
@@ -1344,7 +1357,7 @@ impl App {
             );
         }
         if !narrow || self.messages.pane == 1 || !self.messages.mode.is_empty() {
-            if matches!(self.messages.mode.as_str(), "channel_browser" | "channel_roster") {
+            if matches!(self.messages.mode.as_str(), "channel_browser" | "channel_roster" | "channel_add_member") {
                 self.draw_channel_browser(frame, cols[1]);
             } else if self.messages.mode == "dm_picker" {
                 self.draw_messaging_picker(frame, cols[1]);
@@ -1518,6 +1531,7 @@ impl App {
                     ("d", "DM/group"),
                     ("b", "channels"),
                     ("J/L", "join/leave"),
+                    ("u", "members"),
                 ]),
                 chat_help(&[
                     ("r/t", "reply/thread"),

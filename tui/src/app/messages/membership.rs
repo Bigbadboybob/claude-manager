@@ -1,4 +1,4 @@
-//! Public channel discovery and self-service membership for Owner.
+//! Public channel discovery, self-service membership and admin member additions.
 use super::*;
 
 impl Messages {
@@ -8,6 +8,17 @@ impl Messages {
         self.pane = 1;
     }
     fn channel_matches(&self) -> Vec<Value> {
+        if self.mode == "channel_add_member" {
+            if !self.channel_candidates_ready {
+                return vec![];
+            }
+            return self
+                .picker_people()
+                .into_iter()
+                .filter(|p| !self.channel_members.iter().any(|m| m["id"] == p["id"]))
+                .cloned()
+                .collect();
+        }
         if self.mode == "channel_roster" {
             let query = self.text.to_lowercase();
             let mut matches: Vec<_> = self
@@ -84,6 +95,27 @@ impl Messages {
     }
 }
 impl App {
+    pub(super) fn messaging_add_member(&mut self) {
+        if self.messages.saved.management.pending.is_some() {
+            self.messages.error = "A saved operation is pending; Esc then R retries it".into();
+            return;
+        }
+        let Some(channel) = self.messages.current_channel() else {
+            self.messages.error = "Choose a channel first; b browses channels".into();
+            return;
+        };
+        if channel["can_manage"] != true {
+            self.messages.error = "Only channel admins and Owner can add members".into();
+            return;
+        }
+        let params = json!({"action":"members","conversation":channel["id"]});
+        self.messages.start_form("channel_add_member", vec![]);
+        self.messages.channel_candidates_ready = false;
+        self.messages.picker_selected = 0;
+        self.messages.pane = 1;
+        self.messaging_request("channel_add_candidates", params);
+    }
+
     pub(super) fn messaging_channel_members(&mut self) {
         let Some(channel) = self.messages.current_channel() else {
             self.messages.error = "Choose a channel first; b browses channels".into();
@@ -112,13 +144,19 @@ impl App {
     ) -> bool {
         if !matches!(
             self.messages.mode.as_str(),
-            "channel_browser" | "channel_roster"
+            "channel_browser" | "channel_roster" | "channel_add_member"
         ) {
             return false;
         }
         let matches = self.messages.channel_matches();
         match key.code {
             KeyCode::Esc => self.messages.mode.clear(),
+            KeyCode::Char('a')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.messages.mode == "channel_roster" =>
+            {
+                self.messaging_add_member()
+            }
             KeyCode::Down => {
                 self.messages.picker_selected =
                     (self.messages.picker_selected + 1).min(matches.len().saturating_sub(1))
@@ -145,6 +183,19 @@ impl App {
                     self.messaging_refresh_target();
                 }
             }
+            KeyCode::Enter if self.messages.mode == "channel_add_member" => {
+                if let Some(member) = matches.get(self.messages.picker_selected) {
+                    if let Some(channel) = self.messages.current_channel() {
+                        self.messaging_mutation(
+                            "messaging.channels",
+                            json!({
+                                "action":"add_member", "conversation":channel["id"],
+                                "participant_id":member["id"]
+                            }),
+                        );
+                    }
+                }
+            }
             KeyCode::Backspace => {
                 self.messages.text.pop();
                 self.messages.picker_selected = 0;
@@ -163,12 +214,15 @@ impl App {
     }
     pub(super) fn draw_channel_browser(&self, frame: &mut Frame, area: Rect) {
         let roster = self.messages.mode == "channel_roster";
+        let add = self.messages.mode == "channel_add_member";
         let matches = self.messages.channel_matches();
         let mut lines = vec![
             Line::from(format!("Search: {}▏", self.messages.text)),
             Line::styled(
-                if roster {
-                    "↑/↓ select · type to filter · Esc returns"
+                if add {
+                    "↑/↓ or Ctrl+j/k select · Enter adds · Esc cancels"
+                } else if roster {
+                    "↑/↓ select · Ctrl+a add member · type to filter · Esc returns"
                 } else {
                     "↑/↓ select · Enter preview · then J join / L leave"
                 },
@@ -202,9 +256,9 @@ impl App {
                 },
                 c["description"].as_str().unwrap_or("")
             );
-            let text = if roster {
+            let text = if roster || add {
                 format!(
-                    "{} {}{}",
+                    "{} {}{}{}",
                     if index == self.messages.picker_selected {
                         "›"
                     } else {
@@ -218,6 +272,11 @@ impl App {
                         " · not running"
                     } else {
                         ""
+                    },
+                    if add {
+                        format!(" · {}", c["id"].as_str().unwrap_or(""))
+                    } else {
+                        String::new()
                     }
                 )
             } else {
@@ -235,17 +294,25 @@ impl App {
             ));
         }
         if matches.is_empty() {
-            lines.push(Line::from(if roster {
-                "No matching members"
-            } else {
-                "No matching channels"
-            }));
+            lines.push(Line::from(
+                if add && !self.messages.channel_candidates_ready {
+                    "Waiting for the participant directory"
+                } else if add {
+                    "No matching agents outside this channel"
+                } else if roster {
+                    "No matching members"
+                } else {
+                    "No matching channels"
+                },
+            ));
         }
         frame.render_widget(
             Paragraph::new(lines)
                 .style(Style::default().bg(theme::CHAT_PANEL))
                 .block(chat_block(
-                    if roster {
+                    if add {
+                        "Add channel member"
+                    } else if roster {
                         "Channel members · @here audience"
                     } else {
                         "Browse channels"
@@ -272,6 +339,88 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_add_member_picker_filters_roster_preserves_draft_and_retry_identity() {
+        let _lock = crate::test_support::home_lock();
+        let _home = super::super::tests::Home::new();
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.messages.visible = true;
+        app.messages.daemon_id = "origin".into();
+        app.messages.channels =
+            vec![json!({"id":"work-id","path":"work","joined":false,"can_manage":true})];
+        app.messages.target = json!({"channel":"work"});
+        app.messages.set_draft(Draft {
+            body: "Keep this draft".into(),
+            ..Draft::default()
+        });
+        app.messaging_channel_members();
+        app.messaging_channel_browser_key(&crossterm::event::KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.messages.mode, "channel_add_member");
+        assert!(app.messages.channel_matches().is_empty()); // No stale candidates on a failed fetch.
+        app.messages.channel_members = vec![json!({"id":"a","name":"Already-Joined"})];
+        app.messages.people = vec![
+            json!({"id":"owner","name":"Owner","present":true}),
+            json!({"id":"a","name":"Already-Joined","present":true}),
+            json!({"id":"b","name":"Parser","aliases":["Scout"],"present":true}),
+            json!({"id":"c","name":"Builder","present":false}),
+        ];
+        app.messages.channel_candidates_ready = true;
+        assert_eq!(app.messages.channel_matches().len(), 2);
+        app.messages.text = "scout".into();
+        assert_eq!(app.messages.channel_matches()[0]["id"], "b");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 26)).unwrap();
+        terminal.draw(|f| app.draw_messages(f)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Add channel member"), "{text}");
+        assert!(text.contains("Parser"), "{text}");
+        assert!(!text.contains("Already-Joined"), "{text}");
+        app.messaging_channel_browser_key(&crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        let pending = serde_json::to_value(&app.messages.saved.management.pending).unwrap();
+        assert_eq!(pending["params"]["action"], "add_member");
+        assert_eq!(pending["params"]["participant_id"], "b");
+        assert_eq!(pending["params"]["conversation"], "work-id");
+        assert_eq!(pending["params"]["origin_daemon_id"], "origin");
+        assert!(pending["params"]["request_id"].is_string());
+        app.messaging_channel_browser_key(&crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            serde_json::to_value(&app.messages.saved.management.pending).unwrap(),
+            pending
+        );
+        app.messages.saved.management.pending = None;
+        app.messaging_channel_result("messaging.channels", &json!({"status":"saved",
+            "membership":{"joined":true,"current_joined":false,"added_by":"owner","participant_id":"b"},
+            "channel":{"id":"work-id"}}));
+        assert_eq!(app.messages.target, json!({"channel":"work"}));
+        assert_eq!(app.messages.draft().body, "Keep this draft");
+        assert!(app.messages.status.contains("has since left"));
+        app.messages.channels[0]["can_manage"] = json!(false);
+        app.messaging_add_member();
+        assert!(app.messages.error.contains("Only channel admins"));
+        assert!(app.messages.mode.is_empty());
+    }
+
     #[test]
     fn membership_browser_and_compose_guard_preserve_public_preview_and_draft() {
         let _lock = crate::test_support::home_lock();

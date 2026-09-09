@@ -46,6 +46,21 @@ class MessagingToolsTests(unittest.TestCase):
                                  expected_revision="r1", request_id="defaults")
             self.assertTrue(call.call_args.args[1]["default_join"])
 
+    def test_add_member_keeps_target_identity_and_idempotency_through_mcp(self):
+        with patch.object(control_client, "call", return_value={"ok": True}) as call:
+            params = dict(action="add_member", conversation="channel-id",
+                          participant_id="agent:host:session", request_id="add-1",
+                          origin_daemon_id="host")
+            server.chat_channels(**params)
+            first = copy.deepcopy(call.call_args.args)
+            self.assertEqual(first[0], "messaging.channels")
+            self.assertEqual(first[1]["participant_id"], params["participant_id"])
+            self.assertEqual(first[1]["action"], "add_member")
+            server.chat_channels(**params)
+            self.assertEqual(call.call_args.args, first)
+            server.chat_channels(action="join", path="work", request_id="self-join")
+            self.assertNotIn("participant_id", call.call_args.args[1])
+
     def run_wait(self, binding, sessions):
         clock = [0.0]
         async def sleep(_):

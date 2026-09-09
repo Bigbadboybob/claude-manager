@@ -591,15 +591,7 @@ impl Store {
                 }
             }
             "channel.membership" => {
-                let id = required(e, "conversation_id")?;
-                let actor = required(&e["actor"], "id")?;
-                if actor == "system"
-                    || data["participant_id"] != actor
-                    || !data["joined"].is_boolean()
-                    || !self.memberships.contains_key(&id)
-                {
-                    return Err(err("invalid_record", "Invalid channel membership change"));
-                }
+                self.validate_membership_event(e)?;
             }
             "read.ack" => {
                 self.validate_read_event(e, false)?;
@@ -1626,6 +1618,17 @@ mod tests {
         invalid_join["type"] = json!("channel.membership");
         invalid_join["data"] = json!({"participant_id":original["actor"]["id"],"joined":"yes"});
         cases.push(invalid_join);
+        for data in [
+            json!({"action":"add_member","participant_id":"owner","joined":false}),
+            json!({"action":"add_member","participant_id":"system","joined":true}),
+            json!({"action":"add_member","participant_id":"","joined":true}),
+            json!({"participant_id":"owner","joined":true}),
+        ] {
+            let mut invalid_add = original.clone();
+            invalid_add["type"] = json!("channel.membership");
+            invalid_add["data"] = data;
+            cases.push(invalid_add);
+        }
         let mut duplicate_enrollment = p
             .hub
             .events
@@ -1812,6 +1815,51 @@ mod tests {
             .unwrap();
         let retained = p.hub.events.iter().find(|v| v.event["id"] == id).unwrap();
         assert!(!mention_recipients(&retained.event).contains(&newcomer.id.as_str()));
+    }
+    #[test]
+    fn admin_member_add_replicates_and_validates_offline_here_audience() {
+        let mut p = pair();
+        let host = p.replica.daemon_id.clone();
+        let admin = p.people[0].id.clone();
+        let member = p.people[1].id.clone();
+        p.hub.coordinate(&host, &admin, "messaging.channels",
+            &json!({"action":"create","path":"team","request_id":"create-team"})).unwrap();
+        let cid = p.hub.channels["team"].clone();
+        catch_up(&mut p);
+        let add = json!({"action":"add_member","conversation":cid,"participant_id":member,"request_id":"add-team"});
+        assert_eq!(p.replica.channel_action(&admin, &add, &p.people).unwrap_err().code, "coordinator_required");
+        assert_eq!(p.hub.coordinate(&host, &member, "messaging.channels", &add).unwrap_err().code, "unauthorized");
+        let added = p.hub.coordinate(&host, &admin, "messaging.channels", &add).unwrap();
+        catch_up(&mut p);
+        assert!(p.replica.joined(&member, &cid));
+        assert_eq!(p.replica.membership_revisions[&cid], added["event_id"]);
+        assert_eq!(p.replica.members_at_revision(&cid, added["event_id"].as_str().unwrap()).unwrap(),
+            BTreeSet::from([admin.clone(), member.clone()]));
+        // The new member can send offline, and @here uses the replicated roster.
+        let posted = p.replica.send(&member, "b", "agent", &json!({"channel":"team","body":"Ready", "mention_here":true,
+            "request_id":"member-post"}), &p.people).unwrap();
+        let wire = p.replica.wire_event(posted["event_id"].as_str().unwrap()).unwrap();
+        p.hub.accept_upload(&host, &wire).unwrap();
+        assert!(mention_recipients(&posted["event"]).contains(&admin.as_str()));
+        p.hub.coordinate(&host, &member, "messaging.channels",
+            &json!({"action":"leave","conversation":cid,"request_id":"leave-team"})).unwrap();
+        let retry = p.hub.coordinate(&host, &admin, "messaging.channels", &add).unwrap();
+        assert_eq!(retry["membership"]["current_joined"], false);
+        catch_up(&mut p);
+        let root = p._tmp.path().join("replica");
+        drop(p.replica);
+        let replica = Store::open(&root).unwrap();
+        assert!(replica.degraded.is_none(), "{:?}", replica.degraded);
+        assert!(!replica.joined(&member, &cid));
+        // A replica cannot forge an admin-add record instead of using the hub.
+        let mut forged = added["event"].clone();
+        forged["id"] = json!(format!("{host}:{}", uuid()));
+        forged["origin_daemon_id"] = json!(host);
+        forged["request"]["key"] = json!(uuid());
+        let before = p.hub.position;
+        assert_eq!(p.hub.accept_upload(&host, &json!({"event":serde_json::to_string(&forged).unwrap()}))
+            .unwrap_err().code, "unauthorized");
+        assert_eq!(p.hub.position, before);
     }
     #[test]
     fn revoked_uploads_and_dependent_replies_retain_local_context() {
@@ -2116,7 +2164,7 @@ impl Store {
             }
             "messaging.channels" => matches!(
                 p["action"].as_str(),
-                Some("create" | "update" | "join" | "leave")
+                Some("create" | "update" | "join" | "leave" | "add_member")
             ),
             "messaging.pins" => matches!(
                 p["action"].as_str(),

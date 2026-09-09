@@ -228,14 +228,14 @@ impl Store {
             }).collect();
             return self.directory_page(actor, p, channels);
         }
-        if ["join", "leave"].contains(&action) { return self.change_membership(actor, p, people); }
+        if ["join", "leave", "add_member"].contains(&action) { return self.change_membership(actor, p, people); }
         if action == "create" {
             return self.create_channel_with_people(actor, p, people);
         }
         if !["get", "update", "members"].contains(&action) {
             return Err(err(
                 "unsupported_feature",
-                "Channel actions: list, get, create, update, join, leave, members",
+                "Channel actions: list, get, create, update, join, leave, members, add_member",
             ));
         }
         let request = if action == "update" {

@@ -119,6 +119,35 @@ impl Drop for Network {
     }
 }
 #[test]
+fn messaging_sync_admin_adds_agent_on_another_host_through_normal_rpc() {
+    let n = Network::new();
+    let a = &n.clients[0];
+    let b = &n.clients[1];
+    let b_id = with_store(b, |s| s.participant_id("client-1"));
+    wait_for(|| with_store(a, |s| s.remote_people().iter().any(|p| p.id == b_id)));
+    let channel = call(a, "client-0", "channels",
+        json!({"action":"create","path":"remote-team","request_id":"create-team"}));
+    let cid = channel["channel"]["id"].as_str().unwrap().to_owned();
+    wait_for(|| with_store(b, |s| s.channels().as_array().unwrap().iter().any(|c| c["path"] == "remote-team")));
+    let add = json!({"action":"add_member","conversation":cid,"participant_id":b_id,"request_id":"add-team"});
+    let denied = rpc(b, "client-1", "channels", add.clone());
+    assert_eq!(denied["ok"], false);
+    assert!(denied["error"]["message"].as_str().unwrap().contains("Only channel admins"), "{denied}");
+    let accepted = call(a, "client-0", "channels", add.clone());
+    assert_eq!(accepted["membership"]["participant_id"], b_id);
+    wait_for(|| with_store(b, |s| s.channel_info("remote-team", &cid)["member_count"] == 2));
+    assert_eq!(call(b, "client-1", "channels", json!({"action":"get","conversation":cid}))["joined"], true);
+    let posted = call(b, "client-1", "send",
+        json!({"channel":"remote-team","body":"Joined from the other host","mention_here":true,"request_id":"post"}));
+    wait_for(|| with_store(&n.hub, |s| s.wire_event(posted["event_id"].as_str().unwrap()).is_ok()));
+    call(b, "client-1", "channels", json!({"action":"leave","conversation":cid,"request_id":"leave-team"}));
+    let retry = call(a, "client-0", "channels", add);
+    assert_eq!(retry["event_id"], accepted["event_id"]);
+    assert_eq!(retry["membership"]["current_joined"], false);
+    assert_eq!(call(b, "client-1", "channels", json!({"action":"get","conversation":cid}))["joined"], false);
+}
+
+#[test]
 fn messaging_sync_runtime_coordinates_claims_and_streams_offline_messages_once() {
     let n = Network::new();
     let a = &n.clients[0];

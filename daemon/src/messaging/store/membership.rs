@@ -18,6 +18,27 @@ pub(super) fn mention_recipients(event: &Value) -> Vec<&str> {
 }
 
 impl Store {
+    // Authority is checked by channel_action at the coordinator. Replicas may
+    // receive historical membership after newer access settings; validate the
+    // retained operation's shape here, not today's admin list.
+    pub(super) fn validate_membership_event(&self, event: &Value) -> Result<()> {
+        let id = required(event, "conversation_id")?;
+        let actor = required(&event["actor"], "id")?;
+        let member = required(&event["data"], "participant_id")?;
+        let data = &event["data"];
+        let add = data["action"] == "add_member";
+        if actor == "system"
+            || member == "system"
+            || !data["joined"].is_boolean()
+            || !self.memberships.contains_key(&id)
+            || (add && data["joined"] != true)
+            || (!add && actor != member)
+        {
+            return Err(err("invalid_record", "Invalid channel membership change"));
+        }
+        Ok(())
+    }
+
     pub(super) fn joined(&self, actor: &str, channel: &str) -> bool {
         self.memberships
             .get(channel)
@@ -74,11 +95,9 @@ impl Store {
             self.membership_revisions.insert(id, required(event, "id")?);
         }
         if event["type"] == "channel.membership" {
+            self.validate_membership_event(event)?;
             let id = required(event, "conversation_id")?;
-            let actor = required(&event["actor"], "id")?;
-            if event["data"]["participant_id"] != actor || actor == "system" {
-                return Err(err("invalid_record", "Membership changes are self-only"));
-            }
+            let member = required(&event["data"], "participant_id")?;
             let joined = event["data"]["joined"]
                 .as_bool()
                 .ok_or_else(|| err("invalid_record", "Membership needs joined boolean"))?;
@@ -87,9 +106,9 @@ impl Store {
                 .get_mut(&id)
                 .ok_or_else(|| err("invalid_record", "Channel membership is uninitialized"))?;
             if joined {
-                members.insert(actor);
+                members.insert(member);
             } else {
-                members.remove(&actor);
+                members.remove(&member);
             }
             self.membership_revisions.insert(id, required(event, "id")?);
         }
@@ -213,7 +232,39 @@ impl Store {
             .find(|(_, cid)| **cid == id)
             .map(|(p, _)| p.clone())
             .ok_or_else(|| err("not_found", "Channel not found"))?;
-        let joined = p["action"] == "join";
+        let add = p["action"] == "add_member";
+        let member = if add {
+            let mut channel = self.channel_info(&path, &id);
+            self.channel_permissions(actor, &mut channel);
+            if channel["can_manage"] != true {
+                return Err(err(
+                    "unauthorized",
+                    "Only channel admins and Owner can add members",
+                ));
+            }
+            let member = required(p, "participant_id")?;
+            if member != "owner"
+                && !self.names.contains_key(&member)
+                && !people.iter().any(|person| person.id == member)
+            {
+                return Err(err(
+                    "not_found",
+                    "Participant not found; resolve an ID with chat_people",
+                ));
+            }
+            member
+        } else {
+            if p.get("participant_id")
+                .is_some_and(|member| member != actor)
+            {
+                return Err(err(
+                    "invalid_params",
+                    "Join/leave are self-only; admins can use add_member",
+                ));
+            }
+            actor.to_owned()
+        };
+        let joined = add || p["action"] == "join";
         let name = self
             .names
             .get(actor)
@@ -231,11 +282,31 @@ impl Store {
                     "Agent".into()
                 }
             });
+        let body = if add {
+            let member_name = self
+                .names
+                .get(&member)
+                .map(|n| n.name.as_str())
+                .or_else(|| {
+                    people
+                        .iter()
+                        .find(|p| p.id == member)
+                        .map(|p| p.name.as_str())
+                })
+                .unwrap_or(if member == "owner" { "Owner" } else { &member });
+            format!("{name} added {member_name} to #{path}")
+        } else {
+            format!("{name} {} #{path}", if joined { "joined" } else { "left" })
+        };
+        let mut data = json!({"participant_id":member,"joined":joined});
+        if add {
+            data["action"] = json!("add_member");
+        }
         let event = self.publish(
             "channel.membership",
             Some(&id),
-            &format!("{name} {} #{path}", if joined { "joined" } else { "left" }),
-            json!({"participant_id":actor,"joined":joined}),
+            &body,
+            data,
             actor,
             &name,
             if actor == "owner" { "owner" } else { "agent" },
@@ -248,7 +319,12 @@ impl Store {
 
     fn membership_result(&self, actor: &str, event: &Value) -> Value {
         let mut result = self.send_response(event);
-        result["membership"] = json!({"joined":event["data"]["joined"],"revision":event["id"]});
+        result["membership"] = json!({"joined":event["data"]["joined"],"revision":event["id"],
+            "participant_id":event["data"]["participant_id"],
+            "current_joined":self.joined(strv(&event["data"], "participant_id"), strv(event, "conversation_id"))});
+        if event["data"]["action"] == "add_member" {
+            result["membership"]["added_by"] = event["actor"]["id"].clone();
+        }
         if let Some((path, id)) = self
             .channels
             .iter()

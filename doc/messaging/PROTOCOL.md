@@ -172,7 +172,7 @@ All normal messages remain `message.create`, however their social meaning evolve
 | `channel.create` | Creates permanent path/ID, display name, description, creator/admins, editing policy, default-join flag, and any missing ancestors. `membership_version: 1` in data joins the creator in every newly created channel. |
 | `channel.membership.initialize` | System migration for a legacy channel: `channel_id`, `members` (participant IDs), `version: 1`, `default_join`. Applied once per channel. |
 | `membership.enrollment` | System first enrollment: `participant_id`, `default_channels` (channel IDs). Applied once per participant; retained to keep explicit leaves from being undone. |
-| `channel.membership` | Self-only join/leave in `conversation_id`; data has `participant_id` and `joined` boolean. Preserves public read access and does not notify or become unread chat activity. |
+| `channel.membership` | Join/leave in `conversation_id`; data has `participant_id` and `joined` boolean. Normally self-only. Explicit `data.action: "add_member"` adds the target under a channel admin/Owner actor and requires `joined: true`. Preserves public read access and does not notify or become unread chat activity. |
 | `conversation.create` | Describes a DM's immutable kind and members when imported/explicitly materialized; the usual first send folds this payload into its message event. |
 | `channel.update` | Revision-checked display name, description, named admins, open-editing policy, or default-join policy. Archiving remains a future capability. |
 | `conversation.pin` | Sets/removes a pin to an existing message in that channel or DM. Pins retain attribution. |
@@ -306,6 +306,23 @@ Membership changes and default enrollment are independent of follows, monitors,
 mute and DND. Existing preference overrides still govern delivery; Owner remains
 passive. The `messaging.open` features `channel_membership` and `channel_mentions`
 advertise this additive support. Cross-machine membership is coordinator-owned. Offline messages retain the last complete membership revision observed locally; their frozen audience remains valid at that revision.
+
+`messaging.channels(action="add_member", participant_id=…)` adds a known
+participant under the authenticated admin/Owner identity. Open editing does not
+grant this permission. The coordinator checks current admin rights before a new
+publication; an already accepted request remains retrievable after access changes.
+The `channel.membership` event retains the adding actor and target participant
+separately with `data.action: "add_member"` and `joined: true`. Replicas replay
+that accepted decision without consulting their current access policy. Ordinary
+replica uploads cannot publish membership events. Join/leave are still self-only;
+removing someone else is unsupported. Retries return the original membership
+event plus `current_joined` and never override a subsequent leave.
+
+Readers advertise `channel_member_add` in `messaging.open.features`. All paired
+reducers must support it before the coordinator accepts the first admin-add
+operation: previous reducers reject membership records with different actor and
+participant IDs. Upgrade replicas before the coordinator, and do not roll back
+to an older reducer after publication.
 
 
 ## Shared-machine implementation fields (additive v1)

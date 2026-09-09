@@ -223,7 +223,6 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             # Public channel preview does not join; Owner joins/leaves explicitly.
             rpc("tui.update_sessions_snapshot", {"sessions": fixtures}, raw=True)
             rpc("channels", {"action": "create", "path": "membership-test", "description": "Membership and mentions", "request_id": "member-create"}, session="alpha")
-            rpc("channels", {"action": "join", "path": "membership-test", "request_id": "beta-join"}, session="beta")
             key(b"g", 0.6)
             key(b"bmembership\r", 0.6)
             wait_text("Preview")
@@ -235,8 +234,16 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             assert rpc("channels", {"action": "get", "path": "membership-test"})["joined"] is True
             key(b"u", 0.5)
             wait_text("Channel members")
-            assert "Alpha" in visible() and "Beta" in visible() and "Owner" in visible(), visible()
-            key(b"\x1b", 0.3)
+            assert "Alpha" in visible() and "Owner" in visible() and "Beta" not in visible(), visible()
+            assert rpc("channels", {"action": "get", "path": "membership-test"}, session="beta")["joined"] is False
+            key(b"\x01Beta", 0.5)  # Ctrl+a opens the admin add-member search.
+            wait_text("Add channel member")
+            wait_text("Beta")
+            shot("cm-chat-add-member")
+            key(b"\r", 0.8)
+            wait_text("#membership-test")
+            assert rpc("channels", {"action": "get", "path": "membership-test"}, session="beta")["joined"] is True
+            assert rpc("read", {"channel": "membership-test"})["items"] == []
             key(b"c@Al", 0.4)
             wait_text("@Alpha")
             shot("cm-chat-mention-completion")
@@ -433,7 +440,7 @@ with tempfile.TemporaryDirectory(prefix="cm-chat-B-preview-") as tmp:
             tui.wait(timeout=5)
             assert tui.returncode == 0
             print(
-                "PASS: channel browser/preview/join/leave, direct and @here completion/recipients, edited mentions no longer notify; channel creation/settings/admins, stable-name edits, pin/unpin and pins view; timeline full messages/order/unread, searchable group creation/reply/collapse, real TUI global/channel norms acknowledge/publish/diff/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
+                "PASS: channel browser/preview/join/leave, admin add-member search and quiet addition, direct and @here completion/recipients, edited mentions no longer notify; channel creation/settings/admins, stable-name edits, pin/unpin and pins view; timeline full messages/order/unread, searchable group creation/reply/collapse, real TUI global/channel norms acknowledge/publish/diff/revert/conflict/rebase, persistent draft archive, monitor create/results/ack/cancel/dismiss, follow/bell/DND, 80x24 and 48x16, chat/mouse shortcuts.",
                 flush=True,
             )
         except Exception:

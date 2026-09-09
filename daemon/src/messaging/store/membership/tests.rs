@@ -242,7 +242,13 @@ fn joins_are_self_only_retries_do_not_rejoin_and_roster_matches_membership() {
         .as_array()
         .unwrap()
         .is_empty());
-    let join = json!({"action":"join","path":"work","request_id":"join","participant_id":p[2].id});
+    let join = json!({"action":"join","path":"work","request_id":"join"});
+    let mut forged = join.clone();
+    forged["participant_id"] = json!(p[2].id);
+    assert_eq!(
+        s.channel_action(&p[1].id, &forged, &p).unwrap_err().code,
+        "invalid_params"
+    );
     let first = s.channel_action(&p[1].id, &join, &p).unwrap();
     let id = s.channels["work"].clone();
     assert!(s.joined(&p[1].id, &id));
@@ -272,6 +278,195 @@ fn joins_are_self_only_retries_do_not_rejoin_and_roster_matches_membership() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn adding_members_requires_admin_even_with_open_editing_and_never_grants_admin() {
+    let (_root, mut s, p) = fixture();
+    let created = s
+        .create_channel(
+            &p[0].id,
+            &json!({"path":"work","request_id":"create","allow_agent_edits":true}),
+        )
+        .unwrap();
+    let id = s.channels["work"].clone();
+    let add = json!({"action":"add_member","conversation":id,"participant_id":p[2].id,"request_id":"add"});
+    let before = s.position;
+    assert_eq!(
+        s.channel_action(&p[1].id, &add, &p).unwrap_err().code,
+        "unauthorized"
+    );
+    assert_eq!(s.position, before);
+    let added = s.channel_action(&p[0].id, &add, &p).unwrap();
+    assert!(s.joined(&p[2].id, &id));
+    assert_eq!(added["event"]["actor"]["id"], p[0].id);
+    assert_eq!(added["event"]["data"]["participant_id"], p[2].id);
+    assert_eq!(added["membership"]["added_by"], p[0].id);
+    assert_eq!(
+        s.channel_action(&p[2].id, &json!({"action":"get","path":"work"}), &p)
+            .unwrap()["can_manage"],
+        false
+    );
+    assert!(s.wake_intents().values().all(Vec::is_empty));
+    assert!(
+        s.read(&p[2].id, &json!({"inbox":true}), &p).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.read(&p[2].id, &json!({"channel":"work"}), &p).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Owner administers without joining or changing the added member's role.
+    assert!(!s.joined("owner", &id));
+    let add_b = json!({"action":"add_member","path":"work","participant_id":p[1].id,"request_id":"owner-add"});
+    s.channel_action("owner", &add_b, &p).unwrap();
+    assert!(s.joined(&p[1].id, &id));
+    assert!(!s.joined("owner", &id));
+    let settings = s
+        .channel_action(
+            "owner",
+            &json!({"action":"update","path":"work","admins":[p[1].id],
+        "expected_revision":created["channel"]["revision"],"request_id":"delegate"}),
+            &p,
+        )
+        .unwrap();
+    change(&mut s, &p[0].id, "work", "leave");
+    let add_a = json!({"action":"add_member","path":"work","participant_id":p[0].id,"request_id":"delegated-add"});
+    s.channel_action(&p[1].id, &add_a, &p).unwrap();
+    assert!(s.joined(&p[0].id, &id));
+    s.channel_action(
+        "owner",
+        &json!({"action":"update","path":"work","admins":[],
+        "expected_revision":settings["channel"]["revision"],"request_id":"revoke"}),
+        &p,
+    )
+    .unwrap();
+    let mut next = add_a.clone();
+    next["request_id"] = json!("after-revoke");
+    assert_eq!(
+        s.channel_action(&p[1].id, &next, &p).unwrap_err().code,
+        "unauthorized"
+    );
+    // An accepted request remains retrievable after the caller loses admin.
+    assert_eq!(
+        s.channel_action(&p[1].id, &add_a, &p).unwrap()["status"],
+        "saved"
+    );
+}
+
+#[test]
+fn added_members_can_leave_and_old_add_retries_never_restore_membership() {
+    let (root, mut s, p) = fixture();
+    s.create_channel(&p[0].id, &json!({"path":"work","request_id":"create"}))
+        .unwrap();
+    let id = s.channels["work"].clone();
+    let old = send(
+        &mut s,
+        &p[0],
+        &p,
+        json!({"channel":"work","mention_here":true}),
+    )
+    .unwrap();
+    let request =
+        json!({"action":"add_member","path":"work","participant_id":p[1].id,"request_id":"add"});
+    let added = s.channel_action(&p[0].id, &request, &p).unwrap();
+    assert!(!mention_recipients(&old["event"]).contains(&p[1].id.as_str()));
+    assert!(s.wake_intents().get("b").is_none_or(Vec::is_empty));
+    send(&mut s, &p[1], &p, json!({"channel":"work"})).unwrap();
+    let next = send(
+        &mut s,
+        &p[0],
+        &p,
+        json!({"channel":"work","mention_here":true}),
+    )
+    .unwrap();
+    assert!(mention_recipients(&next["event"]).contains(&p[1].id.as_str()));
+    change(&mut s, &p[1].id, "work", "leave");
+    let next = send(
+        &mut s,
+        &p[0],
+        &p,
+        json!({"channel":"work","mention_here":true}),
+    )
+    .unwrap();
+    assert!(!mention_recipients(&next["event"]).contains(&p[1].id.as_str()));
+    drop(s);
+    let mut s = Store::open(root.path()).unwrap();
+    assert!(s.degraded.is_none(), "{:?}", s.degraded);
+    s.enroll_participants(&p).unwrap();
+    let position = s.position;
+    let retry = s.channel_action(&p[0].id, &request, &p).unwrap();
+    assert_eq!(retry["event_id"], added["event_id"]);
+    assert_eq!(retry["membership"]["joined"], true);
+    assert_eq!(retry["membership"]["current_joined"], false);
+    assert_eq!(s.position, position);
+    assert!(!s.joined(&p[1].id, &id));
+    let mut changed = request.clone();
+    changed["participant_id"] = json!(p[2].id);
+    assert_eq!(
+        s.channel_action(&p[0].id, &changed, &p).unwrap_err().code,
+        "idempotency_conflict"
+    );
+    changed["request_id"] = json!("new-intent");
+    changed["participant_id"] = json!(p[1].id);
+    s.channel_action(&p[0].id, &changed, &p).unwrap();
+    assert!(s.joined(&p[1].id, &id));
+}
+
+#[test]
+fn add_member_rejects_invalid_targets_and_has_no_remove_someone_else_action() {
+    let (_root, mut s, p) = fixture();
+    s.create_channel(&p[0].id, &json!({"path":"work","request_id":"create"}))
+        .unwrap();
+    let before = s.position;
+    for (member, code) in [
+        (Value::Null, "invalid_params"),
+        (json!(42), "invalid_params"),
+        (json!(""), "invalid_params"),
+        (json!("system"), "not_found"),
+        (json!("unknown"), "not_found"),
+        (json!(p[1].name), "not_found"),
+    ] {
+        assert_eq!(s.channel_action(&p[0].id,
+            &json!({"action":"add_member","path":"work","participant_id":member,"request_id":"bad"}),
+            &p).unwrap_err().code, code);
+    }
+    assert_eq!(s.position, before);
+    assert_eq!(
+        s.channel_action(
+            "owner",
+            &json!({"action":"leave","path":"work","participant_id":p[0].id,
+        "request_id":"remove"}),
+            &p
+        )
+        .unwrap_err()
+        .code,
+        "invalid_params"
+    );
+    assert_eq!(
+        s.channel_action(
+            "owner",
+            &json!({"action":"remove_member","path":"work","participant_id":p[0].id,
+        "request_id":"remove"}),
+            &p
+        )
+        .unwrap_err()
+        .code,
+        "unsupported_feature"
+    );
+    s.channel_action(
+        &p[0].id,
+        &json!({"action":"add_member","path":"work","participant_id":"owner",
+        "request_id":"add-owner"}),
+        &p,
+    )
+    .unwrap();
+    assert!(s.joined("owner", &s.channels["work"]));
 }
 
 #[test]

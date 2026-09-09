@@ -21,7 +21,7 @@ impl Messages {
             .collect::<Vec<_>>()
             .join(", ")
     }
-    fn picker_people(&self) -> Vec<&Value> {
+    pub(super) fn picker_people(&self) -> Vec<&Value> {
         let query = self.text.trim().to_lowercase();
         let mut people: Vec<_> = self
             .people

@@ -434,7 +434,11 @@ impl App {
         self.messages.fields.clear();
         self.messages.error.clear();
         if method == "messaging.channels" {
-            self.messages.status = if value["membership"]["joined"] == true { "Joined channel" }
+            self.messages.status = if value["membership"]["added_by"].is_string() {
+                if value["membership"]["current_joined"] == false {
+                    "Add already processed · participant has since left"
+                } else { "Member added to channel" }
+            } else if value["membership"]["joined"] == true { "Joined channel" }
                 else if value["membership"]["joined"] == false { "Left channel · history remains browsable" }
                 else { "Channel settings saved" }.into();
             self.messages.channel_selection_pending = true;
