@@ -218,3 +218,46 @@ The ten-minute stability check completed at **2026-09-08 03:13:49 UTC** after
 sessions present, matching holder/brain counts, and healthy MCP throughout.
 The final screen and process snapshots still matched the pre-restart snapshots.
 No TUI relaunch or further deployment is needed for this recovery.
+
+## Bash Enter latency after the session-host migration
+
+2026-09-09 UTC. Typing echoed reasonably quickly, but Enter waited for the next
+shell prompt. Starship's synchronous Git-status module repeatedly reached its
+500 ms command timeout in several migrated trading workspaces. The copied Git
+indexes retained laptop stat-cache values (device, inode, ctime and UID), so
+read-only prompt checks kept revalidating unchanged cloud files without saving
+the refreshed metadata. A sample index still recorded UID 1000 and the laptop
+device/inode, while its cloud file had UID 1001 and different inode/ctime values.
+
+On a private index copy, `git update-index --refresh` reduced a full Git-status
+check from about 2.4 seconds to 53–58 ms. Starship's normal prompt then rendered
+in 86–93 ms instead of about 533 ms. This keeps the existing prompt and current
+Git status; no disabled modules, cached display, new Bash hooks or daemon/TUI
+changes are required. The refresh applies to existing shells on their next
+prompt, without restart or injected terminal input.
+
+The rollout backs up each index and compares `git ls-files --stage -v -z` before
+and after refreshing. Staged blobs, modes, merge stages, paths and
+`skip-worktree`/assume-unchanged flags must remain identical. An exit status of
+1 can report an existing dirty file; it is not an instruction to stage or reset
+that file. Concurrent changes require inspection, never blind index restoration.
+The one-time operator script and per-repository receipts are private under
+`~/.cm/migrations/cloud-20260908/git-stat-refresh/`.
+
+The main `predictionTrading` checkout also spent about 590 ms scanning untracked
+paths after the stat refresh. Git's own `--test-untracked-cache` filesystem test
+passed. Enabling the standard `core.untrackedCache=true` repository setting and
+warming it with normal Git status preserved identical status output and index
+entries in all eight checked trading worktrees/checkouts. The setting is shared
+by that repository's linked worktrees. Subsequent prompt samples were 60–115 ms,
+including 76–84 ms in the main checkout. No filesystem-monitor hook or custom
+cache process was installed. Evidence: `git-stat-refresh/untracked-cache-receipt.json`
+in the same private migration directory.
+
+In disposable PTYs using the real Bash configuration, five samples per condition
+in `predictionTrading-rbpf-simplification` measured median empty-Enter-to-prompt
+latency of **545 ms before / 86 ms after** and no-op-command-to-prompt latency of
+**554 ms before / 93 ms after** with both fixes applied. The before condition
+used a private copy of the original migrated index. These are cloud-host measurements during the background
+refresh, excluding SSH transport and TUI drawing. Evidence:
+`~/.cm/migrations/cloud-20260908/bash-enter-pty-verification.json`.
