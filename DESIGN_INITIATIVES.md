@@ -259,6 +259,7 @@ Prediction Trading
 
 Required v1 behavior:
 
+- prefix the designated coordinator task with `◆` in planning (grid and linear) and the work-panel task sidebar; keep status and fold indicators separate;
 - project remains the top-level codebase filter;
 - initiative-backed subsections group initiative tasks inside each project view;
 - standalone tasks remain visible in a standalone subsection;

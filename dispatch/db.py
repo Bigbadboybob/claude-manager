@@ -184,7 +184,8 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
                           CASE WHEN i.id IS NULL THEN NULL ELSE
                             jsonb_build_object('id', i.id, 'slug', i.slug,
                                                'name', i.name, 'status', i.status,
-                                               'color', i.color) END AS initiative
+                                               'color', i.color,
+                                               'coordinator_task_id', i.coordinator_task_id) END AS initiative
                    FROM tasks t
                    LEFT JOIN initiatives i ON i.id = t.initiative_id
                    {where.replace('status', 't.status').replace('project', 't.project').replace('initiative_id', 't.initiative_id')}
@@ -517,7 +518,8 @@ async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
             """SELECT t.*, CASE WHEN i.id IS NULL THEN NULL ELSE
                        jsonb_build_object('id', i.id, 'slug', i.slug,
                                           'name', i.name, 'status', i.status,
-                                          'color', i.color) END AS initiative
+                                          'color', i.color,
+                                          'coordinator_task_id', i.coordinator_task_id) END AS initiative
                   FROM tasks t LEFT JOIN initiatives i ON i.id = t.initiative_id
                  WHERE t.id = $1""", task_id,
         )

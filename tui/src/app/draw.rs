@@ -2101,7 +2101,9 @@ impl App {
                         .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
                         .map(|t| t.name.clone())
                         .unwrap_or_else(|| "task".into());
-                    let max_name = (inner.width as usize).saturating_sub(4);
+                    let initiative_marker = self.planning.task_initiative_marker(task_id);
+                    let max_name = (inner.width as usize)
+                        .saturating_sub(4 + initiative_marker.chars().count());
                     let name = crate::planning::truncate_with_ellipsis(&name, max_name);
                     // Style lives on the ListItem so selection highlight can
                     // override. Using Span::styled with a fixed color here
@@ -2123,6 +2125,7 @@ impl App {
                     let line = Line::from(vec![
                         Span::raw(indent(*ws_idx)),
                         Span::raw("  "),
+                        Span::raw(initiative_marker),
                         Span::raw(name),
                     ]);
                     items.push(ListItem::new(line).style(base_style));

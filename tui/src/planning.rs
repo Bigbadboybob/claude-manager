@@ -103,6 +103,8 @@ pub struct PlanTask {
     pub initiative_name: Option<String>,
     pub initiative_status: Option<String>,
     pub initiative_color: Option<String>,
+    /// Marks the initiative's designated coordinator, not every member task.
+    pub is_initiative_coordinator: bool,
     /// Task kind from the API row ("oneshot" | "continuous" | "backtest").
     /// The `A-w` watch action fires only on `"backtest"`.
     pub kind: String,
@@ -146,6 +148,10 @@ fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
 }
 
 impl PlanTask {
+    fn initiative_marker(&self) -> &'static str {
+        if self.is_initiative_coordinator { "◆ " } else { "" }
+    }
+
     fn from_api(task: &Task) -> Self {
         PlanTask {
             id: task.id.clone(),
@@ -171,6 +177,10 @@ impl PlanTask {
                 .and_then(|v| v.get("status")).and_then(|v| v.as_str()).map(str::to_string),
             initiative_color: task.initiative.as_ref()
                 .and_then(|v| v.get("color")).and_then(|v| v.as_str()).map(str::to_string),
+            is_initiative_coordinator: task.initiative_id.is_some()
+                && task.initiative.as_ref()
+                    .and_then(|v| v.get("coordinator_task_id"))
+                    .and_then(|v| v.as_str()) == Some(task.id.as_str()),
             kind: task.kind.clone(),
             worker_vm: task.worker_vm.clone().filter(|s| !s.is_empty()),
             vm_project: meta_str(&task.metadata, "vm", "project"),
@@ -1262,6 +1272,13 @@ impl PlanningView {
         }
     }
 
+    /// Shared with the work-panel task sidebar; filters and folds do not hide membership.
+    pub(crate) fn task_initiative_marker(&self, task_id: &str) -> &'static str {
+        self.project_data.iter().flat_map(|pd| &pd.tasks)
+            .find(|task| task.id == task_id)
+            .map(PlanTask::initiative_marker).unwrap_or("")
+    }
+
     /// Update planning data from API tasks. Called when BackendEvent::PlanTasksUpdated arrives.
     /// Merges API state into existing local state rather than rebuilding from scratch.
     pub fn update_from_api(&mut self, api_tasks: Vec<Task>) {
@@ -1356,6 +1373,11 @@ impl PlanningView {
                         // stale `None` from `pd.tasks`, and the subtask
                         // never appeared under its parent.
                         local_task.parent_task_id = api_task.parent_task_id.clone();
+                        local_task.initiative_id = api_task.initiative_id.clone();
+                        local_task.initiative_name = api_task.initiative_name.clone();
+                        local_task.initiative_status = api_task.initiative_status.clone();
+                        local_task.initiative_color = api_task.initiative_color.clone();
+                        local_task.is_initiative_coordinator = api_task.is_initiative_coordinator;
                     } else {
                         // New task from API — add it.
                         pd.tasks.push(api_task.clone());
@@ -4243,7 +4265,9 @@ impl PlanningView {
                     };
 
                     let claude_prefix = if is_claude { "[C] " } else { "" };
-                    let prefix_len = indent.len() + 2 /*fold*/ + 2 /*ind+space*/ + claude_prefix.len();
+                    let initiative_marker = task.map(PlanTask::initiative_marker).unwrap_or("");
+                    let prefix_len = indent.len() + 2 /*fold*/ + 2 /*ind+space*/
+                        + claude_prefix.len() + initiative_marker.chars().count();
                     let max_title = width.saturating_sub(prefix_len + count_suffix.len());
                     let title_display = truncate_with_ellipsis(&title_str, max_title);
 
@@ -4256,6 +4280,7 @@ impl PlanningView {
                     if is_claude {
                         spans.push(Span::styled(claude_prefix, Style::default().fg(theme::REMOTE)));
                     }
+                    spans.push(Span::raw(initiative_marker));
                     self.push_title_spans(&mut spans, title_display, task, search_q.as_deref());
                     if !count_suffix.is_empty() {
                         spans.push(Span::styled(count_suffix, Style::default().fg(theme::DIM)));
@@ -4438,7 +4463,9 @@ impl PlanningView {
                             }
                         };
                         let claude_prefix = if is_claude { "[C] " } else { "" };
-                        let max_title = (inner.width as usize).saturating_sub(5 + claude_prefix.len());
+                        let initiative_marker = task.map(PlanTask::initiative_marker).unwrap_or("");
+                        let max_title = (inner.width as usize)
+                            .saturating_sub(5 + claude_prefix.len() + initiative_marker.chars().count());
                         let title_display = truncate_with_ellipsis(&title_str, max_title);
 
                         let mut spans = vec![
@@ -4447,6 +4474,7 @@ impl PlanningView {
                         if is_claude {
                             spans.push(Span::styled(claude_prefix, Style::default().fg(theme::REMOTE)));
                         }
+                        spans.push(Span::raw(initiative_marker));
                         self.push_title_spans(&mut spans, title_display, task, search_q.as_deref());
                         let line = Line::from(spans);
                         let conflict = self.is_conflict(&pd.project.name, slug);
@@ -5028,6 +5056,7 @@ mod tests {
             initiative_name: None,
             initiative_status: None,
             initiative_color: None,
+            is_initiative_coordinator: false,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5601,6 +5630,7 @@ mod tests {
             initiative_name: None,
             initiative_status: None,
             initiative_color: None,
+            is_initiative_coordinator: false,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5657,6 +5687,7 @@ mod tests {
             initiative_name: None,
             initiative_status: None,
             initiative_color: None,
+            is_initiative_coordinator: false,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5721,6 +5752,7 @@ mod tests {
             initiative_name: None,
             initiative_status: None,
             initiative_color: None,
+            is_initiative_coordinator: false,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5784,6 +5816,7 @@ mod tests {
                 initiative_name: None,
                 initiative_status: None,
                 initiative_color: None,
+                is_initiative_coordinator: false,
                 kind: "oneshot".to_string(),
                 worker_vm: None,
                 vm_project: None,
@@ -5859,6 +5892,7 @@ mod tests {
             initiative_name: None,
             initiative_status: None,
             initiative_color: None,
+            is_initiative_coordinator: false,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -6031,6 +6065,7 @@ mod tests {
             initiative_name: None,
             initiative_status: None,
             initiative_color: None,
+            is_initiative_coordinator: false,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
