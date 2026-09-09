@@ -2752,6 +2752,25 @@ impl App {
         }
         if self.messaging_event(event) { return true; }
 
+        // Kitty/CSI-u can report Alt+? as Alt+Shift+/. Consume both forms
+        // before Planning or a search modal can interpret the slash.
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && (key.code == KeyCode::Char('?')
+                    || key.code == KeyCode::Char('/')
+                        && key.modifiers.contains(KeyModifiers::SHIFT))
+            {
+                self.keybinding_helper_visible = !self.keybinding_helper_visible;
+                self.planning.keybinding_helper_visible = self.keybinding_helper_visible;
+                self.set_status_msg(if self.keybinding_helper_visible {
+                    "Keybinding helper shown"
+                } else {
+                    "Keybinding helper hidden (A-? toggles it)"
+                });
+                return true;
+            }
+        }
+
         // A-; MRU walk boundary: any OTHER key press ends the walk, so
         // the next A-; starts fresh from the live deque. This is the
         // closest a TUI gets to classic alt-tab's "modifier released".
@@ -3034,16 +3053,6 @@ impl App {
                         } else {
                             self.input_mode = InputMode::SidebarSearch { query: String::new() };
                         }
-                        return true;
-                    }
-                    // A-? toggles the compact keybinding footer.
-                    KeyCode::Char('?') => {
-                        self.keybinding_helper_visible = !self.keybinding_helper_visible;
-                        self.set_status_msg(if self.keybinding_helper_visible {
-                            "Keybinding helper shown"
-                        } else {
-                            "Keybinding helper hidden (A-? toggles it)"
-                        });
                         return true;
                     }
                     // A-i: read-only info peek for the focused row.

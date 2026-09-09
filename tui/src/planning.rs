@@ -145,20 +145,6 @@ fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
         .unwrap_or_default()
 }
 
-/// Initiative subsection tint: deliberately dark so task status/selection
-/// colors remain legible. Named initiative colors use the shared palette;
-/// unknown colors and missing colors get a deterministic quiet blue tint.
-fn initiative_tint(color: Option<&str>, id: &str) -> Color {
-    let rgb = match color.and_then(theme::user_color) {
-        Some(Color::Rgb(r, g, b)) => (r, g, b),
-        _ => {
-            let hash = id.bytes().fold(0u8, |acc, byte| acc.wrapping_add(byte));
-            (35u8.saturating_add(hash % 22), 40u8.saturating_add(hash % 18), 58u8.saturating_add(hash % 28))
-        }
-    };
-    Color::Rgb(rgb.0 / 5, rgb.1 / 5, rgb.2 / 5)
-}
-
 impl PlanTask {
     fn from_api(task: &Task) -> Self {
         PlanTask {
@@ -255,6 +241,51 @@ enum VisibleRowKind {
     /// Synthetic subsection heading derived from first-class initiative
     /// membership. It has no raw-layout slot and is never a task target.
     InitiativeHeader { id: String, name: String, color: Option<String> },
+}
+
+/// Shading follows the visible headings, including nested members and the
+/// Standalone subsection. Plain layout headings use the same neutral tint.
+fn subsection_backgrounds(rows: &[VisibleRow]) -> Vec<Option<Color>> {
+    let mut current = None;
+    rows.iter().map(|row| {
+        match &row.kind {
+            VisibleRowKind::InitiativeHeader { color, .. } => {
+                current = Some(theme::subsection_bg(color.as_deref()));
+            }
+            VisibleRowKind::Layout { item: GridItem::Header(_), .. } => {
+                current = Some(theme::subsection_bg(None));
+            }
+            VisibleRowKind::Layout { item: GridItem::Separator | GridItem::Empty, .. } => {
+                current = None;
+            }
+            _ => {}
+        }
+        current
+    }).collect()
+}
+
+fn subsection_ends(rows: &[VisibleRow], index: usize, backgrounds: &[Option<Color>]) -> bool {
+    backgrounds[index].is_some()
+        && visible_row_slug(&rows[index]).is_some()
+        && rows.get(index + 1).and_then(visible_row_slug).is_none()
+}
+
+/// Scroll in logical rows, but budget terminal lines: subsection endings
+/// take an extra line without becoming extra keyboard navigation targets.
+fn column_scroll_start(rows: &[VisibleRow], backgrounds: &[Option<Color>], offset: usize,
+    selected: Option<usize>, height: usize) -> usize
+{
+    let mut start = offset.min(rows.len().saturating_sub(1));
+    let Some(selected) = selected.filter(|&index| index < rows.len()) else { return start; };
+    if height == 0 { return start; }
+    start = start.min(selected);
+    let row_height = |index| (1 + usize::from(subsection_ends(rows, index, backgrounds))).min(height);
+    let mut used: usize = (start..=selected).map(row_height).sum();
+    while used > height && start < selected {
+        used -= row_height(start);
+        start += 1;
+    }
+    start
 }
 
 /// Slug at a visible row, regardless of layout vs. synthetic origin.
@@ -1122,6 +1153,7 @@ fn repo_url_for_project(project: &str) -> String {
 // ── PlanningView ────────────────────────────────────────────
 
 pub struct PlanningView {
+    pub keybinding_helper_visible: bool,
     pub launch_host: crate::hosts::HostId,
     launch_hosts: Vec<crate::hosts::HostId>,
     default_launch_host: crate::hosts::HostId,
@@ -1196,6 +1228,7 @@ pub struct PlanningView {
 impl PlanningView {
     pub fn new() -> Self {
         PlanningView {
+            keybinding_helper_visible: true,
             launch_host: crate::hosts::HostId::local(),
             launch_hosts: vec![crate::hosts::HostId::local()],
             default_launch_host: crate::hosts::HostId::local(),
@@ -1824,17 +1857,13 @@ impl PlanningView {
             return;
         }
         if self.cursor.col >= self.grid_col_scroll.len() { return; }
-        let off = self.grid_col_scroll[self.cursor.col];
-        if self.cursor.row < off {
-            self.grid_col_scroll[self.cursor.col] = self.cursor.row;
-            return;
+        if let Some(rows) = self.cursor_visible_column() {
+            let backgrounds = subsection_backgrounds(&rows);
+            self.grid_col_scroll[self.cursor.col] = column_scroll_start(
+                &rows, &backgrounds, self.grid_col_scroll[self.cursor.col],
+                Some(self.cursor.row), h,
+            );
         }
-        // cursor.row already indexes the visible-row projection, so
-        // the count "off..=cursor.row" is cursor.row - off + 1.
-        let visible = self.cursor.row.saturating_sub(off).saturating_add(1);
-        if visible <= h { return; }
-        self.grid_col_scroll[self.cursor.col] =
-            self.cursor.row.saturating_sub(h - 1);
     }
 
     /// Build the tree-aware visible-row list for one column. Top-level
@@ -4016,7 +4045,8 @@ impl PlanningView {
         // The `[debug]` row is a dev aid, off by default (reclaims a
         // list row); CM_PLANNING_DEBUG=1 brings it back.
         let debug_on = planning_debug_enabled();
-        let help_h = if debug_on { 4u16 } else { 3u16 };
+        let help_h = if !self.keybinding_helper_visible { 0u16 }
+            else if debug_on { 4u16 } else { 3u16 };
         let grid_height = inner.height.saturating_sub(help_h) as usize;
         let num_cols = self.unified_cols.len().max(1);
         let col_width = inner.width / num_cols as u16;
@@ -4085,6 +4115,7 @@ impl PlanningView {
         }
 
         // Help.
+        if !self.keybinding_helper_visible { return; }
         let help_y = inner.y + inner.height.saturating_sub(help_h);
         let help_area = Rect::new(inner.x, help_y, inner.width, help_h);
         let mut help_lines = vec![self.footer_sep_line(inner.width as usize, dim)];
@@ -4145,10 +4176,15 @@ impl PlanningView {
         let rows = self.visible_rows_for_column(pi, ci);
         let mut items = Vec::new();
         let search_q = self.active_search_query();
-        let start = self.grid_col_scroll.get(col_idx).copied().unwrap_or(0).min(rows.len());
+        let backgrounds = subsection_backgrounds(&rows);
+        let start = column_scroll_start(
+            &rows, &backgrounds, self.grid_col_scroll.get(col_idx).copied().unwrap_or(0),
+            (self.cursor.col == col_idx).then_some(self.cursor.row), max_rows,
+        );
+        let mut used_lines = 0;
 
         for ri in start..rows.len() {
-            if items.len() >= max_rows { break; }
+            if used_lines >= max_rows { break; }
             let is_selected = self.cursor.col == col_idx && self.cursor.row == ri;
             let in_visual = self.is_in_visual_range(col_idx, ri);
             let row = &rows[ri];
@@ -4224,46 +4260,33 @@ impl PlanningView {
                     if !count_suffix.is_empty() {
                         spans.push(Span::styled(count_suffix, Style::default().fg(theme::DIM)));
                     }
-                    // A short rule on the final member makes the subsection
-                    // boundary visible without adding a selectable row.
-                    let group_ends = rows.get(ri + 1).map_or(true, |next| {
-                        let next_slug = match visible_row_slug(next) {
-                            Some(slug) => slug,
-                            None => return true,
-                        };
-                        let next_task = self.project_data.iter().find_map(|pd| {
-                            if pd.project.name == project_name {
-                                pd.tasks.iter().find(|t| t.slug == next_slug)
-                            } else { None }
-                        });
-                        next_task.and_then(|t| t.initiative_id.as_deref())
-                            != task.and_then(|t| t.initiative_id.as_deref())
-                    });
-                    if task.and_then(|t| t.initiative_id.as_ref()).is_some() && group_ends {
-                        spans.push(Span::styled("  ┄", Style::default().fg(theme::DIM)));
-                    }
                     let line = Line::from(spans);
                     let conflict = self.is_conflict(project_name, slug);
                     let base_fg = if is_claude { theme::REMOTE } else { theme::MUTED };
-                    let initiative_bg = task.and_then(|t| t.initiative_id.as_deref())
-                        .map(|id| initiative_tint(task.and_then(|t| t.initiative_color.as_deref()), id));
+                    let base_style = Style::default().fg(base_fg)
+                        .bg(backgrounds[ri].unwrap_or(Color::Reset));
                     let style = if is_selected && in_visual {
                         Style::default().fg(theme::TEXT).bg(theme::SELECT_BG).add_modifier(Modifier::BOLD)
                     } else if is_selected {
-                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                        base_style.fg(theme::TEXT).add_modifier(Modifier::BOLD)
                     } else if in_visual {
                         Style::default().fg(theme::TEXT).bg(theme::SELECT_BG)
                     } else {
-                        let mut style = Style::default().fg(base_fg);
-                        if let Some(bg) = initiative_bg { style = style.bg(bg); }
-                        style
+                        base_style
                     };
                     let style = if conflict && is_selected {
                         style.bg(theme::ERROR).fg(theme::TEXT)
                     } else if conflict {
                         style.bg(theme::CONFLICT_BG)
                     } else { style };
-                    items.push(ListItem::new(line).style(style));
+                    let mut lines = vec![line];
+                    if subsection_ends(&rows, ri, &backgrounds) && max_rows - used_lines > 1 {
+                        lines.push(Line::from(" ╰──").style(
+                            Style::default().fg(theme::DIM).bg(Color::Reset),
+                        ));
+                    }
+                    used_lines += lines.len().saturating_sub(1);
+                    items.push(ListItem::new(lines).style(style));
                 }
                 (Some(GridItem::Separator), None) => {
                     let ch = if is_selected { "\u{2501}" } else { "\u{2500}" };
@@ -4274,7 +4297,8 @@ impl PlanningView {
                     items.push(ListItem::new(Line::from("")));
                 }
                 (Some(GridItem::Header(text)), None) => {
-                    let base_style = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
+                    let base_style = Style::default().fg(theme::TEXT)
+                        .bg(backgrounds[ri].unwrap_or(Color::Reset)).add_modifier(Modifier::BOLD);
                     let style = if is_selected && in_visual {
                         base_style.bg(theme::SELECT_BG)
                     } else if is_selected {
@@ -4290,22 +4314,23 @@ impl PlanningView {
                     } else {
                         text.clone()
                     };
-                    items.push(ListItem::new(Line::from(Span::styled(display, style))));
+                    items.push(ListItem::new(Line::from(display)).style(style));
                 }
                 (None, None) => {
-                    if let VisibleRowKind::InitiativeHeader { id, name, color } = &row.kind {
+                    if let VisibleRowKind::InitiativeHeader { name, color, .. } = &row.kind {
                         let accent = color.as_deref().and_then(theme::user_color).unwrap_or(theme::HEADER);
-                        let tint = initiative_tint(color.as_deref(), id);
+                        let tint = theme::subsection_bg(color.as_deref());
                         let prefix = format!("▸ {}", name);
                         let display = truncate_with_ellipsis(&prefix, width.saturating_sub(1));
                         let mut style = Style::default().fg(accent).bg(tint).add_modifier(Modifier::BOLD);
                         if is_selected && in_visual { style = style.bg(theme::SELECT_BG); }
                         else if is_selected { style = style.bg(theme::HEADER_SELECT_BG); }
-                        items.push(ListItem::new(Line::from(Span::styled(display, style))));
+                        items.push(ListItem::new(Line::from(display)).style(style));
                     }
                 }
                 _ => {}
             }
+            used_lines += 1;
         }
         items
     }
@@ -4339,8 +4364,9 @@ impl PlanningView {
             ("A-p    filter", "/      search"),
             ("n      next match", "N      prev match"),
         ];
-        let help_rows = help_entries.len() as u16;
-        let list_height = inner.height.saturating_sub(help_rows + 2) as usize;
+        let help_rows = if self.keybinding_helper_visible { help_entries.len() as u16 } else { 0 };
+        let help_height = if self.keybinding_helper_visible { help_rows + 2 } else { 0 };
+        let list_height = inner.height.saturating_sub(help_height) as usize;
         let dim = Style::default().fg(theme::DIM);
         self.grid_rows_visible.set(list_height);
 
@@ -4469,6 +4495,7 @@ impl PlanningView {
 
         frame.render_widget(List::new(items), Rect { x: inner.x, y: inner.y, width: inner.width, height: list_height as u16 });
 
+        if !self.keybinding_helper_visible { return; }
         let help_y = inner.y + inner.height.saturating_sub(help_rows + 1);
         let help_area = Rect { x: inner.x, y: help_y, width: inner.width, height: help_rows + 1 };
         let sep = self.footer_sep_line(inner.width as usize, dim);
@@ -5084,6 +5111,97 @@ mod tests {
         assert!(matches!(&rows[2].kind, VisibleRowKind::InitiativeHeader { name, id, .. } if name == "Standalone" && id == "__standalone__"));
         assert!(matches!(rows[1].kind, VisibleRowKind::Layout { item: GridItem::Task(ref slug), .. } if slug == "initiative-task"));
         assert!(matches!(rows[3].kind, VisibleRowKind::Layout { item: GridItem::Task(ref slug), .. } if slug == "standalone"));
+    }
+
+    fn subsection_test_view() -> PlanningView {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        let mut parent = make_task("a", "parent", None);
+        parent.initiative_id = Some("initiative".into());
+        parent.initiative_name = Some("Research".into());
+        parent.initiative_color = Some("blue".into());
+        let mut child = make_task("b", "nested-child", Some("a"));
+        child.initiative_id = parent.initiative_id.clone();
+        child.initiative_color = parent.initiative_color.clone();
+        pd.tasks = vec![parent, child, make_task("c", "independent", None)];
+        pd.layout.columns = vec![vec![GridItem::Task("parent".into()),
+            GridItem::Task("nested-child".into()), GridItem::Task("independent".into())]];
+        view.project_data.push(pd);
+        view.expanded_tasks.insert("a".into());
+        view.rebuild_unified_cols();
+        view
+    }
+
+    fn subsection_buffer(view: &PlanningView, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::widgets::Widget;
+        let area = Rect::new(0, 0, 36, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        List::new(view.build_column_items(0, "p", 0, 0, 36, height as usize)).render(area, &mut buffer);
+        buffer
+    }
+
+    #[test]
+    fn subsection_shading_covers_members_and_leaves_an_unshaded_end() {
+        let mut view = subsection_test_view();
+        view.cursor.row = 1; // Selected parent must retain the group background.
+        let buffer = subsection_buffer(&view, 10);
+        let blue = theme::subsection_bg(Some("blue"));
+        for y in [0, 1, 2] {
+            assert_eq!(buffer[(35, y)].bg, blue, "header/parent/child fill the full width");
+        }
+        assert_eq!(buffer[(35, 3)].bg, Color::Reset);
+        assert_eq!(buffer[(1, 3)].symbol(), "╰");
+        for y in [4, 5] {
+            assert_eq!(buffer[(35, y)].bg, theme::subsection_bg(None), "Standalone groups also have a surface");
+        }
+        assert_eq!(buffer[(35, 6)].bg, Color::Reset);
+        assert_eq!(buffer[(1, 6)].symbol(), "╰");
+        view.visual_anchor = Some(1);
+        let buffer = subsection_buffer(&view, 10);
+        assert_eq!(buffer[(35, 1)].bg, theme::SELECT_BG);
+        assert_eq!(buffer[(35, 3)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn subsection_navigation_accounts_for_endings_and_small_viewports() {
+        let mut view = subsection_test_view();
+        let rows = view.visible_rows_for_column(0, 0);
+        for height in [1, 2, 3, 5] {
+            view.grid_rows_visible.set(height);
+            for row in 0..rows.len() {
+                view.cursor.row = row;
+                view.ensure_cursor_visible();
+                let buffer = subsection_buffer(&view, height as u16);
+                let text = buffer.content().iter().map(|cell| cell.symbol()).collect::<String>();
+                if let Some(slug) = visible_row_slug(&rows[row]) {
+                    assert!(text.contains(slug), "selected {slug} missing at height {height}: {text}");
+                }
+            }
+        }
+        view.grid_rows_visible.set(3);
+        view.cursor.row = 2; // Last child, followed by a display-only closing line.
+        view.navigate_vertical(1);
+        assert_eq!(view.cursor.row, 3, "next navigation lands on Standalone header");
+        view.navigate_vertical(1);
+        assert_eq!(view.selected_slug().as_deref(), Some("independent"));
+    }
+
+    #[test]
+    fn hidden_planning_helper_reclaims_space_in_both_views() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut view = subsection_test_view();
+        for linear in [false, true] {
+            view.linear_mode = linear;
+            let mut terminal = Terminal::new(TestBackend::new(100, 35)).unwrap();
+            view.keybinding_helper_visible = true;
+            terminal.draw(|frame| view.draw(frame, frame.area())).unwrap();
+            let with_helper = view.grid_rows_visible.get();
+            view.keybinding_helper_visible = false;
+            terminal.draw(|frame| view.draw(frame, frame.area())).unwrap();
+            let text = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+            assert!(!text.contains("A-j/k"));
+            assert!(view.grid_rows_visible.get() > with_helper);
+        }
     }
 
     #[test]

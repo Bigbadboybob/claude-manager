@@ -393,6 +393,43 @@ mod layout_tests {
         app
     }
 
+    #[test]
+    fn helper_shortcut_never_starts_or_submits_search() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        for mode in [ViewMode::Sessions, ViewMode::Planning] {
+            app.view_mode = mode;
+            for (code, modifiers) in [
+                (KeyCode::Char('?'), KeyModifiers::ALT),
+                (KeyCode::Char('?'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+                (KeyCode::Char('/'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            ] {
+                app.input_mode = InputMode::Normal;
+                app.sidebar_filter = Some("keep-filter".into());
+                app.keybinding_helper_visible = true;
+                assert!(app.handle_event(&Event::Key(KeyEvent::new(code, modifiers))));
+                assert!(!app.keybinding_helper_visible);
+                assert!(!app.planning.keybinding_helper_visible);
+                assert!(matches!(app.input_mode, InputMode::Normal));
+                assert_eq!(app.sidebar_filter.as_deref(), Some("keep-filter"));
+                assert!(app.handle_event(&Event::Key(KeyEvent::new(code, modifiers))));
+                assert!(app.keybinding_helper_visible);
+            }
+        }
+        app.view_mode = ViewMode::Sessions;
+        let slash = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        app.handle_event(&slash);
+        assert!(app.sidebar_filter.is_none(), "plain A-/ still clears the filter");
+        app.handle_event(&slash);
+        assert!(matches!(app.input_mode, InputMode::SidebarSearch { .. }));
+        app.input_mode = InputMode::SidebarSearch { query: "unfinished".into() };
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('/'), KeyModifiers::ALT | KeyModifiers::SHIFT,
+        )));
+        assert!(matches!(&app.input_mode, InputMode::SidebarSearch { query } if query == "unfinished"));
+        assert!(app.sidebar_filter.is_none(), "helper toggle must not apply a search modal");
+    }
+
     /// Workspace ids in the order the Task sub-view lays them out, with
     /// section headers rendered as `#<id>`.
     fn layout(app: &App) -> Vec<String> {

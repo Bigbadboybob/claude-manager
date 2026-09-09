@@ -132,3 +132,12 @@ pub(crate) fn cycle_user_color(current: Option<&str>, forward: bool) -> Option<S
         Some(USER_COLORS[next - 1].0.to_string())
     }
 }
+
+/// Quiet planning subsection surfaces, with optional user-color accents.
+/// Keep a neutral base so missing colors are visible rather than near black.
+pub(crate) fn subsection_bg(color: Option<&str>) -> Color {
+    match color.and_then(user_color) {
+        Some(Color::Rgb(r, g, b)) => Color::Rgb(16 + r / 12, 18 + g / 12, 22 + b / 12),
+        _ => Color::Rgb(25, 29, 38),
+    }
+}
