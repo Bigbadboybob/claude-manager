@@ -247,6 +247,11 @@ pub(super) enum InputMode {
         query: String,
         selected: usize,
     },
+    /// Persistent sidebar filter edited by A-/. Enter applies it; pressing
+    /// A-/ again while the filter is active clears it.
+    SidebarSearch {
+        query: String,
+    },
     /// Read-only info overlay for the focused row (A-i, Sessions view):
     /// bound-task detail (name/status/prompt) or the workspace fallback.
     /// `lines` are assembled once at open. `max_scroll` is written back
@@ -574,6 +579,7 @@ pub(crate) enum SubmitAction {
     PaletteJump {
         target: PaletteTarget,
     },
+    SetSidebarFilter { query: String },
     /// Confirmed Y on the "Restore N closed sessions?" prompt.
     RestoreTombstones {
         ws_id: String,
@@ -2140,6 +2146,28 @@ pub(crate) fn handle_session_palette(
     }
 }
 
+/// A-/ sidebar filter. Unlike the jump palette, Enter keeps the filter active
+/// so the operator can navigate a small result set; A-/ clears it from the
+/// normal view.
+pub(crate) fn handle_sidebar_search(query: &mut String, event: &CrosstermEvent) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('/') {
+        return InputOutcome::Submit(SubmitAction::SetSidebarFilter { query: query.clone() });
+    }
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SetSidebarFilter { query: query.clone() }),
+        KeyCode::Backspace => { query.pop(); InputOutcome::Consumed }
+        KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            query.push(c);
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
 /// A-i read-only peek: j/k, Up/Down, PgUp/PgDn scroll (no text input in
 /// this modal); Esc, q, or A-i again close. `max_scroll` comes from the
 /// modal state (written back by the draw) so scrolling clamps to the
@@ -2997,6 +3025,27 @@ impl App {
                         self.open_session_palette();
                         return true;
                     }
+                    // A-/: persistent sidebar filter. Repeating it from the
+                    // normal view clears the current filter.
+                    KeyCode::Char('/') => {
+                        if self.sidebar_filter.is_some() {
+                            self.sidebar_filter = None;
+                            self.set_status_msg("Sidebar filter cleared");
+                        } else {
+                            self.input_mode = InputMode::SidebarSearch { query: String::new() };
+                        }
+                        return true;
+                    }
+                    // A-? toggles the compact keybinding footer.
+                    KeyCode::Char('?') => {
+                        self.keybinding_helper_visible = !self.keybinding_helper_visible;
+                        self.set_status_msg(if self.keybinding_helper_visible {
+                            "Keybinding helper shown"
+                        } else {
+                            "Keybinding helper hidden (A-? toggles it)"
+                        });
+                        return true;
+                    }
                     // A-i: read-only info peek for the focused row.
                     KeyCode::Char('i') => {
                         self.open_task_peek();
@@ -3754,6 +3803,7 @@ impl App {
                     event,
                 )
             }
+            InputMode::SidebarSearch { query } => handle_sidebar_search(query, event),
             InputMode::TaskPeek { scroll, max_scroll, .. } => {
                 handle_task_peek(scroll, *max_scroll, event)
             }
@@ -4207,6 +4257,14 @@ impl App {
             SubmitAction::PaletteJump { target } => {
                 self.apply_palette_jump(target);
             }
+            SubmitAction::SetSidebarFilter { query } => {
+                self.sidebar_filter = (!query.trim().is_empty()).then(|| query.trim().to_string());
+                self.clamp_cursor();
+                self.set_status_msg(match self.sidebar_filter.as_deref() {
+                    Some(q) => format!("Sidebar filter: {q}  (A-/ clears)"),
+                    None => "Sidebar filter cleared".to_string(),
+                }.as_str());
+            }
         }
     }
 }
@@ -4406,6 +4464,19 @@ mod input_handler_tests {
 
     fn ctx_no_repos<'a>() -> InputCtx<'a> {
         InputCtx { repo_urls: &[], host_ids: &[], section_ids: &[] }
+    }
+
+    #[test]
+    fn sidebar_search_applies_on_enter_and_alt_slash() {
+        let mut query = "worker".to_string();
+        for event in [key(KeyCode::Enter), CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT))] {
+            match handle_sidebar_search(&mut query, &event) {
+                InputOutcome::Submit(SubmitAction::SetSidebarFilter { query: got }) => {
+                    assert_eq!(got, "worker");
+                }
+                other => panic!("expected filter submit, got {other:?}"),
+            }
+        }
     }
 
     fn assert_consumed(o: &InputOutcome) {

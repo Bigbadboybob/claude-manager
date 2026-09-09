@@ -8,7 +8,7 @@ use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButt
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::agent;
@@ -225,6 +225,12 @@ pub struct App {
     /// if the saved session is gone.
     pub saved_continuous_uid: Option<String>,
     pub sidebar_view: SidebarView,
+    /// Case-insensitive filter applied to the sessions/tasks sidebar.
+    pub sidebar_filter: Option<String>,
+    /// Whether the compact keybinding footer is visible in the main sidebar.
+    pub keybinding_helper_visible: bool,
+    sidebar_list_state: ListState,
+    continuous_list_state: ListState,
     pub view_mode: ViewMode,
     pub planning: PlanningView,
     pub should_quit: bool,
@@ -342,8 +348,8 @@ pub struct App {
     /// out to loose). Absent = inherit through the task tree. Persisted as
     /// `Manifest::workspace_sections`.
     pub(crate) workspace_sections: HashMap<String, String>,
-    /// Cloud backtest runs, rendered as the sidebar's `backtests` group
-    /// instead of per-task workspaces (they never hold a local session).
+    /// Cloud backtest runs, rendered in the continuous panel's `backtests`
+    /// group instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
     /// [`backtests::update_backtest_rows`]; in-memory only.
     pub(crate) backtest_rows: Vec<BacktestRow>,
@@ -861,6 +867,10 @@ impl App {
             mru_walk: None,
             saved_continuous_uid: None,
             sidebar_view,
+            sidebar_filter: None,
+            keybinding_helper_visible: true,
+            sidebar_list_state: ListState::default(),
+            continuous_list_state: ListState::default(),
             view_mode: ViewMode::Sessions,
             planning: PlanningView::new(),
             should_quit: false,

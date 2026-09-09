@@ -362,8 +362,8 @@ pub(super) enum VisualItem {
     /// group. Non-selectable. See
     /// DESIGN_CONTINUOUS_TASKS.md §12.
     ContinuousHeader,
-    /// Cloud-backtests group header, appended at the bottom of BOTH
-    /// sidebar sub-views when any backtest row is live. SELECTABLE
+    /// Cloud-backtests group header, appended at the bottom of the
+    /// continuous column when any backtest row is live. SELECTABLE
     /// (unlike `ContinuousHeader`) so Space/Enter can fold the group.
     BacktestHeader,
     /// A fleet row inside the backtests group: ≥2 runs sharing a label
@@ -648,16 +648,73 @@ impl App {
         }
     }
 
-    /// Build visual items for the current sidebar view. The cloud-backtests
-    /// group rides at the bottom of BOTH sub-views (its rows aren't sessions,
-    /// so neither sub-view's own builder can place them).
+    /// Build visual items for the current main sidebar view. Cloud backtests
+    /// are owned by the dedicated continuous column and are returned by
+    /// [`continuous_backtest_items`].
     pub(super) fn visual_items(&self) -> Vec<VisualItem> {
         let mut items = match self.sidebar_view {
             SidebarView::Status => self.visual_items_status(),
             SidebarView::Task => self.visual_items_task(),
         };
-        self.append_backtest_items(&mut items);
+        if let Some(query) = self.sidebar_filter.as_deref() {
+            let query = query.to_lowercase();
+            items.retain(|item| self.visual_item_matches(item, &query));
+            while matches!(items.first(), Some(VisualItem::Separator)) {
+                items.remove(0);
+            }
+            while matches!(items.last(), Some(VisualItem::Separator)) {
+                items.pop();
+            }
+        }
         items
+    }
+
+    /// Rows for the dedicated right-hand column after backtests moved there.
+    pub(super) fn continuous_backtest_items(&self) -> Vec<VisualItem> {
+        let mut items = Vec::new();
+        self.append_backtest_items(&mut items);
+        if let Some(query) = self.sidebar_filter.as_deref() {
+            let query = query.to_lowercase();
+            items.retain(|item| self.visual_item_matches(item, &query));
+            while matches!(items.first(), Some(VisualItem::Separator)) {
+                items.remove(0);
+            }
+            while matches!(items.last(), Some(VisualItem::Separator)) {
+                items.pop();
+            }
+        }
+        items
+    }
+
+    fn visual_item_matches(&self, item: &VisualItem, query: &str) -> bool {
+        let contains = |s: &str| s.to_lowercase().contains(query);
+        match item {
+            VisualItem::WorkspaceHeader(wi) => self.workspaces.get(*wi).is_some_and(|w| contains(&w.name)),
+            VisualItem::Session(wi, si) => self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si)).is_some_and(|s| {
+                contains(&s.label)
+                    || s.task_id.as_deref().and_then(|id| self.find_task_entry(id)).is_some_and(|t| contains(&t.name))
+            }),
+            VisualItem::TaskHeader { task_id, .. } => self.find_task_entry(task_id).is_some_and(|t| contains(&t.name) || contains(task_id)),
+            VisualItem::WorkflowHeader { run_id, .. } => contains(run_id),
+            VisualItem::SectionHeader(id) => self.section_by_id(id).is_some_and(|s| contains(&s.name) || contains(id)),
+            VisualItem::BacktestHeader => contains("backtest") || self.backtest_rows.iter().any(|r| contains(&r.label)),
+            VisualItem::BacktestFleet(stem) => contains(stem),
+            VisualItem::BacktestRun { task_id, .. } => self.backtest_rows.iter().find(|r| r.task_id == *task_id).is_some_and(|r| contains(&r.label) || contains(task_id)),
+            VisualItem::ContinuousHeader | VisualItem::Separator => false,
+        }
+    }
+
+    pub(super) fn sidebar_cursor_index(&self, items: &[VisualItem]) -> Option<usize> {
+        items.iter().position(|item| match (&self.cursor, item) {
+            (Cursor::Workspace(a), VisualItem::WorkspaceHeader(b)) => a == b,
+            (Cursor::Session(a, b), VisualItem::Session(c, d)) => a == c && b == d,
+            (Cursor::Task { ws_idx, task_id }, VisualItem::TaskHeader { ws_idx: a, task_id: b }) => ws_idx == a && task_id == b,
+            (Cursor::Section(a), VisualItem::SectionHeader(b)) => a == b,
+            (Cursor::Backtest(BacktestCursor::Group), VisualItem::BacktestHeader) => true,
+            (Cursor::Backtest(BacktestCursor::Fleet(a)), VisualItem::BacktestFleet(b)) => a == b,
+            (Cursor::Backtest(BacktestCursor::Run(a)), VisualItem::BacktestRun { task_id: b, .. }) => a == b,
+            _ => false,
+        })
     }
 
     /// Append the `backtests` group: a header (with rollup counts when
@@ -1176,6 +1233,10 @@ impl App {
                 rows.extend(group_rows);
             }
         }
+        if let Some(query) = self.sidebar_filter.as_deref() {
+            let query = query.to_lowercase();
+            rows.retain(|r| self.visual_item_matches(&VisualItem::Session(r.ws_idx, r.sess_idx), &query));
+        }
         rows
     }
 
@@ -1209,7 +1270,8 @@ impl App {
         match (self.cursor_column, dir) {
             (SidebarColumn::Main, d) if d > 0 => {
                 let rows = self.visual_items_continuous();
-                if rows.is_empty() {
+                let backtests = self.continuous_backtest_items();
+                if rows.is_empty() && backtests.is_empty() {
                     return;
                 }
                 // Restore the last continuous spot by UID (stable across a
@@ -1225,6 +1287,9 @@ impl App {
                     })
                     .map(|r| Cursor::Session(r.ws_idx, r.sess_idx))
                     .unwrap_or_else(|| {
+                        if rows.is_empty() {
+                            return Cursor::Backtest(BacktestCursor::Group);
+                        }
                         let r = rows[0];
                         Cursor::Session(r.ws_idx, r.sess_idx)
                     });
@@ -1253,7 +1318,8 @@ impl App {
         // (every row is a selectable session, so just wrap ±1).
         if self.cursor_column == SidebarColumn::Continuous && self.continuous_column_on {
             let rows = self.visual_items_continuous();
-            if rows.is_empty() {
+            let backtests = self.continuous_backtest_items();
+            if rows.is_empty() && backtests.is_empty() {
                 // Column emptied out from under us — fall back to main.
                 self.cursor = self
                     .saved_main_cursor
@@ -1266,13 +1332,25 @@ impl App {
                 Cursor::Session(wi, si) => rows
                     .iter()
                     .position(|r| r.ws_idx == *wi && r.sess_idx == *si)
-                    .unwrap_or(0),
+                    .unwrap_or_else(|| (rows.len() + backtests.len()).saturating_sub(1)),
+                Cursor::Backtest(BacktestCursor::Group) => rows.len() + backtests.iter().position(|v| matches!(v, VisualItem::BacktestHeader)).unwrap_or(0),
+                Cursor::Backtest(BacktestCursor::Fleet(stem)) => rows.len() + backtests.iter().position(|v| matches!(v, VisualItem::BacktestFleet(s) if s == stem)).unwrap_or(0),
+                Cursor::Backtest(BacktestCursor::Run(id)) => rows.len() + backtests.iter().position(|v| matches!(v, VisualItem::BacktestRun { task_id, .. } if task_id == id)).unwrap_or(0),
                 _ => 0,
             };
-            let n = rows.len() as i32;
+            let n = (rows.len() + backtests.len()) as i32;
             let next = (cur as i32 + direction).rem_euclid(n) as usize;
-            let r = rows[next];
-            self.cursor = Cursor::Session(r.ws_idx, r.sess_idx);
+            if next < rows.len() {
+                let r = rows[next];
+                self.cursor = Cursor::Session(r.ws_idx, r.sess_idx);
+            } else {
+                self.cursor = match &backtests[next - rows.len()] {
+                    VisualItem::BacktestHeader => Cursor::Backtest(BacktestCursor::Group),
+                    VisualItem::BacktestFleet(stem) => Cursor::Backtest(BacktestCursor::Fleet(stem.clone())),
+                    VisualItem::BacktestRun { task_id, .. } => Cursor::Backtest(BacktestCursor::Run(task_id.clone())),
+                    _ => Cursor::Backtest(BacktestCursor::Group),
+                };
+            }
             return;
         }
 
@@ -1338,10 +1416,11 @@ impl App {
                 (Cursor::Section(id), VisualItem::SectionHeader(vid)) => id == vid,
                 _ => false,
             })
-            .unwrap_or(0);
+            .map(|p| p as i32)
+            .unwrap_or(-1);
 
         let len = items.len() as i32;
-        let mut next = cur_pos as i32;
+        let mut next = cur_pos;
         for _ in 0..items.len() {
             next = (next + direction).rem_euclid(len);
             if is_selectable(&items[next as usize]) {

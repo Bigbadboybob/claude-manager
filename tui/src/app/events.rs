@@ -7685,7 +7685,7 @@ mod backtest_group_tests {
         });
     }
 
-    /// Sidebar shape: the group rides at the bottom of BOTH sub-views; a
+    /// Sidebar shape: the group rides at the bottom of the continuous panel;
     /// perf-bench fleet (shared label stem) renders as ONE fleet row —
     /// members hidden until unfolded — while an unrelated run stays flat.
     /// Folding the group collapses everything to the header.
@@ -7703,7 +7703,7 @@ mod backtest_group_tests {
 
             for view in [SidebarView::Status, SidebarView::Task] {
                 app.sidebar_view = view;
-                let items = app.visual_items();
+                let items = app.continuous_backtest_items();
                 assert!(
                     items.iter().any(|v| matches!(v, VisualItem::BacktestHeader)),
                     "group header present in both sub-views",
@@ -7732,7 +7732,7 @@ mod backtest_group_tests {
             app.cursor =
                 Cursor::Backtest(BacktestCursor::Fleet("perf-bench-hist-k3".into()));
             assert!(app.toggle_backtest_fold());
-            let items = app.visual_items();
+            let items = app.continuous_backtest_items();
             let members: Vec<&str> = items
                 .iter()
                 .filter_map(|v| match v {
@@ -7752,7 +7752,7 @@ mod backtest_group_tests {
                 Cursor::Backtest(BacktestCursor::Fleet("perf-bench-hist-k3".into())),
             );
             assert!(
-                !app.visual_items()
+                !app.continuous_backtest_items()
                     .iter()
                     .any(|v| matches!(v, VisualItem::BacktestRun { depth: 1, .. })),
             );
@@ -7760,7 +7760,7 @@ mod backtest_group_tests {
             // Fold the whole group → header only.
             app.cursor = Cursor::Backtest(BacktestCursor::Group);
             assert!(app.toggle_backtest_fold());
-            let items = app.visual_items();
+            let items = app.continuous_backtest_items();
             assert!(items.iter().any(|v| matches!(v, VisualItem::BacktestHeader)));
             assert!(!items.iter().any(|v| matches!(
                 v,
@@ -7786,11 +7786,12 @@ mod backtest_group_tests {
                 api_task("solo", "backlog", "backtest", true, "one-off", None),
             ]);
             app.sidebar_view = SidebarView::Task;
+            app.continuous_column_on = true;
 
             app.cursor = Cursor::Session(0, 0);
             assert!(app.active_session().is_some(), "real session untouched");
 
-            app.navigate(1);
+            app.step_column(1);
             assert_eq!(app.cursor, Cursor::Backtest(BacktestCursor::Group));
             assert!(
                 app.active_session().is_none(),
@@ -7802,7 +7803,9 @@ mod backtest_group_tests {
                 Cursor::Backtest(BacktestCursor::Run("solo".into())),
             );
             app.navigate(1);
-            assert_eq!(app.cursor, Cursor::Session(0, 0), "wraps back to sessions");
+            assert_eq!(app.cursor, Cursor::Backtest(BacktestCursor::Group), "wraps inside continuous panel");
+            app.step_column(-1);
+            assert_eq!(app.cursor, Cursor::Session(0, 0), "returns to the main session");
 
             // Cursor on a row that then leaves the group → clamp steps up to
             // the header; group emptied entirely → falls back to workspaces.
