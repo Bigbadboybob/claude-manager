@@ -58,6 +58,17 @@ impl Management {
     }
 }
 impl Messages {
+    pub(super) fn norms_scope(&self) -> &str {
+        self.target["norms_scope"].as_str().unwrap_or("global")
+    }
+    pub(super) fn norms_key(&self) -> String {
+        if self.norms_scope() == "global" { self.space_id.clone() }
+        else { format!("{}:{}", self.space_id, self.norms_scope()) }
+    }
+    fn norms_changed(&self) -> bool {
+        let scope = self.norms_scope();
+        self.management.context["current"][scope] != self.management.context["acknowledged"][scope]
+    }
     pub(super) fn management_view(&self) -> bool {
         self.target["norms"] == true
             || self.target["monitors"] == true
@@ -125,12 +136,16 @@ impl Messages {
         }
         Err("Scope: #channel, #channel/**, @person, dms, or thread:message-id".into())
     }
+    fn management_form_key(&self, mode: &str) -> String {
+        if mode == "norm_summary" { format!("norm_summary:{}", self.norms_key()) }
+        else { mode.into() }
+    }
     fn begin_management_form(&mut self, mode: &str, defaults: Vec<String>) {
         let fields = self
             .saved
             .management
             .forms
-            .get(mode)
+            .get(&self.management_form_key(mode))
             .cloned()
             .unwrap_or(defaults);
         self.start_form(mode, fields);
@@ -144,7 +159,7 @@ impl Messages {
             self.saved
                 .management
                 .forms
-                .insert(self.mode.clone(), self.fields.clone());
+                .insert(self.management_form_key(&self.mode), self.fields.clone());
             self.persist();
         }
     }
@@ -163,7 +178,8 @@ impl Messages {
             return "Tab field · Enter save/review · Esc keeps draft".into();
         }
         if self.target["norms"] == true {
-            return "d diff · h history · g current · p edit · v revert · D archive draft · Enter acknowledge · ] next".into();
+            return format!("{}d diff · h history · g current · p edit · v revert · D archive draft · Enter acknowledge · ] next",
+                if self.target["norms_channel"].is_string() { "b channel · " } else { "" });
         }
         if self.target["monitors"] == true {
             return "n new · Enter results/open · a acknowledge · x cancel · D dismiss · X cancel all · b list · ] next".into();
@@ -261,10 +277,16 @@ impl App {
     }
     pub(super) fn messaging_refresh_target(&mut self) {
         if self.messages.target["norms"] == true {
-            if self.messages.management.doc.is_null() {
+            if self.messages.management.doc.is_null() || self.messages.management.doc["scope"].as_str().unwrap_or("global") != self.messages.norms_scope() {
+                self.messages.management.doc = Value::Null;
+                self.messages.management.text.clear();
+                self.messages.management.history.clear();
+                self.messages.management.current_revision.clear();
+                self.messages.management.current_text.clear();
+                self.messages.management.after_document.clear();
                 self.messaging_document(json!({"action":"read"}));
             } else {
-                self.messaging_request("messaging.open", json!({"claim_bell":true}));
+                self.messaging_request("messaging.open", json!({"claim_bell":true,"scope":self.messages.norms_scope(),"conversation":self.messages.target["norms_channel"]}));
             }
         } else if self.messages.target["monitors"] == true {
             if self.messages.management.view == "results" || self.messages.management.paging {
@@ -296,6 +318,9 @@ impl App {
         self.messaging_request("norms_document", p);
     }
     pub(super) fn messaging_mutation(&mut self, method: &str, mut p: Value) {
+        if method == "messaging.norms" && p.get("scope").is_none() {
+            p["scope"] = json!(self.messages.norms_scope());
+        }
         if self.messages.saved.management.pending.is_some() {
             self.messages.error = "A saved operation is pending; press R to retry it first".into();
             return;
@@ -384,7 +409,7 @@ impl App {
             self.messages.management.viewed = 0;
             self.messages.body_scroll = 0;
             if v["format"] == "markdown"
-                && v["revision"] == self.messages.management.context["current"]["global"]
+                && v["revision"] == self.messages.management.context["current"][self.messages.norms_scope()]
             {
                 self.messages.management.current_text = self.messages.management.text.clone();
                 self.messages.management.current_revision =
@@ -396,7 +421,7 @@ impl App {
             }
             if next == "rebase" {
                 let m = &mut self.messages;
-                if let Some(d) = m.saved.management.norms.get_mut(&m.space_id) {
+                if let Some(d) = m.saved.management.norms.get_mut(&m.norms_key()) {
                     d.base = m.management.current_text.clone();
                     d.revision = m.management.current_revision.clone();
                 }
@@ -426,16 +451,16 @@ impl App {
                     .saved
                     .management
                     .norms
-                    .get(&self.messages.space_id)
+                    .get(&self.messages.norms_key())
                     .map(|d| d.revision.clone());
-                self.messaging_document(json!({"action":"diff","since":{"global":since},"revision":v["current_revision"]}));
+                self.messaging_document(json!({"action":"diff","since":{(self.messages.norms_scope()):since},"revision":v["current_revision"]}));
             } else if v["status"] == "published" {
                 self.messages
                     .saved
                     .management
                     .norms
-                    .remove(&self.messages.space_id);
-                self.messages.saved.management.forms.remove("norm_summary");
+                    .remove(&self.messages.norms_key());
+                self.messages.saved.management.forms.remove(&self.messages.management_form_key("norm_summary"));
                 self.messages.persist();
                 self.messages.mode.clear();
                 self.messages.status = "Norms published as a new revision".into();
@@ -511,10 +536,10 @@ impl App {
             .saved
             .management
             .norms
-            .contains_key(&self.messages.space_id)
+            .contains_key(&self.messages.norms_key())
         {
             if self.messages.management.current_revision
-                != self.messages.management.context["current"]["global"]
+                != self.messages.management.context["current"][self.messages.norms_scope()]
                     .as_str()
                     .unwrap_or("")
                 || self.messages.management.current_revision.is_empty()
@@ -525,7 +550,7 @@ impl App {
             }
             let m = &mut self.messages;
             m.saved.management.norms.insert(
-                m.space_id.clone(),
+                m.norms_key(),
                 NormDraft {
                     text: m.management.current_text.clone(),
                     base: m.management.current_text.clone(),
@@ -541,7 +566,7 @@ impl App {
     }
     fn messaging_revert_norms(&mut self) {
         if self.messages.management.current_revision
-            != self.messages.management.context["current"]["global"]
+            != self.messages.management.context["current"][self.messages.norms_scope()]
                 .as_str()
                 .unwrap_or("")
         {
@@ -561,14 +586,14 @@ impl App {
             .saved
             .management
             .norms
-            .contains_key(&self.messages.space_id)
+            .contains_key(&self.messages.norms_key())
         {
             self.messages.error="A norms draft already exists; p resumes it. Publish or save it to a file before replacing it.".into();
             return;
         }
         let m = &mut self.messages;
         m.saved.management.norms.insert(
-            m.space_id.clone(),
+            m.norms_key(),
             NormDraft {
                 text: m.management.text.clone(),
                 base: m.management.current_text.clone(),
@@ -590,7 +615,7 @@ impl App {
             .saved
             .management
             .norms
-            .get(&self.messages.space_id)
+            .get(&self.messages.norms_key())
             .cloned()
         else {
             return;
@@ -613,7 +638,7 @@ impl App {
                         .saved
                         .management
                         .norms
-                        .get_mut(&self.messages.space_id)
+                        .get_mut(&self.messages.norms_key())
                         .ok_or("No saved draft")?;
                     if f[0].trim().is_empty() {
                         return Err("Describe why the norms are changing".into());
@@ -661,6 +686,16 @@ impl App {
         }
         if key.code == KeyCode::Char('R') && self.messages.mode != "norm_edit" {
             if let Some(p) = self.messages.saved.management.pending.clone() {
+                if p.method == "messaging.norms" {
+                    let scope = p.params["scope"].as_str().unwrap_or("global");
+                    self.messages.target = json!({"norms":true,"norms_scope":scope});
+                    if let Some(id) = scope.strip_prefix("channel:") {
+                        self.messages.target["norms_channel"] = json!(id);
+                        self.messages.target["norms_label"] = json!(format!("{} norms", self.messages.conversation_label(&json!(id))));
+                    }
+                    self.messages.management.current_revision.clear();
+                    self.messages.pane = 1;
+                }
                 self.messaging_request(&p.method, p.params);
                 return true;
             }
@@ -686,7 +721,7 @@ impl App {
                         .saved
                         .management
                         .norms
-                        .get(&self.messages.space_id)
+                        .get(&self.messages.norms_key())
                         .cloned()
                         .unwrap_or_default();
                     if d.text.len() > 32768 {
@@ -774,6 +809,21 @@ impl App {
         if !self.messages.mode.is_empty() {
             return false;
         }
+        if key.code == KeyCode::Char('N') {
+            if let Some(channel) = self.messages.current_channel().cloned() {
+                self.messages.target = json!({"norms":true,"norms_scope":format!("channel:{}", channel["id"].as_str().unwrap()),"norms_label":format!("#{} norms",channel["path"].as_str().unwrap()),"norms_channel":channel["id"]});
+                self.messages.pane = 1;
+                self.messages.page_cursor = Value::Null;
+                self.messaging_refresh_target();
+                return true;
+            }
+        }
+        if key.code == KeyCode::Char('b') && self.messages.target["norms_channel"].is_string() {
+            self.messages.target = json!({"conversation":self.messages.target["norms_channel"]});
+            self.messages.page_cursor = Value::Null;
+            self.messaging_refresh_target();
+            return true;
+        }
         if key.code == KeyCode::Char('W')
             || key.code == KeyCode::Char('n') && self.messages.target["monitors"] == true
         {
@@ -843,7 +893,7 @@ impl App {
                     .saved
                     .management
                     .norms
-                    .get(&self.messages.space_id)
+                    .get(&self.messages.norms_key())
                 {
                     let path = Messages::path()
                         .with_file_name(format!("norms-draft-{}.md", uuid::Uuid::new_v4()));
@@ -853,7 +903,7 @@ impl App {
                                 .saved
                                 .management
                                 .norms
-                                .remove(&self.messages.space_id);
+                                .remove(&self.messages.norms_key());
                             self.messages.persist();
                             self.messages.status = format!("Draft archived at {}", path.display());
                         }
@@ -1117,7 +1167,7 @@ impl App {
                 .saved
                 .management
                 .norms
-                .get(&m.space_id)
+                .get(&m.norms_key())
                 .cloned()
                 .unwrap_or_default();
             (
@@ -1160,9 +1210,10 @@ impl App {
                 .join("\n");
             ("Norms history · Enter reads · v reverts".into(), text, true)
         } else if m.target["norms"] == true {
-            let changed = m.management.context["changed"] == true;
+            let changed = m.norms_changed();
             let title = format!(
-                "Shared norms{} · {}",
+                "{}{} · {}",
+                m.target_label(),
                 if changed { " · changed" } else { "" },
                 m.management.doc["revision"]
                     .as_str()
@@ -1174,7 +1225,9 @@ impl App {
             (
                 title,
                 if m.management.doc.is_null() {
-                    m.norms.clone()
+                    if m.norms_scope() == "global" { m.norms.clone() } else { String::new() }
+                } else if m.norms_scope() != "global" && m.management.doc["format"] == "markdown" && m.management.text.is_empty() {
+                    "No channel norms yet. Shared norms still apply. Press p to add local conventions.".into()
                 } else {
                     m.management.text.clone()
                 },
@@ -1357,6 +1410,50 @@ mod tests {
         app.messaging_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(
             code, mods,
         )));
+    }
+    #[test]
+    fn messaging_channel_norms_ui_isolates_drafts_and_pins_retry_scope() {
+        let _lock = crate::test_support::home_lock();
+        let _home = super::super::tests::Home::new();
+        let mut a = app();
+        a.messages.channels = vec![json!({"id":"cid","path":"work","name":"Work"})];
+        a.messages.target = json!({"norms":true});
+        a.messages.management.context = json!({"current":{"global":"g1","channel:cid":"c1"}});
+        a.messaging_management_result("norms_document",&json!({"scope":"global","text":"Shared convention","revision":"g1","format":"markdown","complete":true}));
+        key(&mut a,KeyCode::Char('p'),KeyModifiers::NONE);
+        assert_eq!(a.messages.draft().body,"Shared convention");
+        key(&mut a,KeyCode::Esc,KeyModifiers::NONE);
+        a.messages.target = json!({"channel":"work"});
+        key(&mut a,KeyCode::Char('N'),KeyModifiers::NONE);
+        assert_eq!(a.messages.norms_scope(),"channel:cid");
+        assert_eq!(a.messages.target_label(),"#work norms");
+        assert!(a.messages.management.doc.is_null());
+        a.messages.busy = false; // Simulate the reply arriving through the UI pump.
+        a.messaging_management_result("norms_document",&json!({"scope":"channel:cid","text":"Local convention","revision":"c1","format":"markdown","complete":true}));
+        key(&mut a,KeyCode::Char('p'),KeyModifiers::NONE);
+        assert_eq!(a.messages.draft().body,"Local convention");
+        a.messages.edit_text("New ",false);
+        key(&mut a,KeyCode::Char('s'),KeyModifiers::CONTROL);
+        a.messages.fields[0] = "Local change".into();
+        key(&mut a,KeyCode::Enter,KeyModifiers::NONE);
+        key(&mut a,KeyCode::Char('s'),KeyModifiers::CONTROL);
+        let pending = a.messages.saved.management.pending.as_ref().unwrap();
+        assert_eq!(pending.params["scope"],"channel:cid");
+        assert_eq!(pending.params["expected_revision"],"c1");
+        assert_eq!(a.messages.saved.management.norms["space"].text,"Shared convention");
+        let restored = Messages::load();
+        assert_eq!(restored.saved.management.norms["space:channel:cid"].text,"New Local convention");
+        assert_eq!(restored.saved.management.pending.unwrap().params["scope"],"channel:cid");
+        a.messages.mode.clear();
+        a.messages.target = json!({"norms":true});
+        a.messages.busy = false;
+        key(&mut a,KeyCode::Char('R'),KeyModifiers::NONE);
+        assert_eq!(a.messages.norms_scope(),"channel:cid");
+        assert_eq!(a.messages.saved.management.pending.as_ref().unwrap().params["scope"],"channel:cid");
+        a.messages.saved.management.pending = None;
+        a.messages.busy = false;
+        key(&mut a,KeyCode::Char('b'),KeyModifiers::NONE);
+        assert_eq!(a.messages.target,json!({"conversation":"cid"}));
     }
     #[test]
     fn messaging_b_norm_draft_preview_conflict_and_pending_survive_restart() {

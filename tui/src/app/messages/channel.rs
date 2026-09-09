@@ -58,6 +58,7 @@ mod tests {
             app.messages.menu_items()[app.messages.menu].1,
             json!({"channel":"stable/path"})
         );
+        app.messages.management.context = json!({"current":{"channel:channel":"norm-r1"},"stale_scopes":["channel:channel"]});
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| app.draw_messages(f)).unwrap();
@@ -70,6 +71,7 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("Coordinate parser reviews here."), "{text}");
         assert!(text.contains("pinned"), "{text}");
+        assert!(text.contains("channel norms changed"), "{text}");
         app.messaging_channel_form(true);
         assert_eq!(
             app.messages.fields,
@@ -507,6 +509,12 @@ impl App {
             ),
             Style::default().fg(theme::CHAT_FOCUS),
         ));
+        let scope = format!("channel:{}", c["id"].as_str().unwrap_or(""));
+        if self.messages.management.context["stale_scopes"].as_array().is_some_and(|scopes| scopes.iter().any(|s| s == &scope))
+            && self.messages.management.context["current"][&scope] != c["id"]
+        {
+            lines.push(Line::styled("N · channel norms changed", Style::default().fg(theme::CHAT_TAG)));
+        }
         let parts = Layout::vertical([
             Constraint::Length(lines.len() as u16 + 2),
             Constraint::Min(3),

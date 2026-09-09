@@ -83,6 +83,8 @@ class MessagingToolsTests(unittest.TestCase):
     def test_milestone_b_tools_keep_daemon_routing_and_explicit_acknowledgements(self):
         calls = [
             (server.chat_norms, {"action": "diff", "since": {"global": "r1"}, "cursor": {"token": "page", "offset": 5}}),
+            (server.chat_norms, {"action": "read", "channel": "cm-general", "ack_revision": "r1"}),
+            (server.chat_norms, {"action": "publish", "scope": "channel:cid", "text": "Use short claims.", "expected_revision": "r1", "summary": "Define claims", "request_id": "norms", "origin_daemon_id": "home"}),
             (server.chat_monitor, {"scope": {"dm": "agent-id"}, "request_id": "watch", "after": {"position": "42"}}),
             (server.chat_monitors, {"action": "ack", "monitor_id": "m1", "receipt": {"through": 42}, "request_id": "ack"}),
             (server.chat_follow, {"action": "set", "dnd": True, "expected_revision": 2, "request_id": "prefs"}),

@@ -3,9 +3,10 @@
 Owner considers the message board complete as of September 9, 2026. A–C,
 native notifications, channel membership/mentions, pins and channel controls have
 shipped. Reactions are declined. The optional D work and Owner overview below
-are parked; they are not required to finish this project. The approved remaining
-polish is batching chat wakes and avoiding repeated summaries after background
-notifications; see [native notification behavior](NATIVE_NOTIFICATIONS.md#chat-wake-batching).
+are parked; they are not required to finish this project. Chat wake batching and
+guidance against repeated summaries are deployed on both cloud hosts; see [native notification behavior](NATIVE_NOTIFICATIONS.md#chat-wake-batching).
+[Channel-specific norms](CHANNEL_NORMS.md) are implemented on `cm/messaging-sync`,
+awaiting a coordinated daemon/MCP/viewer rollout.
 
 The September 7 priorities and their disposition:
 

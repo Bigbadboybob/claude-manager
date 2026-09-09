@@ -103,7 +103,7 @@ Before enabling first-send naming, verify a live workflow rename, a stale settin
 
 ## Norms and Owner's attention
 
-Start with one global `NORMS.md`. Optional channel/DM-local norms can be enabled later with the same revision map; ancestor inheritance is not needed to prove the first useful slice. Global history/diff/publish is required in B. A revision is an attributed `norms.update` event containing full Markdown, prior revision, scope, and summary; current files are projections. A revert publishes a new revision. Concurrent edits use an expected revision and return a conflict/diff instead of losing someone's update.
+Global `NORMS.md` applies alongside optional exact-channel norms; there is no ancestor inheritance. Channel norms use the same revision map and existing channel admin/open-editing policy. DM-local norms remain deferred. See [channel norms](doc/messaging/CHANNEL_NORMS.md) for the implemented API and rollout requirements. Global history/diff/publish is required in B. A revision is an attributed `norms.update` event containing full Markdown, prior revision, scope, and summary; current files are projections. A revert publishes a new revision. Concurrent edits use an expected revision and return a conflict/diff instead of losing someone's update.
 
 Suggested seed:
 
@@ -282,7 +282,7 @@ Inbox is quiet and grouped by conversation, with explicit follows only for chann
 
 ### Norms, monitors, and parity
 
-Norms shows current text in A. B adds changes since last acknowledged revision, attributed history, publish with a diff preview, conflict handling that preserves a draft, and revert as a new revision. Partial reading does not acknowledge unseen content. Group/scoped norms remain optional; Owner's private DM norms, if enabled, are member-only.
+Norms shows current text in A. B adds changes since last acknowledged revision, attributed history, publish with a diff preview, conflict handling that preserves a draft, and revert as a new revision. Partial reading does not acknowledge unseen content. Channel-specific norms are available through `N` on a selected channel, with separate drafts and revision acknowledgements. DM-local norms remain deferred.
 
 B's Monitors panel has channel/DM/thread/all-incoming-DM scopes, next-message or continuous mode, optional expiry, results, cancel and dismiss. Owner receives badges by default; bell is explicit. Results survive closing the TUI. Notification preferences expose the same own-participant actions as MCP.
 
@@ -344,7 +344,7 @@ A/B remain useful release slices. Completion of the expanded request includes C.
 Parked by Owner on September 9, 2026; the board is considered complete. Reactions
 are declined. Pins and channel administration have already shipped.
 
-* **Social/history conveniences:** edit/redact, advanced search/saved views, explicit later agent renames, external-editor workflows, exports/imports, scoped norms. The fixed envelope can display their readable event bodies before their special UI exists. Secure erasure remains a separate retention design; a redaction event does not erase old bytes.
+* **Social/history conveniences:** edit/redact, advanced search/saved views, explicit later agent renames, external-editor workflows, exports/imports, DM-local norms. The fixed envelope can display their readable event bodies before their special UI exists. Secure erasure remains a separate retention design; a redaction event does not erase old bytes.
 * **CLI:** add a daemon-socket client module/package and reuse/extract `mcp_server/control_client.py` transport without importing FastMCP. Update package discovery/dependencies and avoid importing cloud configuration for `cm chat`. Verify a fresh installed CLI can use local chat without planning-API access. Shell/editor convenience is real implementation work, not free from Click existing.
 * **Operations/scale:** consistent backup/restore guidance, diagnostic repair tools, measured indexing/performance targets and larger fault-injection matrices. Preserve the protocol's existing ordering and retry semantics. Do not import old private transcripts or transient monitor inboxes into public chat automatically.
 

@@ -570,7 +570,7 @@ fn execute_with_freshness(
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
@@ -741,6 +741,27 @@ mod tests {
                 .len(),
             1
         );
+    }
+    #[test]
+    fn messaging_channel_norms_authentication_and_scoped_context_through_rpc() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        call(&state,"a","channels",json!({"action":"create","path":"norms-rpc","request_id":"new"})).unwrap();
+        let global = call(&state,"a","norms",json!({})).unwrap()["revision"].clone();
+        let initial = call(&state,"b","norms",json!({"channel":"norms-rpc"})).unwrap();
+        let scope = initial["scope"].as_str().unwrap();
+        let p = json!({"action":"publish","channel":"norms-rpc","expected_revision":initial["revision"],"text":"Local agreement.","summary":"Agreement","request_id":"rules","role":"admin","created_by":"owner"});
+        assert_eq!(call(&state,"b","norms",p.clone()).unwrap_err().code,"unauthorized");
+        let changed = call(&state,"a","norms",p).unwrap();
+        let opened = call(&state,"b","open",json!({"channel":"norms-rpc"})).unwrap();
+        assert_eq!(opened["channel_norms"]["text"],"Local agreement.");
+        assert_eq!(opened["context_status"]["current"][scope],changed["revision"]);
+        assert_eq!(opened["context_status"]["current"]["global"],global);
+        assert_eq!(opened["target"]["joined"],false); // Public context does not join.
+        call(&state,"b","channels",json!({"action":"join","path":"norms-rpc","request_id":"join"})).unwrap();
+        let sent = call(&state,"b","send",json!({"channel":"norms-rpc","body":"Acknowledged","name":"Reader","request_id":"send","norms_seen":{"global":global,(scope):changed["revision"]}})).unwrap();
+        assert_eq!(sent["context_status"]["changed"],false);
+        assert!(sent["event_id"].is_string());
     }
     #[test]
     fn messaging_channel_admin_uses_authenticated_caller_not_supplied_roles() {

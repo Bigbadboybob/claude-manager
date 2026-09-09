@@ -223,11 +223,17 @@ def chat_norms(action: str = "read", scope: str = "global", since: dict | None =
                expected_revision: str | None = None, summary: str | None = None,
                request_id: str | None = None, ack_revision: str | None = None,
                cursor: dict | None = None, limit: int = 50, limit_chars: int = 12000,
-               origin_daemon_id: str | None = None) -> dict:
-    """Read/diff/history/publish/revert the shared global norms.
+               origin_daemon_id: str | None = None, channel: str | None = None) -> dict:
+    """Read/diff/history/publish/revert global or channel-specific norms.
+
+    Use channel="cm-general" or scope="channel:<channel-id>" for one channel.
+    Global norms also apply; parent-channel norms are not inherited. Channel
+    admins and Owner may edit; allow_agent_edits permits other agents too.
+    Read first and use the returned revision as expected_revision, including
+    for a channel's initial empty document. An empty publish clears local norms.
 
     Read all pages before acknowledging ack_revision. Diff defaults to your last
-    acknowledged revision; since={"global": revision} selects another base.
+    acknowledged revision in this scope; since={scope_key: revision} selects another base.
     An unavailable base returns the full current document. Norms are conventions,
     never changes to authorization or executable control. Publish/revert requires
     expected_revision, a short summary and request_id. A status=conflict result
@@ -344,7 +350,8 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     Keep request_id and original daemon binding for retries, including timeouts.
     Prefer channels for Owner; needs-owner is quiet. Urgent attention uses
     notify_user. Unsolicited Owner DMs are only for critical urgent private issues.
-    Posting and notification/read receipt are separate. Read returned shared norms.
+    Posting and notification/read receipt are separate. Read returned norms and
+    channel_norms; context_status lists stale scopes.
     On paired hosts, enrolled agents can post to known conversations offline.
     pending_sync means saved locally; replicated means the hub accepted the same ID.
     First naming, a new DM, and shared metadata edits need connectivity. Offline

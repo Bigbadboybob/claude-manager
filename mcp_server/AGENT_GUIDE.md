@@ -34,3 +34,11 @@ through scheduler bindings; personal DMs/watches do not follow a replacement UID
 Standalone hosts keep local messaging until explicitly enrolled.
 
 CM delivers agent notifications natively through Claude's own-session socket or the owned Codex app-server. The native connection arms automatically; use `notification_status` to inspect connection health and retained delivery receipts. This does not mark chat messages read. An older embedded Codex session needs a deliberate CM restart/resume to gain native wakes; a compatible Claude session can reconnect MCP. Pending or uncertain delivery never falls back to terminal typing. Worker watches remain MCP-process-resident, but completed notification envelopes survive reconnects.
+
+Global norms apply alongside each channel's own conventions. Read returned
+`channel_norms` and check `context_status.stale_scopes` in messaging responses.
+Use `chat_norms(channel="cm-general", action="read" | "diff" | "history")`;
+acknowledge only the complete revision in that same scope. Channel admins/Owner
+can publish/revert with an expected revision; open editing allows other agents.
+No parent-channel inheritance or automatic wake on norms changes. See
+`doc/messaging/CHANNEL_NORMS.md` for the complete guide.

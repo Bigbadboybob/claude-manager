@@ -254,6 +254,7 @@ pub struct Store {
     reads: BTreeMap<String, ReadState>,
     personal: BTreeMap<String, Personal>,
     pub norms: Value,
+    channel_norms: BTreeMap<String, Value>,
     enrollment_revision: String,
     owner_identity_revision: String,
 }
@@ -335,6 +336,7 @@ impl Store {
             reads: BTreeMap::new(),
             personal: BTreeMap::new(),
             norms: json!({}),
+            channel_norms: BTreeMap::new(),
             enrollment_revision: required(&meta, "enrollment_revision")?,
             owner_identity_revision: required(&meta, "owner_identity_revision")?,
         };
@@ -649,7 +651,11 @@ impl Store {
             }
         }
         if e["type"] == "norms.update" {
-            self.norms = e["data"].clone();
+            if e["data"]["scope"] == "global" {
+                self.norms = e["data"].clone();
+            } else if strv(&e["data"], "scope").starts_with("channel:") {
+                self.channel_norms.insert(required(&e["data"], "scope")?, e["data"].clone());
+            }
         }
         let key = format!(
             "{}\n{}",
@@ -678,6 +684,9 @@ impl Store {
             strv(&self.norms, "text").as_bytes(),
         )?;
         for (path, id) in &self.channels {
+            if let Some(doc) = self.channel_norms.get(&format!("channel:{id}")) {
+                project_file(&self.root.join("channels").join(path).join("NORMS.md"), strv(doc,"text").as_bytes())?;
+            }
             project_json(
                 &self.root.join("channels").join(path).join("CHANNEL.json"),
                 &self.channel_info(path, id),

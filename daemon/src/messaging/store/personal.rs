@@ -10,6 +10,7 @@ pub(super) struct Personal {
     pub bell_position: u64,
     pub bell_monitors: BTreeMap<String, u64>,
     pub norms_ack: Option<String>,
+    pub channel_norms_ack: BTreeMap<String, String>,
     pub norms_supplied: BTreeSet<String>,
     pub norms_offered: BTreeSet<String>,
     pub norm_pages: BTreeMap<String, NormPage>,
@@ -21,6 +22,8 @@ pub(super) struct Personal {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct NormPage {
+    #[serde(default = "global_scope")]
+    pub scope: String,
     pub revision: String,
     pub since: Option<String>,
     pub action: String,
@@ -163,5 +166,18 @@ impl Store {
         );
         self.save_personal(state)?;
         Ok(result)
+    }
+}
+
+fn global_scope() -> String {
+    "global".into()
+}
+impl Personal {
+    pub(super) fn norms_ack_for(&self, scope: &str) -> Option<&str> {
+        if scope == "global" {
+            self.norms_ack.as_deref()
+        } else {
+            self.channel_norms_ack.get(scope).map(String::as_str)
+        }
     }
 }

@@ -121,7 +121,7 @@ impl Messages {
                 .saved
                 .management
                 .norms
-                .get(&self.space_id)
+                .get(&self.norms_key())
                 .map(|n| Draft {
                     body: n.text.clone(),
                     cursor: n.cursor,
@@ -141,7 +141,7 @@ impl Messages {
                 .saved
                 .management
                 .norms
-                .entry(self.space_id.clone())
+                .entry(self.norms_key())
                 .or_default();
             if n.text != draft.body {
                 n.revert = None;
@@ -163,7 +163,7 @@ impl Messages {
             (
                 format!(
                     "Shared norms{}",
-                    if self.management.context["changed"] == true {
+                    if self.management.context["current"]["global"] != self.management.context["acknowledged"]["global"] {
                         " · changed"
                     } else {
                         ""
@@ -253,7 +253,7 @@ impl Messages {
     }
     fn target_label(&self) -> String {
         if self.target["norms"] == true {
-            return "Shared norms".into();
+            return self.target["norms_label"].as_str().unwrap_or("Shared norms").into();
         }
         if self.target["inbox"] == true {
             return "Inbox".into();
@@ -580,7 +580,10 @@ impl App {
             self.messaging_refresh_target();
         }
     }
-    fn messaging_request(&mut self, method: &str, params: Value) {
+    fn messaging_request(&mut self, method: &str, mut params: Value) {
+        if matches!(method, "messaging.norms" | "norms_document") && params.get("scope").is_none() {
+            params["scope"] = json!(self.messages.norms_scope());
+        }
         if self.messages.busy {
             return;
         }
@@ -1526,6 +1529,7 @@ impl App {
                 chat_help(&[
                     ("]", "older"),
                     ("g/G", "refresh/hub"),
+                    ("N", "norms"),
                     ("W", "monitor"),
                     ("f", "preferences"),
                 ]),

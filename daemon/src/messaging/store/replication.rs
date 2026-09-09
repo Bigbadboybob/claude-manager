@@ -1503,6 +1503,27 @@ mod tests {
         }
     }
     #[test]
+    fn messaging_channel_norms_coordinate_permissions_and_sync_without_global_corruption() {
+        let mut p = pair();
+        let actor = p.people[0].id.clone();
+        let other = p.people[1].id.clone();
+        let host = p.replica.daemon_id.clone();
+        let global = p.hub.norms.clone();
+        let channel = p.hub.coordinate(&host,&actor,"messaging.channels",&json!({"action":"create","path":"norms-test","request_id":"new-channel"})).unwrap()["channel"].clone();
+        let scope = format!("channel:{}",channel["id"].as_str().unwrap());
+        let request = json!({"action":"publish","scope":scope,"text":"Cross-host convention.\n","expected_revision":channel["id"],"summary":"Shared practice","request_id":"norms-publish"});
+        assert_eq!(p.hub.coordinate(&host,&other,"messaging.norms",&request).unwrap_err().code,"unauthorized");
+        let published = p.hub.coordinate(&host,&actor,"messaging.norms",&request).unwrap();
+        catch_up(&mut p);
+        assert_eq!(p.replica.norms,global);
+        assert!(p.replica.needs_coordinator(&actor,"messaging.norms",&request,&p.people).unwrap());
+        let doc = p.replica.norms_document(&actor,&json!({"channel":"norms-test"})).unwrap();
+        assert_eq!(doc["revision"],published["revision"]);
+        assert_eq!(doc["text"],"Cross-host convention.\n");
+        assert_eq!(fs::read_to_string(p.replica.root.join("channels/norms-test/NORMS.md")).unwrap(),"Cross-host convention.\n");
+        assert_eq!(p.hub.coordinate(&host,&actor,"messaging.norms",&request).unwrap()["revision"],published["revision"]);
+    }
+    #[test]
     fn live_dm_and_mention_bypass_bulk_without_certifying_missing_history() {
         let mut p = pair();
         let covered = p.hub.position;
