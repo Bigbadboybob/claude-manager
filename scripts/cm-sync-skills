@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Sync personal skills to an explicit host inventory; see doc/personal-skill-sync.md."""
+from __future__ import annotations
+
+import argparse
+import base64
+from datetime import datetime, timezone
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+import uuid
+
+ROOTS = (".claude/skills", ".agents/skills", ".codex/skills")
+EXCLUDES = (".*", "__pycache__", "node_modules", "*.pyc", "*.pem", "*.key", "*.p12", "*.pfx", "credentials*", "*credentials.json", "auth.json", "secrets*", "tokens*", "*token.json")
+MAX_BYTES = 32 * 1024 * 1024
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def allowed(path):
+    p = PurePosixPath(path)
+    return (not p.is_absolute() and len(p.parts) >= 3 and "/".join(p.parts[:2]) in ROOTS
+            and all(part not in ("", ".", "..") and not any(fnmatch.fnmatch(part.lower(), pat) for pat in EXCLUDES) for part in p.parts[2:]))
+
+
+def bundle_id(entries):
+    return digest(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode())
+
+
+def build_bundle(home):
+    """Only skill directories are eligible, never whole agent config directories."""
+    home = home.resolve()
+    entries = {}
+    skipped = []
+    total = 0
+
+    def visit(path):
+        nonlocal total
+        rel = path.relative_to(home).as_posix()
+        if not allowed(rel):
+            skipped.append(rel)
+            return
+        if path.is_symlink():
+            target = path.resolve(strict=True)
+            try:
+                target_rel = target.relative_to(home).as_posix()
+            except ValueError:
+                raise ValueError(f"external skill symlink: {rel}") from None
+            if not allowed(target_rel):
+                raise ValueError(f"symlink leaves skill roots: {rel}")
+            entries[rel] = {"link": target_rel}
+        elif path.is_dir():
+            for child in sorted(path.iterdir()):
+                visit(child)
+        elif path.is_file():
+            if path.stat().st_size > MAX_BYTES:
+                raise ValueError(f"skill file exceeds bundle limit: {rel}")
+            data = path.read_bytes()
+            if b"PRIVATE KEY-----" in data:
+                raise ValueError(f"private key found in skill file: {rel}")
+            total += len(data)
+            if total > MAX_BYTES:
+                raise ValueError("skill bundle exceeds 32 MiB")
+            entries[rel] = {"data": base64.b64encode(data).decode(), "sha256": digest(data), "mode": 0o755 if path.stat().st_mode & 0o111 else 0o644}
+        else:
+            raise ValueError(f"unsupported skill file: {rel}")
+
+    for root in ROOTS:
+        directory = home / root
+        if not directory.exists():
+            continue
+        if directory.is_symlink():
+            raise ValueError(f"skill root must be a directory, not a symlink: {root}")
+        for skill in sorted(directory.iterdir()):
+            if allowed(skill.relative_to(home).as_posix()) and (skill / "SKILL.md").is_file():
+                visit(skill)
+    if not entries:
+        raise ValueError("no personal skills found; refusing an empty sync")
+    # All links must resolve to something included, including directory links.
+    for rel, entry in entries.items():
+        if "link" in entry and not any(p == entry["link"] or p.startswith(entry["link"] + "/") for p in entries):
+            raise ValueError(f"skill symlink target is not included: {rel}")
+    return {"version": 1, "revision": bundle_id(entries), "entries": entries, "skipped": skipped}
+
+
+def atomic_write(path, data, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".skill-sync-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fchmod(stream.fileno(), mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+
+
+def check_parents(home, path):
+    for parent in path.relative_to(home).parents:
+        absolute = home / parent
+        if absolute.is_symlink() or (absolute.exists() and not absolute.is_dir()):
+            raise ValueError(f"unsafe destination parent: {absolute}")
+
+
+def same(path, entry):
+    if "link" in entry:
+        return path.is_symlink() and os.readlink(path) == entry["target"]
+    return (path.is_file() and not path.is_symlink() and digest(path.read_bytes()) == entry["sha256"]
+            and path.stat().st_mode & 0o777 == entry["mode"])
+
+
+def install(bundle, home, dry_run=False):
+    """Validate everything before writing; atomically replace each file/link, with backups."""
+    if bundle.get("version") != 1 or bundle_id(bundle["entries"]) != bundle.get("revision"):
+        raise ValueError("invalid bundle version/checksum")
+    home = home.resolve()
+    entries = bundle["entries"]
+    changes = []
+    size = 0
+    for rel, original in sorted(entries.items()):
+        if not allowed(rel):
+            raise ValueError(f"invalid destination path: {rel}")
+        path = home / rel
+        check_parents(home, path)
+        entry = dict(original)
+        if "link" in entry:
+            link = entry["link"]
+            if not allowed(link) or not any(p == link or p.startswith(link + "/") for p in entries):
+                raise ValueError(f"invalid link: {rel}")
+            # Never trust a pre-existing symlink along a target's path either.
+            check_parents(home, home / link)
+            if (home / link).is_symlink():
+                raise ValueError(f"destination link target is itself a symlink: {link}")
+            entry["target"] = os.path.relpath(home / link, path.parent)
+        else:
+            data = base64.b64decode(entry["data"], validate=True)
+            size += len(data)
+            if size > MAX_BYTES or digest(data) != entry["sha256"] or entry["mode"] not in (0o644, 0o755):
+                raise ValueError(f"invalid file/checksum: {rel}")
+        if path.exists() and path.is_dir() and not path.is_symlink():
+            raise ValueError(f"refusing to replace an existing directory: {rel}")
+        if not same(path, entry):
+            changes.append((rel, entry))
+    result = {"revision": bundle["revision"], "entries": len(entries), "changed": len(changes), "dry_run": dry_run,
+              "skills": {root: sorted({PurePosixPath(p).parts[2] for p in entries if p.startswith(root + "/")}) for root in ROOTS}}
+    if dry_run:
+        return result
+    state_dir = home / ".cm/skill-sync"
+    backup = state_dir / "backups" / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8])
+    # Files first, links second: adapters never point at an uninstalled canonical body.
+    for rel, entry in sorted(changes, key=lambda row: "link" in row[1]):
+        path = home / rel
+        check_parents(home, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(path):
+            saved = backup / rel
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
+                saved.symlink_to(os.readlink(path))
+            else:
+                atomic_write(saved, path.read_bytes(), path.stat().st_mode & 0o777)
+        if "link" in entry:
+            tmp = path.parent / (".skill-sync-" + uuid.uuid4().hex)
+            try:
+                tmp.symlink_to(entry["target"])
+                os.replace(tmp, path)
+            finally:
+                if os.path.lexists(tmp):
+                    tmp.unlink()
+        else:
+            atomic_write(path, base64.b64decode(entry["data"]), entry["mode"])
+    # Verify the installed bytes and link targets, not just a successful transfer.
+    for rel, original in entries.items():
+        entry = dict(original)
+        if "link" in entry:
+            entry["target"] = os.path.relpath(home / entry["link"], (home / rel).parent)
+        if not same(home / rel, entry):
+            raise ValueError(f"post-install verification failed: {rel}")
+    result["verified_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_write(state_dir / "installed.json", json.dumps(result, indent=2).encode())
+    return result
+
+
+def remote_command(target, command):
+    if "ssh" in target:
+        if target["ssh"].startswith("-"):
+            raise ValueError("invalid SSH destination")
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2", target["ssh"], command]
+    instance = target["gcloud"]
+    args = ["gcloud", "compute", "ssh", instance["instance"], "--quiet", "--project=" + instance["project"], "--zone=" + instance["zone"], "--ssh-flag=-oBatchMode=yes", "--ssh-flag=-oConnectTimeout=10", "--command=" + command]
+    if instance.get("internal_ip"):
+        args.append("--internal-ip")
+    return args
+
+
+def sync(config, bundle, dry_run=False, selected=None):
+    source = config.get("source_hostname")
+    if not source or source != socket.gethostname():
+        raise ValueError(f"source_hostname must match this machine ({socket.gethostname()})")
+    targets = config["targets"]
+    names = [t["name"] for t in targets]
+    if len(set(names)) != len(names) or (selected and not set(selected).issubset(names)):
+        raise ValueError("duplicate or unknown target name")
+    code = Path(__file__).read_text()
+    command = "python3 -c " + shlex.quote(code) + " --receive" + (" --dry-run" if dry_run else "")
+    payload = json.dumps(bundle)
+    result = {"checked_at": datetime.now(timezone.utc).isoformat(), "source": source, "revision": bundle["revision"], "skipped_files": bundle["skipped"], "targets": {}}
+    for target in targets:
+        name = target["name"]
+        if selected and name not in selected:
+            continue
+        try:
+            run = subprocess.run(remote_command(target, command), input=payload, text=True, capture_output=True, timeout=60)
+            if run.returncode:
+                raise RuntimeError(run.stderr.strip()[-1500:] or f"exit {run.returncode}")
+            response = json.loads(run.stdout)
+            if response.get("revision") != bundle["revision"]:
+                raise ValueError("remote revision mismatch")
+            result["targets"][name] = {"ok": True, **response}
+            print(f"{name}: {response['changed']} changed / {response['entries']} entries" + (" (dry run)" if dry_run else " verified"), flush=True)
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            result["targets"][name] = {"ok": False, "error": str(exc)}
+            print(f"{name}: ERROR: {exc}", file=sys.stderr, flush=True)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=Path.home() / ".cm/skill-sync.json")
+    parser.add_argument("--host", action="append", help="Select target name(s) from the inventory; default all")
+    parser.add_argument("--dry-run", action="store_true", help="Read and compare; write nothing on either end")
+    parser.add_argument("--receive", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    try:
+        if args.receive:
+            print(json.dumps(install(json.load(sys.stdin), Path.home(), args.dry_run)))
+            return 0
+        import fcntl
+        config = json.loads(args.config.read_text())
+        if config.get("source_hostname") != socket.gethostname():
+            raise ValueError("this host is not the configured skill source")
+        # The lock lives outside the user's skill roots. Dry runs acquire no write lock.
+        lock = None
+        if not args.dry_run:
+            directory = Path.home() / ".cm/skill-sync"
+            directory.mkdir(parents=True, exist_ok=True)
+            lock = (directory / "sync.lock").open("a")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("skill sync is already running")
+                return 0
+        result = sync(config, build_bundle(Path.home()), args.dry_run, args.host)
+        if not args.dry_run:
+            atomic_write(Path.home() / ".cm/skill-sync/status.json", json.dumps(result, indent=2).encode())
+        return int(any(not row["ok"] for row in result["targets"].values()))
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"cm-sync-skills: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
