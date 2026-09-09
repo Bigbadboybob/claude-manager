@@ -65,6 +65,10 @@ Unread state still requires `ack_receipt`, and explicit watch results still
 require `chat_monitors(action="ack", ...)`. A lost response leaves the messages
 unread and retrievable; it does not grant an automatic native resend. Existing
 submitted notices cannot be recalled, including ones queued before this upgrade.
+Legacy delivered/ambiguous batches have no fetch boundary, so they remain
+historical deduplication records and cannot hold the new latch closed. The first
+new arrival starts a new batch without replaying those old messages. Legacy
+unsubmitted work stays live and can combine with new arrivals.
 An agent must finish reading its batch; an unread batch is not periodically
 re-notified. Mute/cancellation can still retract unclaimed native work.
 

@@ -40,6 +40,8 @@ struct Batch {
     checked: BTreeSet<String>,
     // Freeze a batch at its first read so concurrent arrivals form a successor.
     sealed: bool,
+    // Pre-batching ledgers did not record fetches. Retain their dedup IDs and
+    // receipts as history rather than blocking new wakes behind old unread IDs.
     released: bool,
     coalesced: BTreeSet<String>,
 }
@@ -48,7 +50,18 @@ fn queue_path(root: &Path, uid: &str) -> PathBuf {
 }
 fn load(path: &Path) -> io::Result<Queue> {
     match fs::read(path) {
-        Ok(b) => Ok(serde_json::from_slice(&b)?),
+        Ok(b) => {
+            let mut value: Value = serde_json::from_slice(&b)?;
+            for batch in value["batches"].as_array_mut().into_iter().flatten() {
+                if batch.get("released").is_none() {
+                    let status = batch["status"].as_str().unwrap_or("pending");
+                    // Keep old unsubmitted work live. Delivered/ambiguous old
+                    // receipts have no fetch history and cannot own a new latch.
+                    batch["released"] = json!(!pending(status) && status != "native_pending");
+                }
+            }
+            Ok(serde_json::from_value(value)?)
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Queue::default()),
         Err(e) => Err(e),
     }
@@ -437,11 +450,10 @@ pub fn reconcile(cm_root: &Path, store: &Store) -> io::Result<()> {
         settle(&mut q, &intents);
         let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
         for batch in &mut q.batches {
-            let active = !batch.released
-                && batch
-                    .ids
-                    .iter()
-                    .any(|id| eligible.contains(id.as_str()) && !batch.checked.contains(id));
+            let active = batch
+                .ids
+                .iter()
+                .any(|id| eligible.contains(id.as_str()) && !batch.checked.contains(id));
             let id = format!("chat:{}", batch.wake_id);
             let text = active.then(|| wake_text(batch, &intents));
             if let Some(event) =
@@ -544,6 +556,60 @@ mod tests {
             &event,
         )
         .unwrap();
+    }
+    #[test]
+    fn messaging_legacy_unsubmitted_work_stays_live_and_coalesces_after_upgrade() {
+        for initial_engine in ["codex", "bash"] {
+            let (t, mut store, actor, people) = fixture();
+            dm(&mut store, &actor, &people, "one");
+            let q = deliver(&store, t.path(), initial_engine);
+            let mut old = serde_json::to_value(&q).unwrap();
+            for key in ["checked", "sealed", "released", "coalesced"] {
+                old["batches"][0].as_object_mut().unwrap().remove(key);
+            }
+            atomic_replace(&queue_path(&store.root, "b"), &old).unwrap();
+            reconcile(t.path(), &store).unwrap();
+            dm(&mut store, &actor, &people, "two");
+            let q = deliver(&store, t.path(), "codex");
+            assert_eq!(q.batches.len(), 1);
+            assert_eq!(q.batches[0].ids.len(), 2);
+            assert!(!q.batches[0].released);
+            assert_eq!(
+                native_event(t.path(), &q.batches[0]).unwrap()["status"],
+                "pending"
+            );
+        }
+    }
+    #[test]
+    fn messaging_legacy_receipts_do_not_block_new_wakes_or_replay_old_messages() {
+        let (t, mut store, actor, people) = fixture();
+        let one = dm(&mut store, &actor, &people, "one");
+        let q = deliver(&store, t.path(), "codex");
+        set_native_status(t.path(), &q.batches[0], "observed");
+        let mut old = serde_json::to_value(&q).unwrap();
+        old["batches"][0]["status"] = json!("confirmed");
+        for batch in old["batches"].as_array_mut().unwrap() {
+            for key in ["checked", "sealed", "released", "coalesced"] {
+                batch.as_object_mut().unwrap().remove(key);
+            }
+        }
+        atomic_replace(&queue_path(&store.root, "b"), &old).unwrap();
+        drop(store);
+        let mut store = Store::open(t.path()).unwrap();
+        let two = dm(&mut store, &actor, &people, "two");
+        let q = deliver(&store, t.path(), "codex");
+        assert_eq!(q.batches.len(), 2);
+        assert!(q.batches[0].released);
+        assert_eq!(q.batches[0].ids, vec![one]);
+        assert_eq!(
+            native_event(t.path(), &q.batches[0]).unwrap()["status"],
+            "observed"
+        );
+        assert_eq!(q.batches[1].ids, vec![two]);
+        assert_eq!(
+            native_event(t.path(), &q.batches[1]).unwrap()["status"],
+            "pending"
+        );
     }
     fn read_page(store: &mut Store, actor: &str, params: &Value) -> Value {
         let result = store.read(actor, params, &[]).unwrap();
