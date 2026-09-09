@@ -79,13 +79,20 @@ impl App {
         if self.sidebar_view != SidebarView::Task || self.sections.is_empty() {
             return vec![None; rows.len()];
         }
-        let workspace_sections: Vec<_> = (0..self.workspaces.len())
-            .map(|wi| self.section_of_workspace(wi)).collect();
+        let mut workspace_sections = HashMap::new();
+        for row in rows {
+            if let VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
+                | VisualItem::TaskHeader { ws_idx: wi, .. }
+                | VisualItem::WorkflowHeader { ws_idx: wi, .. } = row
+            {
+                workspace_sections.entry(*wi).or_insert_with(|| self.section_of_workspace(*wi));
+            }
+        }
         let sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
             VisualItem::SectionHeader(id) => Some(id.as_str()),
             VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
             | VisualItem::TaskHeader { ws_idx: wi, .. }
-            | VisualItem::WorkflowHeader { ws_idx: wi, .. } => workspace_sections[*wi].as_deref(),
+            | VisualItem::WorkflowHeader { ws_idx: wi, .. } => workspace_sections[wi].as_deref(),
             _ => None,
         }).collect();
         rows.iter().enumerate().map(|(i, row)| {
