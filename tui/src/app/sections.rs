@@ -550,6 +550,13 @@ mod layout_tests {
         for y in [9, 12, 13, 14] {
             assert_eq!(buffer[(38, y)].bg, Color::Reset, "section boundaries and loose rows");
         }
+        for y in [9, 12] {
+            assert_eq!(buffer[(2, y)].symbol(), "━");
+            assert_eq!(buffer[(2, y)].fg, theme::SECTION_BOUNDARY);
+            assert!(buffer[(2, y)].modifier.contains(Modifier::BOLD));
+        }
+        assert_eq!(buffer[(2, 5)].symbol(), "─", "internal workspace divider stays thin");
+        assert_eq!(buffer[(2, 5)].fg, theme::DIM);
         assert_eq!(buffer[(38, 10)].bg, blue, "same-colored next section still has a clear boundary");
 
         app.sections[0].folded = true;
@@ -580,6 +587,22 @@ mod layout_tests {
         assert_eq!(buffer[(38, 1)].bg, neutral, "filtered task keeps tint without its heading");
         assert_eq!(buffer[(38, 2)].bg, neutral, "filtered session keeps tint without its heading");
         assert_eq!(buffer[(38, 3)].bg, Color::Reset, "empty space stays transparent");
+    }
+
+    #[test]
+    fn final_sidebar_section_has_a_closing_rule_without_loose_workspaces() {
+        let mut app = sectioned_app();
+        app.workspaces.truncate(2);
+        app.cursor = Cursor::Section("s1".into());
+        let buffer = sidebar_buffer(&mut app, 10);
+        assert_eq!(buffer[(2, 5)].symbol(), "━");
+        assert_eq!(buffer[(2, 5)].fg, theme::SECTION_BOUNDARY);
+        assert_eq!(buffer[(38, 5)].bg, Color::Reset);
+        assert_eq!(buffer[(2, 6)].symbol(), " ");
+
+        app.sections[0].folded = true;
+        let buffer = sidebar_buffer(&mut app, 10);
+        assert_eq!(buffer[(2, 2)].symbol(), "━", "folded final section also closes");
     }
 
     #[test]

@@ -61,6 +61,9 @@ pub(crate) const HEADER_SELECT_BG: Color = Color::Rgb(40, 40, 50);
 /// selected conflict rows use a full [`ERROR`] background instead).
 pub(crate) const CONFLICT_BG: Color = Color::Rgb(80, 0, 0);
 
+/// Bright closing rule for a task-sidebar section, drawn with a heavy glyph.
+pub(crate) const SECTION_BOUNDARY: Color = Color::Rgb(215, 220, 230);
+
 /// Messages: navy surfaces, slate chrome, and a cyan focus outline.
 /// Content accents stay the same when focus moves between panes.
 pub(crate) const CHAT_BG: Color = Color::Rgb(16, 21, 32);
@@ -133,12 +136,14 @@ pub(crate) fn cycle_user_color(current: Option<&str>, forward: bool) -> Option<S
     }
 }
 
-/// Quiet task-sidebar section surfaces, with optional user-color accents.
+/// Task-sidebar section surfaces, with optional user-color accents.
 /// Keep a neutral base so missing colors are visible rather than near black.
 /// Terminal opacity is applied by the terminal emulator; ANSI colors have no alpha.
 pub(crate) fn sidebar_section_bg(color: Option<&str>) -> Color {
-    match color.and_then(user_color) {
-        Some(Color::Rgb(r, g, b)) => Color::Rgb(16 + r / 12, 18 + g / 12, 22 + b / 12),
-        _ => Color::Rgb(25, 29, 38),
-    }
+    let (r, g, b) = match color.and_then(user_color) {
+        Some(Color::Rgb(r, g, b)) => (16 + r / 12, 18 + g / 12, 22 + b / 12),
+        _ => (25, 29, 38),
+    };
+    // Three times the original RGB intensity; terminal alpha stays untouched.
+    Color::Rgb(r * 3, g * 3, b * 3)
 }

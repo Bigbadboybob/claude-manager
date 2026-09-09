@@ -353,6 +353,8 @@ pub(super) enum VisualItem {
     TaskHeader { ws_idx: usize, task_id: String },
     Session(usize, usize),
     Separator,
+    /// Closing boundary of a sidebar section, including the final section.
+    SectionEnd,
     /// Header row for a workflow grouping, followed by its participant Sessions.
     WorkflowHeader { ws_idx: usize, run_id: String },
     /// Continuous Tasks: header row for the continuous-session
@@ -700,7 +702,7 @@ impl App {
             VisualItem::BacktestHeader => contains("backtest") || self.backtest_rows.iter().any(|r| contains(&r.label)),
             VisualItem::BacktestFleet(stem) => contains(stem),
             VisualItem::BacktestRun { task_id, .. } => self.backtest_rows.iter().find(|r| r.task_id == *task_id).is_some_and(|r| contains(&r.label) || contains(task_id)),
-            VisualItem::ContinuousHeader | VisualItem::Separator => false,
+            VisualItem::ContinuousHeader | VisualItem::Separator | VisualItem::SectionEnd => false,
         }
     }
 
@@ -881,25 +883,22 @@ impl App {
             }
         }
         for sec in &self.sections {
-            if !items.is_empty() {
-                items.push(VisualItem::Separator);
-            }
             items.push(VisualItem::SectionHeader(sec.id.clone()));
-            if sec.folded {
-                continue;
-            }
-            let mut first_in_section = true;
-            for wi in by_section.remove(&sec.id).unwrap_or_default() {
-                if !first_in_section {
-                    items.push(VisualItem::Separator);
+            if !sec.folded {
+                let mut first_in_section = true;
+                for wi in by_section.remove(&sec.id).unwrap_or_default() {
+                    if !first_in_section {
+                        items.push(VisualItem::Separator);
+                    }
+                    first_in_section = false;
+                    self.push_task_view_workspace(&mut items, wi, &members);
                 }
-                first_in_section = false;
-                self.push_task_view_workspace(&mut items, wi, &members);
             }
+            items.push(VisualItem::SectionEnd);
         }
         // Loose workspaces (no section) follow, exactly as pre-feature.
         for wi in loose {
-            if !items.is_empty() {
+            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::SectionEnd)) {
                 items.push(VisualItem::Separator);
             }
             self.push_task_view_workspace(&mut items, wi, &members);
@@ -1370,7 +1369,7 @@ impl App {
                 .get(*wi)
                 .map_or(false, |w| w.sessions.is_empty()),
             VisualItem::TaskHeader { .. } => true,
-            VisualItem::Separator => false,
+            VisualItem::Separator | VisualItem::SectionEnd => false,
             VisualItem::WorkflowHeader { .. } => false,
             // 12e: host headers are presentation-only; skip
             // them in cursor navigation.

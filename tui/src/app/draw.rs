@@ -2037,16 +2037,21 @@ impl App {
                     };
                     items.push(ListItem::new(line).style(base_style));
                 }
-                VisualItem::Separator => {
+                VisualItem::Separator | VisualItem::SectionEnd => {
+                    let (glyph, style) = if matches!(vi, VisualItem::SectionEnd) {
+                        ("\u{2501}", Style::default().fg(theme::SECTION_BOUNDARY).add_modifier(Modifier::BOLD))
+                    } else {
+                        ("\u{2500}", dim)
+                    };
                     let sep_line = Line::from(Span::styled(
                         format!(
                             " {}",
-                            "\u{2500}"
+                            glyph
                                 .repeat(
                                     inner.width.saturating_sub(2) as usize
                                 )
                         ),
-                        dim,
+                        style,
                     ));
                     items.push(ListItem::new(sep_line));
                 }

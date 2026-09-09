@@ -66,12 +66,20 @@ Explicit assignment always wins, so the Owner can pull a subtask out of its pare
 
 Folded header: `▸ Name  (n)` with a running/idle rollup. Unfolded: `▾ Name`. Colored by the section's color, else `theme::HEADER`; selection keeps White+BOLD.
 
-In the Task sidebar, a quiet background tint covers the section heading and its
+In the Task sidebar, a background tint covers the section heading and its
 workspace, task, workflow, and session rows. The tint follows the section color,
 with a neutral fallback. Internal workspace separators share the tint; section
-boundaries and loose workspaces use the terminal's default background. Filtering
+boundaries and loose workspaces use the terminal's default background. Each
+section ends with a heavy, bold, near-white horizontal rule, including a folded
+section or the final section without loose workspaces below it. Internal
+workspace separators stay thin and dim. Filtering
 or scrolling away the heading does not remove a member's tint. Planning keeps
 its default background and the initiative coordinator `◆` glyph.
+
+Select a section heading and press **Alt+E** to change its color. The palette is
+red, orange, yellow, green, cyan, blue, magenta, and pink, plus the neutral default.
+The choice controls both the heading accent and its background tint. The tint
+uses three times the original RGB intensity; this does not change terminal alpha.
 
 Terminal colors do not include alpha. Whether these colored cells inherit the
 window's transparency is controlled by the terminal emulator; CM does not change
