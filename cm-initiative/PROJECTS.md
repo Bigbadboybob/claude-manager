@@ -5,9 +5,11 @@ Native initiative: **Swarm Focused Design**, slug `swarm-focused-design`, ID
 memberships are approved and both existing tasks are linked. All three channels
 are created and their paths are stored on the native records. Each has a pinned
 kickoff; both coordinators are members of the shared channel and their own side.
-Owner membership is verified in all three channels. The requested laptop
-Work / Task sidebar subsection is reported created; coordinator/scout grouping
-verification remains pending. See [the local steps](SETUP.md#remaining-local-sidebar-step).
+Owner membership is verified in all three channels. Both coordinators and all
+eight proposal scouts are verified grouped in the laptop Work / Task sidebar's
+**Swarm-Focused-Design** subsection (`sec-18d3da776be0a234`). See the
+[grouping evidence](SETUP.md#sidebar-grouping-verification). The separate
+Fable-Scout research workspace remains pending with Swarm-Gardener.
 
 ## Canonical hub
 

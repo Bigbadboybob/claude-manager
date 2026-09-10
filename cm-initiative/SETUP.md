@@ -1,37 +1,49 @@
 # Swarm Focused Design — Setup record
 
-Status: **Infrastructure established; subsection created, task grouping verification pending**,
+Status: **Coordinator and proposal-scout grouping verified; Fable-Scout pending**,
 2026-09-10. The [charter](CHARTER.md) is approved. This document records
 infrastructure setup. The substantive, interactive work plan is [PLAN.md](PLAN.md).
 
 Owner's further review identified two omitted setup checks: Owner must belong
 to every chat and the existing tasks need a Work / Task sidebar subsection.
-Owner membership is verified in all three channels. Swarm-Gardener relayed
-that Owner created the laptop subsection and requested moving the scouts into
-it (message `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:f78d5126-3695-4e82-9b25-1cad0ae2ec59`).
-Coordinator/scout assignments have not been verified from this cloud session,
-which has no supported interface to mutate the live viewer grouping. Earlier
-completion statements below record the narrower checks done at their time.
+Owner membership is verified in all three channels. Owner created the laptop
+subsection; both coordinator workspaces and all eight proposal scouts are now
+verified grouped, with evidence below. The separate Fable-Scout research
+workspace remains a pending assignment owned by Swarm-Gardener.
+Earlier completion statements in the
+decision log record the narrower checks done at their time.
 
-## Remaining local sidebar step
+## Sidebar grouping verification
 
-In the laptop TUI's **Work / Task sidebar**:
+The laptop TUI's **Work / Task sidebar** subsection is **Swarm-Focused-Design**,
+ID `sec-18d3da776be0a234`, blue. Creation and coordinator grouping are complete.
 
-1. Select the existing **Swarm Focused Design** subsection; creation was
-   reported complete by Owner through Swarm-Gardener.
-2. Select **Swarm focused design CM**, press **Alt+E**, and set its **Section**
-   field to **Swarm Focused Design**; save the form.
-3. Do the same for **Swarm focused design** on the predictionTrading side.
+- **CM coordinator — directly verified by Initiative-Bridge:** `sidebar.list`
+  reports `viewer_published=true`; workspace `ws-18d3bae538b649c9` has
+  `observed.choice` and `observed.effective_section_id` equal to the subsection
+  ID, with `pending=null`. Its receipt is null because this is an existing
+  assignment, not a newly queued change. No assignment mutation was needed.
+- **predictionTrading coordinator and scouts — verified by Swarm-Gardener:**
+  all six standalone P1–P6 scout workspaces have applied receipts, matching
+  effective section IDs, and no pending request. P7/P8 share the coordinator
+  workspace, also observed in this subsection. Completion report:
+  `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:c9950088-dec7-41e2-8d19-bf577e19ab76`.
+- **Fable-Scout — pending:** the earlier research task
+  `59a67007-7a71-412a-87d4-bf535df42893` is separate from P1–P8. Swarm-Gardener
+  reports that its workspace is absent from the coordinator's sidebar scope
+  and assignment returns "not a live session in scope". It has asked Fable
+  to self-assign using its own session identity and verify the observed result.
+  Report: `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:9c2cee9e-b9bc-4000-9882-57a705e1b6a2`.
 
-Verify both coordinator tasks and their scout workspaces appear under this
-subsection. Child workspaces inherit through loaded task ancestry unless an
-explicit section or **none** overrides inheritance; use **inherit** when the
-parent grouping is intended. Current source also resolves cloud workspaces
-through retained session task IDs before planning workspace bindings arrive.
-A missing loaded task record still prevents ancestry traversal, so a failure
-to appear does not by itself identify a cloud-specific bug.
-Native initiative membership and the coordinator glyph do not create this
-viewer-owned grouping. Current reference: [sidebar sections](../doc/sidebar-sections.md).
+The deployed sidebar tools now support scoped remote assignment to existing
+sections. Both coordinators used the documented shell fallback with their own
+CM session identities because their MCP tool lists were cached. Future tasks
+should use `list_sidebar_sections` and `set_session_section`, or that fallback,
+and verify observed membership after any queued assignment. Reference:
+[sidebar sections at `d0dfb5e`](https://github.com/Bigbadboybob/claude-manager/blob/d0dfb5e7aaae48cc2aa43cd300fb708cb82d3b28/doc/sidebar-sections.md).
+The older sidebar document on this coordinator branch predates those tools.
+Section definitions remain viewer-owned; native initiative membership and the
+coordinator glyph are separate from this display grouping.
 
 ## Approved setup
 
@@ -68,7 +80,7 @@ These are responsibilities within the existing coordinator tasks.
 | predictionTrading onboarding link | Swarm-Gardener | `agent_docs/swarm-focused-design-onboarding.md` in its existing worktree | Shared docs and initiative ID | Links identify the canonical charter, local role, shared artifact index, channels, and approval boundaries | Complete; `ae3724a69` pushed and reviewed |
 | Channels and kickoff | Initiative-Bridge; Swarm-Gardener joins shared and predictionTrading channels | Three channel paths above and channel references on native records | Plan approval; initiative and docs ready | Read back all channels, pinned kickoff, participant membership, and stored channel paths | Complete; pins and memberships verified |
 | Owner chat membership | Initiative-Bridge | Membership in all three channels | Channels created; Owner identity resolved | Owner appears in all three rosters | Complete; already joined by Owner, verified on review |
-| Work / Task sidebar subsection | Laptop viewer | One Swarm Focused Design subsection containing both existing task workspaces | Supported access to the laptop TUI | Both named tasks visible within the subsection | Subsection creation reported complete; coordinator/scout grouping verification pending |
+| Work / Task sidebar subsection | Owner creates; each coordinator assigns its scoped workspaces | Swarm-Focused-Design (`sec-18d3da776be0a234`), containing participating workspaces | Viewer catalogue published; supported sidebar tools or documented fallback | Observed effective section matches; no pending assignment; applied receipts for new changes | Both coordinators and P1–P8 verified; separate Fable-Scout assignment pending with Swarm-Gardener |
 
 ## Documents and shared artifacts
 
@@ -148,8 +160,10 @@ tasks or SEJD records changed.
 
 ## Remaining setup work
 
-Create and verify the laptop subsection above. No further decision blocks the
-bounded exploration recorded in [PLAN.md](PLAN.md).
+Swarm-Gardener owns the remaining Fable-Scout assignment and observed-result
+verification. Owner membership, both coordinators, and P1–P8 grouping are
+verified. Selecting candidate implementations or new swarms remains an
+interactive Owner decision in [PLAN.md](PLAN.md).
 
 ## Initial completion record
 
@@ -202,3 +216,10 @@ does not launch later candidate swarms or authorize deployments.
   plan. Owner is verified in all three chats; subsection creation remains a
   laptop UI action. The interactive work plan now lives in `PLAN.md`. Full
   setup completion remains pending until the subsection is verified.
+- **2026-09-10 — Sidebar grouping verified:** after deployment of the remote
+  assignment tools, Swarm-Gardener verified its coordinator and all eight
+  proposal scouts in `sec-18d3da776be0a234`. Initiative-Bridge directly verified
+  its CM coordinator workspace in the same subsection. The observed assignments
+  above supersede the earlier manual-only status. Swarm-Gardener then reported
+  the separate Fable-Scout workspace still needs assignment and requested its
+  self-assignment; full setup completion awaits that remaining verification.

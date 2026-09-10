@@ -286,3 +286,15 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   unverified here. CM supplied the current inheritance path and explicit-none
   override behavior; no writable laptop control route or inheritance defect
   has been established, and no viewer file was changed.
+
+- **2026-09-10 — Sidebar grouping verified:** the newly deployed supported
+  assignment interface resolves the earlier access limitation. Swarm-Gardener
+  reports applied receipts, matching effective section and no pending request
+  for all six standalone P1–P6 scout workspaces; P7/P8 share its already-grouped
+  coordinator workspace. Initiative-Bridge directly verified the CM coordinator
+  workspace in the same `Swarm-Focused-Design` subsection
+  (`sec-18d3da776be0a234`), with no pending request or mutation needed. See
+  [SETUP.md](SETUP.md#sidebar-grouping-verification) for evidence and the current
+  documented interface. Swarm-Gardener subsequently flagged the separate
+  Fable-Scout research workspace as still pending and owns that assignment
+  follow-up. Selecting implementations or new swarms remains with Owner.

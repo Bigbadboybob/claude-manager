@@ -266,7 +266,8 @@ to configure a scheduler or migrate existing continuous tasks.
 Owner approved the combined charter and initial setup on 2026-09-10. The
 initiative is active, both coordinator tasks are linked, onboarding docs are
 committed, and channels have pinned kickoffs and Owner membership. The laptop
-sidebar subsection is reported created; task grouping verification remains
-pending in [SETUP.md](SETUP.md). Owner has now
+sidebar subsection contains both coordinators and all eight proposal scouts,
+with grouping verification recorded in [SETUP.md](SETUP.md); the separate
+Fable-Scout research workspace is still pending there. Owner has now
 authorized the initial research and brainstorming in [PLAN.md](PLAN.md); develop
 and review candidate plans interactively before selecting new swarms.
