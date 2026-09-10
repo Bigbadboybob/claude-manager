@@ -1,6 +1,6 @@
 # Swarm Focused Design — Initial setup plan
 
-Status: **Approved by Owner; setup in progress**, 2026-09-10. The
+Status: **Approved by Owner; setup complete**, 2026-09-10. The
 [charter](CHARTER.md) is approved. This plan establishes coordination between
 the two existing tasks; candidate swarms will be discussed after setup.
 
@@ -35,9 +35,9 @@ These are responsibilities within the existing coordinator tasks.
 | Work | Responsible coordinator | Owned paths or records | Dependencies | Verification | Status |
 |---|---|---|---|---|---|
 | Native initiative and task links | Initiative-Bridge | New initiative and its two memberships; initiative association on the two named tasks | Owner approval of this plan, memberships, and activation through the supported Owner flow | Read back the initiative, coordinator, memberships, task links, and approval fields | Complete |
-| Shared onboarding and protocol | Initiative-Bridge, with Swarm-Gardener review | CM hub `cm-initiative/` | Approved charter and setup plan; fill in native ID when created | Both coordinators can follow links to the same current docs and identify ownership and checkpoints | Prepared; committing bootstrap |
-| predictionTrading onboarding link | Swarm-Gardener | `agent_docs/swarm-focused-design-onboarding.md` in its existing worktree | Shared docs and initiative ID | Links identify the canonical charter, local role, shared artifact index, channels, and approval boundaries | Prepared; awaiting shared commit and channel joins |
-| Channels and kickoff | Initiative-Bridge; Swarm-Gardener joins shared and predictionTrading channels | Three channel paths above and channel references on native records | Plan approval; initiative and docs ready | Read back all channels, pinned kickoff, participant membership, and stored channel paths | Created and stored; kickoff and joins pending |
+| Shared onboarding and protocol | Initiative-Bridge, with Swarm-Gardener review | CM hub `cm-initiative/` | Approved charter and setup plan; fill in native ID when created | Both coordinators can follow links to the same current docs and identify ownership and checkpoints | Complete; bootstrap `867d8ee` pushed |
+| predictionTrading onboarding link | Swarm-Gardener | `agent_docs/swarm-focused-design-onboarding.md` in its existing worktree | Shared docs and initiative ID | Links identify the canonical charter, local role, shared artifact index, channels, and approval boundaries | Complete; `ae3724a69` pushed and reviewed |
+| Channels and kickoff | Initiative-Bridge; Swarm-Gardener joins shared and predictionTrading channels | Three channel paths above and channel references on native records | Plan approval; initiative and docs ready | Read back all channels, pinned kickoff, participant membership, and stored channel paths | Complete; pins and memberships verified |
 
 ## Documents and shared artifacts
 
@@ -117,8 +117,28 @@ tasks or SEJD records changed.
 
 ## Open decisions
 
-No remaining decision blocks the approved setup. Select later swarm proposals
-with Owner after setup is complete.
+Setup is complete. Select later swarm proposals with Owner; no new swarm launch
+has been approved yet.
+
+## Completion record
+
+- Initiative `d381971d-0668-4ac0-8483-bf4111f3ddc2` is active with both approved
+  memberships and exactly the two existing coordinator tasks linked. Task
+  identity, status, worktree branches, and SEJD ownership remain intact.
+- Shared docs were reviewed and pushed at CM bootstrap commit
+  `867d8ee5ae3413c654e0c06483e376763f3c908e`. Follow the hub branch for this
+  completion record and later decisions.
+- predictionTrading onboarding was reviewed and pushed at
+  [`ae3724a69`](https://github.com/Bigbadboybob/predictionTrading/blob/ae3724a69/agent_docs/swarm-focused-design-onboarding.md).
+- All three channels are created, linked from native records, and have pinned
+  kickoffs. Both coordinators' required memberships were read back; shared
+  messages and pins were confirmed synchronized with the message-board hub.
+- Local document links and whitespace checks passed. Swarm-Gardener independently
+  verified the six shared documents, published bootstrap reference, local
+  instruction links, and shared/predictionTrading channel access and pins.
+
+The initiative and its coordinator tasks remain ongoing. Completing this setup
+does not launch later candidate swarms or authorize deployments.
 
 ## Decision log
 
@@ -143,3 +163,6 @@ with Owner after setup is complete.
   `d381971d-0668-4ac0-8483-bf4111f3ddc2`, approved both memberships through the
   supported API, activated it at `2026-09-10T03:32:34.797365Z`, and linked the
   two existing tasks. All three channel paths are now stored on native records.
+- **2026-09-10 — Setup complete:** both coordinators verified the shared docs and
+  conversations; predictionTrading onboarding is committed at `ae3724a69`.
+  The initiative is ready for discussion of later work with Owner.

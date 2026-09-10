@@ -12,6 +12,7 @@ and [project map](../PROJECTS.md) for current goals, scope, and onboarding.
 | Artifact | Owner | Source/version | Status and use |
 |---|---|---|---|
 | [Charter review record](../reviews/2026-09-10-charter-review.md) | Initiative-Bridge | CM hub branch; bootstrap commit identified in the pinned kickoff | Owner decisions and review provenance |
+| [predictionTrading onboarding](https://github.com/Bigbadboybob/predictionTrading/blob/ae3724a69/agent_docs/swarm-focused-design-onboarding.md) | Swarm-Gardener | predictionTrading, commit `ae3724a69` | Verified local entry point to the shared docs, project instructions, and channels |
 | [predictionTrading contribution and candidate register](https://github.com/Bigbadboybob/predictionTrading/blob/acfd6f8ce/agent_docs/swarm-focused-design-charter-review-2026-09-10.md) | Swarm-Gardener | predictionTrading, commit `acfd6f8ce` | Reviewed input and later candidate ideas; canonical goal is the approved shared charter |
 | [SEJD historical evidence and lessons](https://github.com/Bigbadboybob/predictionTrading/blob/acfd6f8ce/agent_docs/swarm-focused-design-charter-review-2026-09-10.md#sejd-evidence-and-lessons) | Swarm-Gardener | predictionTrading contribution at `acfd6f8ce`, with dated source records | Historical case-study starting points; not current defect findings |
 

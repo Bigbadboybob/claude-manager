@@ -7,7 +7,7 @@ clarifications, and the predictionTrading contribution, aligned through commit
 The charter and [initial setup plan](PLAN.md) are approved. Native initiative
 `d381971d-0668-4ac0-8483-bf4111f3ddc2` is active with both memberships approved.
 The [project map](PROJECTS.md) records native IDs and channels; the plan tracks
-setup completion.
+the completed setup.
 
 Initiative slug: `swarm-focused-design`.
 
@@ -261,8 +261,8 @@ to configure a scheduler or migrate existing continuous tasks.
 
 ## Review and next step
 
-Owner approved the combined charter and setup plan on 2026-09-10. The initiative
-is active, both existing coordinator tasks are linked, and channels are created.
-Finish the remaining onboarding and kickoff checks in [PLAN.md](PLAN.md), then
-discuss later candidate swarms with Owner. Launch only separately selected,
-approved work.
+Owner approved the combined charter and setup plan on 2026-09-10. Setup is
+complete: the initiative is active, both existing coordinator tasks are linked,
+onboarding docs are committed, and channels have pinned kickoffs. See the
+[completion record](PLAN.md#completion-record). Next, discuss later candidate
+swarms with Owner and launch only separately selected, approved work.

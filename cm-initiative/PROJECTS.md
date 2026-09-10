@@ -3,8 +3,8 @@
 Native initiative: **Swarm Focused Design**, slug `swarm-focused-design`, ID
 `d381971d-0668-4ac0-8483-bf4111f3ddc2`. Status: **active**, 2026-09-10. Both project
 memberships are approved and both existing tasks are linked. All three channels
-are created and their paths are stored on the native records. Kickoff and the
-predictionTrading coordinator's channel joins are being completed.
+are created and their paths are stored on the native records. Each has a pinned
+kickoff; both coordinators are members of the shared channel and their own side.
 
 ## Canonical hub
 
@@ -15,6 +15,7 @@ predictionTrading coordinator's channel joins are being completed.
 - Read [CHARTER.md](CHARTER.md), [PLAN.md](PLAN.md), [PROTOCOL.md](PROTOCOL.md), and
   [shared/README.md](shared/README.md). Pinned kickoff messages identify the
   committed bootstrap snapshot; use the hub branch for subsequent status updates.
+- Reviewed bootstrap: [`867d8ee5ae3413c654e0c06483e376763f3c908e`](https://github.com/Bigbadboybob/claude-manager/tree/867d8ee5ae3413c654e0c06483e376763f3c908e/cm-initiative).
 
 ## Participating projects
 
@@ -28,7 +29,7 @@ predictionTrading coordinator's channel joins are being completed.
 | Task ID | `3b58ab69-3c89-4dee-bed4-c714858b0656` | `f279464b-59da-4ba2-bce6-7bdb0a450847` |
 | Branch | `cm/swarm-focused-design-cm` | `cm/swarm-focused-design` |
 | Worktree | `/home/lucas/.cm/worktrees/claude-manager-swarm-focused-design-cm` | `/home/lucas/.cm/worktrees/predictionTrading-swarm-focused-design` |
-| Onboarding | This map and [PROTOCOL.md](PROTOCOL.md); repository [CLAUDE.md](../CLAUDE.md) | `agent_docs/swarm-focused-design-onboarding.md`, linking the hub and local repository instructions |
+| Onboarding | This map and [PROTOCOL.md](PROTOCOL.md); repository [CLAUDE.md](../CLAUDE.md) | [agent_docs/swarm-focused-design-onboarding.md at `ae3724a69`](https://github.com/Bigbadboybob/predictionTrading/blob/ae3724a69/agent_docs/swarm-focused-design-onboarding.md), linking the hub and local repository instructions |
 | Membership | Approved | Approved |
 
 ## Conversations
@@ -42,6 +43,12 @@ predictionTrading coordinator's channel joins are being completed.
 Conversation IDs: shared `d506d8f9-3fc8-4d92-bf43-c356234fe4b8`; claude-manager
 `cf333e79-7f2e-4b8e-a5d2-715756c87b02`; predictionTrading
 `45785665-6b92-49eb-bd50-7209080792da`.
+
+Pinned kickoff message IDs:
+
+- Shared: `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:00f4e45e-7fa7-45b0-b822-c026f4a1ec77`.
+- claude-manager: `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:dc17eefd-7ea6-4bed-ba3d-f12731b33a96`.
+- predictionTrading: `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:6e9ab38d-54b0-425f-89c8-4ea2fa1baf11`.
 
 Both coordinators join the shared channel and their own project channel. New
 approved participants join the channels relevant to their work and read the
