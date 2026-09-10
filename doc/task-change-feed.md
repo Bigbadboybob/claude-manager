@@ -37,7 +37,24 @@ The app above the backend is unchanged: it still receives `TasksUpdated(Vec<Task
 
 ## Measuring
 
-`scripts/measure-task-feed.py` boots a throwaway PostgreSQL 17 + the real API, seeds a production-shaped task list and reports wire bytes, requests, API CPU seconds and DB transactions per scenario (legacy identity/gzip polling, cold snapshot, idle long poll, single change, 50-change burst, reconnect catch-up, delete, expired cursor). See the release notes in the task report for the 2026-09-10 numbers.
+`scripts/measure-task-feed.py` boots a throwaway PostgreSQL 17 + the real API, seeds a production-shaped task list and reports wire bytes, requests, API CPU seconds and DB transactions per scenario (legacy identity/gzip polling, cold snapshot, idle long poll, single change, 50-change burst, reconnect catch-up, delete, expired cursor). Run on cm-sessions on 2026-09-10 (synthetic prompts compress better than real ones: the real prod list was 5,106,471 B raw / 1,649,095 B gzipped that day, the synthetic one 4.63 MB / 0.70 MB; `db_xacts` / `db_tup_returned` include the dispatch loops, see the no-client baseline):
+
+| scenario | seconds | requests | wire_bytes | api_cpu_s | db_xacts | db_tup_returned | notes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| baseline_no_client | 30.03 | 0 | 0 | 0.09 | 82 | 37360 |  |
+| legacy_identity | 30.03 | 6 | 27765216 | 0.51 | 84 | 41372 | rows_per_response=1424, bytes_per_day_at_5s=79963822080 |
+| legacy_gzip | 30.03 | 6 | 4218624 | 0.98 | 74 | 28700 | rows_per_response=1424, bytes_per_day_at_5s=12149637120 |
+| feed_cold_snapshot_gzip | 0.21 | 1 | 703190 | 0.14 | 14 | 7262 | rows=1424 |
+| feed_idle | 60.05 | 3 | 345 | 0.21 | 132 | 38329 | bytes_per_day=496386 |
+| feed_single_change | 0.06 | 1 | 1102 | 0.01 | 2 | 123 | entries=1, patch_to_delivery_ms=31 |
+| feed_burst_50 | 0.29 | 2 | 26014 | 0.15 | 2 | 123 | pages=2 |
+| feed_reconnect_30_changes | 0.04 | 1 | 15976 | 0.01 | 2 | 123 | entries=30 |
+| feed_delete | 0.04 | 1 | 202 | 0.01 | 2 | 123 |  |
+| feed_expired_cursor_resnapshot | 0.22 | 1 | 702819 | 0.14 | 12 | 4393 |  |
+
+Read: legacy polling moves 4.6 MB per request; the feed's idle cost is 3 requests and 345 bytes per minute (one ~112-byte reply per 25 s hold) with no DB work beyond the dispatcher's baseline, a status change is delivered ~30 ms after its commit as a ~1 KB page, and a reconnect after 30 edits catches up with one 16 KB page instead of a resnapshot.
+
+Live on cm-manager right after the deploy (2026-09-10 04:50 UTC, 1,444 non-archived tasks): `/tasks` 5,106,471 B identity vs 1,649,095 B gzip; feed snapshot 1,649,152 B; idle poll reply 112 B; a benign PATCH on one task was delivered to a waiting poll in 44 ms as a 3,298 B page.
 
 ## Operations
 
