@@ -423,12 +423,14 @@ impl App {
     /// Process all pending terminal events (non-blocking).
     pub fn drain_terminal_events(&mut self) {
         let visible_uid = self.active_session().map(|(_, ts)| ts.uid.clone());
-        for ts in self.workspaces.iter_mut().flat_map(|ws| &mut ws.sessions) {
-            if let Some(control) = &mut ts.session.output_control {
-                control.set_visible(visible_uid.as_deref() == Some(&ts.uid));
-            }
-        }
         let now = Instant::now();
+        for ts in self.workspaces.iter_mut().flat_map(|ws| &mut ws.sessions) {
+            let visible = visible_uid.as_deref() == Some(&ts.uid);
+            if let Some(control) = &mut ts.session.output_control {
+                control.set_visible(visible);
+            }
+            ts.session.poll_repaint(visible, now);
+        }
         let should_check_session_ids =
             now.duration_since(self.last_session_id_check) >= SESSION_ID_CHECK_INTERVAL;
 

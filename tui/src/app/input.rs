@@ -3147,6 +3147,13 @@ impl App {
                     }
                     KeyCode::Char('r') => {
                         self.backend.refresh();
+                        // Outer-buffer clearing cannot reconstruct a Codex
+                        // screen missing from the daemon's bounded replay tail.
+                        if let Some(ts) = self.active_session_mut() {
+                            if ts.session_type == "codex" {
+                                ts.session.request_repaint();
+                            }
+                        }
                         // A-r doubles as "reconnect now": accelerate in-flight
                         // remote reconnects and revive any that gave up (the
                         // daemon may have restored them since). Addresses the

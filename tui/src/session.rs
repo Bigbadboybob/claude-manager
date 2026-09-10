@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::tty;
@@ -51,6 +52,7 @@ impl EventListener for EventProxy {
 
 /// A terminal session wrapping alacritty's Term + PTY + EventLoop.
 pub struct Session {
+    repaint: Repaint,
     pub output_control: Option<crate::attach_writer::OutputControl>,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub sender: EventLoopSender,
@@ -122,6 +124,14 @@ pub struct Session {
     /// for daemon-attached sessions; `None` for local-PTY sessions. See
     /// [`Self::attach_socket_hung_up`].
     pub attach_hup_fd: Option<std::os::fd::OwnedFd>,
+}
+
+#[derive(Default)]
+enum Repaint {
+    #[default]
+    None,
+    WhenVisible,
+    RestoreAt(Instant),
 }
 
 impl Session {
@@ -267,6 +277,7 @@ impl Session {
         event_loop.spawn();
 
         Ok(Session {
+            repaint: Repaint::None,
             term,
             sender,
             pty_writer: Some(pty_writer),
@@ -320,9 +331,18 @@ impl Session {
         restore_context: bool,
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
+        // A bounded raw replay can start after the application's last complete
+        // screen. Codex can reconstruct its history on resize; defer that work
+        // until this pane is viewed, rather than repainting the whole fleet.
+        let repaint = if config.session_type == "codex" {
+            Repaint::WhenVisible
+        } else {
+            Repaint::None
+        };
         let cs = crate::client_session::ClientSession::attach_existing_with_context(config, restore_context)?;
         let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
         Ok(Session {
+            repaint,
             term: cs.term,
             sender: cs.sender,
             pty_writer: None,
@@ -362,6 +382,7 @@ impl Session {
         // surfaces them via `daemon_memory_cap_kill`.
         let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
         Ok(Session {
+            repaint: Repaint::None,
             term: cs.term,
             sender: cs.sender,
             pty_writer: None,
@@ -514,6 +535,49 @@ impl Session {
             screen_lines: rows as usize,
         });
     }
+
+    /// Ask a repaintable application to rebuild its screen, without input or
+    /// restart. Callers restrict this to Codex; shells cannot recreate output.
+    pub fn request_repaint(&mut self) {
+        if !self.exited && !matches!(self.repaint, Repaint::RestoreAt(_)) {
+            self.repaint = Repaint::WhenVisible;
+        }
+    }
+
+    fn send_pty_size(&self, cols: u16, rows: u16) {
+        let _ = self.sender.send(Msg::Resize(WindowSize {
+            num_cols: cols,
+            num_lines: rows,
+            cell_width: 1,
+            cell_height: 1,
+        }));
+    }
+
+    fn viewport_size(&self) -> (u16, u16) {
+        let term = self.term.lock();
+        (term.columns() as u16, term.screen_lines() as u16)
+    }
+
+    /// Tick-driven resize pulse: no sleeps, RPCs, or socket writes on the UI
+    /// thread. Keep the parser at the real viewport size. The second resize
+    /// restores the CURRENT viewport, so a user resize during the pulse wins.
+    /// Complete a started pulse even if the user switches to another pane.
+    pub fn poll_repaint(&mut self, visible: bool, now: Instant) {
+        match self.repaint {
+            Repaint::WhenVisible if visible && !self.exited => {
+                let (cols, rows) = self.viewport_size();
+                let temporary_cols = if cols > 2 { cols - 1 } else { cols + 1 };
+                self.send_pty_size(temporary_cols, rows);
+                self.repaint = Repaint::RestoreAt(now + Duration::from_millis(400));
+            }
+            Repaint::RestoreAt(deadline) if now >= deadline => {
+                let (cols, rows) = self.viewport_size();
+                self.send_pty_size(cols, rows);
+                self.repaint = Repaint::None;
+            }
+            _ => {}
+        }
+    }
 }
 
 // Drop semantics: send `Msg::Shutdown` so alacritty's EventLoop
@@ -558,6 +622,10 @@ impl Session {
 // of respawning.
 impl Drop for Session {
     fn drop(&mut self) {
+        if matches!(self.repaint, Repaint::RestoreAt(_)) {
+            let (cols, rows) = self.viewport_size();
+            self.send_pty_size(cols, rows);
+        }
         let _ = self.sender.send(Msg::Shutdown);
     }
 }

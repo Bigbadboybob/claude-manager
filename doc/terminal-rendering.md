@@ -36,3 +36,35 @@ CARGO_TARGET_DIR="$HOME/.cm/builds/terminal-rendering" CARGO_BUILD_JOBS=4 \
 Activation requires only the [laptop TUI release](TUI_RELEASES.md) and viewer
 relaunch. A viewer window resize repaints existing outer-screen damage as a
 temporary workaround. Do not use a session restart to repair sidebar artifacts.
+
+## Missing conversation after reconnect
+
+The daemon retains a 1 MiB tail of raw PTY bytes. A long-lived session can fill
+that tail entirely with incremental screen updates, evicting the original
+screen those updates depended on. Replaying it into a fresh terminal can leave
+the upper conversation blank even while new messages and input work. The agent's
+saved transcript is separate from this display buffer.
+
+Existing Codex panes now request a repaint the first time they are viewed after
+attachment or reconnect. The viewer briefly changes the PTY width by one column
+and restores the current viewport size 400 ms later. Codex rebuilds its history
+and composer in response. The viewer ticks drive this asynchronously: no input,
+agent restart, blocking delay, or extra control RPC is involved. Hidden panes
+defer the work until viewed. A size restoration still completes if focus moves,
+and a user window resize during recovery takes precedence over the old size.
+
+**Alt+r** also requests this repaint for the focused Codex session, alongside
+the existing planning refresh, reconnect nudge, and outer-screen clear.
+**Alt+Shift+r** retains its distinct agent restart/revive behavior.
+
+Shells are not automatically repainted: a shell cannot recreate old command
+output on resize. This recovery also does not turn the terminal into an unlimited
+transcript viewer; its 1,500-line scrollback limit still applies. Authoritative
+terminal snapshots and longer history access remain separate work.
+
+The regression uses a real daemon/PTY and a deterministic repaintable application.
+It evicts the first screen with more than 1 MiB of incremental updates, verifies
+the missing header after attachment, and recovers it without changing the child
+PID or sending input. It also covers hidden panes, focus changes, a concurrent
+window resize, repeated focus, and shell attachments. Run the `codex_repaint`
+test filter through the isolated runner above.

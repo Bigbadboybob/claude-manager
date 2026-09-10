@@ -2588,6 +2588,118 @@ mod tests {
     }
 
     #[test]
+    fn codex_repaint_recovers_evicted_screen_without_input_or_restart() {
+        use alacritty_terminal::index::{Column, Line};
+        use std::time::{Duration, Instant};
+
+        fn wait_until(mut condition: impl FnMut() -> bool) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(Instant::now() < until, "timed out waiting for PTY");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let (socket, working_dir, state, stop, handle) = start_test_daemon("ws-repaint");
+        // A deterministic repaintable PTY application. Its initial header is
+        // evicted by >1 MiB of updates to the bottom row; only SIGWINCH redraws
+        // it. No network/model calls and no production session are involved.
+        let program = r#"
+import os, signal
+def repaint(*_):
+    os.write(1, b'\x1b[2J\x1b[HCONVERSATION-START\x1b[22;1HREADY')
+signal.signal(signal.SIGWINCH, repaint)
+repaint()
+data = b'\x1b[22;1H\x1b[2Kworking' * 70000
+while data:
+    data = data[os.write(1, data):]
+os.write(1, b'\x1b[22;1HREADY')
+while True:
+    signal.pause()
+"#;
+        let argv = vec!["python3".into(), "-c".into(), program.into()];
+        let uid = test_uid();
+        let config = bash_config(&socket, &working_dir, "op-test", &uid,
+            "ws-repaint", "repaint-fixture", &argv, 80, 24);
+        rpc_start_session(&config).unwrap();
+        let (fanout, pid) = {
+            let st = state.lock().unwrap();
+            let s = st.sessions.get(&uid).unwrap();
+            (s.fanout.clone(), s.pid)
+        };
+        wait_until(|| {
+            let snap = fanout.snapshot_since(None);
+            snap.start_offset > 0 && snap.bytes.ends_with(b"READY")
+        });
+        let dimensions = || {
+            let st = state.lock().unwrap();
+            let s = st.sessions.get(&uid).unwrap();
+            (s.last_cols, s.last_rows)
+        };
+        let mut config = bash_config(&socket, &working_dir, "op-test", &uid,
+            "ws-repaint", "repaint-fixture", &argv, 80, 24);
+        // Model this repaintable fixture as an existing Codex pane in the TUI.
+        config.session_type = "codex";
+        let mut viewer = crate::session::Session::new_attached_existing(config).unwrap();
+        wait_until(|| viewer.term.lock().grid()[Line(21)][Column(0)].c == 'R');
+        assert_ne!(viewer.term.lock().grid()[Line(0)][Column(0)].c, 'C',
+            "the raw replay tail reproduces the missing upper conversation");
+
+        let now = Instant::now();
+        viewer.poll_repaint(false, now);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dimensions(), (80, 24), "hidden panes must not repaint the fleet");
+
+        viewer.poll_repaint(true, now);
+        wait_until(|| dimensions() == (79, 24));
+        wait_until(|| viewer.term.lock().grid()[Line(0)][Column(0)].c == 'C');
+        // Finish even when focus moved away in the meantime.
+        let before_restore = fanout.snapshot_since(None).cursor;
+        viewer.poll_repaint(false, now + Duration::from_millis(500));
+        wait_until(|| dimensions() == (80, 24));
+        wait_until(|| {
+            let snap = fanout.snapshot_since(None);
+            snap.cursor > before_restore && snap.bytes.ends_with(b"READY")
+        });
+
+        // Repeated focus changes do not repeat the automatic pulse.
+        let cursor = fanout.snapshot_since(None).cursor;
+        viewer.poll_repaint(true, now + Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dimensions(), (80, 24));
+        assert_eq!(fanout.snapshot_since(None).cursor, cursor);
+
+        // A-r can request another repaint; a simultaneous user resize wins.
+        viewer.request_repaint();
+        viewer.poll_repaint(true, now + Duration::from_secs(2));
+        wait_until(|| dimensions() == (79, 24));
+        viewer.resize(100, 30);
+        wait_until(|| dimensions() == (100, 30));
+        viewer.poll_repaint(false, now + Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dimensions(), (100, 30));
+        {
+            let st = state.lock().unwrap();
+            let s = st.sessions.get(&uid).unwrap();
+            assert_eq!(s.pid, pid, "repaint must keep the same process");
+            assert!(s.last_input_at.lock().unwrap().is_none(),
+                "repaint must never send input or submit a prompt");
+        }
+        drop(viewer);
+
+        // A shell attach uses the same transport but is never auto-repainted.
+        let config = bash_config(&socket, &working_dir, "op-test", &uid,
+            "ws-repaint", "shell-fixture", &argv, 100, 30);
+        let mut shell_viewer = crate::session::Session::new_attached_existing(config).unwrap();
+        shell_viewer.poll_repaint(true, Instant::now());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dimensions(), (100, 30));
+        drop(shell_viewer);
+        let _ = rpc_kill_session(&socket, "op-test", &uid);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    #[test]
     fn rpc_start_session_with_unknown_workspace_surfaces_not_found() {
         let (socket, working_dir, _state, stop, handle) = start_test_daemon("ws-rpc");
         let argv = vec!["/bin/bash".to_string()];
