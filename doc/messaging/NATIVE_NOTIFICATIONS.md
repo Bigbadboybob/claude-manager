@@ -196,15 +196,9 @@ repair. Do not start a second app-server writer or edit rollout JSONL to repair
 permissions. Record the prior settings for rollback and verify model, identity
 and process continuity.
 
-Older embedded Codex processes have no app-server settings endpoint. Until their tool configuration has been reloaded, retain their previous `/permissions` → **Approve for me** setting:
-`on-request` plus `auto_review`, with the workspace sandbox retained. Network
-and outside-workspace commands can request automatically reviewed escalation.
-Verify the selection in the menu and leave the composer empty. This fallback
-does not provide unrestricted command access; the next normal CM restart/resume
-uses the configured full-access launcher. Do not force-restart a continuous
-orchestrator with pending work merely to remove its sandbox.
+Older embedded Codex 0.153.4 processes have no external app-server settings endpoint. Their existing TUI can reload the tool configuration without a restart: at an idle boundary with an empty composer, open `/experimental` and press Enter with every feature left unchanged. That UI submits the current feature settings through `experimentalFeature/enablement/set`, whose handler reloads loaded-thread runtime configuration. Verify that the menu values still match the intended host settings before saving; the September 10 fleet had both Network proxy and Prevent sleep unchecked. Then select `/permissions` → **Full Access**, confirm the full-access dialog, reopen the menu to verify **Full Access (current)**, and exit the menu with an empty composer. A disposable real-client test changed an MCP transport marker and proved the next tool call used the refreshed transport in the same process. Selecting the same model does **not** provide this reload: session-default-only writes deliberately skip it. `/mcp` displays inventory and has no reload command.
 
-Once their tool rules are loaded, **Full Access** removes the local review step. Their next normal CM restart/resume adopts the complete configured launcher policy. Preserve scheduler ownership when migrating continuous orchestrators; never start a competing writer or blindly restart pending work.
+For continuous orchestrators, briefly pause new schedule admission only around the idle UI operation and restore the original pause state afterward. Leave busy sessions pending until their turn ends. Verify a subsequent live MCP call and the next turn's `never`/`user`/`danger-full-access` context, preserving process and conversation identity. The next normal CM restart/resume also adopts the configured launcher policy. Never start a competing writer or blindly restart pending work.
 
 The isolated real-client regression is
 `mcp_server/tests/integration_codex_resume.py` (requires aiohttp, pyte and
