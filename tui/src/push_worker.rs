@@ -35,6 +35,8 @@ use crate::host_pool::HostPool;
 /// worker.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct TuiSessionRow {
+    pub preferences: Option<cm_daemon::resume_identity::Preferences>,
+    pub daemon_attached: bool,
     pub uid: String,
     pub task_id: Option<String>,
     pub label: Option<String>,
@@ -389,8 +391,10 @@ fn push_tui_sessions(
             return;
         }
     };
+    let preferences: Vec<_> = sessions.iter().filter_map(|s| s.preferences.clone()).collect();
     let borrowed: Vec<crate::client_session::TuiSessionSnapshotPush<'_>> = sessions
         .iter()
+        .filter(|s| !s.daemon_attached)
         .map(|s| crate::client_session::TuiSessionSnapshotPush {
             uid: s.uid.as_str(),
             task_id: s.task_id.as_deref(),
@@ -404,10 +408,11 @@ fn push_tui_sessions(
             worktree_path: s.worktree_path.as_deref(),
         })
         .collect();
-    match crate::client_session::rpc_tui_update_sessions_snapshot(
+    match crate::client_session::rpc_tui_update_sessions_with_preferences(
         &daemon_socket,
         &host_pool.operator_token_for(host_id),
         &borrowed,
+        &preferences,
     ) {
         Ok(()) => {
             host_pool.mark_push_success(host_id);
@@ -657,6 +662,8 @@ mod tests {
         per_host.insert(
             HostId::local(),
             vec![TuiSessionRow {
+                preferences: None,
+                daemon_attached: false,
                 uid: "ts-dedupe-probe".to_string(),
                 task_id: None,
                 label: Some("probe".to_string()),

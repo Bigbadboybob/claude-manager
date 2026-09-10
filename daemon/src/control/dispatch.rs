@@ -799,7 +799,7 @@ pub fn dispatch_request(
                 }
             })
         }
-        "add_session" => {
+        "add_session" | "session.resume" => {
             DispatchOutcome::Done(dispatch_add_session(state, req))
         }
 
@@ -1148,6 +1148,9 @@ fn dispatch_add_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
          agents use mcp_start_session)",
     ) {
         return resp;
+    }
+    if req.method == "session.resume" && req.params.get("resume_id").and_then(serde_json::Value::as_str).is_none() {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.resume requires resume_id");
     }
     match methods::add_session(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
@@ -2954,6 +2957,7 @@ mod tests {
             "send_input",
             "kill_session",
             "session.revive",
+            "session.resume",
             "session.attach",
             "create_session",
             "add_session",
@@ -4276,6 +4280,18 @@ mod tests {
             ErrorCode::InvalidParams,
             "operator caller with malformed params should reach the methods layer",
         );
+    }
+
+    #[test]
+    fn resume_identity_operator_only_and_requires_a_conversation() {
+        let state = make_state();
+        let req = session_request("session.resume", serde_json::json!({"resume_id":"a"}), "ts-agent");
+        let denied = dispatch_request(&state, &req).into_response();
+        assert_eq!(denied.error.unwrap().code, ErrorCode::Unauthorized);
+        let req = operator_request("session.resume", serde_json::json!({}));
+        let missing = dispatch_request(&state, &req).into_response();
+        assert_eq!(missing.error.unwrap().code, ErrorCode::InvalidParams);
+        assert!(state.lock().unwrap().sessions.is_empty());
     }
 
     #[test]

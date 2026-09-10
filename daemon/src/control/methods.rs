@@ -1528,6 +1528,11 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     {
         close_continuous_run_for_exit(&ct_id, uid, terminal_status, detail);
     }
+    // Archive the final metadata before removing the live source. This archive
+    // is independent of the bounded read-after-exit tombstones.
+    if let Err(e) = crate::resume_identity::persist(state) {
+        eprintln!("cm-daemon: resume identity archive at exit: {e}");
+    }
     state.sessions.remove(uid);
     // P0 session durability (S1): persist the registry now that the
     // session is gone, so the durable file converges to live state and
@@ -4091,6 +4096,8 @@ pub fn daemon_drain(
 #[derive(Deserialize)]
 struct TuiUpdateSessionsSnapshotParams {
     sessions: Vec<crate::state::TuiSessionSnapshot>,
+    #[serde(default)]
+    preferences: Vec<crate::resume_identity::Preferences>,
 }
 
 pub fn tui_update_sessions_snapshot(
@@ -4103,6 +4110,8 @@ pub fn tui_update_sessions_snapshot(
             format!("tui.update_sessions_snapshot params: {}", e),
         ))?;
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    crate::resume_identity::save_preferences(&state, p.preferences)
+        .map_err(|e| (ErrorCode::Internal, format!("Resume preferences: {e}")))?;
     state.tui_sessions.clear();
     for mut entry in p.sessions {
         if let Some(name) = state.messaging_names.get(&entry.uid) {
@@ -9741,6 +9750,11 @@ fn compose_daemon_spawn_params(
             );
         }
     }
+    if engine == "codex" {
+        if let Some(path) = resume_session_id.and_then(crate::transcript_detect::codex_transcript_path) {
+            full.insert("transcript_path".into(), json!(path));
+        }
+    }
     full.insert("cols".into(), Value::Number(cols.into()));
     full.insert("rows".into(), Value::Number(rows.into()));
     if let Some(tid) = task_id {
@@ -10456,7 +10470,32 @@ fn restore_one_session(
     };
 
     let params = compose_restore_params(state_arc, workspace_id, worktree, e)?;
+    {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        // Explicit Resume already checked the archive. Startup restore can
+        // still use its authoritative live manifest if the archive is damaged.
+        if let Err(err) = crate::resume_identity::remember(&state, crate::resume_identity::Record {
+            workspace_id: workspace_id.into(), worktree_path: worktree.into(),
+            entry: e.clone(), transcript_ids: Default::default(),
+        }) { eprintln!("cm-daemon: restore identity archive: {err}"); }
+    }
     let result = start_session(state_arc, &params)?;
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(sess) = state.sessions.get_mut(&e.uid) {
+            sess.generation = sess.generation.max(e.generation);
+            if let Some(at_unix) = e.reported_done_at {
+                *sess.done_report.lock().unwrap_or_else(|p| p.into_inner()) = Some(crate::session::ReportedDone {
+                    at_unix, at_instant: std::time::Instant::now(), reason: e.report_reason.clone(),
+                });
+            }
+        }
+        if let Some(ws) = state.workspaces.get_mut(workspace_id) {
+            ws.sessions.retain(|old| old.uid != e.uid);
+            ws.sessions.push(e.clone());
+        }
+        state.persist_sessions_best_effort();
+    }
 
     // Arm a transcript detector so the session's transcript binds + persists.
     // Needed for codex (resume writes a NEW rollout file) and for any FRESH
@@ -10563,13 +10602,13 @@ pub fn revive_session(
                 ),
             ));
         }
-        let ws_entry: Option<(String, crate::manifest::ManifestEntry)> =
-            state.workspaces.iter().find_map(|(id, ws)| {
-                ws.sessions
-                    .iter()
-                    .find(|e| e.uid == p.uid)
-                    .map(|e| (id.clone(), e.clone()))
-            });
+        let archived = crate::resume_identity::lookup_uid(&state, &p.uid)
+            .map_err(|e| (ErrorCode::Internal, format!("Resume archive: {e}")))?;
+        let ws_entry: Option<(String, crate::manifest::ManifestEntry)> = archived.as_ref()
+            .map(|r| (r.workspace_id.clone(), r.entry.clone()))
+            .or_else(|| state.workspaces.iter().find_map(|(id, ws)| {
+                ws.sessions.iter().find(|e| e.uid == p.uid).map(|e| (id.clone(), e.clone()))
+            }));
         let tomb = state.exited_tombstone(&p.uid).cloned();
 
         // Workflow participants are poller-owned — a manual revive would fork
@@ -10635,6 +10674,7 @@ pub fn revive_session(
                     .get(&ws_id)
                     .and_then(|w| w.worktree_path.clone())
             })
+            .or_else(|| archived.as_ref().map(|r| r.worktree_path.clone()))
             .or_else(|| {
                 tomb.as_ref()
                     .and_then(|t| t.worktree_path.as_deref().map(PathBuf::from))
@@ -10725,6 +10765,14 @@ pub fn revive_session(
         (ws_id, worktree, entry)
     };
 
+    let _conversation_claim = if let Some(id) = entry.transcript_id.as_deref() {
+        let (claim, saved) = crate::resume_identity::resolve_and_claim(state_arc, &entry.session_type, id)?;
+        if saved.is_some_and(|r| r.entry.uid != entry.uid) {
+            return Err((ErrorCode::Conflict, "This transcript belongs to another CM identity; use Resume to recover that identity".into()));
+        }
+        Some(claim)
+    } else { None };
+    let _uid_claim = crate::resume_identity::claim_uid(state_arc, &entry.uid)?;
     let result = restore_one_session(state_arc, &ws_id, &worktree, &entry)?;
 
     // Converge the in-memory bookkeeping: the workspace entry is alive again
@@ -14205,6 +14253,9 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
         ));
     }
     let snapshot = load_session_seed(p.seed_from.as_deref(), &p.engine)?;
+    if let Some(id) = p.resume_id.as_deref() {
+        return resume_picked_session(state_arc, &p, id);
+    }
     // Look up the existing workspace's worktree. `add_session` reuses
     // it and NEVER calls `create_worktree`. Unknown workspace →
     // NotFound (the daemon doesn't know this workspace; create one with
@@ -14273,6 +14324,56 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
         "resume_id": resume_id,
         "worktree_path": worktree_path.to_string_lossy().into_owned(),
     }))
+}
+
+/// Explicit Resume restores the identity on the daemon that owns the transcript.
+/// The caller's new-row label/task/uid apply only to a previously unmanaged
+/// transcript. Known identities always keep their original bindings.
+fn resume_picked_session(state_arc: &Arc<Mutex<DaemonState>>, p: &AddSessionParams, id: &str) -> MethodResult {
+    crate::agent_memory::validate_transcript_id(id)
+        .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?;
+    refuse_if_draining(state_arc, "session.resume")?;
+    let (_conversation_claim, saved) = crate::resume_identity::resolve_and_claim(state_arc, &p.engine, id)?;
+    let identity_preserved = saved.is_some();
+    let mut record = match saved {
+        Some(r) => r,
+        None => {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let wt = state.workspaces.get(&p.workspace_id).and_then(|w| w.worktree_path.clone())
+                .ok_or((ErrorCode::NotFound, "Resume workspace has no known worktree on this host".into()))?;
+            let entry = serde_json::from_value(json!({
+                "uid": p.uid, "label": p.label, "session_type": p.engine,
+                "transcript_id": id, "task_id": p.task_id,
+            })).map_err(|e| (ErrorCode::Internal, format!("Resume metadata: {e}")))?;
+            crate::resume_identity::Record { workspace_id: p.workspace_id.clone(), worktree_path: wt,
+                entry, transcript_ids: Default::default() }
+        }
+    };
+    let _uid_claim = crate::resume_identity::claim_uid(state_arc, &record.entry.uid)?;
+    let path = match p.engine.as_str() {
+        "claude-code" => crate::transcript_detect::claude_transcript_path(&record.worktree_path, id),
+        "codex" => crate::transcript_detect::codex_transcript_path(id),
+        _ => None,
+    }.filter(|p| p.is_file()).ok_or((ErrorCode::NotFound, "Requested transcript no longer exists on this host".into()))?;
+    record.entry.session_type = p.engine.clone();
+    record.entry.transcript_id = Some(id.into());
+    record.entry.transcript_path = Some(path.to_string_lossy().into_owned());
+    record.entry.last_exit = None;
+    {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(name) = state.messaging_names.get(&record.entry.uid) {
+            record.entry.label = name.name.clone();
+        }
+    }
+    restore_one_session(state_arc, &record.workspace_id, &record.worktree_path, &record.entry)?;
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.recently_exited.retain(|t| t.session_uid != record.entry.uid);
+    }
+    Ok(json!({ "session_uid": record.entry.uid, "resume_id": id,
+        "workspace_id": record.workspace_id, "worktree_path": record.worktree_path,
+        "entry": record.entry, "identity_preserved": identity_preserved,
+        "resume_identity_version": 1 }))
 }
 
 /// P-3: parse `"6G" | "512M" | "1024K" | "67108864"` into a byte count.
@@ -22068,6 +22169,10 @@ mod tests {
             let mut e = me(uid, "bash");
             e.task_id = Some("task-rv".into());
             e.global_perms = true;
+            e.hidden = true; e.notify_on_idle = true; e.color = Some("green".into());
+            e.idle_timeout_secs = 17; e.burst_threshold = 19; e.generation = 42;
+            e.seeded_from_snapshot = Some("seed".into());
+            e.managed_by_uid = Some("ts-parent-0".into());
             e.last_exit = Some(crate::manifest::LastExit {
                 code: None,
                 memory_cap_kill: false,
@@ -22122,6 +22227,45 @@ mod tests {
             "read-after-exit tombstone dropped — the live registry serves \
              this uid now",
         );
+        let persisted = s.build_daemon_manifest();
+        let restored = &persisted.workspaces["ws-rv"].sessions[0];
+        assert!(restored.hidden && restored.notify_on_idle);
+        assert_eq!(restored.color.as_deref(), Some("green"));
+        assert_eq!(restored.idle_timeout_secs, 17);
+        assert_eq!(restored.burst_threshold, 19);
+        assert_eq!(restored.generation, 42);
+        assert_eq!(restored.seeded_from_snapshot.as_deref(), Some("seed"));
+        assert_eq!(restored.managed_by_uid.as_deref(), Some("ts-parent-0"));
+        s.sessions.clear();
+    }
+
+    #[test]
+    fn revive_prefers_authoritative_archive_to_stale_workspace_snapshot() {
+        let state = make_state_arc();
+        let uid = "ts-abc123-0";
+        let wt = std::env::temp_dir();
+        {
+            let mut s = state.lock().unwrap();
+            let old = me(uid, "bash");
+            s.workspaces.insert("ws-original".into(), crate::manifest::ManifestWorkspace {
+                id: "ws-original".into(), worktree_path: Some(wt.clone()),
+                sessions: vec![old.clone()], ..Default::default()
+            });
+            let mut current = old;
+            current.global_perms = true; current.task_id = Some("current-task".into());
+            current.color = Some("green".into()); current.label = "Current name".into();
+            crate::resume_identity::remember(&s, crate::resume_identity::Record {
+                workspace_id: "ws-original".into(), worktree_path: wt,
+                entry: current, transcript_ids: Default::default(),
+            }).unwrap();
+        }
+        revive_session(&state, &json!({"uid":uid})).unwrap();
+        let mut s = state.lock().unwrap();
+        let restored = &s.build_daemon_manifest().workspaces["ws-original"].sessions[0];
+        assert!(restored.global_perms);
+        assert_eq!(restored.task_id.as_deref(), Some("current-task"));
+        assert_eq!(restored.label, "Current name");
+        assert_eq!(restored.color.as_deref(), Some("green"));
         s.sessions.clear();
     }
 

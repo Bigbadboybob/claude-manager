@@ -4519,6 +4519,7 @@ mod past_workspace_reopen_tests {
         let mut app = closed_workspace("sessions", Some(path));
         app.auto_close_workspaces.insert("ws-past-worker".into());
         app.workspaces[0].tombstones.push(SessionTombstone {
+            entry: None,
             uid: "ts-closed-worker".into(),
             managed_by_uid: Some("ts-parent".into()),
             label: "worker".into(),
