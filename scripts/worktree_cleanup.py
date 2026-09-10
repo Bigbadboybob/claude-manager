@@ -80,6 +80,16 @@ def base_context() -> reaper.ScanContext:
     return context
 
 
+def path_absent(path: Path) -> bool:
+    # lstat distinguishes a missing checkout from a dangling symlink. Only a
+    # missing pathname is a no-op; inaccessible or invalid checkouts still fail.
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
 def inventory(ctx: reaper.ScanContext, root: Path | None = None) -> tuple[dict[str, dict], list[str]]:
     warnings = []
     known = {Path(row['path']) for row in lineage.records().values()} | set(ctx.workspaces)
@@ -92,6 +102,8 @@ def inventory(ctx: reaper.ScanContext, root: Path | None = None) -> tuple[dict[s
     # confers task ownership.
     for path in sorted(known):
         try:
+            if path_absent(path):
+                continue
             common = lineage.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir')
             if common in repos:
                 continue
@@ -106,6 +118,8 @@ def inventory(ctx: reaper.ScanContext, root: Path | None = None) -> tuple[dict[s
     warnings.extend(native_warnings)
     for path in sorted(known):
         try:
+            if path_absent(path):
+                continue
             facts = ctx.workspaces.get(path, reaper.WorkspaceFacts())
             task_ids = set(facts.task_ids)
             branch = lineage.git(path, 'branch', '--show-current')
@@ -203,14 +217,26 @@ def scoped_context(ctx: reaper.ScanContext, row: dict, owners: set[str], job: di
 
 def preview(job: dict) -> None:
     ctx = base_context()
-    root = lineage.checkout(Path(job['worktree_path'])) if job.get('worktree_path') else None
-    records, warnings = inventory(ctx, Path(root['path']) if root else None)
+    root_path = Path(job['worktree_path']) if job.get('worktree_path') else None
+    missing_root = root_path is not None and path_absent(root_path)
+    root = lineage.checkout(root_path) if root_path is not None and not missing_root else None
+    records, warnings = inventory(ctx, root_path if not missing_root else None)
+    if missing_root:
+        # Retained creation evidence can still name surviving descendants.
+        # Never register a missing checkout or transfer a removed UUID onto a
+        # new checkout that happens to use the same pathname.
+        prior = [row for row in lineage.stored_records().values() if row['path'] == str(root_path.resolve())]
+        if len(prior) == 1:
+            root = prior[0]
+        elif prior:
+            warnings.append(f'{root_path}: multiple historical checkout identities; descendant ancestry was not inferred')
     roots = {job['task_id']} if job.get('task_id') else set()
-    if not roots and root:
+    if not roots and root_path is not None:
         # A workspace close approves its own directly associated tasks. An
         # absent task_id is not evidence that every owner is an unrelated task.
-        roots.update(records.get(root['id'], {}).get('task_ids', []))
-        roots.update(ctx.workspaces.get(Path(root['path']), reaper.WorkspaceFacts()).task_ids)
+        if root:
+            roots.update(records.get(root['id'], root).get('task_ids', []))
+        roots.update(ctx.workspaces.get(root_path, reaper.WorkspaceFacts()).task_ids)
     family = task_families(ctx.tasks, roots)
     job['root_task_ids'] = sorted(roots)
     job['root_tasks'] = [dataclasses.asdict(ctx.tasks[tid]) for tid in sorted(roots) if tid in ctx.tasks]
@@ -227,8 +253,10 @@ def preview(job: dict) -> None:
             check = reaper.decision(Path(row['path']), scoped_context(ctx, row, own, {'family': family, 'task_id': job.get('task_id'), 'root_task_ids': sorted(roots)}))
             reason = check.reason
         planned.append({**row, 'owners': sorted(own), 'reason': reason})
+    prefix = 'Workspace checkout already absent. ' if missing_root else ''
     job.update(phase='preview', family=sorted(family), candidates=planned, warnings=warnings,
-               message=f'{len(planned)} tracked checkout(s). Active/shared work is retained; state is checked again after closing.')
+               missing_root=missing_root,
+               message=prefix + f'{len(planned)} tracked checkout(s). Active/shared work is retained; state is checked again after closing.')
     write_job(job)
 
 
@@ -254,28 +282,37 @@ def apply(job: dict) -> None:
             continue
         path = Path(row['path'])
         removed = False
+        already_absent = False
         message = ''
         try:
-            fresh = lineage.checkout(path, create=False)
-            if fresh['id'] != row['id']:
-                raise ValueError('checkout identity changed since preview')
-            if fresh['primary']:
-                raise ValueError('primary checkout is always retained')
-            ctx = base_context()
-            owners = scope_facts(ctx, row, set(job['family']), job.get('task_id'), job_roots(job)).task_ids
-            context = scoped_context(ctx, row, owners, job)
-            candidate = reaper.decision(path, context, refresh_processes=True)
-            if not candidate.eligible:
-                message = f'retained: {candidate.reason}'
+            if path_absent(path):
+                # Another cleanup may have finished since preview (or this
+                # worker crashed after removing it but before saving results).
+                already_absent = True
+                message = 'already absent; nothing to reap'
             else:
-                removed, message, _ = reaper.reap_one(candidate, context, home() / 'worktree-reaper.jsonl')
+                fresh = lineage.checkout(path, create=False)
+                if fresh['id'] != row['id']:
+                    raise ValueError('checkout identity changed since preview')
+                if fresh['primary']:
+                    raise ValueError('primary checkout is always retained')
+                ctx = base_context()
+                owners = scope_facts(ctx, row, set(job['family']), job.get('task_id'), job_roots(job)).task_ids
+                context = scoped_context(ctx, row, owners, job)
+                candidate = reaper.decision(path, context, refresh_processes=True)
+                if not candidate.eligible:
+                    message = f'retained: {candidate.reason}'
+                else:
+                    removed, message, _ = reaper.reap_one(candidate, context, home() / 'worktree-reaper.jsonl')
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             message = f'retained: {exc}'
-        result_by_id[row['id']] = {'id': row['id'], 'path': str(path), 'removed': removed, 'message': message}
+        result_by_id[row['id']] = {'id': row['id'], 'path': str(path), 'removed': removed, 'already_absent': already_absent, 'message': message}
         job['results'] = list(result_by_id.values())
         write_job(job)
     count = sum(row['removed'] for row in job.get('results', []))
-    job.update(phase='complete', message=f'Reaped {count}; retained {len(rows) - count}. Branches and preserved artifacts remain available.')
+    absent = sum(row.get('already_absent', False) for row in job.get('results', []))
+    prefix = 'Workspace checkout already absent. ' if job.get('missing_root') else ''
+    job.update(phase='complete', message=prefix + f'Reaped {count}; already absent {absent}; retained {len(rows) - count - absent}. Branches and preserved artifacts remain available.')
     write_job(job)
 
 
