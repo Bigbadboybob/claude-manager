@@ -252,6 +252,9 @@ impl Menu {
                 detail.push(format!("  Receipt: ~/.cm/worktree-cleanup/{id}.json"));
             }
         }
+        // Wrap before calculating scroll bounds: long remote paths must not
+        // hide their retention reason or make the final rows unreachable.
+        let detail = wrap_details(detail, usize::from(inner.width));
         let available = usize::from(inner.height).saturating_sub(lines.len());
         let start = self.scroll.min(detail.len().saturating_sub(available));
         lines.extend(
@@ -263,6 +266,25 @@ impl Menu {
         );
         frame.render_widget(Paragraph::new(lines), inner);
     }
+}
+
+fn wrap_details(lines: Vec<String>, width: usize) -> Vec<String> {
+    let mut wrapped = Vec::new();
+    for line in lines {
+        let mut current = String::new();
+        let mut used = 0;
+        for ch in line.chars() {
+            let columns = Span::raw(ch.to_string()).width();
+            if used + columns > width.max(1) && !current.is_empty() {
+                wrapped.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            current.push(ch);
+            used += columns;
+        }
+        wrapped.push(current);
+    }
+    wrapped
 }
 
 impl App {
@@ -439,6 +461,20 @@ mod tests {
         assert_eq!(menu.task_id.as_deref(), Some("captured-task"));
         menu.closed = true;
         assert!(!menu.close_ready(), "one close only");
+    }
+
+    #[test]
+    fn worktree_cleanup_wraps_entire_paths_and_reasons_without_losing_characters() {
+        let detail = format!(
+            "/home/lucas/.cm/worktrees/{} — shared with another task",
+            "long-task/".repeat(20)
+        );
+        let wrapped = wrap_details(vec![detail.clone()], 48);
+        assert!(wrapped.len() > 4);
+        assert_eq!(wrapped.concat(), detail);
+        assert!(wrapped
+            .iter()
+            .all(|line| Span::raw(line.as_str()).width() <= 48));
     }
 
     #[test]
