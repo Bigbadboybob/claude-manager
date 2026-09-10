@@ -14,11 +14,11 @@ An open unfinished task retains a visible live session, including review and evi
 
 ## Visible stages
 
-The continuous column shows a colored text badge for every subtask. The spinner remains agent activity; idle is never an approval signal. A fixed legend below the list explains the colors and the distinction between the review queue and active review. Missing or unrecognized metadata is shown as **Unstaged**. Terminal planning status overrides stale stage metadata; legacy `metadata.stage` and operator-blocked rows remain readable.
+The continuous column colors each subtask's label by its lifecycle stage, leaving the full available width for the task name. Selected labels become bold and retain their stage color; idle age does not replace that color. The spinner remains agent activity; idle is never an approval signal. A fixed legend below the list explains the colors and the distinction between the review queue and active review. Missing or unrecognized metadata uses the **Unstaged** color. Terminal planning status overrides stale stage metadata; legacy `metadata.stage` and operator-blocked rows remain readable.
 
 Write `metadata.continuous_stage` at every transition, with an actual timezone-aware UTC `metadata.stage_updated_at` and a concrete `metadata.next_action`. Merge these keys into current metadata; preserve unrelated evidence and bindings. The following values are the shared contract:
 
-| Value | Badge | Meaning / writer |
+| Value | Legend label | Meaning / writer |
 |---|---|---|
 | `queued` | Queue | Admitted, waiting for dispatch; orchestrator |
 | `investigating` | Investigate | Evidence gathering; worker |
@@ -33,4 +33,4 @@ Write `metadata.continuous_stage` at every transition, with an actual timezone-a
 
 Keep planning status `running` for internal review queues, active review and other work the orchestrator handles. Use `blocked` only for an actual Owner decision. Workers may request internal review but must not declare their own work approved for Owner. A reviewer records `metadata.reviewed_commit` when moving to `owner_review`; returning a patch for correction moves it to `implementing`. Clear resolved blockers/questions so they cannot leave stale attention markers.
 
-The viewer reads these fields through the existing planning metadata feed. No daemon or API schema change is needed. Updating prompts changes live agent policy; installing the matching TUI is separately required to display the new badges and legend.
+The viewer reads these fields through the existing planning metadata feed. No daemon or API schema change is needed. Updating prompts changes live agent policy; installing the matching TUI is separately required to display the stage colors and legend.

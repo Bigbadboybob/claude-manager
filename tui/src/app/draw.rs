@@ -1264,13 +1264,9 @@ impl App {
     /// `visual_items_continuous()`. Reuses `draw_session_list`'s indicator
     /// glyphs (reconnecting `⟳` / hidden / Running spinner / Idle `●` / alert).
     /// The cursor highlight + the `├`/`└` corner polish land in S4/S5.
-    /// A continuous-column row "needs the operator" when its planning task is
-    /// raw-`blocked`. The orchestrators set `blocked` ONLY for a fix-ready
-    /// subtask awaiting review or an explicit human decision
-    /// (needs_human_decision / long_review / source_down); everything they
-    /// advance themselves stays `running`. We read the RAW `api_status` here
-    /// (not `task_status()`, which derives `Blocked` from any idle session and
-    /// would flag every idle row as needing a human).
+    /// A continuous-column row needs the operator when its durable stage is
+    /// OwnerReview, including the legacy raw-`blocked` compatibility mapping.
+    /// Never derive review ownership from session activity or idle time.
     fn session_needs_human(&self, ts: &TerminalSession) -> bool {
         let Some(tid) = ts.task_id.as_deref() else {
             return false;
@@ -1400,8 +1396,8 @@ impl App {
             } else {
                 Vec::new()
             };
-            // Idle-age bucket — mirrors the main sidebar: tints the
-            // needs-human ● and, when stale, dims the row's label.
+            // Idle age tints the needs-human ● and stale orchestrator labels.
+            // Subtask labels retain their durable lifecycle color.
             let idle_bucket = (ts.status == SessionStatus::Idle
                 && !ts.session.exited)
                 .then(|| idle_age_bucket_at(ts.idle_since, now));
@@ -1455,8 +1451,7 @@ impl App {
                     task.is_some_and(|t| matches!(t.api_status, TaskStatus::Blocked)),
                 )
             });
-            let badge_width = stage.map_or(0, |s| s.label().len() + 3);
-            let max_name = (inner.width as usize).saturating_sub(prefix_cells + badge_width);
+            let max_name = (inner.width as usize).saturating_sub(prefix_cells);
             let label = crate::planning::truncate_with_ellipsis(&ts.label, max_name);
 
             let mut spans = vec![Span::styled(
@@ -1488,14 +1483,20 @@ impl App {
                     Style::default().fg(theme::DIM),
                 ));
             }
-            // Focus highlight: only when the cursor is actually IN this column
-            // (S4). Bold-white, matching the main sidebar's selected style.
+            // Focus adds bold while preserving the subtask's lifecycle color.
             let is_selected = self.cursor_column == SidebarColumn::Continuous
                 && matches!(
                     &self.cursor,
                     Cursor::Session(cwi, csi) if *cwi == r.ws_idx && *csi == r.sess_idx
                 );
-            let label_style = if is_selected {
+            let label_style = if let Some(stage) = stage {
+                let style = Style::default().fg(stage.color());
+                if is_selected {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                }
+            } else if is_selected {
                 Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
             } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
                 && !self.session_has_alert(&ts.uid)
@@ -1511,9 +1512,6 @@ impl App {
             } else {
                 Style::default().fg(theme::MUTED)
             };
-            if let Some(stage) = stage {
-                spans.push(stage.badge());
-            }
             spans.push(Span::styled(label, label_style));
             let item_style = if is_selected {
                 Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
