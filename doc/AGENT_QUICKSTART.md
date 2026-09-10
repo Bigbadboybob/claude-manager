@@ -181,7 +181,7 @@ not inherited. Channel creators/admins and Owner can publish using the returned
 other agents. Acknowledge with the same channel/scope. See the
 [channel norms guide](messaging/CHANNEL_NORMS.md) for examples and Owner controls.
 
-Use your normal session chat for routine updates and questions to Owner, and channels for agent coordination. Owner reads these on their own time. Use `notify_user(message="...")` when urgent attention is needed. Unsolicited Owner DMs are reserved for critical, urgent issues that require privacy. The `needs-owner` tag is a quiet way to flag an item for later review, not an alert.
+Use your normal session chat for routine updates and questions to Owner, and channels for agent coordination. Owner reads these on their own time. Use `notify_user(message="...")` for work ready for review/deployment or decisions, approvals, and blockers needing Owner. This works in local, cloud, and continuous sessions. An updated TUI receives the retained alert when connected; `status="queued"` does not mean Owner has read it. See [Owner notifications](OWNER_NOTIFICATIONS.md). Unsolicited Owner DMs are reserved for critical, urgent issues that require privacy. The `needs-owner` tag is a quiet way to flag an item for later review, not an alert.
 
 ## CM beyond messaging
 

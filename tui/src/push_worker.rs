@@ -52,6 +52,7 @@ pub struct TuiSessionRow {
 }
 
 enum PushCommand {
+    OwnerAttention(crate::owner_notification::Command),
     TaskTree {
         tasks: Vec<(String, Option<String>, Option<String>)>,
         workspaces: Vec<(String, Option<String>)>,
@@ -83,6 +84,13 @@ pub struct PushWorker {
 }
 
 impl PushWorker {
+    pub fn present_owner_alert(&self, alert: cm_daemon::owner_attention::Alert) {
+        let _ = self.cmd_tx.send(PushCommand::OwnerAttention(crate::owner_notification::Command::Present(alert)));
+    }
+    pub fn ack_owner_alert(&self, host: HostId, alert: cm_daemon::owner_attention::Alert) {
+        let _ = self.cmd_tx.send(PushCommand::OwnerAttention(crate::owner_notification::Command::Acknowledge(host, alert)));
+    }
+
     pub fn spawn(host_pool: Arc<HostPool>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let thread = thread::Builder::new()
@@ -163,6 +171,7 @@ impl Drop for PushWorker {
 /// single fanout pass.
 #[derive(Default)]
 struct Pending {
+    owner_attention: Vec<crate::owner_notification::Command>,
     task_tree: Option<(
         Vec<(String, Option<String>, Option<String>)>,
         Vec<(String, Option<String>)>,
@@ -180,6 +189,7 @@ struct Pending {
 
 fn apply(pending: &mut Pending, cmd: PushCommand) {
     match cmd {
+        PushCommand::OwnerAttention(c) => pending.owner_attention.push(c),
         PushCommand::TaskTree {
             tasks,
             workspaces,
@@ -220,10 +230,14 @@ fn worker_loop(
     // so no Mutex needed.
     let mut last_hashes: HashMap<(HostId, PushKind), u64> = HashMap::new();
 
+    let receipt_path = std::env::var_os("HOME").map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir).join(".cm/owner-notification-receipts.json");
+    let mut attention = crate::owner_notification::Delivery::new(receipt_path);
     loop {
-        let first = match cmd_rx.recv() {
+        let first = match cmd_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(c) => c,
-            Err(_) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => { attention.flush(&host_pool); continue; }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         let mut pending = Pending::default();
         apply(&mut pending, first);
@@ -236,6 +250,8 @@ fn worker_loop(
         if pending.shutdown {
             return;
         }
+        for cmd in pending.owner_attention.drain(..) { attention.handle(cmd); }
+        attention.flush(&host_pool);
         execute(&host_pool, &mut last_hashes, pending);
     }
 }

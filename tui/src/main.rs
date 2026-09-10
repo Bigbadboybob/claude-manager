@@ -21,6 +21,7 @@ mod memory_cap;
 mod planning;
 mod preflight;
 mod push_worker;
+mod owner_notification;
 mod session;
 mod session_watch;
 mod term_shim;

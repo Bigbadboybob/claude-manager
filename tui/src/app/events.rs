@@ -1824,6 +1824,9 @@ impl App {
         // applied may post-date the daemon's capture, and an A-R
         // force-restart's own kill is skipped like the diff path does.
         self.prune_rows_absent_from_snapshot(&snapshot);
+        if let Some(alerts) = &snapshot.owner_attention {
+            self.apply_owner_attention_snapshot(&snapshot.host, alerts);
+        }
         // 10e-d: collect uids we adopted with memory_cap_kill=true
         // so we can fire toasts AFTER the workspaces-iteration
         // is done — avoids the &mut self contention from calling
@@ -2162,6 +2165,13 @@ impl App {
                 // re-assert that healed a drifted row). Entries that
                 // don't carry the field (workflow-binding `Updated`s,
                 // `Added`s) are left alone.
+                if let Some(value) = entry.get("owner_attention") {
+                    if value.is_null() {
+                        self.apply_owner_attention(&host, &uid, None);
+                    } else if let Ok(alert) = serde_json::from_value(value.clone()) {
+                        self.apply_owner_attention(&host, &uid, Some(alert));
+                    }
+                }
                 self.apply_messaging_name(&host, &uid, &entry);
                 self.apply_global_perms_from_diff(&uid, &entry);
                 self.apply_transcript_from_diff(&host, &uid, &entry);
@@ -2934,6 +2944,69 @@ mod apply_manifest_diff_tests {
         app
     }
 
+    fn owner_test_alert(id: &str, uid: &str) -> cm_daemon::owner_attention::Alert {
+        cm_daemon::owner_attention::Alert {
+            id: id.into(), session_uid: uid.into(), label: "Task".into(),
+            message: "Ready for review".into(), task_id: None, continuous_task_id: None,
+        }
+    }
+
+    #[test]
+    fn owner_attention_local_and_cloud_stream_indicators_clear_on_focus() {
+        for host in [crate::hosts::HostId::local(), crate::hosts::HostId::new("sessions")] {
+            let mut app = build_app_with_session("self");
+            app.push_worker.shutdown(); // no real desktop/socket side effects in view tests
+            app.workspaces[0].sessions[0].host_id = host.clone();
+            let alert = owner_test_alert("a", "self");
+            app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+                uid: "self".into(), entry: serde_json::json!({"owner_attention": alert}),
+            });
+            assert!(app.session_has_alert("self"));
+            app.needs_redraw = false;
+            app.sync_owner_alert_indicators();
+            assert!(!app.needs_redraw, "pending alerts must not busy-redraw");
+            app.acknowledge_owner_alerts_for_row("self");
+            app.alerts.remove("self");
+            assert!(app.owner_alerts.is_empty());
+            app.apply_owner_attention(&host, "self", Some(alert));
+            assert!(!app.session_has_alert("self"), "old snapshot cannot resurrect a focused alert");
+            app.apply_owner_attention(&host, "self", Some(owner_test_alert("new", "self")));
+            assert!(app.session_has_alert("self"));
+        }
+    }
+
+    #[test]
+    fn owner_attention_snapshot_clears_only_its_host_and_survives_delayed_adoption() {
+        let mut app = build_app_with_session("other");
+        app.push_worker.shutdown();
+        let host = crate::hosts::HostId::new("sessions");
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.apply_owner_attention(&host, "self", Some(owner_test_alert("a", "self")));
+        assert!(!app.session_has_alert("self"));
+        app.workspaces[0].sessions[0].uid = "self".into();
+        app.sync_owner_alert_indicators();
+        assert!(app.session_has_alert("self"));
+        app.apply_owner_attention_snapshot(&crate::hosts::HostId::local(), &Default::default());
+        assert!(app.session_has_alert("self"));
+        app.apply_owner_attention_snapshot(&host, &Default::default());
+        assert!(!app.session_has_alert("self"));
+    }
+
+    #[test]
+    fn owner_attention_continuous_tick_replacement_keeps_attention_and_focus_ack() {
+        let mut app = build_app_with_session("new-tick");
+        app.push_worker.shutdown();
+        let host = crate::hosts::HostId::new("manager");
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.workspaces[0].sessions[0].continuous_task_id = Some("continuous".into());
+        let mut alert = owner_test_alert("a", "previous-tick");
+        alert.continuous_task_id = Some("continuous".into());
+        app.apply_owner_attention(&host, "previous-tick", Some(alert));
+        assert!(app.session_has_alert("new-tick"));
+        app.acknowledge_owner_alerts_for_row("new-tick");
+        assert!(app.owner_alerts.is_empty());
+    }
+
     #[test]
     fn reconcile_binds_remote_session_without_branch_metadata() {
         let mut app = build_app_with_session("lost-launch");
@@ -3303,6 +3376,7 @@ mod apply_manifest_diff_tests {
         crate::manifest_watch::ManifestSnapshotPayload {
             host,
             session_transcripts: Vec::new(),
+            owner_attention: None,
             listed_uids: listed.iter().map(|u| u.to_string()).collect(),
             session_last_exits: listed
                 .iter()
@@ -3862,6 +3936,7 @@ mod apply_manifest_diff_tests {
             listed_uids: vec!["ts-snap-resume".into()],
             session_last_exits: Vec::new(),
             session_transcripts: vec![("ts-snap-resume".into(), "current".into())],
+            owner_attention: None,
             received_at: std::time::Instant::now(),
         };
         app.apply_manifest_snapshot(payload);
@@ -3891,6 +3966,7 @@ mod apply_manifest_diff_tests {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
+            owner_attention: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t22".into(),
@@ -3933,6 +4009,7 @@ mod apply_manifest_diff_tests {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
+            owner_attention: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t23".into(),
@@ -4092,6 +4169,7 @@ mod apply_manifest_diff_tests {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
+            owner_attention: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t27".into(),
@@ -4132,6 +4210,7 @@ mod apply_manifest_diff_tests {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
+            owner_attention: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t28".into(),

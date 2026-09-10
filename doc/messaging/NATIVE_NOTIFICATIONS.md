@@ -3,8 +3,9 @@
 CM's chat wakes and session-monitor completion notices share a durable local
 queue. Claude receives them through its own-child messaging socket. New Codex
 sessions run a CM-owned app-server with the ordinary Codex remote terminal UI.
-Neither notification path types into a terminal. `notify_user` still sends
-human-facing desktop/sidebar alerts.
+Neither notification path types into a terminal. `notify_user` uses a separate daemon-owned queue for
+[Owner desktop/sidebar alerts](../OWNER_NOTIFICATIONS.md), including cloud and
+continuous sessions. It does not use the native agent queue or change chat preferences.
 
 Installing this implementation does not migrate an already running embedded
 Codex process. Channel membership, tagging UX, and an Owner overview of all

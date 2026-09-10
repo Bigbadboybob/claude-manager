@@ -415,8 +415,19 @@ pub fn dispatch_request(
         "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        // Reads the caller's session (when known) to report its
-        // own perms + scope; still pongs for unknown callers.
+        // Explicit Owner attention is self-scoped and survives viewer disconnects.
+        "notify_user" => {
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::notify(&s, req))
+        }
+        "owner_attention.ack" => {
+            if let Err(resp) = require_operator(req, "Owner attention acknowledgement is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::acknowledge(&s, req))
+        }
+        // Reads the caller's session (when known) to report its own scope.
         "ping" => DispatchOutcome::Done(dispatch_ping(state, req)),
 
         // `start_session` manages its own locking. The reaper
@@ -2458,7 +2469,16 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
     // to the lock duration we'd save with a typed serialize-from-
     // ref (workspaces is dozens of entries in normal use). Build
     // the JSON payload structure the client will deserialize.
+    let owner_attention = match crate::owner_attention::snapshot(state) {
+        Ok(alerts) => Some(alerts),
+        Err(e) => {
+            // A damaged attention sidecar must not disable session/exit updates.
+            eprintln!("cm-daemon: {e}; Owner alerts unavailable in manifest snapshot");
+            None
+        }
+    };
     let snapshot_payload = serde_json::json!({
+        "owner_attention": owner_attention,
         "workspaces": state.workspaces,
         "bindings": state.bindings,
         "messaging_names": state.messaging_names,

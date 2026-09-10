@@ -11929,8 +11929,8 @@ pub fn queue_stats(
 // NOTIFY-THE-USER is the durable failure-surfacing trio (DESIGN §11)
 // PLUS, since the 2026-08-03 auth-expiry incident, an operator push via
 // the configured `notify_command` (`crate::notify::notify_operator`) on
-// escalations. There is still no daemon-side `notify_user` RPC (it is
-// TUI-only, routed to ~/.cm/tui.sock). See `escalate_stuck` for the trio.
+// escalations. Explicit `notify_user` requests use the separate Owner-attention
+// queue and laptop desktop/sidebar delivery. See doc/OWNER_NOTIFICATIONS.md.
 // ===================================================================
 
 #[derive(Deserialize, Default)]
@@ -12461,8 +12461,8 @@ pub fn resolve_stuck(
 /// the session carries `continuous_task_id`; the runs.jsonl escalated line) is
 /// what the operator FINDS; step 4's `notify_command` push is what tells them
 /// to look (added after the 2026-08-03 incident, where fully-surfaced failures
-/// went unnoticed for 3.5 days). There is still NO daemon-side `notify_user`
-/// RPC (it is TUI-only).
+/// went unnoticed for 3.5 days). Explicit daemon `notify_user` alerts are separate
+/// desktop/sidebar requests; this unattended escalation policy is unchanged.
 ///
 /// LOCK DISCIPLINE: takes NO DaemonState lock itself — `kill_session` (and the
 /// reaper's on_exit) re-lock internally, so a caller (the scheduler tick) MUST

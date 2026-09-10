@@ -103,6 +103,7 @@ pub struct ManifestSnapshotPayload {
     /// binds once, at spawn). Catch-up for every transcript `Updated`
     /// diff missed while the stream was down.
     pub session_transcripts: Vec<(String, String)>,
+    pub owner_attention: Option<std::collections::BTreeMap<String, cm_daemon::owner_attention::Alert>>,
     /// When the consumer thread read the frame. Rows created locally
     /// after (or just before) this instant may be newer than the
     /// daemon's capture and are exempt from the reconcile prune.
@@ -636,6 +637,8 @@ fn parse_snapshot_payload(
         session_last_exits,
         listed_uids,
         session_transcripts,
+        owner_attention: payload.get("owner_attention").filter(|v| !v.is_null()).map(|v| serde_json::from_value(v.clone()))
+            .transpose().map_err(|e| format!("invalid Owner attention snapshot: {e}"))?,
         received_at: std::time::Instant::now(),
     })
 }

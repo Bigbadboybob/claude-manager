@@ -26,6 +26,31 @@ from mcp_server.control_client import (
 )
 
 
+class OwnerNotificationRouteTests(unittest.TestCase):
+    def test_cloud_and_local_daemon_sessions_route_notify_to_daemon(self):
+        from mcp_server import control_client
+        for tui_socket in ["/tmp/laptop-tui.sock", "/tmp/cloud-daemon.sock"]:
+            with self.subTest(tui_socket=tui_socket), mock.patch.dict("os.environ", {
+                "CM_DAEMON_SOCKET": "/tmp/owner-daemon.sock", "CM_TUI_SOCKET": tui_socket,
+                "CM_TUI_SESSION_ID": "caller",
+            }, clear=True):
+                self.assertEqual(control_client.resolve_socket_for_method("notify_user"), Path("/tmp/owner-daemon.sock"))
+
+    def test_legacy_local_client_keeps_tui_route(self):
+        from mcp_server import control_client
+        with mock.patch.dict("os.environ", {"CM_TUI_SOCKET": "/tmp/legacy.sock"}, clear=True):
+            self.assertEqual(control_client.resolve_socket_for_method("notify_user"), Path("/tmp/legacy.sock"))
+
+    def test_missing_cloud_socket_does_not_fall_back_to_tui(self):
+        from mcp_server import control_client
+        with TemporaryDirectory() as tmp, mock.patch.dict("os.environ", {
+            "CM_DAEMON_SOCKET": str(Path(tmp) / "missing.sock"),
+            "CM_TUI_SOCKET": str(Path(tmp) / "tui.sock"), "CM_TUI_SESSION_ID": "caller",
+        }, clear=True):
+            with self.assertRaises(control_client.TransportError):
+                control_client.call("notify_user", {"message": "Review ready"})
+
+
 class ResolveSocketRouteTests(unittest.TestCase):
     def test_explicit_daemon_socket_chose_daemon_true(self):
         """Explicit `CM_DAEMON_SOCKET` → chose_daemon=True."""

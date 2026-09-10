@@ -1584,22 +1584,23 @@ async def send_input(
 
 @mcp.tool()
 def notify_user(message: str = "") -> dict:
-    """Alert the user that you need their attention.
+    """Request Owner attention for your own session (local, cloud, or continuous).
 
-    Fires a desktop notification and makes the icon next to YOUR session
-    blink in the TUI sidebar. The blink stops once the user selects your
-    session. Use this when you're blocked on the user — a question, a
-    decision, an approval, or "I'm done, come look" — and don't want to
-    sit idle unnoticed.
+    Use for work ready for review/deployment, decisions, approvals, or blockers
+    needing Owner. Supply a concise reason and a relevant message/file link.
+    Routine progress stays in session chat; this does not authorize deployment,
+    session control, or unsolicited Owner DMs.
 
-    Args:
-        message: Short reason shown in the notification (e.g. "need your
-            decision on the migration approach"). Optional; if omitted the
-            notification just says your session needs attention.
+    The daemon retains the alert until Owner selects the session. A connected
+    updated TUI submits the normal desktop notification and blinks the sidebar;
+    otherwise delivery waits for reconnection. Alt+g jumps to attention, including
+    continuous tasks. Identical pending reasons coalesce; a changed reason raises
+    a new alert. Returns status="queued", not proof of desktop delivery/read.
 
-    This only ever pings the user about your own session, so — unlike the
-    session-spawning / killing tools — you do NOT need to ask first. Just
-    call it when you genuinely need the user.
+    message is optional (maximum 4096 UTF-8 bytes). Identity and label come from
+    the live caller, never a target parameter; no global permission is required.
+    Desktop/DND preferences, notify_on_idle, chat mutes/follows, and Telegram
+    escalation settings are unchanged. See doc/OWNER_NOTIFICATIONS.md.
     """
     return control_client.call("notify_user", {"message": message})
 

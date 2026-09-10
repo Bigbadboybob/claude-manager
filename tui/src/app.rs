@@ -35,6 +35,7 @@ use sections::*;
 mod model;
 use model::*;
 mod nav;
+mod attention;
 use nav::*;
 mod workflow_ui;
 use workflow_ui::*;
@@ -134,19 +135,26 @@ fn notify_session_idle(label: &str) {
 /// we fall back to a generic line so the notification still says something
 /// useful.
 pub(crate) fn notify_user_alert(label: &str, message: &str) {
-    let label = label.to_string();
+    let (label, message) = (label.to_string(), message.to_string());
+    std::thread::spawn(move || {
+        if let Err(e) = show_user_alert(&label, &message) {
+            eprintln!("cm-tui: Owner notification failed: {e}");
+        }
+    });
+}
+
+/// Blocking desktop submission; call only on a background thread. Success
+/// means the desktop service accepted the notification, not that Owner read it.
+pub(crate) fn show_user_alert(label: &str, message: &str) -> Result<(), String> {
     let body = if message.trim().is_empty() {
         format!("{} needs your attention", label)
     } else {
         format!("{}: {}", label, message)
     };
-    std::thread::spawn(move || {
-        let _ = notify_rust::Notification::new()
-            .summary("Claude Manager")
-            .body(&body)
-            .show();
-        play_notification_sound();
-    });
+    notify_rust::Notification::new().summary("Claude Manager").body(&body)
+        .show().map_err(|e| e.to_string())?;
+    play_notification_sound();
+    Ok(())
 }
 
 /// Best-effort: play a short notification sound. Called from the detached
@@ -568,6 +576,9 @@ pub struct App {
     /// blinking sidebar indicator, and it's cleared the moment the user
     /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
     alerts: HashMap<String, String>,
+    owner_alerts: HashMap<(crate::hosts::HostId, String), cm_daemon::owner_attention::Alert>,
+    owner_alert_rows: HashSet<String>,
+    dismissed_owner_alerts: HashSet<String>,
     /// Fingerprint of every open-workspace idle session's `(uid, age
     /// bucket)` set at the last `tick_idle_ages` evaluation. Idle ages only
     /// matter at bucket granularity (afterglow → settled → stale), and an
@@ -944,6 +955,9 @@ impl App {
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
+            owner_alerts: HashMap::new(),
+            owner_alert_rows: HashSet::new(),
+            dismissed_owner_alerts: HashSet::new(),
             last_alert_frame: 0,
             idle_bucket_fingerprint: 0,
             last_idle_bucket_check: None,

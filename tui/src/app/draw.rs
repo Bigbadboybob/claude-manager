@@ -1281,8 +1281,9 @@ impl App {
 
     /// P3 (Feature 1): the operator-facing question an orchestrator has parked on
     /// its planning task's metadata (`metadata.operator_question`), if any. A
-    /// headless orchestrator can't call the TUI-only `notify_user`, so it sets
-    /// this via `update_task(metadata=…)` (daemon-routed, works headless) and it
+    /// headless orchestrator can also call daemon-owned `notify_user` for an
+    /// immediate attention alert. This durable question is set through
+    /// `update_task(metadata=…)` (daemon-routed, works headless) and it
     /// rides the existing task-metadata sync (`reconcile_tasks`) to here —
     /// rendered as a distinct `◉` glyph + an inline text line in the continuous
     /// column so a pending decision (e.g. a `needs_human_decision`) is visible

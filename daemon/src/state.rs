@@ -1406,7 +1406,7 @@ fn write_manifest_atomic_impl(
 /// `durable`, the temp file is `fsync`ed before the rename and the
 /// containing directory after it (the rename-swap idiom needs the dir
 /// fsync for durability — phase 4c).
-fn write_json_atomic(path: &Path, json: &str, durable: bool) -> std::io::Result<()> {
+pub(crate) fn write_json_atomic(path: &Path, json: &str, durable: bool) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
