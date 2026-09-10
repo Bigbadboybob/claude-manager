@@ -411,6 +411,103 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
             await t1.close()
             await t2.close()
 
+    async def _deadlock_shape(self, serialize_first: bool) -> tuple[bool, list[str]]:
+        """T1: transaction that row-locks the initiative, then writes tasks.
+        T2: a concurrent single-statement initiative UPDATE (trigger takes the
+        advisory lock first, then waits on the row). Returns (deadlocked,
+        change ops delivered). Deterministic: T2 is provably waiting before
+        T1 issues its task write."""
+        coord = await self.create("coordinator")
+        r = await self.client.post("/initiatives", json={
+            "name": "Init", "coordinator_task_id": coord["id"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        init = r.json()
+        snap = await self.snapshot()
+        t1 = await asyncpg.connect(self.dsn)
+        t2 = await asyncpg.connect(self.dsn)
+        deadlocked = False
+        try:
+            tx1 = t1.transaction()
+            await tx1.start()
+            if serialize_first:
+                await db._serialize_task_writes(t1)
+            await t1.fetchrow("SELECT * FROM initiatives WHERE id = $1 FOR UPDATE", init["id"])
+
+            async def writer2():
+                await t2.execute("UPDATE initiatives SET color = 'red' WHERE id = $1", init["id"])
+
+            w2 = asyncio.create_task(writer2())
+            # Wait until T2 is genuinely blocked on a lock (not merely scheduled).
+            for _ in range(100):
+                waiting = await self.pool.fetchval(
+                    "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                    "AND query LIKE 'UPDATE initiatives SET color%'")
+                if waiting:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertTrue(waiting, "T2 must be waiting on a lock")
+            try:
+                await t1.execute(
+                    "UPDATE tasks SET priority = 5, updated_at = now() WHERE id = $1", coord["id"])
+                await tx1.commit()
+            except asyncpg.DeadlockDetectedError:
+                deadlocked = True
+                await tx1.rollback()
+            try:
+                await asyncio.wait_for(w2, 10)
+            except asyncpg.DeadlockDetectedError:
+                deadlocked = True
+        finally:
+            await t1.close()
+            await t2.close()
+        page = await self.changes(snap["cursor"], snap["epoch"])
+        return deadlocked, [c["op"] for c in page["changes"]]
+
+    async def test_row_lock_before_task_write_deadlocks_without_serialize(self):
+        """The hazard the application helper exists for: a transaction holding
+        a row lock taken by an EARLIER statement, then writing tasks, deadlocks
+        against a concurrent trigger-serialised writer."""
+        deadlocked, _ops = await self._deadlock_shape(serialize_first=False)
+        self.assertTrue(deadlocked, "expected PostgreSQL to detect the lock cycle")
+
+    async def test_serialized_transaction_does_not_deadlock(self):
+        """With the advisory lock taken first, the same interleaving serialises:
+        T2 waits on the advisory lock (not the row), T1 completes, T2 follows,
+        and the feed delivers both commits in order."""
+        deadlocked, ops = await self._deadlock_shape(serialize_first=True)
+        self.assertFalse(deadlocked)
+        self.assertEqual(ops, ["upsert"], "coordinator task delivered once (collapsed)")
+
+    async def test_helper_key_matches_trigger_key(self):
+        trigger_src = await self.pool.fetchval(
+            "SELECT prosrc FROM pg_proc WHERE proname = 'task_changes_serialize'")
+        self.assertIn("pg_advisory_xact_lock(hashtext('cm_task_changes'))", trigger_src)
+        self.assertIn("pg_advisory_xact_lock(hashtext('cm_task_changes'))", db.TASK_WRITE_LOCK_SQL)
+
+    async def test_update_initiative_under_concurrent_initiative_writes(self):
+        """Soak the real application paths that mix row locks and task writes:
+        update_initiative (FOR UPDATE then UPDATE tasks/initiatives) racing
+        single-statement initiative and task updates. Pre-fix this deadlocked
+        intermittently; post-fix every iteration must succeed."""
+        coord = await self.create("coordinator")
+        r = await self.client.post("/initiatives", json={
+            "name": "Init", "coordinator_task_id": coord["id"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        init = r.json()
+        other = await self.create("other")
+        async with self.pool.acquire() as c:
+            await c.execute("SET deadlock_timeout = '50ms'")
+        for i in range(25):
+            results = await asyncio.gather(
+                db.update_initiative(self.pool, init["id"], name=f"n{i}", actor="t"),
+                self.pool.execute("UPDATE initiatives SET color = $2 WHERE id = $1", init["id"], f"c{i}"),
+                db.update_task(self.pool, coord["id"], priority=i),
+                db.update_task(self.pool, other["id"], priority=i),
+                return_exceptions=True,
+            )
+            errors = [x for x in results if isinstance(x, Exception)]
+            self.assertEqual(errors, [], f"iteration {i}: {errors}")
+
     async def test_snapshot_cursor_is_consistent_with_rows(self):
         """Every change with seq <= snapshot cursor is reflected in the rows."""
         a = await self.create("a")

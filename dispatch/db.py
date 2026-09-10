@@ -339,6 +339,24 @@ async def prune_task_changes(pool: asyncpg.Pool, keep_seconds: float) -> int:
 # Initiatives
 # ---------------------------------------------------------------------------
 
+# The advisory-lock key the sql/016 triggers take BEFORE every tasks /
+# initiatives write statement (seq order == commit order for the change
+# feed). A trigger fires per statement, so it cannot precede a row lock an
+# EARLIER statement of the same transaction already holds: a transaction
+# that does `SELECT ... FOR UPDATE` and then writes tasks would hold the row
+# while waiting for the advisory lock, while a concurrent single-statement
+# writer holds the advisory lock while waiting for that row — a deadlock.
+# Every application transaction that takes row locks before writing tasks or
+# initiatives therefore calls `_serialize_task_writes` as its FIRST statement,
+# keeping the global lock order advisory -> rows.
+TASK_WRITE_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('cm_task_changes'))"
+
+
+async def _serialize_task_writes(conn) -> None:
+    """Take the change-feed advisory lock for the current transaction."""
+    await conn.execute(TASK_WRITE_LOCK_SQL)
+
+
 INITIATIVE_STATUSES = frozenset(
     {"draft", "active", "paused", "completed", "archived", "cancelled"}
 )
@@ -430,6 +448,7 @@ async def create_initiative(
     coordinator_task_id = normalize_task_id(coordinator_task_id)
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await _serialize_task_writes(conn)
             task = await conn.fetchrow(
                 "SELECT id, project FROM tasks WHERE id = $1", coordinator_task_id,
             )
@@ -486,6 +505,8 @@ async def update_initiative(
     column, value = _initiative_ref(ref)
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Advisory lock BEFORE the FOR UPDATE row lock (see the helper).
+            await _serialize_task_writes(conn)
             current = await conn.fetchrow(
                 f"SELECT * FROM initiatives WHERE {column} = $1 FOR UPDATE", value,
             )
