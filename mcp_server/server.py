@@ -1586,8 +1586,11 @@ async def send_input(
 def notify_user(message: str = "") -> dict:
     """Request Owner attention for your own session (local, cloud, or continuous).
 
-    Use for work ready for review/deployment, decisions, approvals, or blockers
-    needing Owner. Supply a concise reason and a relevant message/file link.
+    Continuous workers must DM their orchestrator for routine reviews, progress,
+    recoverable failures and handoffs; do not notify Owner for those events.
+    Orchestrators use this only for a reviewed decision/blocker requiring Owner,
+    preserving stricter quiet policies. Interactive sessions use it when Owner
+    action is needed. Supply a concise reason and relevant message/file link.
     Routine progress stays in session chat; this does not authorize deployment,
     session control, or unsolicited Owner DMs.
 

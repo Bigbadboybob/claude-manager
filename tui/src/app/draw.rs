@@ -1275,9 +1275,12 @@ impl App {
         let Some(tid) = ts.task_id.as_deref() else {
             return false;
         };
-        self.tasks
-            .iter()
-            .any(|t| t.task_id.as_deref() == Some(tid) && matches!(t.api_status, TaskStatus::Blocked))
+        self.tasks.iter().find(|t| t.task_id.as_deref() == Some(tid)).is_some_and(|t| {
+            crate::continuous_stage::ContinuousStage::resolve(
+                t.metadata.as_ref(), matches!(t.api_status, TaskStatus::Done),
+                matches!(t.api_status, TaskStatus::Blocked),
+            ) == crate::continuous_stage::ContinuousStage::OwnerReview
+        })
     }
 
     /// P3 (Feature 1): the operator-facing question an orchestrator has parked on
@@ -1373,6 +1376,12 @@ impl App {
             return;
         }
 
+        let legend = crate::continuous_stage::legend();
+        let legend_height = (legend.len() as u16).min(inner.height.saturating_sub(2));
+        let rows_area = Rect { height: inner.height - legend_height, ..inner };
+        let legend_area = Rect { y: inner.y + rows_area.height, height: legend_height, ..inner };
+        frame.render_widget(Paragraph::new(legend).style(Style::default().fg(theme::DIM)), legend_area);
+
         let spinner = self.spinner_frame();
         // One clock sample for every row's idle-age bucket this frame.
         let now = Instant::now();
@@ -1438,7 +1447,16 @@ impl App {
             // depth 0 → 4 cells, depth 1 → 6, depth 2 (session nested under a
             // subtask) → 8 — each level indents 2 more before the label.
             let prefix_cells = 4 + (r.depth as usize) * 2;
-            let max_name = (inner.width as usize).saturating_sub(prefix_cells);
+            let stage = (r.depth >= 1).then(|| {
+                let task = ts.task_id.as_deref().and_then(|tid| self.tasks.iter().find(|t| t.task_id.as_deref() == Some(tid)));
+                crate::continuous_stage::ContinuousStage::resolve(
+                    task.and_then(|t| t.metadata.as_ref()),
+                    task.is_some_and(|t| matches!(t.api_status, TaskStatus::Done)),
+                    task.is_some_and(|t| matches!(t.api_status, TaskStatus::Blocked)),
+                )
+            });
+            let badge_width = stage.map_or(0, |s| s.label().len() + 3);
+            let max_name = (inner.width as usize).saturating_sub(prefix_cells + badge_width);
             let label = crate::planning::truncate_with_ellipsis(&ts.label, max_name);
 
             let mut spans = vec![Span::styled(
@@ -1493,6 +1511,9 @@ impl App {
             } else {
                 Style::default().fg(theme::MUTED)
             };
+            if let Some(stage) = stage {
+                spans.push(stage.badge());
+            }
             spans.push(Span::styled(label, label_style));
             let item_style = if is_selected {
                 Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
@@ -1555,7 +1576,7 @@ impl App {
             };
             state.select(selected);
         }
-        frame.render_stateful_widget(List::new(items).highlight_style(Style::default()), inner, &mut state);
+        frame.render_stateful_widget(List::new(items).highlight_style(Style::default()), rows_area, &mut state);
         self.continuous_list_state = state;
     }
 
