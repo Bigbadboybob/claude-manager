@@ -49,8 +49,8 @@ coordinator keeps the live roster; these are proposal-development statuses.
 | Topic | Intended proposal | Snapshot status |
 |---|---|---|
 | P1 | Momentum detection through explanatory ingest and useful source coverage | Final `8bbfcd823` personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
-| P2 | Useful article follow-through, blocks, and appropriate non-trades | Draft `f16a13d1d` and revision `e9764a371` personally reviewed; [further revisions requested](reviews/2026-09-10-p2-article-follow-through-review.md) before Owner selection |
-| P3 | Production-baseline P&L improvement with bounded rounds | Author handed off revised `e616b6dea`; personal review pending |
+| P2 | Useful article follow-through, blocks, and appropriate non-trades | Revised `a97faa1a6` fully personally read; [bounded consistency corrections requested](reviews/2026-09-10-p2-article-follow-through-review.md#personal-rereview-of-a97faa1a6) before Owner discussion |
+| P3 | Production-baseline P&L improvement with bounded rounds | Revised `e616b6dea` fully personally read; [CM revisions requested](reviews/2026-09-10-p3-production-pnl-review.md) |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Initial `efddc8bce` handed off; Swarm-Gardener requested revisions; personal review pending |
 | P5 | Backtest speed and resource efficiency preserving workload and outcomes | Initial `259cb6839` handed off; Swarm-Gardener requested revisions; personal review pending |
 | P6 | Useful timely delivery from existing sources | Final `136589a7e` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p6-source-reliability-review.md#final-disposition-at-136589a7e), no implementation selected |
@@ -76,9 +76,8 @@ personal review before later Owner selection.
 
 The authors hand off consolidated commits after addressing both coordinators'
 comments and reconciling shared boundaries. P1 `8bbfcd823` and P6 `136589a7e`
-have passed personal review and are ready for Owner discussion. P2's latest
-handoff is `a97faa1a6`; `e9764a371` remains its last personally reviewed revision.
-P3's latest handoff is `e616b6dea`. P4/P5 authors are revising in response to
+have passed personal review and are ready for Owner discussion. P2 `a97faa1a6` and P3 `e616b6dea` have now been fully personally read;
+bounded consistency and evidence-scope corrections are requested in their reviews. P4/P5 authors are revising in response to
 Swarm-Gardener; P7/P8 full text is being collected. These handoff statuses come
 from their authors and coordinator, not completed personal reads. No proposal
 has been selected for implementation.

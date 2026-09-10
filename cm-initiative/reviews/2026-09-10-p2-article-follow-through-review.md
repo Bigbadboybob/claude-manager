@@ -118,3 +118,48 @@ or deployment ran for this documentation review.
 
 Return a committed revision to both coordinators and reconcile the population
 and clock contract with P1/P6. The candidate remains unselected for implementation.
+
+## Personal rereview of `a97faa1a6`
+
+Personally read the full revised proposal at
+`a97faa1a6c409da06a61897f819cba5acc7819c3` and its response mappings and notes.
+The original substantive requests are addressed: observed stage outcomes are
+primary, both economic estimators have explicit limits, `no_trade` can reflect
+missing inputs, pre-mapping losses retain article grain, S3 remains causally
+ambiguous, and recovery must consider deadlines, load displacement, fresh work,
+and side effects. The proposal does not grant current execution authority.
+
+**Disposition: bounded consistency corrections before Owner discussion.** No
+new investigation or redesign is requested:
+
+1. Section 4.3's bold bullet still says “`≤ 0` designates no modelled opportunity.”
+   It needs “does not designate”; its own worked example and NOTES correctly say
+   the opposite of the current opening sentence.
+2. Section 3's table still labels policy replay “The no-hindsight artifact.”
+   NOTES, “Findings from source,” item 3 also claims “no hindsight by construction”
+   and that status distinguishes policy declines. Replace both current summaries
+   with section 4.3's restricted future-book access, unconstrained input
+   provenance, campaign selection, and mixed `no_trade` bucket. Historical
+   response entries may remain historical, explicitly superseded where needed.
+3. Section 5 defines Pop-I as everything entering the pipeline **and lost before
+   emission**, then says it contains emitted Pop-M. Those cannot both hold.
+   Define Pop-I as all entrants through the relevant stages, with pre-emission
+   losses a subset, preserving article grain before mapping and pair grain
+   afterward. This matches the intended nesting already explained in section 3.3.
+4. Keep the proposed round consistent with the accepted conditional dependencies.
+   Section 4.3 makes policy/alpha optional, and section 13 makes D1/D2 prerequisites
+   only where needed. Yet section 13 Phase 0 lists all estimator coverage and all
+   mint/ES coverage work as prerequisites, and section 8 says W3 rules settle
+   first for W1 generally. Scope each prerequisite to the finding it supports;
+   a useful pre-emission investigation need not wait for unrelated policy replay,
+   mint reconstruction, ES provenance, or evidence repairs. Keep their optional
+   diagnostic routes available without requiring them to produce a result.
+
+The revised article identity and receipt-clock caveats are useful. The earlier
+anchor now correctly shifts the forward window; the fixed duration is capped
+per signal, so the parenthetical “except where the cap binds” should not imply
+that moving only the anchor changes that duration. This is a wording clarification,
+not a request to change estimator semantics.
+
+After those changes, return one consolidated commit for final diff review. No
+live queries, recovery experiment, code change, or new swarm is selected here.
