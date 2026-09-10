@@ -111,3 +111,22 @@ research review already checked the temporal scoring guard. No live query, model
 job, or implementation ran. Coverage-Scout should revise its owned documents,
 reconcile the shared contract with P2/P6, and return a committed revision for both
 coordinators' review before Owner selection.
+
+## Final personal read of `8bbfcd823`
+
+**Ready for Owner proposal discussion.** I personally read the consolidated
+proposal and its revision-response record on 2026-09-10. The substantive review
+requests are addressed: the directional-bias claim is withdrawn; exploratory
+descriptive reads remain usable with their limits; retrieval comparisons use a
+common evaluator; existing scorer versus merger extension is an explicit choice;
+historical reconstruction and prospective capture limits are stated; unexplained
+events retain uncertainty; and the shared populations, clocks, and authority are
+correctly scoped. The census is an optional reference rather than a prerequisite
+for every conditional investigation.
+
+The proposal now offers a reviewable bounded round using existing infrastructure,
+with no new production swarm, implementation, measurement, or spend authorized.
+No further document revision is required by this personal review. Owner still
+chooses whether and how to pursue it, including evaluation definitions, resources,
+and the preferred relationship to the other proposals. No live impact or baseline
+has been established by these source reads.

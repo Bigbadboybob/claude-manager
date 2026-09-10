@@ -48,7 +48,7 @@ coordinator keeps the live roster; these are proposal-development statuses.
 
 | Topic | Intended proposal | Snapshot status |
 |---|---|---|
-| P1 | Momentum detection through explanatory ingest and useful source coverage | Draft `e426f6885` personally reviewed; [revisions requested](reviews/2026-09-10-p1-momentum-coverage-review.md) before Owner selection |
+| P1 | Momentum detection through explanatory ingest and useful source coverage | Final `8bbfcd823` personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
 | P2 | Useful article follow-through, blocks, and appropriate non-trades | Draft `f16a13d1d` and revision `e9764a371` personally reviewed; [further revisions requested](reviews/2026-09-10-p2-article-follow-through-review.md) before Owner selection |
 | P3 | Production-baseline P&L improvement with bounded rounds | Running in isolated worktree, per `545c96a6f` roster |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Running in isolated worktree, per `545c96a6f` roster |
@@ -76,8 +76,8 @@ personal review before later Owner selection.
 
 The authors hand off consolidated commits after addressing both coordinators'
 comments and reconciling shared boundaries. P6 `62f5eafa4` has been personally
-rereviewed and needs bounded wording fixes. P1 `1f9cc381e` is receiving further
-local review corrections before the next personal read. P2 `11ddf26ef` is newly
+rereviewed and needs bounded wording fixes. P1 `8bbfcd823` has passed the final
+personal read and is ready for Owner discussion. P2 `11ddf26ef` is newly
 handed off and awaits personal rereview; `e9764a371` is the last personally
 reviewed P2 revision. No proposal has been selected for implementation.
 
