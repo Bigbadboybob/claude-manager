@@ -129,3 +129,19 @@ section 3.7's mixed `no_trade` description; and scope section 7.1's routine-work
 permission paragraph to work already authorized, preserving current proposal
 research versus future live reads/backtests/implementation. No new investigation
 or design round is requested. Final acceptance awaits that consolidated diff.
+
+## Final disposition at `5e8e56e9f`
+
+**Ready for Owner discussion; no round selected.** Personally reviewed the
+remaining consolidated text and all proposal/NOTES changes through final
+`5e8e56e9fae61b4103ed8cf7e3c7979929cb2a70`, following the full `e616b6dea` read.
+All three final corrections are addressed: source versus deployed defaults,
+the mixed unassessed/declined `no_trade` population, and current research scope.
+The additional consistency sweep preserves attempts versus publications,
+existing evaluator ownership, claim-specific prerequisites, and saturation as
+one diagnostic rather than a stopping verdict. The historical compact-summary
+defect is linked to its existing task; remedy and live prevalence remain open.
+
+Keep the existing loop's current freeze/Q23 status explicitly unknown until its
+owner supplies current evidence. Acceptance concerns the proposal's suitability
+for discussion, not permission to run its proposed studies or change ownership.
