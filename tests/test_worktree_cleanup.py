@@ -223,6 +223,50 @@ class CleanupTests(unittest.TestCase):
         self.assertIn('nested checkout', result['results'][0]['message'])
         self.assertTrue(nested.exists())
 
+    def workspace_preview(self):
+        job = {'id': str(uuid.uuid4()), 'phase': 'scanning', 'task_id': None, 'worktree_path': str(self.worktree)}
+        with patch.object(cleanup, 'base_context', return_value=self.context), patch.object(reaper, 'process_references', return_value={}):
+            cleanup.preview(job)
+        return job
+
+    def test_workspace_close_owns_its_bound_task_and_reaps_terminal_descendants(self):
+        child = self.child('workspace-raw-child')
+        lineage.register(child, self.worktree, inherit_session=False)
+        job = self.workspace_preview()
+        self.assertEqual(job['root_task_ids'], ['task-1'])
+        self.assertEqual(job['family'], ['task-1'])
+        self.assertTrue(all(r['reason'] != 'shared_with_another_task' for r in job['candidates']))
+        result = self.run_apply(job)
+        self.assertEqual(sum(r['removed'] for r in result['results']), 2)
+        self.assertFalse(child.exists())
+
+    def test_workspace_close_explains_running_task_instead_of_false_sharing(self):
+        self.context.tasks['task-1'] = dataclasses.replace(self.context.tasks['task-1'], status='running')
+        job = self.workspace_preview()
+        self.assertEqual(job['candidates'][0]['reason'], 'task_not_terminal')
+        self.assertEqual(job['root_tasks'][0]['status'], 'running')
+        with patch.object(cleanup.time, 'monotonic', side_effect=[0, 31]):
+            result = self.run_apply(job)
+        self.assertFalse(result['results'][0]['removed'])
+        self.assertIn('task_not_terminal', result['results'][0]['message'])
+
+    def test_resolved_workspace_task_waits_for_done_update_before_cleanup(self):
+        self.context.tasks['task-1'] = dataclasses.replace(self.context.tasks['task-1'], status='running')
+        job = self.workspace_preview()
+        def finish_task(_):
+            self.context.tasks['task-1'] = dataclasses.replace(self.context.tasks['task-1'], status='done')
+        with patch.object(cleanup.time, 'sleep', side_effect=finish_task) as sleep:
+            result = self.run_apply(job)
+        sleep.assert_any_call(1)
+        self.assertTrue(result['results'][0]['removed'])
+
+    def test_workspace_close_rechecks_new_owners_against_preview_scope(self):
+        job = self.workspace_preview()
+        lineage.register(self.worktree, task_ids=['new-owner'], inherit_session=False)
+        result = self.run_apply(job)
+        self.assertFalse(result['results'][0]['removed'])
+        self.assertIn('shared with another task', result['results'][0]['message'])
+
     def test_request_ids_cannot_escape_job_directory(self):
         with self.assertRaises(ValueError):
             cleanup.request({'action': 'status', 'id': '../daemon-sessions'})

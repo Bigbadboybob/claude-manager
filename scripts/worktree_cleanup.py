@@ -45,6 +45,15 @@ def task_family(tasks: dict[str, reaper.TaskFacts], root: str | None) -> set[str
         family |= added
 
 
+def job_roots(job: dict) -> set[str]:
+    """Legacy jobs retain their original scope; new workspace jobs pin owners."""
+    return set(job.get('root_task_ids', [job['task_id']] if job.get('task_id') else []))
+
+
+def task_families(tasks: dict[str, reaper.TaskFacts], roots: set[str]) -> set[str]:
+    return set().union(*(task_family(tasks, root) for root in roots))
+
+
 def inherited_owners(records: dict[str, dict]) -> dict[str, set[str]]:
     records = {**lineage.stored_records(), **records}
     owners = {key: set(row.get('task_ids', [])) for key, row in records.items()}
@@ -126,7 +135,7 @@ def selected_records(records: dict[str, dict], family: set[str], root: dict | No
         selected |= added
 
 
-def scope_facts(ctx: reaper.ScanContext, row: dict, approved_family: set[str], root_task: str | None) -> reaper.WorkspaceFacts:
+def scope_facts(ctx: reaper.ScanContext, row: dict, approved_family: set[str], root_task: str | None, root_task_ids: set[str] | None = None) -> reaper.WorkspaceFacts:
     """Called again by the reaper before/after preservation and final removal."""
     path = Path(row['path'])
     fresh = lineage.checkout(path, create=False)
@@ -157,7 +166,8 @@ def scope_facts(ctx: reaper.ScanContext, row: dict, approved_family: set[str], r
             if parent not in ancestors:
                 ancestors.add(parent)
                 pending.append(parent)
-    family = approved_family & task_family(ctx.tasks, root_task)
+    roots = root_task_ids if root_task_ids is not None else ({root_task} if root_task else set())
+    family = approved_family & task_families(ctx.tasks, roots)
     if facts.task_ids - family:
         raise ValueError('shared with another task')
     for record in records.values():
@@ -185,7 +195,7 @@ def scoped_context(ctx: reaper.ScanContext, row: dict, owners: set[str], job: di
     guard = None
     if job is not None:
         def guard(fresh, _):
-            return scope_facts(fresh, row, set(job['family']), job.get('task_id'))
+            return scope_facts(fresh, row, set(job['family']), job.get('task_id'), job_roots(job))
     return dataclasses.replace(ctx, root=path.parent, retention_days=0, unowned_retention_days=0,
                                immediate_paths={path: row['id']}, ownership={path: reaper.WorkspaceFacts(task_ids=owners)},
                                scope_guard=guard, process_paths=reaper.process_references(path.parent))
@@ -194,19 +204,27 @@ def scoped_context(ctx: reaper.ScanContext, row: dict, owners: set[str], job: di
 def preview(job: dict) -> None:
     ctx = base_context()
     root = lineage.checkout(Path(job['worktree_path'])) if job.get('worktree_path') else None
-    family = task_family(ctx.tasks, job.get('task_id'))
     records, warnings = inventory(ctx, Path(root['path']) if root else None)
+    roots = {job['task_id']} if job.get('task_id') else set()
+    if not roots and root:
+        # A workspace close approves its own directly associated tasks. An
+        # absent task_id is not evidence that every owner is an unrelated task.
+        roots.update(records.get(root['id'], {}).get('task_ids', []))
+        roots.update(ctx.workspaces.get(Path(root['path']), reaper.WorkspaceFacts()).task_ids)
+    family = task_families(ctx.tasks, roots)
+    job['root_task_ids'] = sorted(roots)
+    job['root_tasks'] = [dataclasses.asdict(ctx.tasks[tid]) for tid in sorted(roots) if tid in ctx.tasks]
     owners = inherited_owners(records)
     rows = selected_records(records, family, root)
     planned = []
     for row in rows:
         own = owners[row['id']]
         reason = 'primary_checkout' if row['primary'] else 'unknown_ownership' if not own and not root else None
-        # For workspace-only closes, descendants with task claims stay protected.
+        # Owners outside the explicitly selected task/workspace family stay protected.
         if own - family:
             reason = 'shared_with_another_task'
         if not reason:
-            check = reaper.decision(Path(row['path']), scoped_context(ctx, row, own, {'family': family, 'task_id': job.get('task_id')}))
+            check = reaper.decision(Path(row['path']), scoped_context(ctx, row, own, {'family': family, 'task_id': job.get('task_id'), 'root_task_ids': sorted(roots)}))
             reason = check.reason
         planned.append({**row, 'owners': sorted(own), 'reason': reason})
     job.update(phase='preview', family=sorted(family), candidates=planned, warnings=warnings,
@@ -220,9 +238,10 @@ def apply(job: dict) -> None:
     deadline = time.monotonic() + 30
     while True:
         ctx = base_context()
-        task = ctx.tasks.get(job.get('task_id'))
+        tasks = [ctx.tasks[tid] for tid in job_roots(job) if tid in ctx.tasks]
         root_path = Path(job['worktree_path']) if job.get('worktree_path') else None
-        closed = (task.status in reaper.TERMINAL_TASK_STATUSES if task else not root_path or root_path not in ctx.live_paths)
+        closed = (all(task.status in reaper.TERMINAL_TASK_STATUSES for task in tasks)
+                  if tasks else not root_path or root_path not in ctx.live_paths)
         if closed or time.monotonic() >= deadline:
             break
         time.sleep(1)
@@ -243,7 +262,7 @@ def apply(job: dict) -> None:
             if fresh['primary']:
                 raise ValueError('primary checkout is always retained')
             ctx = base_context()
-            owners = scope_facts(ctx, row, set(job['family']), job.get('task_id')).task_ids
+            owners = scope_facts(ctx, row, set(job['family']), job.get('task_id'), job_roots(job)).task_ids
             context = scoped_context(ctx, row, owners, job)
             candidate = reaper.decision(path, context, refresh_processes=True)
             if not candidate.eligible:

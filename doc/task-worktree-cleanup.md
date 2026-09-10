@@ -12,6 +12,11 @@ task still protects its checkout. For task completion and cleanup, use Alt+d
 on that task's header. Plain Alt+w retains its existing close-session behavior.
 A workspace containing several tasks requires selecting a specific task before
 Alt+d; cleanup never guesses which one to complete.
+For an exited worker whose viewer binding is missing, Alt+d resolves a single
+associated task from the host's checkout inventory before completion. A
+workspace-close preview includes the workspace's own task owners; an open
+associated task is reported as needing completion, not as unrelated sharing.
+New ownership discovered after the preview still blocks removal.
 
 Workspaces the viewer creates for adopted agent sessions close automatically when their last session is removed, including workers whose tasks still await review or monitoring. The viewer saves this policy independently of workspace names, so plain labels such as `scraper-cohort-914e0fc2` work. Closure only hides the empty workspace: planning tasks, task bindings, Git worktrees, branches and transcript tombstones remain. A later worker on the same daemon workspace makes it visible again. User-created workspaces, pinned workspaces, live session rows and pending/offline attachments are protected. Renaming an adopted workspace claims it as a user workspace and turns off this automatic closure; pinning also keeps it visible.
 
@@ -92,7 +97,9 @@ python3 ~/.cm/worktree-tools/worktree_lineage.py install /absolute/repository
 The operator-only daemon RPC is `worktree.cleanup` with actions `preview`,
 `apply`, and `status`. Preview uses a caller-generated UUID `id`, optional
 `task_id`, and optional absolute host-local `worktree_path`. Apply and status
-use that same `id`; retries are idempotent. Agent session callers cannot invoke
+use that same `id`; retries are idempotent. Preview pins `root_task_ids` and
+returns `root_tasks` with their current status, including ownership resolved
+from a workspace path. Agent session callers cannot invoke
 this destructive RPC through MCP. Normal task/session permissions are unchanged.
 
 The TUI waits for every host to acknowledge its persisted cleanup request
