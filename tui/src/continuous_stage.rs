@@ -110,12 +110,6 @@ impl ContinuousStage {
         }
     }
 
-    pub fn badge(self) -> Span<'static> {
-        Span::styled(
-            format!("[{}] ", self.label()),
-            Style::default().fg(self.color()),
-        )
-    }
 }
 
 pub fn legend() -> Vec<Line<'static>> {
