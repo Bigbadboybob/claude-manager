@@ -73,3 +73,19 @@ No new measurement, test campaign, code change, or cleanup is requested in this
 revision. This review consumed committed documents, prior CM source evidence,
 and the read L4 historical record; it queried no live system. Return a consolidated
 revision for final personal review.
+
+## Final disposition at `765f500a6`
+
+**Ready for Owner discussion; no implementation selected.** Following the full
+`0c55b8b05` proposal/NOTES read, personally read the complete consolidated diff
+through `765f500a6` (content `efb3a804c`) and checked the current protocol and
+first-round sections. The six review groups are addressed. The proposal keeps
+comparison-specific protocols, coverage obligations and residual risk rather
+than majority-row soundness, and independent evaluator scrutiny beyond peer
+cross-review. P3's variation estimate and admissibility read are complementary;
+roles remain proposed under existing ownership. Optional telemetry limits and
+CM task/run/attempt clocks are scoped correctly.
+
+Accept this as a candidate for a later bounded round, not approval to change
+physics, repair a sibling surface, or launch a study. The default-runner item
+is deduplicated to existing CM backlog `21b75bd3`; it is not a new dependency.

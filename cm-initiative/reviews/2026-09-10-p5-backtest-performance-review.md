@@ -81,3 +81,18 @@ further research required. Final acceptance awaits the corrected diff.
 
 Personally checked predictionTrading `538404b5a`'s BACKTESTING change: the
 historical-repeatability item is resolved in those docs. No benchmark was run.
+
+## Final disposition at root `67ee54d1f`
+
+**Ready for Owner discussion; no implementation selected.** Personally read
+all root corrections from author `5317f480b` through `67ee54d1f`, following the
+full proposal/NOTES and consolidated-diff reads above. This root version is the
+accepted target. The final table and operating-step corrections align launch
+clock boundaries, fleet effects, candidate-specific savings, local-corpus reuse,
+historical descriptive/statistical evidence, and existing ownership. L4's
+publication span is no longer compared to a preflight estimate as turnaround.
+
+The proposed goal remains useful-result turnaround with preserved behavior and
+artifacts; a bounded round may find its investigated candidates unhelpful
+without claiming all O4 work exhausted. Acceptance selects no optimization,
+experiment, new swarm, or resource budget.
