@@ -96,3 +96,10 @@ The proposed goal remains useful-result turnaround with preserved behavior and
 artifacts; a bounded round may find its investigated candidates unhelpful
 without claiming all O4 work exhausted. Acceptance selects no optimization,
 experiment, new swarm, or resource budget.
+
+## Final pin at root `db4d9a726`
+
+Personally checked the diff from root `67ee54d1f`: PROPOSAL is unchanged and
+NOTES now correctly scopes the restriction to exact between-arm attribution,
+keeping statistical causal inference available with its controls. Acceptance
+carries to root `db4d9a726`; this is the final reviewed pin.

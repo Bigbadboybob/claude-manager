@@ -74,7 +74,7 @@ revision. This review consumed committed documents, prior CM source evidence,
 and the read L4 historical record; it queried no live system. Return a consolidated
 revision for final personal review.
 
-## Final disposition at `765f500a6`
+## Author revision disposition at `765f500a6`
 
 **Ready for Owner discussion; no implementation selected.** Following the full
 `0c55b8b05` proposal/NOTES read, personally read the complete consolidated diff
@@ -89,3 +89,15 @@ CM task/run/attempt clocks are scoped correctly.
 Accept this as a candidate for a later bounded round, not approval to change
 physics, repair a sibling surface, or launch a study. The default-runner item
 is deduplicated to existing CM backlog `21b75bd3`; it is not a new dependency.
+
+## Final disposition at root `d8de69d36`
+
+**Ready for Owner discussion.** Root reported remaining operational-row
+repetitions after the author disposition above. Personally read every
+proposal/NOTES correction from `765f500a6` through root `d8de69d36`: intended
+SIGTERM handling versus missing artifacts; the observed round's 7/7 rate;
+claim-specific repeat evidence; bounded async findings versus general closure;
+linked machine/attempt provenance; proposed roles; and scope based on actual
+residual risk. These correct the remaining repetitions of the accepted
+principles. This root version supersedes the author target for final acceptance.
+No implementation selected.

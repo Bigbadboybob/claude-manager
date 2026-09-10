@@ -51,8 +51,8 @@ coordinator keeps the live roster; these are proposal-development statuses.
 | P1 | Momentum detection through explanatory ingest and useful source coverage | Final `8bbfcd823` personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
 | P2 | Useful article follow-through, blocks, and appropriate non-trades | Final `3eea07af0` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p2-article-follow-through-review.md#final-disposition-at-3eea07af0), no implementation selected |
 | P3 | Production-baseline P&L improvement with bounded rounds | Final `5e8e56e9f` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p3-production-pnl-review.md#final-disposition-at-5e8e56e9f), no round selected |
-| P4 | Backtest fidelity, reliability, and useful completed comparisons | Final `765f500a6` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p4-backtest-fidelity-review.md#final-disposition-at-765f500a6), no implementation selected |
-| P5 | Backtest speed and resource efficiency preserving workload and outcomes | Final root `67ee54d1f` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p5-backtest-performance-review.md#final-disposition-at-root-67ee54d1f), no implementation selected |
+| P4 | Backtest fidelity, reliability, and useful completed comparisons | Final root `d8de69d36` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p4-backtest-fidelity-review.md#final-disposition-at-root-d8de69d36), no implementation selected |
+| P5 | Backtest speed and resource efficiency preserving workload and outcomes | Final root `db4d9a726` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p5-backtest-performance-review.md#final-pin-at-root-db4d9a726), no implementation selected |
 | P6 | Useful timely delivery from existing sources | Final `136589a7e` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p6-source-reliability-review.md#final-disposition-at-136589a7e), no implementation selected |
 | P7 | News-decision latency and cost while preserving useful outcomes | Full `c4ab89af1` draft personally read (committed blobs verified against read SHA256s); [CM revisions requested](reviews/2026-09-10-p7-news-latency-cost-review.md); coordinator writes the consolidated handoff |
 | P8 | Recurring initiatives and continuous-task organization | Full `1bf555817` proposal/NOTES personally read; [CM revisions requested](reviews/2026-09-10-p8-recurring-work-review.md) |
@@ -76,7 +76,7 @@ personal review before later Owner selection.
 
 The authors hand off consolidated commits after addressing both coordinators'
 comments and reconciling shared boundaries. P1 `8bbfcd823`, P2 `3eea07af0`,
-P3 `5e8e56e9f`, P4 `765f500a6`, P5 root `67ee54d1f`, and P6 `136589a7e`
+P3 `5e8e56e9f`, P4 root `d8de69d36`, P5 root `db4d9a726`, and P6 `136589a7e`
 have passed personal review and are ready for Owner discussion. P7 `c4ab89af1`
 and P8 `1bf555817` have been fully personally read with revisions requested.
 Their consolidated revisions remain pending personal acceptance.
