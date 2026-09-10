@@ -1,168 +1,138 @@
-# Swarm Focused Design — Initial setup plan
+# Swarm Focused Design — Work plan
 
-Status: **Approved by Owner; setup complete**, 2026-09-10. The
-[charter](CHARTER.md) is approved. This plan establishes coordination between
-the two existing tasks; candidate swarms will be discussed after setup.
+Status: **Initial exploration authorized; planning remains interactive**,
+2026-09-10. Owner supplied the initial directions below and will continue the
+predictionTrading brainstorm directly with Swarm-Gardener. The
+[charter](CHARTER.md) remains the agreed goal. Infrastructure history is in
+[SETUP.md](SETUP.md); it is not the substantive work plan.
 
-## Approved setup
+## How we plan together
 
-Create one initiative named **Swarm Focused Design**, slug
-`swarm-focused-design`, with these two project memberships and existing tasks:
+Owner text/voice-dumps ideas, both coordinators explore and discuss them, and we
+refine candidate plans together. Earlier dumps are useful starting material.
+We keep open choices visible and update this plan as Owner steers the work;
+drafting a document does not settle those choices.
 
-| Project | Membership role | Existing task to link | Coordinator |
-|---|---|---|---|
-| `claude-manager` | Initiative coordination and CM capabilities | `Swarm focused design CM` — `3b58ab69-3c89-4dee-bed4-c714858b0656` | Initiative-Bridge; initiative entry point and native coordinator |
-| `predictionTrading` | Find suitable work, support approved swarms, and evaluate coordination practices | `Swarm focused design` — `f279464b-59da-4ba2-bce6-7bdb0a450847` | Swarm-Gardener; predictionTrading entry point |
+The current authorization is to get ideas flowing through bounded research and
+brainstorming within this existing initiative. Research tasks and the expressly
+requested research subagents may support that exploration. Candidate documents
+are proposals: no new initiative or production swarm is being created or
+launched, and no candidate implementation or deployment is selected.
 
-The CM hub is `/home/lucas/.cm/worktrees/claude-manager-swarm-focused-design-cm`
-on `cm/swarm-focused-design-cm`. The predictionTrading side remains in
-`/home/lucas/.cm/worktrees/predictionTrading-swarm-focused-design` on
-`cm/swarm-focused-design`. Preserve both tasks' identities, history, sessions,
-and worktrees. Linking them requires no new worker sessions or subtasks.
+## Initial work
 
-Create and record these channels:
+| Effort | Responsible side | Work and output | Review / dependencies | Current status |
+|---|---|---|---|---|
+| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates an Owner-requested Fable research task/session using research subagents | Investigate the codebase and develop candidate swarm plans with clear, meaningful measures of improvement; write one document per candidate | Owner will brief Swarm-Gardener directly with more ideas; Initiative-Bridge reviews each document before joint discussion with Owner | Direction authorized; local brief and exact Fable session configuration to be resolved by that coordinator |
+| Brainstorm useful CM swarm features | Initiative-Bridge, assisted by a bounded research subagent | Inspect existing capabilities and identify useful coordination improvements, with evidence of the gap and concrete discussion options | Incorporate candidate plans and SEJD feedback as they arrive; Owner selects later feature implementation | [First discussion draft](shared/cm-feature-ideas.md) read and reviewed by Initiative-Bridge; no implementation selected |
+| Learn from SEJD's coordinator | predictionTrading; Swarm-Gardener contacts SEJD-Coordinator | Ask what would help communication and swarming, capture concrete friction and useful feature/practice ideas in a feedback note | Preserve SEJD's current work and deliberate close Owner collaboration; bring transferable lessons to both sides | Requested through the shared-channel handoff |
 
-| Channel | Purpose |
-|---|---|
-| `initiative/swarm-focused-design` | Shared goals, decisions, proposals, results, and cross-project blockers |
-| `initiative/swarm-focused-design/claude-manager` | CM coordination features and local implementation discussion |
-| `initiative/swarm-focused-design/prediction-trading` | Suitable task ideas, approved swarm support, evaluation, and local discussion |
+The predictionTrading side owns its research task, local briefs, codebase
+investigation, candidate documents, and SEJD contact. Initiative-Bridge owns CM
+feature exploration, cross-project review, and the shared plan/index. Existing
+repository and session permissions still apply. Each research task gets bounded
+owned paths and records its task ID, base revision, session configuration, and
+result references when launched.
 
-## Setup work
+## predictionTrading candidate development
 
-These are responsibilities within the existing coordinator tasks.
+Start with Owner's earlier ideas and the next direct brainstorm. Ingest and
+improving the momentum pipeline are explicit examples; the
+[existing candidate register](https://github.com/Bigbadboybob/predictionTrading/blob/acfd6f8ce/agent_docs/swarm-focused-design-charter-review-2026-09-10.md#candidate-register-for-later-discussion)
+also records production-baseline P&L improvement, backtest infrastructure, and
+organization of continuous tasks. These are seeds for investigation, not a
+selected implementation backlog. New platform expansion remains on hold.
 
-| Work | Responsible coordinator | Owned paths or records | Dependencies | Verification | Status |
-|---|---|---|---|---|---|
-| Native initiative and task links | Initiative-Bridge | New initiative and its two memberships; initiative association on the two named tasks | Owner approval of this plan, memberships, and activation through the supported Owner flow | Read back the initiative, coordinator, memberships, task links, and approval fields | Complete |
-| Shared onboarding and protocol | Initiative-Bridge, with Swarm-Gardener review | CM hub `cm-initiative/` | Approved charter and setup plan; fill in native ID when created | Both coordinators can follow links to the same current docs and identify ownership and checkpoints | Complete; bootstrap `867d8ee` pushed |
-| predictionTrading onboarding link | Swarm-Gardener | `agent_docs/swarm-focused-design-onboarding.md` in its existing worktree | Shared docs and initiative ID | Links identify the canonical charter, local role, shared artifact index, channels, and approval boundaries | Complete; `ae3724a69` pushed and reviewed |
-| Channels and kickoff | Initiative-Bridge; Swarm-Gardener joins shared and predictionTrading channels | Three channel paths above and channel references on native records | Plan approval; initiative and docs ready | Read back all channels, pinned kickoff, participant membership, and stored channel paths | Complete; pins and memberships verified |
+Explore why the work is favorable to agents operating with little supervision:
+what can proceed independently, how results fit together, what evidence can
+establish useful progress, and which domain decisions still need Owner. Look
+for clear metrics that track the desired result, with a credible baseline and
+ways to check that apparent improvement is real. A metric to maximize is a
+candidate evaluation tool; it does not override intended goals or justify
+optimizing an unreliable proxy.
 
-## Documents and shared artifacts
+Write **one document per candidate plan**, in the predictionTrading task's
+appropriate repository-local documentation area. Swarm-Gardener chooses the
+exact directory under that repository's instructions and posts committed links
+to the shared channel and artifact index. Each document should make the idea
+reviewable without prematurely fixing implementation details:
 
-The CM coordinator branch is the canonical hub. Prepare and commit the following
-initiative bootstrap files there, including this plan and the review record:
+- Intended outcome, why Owner might want it, and supporting codebase evidence.
+- Why it suits swarming with little supervision; likely independent tasks and
+  integration needs.
+- Candidate metric/evaluation, baseline, uncertainty, and potential Goodharting.
+- Proposed boundaries, dependencies, resources, risks, and Owner involvement.
+- Alternatives and unresolved choices for the next interactive discussion.
 
-- `CHARTER.md`: approved goal and boundaries.
-- `PLAN.md`: setup status, later approved work, and decision log.
-- `PROTOCOL.md`: onboarding order, communication, file ownership, verification,
-  integration, and Owner checkpoints.
-- `PROJECTS.md`: native initiative ID and project/task/worktree/channel mapping.
-- `shared/README.md`: index linking shared results and documents to their owners
-  and source versions. Add artifact directories as work needs them.
+Investigation may read code and existing evidence and produce documents. Any
+proposed costly experiment, implementation, production change, or wider scope
+must be brought back with its concrete requirements before proceeding.
 
-The protocol will direct participants to read the charter, current plan, project
-mapping, and current message-board norms before working. Each future approved
-task keeps `NOTES.md` in its owned area and reports completion with `report_done`,
-including the outcome, evidence, and unresolved work. Coordinators keep status
-and material decisions current at handoffs and reviews.
+## CM feature exploration and SEJD feedback
 
-Onboarding and kickoff references identify the canonical repository, branch,
-path, and reviewed commit as well as convenient absolute worktree paths.
-Shared artifacts live in the hub when consumed across projects. Repository-local
-evidence may stay with its code and be indexed by committed reference. The
-predictionTrading onboarding doc links to the canonical charter rather than
-maintaining a second copy. Each coordinator edits their own repository; proposed
-hub changes come through the CM coordinator.
+CM ideas should start from the existing product and an actual coordination need.
+Distinguish capabilities already present, shortcomings in how agents use them,
+and features that need building. For each promising idea, describe the user/agent
+workflow, the observed or hypothesized failure it addresses, a bounded possible
+change, and how we could tell whether it helped.
 
-Independent implementation tasks use separate worktrees. Workers ask the
-coordinator before touching another task's paths or driving another session;
-coordination does not grant permissions the session lacks. Normal repository
-review, merge, and verification rules apply. Commit only setup files, preserving
-unrelated working-tree changes.
+Swarm-Gardener should ask SEJD-Coordinator about communication friction, lost
+context or decisions, handoffs, and other coordination improvements it would
+find useful. Capture its examples and uncertainty in its own words; do not
+interrupt or redirect SEJD work. SEJD is deliberately hands-on, so assess which
+lessons transfer to the little-supervision work this initiative seeks.
 
-## Owner checkpoints and future proposals
+Both sides may develop further ideas as evidence arrives. Owner chooses which
+ones become implementation tasks or new swarms after discussion.
 
-Approval of this plan covers setting up the named initiative, its two project
-memberships, linking the existing tasks, the onboarding documents, and the three
-channels. Apply the native membership and activation approvals through the
-supported Owner flow and record the resulting state.
+The initial CM discussion draft covers easier access to current initiative
+context, outcome/evidence handoffs, finding results affected by changed inputs,
+and linking concrete Owner decisions to plans. It separates current capabilities
+from possible additions and leaves ranking open for the brainstorm.
 
-New swarms, initiatives, project sides, groups, or expanded scope still require
-Owner approval. Future proposals will state the intended goal, why the task is
-suited to swarms, project and owned paths, task breakdown and dependencies,
-verification, resources and risks, reporting, and requested Owner involvement.
-Before any approved launch, the brief identifies the actual task, worktree,
-current document versions, channel, and limits on further delegation.
+## Review and next checkpoints
 
-Keep the charter's deployment rule in the protocol: Owner approval is required,
-with the existing critical-bug-fix exception and normal repository checks. Where
-the exception's applicability or authority is unclear, bring the concrete case
-to Owner; do not infer a wider exception. This setup requires no deployment.
+1. Owner continues the predictionTrading idea dump with Swarm-Gardener. That
+   coordinator refines and launches the requested bounded Fable research task,
+   using research subagents as authorized, and records the actual task/session
+   identity. It also makes the SEJD contact within the existing coordinator task.
+2. Share candidate documents and CM feature ideas as they become reviewable.
+   There is no fixed candidate count, score, or deadline.
+3. **Initiative-Bridge personally reviews each predictionTrading candidate
+   document** for fit with Owner's intention, swarm suitability, evaluation and
+   Goodharting risks, integration, and useful CM support. Return comments and
+   questions to Swarm-Gardener, with review references in the shared index.
+4. Discuss the options with Owner, revise the documents, and record the work
+   Owner actually selects. Any new initiative, swarm, or implementation scope
+   follows the charter's approval boundaries.
 
-After setup, discuss the candidate directions already recorded in the charter
-and predictionTrading contribution. SEJD remains an independently coordinated,
-deliberately hands-on case study. Later proposals should distinguish lessons
-that transfer to little-supervision work from those requiring close Owner input.
+## Open choices for the brainstorm
 
-## Milestones and completion checks
+- Owner's additional predictionTrading ideas and preferred starting emphasis.
+- Which candidates have trustworthy evaluation and sufficiently independent
+  work to merit a full swarm proposal.
+- Which CM improvements would help those candidates or existing coordination
+  enough to build first.
 
-1. **Setup approved:** Owner approves this plan and the named memberships and
-   activation; record the approval before provisioning.
-2. **Native grouping established:** the initiative is active, both memberships
-   are approved, and both existing tasks point to it with the CM task as coordinator.
-3. **Onboarding usable:** commit and cross-check the shared documents and local
-   onboarding link; both coordinators know their responsibilities and checkpoints.
-4. **Shared conversations ready:** create channels, post and pin a kickoff with
-   doc links and approved setup scope, and verify shared access and native links.
-5. **Setup complete:** report the initiative ID, channels, document references,
-   and any remaining issue. Move to discussion of later work with Owner.
-
-Before provisioning, check for existing records or channels with the same slug
-to avoid duplicates. If a task already belongs to another initiative, resolve
-the conflict with Owner before changing that association. If setup partially
-succeeds, record completed IDs and resume from them. Check that no unrelated
-tasks or SEJD records changed.
-
-## Open decisions
-
-Setup is complete. Select later swarm proposals with Owner; no new swarm launch
-has been approved yet.
-
-## Completion record
-
-- Initiative `d381971d-0668-4ac0-8483-bf4111f3ddc2` is active with both approved
-  memberships and exactly the two existing coordinator tasks linked. Task
-  identity, status, worktree branches, and SEJD ownership remain intact.
-- Shared docs were reviewed and pushed at CM bootstrap commit
-  `867d8ee5ae3413c654e0c06483e376763f3c908e`. Follow the hub branch for this
-  completion record and later decisions.
-- predictionTrading onboarding was reviewed and pushed at
-  [`ae3724a69`](https://github.com/Bigbadboybob/predictionTrading/blob/ae3724a69/agent_docs/swarm-focused-design-onboarding.md).
-- All three channels are created, linked from native records, and have pinned
-  kickoffs. Both coordinators' required memberships were read back; shared
-  messages and pins were confirmed synchronized with the message-board hub.
-- Local document links and whitespace checks passed. Swarm-Gardener independently
-  verified the six shared documents, published bootstrap reference, local
-  instruction links, and shared/predictionTrading channel access and pins.
-
-The initiative and its coordinator tasks remain ongoing. Completing this setup
-does not launch later candidate swarms or authorize deployments.
+These are discussion topics, not a prerequisite questionnaire for Owner.
 
 ## Decision log
 
-- **2026-09-10 — Owner:** approved the combined charter: "Okay is the charter
-  complete. This looks solid to me".
-- **2026-09-10 — Owner, earlier direction:** establish this coordination
-  initiative using the two existing tasks before choosing later swarms.
-- **2026-09-10 — Owner:** focus this initiative on swarm-favorable work with
-  little supervision; preserve desired deep participation in SEJD and learn
-  from its failure modes and Goodharting.
-- **2026-09-10 — Coordinator proposal:** the setup responsibilities, document
-  layout, and provisioning sequence above are ready for review. No new worker
-  launch is part of this setup plan.
-- **2026-09-10 — predictionTrading review:** Swarm-Gardener found no blockers
-  with the proposed responsibilities; added canonical repository/branch/path
-  and reviewed commit to onboarding references.
-- **2026-09-10 — Owner:** responded to the setup-plan checkpoint, "Oh I see,
-  protocol and projects. Sure sure, makes sense". Recorded as approval to set up
-  the named initiative, both memberships, existing task links, documents, and
-  channels. This authorizes the setup above; later swarm launches remain gated.
-- **2026-09-10 — Provisioning:** created initiative
-  `d381971d-0668-4ac0-8483-bf4111f3ddc2`, approved both memberships through the
-  supported API, activated it at `2026-09-10T03:32:34.797365Z`, and linked the
-  two existing tasks. All three channel paths are now stored on native records.
-- **2026-09-10 — Setup complete:** both coordinators verified the shared docs and
-  conversations; predictionTrading onboarding is committed at `ae3724a69`.
-  The initiative is ready for discussion of later work with Owner.
+- **2026-09-10 — Owner:** clarified that planning should be an interactive
+  text-dump and brainstorm with both sides; setup infrastructure alone is not
+  the work plan. Infrastructure history moved to `SETUP.md`.
+- **2026-09-10 — Owner:** requested predictionTrading codebase research and
+  brainstorming through a Fable task/session using subagents, with one document
+  per candidate plan. Owner will provide more ideas directly to Swarm-Gardener.
+- **2026-09-10 — Owner:** requested CM feature brainstorming, allowed a research
+  subagent, and asked the predictionTrading side to contact SEJD-Coordinator for
+  communication and swarm-coordination ideas.
+- **2026-09-10 — Owner:** asked Initiative-Bridge to review the predictionTrading
+  documents personally, record these directions here, and mention that
+  coordinator in the shared channel. New initiatives and production swarms
+  remain unselected.
+- **2026-09-10 — Coordinator:** read the initial CM feature draft and kept its
+  four candidates as discussion options. Shared-channel message
+  `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:3d3e6d09-cd95-488d-b3d5-5110cc5287a7`
+  mentions Swarm-Gardener with Owner's exploration directions, the direct
+  brainstorm handoff, per-candidate documents, and the SEJD contact request.

@@ -5,6 +5,8 @@ Native initiative: **Swarm Focused Design**, slug `swarm-focused-design`, ID
 memberships are approved and both existing tasks are linked. All three channels
 are created and their paths are stored on the native records. Each has a pinned
 kickoff; both coordinators are members of the shared channel and their own side.
+Owner membership is verified in all three channels. The requested laptop
+Work / Task sidebar subsection remains pending; see [the local steps](SETUP.md#remaining-local-sidebar-step).
 
 ## Canonical hub
 

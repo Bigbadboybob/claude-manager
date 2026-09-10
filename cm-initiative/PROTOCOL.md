@@ -1,7 +1,7 @@
 # Swarm Focused Design — Work protocol
 
 Initiative: `d381971d-0668-4ac0-8483-bf4111f3ddc2` (`swarm-focused-design`).
-Established under the Owner-approved [charter](CHARTER.md) and [setup plan](PLAN.md),
+Established under the Owner-approved [charter](CHARTER.md) and [setup](SETUP.md),
 2026-09-10. The [project map](PROJECTS.md) identifies the current coordinators,
 repositories, branches, worktrees, and channels.
 
@@ -18,10 +18,18 @@ ongoing Owner supervision. Low levels of Goodharting is an outcome; investigatin
 failure modes and hunting Goodharting is part of predictionTrading's work. SEJD
 remains a separately coordinated case study with deliberate close Owner input.
 
-Setup uses Initiative-Bridge and Swarm-Gardener in their existing tasks. No
-additional worker or production swarm has been selected. Future workers begin
-only with an approved task brief covering the goal, project, worktree, owned
-paths, dependencies, verification, reporting channel, and limits on delegation.
+The existing coordinators are Initiative-Bridge and Swarm-Gardener. Owner's
+[work plan](PLAN.md) now authorizes initial exploration, including a bounded CM
+research subagent and a predictionTrading research task/session with research
+subagents. No production swarm is selected. Worker briefs cover the goal,
+project, worktree, owned paths, dependencies, verification, reporting channel,
+and limits on delegation.
+
+Plan interactively with Owner and both coordinators: take text/voice dumps,
+explore options, discuss candidate documents, and record chosen directions.
+Infrastructure setup alone is not the work plan. For this initial exploration,
+predictionTrading writes one document per candidate and Initiative-Bridge
+personally reviews each before Owner selects later work.
 
 ## Coordination and decisions
 

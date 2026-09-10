@@ -11,12 +11,18 @@ and [project map](../PROJECTS.md) for current goals, scope, and onboarding.
 
 | Artifact | Owner | Source/version | Status and use |
 |---|---|---|---|
+| [Interactive work plan](../PLAN.md) | Initiative-Bridge with Owner and Swarm-Gardener | CM hub branch; see decision log | Initial exploration directions, candidate review, and open choices |
+| [CM coordination feature ideas](cm-feature-ideas.md) | Initiative-Bridge; research subagent draft | Source inspection at CM `849058f`; draft read by Initiative-Bridge | Four discussion candidates; no implementation selected |
 | [Charter review record](../reviews/2026-09-10-charter-review.md) | Initiative-Bridge | CM hub branch; bootstrap commit identified in the pinned kickoff | Owner decisions and review provenance |
 | [predictionTrading onboarding](https://github.com/Bigbadboybob/predictionTrading/blob/ae3724a69/agent_docs/swarm-focused-design-onboarding.md) | Swarm-Gardener | predictionTrading, commit `ae3724a69` | Verified local entry point to the shared docs, project instructions, and channels |
 | [predictionTrading contribution and candidate register](https://github.com/Bigbadboybob/predictionTrading/blob/acfd6f8ce/agent_docs/swarm-focused-design-charter-review-2026-09-10.md) | Swarm-Gardener | predictionTrading, commit `acfd6f8ce` | Reviewed input and later candidate ideas; canonical goal is the approved shared charter |
 | [SEJD historical evidence and lessons](https://github.com/Bigbadboybob/predictionTrading/blob/acfd6f8ce/agent_docs/swarm-focused-design-charter-review-2026-09-10.md#sejd-evidence-and-lessons) | Swarm-Gardener | predictionTrading contribution at `acfd6f8ce`, with dated source records | Historical case-study starting points; not current defect findings |
 
-No new swarm results exist yet. Add artifact directories as approved work needs
+predictionTrading candidate documents and the SEJD coordinator feedback note
+will be indexed here as they arrive. Initiative-Bridge personally reviews each
+candidate and links review comments alongside it.
+
+No new production swarm results exist yet. Add artifact directories as approved work needs
 them; put repository-local evidence with its code when appropriate and link a
 committed reference here. Include owner, purpose, source revision, and status.
 When an artifact is superseded or its evidence invalidated, record that change

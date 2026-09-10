@@ -4,10 +4,12 @@ Status: **Approved by Owner**, 2026-09-10: "Okay is the charter complete. This
 looks solid to me". Incorporates Owner's inline comments, subsequent
 clarifications, and the predictionTrading contribution, aligned through commit
 `acfd6f8ce`. See [review notes](reviews/2026-09-10-charter-review.md) for provenance.
-The charter and [initial setup plan](PLAN.md) are approved. Native initiative
+The charter and initial infrastructure setup were approved. Native initiative
 `d381971d-0668-4ac0-8483-bf4111f3ddc2` is active with both memberships approved.
-The [project map](PROJECTS.md) records native IDs and channels; the plan tracks
-the completed setup.
+The [project map](PROJECTS.md) records native IDs and channels. [PLAN.md](PLAN.md)
+captures Owner's initial exploration directions and continuing interactive
+brainstorm; [SETUP.md](SETUP.md) records infrastructure and the pending sidebar
+subsection.
 
 Initiative slug: `swarm-focused-design`.
 
@@ -261,8 +263,9 @@ to configure a scheduler or migrate existing continuous tasks.
 
 ## Review and next step
 
-Owner approved the combined charter and setup plan on 2026-09-10. Setup is
-complete: the initiative is active, both existing coordinator tasks are linked,
-onboarding docs are committed, and channels have pinned kickoffs. See the
-[completion record](PLAN.md#completion-record). Next, discuss later candidate
-swarms with Owner and launch only separately selected, approved work.
+Owner approved the combined charter and initial setup on 2026-09-10. The
+initiative is active, both coordinator tasks are linked, onboarding docs are
+committed, and channels have pinned kickoffs and Owner membership. The laptop
+sidebar subsection remains pending in [SETUP.md](SETUP.md). Owner has now
+authorized the initial research and brainstorming in [PLAN.md](PLAN.md); develop
+and review candidate plans interactively before selecting new swarms.
