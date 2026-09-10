@@ -1,8 +1,8 @@
 # Swarm Focused Design — Work plan
 
 Status: **Initial exploration authorized; planning remains interactive**,
-2026-09-10. Owner supplied the initial directions below and will continue the
-predictionTrading brainstorm directly with Swarm-Gardener. The
+2026-09-10. Owner supplied the initial directions below and then briefed
+Swarm-Gardener directly with the research sequence recorded here. The
 [charter](CHARTER.md) remains the agreed goal. Infrastructure history is in
 [SETUP.md](SETUP.md); it is not the substantive work plan.
 
@@ -23,9 +23,9 @@ launched, and no candidate implementation or deployment is selected.
 
 | Effort | Responsible side | Work and output | Review / dependencies | Current status |
 |---|---|---|---|---|
-| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates an Owner-requested Fable research task/session using research subagents | Investigate the codebase and develop candidate swarm plans with clear, meaningful measures of improvement; write one document per candidate | Owner will brief Swarm-Gardener directly with more ideas; Initiative-Bridge reviews each document before joint discussion with Owner | Direction authorized; local brief and exact Fable session configuration to be resolved by that coordinator |
+| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | Swarm-Gardener reports Fable route verified and bounded launch being prepared |
 | Brainstorm useful CM swarm features | Initiative-Bridge, assisted by a bounded research subagent | Inspect existing capabilities and identify useful coordination improvements, with evidence of the gap and concrete discussion options | Incorporate candidate plans and SEJD feedback as they arrive; Owner selects later feature implementation | [First discussion draft](shared/cm-feature-ideas.md) read and reviewed by Initiative-Bridge; no implementation selected |
-| Learn from SEJD's coordinator | predictionTrading; Swarm-Gardener contacts SEJD-Coordinator | Ask what would help communication and swarming, capture concrete friction and useful feature/practice ideas in a feedback note | Preserve SEJD's current work and deliberate close Owner collaboration; bring transferable lessons to both sides | Requested through the shared-channel handoff |
+| Learn from SEJD's coordinator | predictionTrading; Swarm-Gardener contacts SEJD-Coordinator | Ask what would help communication and swarming, capture concrete friction and useful feature/practice ideas in a feedback note | Preserve SEJD's current work and deliberate close Owner collaboration; bring transferable lessons to both sides | Contact made; feedback note pending |
 
 The predictionTrading side owns its research task, local briefs, codebase
 investigation, candidate documents, and SEJD contact. Initiative-Bridge owns CM
@@ -36,12 +36,34 @@ result references when launched.
 
 ## predictionTrading candidate development
 
-Start with Owner's earlier ideas and the next direct brainstorm. Ingest and
-improving the momentum pipeline are explicit examples; the
+Keep a separate list of **all Owner ideas**, including earlier ideas. Synthesize
+only the AI-generated ideas; do not merge away or silently replace Owner's list.
+Owner's latest direct brainstorm on predictionTrading, relayed by Swarm-Gardener,
+adds these directions:
+
+- Momentum-event detection and coverage of explanations from existing articles;
+  then explanations discovered on the web and routed toward scraper creation.
+  Use the **existing RAG momentum pipeline**; do not have an agent manually
+  search all recent articles.
+- Follow articles through to trades and diagnose why each stage blocks progress;
+  compare whether one swarm or separate swarms would fit this work.
+- Improve P&L after production deployments using the **existing auto-backtest
+  system** as the starting infrastructure.
+
+The
 [existing candidate register](https://github.com/Bigbadboybob/predictionTrading/blob/acfd6f8ce/agent_docs/swarm-focused-design-charter-review-2026-09-10.md#candidate-register-for-later-discussion)
 also records production-baseline P&L improvement, backtest infrastructure, and
 organization of continuous tasks. These are seeds for investigation, not a
 selected implementation backlog. New platform expansion remains on hold.
+
+Swarm-Gardener reports that Owner pre-authorized this sequence after the direct
+brief is incorporated: preserve Owner's ideas; add the coordinator's ideas and
+an independent Fable brainstorm; synthesize the AI ideas; obtain agent reviews
+and refine that list; then launch one collaborative proposal-document effort
+per refined idea. Agents should share findings, questions, and drafts with each
+other. This authorization covers research and proposal development, including
+those bounded proposal tasks, not the candidate implementations or production
+swarms they describe.
 
 Explore why the work is favorable to agents operating with little supervision:
 what can proceed independently, how results fit together, what evidence can
@@ -92,12 +114,14 @@ from possible additions and leaves ranking open for the brainstorm.
 
 ## Review and next checkpoints
 
-1. Owner continues the predictionTrading idea dump with Swarm-Gardener. That
-   coordinator refines and launches the requested bounded Fable research task,
-   using research subagents as authorized, and records the actual task/session
-   identity. It also makes the SEJD contact within the existing coordinator task.
-2. Share candidate documents and CM feature ideas as they become reviewable.
-   There is no fixed candidate count, score, or deadline.
+1. Swarm-Gardener incorporates the direct Owner brief, preserves the Owner idea
+   list, and launches the independent Fable brainstorm using research subagents
+   as authorized. Record actual task/session identities and source revisions.
+2. Synthesize the AI ideas, obtain agent reviews, and refine them before creating
+   the pre-authorized collaborative proposal-document tasks. Share findings and
+   drafts across those tasks. Post candidate documents, CM ideas, and SEJD
+   feedback as they become reviewable. There is no fixed candidate count, score,
+   or deadline.
 3. **Initiative-Bridge personally reviews each predictionTrading candidate
    document** for fit with Owner's intention, swarm suitability, evaluation and
    Goodharting risks, integration, and useful CM support. Return comments and
@@ -108,7 +132,7 @@ from possible additions and leaves ranking open for the brainstorm.
 
 ## Open choices for the brainstorm
 
-- Owner's additional predictionTrading ideas and preferred starting emphasis.
+- Owner's further corrections and preferred emphasis as ideas are reviewed.
 - Which candidates have trustworthy evaluation and sufficiently independent
   work to merit a full swarm proposal.
 - Which CM improvements would help those candidates or existing coordination
@@ -136,3 +160,12 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:3d3e6d09-cd95-488d-b3d5-5110cc5287a7`
   mentions Swarm-Gardener with Owner's exploration directions, the direct
   brainstorm handoff, per-candidate documents, and the SEJD contact request.
+- **2026-09-10 — Owner direction relayed by Swarm-Gardener:** message
+  `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:2b1cd16d-094a-4c5d-b06f-8db759d75588`
+  records the further direct brainstorm and pre-authorized research/proposal
+  sequence above. Existing RAG momentum and auto-backtest infrastructure are
+  required starting points; Owner ideas remain separate from AI synthesis.
+- **2026-09-10 — Launch configuration reported by Swarm-Gardener:** the local
+  Claude settings select `claude-fable-5-1[1m]`, and its inspection found that
+  `claude-code` launches have no daemon model override. That coordinator owns
+  verifying the actual launched session; launch completion is not yet reported.
