@@ -1,0 +1,13 @@
+# Codex LB browser callback on the laptop
+
+The cloud migration moved the former laptop Codex pool to `cm-sessions`. Its dashboard at laptop `http://localhost:2455` is forwarded by `cm-codex-lb.service`, but browser OAuth returns to **the laptop's** `localhost:1455/auth/callback`. That port must also reach `cm-sessions:1455`, where Codex LB starts its callback listener when a login begins. The observed September 10 failure had a pending cloud login and a cloud callback listener, while the browser reported connection refused on the laptop.
+
+`scripts/install-codex-oauth-tunnel.py` installs a separate, reconnecting user service, `cm-codex-oauth-tunnel.service`. It uses the existing `cm-sessions` SSH alias, binds only laptop loopback, preserves the dashboard tunnel, and changes no credentials or cloud service. It refuses cloud execution, conflicting listeners, and unrelated existing units. Activation failure removes a newly created unit. Repeating a successful installation is safe. The cloud agent can prepare this installer, but current cloud-to-laptop access is read-only; installation must run in a local laptop terminal.
+
+After installation, start a fresh **Accounts → Add account → OAuth → Browser** flow from `http://localhost:2455`. A listening tunnel proves connectivity is configured; account enrollment is complete only when the dashboard reports success. Expired authorization links must be replaced. The callback listener on the cloud is normally absent between login flows, so an idle tunnel's remote connection refusal does not prove the tunnel is broken.
+
+The `cm-manager` pool at laptop `http://localhost:2456` is separate. Use its existing manual callback field or device-code login for enrollment; the same fixed local callback port cannot be forwarded to both pools at once. If another local Codex login owns 1455, finish that login before installing or starting the tunnel. To intentionally free the port, run `systemctl --user stop cm-codex-oauth-tunnel.service`; restart it before the next cloud-pool browser enrollment. To remove the persistent forward, disable it with `systemctl --user disable --now cm-codex-oauth-tunnel.service`.
+
+Fallback: paste the final browser callback URL directly into **Paste callback URL (for remote server)** in the originating dashboard dialog. Keep that URL out of chats and logs because it contains a temporary authorization code. Device-code login is also available and avoids the local callback entirely; account settings must permit device-code authentication.
+
+Official reference: [Codex authentication — forwarding the localhost callback](https://developers.openai.com/codex/auth#fallback-forward-the-localhost-callback-over-ssh).
