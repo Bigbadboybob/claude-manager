@@ -581,6 +581,9 @@ pub struct Manifest {
     /// load as "column off" (today's single-sidebar layout).
     #[serde(default)]
     pub continuous_column_on: bool,
+    /// Viewer shortcut hints (Alt+?): old manifests keep hints visible.
+    #[serde(default)]
+    pub hide_keybinding_helper: bool,
     /// User-assigned accent colors for planning tasks, keyed by task id.
     /// Tasks live in the planning API rather than this manifest, so their
     /// display color rides here as a TUI-side sidecar (same palette names

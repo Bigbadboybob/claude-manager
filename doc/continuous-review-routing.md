@@ -14,7 +14,7 @@ An open unfinished task retains a visible live session, including review and evi
 
 ## Visible stages
 
-The continuous column colors each subtask's label by its lifecycle stage, leaving the full available width for the task name. Selected labels become bold and retain their stage color; idle age does not replace that color. The spinner remains agent activity; idle is never an approval signal. A fixed legend below the list explains the colors and the distinction between the review queue and active review. Missing or unrecognized metadata uses the **Unstaged** color. Terminal planning status overrides stale stage metadata; legacy `metadata.stage` and operator-blocked rows remain readable.
+The continuous column colors each subtask's label by its lifecycle stage, leaving the full available width for the task name. Focused labels use the normal white/bold selection highlight, overriding their stage color; moving focus away restores the stage color. Idle age does not replace stage color. The spinner remains agent activity; idle is never an approval signal. A fixed legend below the list explains the colors and the distinction between the review queue and active review. Missing or unrecognized metadata uses the **Unstaged** color. Terminal planning status overrides stale stage metadata; legacy `metadata.stage` and operator-blocked rows remain readable.
 
 Write `metadata.continuous_stage` at every transition, with an actual timezone-aware UTC `metadata.stage_updated_at` and a concrete `metadata.next_action`. Merge these keys into current metadata; preserve unrelated evidence and bindings. The following values are the shared contract:
 
