@@ -46,11 +46,15 @@ def launch_permissions():
         policy = json.loads(path.read_text())
     except FileNotFoundError:
         return None
-    if policy != {"mode": "full-access-auto-review"}:
+    if policy == {"mode": "full-access-auto-review"}:
+        approval_policy, reviewer = "on-request", "auto_review"
+    elif policy == {"mode": "full-access-no-review"}:
+        approval_policy, reviewer = "never", "user"
+    else:
         raise ValueError(f"unsupported CM Codex permissions in {path}")
     return {
-        "approvalPolicy": "on-request",
-        "approvalsReviewer": "auto_review",
+        "approvalPolicy": approval_policy,
+        "approvalsReviewer": reviewer,
         "permissions": ":danger-full-access",
     }
 
@@ -447,11 +451,11 @@ def split_args(args, permissions=None):
         frontend.extend(["resume", resume])
     if permissions is not None:
         # The remote resume frontend rejects permission flags. Set the backend
-        # defaults and explicit thread RPC instead; never send the YOLO flag
-        # that would override on-request with never again.
+        # defaults and explicit thread RPC instead. Tool-level direct approval
+        # is configured separately; `never` alone rejects prompted MCP calls.
         backend.extend([
-            "-c", 'approval_policy="on-request"',
-            "-c", 'approvals_reviewer="auto_review"',
+            "-c", "approval_policy=" + json.dumps(permissions["approvalPolicy"]),
+            "-c", "approvals_reviewer=" + json.dumps(permissions["approvalsReviewer"]),
             "-c", 'sandbox_mode="danger-full-access"',
         ])
     return backend, frontend
