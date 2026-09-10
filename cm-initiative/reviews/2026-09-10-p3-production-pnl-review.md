@@ -113,3 +113,19 @@ previous CM provenance source inspection. No runtime, database, cloud, or
 backtest operation was performed. Return one consolidated revision to both
 coordinators; Initiative-Bridge will review it personally. Document revision is
 already authorized, while a selected round, code changes, and deployment are not.
+
+## Rereview of `5e09618c`
+
+After the full `e616b6dea` read, personally reviewed the consolidated proposal
+and NOTES diffs through `5e09618c18c2bc72f00575c690780651584e049c`. Substantive
+requests are addressed, including unseen evidence versus metric validity,
+matched-state reconstruction, publication timing, conditional provenance work,
+and proposed rather than transferred evaluator ownership. The published-realized
+summary gap is now linked to existing task `58d0508b-c479-4266-8f57-baa1515f94d5`.
+
+Three final wording corrections requested: remove “live” from section 3.3's
+source-default heading; include pre-opportunity missing/out-of-range inputs in
+section 3.7's mixed `no_trade` description; and scope section 7.1's routine-work
+permission paragraph to work already authorized, preserving current proposal
+research versus future live reads/backtests/implementation. No new investigation
+or design round is requested. Final acceptance awaits that consolidated diff.

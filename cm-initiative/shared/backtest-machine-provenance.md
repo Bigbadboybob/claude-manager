@@ -80,3 +80,21 @@ the inspected CM default while checking out that PT revision names an absent
 module. An explicit `script` is already supported and recorded in task
 `metadata.backtest`; this is a concrete compatibility risk for omitted scripts,
 not evidence that existing submissions failed. No submission was performed.
+
+## Launch timestamp boundary (source addendum, 2026-09-10)
+
+Inspected `api/dispatch_daemon.py:244-255` and `dispatch/vm.py:120-127`,
+blob-identical between source pin `ecd41d6` and review branch `ff392bf`.
+`_launch_backtest_vm` assigns `metadata.backtest.launched_at` **after** awaiting
+`_launch_backtest_vm_sync`. That helper calls `launch_worker`, which waits for
+GCE instance creation with `op.result()`, then fetches the external IP and returns.
+
+Thus `launched_at` is a dispatcher wall-clock observation after VM creation and
+lookup, not queue admission, creation start, worker-startup-script start, or
+replay start. `launched_at - task.created_at` can include queueing and creation;
+`artifact.created_at - launched_at` excludes the already completed creation
+interval and may overlap differently with startup work. Relabel those intervals
+by their actual endpoints before calling them queue wait or inclusive worker
+wall. Establish task/run/attempt and clock provenance before subtracting replay
+wall from them. A small remainder is not proof that provisioning was cheap.
+No GCE, worker, database, or deployed-state read was performed for this addendum.

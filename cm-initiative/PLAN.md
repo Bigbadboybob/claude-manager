@@ -50,9 +50,9 @@ coordinator keeps the live roster; these are proposal-development statuses.
 |---|---|---|
 | P1 | Momentum detection through explanatory ingest and useful source coverage | Final `8bbfcd823` personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
 | P2 | Useful article follow-through, blocks, and appropriate non-trades | Final `3eea07af0` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p2-article-follow-through-review.md#final-disposition-at-3eea07af0), no implementation selected |
-| P3 | Production-baseline P&L improvement with bounded rounds | Revised `e616b6dea` fully personally read; [CM revisions requested](reviews/2026-09-10-p3-production-pnl-review.md) |
-| P4 | Backtest fidelity, reliability, and useful completed comparisons | Initial `efddc8bce` handed off; Swarm-Gardener requested revisions; personal review pending |
-| P5 | Backtest speed and resource efficiency preserving workload and outcomes | Initial `259cb6839` handed off; Swarm-Gardener requested revisions; personal review pending |
+| P3 | Production-baseline P&L improvement with bounded rounds | Full `e616b6dea` and consolidated diffs through `5e09618c` personally reviewed; [three final wording corrections](reviews/2026-09-10-p3-production-pnl-review.md#rereview-of-5e09618c) requested |
+| P4 | Backtest fidelity, reliability, and useful completed comparisons | Revised `0c55b8b05` fully personally read; [CM revisions requested](reviews/2026-09-10-p4-backtest-fidelity-review.md) |
+| P5 | Backtest speed and resource efficiency preserving workload and outcomes | Revised `c45592435` fully personally read; [CM revisions requested](reviews/2026-09-10-p5-backtest-performance-review.md) |
 | P6 | Useful timely delivery from existing sources | Final `136589a7e` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p6-source-reliability-review.md#final-disposition-at-136589a7e), no implementation selected |
 | P7 | News-decision latency and cost while preserving useful outcomes | Full uncommitted draft personally read; [CM revisions requested](reviews/2026-09-10-p7-news-latency-cost-review.md); coordinator writes the consolidated handoff |
 | P8 | Recurring initiatives and continuous-task organization | Read-only author launched; CM consultation supplied; full committed handoff pending |
@@ -77,8 +77,9 @@ personal review before later Owner selection.
 The authors hand off consolidated commits after addressing both coordinators'
 comments and reconciling shared boundaries. P1 `8bbfcd823`, P2 `3eea07af0`, and P6 `136589a7e`
 have passed personal review and are ready for Owner discussion. P3 `e616b6dea`
-and P7's full uncommitted draft have been personally read, with revisions requested. P4/P5 revised commits are available for personal review; P8 consolidated text
-is being collected. These handoff statuses come
+and P7's full uncommitted draft have been personally read, with revisions requested. P4 `0c55b8b05` and P5 `c45592435` have also been fully personally read with
+revisions requested. P8 initial full text is committed at `1bf555817`; its
+author is consolidating Swarm-Gardener's review before the personal read. These handoff statuses come
 from their authors and coordinator, not completed personal reads. No proposal
 has been selected for implementation.
 
