@@ -51,7 +51,7 @@ reported at `2026-09-10T04:47:04Z`; the owning coordinator keeps the live roster
 | P3 | Production-baseline P&L improvement with bounded rounds | Created; follows first group |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Created; follows first group |
 | P5 | Backtest speed and resource efficiency preserving workload and outcomes | Created; follows first group |
-| P6 | Useful timely delivery from existing sources | Running |
+| P6 | Useful timely delivery from existing sources | Draft `0cf7013da` personally reviewed; [revisions requested](reviews/2026-09-10-p6-source-reliability-review.md) before Owner selection |
 | P7 | News-decision latency and cost while preserving useful outcomes | Created; uses earlier drafts |
 | P8 | Recurring initiatives and continuous-task organization | Created; uses earlier drafts and CM input |
 
@@ -237,3 +237,8 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   obtained two independent list reviews. P1–P8 are retained as document topics
   at `a83f8ddc3`; P1/P2/P6 are running. Initiative-Bridge read those records and
   indexed them; individual proposal reviews await committed handoffs.
+- **2026-09-10 — P6 personal review:** Initiative-Bridge read the source-delivery
+  proposal and notes at `0cf7013da`. Requested corrections to the recovery metric,
+  scheduled-release matching, current authority, detector claims, and overlapping
+  P1/P2/P6 populations. Classification alone must not count as restored useful
+  supply. The candidate remains a proposal; no implementation round is selected.
