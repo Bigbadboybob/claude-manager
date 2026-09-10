@@ -271,3 +271,11 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   The discussion-guide changes through that root were personally read as well.
   CM checks passed: 18 Markdown documents, no missing local link targets,
   and clean diff whitespace. No runtime code, experiment or deployment here.
+
+- **2026-09-10 — Final predictionTrading handoff:** Swarm-Gardener pushed hub
+  `5389c7571`, recording all nine research child tasks complete and retaining
+  the initiative/coordinators for discussion. Initiative-Bridge read the final
+  guide, roster and review-status changes; proposal blobs are unchanged from
+  verified `080256a08`. The coordinator reports 27 docs with no missing local
+  link targets and a passing 13-test targeted gate. The sidebar subsection is
+  still pending Owner's local UI step, as recorded in `SETUP.md`.
