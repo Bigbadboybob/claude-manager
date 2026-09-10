@@ -23,9 +23,9 @@ launched, and no candidate implementation or deployment is selected.
 
 | Effort | Responsible side | Work and output | Review / dependencies | Current status |
 |---|---|---|---|---|
-| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | Swarm-Gardener reports Fable route verified and bounded launch being prepared |
+| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | Research task `59a67007-7a71-412a-87d4-bf535df42893` running; effective Fable runtime confirmation pending with coordinator |
 | Brainstorm useful CM swarm features | Initiative-Bridge, assisted by a bounded research subagent | Inspect existing capabilities and identify useful coordination improvements, with evidence of the gap and concrete discussion options | Incorporate candidate plans and SEJD feedback as they arrive; Owner selects later feature implementation | [First discussion draft](shared/cm-feature-ideas.md) read and reviewed by Initiative-Bridge; no implementation selected |
-| Learn from SEJD's coordinator | predictionTrading; Swarm-Gardener contacts SEJD-Coordinator | Ask what would help communication and swarming, capture concrete friction and useful feature/practice ideas in a feedback note | Preserve SEJD's current work and deliberate close Owner collaboration; bring transferable lessons to both sides | Contact made; feedback note pending |
+| Learn from SEJD's coordinator | predictionTrading; Swarm-Gardener contacts SEJD-Coordinator | Ask what would help communication and swarming, capture concrete friction and useful feature/practice ideas in a feedback note | Preserve SEJD's current work and deliberate close Owner collaboration; bring transferable lessons to both sides | Feedback committed at predictionTrading `af7e3f732` and personally reviewed by Initiative-Bridge |
 
 The predictionTrading side owns its research task, local briefs, codebase
 investigation, candidate documents, and SEJD contact. Initiative-Bridge owns CM
@@ -114,6 +114,11 @@ from possible additions and leaves ranking open for the brainstorm.
 
 ## Review and next checkpoints
 
+The [first coordinator review](reviews/2026-09-10-predictiontrading-research-review.md)
+of predictionTrading's research plan, idea register, and SEJD feedback found no
+blocker to this sequence. Evaluation comments are recorded for the later
+candidate authors; the [shared index](shared/README.md) links the reviewed sources.
+
 1. Swarm-Gardener incorporates the direct Owner brief, preserves the Owner idea
    list, and launches the independent Fable brainstorm using research subagents
    as authorized. Record actual task/session identities and source revisions.
@@ -169,3 +174,10 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   Claude settings select `claude-fable-5-1[1m]`, and its inspection found that
   `claude-code` launches have no daemon model override. That coordinator owns
   verifying the actual launched session; launch completion is not yet reported.
+- **2026-09-10 — Research progress:** Swarm-Gardener supplied committed plan,
+  idea register, SEJD feedback, and launch notes at `af7e3f732`. Fable research
+  task `59a67007-7a71-412a-87d4-bf535df42893` is running in its isolated worktree,
+  base `47076cd8e`, reported session `ts-18d3da59b187e3f9-1`. Initiative-Bridge
+  personally reviewed those documents and the worker brief and checked the
+  narrow RAG source claims. Runtime model confirmation is still pending; no
+  candidate implementation or production swarm is selected.
