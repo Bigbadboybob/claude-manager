@@ -124,6 +124,7 @@ impl App {
             view: Some(view.to_string()),
             hide_continuous: self.hide_continuous,
             continuous_column_on: self.continuous_column_on,
+            hide_keybinding_helper: !self.keybinding_helper_visible,
             task_colors: self.task_colors.clone(),
             sections: self.sections.clone(),
             workspace_sections: self.workspace_sections.clone(),

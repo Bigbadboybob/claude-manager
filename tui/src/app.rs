@@ -670,6 +670,9 @@ impl App {
         };
         let hide_continuous = manifest.hide_continuous;
         let continuous_column_on = manifest.continuous_column_on;
+        let keybinding_helper_visible = !manifest.hide_keybinding_helper;
+        let mut planning = PlanningView::new();
+        planning.keybinding_helper_visible = keybinding_helper_visible;
         let task_colors = manifest.task_colors.clone();
         let sections = manifest.sections.clone();
         // Only keep bindings whose target workspace still exists in the
@@ -891,11 +894,11 @@ impl App {
             saved_continuous_uid: None,
             sidebar_view,
             sidebar_filter: None,
-            keybinding_helper_visible: true,
+            keybinding_helper_visible,
             sidebar_list_state: ListState::default(),
             continuous_list_state: ListState::default(),
             view_mode: ViewMode::Sessions,
-            planning: PlanningView::new(),
+            planning,
             should_quit: false,
             last_term_size: (80, 24),
             last_adopt_scan: None,

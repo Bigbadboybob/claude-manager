@@ -161,6 +161,7 @@ A workflow is a TOML-defined state machine of agent roles running as sibling ses
 
 Global:
 - `A-t` — toggle Sessions / Planning
+- `A-?` — show/hide shortcut hints in Sessions and Planning; saved in `~/.cm/tui-sessions.json` and restored on viewer restart
 - `A-q` — quit
 - `A-j/k` — navigate
 - `A-d` — mark task done

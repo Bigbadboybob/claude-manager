@@ -1483,21 +1483,16 @@ impl App {
                     Style::default().fg(theme::DIM),
                 ));
             }
-            // Focus adds bold while preserving the subtask's lifecycle color.
+            // Focus takes precedence over lifecycle color, matching the main sidebar.
             let is_selected = self.cursor_column == SidebarColumn::Continuous
                 && matches!(
                     &self.cursor,
                     Cursor::Session(cwi, csi) if *cwi == r.ws_idx && *csi == r.sess_idx
                 );
-            let label_style = if let Some(stage) = stage {
-                let style = Style::default().fg(stage.color());
-                if is_selected {
-                    style.add_modifier(Modifier::BOLD)
-                } else {
-                    style
-                }
-            } else if is_selected {
+            let label_style = if is_selected {
                 Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+            } else if let Some(stage) = stage {
+                Style::default().fg(stage.color())
             } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
                 && !self.session_has_alert(&ts.uid)
                 && !self.reconnecting_sessions.contains(&ts.uid)

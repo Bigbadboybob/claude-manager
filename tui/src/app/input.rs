@@ -2762,6 +2762,7 @@ impl App {
             {
                 self.keybinding_helper_visible = !self.keybinding_helper_visible;
                 self.planning.keybinding_helper_visible = self.keybinding_helper_visible;
+                self.save_session_manifest();
                 self.set_status_msg(if self.keybinding_helper_visible {
                     "Keybinding helper shown"
                 } else {
