@@ -111,6 +111,22 @@ impl Menu {
             && self.jobs.values().all(|job| job["phase"] == "preview")
     }
 
+    fn completion_task_ids(&self) -> Vec<String> {
+        if let Some(id) = &self.task_id {
+            return vec![id.clone()];
+        }
+        let mut ids: Vec<String> = self
+            .jobs
+            .values()
+            .filter_map(|job| job["root_task_ids"].as_array())
+            .flatten()
+            .filter_map(|id| id.as_str().map(str::to_owned))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     pub fn close_ready(&self) -> bool {
         self.submitted
             && !self.closed
@@ -136,8 +152,15 @@ impl Menu {
             KeyCode::Char('j') | KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::Enter if !self.submitted => {
-                if self.reap && !self.ready() {
-                    return InputOutcome::Status("Wait for all cleanup previews; unavailable hosts cannot be silently skipped.".into());
+                if (self.reap || (self.mark_done && self.task_id.is_none())) && !self.ready() {
+                    return InputOutcome::Status(
+                        "Wait for the host to resolve task ownership and the cleanup preview."
+                            .into(),
+                    );
+                }
+                if self.mark_done && self.task_id.is_none() && self.completion_task_ids().len() > 1
+                {
+                    return InputOutcome::Status("Multiple tasks own this workspace — select a task header before marking done.".into());
                 }
                 return InputOutcome::Submit(SubmitAction::CompleteWithCleanup);
             }
@@ -175,8 +198,10 @@ impl Menu {
         let block = Block::default()
             .title(if self.submitted {
                 " Worktree cleanup "
+            } else if self.mark_done {
+                " Finish task · worktrees "
             } else {
-                " Close task · worktrees "
+                " Close workspace · worktrees "
             })
             .borders(Borders::ALL);
         let inner = block.inner(popup);
@@ -185,9 +210,10 @@ impl Menu {
         if !self.submitted {
             lines.push(Line::styled(
                 format!(
-                    "{} Keep worktrees     {} Reap this task + descendants",
+                    "{} Keep worktrees     {} Reap {} + descendants",
                     if self.reap { "○" } else { "●" },
-                    if self.reap { "●" } else { "○" }
+                    if self.reap { "●" } else { "○" },
+                    if self.mark_done { "task" } else { "workspace" }
                 ),
                 Style::default().fg(theme::TEXT),
             ));
@@ -199,6 +225,13 @@ impl Menu {
                 "Cleanup continues on the host if you disconnect. Esc closes this report."
             } else {
                 "Waiting for hosts to accept cleanup before closing. Esc leaves the task open."
+            }));
+        }
+        if !self.submitted {
+            lines.push(Line::from(if self.mark_done {
+                "Marks the selected task done, then closes its sessions."
+            } else {
+                "Closes workspace sessions. Task status stays unchanged; Alt+d finishes a task."
             }));
         }
         lines.push(Line::from(
@@ -236,7 +269,10 @@ impl Menu {
                     detail.push(format!(
                         "  {} — {}",
                         row["path"].as_str().unwrap_or("?"),
-                        row["reason"].as_str().unwrap_or("recheck after close")
+                        reason_text(
+                            row["reason"].as_str().unwrap_or("recheck after close"),
+                            self.mark_done
+                        )
                     ));
                 }
             }
@@ -265,6 +301,17 @@ impl Menu {
                 .map(Line::from),
         );
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn reason_text(reason: &str, mark_done: bool) -> &str {
+    match reason {
+        "shared_with_another_task" => "Shared with a task outside this cleanup scope",
+        "task_not_terminal" if mark_done => "Task is still open; rechecked after marking done",
+        "task_not_terminal" => "Task is still open; use Alt+d to finish it before reaping",
+        "live_session" => "Session is active; rechecked after closing",
+        "live_process_reference" => "A process is still using this checkout",
+        other => other,
     }
 }
 
@@ -349,6 +396,16 @@ impl App {
             self.set_status_msg("Task workspace changed; reopen the completion dialog.");
             return;
         };
+        if menu.mark_done && menu.task_id.is_none() {
+            let ids = menu.completion_task_ids();
+            if ids.len() > 1 {
+                self.set_status_msg(
+                    "Multiple tasks own this workspace — select a task header before marking done.",
+                );
+                return;
+            }
+            menu.task_id = ids.into_iter().next();
+        }
         self.cursor = match &menu.task_id {
             Some(id) => Cursor::Task {
                 ws_idx: wi,
@@ -475,6 +532,92 @@ mod tests {
         assert!(wrapped
             .iter()
             .all(|line| Span::raw(line.as_str()).width() <= 48));
+    }
+
+    #[test]
+    fn worktree_cleanup_resolves_finished_session_task_without_viewer_binding() {
+        let (mut menu, tx, _receivers) = fixture();
+        menu.task_id = None;
+        menu.commands.retain(|host, _| host.as_str() == "manager");
+        assert!(matches!(
+            menu.key(key(KeyCode::Enter)),
+            InputOutcome::Status(_)
+        ));
+        tx.send((
+            HostId::new("manager"),
+            Ok(json!({"phase":"preview", "root_task_ids":["host-task"]})),
+        ))
+        .unwrap();
+        menu.poll();
+        assert_eq!(menu.completion_task_ids(), vec!["host-task"]);
+        assert!(matches!(
+            menu.key(key(KeyCode::Enter)),
+            InputOutcome::Submit(SubmitAction::CompleteWithCleanup)
+        ));
+
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.workspaces = vec![Workspace {
+            color: None,
+            pinned: false,
+            id: "captured-workspace".into(),
+            name: "exited worker".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            host_id: HostId::local(),
+            sessions: vec![],
+            tombstones: vec![],
+        }];
+        // An unbound planning entry models an adopted worker whose workspace
+        // binding no longer exists in the viewer.
+        app.tasks.push(TaskEntry {
+            task_id: Some("host-task".into()),
+            name: "host task".into(),
+            api_status: TaskStatus::Running,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            is_continuous: false,
+            workspace_id: None,
+            project: None,
+            parent_task_id: None,
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        });
+        app.complete_with_cleanup(menu);
+        assert_eq!(app.tasks.last().unwrap().api_status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn worktree_cleanup_does_not_guess_between_multiple_host_task_owners() {
+        let (mut menu, tx, _receivers) = fixture();
+        menu.task_id = None;
+        menu.commands.retain(|host, _| host.as_str() == "manager");
+        tx.send((
+            HostId::new("manager"),
+            Ok(json!({"phase":"preview", "root_task_ids":["one","two"]})),
+        ))
+        .unwrap();
+        menu.poll();
+        assert!(matches!(
+            menu.key(key(KeyCode::Enter)),
+            InputOutcome::Status(_)
+        ));
+        assert!(reason_text("task_not_terminal", false).contains("Alt+d"));
+        assert!(reason_text("task_not_terminal", true).contains("after marking done"));
     }
 
     #[test]
