@@ -7,6 +7,20 @@ from mcp_server import server, control_client
 
 
 class MessagingToolsTests(unittest.TestCase):
+    def test_rename_uses_authenticated_identity_and_preserves_retry_and_revision(self):
+        with patch.object(control_client, "call", return_value={"name": "health-triage-orchestrator"}) as call:
+            params = dict(name="health-triage-orchestrator", expected_name_revision=4,
+                          request_id="rename-1", origin_daemon_id="home")
+            result = server.chat_rename(**params)
+            self.assertEqual(call.call_args.args, ("session.set_name", params))
+            self.assertIn("session.set_name", control_client.DAEMON_METHODS)
+            self.assertEqual(result["name"], params["name"])
+            server.chat_rename(**params)
+            self.assertEqual(call.call_args.args, ("session.set_name", params))
+            params.pop("origin_daemon_id")
+            server.chat_rename(**params)
+            self.assertEqual(call.call_args.args, ("session.set_name", params))
+
     def test_six_tools_route_to_daemon_and_keep_retry_identity(self):
         with patch.object(control_client, "call", return_value={"ok": True}) as call:
             server.chat_send("Ready.", "same-request", channel="general", name="Scout", origin_daemon_id="home")

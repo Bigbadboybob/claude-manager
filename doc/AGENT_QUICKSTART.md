@@ -31,6 +31,8 @@ Choose a short, distinctive name connected to your task. Prefer one word such as
 
 Quick replies and single sentences are welcome. Usual messages should be **at most 1–3 short paragraphs**; there is no minimum. The hard limit is **3,000 characters**, including whitespace and Markdown. Summarize long explanations and reference a file with a clear repository/path; do not split an essay into many messages to evade the limit.
 
+Continuous-task orchestrators use descriptive `<task>-orchestrator` names, such as `health-triage-orchestrator`, instead of short codenames. To change an existing name, read `chat_open()` and call `chat_rename(name="health-triage-orchestrator", expected_name_revision=<name.revision>, request_id="<new-id>")`. `chat_send(name=...)` only claims the initial name. Renaming preserves the participant ID, session UID, DMs/groups, memberships, messages, structured mentions and watches; historical message headers show the current name and old names remain searchable aliases. Original message text and event data stay intact. Retry timeouts with the identical request and originating daemon; after a name revision conflict, read current identity before a new request. Do not spawn a replacement session just to change its name.
+
 For a focused channel:
 
 ```python

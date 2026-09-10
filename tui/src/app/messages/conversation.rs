@@ -2,6 +2,17 @@
 use super::*;
 
 impl Messages {
+    pub(super) fn actor_name(&self, event: &Value) -> String {
+        self.people
+            .iter()
+            .find(|p| p["id"].as_str().is_some() && p["id"] == event["actor"]["id"])
+            .and_then(|p| p["name"].as_str())
+            .or_else(|| event["actor"]["name"].as_str())
+            .or_else(|| event["actor"]["id"].as_str())
+            .unwrap_or("?")
+            .to_owned()
+    }
+
     pub(super) fn person_name(&self, id: &str) -> String {
         self.people
             .iter()
@@ -394,7 +405,7 @@ impl App {
                         marker_style,
                     ),
                     Span::styled(
-                        m["actor"]["name"].as_str().unwrap_or("?").to_owned(),
+                        self.messages.actor_name(m),
                         chat_actor_style(m).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(format!("  {stamp}"), muted),
@@ -572,6 +583,7 @@ mod tests {
         let two = message("two", "Newest full message.", "channel", json!(["owner"]));
         a.messages
             .accept_messages(&json!({"items":[two,one],"next_cursor":{"page":1}}));
+        a.messages.people = vec![json!({"id":"agent:a","name":"health-triage-orchestrator","aliases":["Scout"]})];
         assert_eq!(a.messages.items[0]["id"], "one");
         assert_eq!(a.messages.selected, 1);
         a.messaging_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(
@@ -593,6 +605,13 @@ mod tests {
             text.find("Oldest full message.").unwrap() < text.find("Newest full message.").unwrap()
         );
         assert!(text.contains("Its second paragraph stays visible."));
+        assert!(text.contains("health-triage-orchestrator"));
+        assert!(!text.contains("Scout"));
+        assert_eq!(a.messages.items[0]["actor"]["name"], "Scout"); // immutable history
+        assert_eq!(a.messages.actor_name(&json!({"actor":{"id":"absent","name":"Historical"}})), "Historical");
+        a.messages.text = "Scout".into();
+        assert_eq!(a.messages.picker_people()[0]["id"], "agent:a");
+        a.messages.text.clear();
         assert!(text.contains("● @you"));
         assert!(!text.contains("PgUp/PgDn scroll")); // the old separate detail pane is gone
         a.messages.append_older = true;

@@ -78,6 +78,8 @@ python3 -c "import json;print(json.load(open('/home/lucas/.cm/continuous-tasks/s
 
 Keep these **proven idioms** (every live orchestrator uses them):
 
+- **Descriptive orchestrator identity.** Name the session `<task>-orchestrator`, e.g. `health-triage-orchestrator`; this overrides the general short-codename advice. Claim it on first `chat_send(name=...)`. Existing participants use `chat_open().name.revision` with `chat_rename`, preserving their UID, conversations, mentions and aliases. Include `~/.cm/policies/continuous-review-routing.md` in every prompt and worker brief and keep that shared policy deployed on the execution host.
+
 - **Review routing and lifecycle (Owner, 2026-09-10).** Include [continuous-review-routing.md](doc/continuous-review-routing.md) in every new orchestrator and worker brief. Routine worker handoffs go by DM to the parent and wake it immediately; keep scheduled scans/queue admission and reconciliation as fallback. Only the orchestrator escalates a reviewed decision that actually requires Owner. Maintain `metadata.continuous_stage`, actual UTC `stage_updated_at` and `next_action`; distinguish `review_queued`/`reviewing` from `owner_review`. Preserve visible live sessions while tasks remain unfinished. Activity/idle state is never a review decision.
 
 - **You ARE the parent task; you do NOT do the work yourself** — you scan, spawn subtasks (`create_subtask` + `mcp_start_session`), and drive each along a lifecycle. Your memory is a gitignored `./.<task>/` dir (index.yaml + cycle-log.md) in your worktree that persists across cycles. First cycle: `mkdir -p .<task> && echo ".<task>/" >> "$(git rev-parse --git-path info/exclude)"`.
