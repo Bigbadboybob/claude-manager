@@ -267,6 +267,87 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(result['results'][0]['removed'])
         self.assertIn('shared with another task', result['results'][0]['message'])
 
+    def test_already_reaped_workspace_can_preview_and_complete_again(self):
+        first = self.run_apply(self.workspace_preview())
+        self.assertTrue(first['results'][0]['removed'])
+        job = self.workspace_preview()
+        self.assertEqual(job['phase'], 'preview')
+        self.assertEqual(job['root_task_ids'], ['task-1'])
+        self.assertEqual(job['candidates'], [])
+        self.assertEqual(job['warnings'], [])
+        self.assertIn('already absent', job['message'])
+        result = self.run_apply(job)
+        self.assertEqual(result['phase'], 'complete')
+        self.assertIn('retained 0', result['message'])
+        self.assertEqual(self.git(self.repo, 'show', 'parent:file.txt'), 'base')
+
+    def test_missing_workspace_still_finds_durable_descendants_without_manifest(self):
+        child = self.child('surviving-child')
+        child_record = lineage.register(child, self.worktree, inherit_session=False)
+        self.git(self.repo, 'worktree', 'remove', str(self.worktree))
+        self.context.workspaces = {}
+        job = self.workspace_preview()
+        self.assertEqual([row['id'] for row in job['candidates']], [child_record['id']])
+        self.assertEqual(job['root_task_ids'], ['task-1'])
+        result = self.run_apply(job)
+        self.assertTrue(result['results'][0]['removed'], result)
+        self.assertFalse(child.exists())
+
+    def test_unknown_missing_workspace_closes_without_claiming_other_checkouts(self):
+        unrelated = self.child('unrelated')
+        lineage.register(unrelated, task_ids=['task-2'], inherit_session=False)
+        self.git(self.repo, 'worktree', 'remove', str(self.worktree))
+        (self.cm / 'worktree-lineage' / (self.parent['id'] + '.json')).unlink()
+        self.context.workspaces = {}
+        job = self.workspace_preview()
+        self.assertEqual(job['root_task_ids'], [])
+        self.assertEqual(job['candidates'], [])
+        self.assertEqual(self.run_apply(job)['phase'], 'complete')
+        self.assertTrue(unrelated.exists())
+
+    def test_missing_checkout_during_apply_is_a_noop_without_weakening_reused_path_guard(self):
+        job = self.workspace_preview()
+        self.git(self.repo, 'worktree', 'remove', str(self.worktree))
+        result = self.run_apply(job)
+        self.assertTrue(result['results'][0]['already_absent'])
+        self.assertFalse(result['results'][0]['removed'])
+        self.assertIn('already absent 1; retained 0', result['message'])
+        self.git(self.repo, 'worktree', 'add', str(self.worktree), 'parent')
+        lineage.register(self.worktree, task_ids=['new-owner'], inherit_session=False)
+        result = self.run_apply(job)
+        self.assertTrue(self.worktree.exists())
+        self.assertFalse(result['results'][0]['already_absent'])
+        self.assertIn('identity changed', result['results'][0]['message'])
+
+    def test_checkout_recreated_after_missing_preview_is_outside_approved_candidates(self):
+        self.git(self.repo, 'worktree', 'remove', str(self.worktree))
+        job = self.workspace_preview()
+        self.git(self.repo, 'worktree', 'add', str(self.worktree), 'parent')
+        lineage.register(self.worktree, task_ids=['new-owner'], inherit_session=False)
+        self.run_apply(job)
+        self.assertTrue(self.worktree.exists())
+
+    def test_missing_root_does_not_bypass_active_descendant_protection(self):
+        child = self.child('live-child')
+        lineage.register(child, self.worktree, inherit_session=False)
+        self.context.live_paths = {child}
+        self.git(self.repo, 'worktree', 'remove', str(self.worktree))
+        job = self.workspace_preview()
+        self.assertEqual(job['candidates'][0]['reason'], 'live_session')
+        result = self.run_apply(job)
+        self.assertFalse(result['results'][0]['removed'])
+        self.assertTrue(child.exists())
+
+    def test_invalid_existing_checkout_and_dangling_symlink_are_not_absent(self):
+        self.git(self.repo, 'worktree', 'remove', str(self.worktree))
+        self.worktree.symlink_to(self.root / 'nonexistent')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.workspace_preview()
+        self.worktree.unlink()
+        self.worktree.mkdir()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.workspace_preview()
+
     def test_request_ids_cannot_escape_job_directory(self):
         with self.assertRaises(ValueError):
             cleanup.request({'action': 'status', 'id': '../daemon-sessions'})
