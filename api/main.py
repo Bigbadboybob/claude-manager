@@ -12,6 +12,7 @@ import asyncpg
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from api.auth import verify_token
@@ -19,8 +20,10 @@ from api.models import (
     TaskCreate, TaskUpdate, TaskResponse, ArtifactCreate, ArtifactResponse,
     BacktestPhaseUpdate, InitiativeCreate, InitiativeUpdate,
     InitiativeProjectCreate, InitiativeProjectUpdate, InitiativeResponse,
+    TaskChangesResponse,
 )
 from api.dispatch_daemon import dispatch_loop, warm_pool_loop
+from api.task_changes import ChangeBroker, change_log_maintenance_loop
 from dispatch import db
 from dispatch.config import DB_DSN, REPOS
 
@@ -86,16 +89,26 @@ async def lifespan(app: FastAPI):
     # cadence past its 10s target.
     app.state.dispatch_task = asyncio.create_task(dispatch_loop(app.state.pool))
     app.state.warm_pool_task = asyncio.create_task(warm_pool_loop(app.state.pool))
+    # Incremental task feed: LISTEN-driven wake-ups for /tasks/changes long
+    # polls + retention pruning of the change log.
+    app.state.change_broker = ChangeBroker(DB_DSN)
+    app.state.change_broker.start()
+    app.state.change_prune_task = asyncio.create_task(
+        change_log_maintenance_loop(app.state.pool)
+    )
     logger.info("API server started")
     yield
     # Shutdown
-    for task in (app.state.dispatch_task, app.state.warm_pool_task):
+    for task in (app.state.dispatch_task, app.state.warm_pool_task,
+                 app.state.change_prune_task):
         task.cancel()
-    for task in (app.state.dispatch_task, app.state.warm_pool_task):
+    for task in (app.state.dispatch_task, app.state.warm_pool_task,
+                 app.state.change_prune_task):
         try:
             await task
         except asyncio.CancelledError:
             pass
+    await app.state.change_broker.stop()
     if app.state.pending_vm_deletions:
         await asyncio.gather(
             *app.state.pending_vm_deletions, return_exceptions=True
@@ -105,6 +118,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Claude Manager", lifespan=lifespan)
+# Compress large JSON bodies for clients that advertise gzip (the TUI's ureq,
+# httpx, requests all do): the full task list is ~5 MB raw / ~1.6 MB gzipped.
+# Level 5 keeps the (event-loop-blocking) compression of a full snapshot in
+# the tens of milliseconds; the incremental feed makes snapshots rare anyway.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 
 @app.exception_handler(RequestValidationError)
@@ -333,6 +351,67 @@ async def list_tasks(
         pool, status=status, project=project, initiative_id=initiative_id,
         include_archived=include_archived
     )
+
+
+# Bounds for the long-poll parameters. `wait` must stay under the TUI client's
+# 30 s global request timeout; `limit` caps the log rows folded into one page.
+CHANGES_MAX_WAIT_SECS = 25.0
+CHANGES_DEFAULT_LIMIT = 500
+CHANGES_MAX_LIMIT = 2000
+
+
+@app.get("/tasks/changes", response_model=TaskChangesResponse,
+         dependencies=[Depends(verify_token)])
+async def list_task_changes(
+    request: Request,
+    since: int | None = Query(None, ge=0),
+    epoch: str | None = Query(None),
+    wait: float = Query(0.0, ge=0.0, le=CHANGES_MAX_WAIT_SECS),
+    limit: int = Query(CHANGES_DEFAULT_LIMIT, ge=1, le=CHANGES_MAX_LIMIT),
+    project: str | None = Query(None),
+    include_archived: bool = Query(False),
+    pool=Depends(get_pool),
+):
+    """Incremental task feed (see ``doc/task-change-feed.md``).
+
+    Without ``since``/``epoch`` — or when the cursor is expired, unknown, or
+    from another log lineage — returns ``reset=true`` with a consistent full
+    snapshot in ``tasks`` and the matching ``cursor``. Otherwise returns the
+    changes after ``since`` (``op`` = ``upsert`` with the current row, or
+    ``remove``), collapsed to one per task, ``cursor`` to resume from, and
+    ``more`` when the page was cut at ``limit``. With ``wait > 0`` and nothing
+    to deliver, the request parks until a change commits or the budget
+    elapses; an empty ``changes`` list with the same cursor is the idle reply.
+    """
+    broker: ChangeBroker = request.app.state.change_broker
+
+    async def snapshot():
+        snap = await db.task_snapshot(pool, project=project,
+                                      include_archived=include_archived)
+        return {"epoch": snap["epoch"], "cursor": snap["cursor"], "reset": True,
+                "tasks": snap["tasks"], "changes": [], "more": False}
+
+    if since is None or not epoch:
+        return await snapshot()
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait
+    while True:
+        page = await db.list_task_changes(pool, since, limit, project=project,
+                                          include_archived=include_archived)
+        if page["expired"] or page["epoch"] != epoch:
+            return await snapshot()
+        if page["changes"] or page["more"]:
+            return {"epoch": page["epoch"], "cursor": page["cursor"], "reset": False,
+                    "tasks": None, "changes": page["changes"], "more": page["more"]}
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return {"epoch": page["epoch"], "cursor": since, "reset": False,
+                    "tasks": None, "changes": [], "more": False}
+        # Park until a seq beyond what we have already re-queried is
+        # announced (not merely beyond `since`: an announcement whose row the
+        # query did not return, e.g. one pruned meanwhile, must not spin).
+        await broker.wait_beyond(max(since, broker.latest_seq), remaining)
 
 
 @app.get("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])

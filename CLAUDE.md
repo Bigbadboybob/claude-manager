@@ -235,6 +235,8 @@ gcloud compute ssh cm-manager --zone=us-east4-a --project=claude-manager-prod \
 
 Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + restart. The MCP server is installed both on user machines (for local sessions) and at `/opt/cm-daemon/mcp_server/` on cm-manager and cm-sessions (for sessions running against those daemons). Local edits take effect on next local MCP spawn; remote edits need the complete MCP payload copied and a brain-only `daemon.restart` through `scripts/cm-op --ssh <host>` (see Multi-host and HOWTO_HOLDER_BRAIN_SPLIT.md).
 
+The task list reaches the TUI through the incremental feed `GET /tasks/changes` (trigger-fed `task_changes` log, long poll, gzip; see [doc/task-change-feed.md](doc/task-change-feed.md)) — never reintroduce a periodic full `GET /tasks` poll in a viewer: one always-on 5 s poller was ~80 GiB/day (≈$278/month) before 2026-09-10.
+
 The TUI runs on the laptop. For cloud-built viewer updates, follow [doc/TUI_RELEASES.md](doc/TUI_RELEASES.md): build in a private cache, stage a checksum-verified SSH installer, then install on the laptop and reopen only the TUI. A cloud build does not update the laptop, and a TUI-only change needs no daemon restart. The `cm-tui-release` skill points to this runbook.
 
 **Don't `pkill -f uvicorn`** — the systemd unit auto-respawns immediately, so a manual nohup launch fights the systemd-spawned one for port 8000. Also, `pkill -f uvicorn` over `gcloud ssh` self-matches on the SSH command line (which contains "uvicorn") and kills its own shell, returning exit 255. Use `systemctl restart` instead.

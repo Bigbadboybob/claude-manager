@@ -160,6 +160,49 @@ fn default_source() -> String {
     "user".to_string()
 }
 
+/// One entry of the incremental task feed (`GET /tasks/changes`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskChange {
+    /// Log position of this entry; the page's `cursor` is what the client
+    /// resumes from, so this is informational (tests, debugging).
+    #[allow(dead_code)]
+    pub seq: i64,
+    pub task_id: String,
+    /// `"upsert"` (apply `task`) or `"remove"` (deleted / archived / filtered out).
+    pub op: String,
+    #[serde(default)]
+    pub task: Option<Task>,
+}
+
+/// A page of the incremental task feed. `reset == true` carries a full
+/// consistent snapshot in `tasks`; otherwise `changes` are the entries after
+/// the cursor the request was issued with, in commit order.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskChangesPage {
+    pub epoch: String,
+    pub cursor: i64,
+    pub reset: bool,
+    #[serde(default)]
+    pub tasks: Option<Vec<Task>>,
+    #[serde(default)]
+    pub changes: Vec<TaskChange>,
+    /// The page was cut at the server's limit. The client needs no special
+    /// handling — the next poll from `cursor` returns at once — so this is
+    /// informational.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub more: bool,
+}
+
+/// Resume point for the feed: the server's log lineage plus the last applied
+/// seq. Retained across reconnects; a server that no longer recognises it
+/// answers with a `reset` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeCursor {
+    pub epoch: String,
+    pub seq: i64,
+}
+
 /// Body for creating a task.
 #[derive(Serialize)]
 pub struct TaskCreateBody {
@@ -283,6 +326,42 @@ impl ApiClient {
         }
     }
 
+    /// Incremental task feed. `None` cursor asks for a fresh snapshot;
+    /// `wait_secs > 0` lets the server hold the request (long poll) until a
+    /// change commits, so an idle viewer costs one tiny request per wait
+    /// window instead of a full list download. Fails with a 404 status error
+    /// (see [`is_unsupported`]) against an API predating the feed.
+    pub fn task_changes(
+        &self,
+        cursor: Option<&ChangeCursor>,
+        wait_secs: f32,
+    ) -> anyhow::Result<TaskChangesPage> {
+        let mut url = format!("{}?wait={}", self.url("/tasks/changes"), wait_secs);
+        if let Some(c) = cursor {
+            url.push_str(&format!(
+                "&since={}&epoch={}",
+                c.seq,
+                percent_encode_query(&c.epoch)
+            ));
+        }
+        let fetch = || -> anyhow::Result<TaskChangesPage> {
+            let body = self
+                .agent
+                .get(&url)
+                .header("Authorization", &self.auth_header())
+                .call()?
+                .body_mut()
+                .read_json::<TaskChangesPage>()?;
+            Ok(body)
+        };
+        // Same single retry as `list_tasks` for the fast-fail interrupted
+        // transport class; the GET is idempotent.
+        match fetch() {
+            Err(e) if is_interrupted_transport(&e) => fetch(),
+            other => other,
+        }
+    }
+
     pub fn get_task(&self, task_id: &str) -> anyhow::Result<Task> {
         let body = self
             .agent
@@ -347,6 +426,30 @@ fn is_interrupted_transport(e: &anyhow::Error) -> bool {
         ),
         _ => false,
     }
+}
+
+/// True when the server answered 404 — the API predates `GET /tasks/changes`
+/// (or the route was rolled back), so the caller falls back to full polling.
+pub fn is_unsupported(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ureq::Error>(),
+        Some(ureq::Error::StatusCode(404))
+    )
+}
+
+/// Minimal percent-encoding for a query value (the epoch is a UUID today,
+/// but the server may change its shape).
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -486,6 +589,73 @@ mod tests {
         let err = client.list_tasks(None).expect_err("must fail");
         assert!(is_interrupted_transport(&err), "unexpected error: {err}");
         assert_eq!(conns.load(Ordering::SeqCst), 2, "expected exactly one retry");
+    }
+
+    /// The feed call carries cursor + wait in the query string and parses a
+    /// change page; a 404 is classified as "unsupported" for the fallback.
+    #[test]
+    fn task_changes_sends_cursor_and_parses_page() {
+        let body = r#"{"epoch":"e-1","cursor":42,"reset":false,"tasks":null,
+            "changes":[{"seq":42,"task_id":"t-1","op":"remove","task":null}],"more":true}"#;
+        let (port, conns) = spawn_stub_api_capture(vec![Stub::Respond(200, body)]);
+        let client = client_for(port);
+        let cursor = ChangeCursor { epoch: "e 1/x".into(), seq: 41 };
+        let page = client.task_changes(Some(&cursor), 25.0).expect("page");
+        assert_eq!(page.cursor, 42);
+        assert!(page.more);
+        assert_eq!(page.changes.len(), 1);
+        assert_eq!(page.changes[0].op, "remove");
+        let request = conns.lock().unwrap().remove(0);
+        assert!(request.starts_with("GET /tasks/changes?wait=25&since=41&epoch=e%201%2Fx "),
+            "unexpected request line: {request}");
+    }
+
+    #[test]
+    fn task_changes_404_is_unsupported() {
+        let (port, _conns) = spawn_stub_api(vec![Stub::Respond(404, "{}")]);
+        let client = client_for(port);
+        let err = client.task_changes(None, 0.0).expect_err("must fail");
+        assert!(is_unsupported(&err), "unexpected error: {err}");
+        let (port, _conns) = spawn_stub_api(vec![Stub::Respond(500, "{}")]);
+        let client = client_for(port);
+        let err = client.task_changes(None, 0.0).expect_err("must fail");
+        assert!(!is_unsupported(&err));
+    }
+
+    /// Like `spawn_stub_api` but also records each request head so tests can
+    /// assert on the request line.
+    fn spawn_stub_api_capture(
+        behaviors: Vec<Stub>,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_srv = seen.clone();
+        std::thread::spawn(move || {
+            for behavior in behaviors {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                seen_srv
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                if let Stub::Respond(status, body) = behavior {
+                    let resp = format!(
+                        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+        (port, seen)
     }
 
     /// HTTP-level errors (4xx/5xx parsed from a live connection) are not
