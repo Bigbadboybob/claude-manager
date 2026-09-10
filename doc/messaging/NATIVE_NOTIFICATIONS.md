@@ -201,6 +201,15 @@ repair. Do not start a second app-server writer or edit rollout JSONL to repair
 permissions. Record the prior settings for rollback and verify model, identity
 and process continuity.
 
+Older embedded Codex processes have no app-server settings endpoint. The
+noninterrupting fallback is their `/permissions` → **Approve for me** setting:
+`on-request` plus `auto_review`, with the workspace sandbox retained. Network
+and outside-workspace commands can request automatically reviewed escalation.
+Verify the selection in the menu and leave the composer empty. This fallback
+does not provide unrestricted command access; the next normal CM restart/resume
+uses the configured full-access launcher. Do not force-restart a continuous
+orchestrator with pending work merely to remove its sandbox.
+
 The isolated real-client regression is
 `mcp_server/tests/integration_codex_resume.py` (requires aiohttp, pyte and
 websockets). It uses a private HOME, a local mock model, and disposable PTYs;
