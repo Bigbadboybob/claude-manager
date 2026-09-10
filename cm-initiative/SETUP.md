@@ -1,22 +1,21 @@
 # Swarm Focused Design — Setup record
 
-Status: **Coordinator and proposal-scout grouping verified; Fable-Scout pending**,
+Status: **Setup complete; both coordinators and all nine research scouts grouped**,
 2026-09-10. The [charter](CHARTER.md) is approved. This document records
 infrastructure setup. The substantive, interactive work plan is [PLAN.md](PLAN.md).
 
 Owner's further review identified two omitted setup checks: Owner must belong
 to every chat and the existing tasks need a Work / Task sidebar subsection.
 Owner membership is verified in all three channels. Owner created the laptop
-subsection; both coordinator workspaces and all eight proposal scouts are now
-verified grouped, with evidence below. The separate Fable-Scout research
-workspace remains a pending assignment owned by Swarm-Gardener.
-Earlier completion statements in the
-decision log record the narrower checks done at their time.
+subsection; both coordinator workspaces, all eight proposal scouts, and the
+separate Fable-Scout research workspace are now verified grouped, with evidence
+below. Earlier completion statements in the decision log record the narrower
+checks done at their time.
 
 ## Sidebar grouping verification
 
 The laptop TUI's **Work / Task sidebar** subsection is **Swarm-Focused-Design**,
-ID `sec-18d3da776be0a234`, blue. Creation and coordinator grouping are complete.
+ID `sec-18d3da776be0a234`, blue. All requested grouping is complete.
 
 - **CM coordinator — directly verified by Initiative-Bridge:** `sidebar.list`
   reports `viewer_published=true`; workspace `ws-18d3bae538b649c9` has
@@ -28,12 +27,15 @@ ID `sec-18d3da776be0a234`, blue. Creation and coordinator grouping are complete.
   effective section IDs, and no pending request. P7/P8 share the coordinator
   workspace, also observed in this subsection. Completion report:
   `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:c9950088-dec7-41e2-8d19-bf577e19ab76`.
-- **Fable-Scout — pending:** the earlier research task
-  `59a67007-7a71-412a-87d4-bf535df42893` is separate from P1–P8. Swarm-Gardener
-  reports that its workspace is absent from the coordinator's sidebar scope
-  and assignment returns "not a live session in scope". It has asked Fable
-  to self-assign using its own session identity and verify the observed result.
-  Report: `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:9c2cee9e-b9bc-4000-9882-57a705e1b6a2`.
+- **Fable-Scout — verified by Fable, relayed by Swarm-Gardener:** the earlier
+  research task `59a67007-7a71-412a-87d4-bf535df42893` is separate from P1–P8.
+  Fable assigned workspace `73253516d3a241619a5f497a658a1977` using its own
+  session `ts-18d3da59b187e3f9-1`; assignment
+  `7b03487e-9647-47b1-b736-41c9163f4da3` has receipt status `applied`, matching
+  observed choice and effective section ID, and `pending=null`. This resolves
+  the earlier coordinator-scope limitation without changing permissions.
+  Completion report:
+  `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:eab81204-b9bf-4a8b-9438-6f976f8b0f24`.
 
 The deployed sidebar tools now support scoped remote assignment to existing
 sections. Both coordinators used the documented shell fallback with their own
@@ -80,7 +82,7 @@ These are responsibilities within the existing coordinator tasks.
 | predictionTrading onboarding link | Swarm-Gardener | `agent_docs/swarm-focused-design-onboarding.md` in its existing worktree | Shared docs and initiative ID | Links identify the canonical charter, local role, shared artifact index, channels, and approval boundaries | Complete; `ae3724a69` pushed and reviewed |
 | Channels and kickoff | Initiative-Bridge; Swarm-Gardener joins shared and predictionTrading channels | Three channel paths above and channel references on native records | Plan approval; initiative and docs ready | Read back all channels, pinned kickoff, participant membership, and stored channel paths | Complete; pins and memberships verified |
 | Owner chat membership | Initiative-Bridge | Membership in all three channels | Channels created; Owner identity resolved | Owner appears in all three rosters | Complete; already joined by Owner, verified on review |
-| Work / Task sidebar subsection | Owner creates; each coordinator assigns its scoped workspaces | Swarm-Focused-Design (`sec-18d3da776be0a234`), containing participating workspaces | Viewer catalogue published; supported sidebar tools or documented fallback | Observed effective section matches; no pending assignment; applied receipts for new changes | Both coordinators and P1–P8 verified; separate Fable-Scout assignment pending with Swarm-Gardener |
+| Work / Task sidebar subsection | Owner creates; coordinators and scouts assign within their session scope | Swarm-Focused-Design (`sec-18d3da776be0a234`), containing participating workspaces | Viewer catalogue published; supported sidebar tools or documented fallback | Observed effective section matches; no pending assignment; applied receipts for new changes | Complete; both coordinators, P1–P8, and Fable-Scout verified |
 
 ## Documents and shared artifacts
 
@@ -160,10 +162,9 @@ tasks or SEJD records changed.
 
 ## Remaining setup work
 
-Swarm-Gardener owns the remaining Fable-Scout assignment and observed-result
-verification. Owner membership, both coordinators, and P1–P8 grouping are
-verified. Selecting candidate implementations or new swarms remains an
-interactive Owner decision in [PLAN.md](PLAN.md).
+None. Owner membership and all requested sidebar grouping are verified.
+Selecting candidate implementations or new swarms remains an interactive Owner
+decision in [PLAN.md](PLAN.md).
 
 ## Initial completion record
 
@@ -223,3 +224,7 @@ does not launch later candidate swarms or authorize deployments.
   above supersede the earlier manual-only status. Swarm-Gardener then reported
   the separate Fable-Scout workspace still needs assignment and requested its
   self-assignment; full setup completion awaits that remaining verification.
+- **2026-09-10 — Final sidebar verification:** Swarm-Gardener relayed Fable's
+  successful self-assignment and observed applied receipt, resolving the last
+  pending workspace. Both coordinators and all nine research scouts are
+  grouped; setup is complete. This does not select any implementation or swarm.

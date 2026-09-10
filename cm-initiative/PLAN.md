@@ -298,3 +298,9 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   documented interface. Swarm-Gardener subsequently flagged the separate
   Fable-Scout research workspace as still pending and owns that assignment
   follow-up. Selecting implementations or new swarms remains with Owner.
+
+- **2026-09-10 — Final setup item resolved:** Swarm-Gardener relayed Fable's
+  successful self-assignment with matching observed choice/effective section,
+  an applied receipt, and no pending request. Both coordinators and all nine
+  research scouts are now grouped. [SETUP.md](SETUP.md) records the evidence;
+  setup is complete, with candidate selection still an interactive Owner step.
