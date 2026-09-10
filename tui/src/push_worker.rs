@@ -54,6 +54,7 @@ pub struct TuiSessionRow {
 }
 
 enum PushCommand {
+    Sidebar { per_host: HashMap<HostId, cm_daemon::sidebar::Publication> },
     OwnerAttention(crate::owner_notification::Command),
     TaskTree {
         tasks: Vec<(String, Option<String>, Option<String>)>,
@@ -86,6 +87,9 @@ pub struct PushWorker {
 }
 
 impl PushWorker {
+    pub fn push_sidebar(&self, per_host: HashMap<HostId, cm_daemon::sidebar::Publication>) {
+        let _ = self.cmd_tx.send(PushCommand::Sidebar { per_host });
+    }
     pub fn present_owner_alert(&self, alert: cm_daemon::owner_attention::Alert) {
         let _ = self.cmd_tx.send(PushCommand::OwnerAttention(crate::owner_notification::Command::Present(alert)));
     }
@@ -173,6 +177,7 @@ impl Drop for PushWorker {
 /// single fanout pass.
 #[derive(Default)]
 struct Pending {
+    sidebar: Option<HashMap<HostId, cm_daemon::sidebar::Publication>>,
     owner_attention: Vec<crate::owner_notification::Command>,
     task_tree: Option<(
         Vec<(String, Option<String>, Option<String>)>,
@@ -191,6 +196,7 @@ struct Pending {
 
 fn apply(pending: &mut Pending, cmd: PushCommand) {
     match cmd {
+        PushCommand::Sidebar { per_host } => pending.sidebar = Some(per_host),
         PushCommand::OwnerAttention(c) => pending.owner_attention.push(c),
         PushCommand::TaskTree {
             tasks,
@@ -218,6 +224,7 @@ fn apply(pending: &mut Pending, cmd: PushCommand) {
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
 enum PushKind {
+    Sidebar,
     TaskTree,
     TuiSessions,
     WorkflowDefs,
@@ -235,10 +242,15 @@ fn worker_loop(
     let receipt_path = std::env::var_os("HOME").map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir).join(".cm/owner-notification-receipts.json");
     let mut attention = crate::owner_notification::Delivery::new(receipt_path);
+    let mut latest_sidebar = HashMap::new();
     loop {
         let first = match cmd_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(c) => c,
-            Err(mpsc::RecvTimeoutError::Timeout) => { attention.flush(&host_pool); continue; }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                attention.flush(&host_pool);
+                for (host, publication) in &latest_sidebar { push_sidebar(&host_pool, &mut last_hashes, host, publication); }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         let mut pending = Pending::default();
@@ -254,6 +266,7 @@ fn worker_loop(
         }
         for cmd in pending.owner_attention.drain(..) { attention.handle(cmd); }
         attention.flush(&host_pool);
+        if let Some(ref publications) = pending.sidebar { latest_sidebar = publications.clone(); }
         execute(&host_pool, &mut last_hashes, pending);
     }
 }
@@ -273,6 +286,11 @@ fn execute(
     if let Some((tasks, workspaces, hosts)) = pending.task_tree {
         for host_id in &hosts {
             push_task_tree(host_pool, last_hashes, host_id, &tasks, &workspaces);
+        }
+    }
+    if let Some(per_host) = pending.sidebar {
+        for (host, publication) in per_host {
+            push_sidebar(host_pool, last_hashes, &host, &publication);
         }
     }
     if let Some(per_host) = pending.tui_sessions {
@@ -353,6 +371,21 @@ fn push_task_tree(
                 e,
             );
         }
+    }
+}
+
+fn push_sidebar(pool: &HostPool, hashes: &mut HashMap<(HostId, PushKind), u64>, host: &HostId, publication: &cm_daemon::sidebar::Publication) {
+    let hash = hash_payload(publication);
+    let key = (host.clone(), PushKind::Sidebar);
+    if hashes.get(&key) == Some(&hash) || pool.should_skip_for_push(host, Instant::now()) { return; }
+    let result = (|| -> anyhow::Result<()> {
+        let socket = pool.for_host(host)?.socket_path().ok_or_else(|| anyhow::anyhow!("no sidebar socket"))?;
+        crate::client_session::rpc_messaging(&socket, &pool.operator_token_for(host), "sidebar.publish", serde_json::to_value(publication)?)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => { hashes.insert(key, hash); pool.mark_push_success(host); }
+        Err(e) => { eprintln!("cm-tui: sidebar publication to {host} failed: {e}"); }
     }
 }
 
@@ -485,7 +518,7 @@ fn push_workflow_defs(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -498,7 +531,7 @@ mod tests {
     /// start_test_daemon`, minus the workspace seeding the push
     /// RPCs don't need). Push RPCs are plain request/response —
     /// stream outcomes are unreachable here and dropped.
-    fn start_push_test_daemon() -> (
+    pub(crate) fn start_push_test_daemon() -> (
         std::path::PathBuf,
         Arc<Mutex<DaemonState>>,
         Arc<AtomicBool>,
@@ -557,7 +590,7 @@ mod tests {
         (socket_path, state, stop, handle)
     }
 
-    fn stop_push_test_daemon(
+    pub(crate) fn stop_push_test_daemon(
         socket_path: &std::path::Path,
         stop: Arc<AtomicBool>,
         handle: std::thread::JoinHandle<()>,
@@ -567,7 +600,7 @@ mod tests {
         let _ = handle.join();
     }
 
-    fn local_pool_for(socket: &std::path::Path) -> Arc<HostPool> {
+    pub(crate) fn local_pool_for(socket: &std::path::Path) -> Arc<HostPool> {
         let hosts = crate::hosts::HostsConfig {
             hosts: vec![crate::hosts::HostConfig {
                 id: HostId::local(),
@@ -586,7 +619,7 @@ mod tests {
         vec![("task-reprime".to_string(), None, None)]
     }
 
-    fn wait_for<F: Fn() -> bool>(cond: F, what: &str) {
+    pub(crate) fn wait_for<F: Fn() -> bool>(cond: F, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !cond() {
             assert!(

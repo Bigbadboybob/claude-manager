@@ -103,6 +103,7 @@ pub struct ManifestSnapshotPayload {
     /// binds once, at spawn). Catch-up for every transcript `Updated`
     /// diff missed while the stream was down.
     pub session_transcripts: Vec<(String, String)>,
+    pub sidebar_assignments: Option<std::collections::BTreeMap<String, cm_daemon::sidebar::Assignment>>,
     pub owner_attention: Option<std::collections::BTreeMap<String, cm_daemon::owner_attention::Alert>>,
     /// When the consumer thread read the frame. Rows created locally
     /// after (or just before) this instant may be newer than the
@@ -637,6 +638,8 @@ fn parse_snapshot_payload(
         session_last_exits,
         listed_uids,
         session_transcripts,
+        sidebar_assignments: payload.get("sidebar_assignments").filter(|v| !v.is_null()).map(|v| serde_json::from_value(v.clone()))
+            .transpose().map_err(|e| format!("invalid sidebar assignments: {e}"))?,
         owner_attention: payload.get("owner_attention").filter(|v| !v.is_null()).map(|v| serde_json::from_value(v.clone()))
             .transpose().map_err(|e| format!("invalid Owner attention snapshot: {e}"))?,
         received_at: std::time::Instant::now(),

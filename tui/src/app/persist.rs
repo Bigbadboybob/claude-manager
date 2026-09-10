@@ -35,11 +35,17 @@ impl App {
             f.write_all(bytes)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() { std::fs::File::open(parent)?.sync_all()?; }
+        Ok(())
     }
 
     /// Save session manifest to disk.
     pub(crate) fn save_session_manifest(&self) {
+        self.try_save_session_manifest();
+    }
+
+    pub(crate) fn try_save_session_manifest(&self) -> bool {
         // Refuse to persist before the on-disk manifest has been hydrated
         // into `self.workspaces` by `restore_sessions`. This writer does a
         // FULL REPLACE of `~/.cm/tui-sessions.json` from `self.workspaces`
@@ -53,11 +59,11 @@ impl App {
         // `sessions_restored` to true before `restore_sessions` runs its own
         // internal save, so the hydrated write still goes through.
         if !self.sessions_restored {
-            return;
+            return false;
         }
         if self.defer_manifest_save.get() {
             self.manifest_save_pending.set(true);
-            return;
+            return false;
         }
         let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
         for ws in &self.workspaces {
@@ -121,6 +127,7 @@ impl App {
             task_colors: self.task_colors.clone(),
             sections: self.sections.clone(),
             workspace_sections: self.workspace_sections.clone(),
+            sidebar_receipts: self.sidebar_receipts.clone(),
             auto_close_workspaces: self.auto_close_workspaces.iter()
                 .filter(|id| self.workspaces.iter().any(|ws| &ws.id == *id))
                 .cloned().collect(),
@@ -130,14 +137,12 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-            if let Err(e) = Self::atomic_write_manifest(&path, json.as_bytes()) {
-                eprintln!(
-                    "failed to write session manifest at {}: {}",
-                    path.display(),
-                    e
-                );
-            }
+        let saved = serde_json::to_vec_pretty(&manifest)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| Self::atomic_write_manifest(&path, &bytes));
+        if let Err(e) = saved {
+            eprintln!("failed to write session manifest at {}: {}", path.display(), e);
+            return false;
         }
 
         // 10d-1: every session-list mutation site is required by
@@ -154,6 +159,8 @@ impl App {
         // `eprintln!` (round-11 invariant: don't silently
         // swallow under opt-in).
         self.push_tui_sessions_to_daemon();
+        self.push_sidebar_to_daemon();
+        true
     }
 
     /// Load session manifest from disk. On parse failure, the corrupt file is

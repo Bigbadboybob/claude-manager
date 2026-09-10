@@ -1583,6 +1583,38 @@ async def send_input(
 
 
 @mcp.tool()
+def list_sidebar_sections() -> dict:
+    """List Owner's work-sidebar subsections and caller-visible workspace choices.
+
+    Headless/cloud-safe. The catalogue and observed choices are the latest
+    laptop viewer publication, not a live viewer query. Pending requests are
+    shown separately. Only sessions on this daemon are included. Sections are
+    display groups, separate from first-class planning initiatives.
+    """
+    return control_client.call("sidebar.list", {})
+
+
+@mcp.tool()
+def set_session_section(section: str, session_id: str | None = None) -> dict:
+    """Move a session's WHOLE workspace to a work-sidebar subsection.
+
+    section: stable ID or unique exact name from list_sidebar_sections;
+      "auto" restores parent-task inheritance, "none" explicitly leaves it loose.
+    session_id defaults to yourself; use a CM session UID from list_sessions.
+    Requires ordinary session-control scope for every live workspace member.
+    Auto descendants follow their parent; explicit descendant choices remain.
+    This is a durable queued display change, applied when the updated viewer
+    connects. Read list_sidebar_sections again to verify its observed choice
+    and receipt. Does not move files, change initiative/task ownership, create
+    sections, or restart workers. Follow Owner's requested organization.
+    """
+    params = {"section": section}
+    if session_id is not None:
+        params["session_id"] = session_id
+    return control_client.call("sidebar.assign", params)
+
+
+@mcp.tool()
 def notify_user(message: str = "") -> dict:
     """Request Owner attention for your own session (local, cloud, or continuous).
 

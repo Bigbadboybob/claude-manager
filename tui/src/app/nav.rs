@@ -487,6 +487,7 @@ impl App {
     /// the forced redraws — alive forever). Called once per main-loop iteration;
     /// gated on a non-empty `alerts` map so it's free in the common case.
     pub fn reap_and_clear_alerts(&mut self) {
+        self.apply_pending_sidebar_assignments();
         // Bind delayed adoption and replacement continuous ticks to retained alerts.
         if !self.owner_alerts.is_empty() { self.sync_owner_alert_indicators(); }
         if self.alerts.is_empty() {

@@ -1826,6 +1826,9 @@ impl App {
         // applied may post-date the daemon's capture, and an A-R
         // force-restart's own kill is skipped like the diff path does.
         self.prune_rows_absent_from_snapshot(&snapshot);
+        if let Some(assignments) = &snapshot.sidebar_assignments {
+            self.receive_sidebar_snapshot(&snapshot.host, assignments);
+        }
         if let Some(alerts) = &snapshot.owner_attention {
             self.apply_owner_attention_snapshot(&snapshot.host, alerts);
         }
@@ -2167,6 +2170,11 @@ impl App {
                 // re-assert that healed a drifted row). Entries that
                 // don't carry the field (workflow-binding `Updated`s,
                 // `Added`s) are left alone.
+                if let Some(value) = entry.get("sidebar_assignment") {
+                    if let Ok(assignment) = serde_json::from_value(value.clone()) {
+                        self.receive_sidebar_assignment(&host, assignment);
+                    }
+                }
                 if let Some(value) = entry.get("owner_attention") {
                     if value.is_null() {
                         self.apply_owner_attention(&host, &uid, None);
@@ -3379,6 +3387,7 @@ mod apply_manifest_diff_tests {
             host,
             session_transcripts: Vec::new(),
             owner_attention: None,
+            sidebar_assignments: None,
             listed_uids: listed.iter().map(|u| u.to_string()).collect(),
             session_last_exits: listed
                 .iter()
@@ -3965,6 +3974,7 @@ mod apply_manifest_diff_tests {
             session_last_exits: Vec::new(),
             session_transcripts: vec![("ts-snap-resume".into(), "current".into())],
             owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
         };
         app.apply_manifest_snapshot(payload);
@@ -3995,6 +4005,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t22".into(),
@@ -4038,6 +4049,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t23".into(),
@@ -4198,6 +4210,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t27".into(),
@@ -4239,6 +4252,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t28".into(),
@@ -5976,6 +5990,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
@@ -6188,6 +6203,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
@@ -6397,6 +6413,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
@@ -6548,6 +6565,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
@@ -6689,6 +6707,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
         std::fs::write(

@@ -599,6 +599,9 @@ pub struct Manifest {
     /// renders under its parent's section) or renders loose.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub workspace_sections: HashMap<String, String>,
+    /// Viewer receipts prevent replayed remote moves from undoing Owner edits.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sidebar_receipts: HashMap<String, crate::sidebar::Receipt>,
     /// Viewer-created wrappers for adopted agent sessions. Closing an empty
     /// wrapper preserves its tasks, checkout and transcript tombstones.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

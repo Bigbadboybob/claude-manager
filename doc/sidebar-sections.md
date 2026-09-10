@@ -2,7 +2,71 @@
 
 ## Summary
 
-Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view) that group workspaces by project. A section is a pure display construct stored in the TUI manifest; it never touches the planning API, the daemon, or the MCP surface. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically.
+Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically.
+
+## Agent tools: remote subsection assignment
+
+After installing the updated laptop TUI, open it once so it publishes its existing
+section catalogue to the configured daemons. Running agents do not need a
+restart; reconnect MCP to discover the new tools in an existing session.
+
+```python
+list_sidebar_sections()
+set_session_section(session_id="<CM session UID>", section="<section ID>")
+set_session_section(session_id="<scout UID>", section="auto")
+set_session_section(session_id="<scout UID>", section="none")
+```
+
+`session_id` is a **CM session UID** from `list_sessions`, not a Codex conversation
+ID; omit it to change your own workspace. `section` accepts a stable ID or a
+unique exact section name. Use IDs when names are ambiguous or literally
+`auto`/`none`. Agents should follow Owner's requested organization.
+
+- The change affects the **whole workspace**, as does Alt+E → Section. All live
+  sessions sharing it must be within the caller's normal task-tree/workspace
+  scope, unless the caller has Owner-granted global permissions. Listing only
+  exposes caller-visible workspace membership; `can_assign=false` identifies a
+  shared workspace with an out-of-scope session.
+- Auto removes the explicit override and follows the existing parent-task/filer
+  inheritance. None explicitly keeps the workspace outside sections. Descendants
+  on Auto follow changes to their parent; explicit descendant overrides remain.
+- Tools address the daemon hosting the caller. They do not transfer sessions,
+  edit task parents or initiative ownership, move worktrees, or restart workers.
+  Continuous tasks retain their dedicated panel placement.
+- Assignment returns **`status="queued"`**, not proof that the laptop rendered it.
+  Requests survive viewer disconnection and daemon brain restarts. Identical
+  pending requests coalesce; a different request supersedes the pending choice
+  for that workspace. The existing manifest stream delivers them on reconnect.
+- Call `list_sidebar_sections` to check `workspaces[...].pending` versus
+  `observed.choice`, `observed.effective_section_id`, and `observed.receipt`.
+  `choice=null` means Auto and `choice=""` means None. Observed values are the
+  latest viewer publication and can be stale while it is offline. No publication
+  yet produces an explicit install/reopen error rather than a false success.
+- If Owner deleted the destination before delivery, the viewer preserves the
+  workspace's choice and returns a `section_deleted` receipt. List the current
+  sections and make a new request. A successful receipt has `status="applied"`.
+
+Section definitions, folding, appearance, and the saved layout remain owned by
+Owner's laptop viewer. This is not synchronization of independent viewers' layout
+preferences; use the normal Owner viewer as the publishing layout.
+
+### Delivery and recovery
+
+The daemon persists `~/.cm/sidebar-sections.json` before broadcasting requests.
+`sidebar.list` and `sidebar.assign` authenticate the caller and retain normal
+session scope. `sidebar.publish` is Operator-only and carries a catalogue plus
+observed membership/receipts. It uses the existing coalescing background push
+worker; no SSH connection per session or new steady-state network polling is
+introduced. Failed publications retry while successful identical payloads are
+suppressed.
+
+The viewer saves membership and its `sidebar_receipts` manifest sidecar together
+before acknowledgement. This protects a later Owner edit from replay when the
+previous acknowledgement was lost. A stale acknowledgement cannot clear a newer
+request. A failed save leaves the request pending; damaged daemon state fails
+explicitly and is preserved. These optional sidecars require no holder upgrade
+or worker lifecycle change. Older viewers keep working, but cannot publish or
+apply these requests.
 
 ## Problem
 
@@ -18,7 +82,7 @@ Subtasks nest to arbitrary depth, and rendering that tree faithfully in one side
 
 ## Non-goals
 
-- No agent-facing MCP tool for sections. Sections are the Owner's organisation of the board.
+- Agents do not create, rename, delete, reorder, recolor, or fold sections. Those remain Owner controls; agents can change workspace membership within their normal scope.
 - No change to the planning view, the continuous column, or the `backtests` group.
 - No change to the Status sub-view (flat running/idle partition), which stays a "what is happening right now" view.
 - Not a replacement for subtasks: task hierarchy still lives in `parent_task_id`.
