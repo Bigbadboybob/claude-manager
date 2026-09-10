@@ -253,3 +253,12 @@ directory must not be committed. Runtime verification also writes
 `~/.cm/setup-verification.json` on `cm-sessions`. A copy of the tested runtime
 archive, startup script and service unit is retained in
 `~/.cm/provisioning/` on its data disk, which is covered by the snapshot schedule.
+
+## Explicit task cleanup
+
+The work-view completion dialog (Alt+d) can request immediate cleanup of the
+selected task and tracked descendants on their hosts. Keep is the default;
+active/shared/pinned/continuous work remains protected. Jobs and results persist
+under `~/.cm/worktree-cleanup/`, independently of the laptop. The daemon embeds
+its Python runtime under `~/.cm/worktree-tools/` and installs chained Git hooks
+for raw worktree lineage. See [usage, limits and recovery](task-worktree-cleanup.md).

@@ -774,6 +774,12 @@ pub fn dispatch_request(
         // existing workspace's worktree. Both delegate to the shared
         // `start_session` spawn core. Session callers get Unauthorized —
         // agents use the Session-callable `mcp_start_session`.
+        "worktree.cleanup" => DispatchOutcome::Done(
+            if let Err(response) = require_operator(req, "Worktree cleanup is Operator-only") { response }
+            else { match crate::worktree_cleanup::rpc(&req.params) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err(error) => Response::err(req.id.clone(), ErrorCode::InvalidParams, error),
+            }}),
         "create_session" => {
             DispatchOutcome::Done(dispatch_create_session(state, req))
         }
@@ -2806,6 +2812,32 @@ mod tests {
         let mut s = DaemonState::new();
         s.attach_addr = "/tmp/cm-daemon-test.sock".into();
         Arc::new(Mutex::new(s))
+    }
+
+    #[test]
+    fn worktree_cleanup_rejects_session_callers_before_launching_helper() {
+        with_temp_home_dispatch(|| {
+            for action in ["preview", "apply", "status"] {
+                let response = dispatch_request(&make_state(), &session_request("worktree.cleanup",
+                    serde_json::json!({"action":action}), "ts-agent")).into_response();
+                assert_eq!(response.error.unwrap().code, ErrorCode::Unauthorized);
+            }
+            assert!(!std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cm/worktree-tools").exists());
+        });
+    }
+
+    #[test]
+    fn worktree_cleanup_operator_reads_host_local_receipt() {
+        with_temp_home_dispatch(|| {
+            let id = "ac815fc6-4fb2-4df4-9246-b81d149f44ef";
+            let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cm/worktree-cleanup");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{id}.json")), serde_json::json!({"id":id,"phase":"complete","results":[]}).to_string()).unwrap();
+            let response = dispatch_request(&make_state(), &operator_request("worktree.cleanup",
+                serde_json::json!({"action":"status","id":id}))).into_response();
+            assert!(response.ok, "{response:?}");
+            assert_eq!(response.result.unwrap()["phase"], "complete");
+        });
     }
 
     // --- restart quiescence barrier (DESIGN_SEAMLESS_RESTART 2d) ------

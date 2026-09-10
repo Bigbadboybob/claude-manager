@@ -87,6 +87,7 @@ pub mod transcript_detect;
 pub mod transcript_catalog;
 pub mod workflow;
 pub mod worktree;
+pub mod worktree_cleanup;
 pub mod writer_gate;
 
 #[cfg(test)]
@@ -1254,6 +1255,8 @@ pub fn run() -> anyhow::Result<()> {
             e,
         )
     })?;
+
+    worktree_cleanup::bootstrap();
 
     for incoming in listener.incoming() {
         match incoming {

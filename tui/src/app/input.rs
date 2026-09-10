@@ -7,6 +7,7 @@ pub(super) enum InputMode {
     /// Normal operation — keys go to terminal or app navigation.
     Normal,
     ContinuousControl(super::continuous_control::Menu),
+    WorktreeCleanup(super::worktree_cleanup::Menu),
     /// Configuring a new workspace and its initial agent session.
     NewSession {
         engine: LaunchEngine,
@@ -566,6 +567,7 @@ pub(crate) enum SubmitAction {
         cursor_task_id: Option<String>,
     },
     MarkActiveDone,
+    CompleteWithCleanup,
     DeleteActive,
     StopWorkflow {
         run_id: String,
@@ -3083,13 +3085,13 @@ impl App {
                     // differ on whether Shift is baked into the char case or
                     // reported as a modifier — accept both forms.
                     KeyCode::Char('W') => {
-                        self.close_active_workspace();
+                        self.open_worktree_completion(false);
                         return true;
                     }
                     KeyCode::Char('w')
                         if key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
-                        self.close_active_workspace();
+                        self.open_worktree_completion(false);
                         return true;
                     }
                     KeyCode::Char('w') => {
@@ -3105,10 +3107,7 @@ impl App {
                             self.set_status_msg("A section is not a task — nothing to mark done");
                             return true;
                         }
-                        self.input_mode = InputMode::Confirm {
-                            prompt: "Mark task done? Sessions for this task will close.".to_string(),
-                            action: ConfirmAction::MarkDone,
-                        };
+                        self.open_worktree_completion(true);
                         return true;
                     }
                     KeyCode::Char('x') => {
@@ -3605,6 +3604,10 @@ impl App {
         // Section ids for the workspace / task settings pickers.
         let section_ids: Vec<String> = self.section_ids();
         let outcome = match &mut self.input_mode {
+            InputMode::WorktreeCleanup(menu) => match event {
+                CrosstermEvent::Key(key) => menu.key(*key),
+                _ => InputOutcome::Consumed,
+            },
             InputMode::ContinuousControl(menu) => match event {
                 CrosstermEvent::Key(key) => menu.key(*key),
                 _ => InputOutcome::Consumed,
@@ -3876,6 +3879,10 @@ impl App {
                 // chosen name. Other submits (and a no-target catalog)
                 // go through the normal path.
                 let old = std::mem::replace(&mut self.input_mode, InputMode::Normal);
+                if let InputMode::WorktreeCleanup(menu) = old {
+                    if matches!(action, SubmitAction::CompleteWithCleanup) { self.complete_with_cleanup(menu); }
+                    return true;
+                }
                 if let InputMode::SnapshotCatalog {
                     picker_target: Some(target),
                     ..
@@ -4246,6 +4253,7 @@ impl App {
                     cursor_task_id,
                 );
             }
+            SubmitAction::CompleteWithCleanup => {}, // handled with the captured completion menu
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
             SubmitAction::SaveSection { section_id, name, color } => match section_id {

@@ -251,6 +251,7 @@ impl App {
             let mut peek_max: Option<u16> = None;
             match &self.input_mode {
                 InputMode::ContinuousControl(menu) => menu.draw(frame, area),
+                InputMode::WorktreeCleanup(menu) => menu.draw(frame, area),
                 InputMode::NewSession {
                     engine,
                     label_text,

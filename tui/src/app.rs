@@ -50,6 +50,7 @@ mod image_paste;
 use lifecycle::*;
 mod input;
 mod continuous_control;
+mod worktree_cleanup;
 use input::*;
 mod transcripts;
 use transcripts::*;

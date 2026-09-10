@@ -19,6 +19,16 @@ sockets, temporary files and networking while keeping the source read-only.
 Use a private `CARGO_TARGET_DIR`; the shared target also serves live binaries.
 See [cloud responsiveness verification](doc/cloud-responsiveness-fixes.md).
 
+## Task worktree cleanup
+
+In the work view, Alt+d offers **Keep worktrees** (default) or immediate cleanup
+of the selected task and tracked descendants. Alt+Shift+w offers workspace
+closure without changing planning task status. Cleanup runs durably on the
+owning hosts, retains branches and useful artifacts, and protects active,
+shared, pinned and continuous work. Raw `git worktree add` is tracked through a
+chained hook; bypassed hooks and unknown historical ancestry require explicit
+registration. See [task cleanup and recovery](doc/task-worktree-cleanup.md).
+
 ## Global TUI settings
 
 **F9** opens Global Settings in any view. Section tint strength defaults to 2×;

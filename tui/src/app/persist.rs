@@ -641,6 +641,14 @@ impl App {
     /// main tick. Bounds the `list_sessions` RPC to once per
     /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
     pub fn maybe_adopt_daemon_sessions(&mut self) {
+        if let InputMode::WorktreeCleanup(menu) = &mut self.input_mode {
+            self.needs_redraw |= menu.poll();
+            if menu.close_ready() {
+                let InputMode::WorktreeCleanup(menu) = std::mem::replace(&mut self.input_mode, InputMode::Normal) else { unreachable!() };
+                self.complete_with_cleanup(menu);
+                self.needs_redraw = true;
+            }
+        }
         if let InputMode::ContinuousControl(menu) = &mut self.input_mode {
             self.needs_redraw |= menu.poll();
         }
