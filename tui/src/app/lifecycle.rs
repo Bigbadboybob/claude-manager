@@ -1422,11 +1422,9 @@ impl App {
         for host in &self.hosts.hosts {
             per_host.insert(host.id.clone(), Vec::new());
         }
-        // Filter out daemon-attached sessions (`daemon_session_uid.is_some()`):
-        // those already live in `state.sessions` on the daemon and would
-        // double-register if we also pushed them to `state.tui_sessions`.
-        // Bucket each remaining session by its pinned `host_id` so each
-        // daemon only hears about sessions it actually owns (12e-r8 F2).
+        // All rows carry display preferences. The worker excludes attached
+        // rows from the auth snapshot: the daemon already owns those sessions.
+        // Bucket by pinned host so preferences never cross daemon identities.
         for w in &self.workspaces {
             // 5d: carry the workspace identity + checkout on every row.
             // The daemon's `list_sessions` previously reported
@@ -1436,11 +1434,10 @@ impl App {
             let worktree_path =
                 w.worktree_path.as_ref().map(|p| p.display().to_string());
             for ts in &w.sessions {
-                if ts.session.daemon_session_uid.is_some() {
-                    continue;
-                }
                 if let Some(bucket) = per_host.get_mut(&ts.host_id) {
                     bucket.push(crate::push_worker::TuiSessionRow {
+                        preferences: Some(cm_daemon::resume_identity::Preferences::from_entry(&ts.to_manifest_entry())),
+                        daemon_attached: ts.session.daemon_session_uid.is_some(),
                         uid: ts.uid.clone(),
                         task_id: ts.task_id.clone(),
                         label: Some(ts.label.clone()),
@@ -1451,6 +1448,24 @@ impl App {
                         global_perms: ts.global_perms,
                         workspace_id: Some(w.id.clone()),
                         worktree_path: worktree_path.clone(),
+                    });
+                }
+            }
+        }
+        // Keep final preferences in the coalesced snapshot even if the row
+        // was edited and closed before the worker sent its previous update.
+        for ws in &self.workspaces {
+            for tomb in &ws.tombstones {
+                let Some(e) = &tomb.entry else { continue; };
+                if self.workspaces.iter().flat_map(|w| &w.sessions)
+                    .any(|ts| ts.uid == e.uid && ts.host_id == e.host_id) { continue; }
+                if let Some(bucket) = per_host.get_mut(&e.host_id) {
+                    bucket.push(crate::push_worker::TuiSessionRow {
+                        preferences: Some(cm_daemon::resume_identity::Preferences::from_entry(e)),
+                        daemon_attached: true, uid: e.uid.clone(), task_id: None,
+                        label: None, session_type: None, hidden: e.hidden,
+                        workflow_run_id: None, workflow_role: None, global_perms: false,
+                        workspace_id: None, worktree_path: None,
                     });
                 }
             }
@@ -1685,6 +1700,7 @@ impl App {
             .unwrap_or(0.0);
         let worktree_snapshot = ws.worktree_path.clone();
         ws.tombstones.push(SessionTombstone {
+            entry: Some(ts.to_manifest_entry()),
             uid: ts.uid.clone(),
             managed_by_uid: ts.managed_by_uid.clone(),
             label: ts.label.clone(),
@@ -2887,10 +2903,9 @@ impl App {
         // guard with a clear message rather than mistag/misroute.
         let spawn_host = self.workspaces[ws_index].sessions.first().map(|session| session.host_id.clone()).unwrap_or_else(|| self.workspaces[ws_index].host_id.clone());
         // Phase 3 (remote-session-execution): a remote-hosted workspace routes
-        // A-s to the daemon-resolved `add_session` path (reuses the remote
-        // worktree). Local A-s runs the existing path below, unchanged (it
-        // always passed the old `guard_local_host_only`).
-        if spawn_host != crate::hosts::HostId::local() {
+        // Explicit local resumes use the same authoritative identity resolver.
+        // Fresh local launches retain their existing setup and memory policy.
+        if spawn_host != crate::hosts::HostId::local() || resume_from.is_some() {
             self.add_remote_session(
                 &spawn_host,
                 ws_index,
@@ -3162,6 +3177,32 @@ impl App {
             }
         };
 
+        // The original identity may belong to another workspace/task. A picker
+        // selection must not reparent it to the row that opened the dialog.
+        let workspace_id = res.workspace_id.clone().unwrap_or(workspace_id);
+        let ws_index = match self.workspaces.iter().position(|w| w.id == workspace_id && w.host_id == *host) {
+            Some(i) => i,
+            None => {
+                let i = self.workspaces.len();
+                let path = PathBuf::from(&res.worktree_path);
+                self.workspaces.push(Workspace {
+                    id: workspace_id.clone(),
+                    name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| workspace_id.clone()),
+                    worktree_path: Some(path), host_id: host.clone(),
+                    is_closed: false, is_cloud: false, repo_url: None, main_repo_path: None,
+                    worker_vm: None, worker_zone: None, color: None, pinned: false,
+                    sessions: vec![], tombstones: vec![],
+                });
+                i
+            }
+        };
+        let mut restored_entry = res.entry;
+        if let Some(e) = restored_entry.as_mut() {
+            e.host_id = host.clone();
+            e.session_type = normalize_session_type_to_internal(&e.session_type).to_string();
+        }
+        let task_id = restored_entry.as_ref().map(|e| e.task_id.clone()).unwrap_or(task_id);
+        let label = restored_entry.as_ref().map(|e| e.label.as_str()).unwrap_or(session_type);
         let worktree_path = PathBuf::from(&res.worktree_path);
         let session = match try_attach_via_daemon_with_deps(
             &self.host_pool,
@@ -3169,17 +3210,28 @@ impl App {
             &workspace_id,
             &worktree_path,
             session_type,
-            session_type,
+            label,
             cols,
             rows,
             task_id.as_deref(),
-            None,
-            None,
+            restored_entry.as_ref().and_then(|e| e.workflow_run_id.as_deref()),
+            restored_entry.as_ref().and_then(|e| e.workflow_role.as_deref()),
             host,
             None,
         ) {
             Ok(s) => s,
             Err(e) => {
+                if resume_from.is_some() {
+                    self.set_status_msg(&format!("Session resumed; attach will retry: {}", e));
+                    if let Some(entry) = restored_entry {
+                        self.forget_reconnect_state(&entry.uid);
+                        self.pending_remote_reattach.push(super::remote::PendingRemoteReattach::new(workspace_id.clone(), entry.clone()));
+                        self.skipped_manifest_entries.entry(workspace_id.clone()).or_default().push(entry);
+                        self.workspaces[ws_index].is_closed = false;
+                    }
+                    self.save_session_manifest();
+                    return;
+                }
                 // The daemon already started the session into the existing
                 // worktree. Mirror `ClientSession::new`'s cleanup contract:
                 // best-effort kill before bubbling so we don't leak a live,
@@ -3201,22 +3253,33 @@ impl App {
             }
         };
 
-        let mut ts = make_simple_session_with_uid(
-            res.session_uid,
-            session_type,
-            session_type,
-            session,
-            None,
-        );
-        ts.task_id = task_id;
-        ts.transcript_id = if session_type == "claude" || seed_from.is_none() { res.resume_id } else { None };
-        ts.seeded_from_snapshot = seed_from.map(str::to_owned);
-        ts.host_id = host.clone();
+        let ts = if let Some(entry) = restored_entry {
+            Self::build_remote_terminal_session(&entry, session)
+        } else {
+            let mut ts = make_simple_session_with_uid(res.session_uid, session_type, session_type, session, None);
+            ts.task_id = task_id;
+            ts.transcript_id = if session_type == "claude" || seed_from.is_none() { res.resume_id } else { None };
+            ts.seeded_from_snapshot = seed_from.map(str::to_owned);
+            ts.host_id = host.clone();
+            ts
+        };
+        self.workspaces[ws_index].is_closed = false;
+        // Replace any exited row for this UID, including a still-queued attach.
+        self.forget_reconnect_state(&ts.uid);
+        for ws in &mut self.workspaces {
+            ws.sessions.retain(|s| s.uid != ts.uid || s.host_id != *host);
+            if ws.host_id == *host { ws.tombstones.retain(|t| t.uid != ts.uid); }
+        }
+        for entries in self.skipped_manifest_entries.values_mut() {
+            entries.retain(|e| e.uid != ts.uid || e.host_id != *host);
+        }
+        let label = ts.label.clone();
         let si = self.workspaces[ws_index].sessions.len();
         self.workspaces[ws_index].sessions.push(ts);
         self.cursor = Cursor::Session(ws_index, si);
         self.save_session_manifest();
-        self.set_status_msg(&format!("Started {} session on `{}`", session_type, host.as_str()));
+        let action = if resume_from.is_some() { "Resumed" } else { "Started" };
+        self.set_status_msg(&format!("{} {} on `{}`", action, label, host.as_str()));
     }
 
     /// Mark the first task bound to the active workspace as done via the API.
@@ -8271,6 +8334,7 @@ mod spent_workspace_tests {
 
     fn tomb(task_id: Option<&str>) -> SessionTombstone {
         SessionTombstone {
+            entry: None,
             uid: "ts-dead-0".into(),
             managed_by_uid: Some("ts-orch-0".into()),
             label: "worker".into(),

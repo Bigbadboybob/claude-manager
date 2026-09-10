@@ -75,6 +75,7 @@ pub mod path;
 pub mod planning_client;
 pub mod reader_gate;
 pub mod reap_gate;
+pub mod resume_identity;
 pub mod reaper;
 pub mod reexec;
 pub mod reexec_manifest;

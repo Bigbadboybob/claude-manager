@@ -510,6 +510,10 @@ pub struct ManifestWorkspace {
 /// still exists at the path captured at exit time.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionTombstone {
+    /// Full viewer metadata at close, so an immediate close cannot outrun the
+    /// background preferences push. Legacy tombstones have no full entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<ManifestEntry>,
     pub uid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_by_uid: Option<String>,

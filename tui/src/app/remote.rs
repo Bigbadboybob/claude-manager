@@ -166,7 +166,7 @@ impl App {
     /// `try_reattach_remote_session` so the OFF-THREAD attach worker can do the
     /// (blocking, tunnel-bound) attach while the MAIN thread does only this
     /// (cheap) slot build when the result comes back.
-    fn build_remote_terminal_session(
+    pub(super) fn build_remote_terminal_session(
         entry: &ManifestEntry,
         session: crate::session::Session,
     ) -> TerminalSession {
@@ -930,6 +930,7 @@ impl App {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
             ws.tombstones.push(cm_daemon::manifest::SessionTombstone {
+                entry: Some(entry.clone()),
                 uid: uid.clone(),
                 managed_by_uid: entry.managed_by_uid.clone(),
                 label: entry.label.clone(),
@@ -1364,6 +1365,22 @@ mod remote_reconnect_tests {
         };
         let ts = wrap_terminal_session(uid, host, session);
         (ts, tx, teof)
+    }
+
+    #[test]
+    fn resumed_entry_hydrates_all_durable_session_metadata_on_each_host() {
+        for host in [cm_daemon::host_id::HostId::local(), cm_daemon::host_id::HostId::new("sessions")] {
+            let (old, _, _) = session_with_injected_exit("ts-abc-0", host.clone(), false);
+            let mut entry = old.to_manifest_entry();
+            entry.label = "Winners".into(); entry.transcript_id = Some("conversation".into());
+            entry.task_id = Some("original-task".into()); entry.managed_by_uid = Some("ts-parent-0".into());
+            entry.hidden = true; entry.notify_on_idle = true; entry.global_perms = true;
+            entry.color = Some("green".into()); entry.idle_timeout_secs = 17;
+            entry.burst_threshold = 19; entry.generation = 42;
+            entry.seeded_from_snapshot = Some("seed".into());
+            let restored = App::build_remote_terminal_session(&entry, old.session);
+            assert_eq!(serde_json::to_value(restored.to_manifest_entry()).unwrap(), serde_json::to_value(&entry).unwrap());
+        }
     }
 
     /// Wrap an already-built `Session` in a `TerminalSession` slot with

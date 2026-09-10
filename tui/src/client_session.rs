@@ -946,6 +946,8 @@ pub(crate) fn rpc_create_session_with_timeout(
 
 /// `add_session` response (remote-session-execution Phase 1/3).
 pub(crate) struct AddSessionResult {
+    pub entry: Option<cm_daemon::manifest::ManifestEntry>,
+    pub workspace_id: Option<String>,
     pub resume_id: Option<String>,
     pub session_uid: String,
     pub worktree_path: String,
@@ -1016,12 +1018,24 @@ pub fn rpc_add_session_with_resume(
     let req = Request {
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
-        method: "add_session".into(),
+        method: if resume_id.is_some() { "session.resume" } else { "add_session" }.into(),
         params,
     };
     let resp = rpc_round_trip(daemon_socket, &req)?;
     let result = resp.result.context("add_session response missing result")?;
+    let entry: Option<cm_daemon::manifest::ManifestEntry> = result.get("entry")
+        .filter(|e| !e.is_null())
+        .map(|e| serde_json::from_value(e.clone()))
+        .transpose()?;
+    if resume_id.is_some() {
+        let saved = entry.as_ref().context("Resume response lacks identity metadata; update the daemon")?;
+        anyhow::ensure!(Some(saved.uid.as_str()) == result["session_uid"].as_str(),
+            "Resume response contains inconsistent session identities");
+        anyhow::ensure!(result["workspace_id"].is_string(), "Resume response lacks original workspace");
+    }
     Ok(AddSessionResult {
+        entry,
+        workspace_id: result["workspace_id"].as_str().map(str::to_owned),
         resume_id: result["resume_id"].as_str().map(str::to_owned),
         session_uid: result["session_uid"]
             .as_str()
@@ -1744,6 +1758,15 @@ pub fn rpc_tui_update_sessions_snapshot(
     operator_token_id: &str,
     sessions: &[TuiSessionSnapshotPush<'_>],
 ) -> anyhow::Result<()> {
+    rpc_tui_update_sessions_with_preferences(daemon_socket, operator_token_id, sessions, &[])
+}
+
+pub fn rpc_tui_update_sessions_with_preferences(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    sessions: &[TuiSessionSnapshotPush<'_>],
+    preferences: &[cm_daemon::resume_identity::Preferences],
+) -> anyhow::Result<()> {
     let sessions_json: Vec<serde_json::Value> = sessions
         .iter()
         .map(|s| {
@@ -1765,7 +1788,7 @@ pub fn rpc_tui_update_sessions_snapshot(
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
         method: "tui.update_sessions_snapshot".into(),
-        params: serde_json::json!({ "sessions": sessions_json }),
+        params: serde_json::json!({ "sessions": sessions_json, "preferences": preferences }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
@@ -4099,8 +4122,11 @@ while True:
                 let (mut stream, _) = listener.accept().unwrap();
                 let req = wire::read_request(&mut stream).unwrap().unwrap();
                 wire::write_response(&mut stream, &Response::ok(req.id.clone(), serde_json::json!({
-                    "session_uid": "ts-abcd-0", "workspace_id":"ws-test", "worktree_path":"/remote/worktree",
-                    "resume_id":"conversation-id", "main_repo_path":"/remote/repo", "branch":"main"
+                    "session_uid": "ts-aaaa-0", "workspace_id":"ws-test", "worktree_path":"/remote/worktree",
+                    "resume_id":"conversation-id", "main_repo_path":"/remote/repo", "branch":"main",
+                    "entry": { "uid":"ts-aaaa-0", "label":"Winners", "session_type":"claude-code",
+                        "transcript_id":"conversation-id", "task_id":"original-task", "global_perms":true,
+                        "color":"green", "notify_on_idle":true }
                 }))).unwrap();
                 requests.push(req);
             }
@@ -4113,11 +4139,17 @@ while True:
         let added = rpc_add_session_with_resume(&socket, "op-test", "ts-abcd-0", "ws-test", "agent",
             "claude-code", None, 100, 30, Some("conversation-id"), None).unwrap();
         assert_eq!(added.resume_id.as_deref(), Some("conversation-id"));
+        assert_eq!(added.session_uid, "ts-aaaa-0");
+        let entry = added.entry.unwrap();
+        assert_eq!(entry.label, "Winners");
+        assert_eq!(entry.task_id.as_deref(), Some("original-task"));
+        assert!(entry.global_perms && entry.notify_on_idle);
+        assert_eq!(entry.color.as_deref(), Some("green"));
         let requests = server.join().unwrap();
         assert_eq!(requests[0].method, "create_session");
         assert_eq!(requests[0].params["in_place"], true);
         assert_eq!(requests[0].params["seed_from"], "reviewer");
-        assert_eq!(requests[1].method, "add_session");
+        assert_eq!(requests[1].method, "session.resume");
         assert_eq!(requests[1].params["resume_id"], "conversation-id");
         assert!(requests.iter().all(|r| r.params.get("argv").is_none() && r.params.get("env").is_none()));
     }
