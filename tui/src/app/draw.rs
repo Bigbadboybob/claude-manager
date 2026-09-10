@@ -2772,7 +2772,7 @@ impl App {
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
                     .unwrap_or("");
-                let name_style = if !cand.worktree_exists {
+                let name_style = if cand.worktree_exists == Some(false) {
                     Style::default()
                         .fg(theme::DIM)
                         .add_modifier(Modifier::CROSSED_OUT)
@@ -2783,7 +2783,7 @@ impl App {
                 } else {
                     Style::default().fg(theme::HEADER)
                 };
-                let path_style = if !cand.worktree_exists {
+                let path_style = if cand.worktree_exists == Some(false) {
                     Style::default()
                         .fg(theme::ERROR)
                         .add_modifier(Modifier::CROSSED_OUT)
@@ -2792,7 +2792,7 @@ impl App {
                 } else {
                     Style::default().fg(theme::DIM)
                 };
-                let suffix = if cand.worktree_exists {
+                let suffix = if cand.worktree_exists != Some(false) {
                     String::new()
                 } else {
                     "  (worktree gone)".to_string()

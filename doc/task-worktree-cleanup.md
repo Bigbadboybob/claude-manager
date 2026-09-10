@@ -17,6 +17,8 @@ Workspaces the viewer creates for adopted agent sessions close automatically whe
 
 The policy applies to newly adopted workspaces after the viewer update. Older empty headers without the saved policy can be closed with **Alt+Shift+w → Keep worktrees**; there is no need to delete the task or its checkout. Existing legacy `agent:` workspace markers retain automatic cleanup. The viewer also reconciles marked empty workspaces after task updates, protecting the currently focused workspace during that sweep.
 
+Automatic closure never submits a reap request. The scheduled reaper still applies its usual seven-day retention and task/activity protections; an unfinished triage task keeps its checkout. For immediate cleanup later, **Alt+Shift+O** opens past workspaces. Reopen the workspace, then use **Alt+d → Reap this task + descendants** once that task is finished. Reopening returns bound Done tasks to Running and can resume designated designer sessions; restoring other closed sessions is optional. Cloud paths are not checked on the laptop or falsely labelled gone: the owning host validates them when launching sessions or previewing cleanup. A missing local worktree still blocks reopening.
+
 Task completion previews the owning host and other configured remote hosts,
 so CM children created on a different worker host can be included. A remote
 task does not include the laptop's retained migration copies. A workspace-only

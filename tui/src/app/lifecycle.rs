@@ -674,8 +674,9 @@ impl App {
 
     /// Reopen a past workspace by id: flip `is_closed` back to false and
     /// PATCH any bound done tasks back to `running` so the workspace
-    /// re-enters the active sidebar. Refuses gracefully when the worktree
-    /// directory is gone (manually deleted or `git worktree remove`'d).
+    /// re-enters the active sidebar. Refuses when a local worktree is gone;
+    /// remote paths are validated by their owning host at launch/cleanup,
+    /// never against the viewer's filesystem or via blocking SSH here.
     /// Returns true on success — callers in modal mode use it to close
     /// the picker only when the reopen actually went through.
     pub(super) fn reopen_workspace_by_id(&mut self, ws_id: &str) -> bool {
@@ -685,7 +686,7 @@ impl App {
         };
         let worktree_path = self.workspaces[wi].worktree_path.clone();
         match worktree_path.as_deref() {
-            Some(p) if p.exists() => {}
+            Some(_) if self.workspaces[wi].local_worktree_exists() != Some(false) => {}
             Some(p) => {
                 self.set_status_msg(&format!(
                     "Worktree gone: {} — can't reopen",

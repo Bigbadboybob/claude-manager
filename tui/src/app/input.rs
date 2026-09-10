@@ -271,15 +271,15 @@ pub(super) enum InputMode {
     },
 }
 
-/// Snapshot of a past workspace surfaced in the A-O picker. `worktree_exists`
-/// is checked at modal-open time so the row can be greyed/disabled when the
-/// directory has been removed since close.
+/// Snapshot of a past workspace surfaced in the A-O picker. Local paths
+/// are checked at modal-open time; remote existence remains unknown so
+/// cloud workspaces are not labelled gone based on the laptop filesystem.
 #[derive(Clone, Debug)]
 pub struct PastCandidate {
     pub ws_id: String,
     pub display: String,
     pub worktree_path: Option<std::path::PathBuf>,
-    pub worktree_exists: bool,
+    pub worktree_exists: Option<bool>,
     /// Latest tombstone `exited_at` if any — used to sort most-recent first.
     pub last_exited_at: f64,
 }
@@ -2642,10 +2642,7 @@ impl App {
                     .iter()
                     .map(|t| t.exited_at)
                     .fold(0.0f64, f64::max);
-                let worktree_exists = ws
-                    .worktree_path
-                    .as_ref()
-                    .map_or(false, |p| p.exists());
+                let worktree_exists = ws.local_worktree_exists();
                 PastCandidate {
                     ws_id: ws.id.clone(),
                     display: ws.name.clone(),
@@ -4469,6 +4466,105 @@ mod yank_clipboard_tests {
             last_assistant_message_text(&ts, Path::new("/tmp/yankrepo"))
         });
         assert!(got.is_err());
+    }
+}
+
+#[cfg(test)]
+mod past_workspace_reopen_tests {
+    use super::*;
+
+    fn closed_workspace(host: &str, path: Option<PathBuf>) -> App {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.workspaces.clear();
+        app.tasks.clear();
+        app.workspaces.push(Workspace {
+            id: "ws-past-worker".into(),
+            name: "past-worker".into(),
+            is_closed: true,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: path,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::new(host),
+            color: None,
+            pinned: false,
+            sessions: vec![],
+            tombstones: vec![],
+        });
+        app
+    }
+
+    fn assert_picker_evidence(app: &mut App, expected: Option<bool>) {
+        app.open_past_workspace_picker();
+        let InputMode::PastWorkspacePicker { candidates, .. } = &app.input_mode else {
+            panic!("expected past-workspace picker");
+        };
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].worktree_exists, expected);
+    }
+
+    #[test]
+    fn remote_missing_on_viewer_can_reopen_without_restoring_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("only-on-sessions-host");
+        assert!(!path.exists());
+        let mut app = closed_workspace("sessions", Some(path));
+        app.auto_close_workspaces.insert("ws-past-worker".into());
+        app.workspaces[0].tombstones.push(SessionTombstone {
+            uid: "ts-closed-worker".into(),
+            managed_by_uid: Some("ts-parent".into()),
+            label: "worker".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            last_transcript_id: None,
+            worktree_path: None,
+            generation: 0,
+            exited_at: 1.0,
+        });
+        assert_picker_evidence(&mut app, None);
+        assert!(app.reopen_workspace_by_id("ws-past-worker"));
+        assert!(!app.workspaces[0].is_closed);
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+        assert!(matches!(app.input_mode, InputMode::Confirm {
+            action: ConfirmAction::RestoreTombstones { .. }, ..
+        }));
+        app.reap_spent_workspaces();
+        assert!(!app.workspaces[0].is_closed, "reopened focus survives auto-closure");
+    }
+
+    #[test]
+    fn local_missing_is_marked_gone_and_refuses_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = closed_workspace("local", Some(dir.path().join("removed")));
+        assert_picker_evidence(&mut app, Some(false));
+        assert!(!app.reopen_workspace_by_id("ws-past-worker"));
+        assert!(app.workspaces[0].is_closed);
+    }
+
+    #[test]
+    fn local_existing_can_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = closed_workspace("local", Some(dir.path().to_path_buf()));
+        assert_picker_evidence(&mut app, Some(true));
+        assert!(app.reopen_workspace_by_id("ws-past-worker"));
+        assert!(!app.workspaces[0].is_closed);
+    }
+
+    #[test]
+    fn remote_without_recorded_path_still_refuses_reopen() {
+        let mut app = closed_workspace("sessions", None);
+        assert_picker_evidence(&mut app, Some(false));
+        assert!(!app.reopen_workspace_by_id("ws-past-worker"));
+        assert!(app.workspaces[0].is_closed);
     }
 }
 

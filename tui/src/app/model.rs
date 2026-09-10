@@ -321,6 +321,19 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Local filesystem evidence for reopening. Remote paths are unknown
+    /// here: only the owning host can validate them during launch/cleanup.
+    /// A workspace without a recorded path cannot be reopened on any host.
+    pub(super) fn local_worktree_exists(&self) -> Option<bool> {
+        let Some(path) = self.worktree_path.as_ref() else {
+            return Some(false);
+        };
+        if self.host_id != cm_daemon::host_id::HostId::local() {
+            return None;
+        }
+        Some(path.exists())
+    }
+
     /// True when this workspace runs *in-place* — its working directory
     /// IS the main repo checkout (no dedicated git worktree, no
     /// `cm/<slug>` branch). The marker is `worktree_path == main_repo_path`
