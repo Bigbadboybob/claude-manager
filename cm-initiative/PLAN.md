@@ -265,3 +265,9 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   accepted documents and maintains the discussion guide. This completes the
   authorized research/proposal review, not the ongoing initiative. Existing
   owners and Owner's new-initiative/new-swarm checkpoints remain in force.
+
+- **2026-09-10 — Integration verification:** all 16 accepted PROPOSAL/NOTES
+  Git blobs match the integrated predictionTrading root `080256a08` exactly.
+  The discussion-guide changes through that root were personally read as well.
+  CM checks passed: 18 Markdown documents, no missing local link targets,
+  and clean diff whitespace. No runtime code, experiment or deployment here.
