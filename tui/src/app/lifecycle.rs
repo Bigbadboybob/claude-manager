@@ -3336,7 +3336,7 @@ impl App {
         attach_pending
     }
 
-    /// Kill-time close for an adoption-minted `agent: <label>` marker: the
+    /// Kill-time close for an adoption-created agent workspace: the
     /// moment its LAST agent-spawned session is removed (killed by its
     /// orchestrator, exited, gone on the daemon), soft-close the marker —
     /// don't wait for the ~5s `reap_spent_workspaces` sweep, and don't
@@ -3348,9 +3348,9 @@ impl App {
     /// killed perf-triage subtask session left its `agent: PERF-096 …`
     /// header on the sidebar until the subtask flipped Done.
     ///
-    /// Scoped by construction: only the `agent:` prefix (minted solely by
-    /// `resolve_adopt_workspace`; an A-e rename claims the workspace and
-    /// opts out), never cloud workspaces, never a marker that still has a
+    /// Scoped by saved adoption provenance (legacy `agent:` names also
+    /// qualify). A-e rename claims the workspace and opts out. Never close
+    /// pinned or cloud workspaces, a marker that still has a
     /// live row, never one with an attach still pending (see
     /// `attach_pending_ws_ids`). User-created workspaces — including
     /// deliberately empty local ones — are untouched. Returns true when
@@ -3360,11 +3360,7 @@ impl App {
         let Some(ws) = self.workspaces.get(wi) else {
             return false;
         };
-        if ws.is_closed
-            || ws.is_cloud
-            || !ws.name.starts_with("agent: ")
-            || !ws.sessions.is_empty()
-            || pending.contains(ws.id.as_str())
+        if !self.agent_workspace_can_close(ws) || pending.contains(ws.id.as_str())
         {
             return false;
         }
@@ -3378,6 +3374,11 @@ impl App {
         self.clamp_cursor();
         self.needs_redraw = true;
         true
+    }
+
+    fn agent_workspace_can_close(&self, ws: &Workspace) -> bool {
+        !ws.is_closed && !ws.is_cloud && !ws.pinned && ws.sessions.is_empty()
+            && (self.auto_close_workspaces.contains(&ws.id) || ws.name.starts_with("agent: "))
     }
 
     pub(super) fn reap_spent_workspaces(&mut self) {
@@ -3407,7 +3408,7 @@ impl App {
             if attach_pending.contains(ws.id.as_str()) {
                 continue;
             }
-            if Self::workspace_is_spent(ws, &self.tasks) {
+            if self.agent_workspace_can_close(ws) || Self::workspace_is_spent(ws, &self.tasks) {
                 self.workspaces[wi].is_closed = true;
                 changed = true;
             }
@@ -3430,7 +3431,7 @@ impl App {
     /// referenced by a tombstone's `task_id` — continuous tasks exempt from
     /// both edges, being perpetually `running` by design).
     fn workspace_is_spent(ws: &Workspace, tasks: &[TaskEntry]) -> bool {
-        if ws.is_cloud || ws.is_closed || !ws.sessions.is_empty() {
+        if ws.is_cloud || ws.is_closed || ws.pinned || !ws.sessions.is_empty() {
             return false;
         }
         // "It was used" evidence, which excludes a freshly-created empty
@@ -5935,6 +5936,7 @@ mod slice_12e_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6128,6 +6130,7 @@ remote_socket = "/remote/manager.sock"
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -8507,5 +8510,30 @@ mod spent_workspace_tests {
             app.workspaces[1].is_closed,
             "non-focused spent marker still reaped",
         );
+    }
+
+    #[test]
+    fn auto_close_sweep_spares_pin_focus_and_pending_attach() {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(), api_token: String::new(), gcp_project: String::new(),
+            gcp_zone: String::new(), repos: HashMap::new(),
+        });
+        app.workspaces.clear();
+        for name in ["finished-child", "pinned-child", "focused-child", "pending-child"] {
+            let w = ws(name);
+            app.auto_close_workspaces.insert(w.id.clone());
+            app.tasks.push(task(name, Some(&w.id), TaskStatus::Running));
+            app.workspaces.push(w);
+        }
+        app.workspaces[1].pinned = true;
+        app.cursor = Cursor::Workspace(2);
+        app.skipped_manifest_entries.insert(app.workspaces[3].id.clone(), vec![]);
+        app.reap_spent_workspaces();
+        assert!(app.workspaces[0].is_closed, "open task does not retain an empty worker wrapper");
+        assert!(!app.workspaces[1].is_closed);
+        assert!(!app.close_agent_marker_if_empty(1), "pin protects the exit path too");
+        assert!(!app.workspaces[2].is_closed);
+        assert!(!app.workspaces[3].is_closed);
+        assert_eq!(app.tasks.len(), 4);
     }
 }

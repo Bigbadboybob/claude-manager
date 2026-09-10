@@ -13,6 +13,10 @@ on that task's header. Plain Alt+w retains its existing close-session behavior.
 A workspace containing several tasks requires selecting a specific task before
 Alt+d; cleanup never guesses which one to complete.
 
+Workspaces the viewer creates for adopted agent sessions close automatically when their last session is removed, including workers whose tasks still await review or monitoring. The viewer saves this policy independently of workspace names, so plain labels such as `scraper-cohort-914e0fc2` work. Closure only hides the empty workspace: planning tasks, task bindings, Git worktrees, branches and transcript tombstones remain. A later worker on the same daemon workspace makes it visible again. User-created workspaces, pinned workspaces, live session rows and pending/offline attachments are protected. Renaming an adopted workspace claims it as a user workspace and turns off this automatic closure; pinning also keeps it visible.
+
+The policy applies to newly adopted workspaces after the viewer update. Older empty headers without the saved policy can be closed with **Alt+Shift+w → Keep worktrees**; there is no need to delete the task or its checkout. Existing legacy `agent:` workspace markers retain automatic cleanup. The viewer also reconciles marked empty workspaces after task updates, protecting the currently focused workspace during that sweep.
+
 Task completion previews the owning host and other configured remote hosts,
 so CM children created on a different worker host can be included. A remote
 task does not include the laptop's retained migration copies. A workspace-only

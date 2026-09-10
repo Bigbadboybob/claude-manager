@@ -595,6 +595,10 @@ pub struct Manifest {
     /// renders under its parent's section) or renders loose.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub workspace_sections: HashMap<String, String>,
+    /// Viewer-created wrappers for adopted agent sessions. Closing an empty
+    /// wrapper preserves its tasks, checkout and transcript tombstones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_close_workspaces: Vec<String>,
 }
 
 /// One sidebar section (see `Manifest::sections`).
@@ -661,6 +665,7 @@ mod tests {
         let m: Manifest = serde_json::from_str(legacy).unwrap();
         assert!(m.sections.is_empty());
         assert!(m.workspace_sections.is_empty());
+        assert!(m.auto_close_workspaces.is_empty());
         // Empty sections serialize to nothing — legacy files stay byte-stable.
         let s = serde_json::to_string(&m).unwrap();
         assert!(!s.contains("sections"));
@@ -673,10 +678,12 @@ mod tests {
             folded: true,
         });
         m2.workspace_sections.insert("ws-a".into(), "sec-1".into());
+        m2.auto_close_workspaces.push("ws-a".into());
         let s = serde_json::to_string(&m2).unwrap();
         let back: Manifest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.sections, m2.sections);
         assert_eq!(back.workspace_sections.get("ws-a").map(String::as_str), Some("sec-1"));
+        assert_eq!(back.auto_close_workspaces, vec!["ws-a"]);
     }
 
     #[test]

@@ -121,6 +121,9 @@ impl App {
             task_colors: self.task_colors.clone(),
             sections: self.sections.clone(),
             workspace_sections: self.workspace_sections.clone(),
+            auto_close_workspaces: self.auto_close_workspaces.iter()
+                .filter(|id| self.workspaces.iter().any(|ws| &ws.id == *id))
+                .cloned().collect(),
         };
 
         let path = Self::manifest_path();
@@ -985,10 +988,18 @@ impl App {
                         sessions: Vec::new(),
                         tombstones: Vec::new(),
                     });
+                    if s.managed_by_uid.is_some() || s.continuous_task_id.is_some() {
+                        self.auto_close_workspaces.insert(new_id.clone());
+                    }
                     new_id
                 }
             }
         };
+        // A later follow-up session can reuse a soft-closed wrapper. Its
+        // stable daemon workspace id must become visible again on adoption.
+        if let Some(ws) = self.workspaces.iter_mut().find(|ws| ws.id == target_ws_id) {
+            ws.is_closed = false;
+        }
         (target_ws_id, worktree)
     }
 
@@ -1537,6 +1548,44 @@ mod adopt_daemon_session_tests {
         assert_eq!(app.resolve_adopt_workspace(&second, &host).0, "remote-ws");
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.workspaces[0].host_id, host);
+        assert!(!app.auto_close_workspaces.contains("remote-ws"), "operator launch is user-owned");
+    }
+
+    #[test]
+    fn auto_close_adopted_workspace_persists_and_reopens_for_followup() {
+        let _guard = crate::test_support::home_lock();
+        let cfg = || crate::config::Config {
+            api_url: String::new(), api_token: String::new(), gcp_project: String::new(),
+            gcp_zone: String::new(), repos: std::collections::HashMap::new(),
+        };
+        let mut app = App::new(cfg());
+        let host = cm_daemon::host_id::HostId::new("manager");
+        let mut worker = summary("worker", Some("triage-parent"));
+        worker.label = "scraper-cohort-914e0fc2".into();
+        worker.workspace_id = Some("auto-close-test-ws".into());
+        worker.worktree_path = Some("/remote/preserved-worktree".into());
+        let wid = app.resolve_adopt_workspace(&worker, &host).0;
+        let wi = app.workspaces.iter().position(|w| w.id == wid).unwrap();
+        assert!(app.auto_close_workspaces.contains(&wid));
+        assert_eq!(app.workspaces[wi].name, worker.label);
+        app.sessions_restored = true;
+        assert!(app.close_agent_marker_if_empty(wi));
+        let disk = App::load_manifest();
+        assert!(disk.auto_close_workspaces.contains(&wid));
+        assert!(disk.workspaces[&wid].is_closed);
+        assert_eq!(disk.workspaces[&wid].worktree_path.as_deref(), Some(std::path::Path::new("/remote/preserved-worktree")));
+        let restored = App::new(cfg());
+        assert!(restored.auto_close_workspaces.contains(&wid), "provenance survives viewer restart");
+        worker.session_uid = "followup-worker".into();
+        assert_eq!(app.resolve_adopt_workspace(&worker, &host).0, wid);
+        assert!(!app.workspaces[wi].is_closed, "follow-up adoption reopens the same workspace");
+        app.apply_submit_action(crate::app::input::SubmitAction::SaveWorkspaceSettings {
+            workspace_id: wid.clone(), name: "keep this investigation".into(),
+            color: None, pinned: false, section: None,
+        });
+        assert!(!app.auto_close_workspaces.contains(&wid), "rename claims the wrapper");
+        assert!(!app.close_agent_marker_if_empty(wi));
+        assert!(!App::load_manifest().auto_close_workspaces.contains(&wid));
     }
 
     #[test]
