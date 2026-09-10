@@ -23,7 +23,7 @@ launched, and no candidate implementation or deployment is selected.
 
 | Effort | Responsible side | Work and output | Review / dependencies | Current status |
 |---|---|---|---|---|
-| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | Research task `59a67007-7a71-412a-87d4-bf535df42893` running; effective Fable runtime confirmation pending with coordinator |
+| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | Research task `59a67007-7a71-412a-87d4-bf535df42893` running; coordinator confirmed Fable 5.1 in transcript and child report |
 | Brainstorm useful CM swarm features | Initiative-Bridge, assisted by a bounded research subagent | Inspect existing capabilities and identify useful coordination improvements, with evidence of the gap and concrete discussion options | Incorporate candidate plans and SEJD feedback as they arrive; Owner selects later feature implementation | [First discussion draft](shared/cm-feature-ideas.md) read and reviewed by Initiative-Bridge; no implementation selected |
 | Learn from SEJD's coordinator | predictionTrading; Swarm-Gardener contacts SEJD-Coordinator | Ask what would help communication and swarming, capture concrete friction and useful feature/practice ideas in a feedback note | Preserve SEJD's current work and deliberate close Owner collaboration; bring transferable lessons to both sides | Feedback committed at predictionTrading `af7e3f732` and personally reviewed by Initiative-Bridge |
 
@@ -55,6 +55,15 @@ The
 also records production-baseline P&L improvement, backtest infrastructure, and
 organization of continuous tasks. These are seeds for investigation, not a
 selected implementation backlog. New platform expansion remains on hold.
+
+The P&L proposal must also account for the existing
+[execution improvement loop protocol](https://github.com/Bigbadboybob/predictionTrading/blob/cd7559d36/analysis/backtestIteration/PROTOCOL.md),
+adopted with Owner on 2026-08-24. That record deliberately chose a
+single-orchestrator loop rather than a continuous CM task and includes parity
+and realized-primary evaluation rules. Check its current status, ownership,
+and subsequent rulings before proposing a new arrangement. Compare compatible
+evolution with any proposed revision; this brainstorm does not migrate that
+loop, supersede its authority, or transfer SEJD/ES ownership.
 
 Swarm-Gardener reports that Owner pre-authorized this sequence after the direct
 brief is incorporated: preserve Owner's ideas; add the coordinator's ideas and
@@ -181,3 +190,7 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   personally reviewed those documents and the worker brief and checked the
   narrow RAG source claims. Runtime model confirmation is still pending; no
   candidate implementation or production swarm is selected.
+- **2026-09-10 — Follow-up:** Swarm-Gardener confirmed Fable 5.1 in the child's
+  transcript and channel report, recorded in predictionTrading `cd7559d36`.
+  Initiative-Bridge read those notes and the existing execution-loop protocol;
+  the P&L proposal must consider that precedent and its current authority.
