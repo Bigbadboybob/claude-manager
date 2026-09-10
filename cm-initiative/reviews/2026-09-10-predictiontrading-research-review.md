@@ -73,3 +73,21 @@ support tracking affected results; repeated approval requests support retaining
 the scope of existing Owner decisions. These are links between reported needs
 and discussion ideas, not evidence that a particular feature will solve them.
 SEJD's desired close Owner collaboration remains part of its intended operation.
+
+## Follow-up: refined list and source corrections
+
+Read `IDEAS.md`, `LIST-REVIEW.md`, `FINDINGS.md`, and `LANES.md` at
+predictionTrading `a83f8ddc3`. The eight topics are proposal-document assignments,
+with Owner ideas preserved, explicit collaboration, and a requirement to
+describe actual useful improvement rounds. They do not imply eight permanent
+swarms or a universal evidence-store prerequisite. Individual proposal reviews
+remain pending until their handoffs arrive.
+
+The corrected scorer-window claim is appropriately narrower than the initial
+raw brainstorm. I inspected `CompositeScorer.score_attribution` and
+`compute_temporal_fit_logit` at that revision: known publication times at or
+after movement start receive a rejecting temporal result. The shifted retrieval
+window therefore does not by itself prove unconditional post-move causal credit
+or an upward bias in reported explanation coverage. Retrieval omissions, wasted
+assessment, uncertain timestamps, and historical availability still need separate
+treatment. Use the corrected list review when drafting the proposals.

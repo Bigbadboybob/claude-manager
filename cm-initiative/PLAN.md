@@ -23,7 +23,7 @@ launched, and no candidate implementation or deployment is selected.
 
 | Effort | Responsible side | Work and output | Review / dependencies | Current status |
 |---|---|---|---|---|
-| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | Research task `59a67007-7a71-412a-87d4-bf535df42893` running; coordinator confirmed Fable 5.1 in transcript and child report |
+| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | Fable brainstorm and two independent list reviews complete; eight proposal-document tasks created, first group running |
 | Brainstorm useful CM swarm features | Initiative-Bridge, assisted by a bounded research subagent | Inspect existing capabilities and identify useful coordination improvements, with evidence of the gap and concrete discussion options | Incorporate candidate plans and SEJD feedback as they arrive; Owner selects later feature implementation | [First discussion draft](shared/cm-feature-ideas.md) read and reviewed by Initiative-Bridge; no implementation selected |
 | Learn from SEJD's coordinator | predictionTrading; Swarm-Gardener contacts SEJD-Coordinator | Ask what would help communication and swarming, capture concrete friction and useful feature/practice ideas in a feedback note | Preserve SEJD's current work and deliberate close Owner collaboration; bring transferable lessons to both sides | Feedback committed at predictionTrading `af7e3f732` and personally reviewed by Initiative-Bridge |
 
@@ -33,6 +33,44 @@ feature exploration, cross-project review, and the shared plan/index. Existing
 repository and session permissions still apply. Each research task gets bounded
 owned paths and records its task ID, base revision, session configuration, and
 result references when launched.
+
+## Proposal documents in progress
+
+The AI synthesis and two independent reviews retained the following eight
+document topics. This is the authorized research division; it does not select
+eight permanent swarms. Owner's O1–O7 list remains separate and preserved.
+Initiative-Bridge read the synthesis, reviews, findings, and
+[task roster](https://github.com/Bigbadboybob/predictionTrading/blob/a83f8ddc3/agent_docs/swarm-focused-design/LANES.md)
+at predictionTrading `a83f8ddc3`. Status below is that committed snapshot,
+reported at `2026-09-10T04:47:04Z`; the owning coordinator keeps the live roster.
+
+| Topic | Intended proposal | Snapshot status |
+|---|---|---|
+| P1 | Momentum detection through explanatory ingest and useful source coverage | Running |
+| P2 | Useful article follow-through, blocks, and appropriate non-trades | Running |
+| P3 | Production-baseline P&L improvement with bounded rounds | Created; follows first group |
+| P4 | Backtest fidelity, reliability, and useful completed comparisons | Created; follows first group |
+| P5 | Backtest speed and resource efficiency preserving workload and outcomes | Created; follows first group |
+| P6 | Useful timely delivery from existing sources | Running |
+| P7 | News-decision latency and cost while preserving useful outcomes | Created; uses earlier drafts |
+| P8 | Recurring initiatives and continuous-task organization | Created; uses earlier drafts and CM input |
+
+Each document must describe a plausible first improvement round and how it
+would help Owner's goal, not stop at evidence storage or instrumentation.
+Evaluation questions should improve decisions rather than make a new telemetry
+system an automatic prerequisite. Authors compare overlapping scopes and share
+findings and drafts: P1/P2, P3/P4/P5, P6 with P1, P7 with P2/P6, and P8 with P3
+and Initiative-Bridge. Read the
+[adopted list review](https://github.com/Bigbadboybob/predictionTrading/blob/a83f8ddc3/agent_docs/swarm-focused-design/LIST-REVIEW.md)
+for the specific evaluation and collaboration refinements.
+
+The configured worktree limit was reached after six isolated proposal trees.
+Swarm-Gardener keeps P7/P8 authors read-only in its checkout and writes their
+returned drafts itself; there are no shared worker writes, limit overrides, or
+unrelated worktree cleanup. Launch groups limit simultaneous document workers.
+This accommodation does not change the separate-worktree rule for independent
+implementation. Each committed candidate handoff still receives Initiative-Bridge's
+personal review before later Owner selection.
 
 ## predictionTrading candidate development
 
@@ -194,3 +232,8 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   transcript and channel report, recorded in predictionTrading `cd7559d36`.
   Initiative-Bridge read those notes and the existing execution-loop protocol;
   the P&L proposal must consider that precedent and its current authority.
+- **2026-09-10 — Proposal preparation:** Swarm-Gardener integrated the Fable
+  brainstorm, corrected unsupported source claims, synthesized AI ideas, and
+  obtained two independent list reviews. P1–P8 are retained as document topics
+  at `a83f8ddc3`; P1/P2/P6 are running. Initiative-Bridge read those records and
+  indexed them; individual proposal reviews await committed handoffs.
