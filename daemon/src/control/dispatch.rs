@@ -315,6 +315,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "list_tasks",
     "get_task",
     "list_initiatives",
+    "sidebar.list",
     "get_initiative",
     "backtest.result",
     "continuous.list",
@@ -415,6 +416,22 @@ pub fn dispatch_request(
         "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "sidebar.list" | "sidebar.assign" => {
+            if matches!(req.caller, Caller::Operator(_)) {
+                if let Err(resp) = require_operator(req, "Sidebar Operator calls require an authenticated Operator") {
+                    return DispatchOutcome::Done(resp);
+                }
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::sidebar::dispatch(&s, req))
+        }
+        "sidebar.publish" => {
+            if let Err(resp) = require_operator(req, "Sidebar publication is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::sidebar::dispatch(&s, req))
+        }
         // Explicit Owner attention is self-scoped and survives viewer disconnects.
         "notify_user" => {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -2487,6 +2504,9 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
         }
     };
     let snapshot_payload = serde_json::json!({
+        "sidebar_assignments": crate::sidebar::snapshot(state).map_err(|(_, e)| {
+            eprintln!("cm-daemon: {e}; sidebar requests unavailable in snapshot");
+        }).ok(),
         "owner_attention": owner_attention,
         "workspaces": state.workspaces,
         "bindings": state.bindings,

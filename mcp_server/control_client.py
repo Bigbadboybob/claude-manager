@@ -95,6 +95,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "ping",
     "notify_user",
     "owner_attention.ack",
+    "sidebar.list",
+    "sidebar.assign",
+    "sidebar.publish",
+    "worktree.cleanup",  # Operator-only; routing does not grant cleanup access.
     "snapshot.control",
     "session.list_transcripts",
     "start_session",
@@ -109,6 +113,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # TUI. Included for dispatch-surface alignment; no MCP tools expose them.
     "task.register_agent_subtask",
     "session.revive",
+    "session.resume",  # Alias of add_session; same Operator gate.
     # Operator-only daemon lifecycle/configuration RPCs. Routing does not
     # grant access: the daemon retains each method's authorization gates.
     "daemon.health",

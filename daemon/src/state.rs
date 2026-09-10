@@ -1144,6 +1144,7 @@ impl DaemonState {
             task_colors: HashMap::new(),
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         }
     }

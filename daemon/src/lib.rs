@@ -71,6 +71,7 @@ pub mod mcp_config;
 pub mod migrate;
 pub mod notify;
 pub mod owner_attention;
+pub mod sidebar;
 pub mod path;
 pub mod planning_client;
 pub mod reader_gate;

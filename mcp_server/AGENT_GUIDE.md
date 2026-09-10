@@ -58,3 +58,12 @@ hook-bypassed creation, register the inspected parent link with
 `python3 ~/.cm/worktree-tools/worktree_lineage.py register /absolute/child /absolute/parent`.
 Jobs survive viewer disconnects and record results under
 `~/.cm/worktree-cleanup/`. Details: `doc/task-worktree-cleanup.md` in CM.
+
+Work-sidebar organization: `list_sidebar_sections` shows Owner's latest published
+subsections and caller-visible workspace choices. `set_session_section(section,
+session_id=None)` queues a move of the whole workspace (CM session UID; omitted
+means self). Use a section ID/unique exact name, `auto` for parent inheritance, or
+`none` for explicitly ungrouped. Normal session-control scope applies to all live
+workspace members. Delivery survives an offline viewer; check the observed receipt
+after reconnect, and do not claim a queued request was rendered. This is separate
+from planning initiatives. See `doc/sidebar-sections.md`.

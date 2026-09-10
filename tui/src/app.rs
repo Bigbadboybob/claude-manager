@@ -31,6 +31,7 @@ use cm_daemon::worktree;
 mod backtests;
 use backtests::*;
 mod sections;
+mod sidebar_remote;
 use sections::*;
 mod model;
 use model::*;
@@ -359,6 +360,9 @@ pub struct App {
     /// out to loose). Absent = inherit through the task tree. Persisted as
     /// `Manifest::workspace_sections`.
     pub(crate) workspace_sections: HashMap<String, String>,
+    pub(crate) sidebar_receipts: HashMap<String, cm_daemon::sidebar::Receipt>,
+    pub(crate) sidebar_retry_at: Instant,
+    pub(crate) sidebar_pending: HashMap<(cm_daemon::host_id::HostId, String), cm_daemon::sidebar::Assignment>,
     /// Adopted agent workspace ids, persisted independently of display names.
     pub(crate) auto_close_workspaces: HashSet<String>,
     /// Cloud backtest runs, rendered in the continuous panel's `backtests`
@@ -931,6 +935,9 @@ impl App {
             task_colors,
             sections,
             workspace_sections,
+            sidebar_receipts: manifest.sidebar_receipts.clone(),
+            sidebar_pending: HashMap::new(),
+            sidebar_retry_at: Instant::now(),
             auto_close_workspaces,
             backtest_rows: Vec::new(),
             backtests_folded: false,

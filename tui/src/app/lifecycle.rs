@@ -1483,6 +1483,7 @@ impl App {
     pub(crate) fn push_state_to_daemon(&self) {
         self.push_task_tree_to_daemon();
         self.push_tui_sessions_to_daemon();
+        self.push_sidebar_to_daemon();
         // 10d-2c-2-1: workflow definitions are static after TOML
         // load, but bundling the push here is the simplest way to
         // ensure they reach the daemon at least once during the
@@ -6000,6 +6001,7 @@ mod slice_12e_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
@@ -6194,6 +6196,7 @@ remote_socket = "/remote/manager.sock"
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
         std::fs::write(

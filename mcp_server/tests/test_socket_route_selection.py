@@ -894,9 +894,10 @@ class DaemonMethodsAlignmentTests(unittest.TestCase):
         # Only arms inside the dispatch_request match — they all
         # have the same `        "..." =>` indentation prefix.
         import re
-        arms = re.findall(r'^\s{8}"([a-zA-Z0-9_.]+)"\s*=>', content, re.MULTILINE)
-        # `_` => is the catch-all; not a method name.
-        dispatch_methods = {m for m in arms if m and not m.startswith("_")}
+        content = content.split("pub fn dispatch_request(", 1)[1].split("\nfn ", 1)[0]
+        arms = re.findall(r'^\s{8}((?:"[a-zA-Z0-9_.]+"\s*(?:\|\s*)?)+)=>', content, re.MULTILINE)
+        # Rust or-patterns dispatch every named method, not just single arms.
+        dispatch_methods = {m for arm in arms for m in re.findall(r'"([a-zA-Z0-9_.]+)"', arm)}
         # The set must match exactly when we fold in the
         # deliberate divergences. If the daemon adds a method,
         # update DAEMON_METHODS; if a method is removed from
