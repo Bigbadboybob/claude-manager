@@ -161,21 +161,58 @@ that combination with `Permission overrides are not supported when resuming a
 remote task.` This distinction is about Codex's frontend transport, not which
 machine hosts the checkout or where the original transcript was created.
 
-Fresh launches retain CM's existing YOLO policy. Resume argv adds no CM
-permission override to either the frontend or backend. The shared launcher
-also removes the legacy flag from older viewer/daemon argv, so updating the
-host launcher repairs their next resume without restarting other sessions.
-Codex resolves permissions: in 0.154, a new backend restores the saved approval
-policy while resolving sandbox policy from its current host configuration.
-CM does not rewrite stored transcripts or reconstruct permission profiles.
+Without an explicit CM host policy, fresh launches retain the existing YOLO
+behavior and resumes inherit saved approval/current host sandbox settings.
+The launcher removes the legacy resume flag from older viewers and daemons.
+In 0.154, a new backend can restore saved `never` approval while resolving a
+restricted, network-disabled sandbox from host defaults. That combination
+rejects approval-required tools and can unexpectedly constrain resumed work.
+
+Owner's cloud hosts opt into this policy in `~/.cm/codex-permissions.json`:
+
+```json
+{"mode":"full-access-auto-review"}
+```
+
+The shared launcher applies `approvalPolicy=on-request`,
+`approvalsReviewer=auto_review`, and the `:danger-full-access` permission profile
+to thread start/resume/fork RPCs, with matching backend defaults. It sends no
+permission flag to the remote terminal frontend. This covers fresh work, A-R,
+the resume picker, startup restore and continuous-task launches on that host.
+Normal turns and native notification wakeups inherit the effective thread
+settings. User changes during the running conversation remain in effect; a
+new launch or frontend resume reapplies the configured host policy.
+
+Full access allows local filesystem and command-network access. `on-request`
+allows tools requiring approval to reach automatic review; `never` would reject
+them. Automatic review can still deny an action, and browser/MCP service access
+and managed requirements retain their own checks. CM does not fabricate approval
+responses or change its own session-control grants. An invalid policy file
+refuses launch; removing the file restores the previous launch behavior.
+
+Existing loaded threads can be repaired without restarting their processes:
+connect to their existing owning app-server, verify the ID in
+`thread/loaded/list`, and call `thread/settings/update` with `threadId` and the
+three policy fields above. Wait for `thread/settings/updated` before verifying;
+the RPC acknowledgment precedes application of the update. Settings broadcasts
+refresh the normal remote terminal frontend. An in-flight turn keeps its
+captured approval/sandbox policy; the next user turn or scheduled wake gets the
+repair. Do not start a second app-server writer or edit rollout JSONL to repair
+permissions. Record the prior settings for rollback and verify model, identity
+and process continuity.
 
 The isolated real-client regression is
 `mcp_server/tests/integration_codex_resume.py` (requires aiohttp, pyte and
 websockets). It uses a private HOME, a local mock model, and disposable PTYs;
 `--legacy-argv` exercises an older viewer and `--fresh` verifies fresh YOLO
 behavior. The default verifies resumed identity, history, a completed next
-turn, and restrictive permissions. `--legacy-argv --expect-rejection` records
-the original error against a pre-fix checkout.
+turn, and restrictive permissions on a host without this opt-in.
+`--cm-policy` verifies restoration from saved `never`/read-only state to full
+access with automatic review, including a native notification wake;
+`--live-repair` verifies settings broadcast adoption by the existing terminal
+and actual network access plus writes outside the workspace.
+`--legacy-argv --expect-rejection` records the original error against a pre-fix
+checkout.
 
 [OpenAI's plugin documentation](https://learn.chatgpt.com/docs/plugins) says
 to start a new Codex session after installing plugins. `A-R` restarts the

@@ -6,6 +6,13 @@ Fresh work uses the configured default host (`sessions`); launch dialogs also
 allow explicit local execution. Existing workspaces retain their owning host.
 Continuous orchestrators remain on `manager`.
 
+Owner's cloud hosts enable `~/.cm/codex-permissions.json` with
+`{"mode":"full-access-auto-review"}` for Codex: full filesystem/network access
+and automatic review of approval-required tools. This policy covers fresh and
+resumed sessions, including continuous workers. `approval_policy=never` rejects
+tools that need approval; it does not automatically approve them. See
+[Codex permissions and live repair](doc/messaging/NATIVE_NOTIFICATIONS.md#codex-restart-permissions-cli-0154).
+
 ## Repository workflow
 
 Work on branches and merge tested changes directly into `main`. Owner does not use pull requests in this repository; do not create them.

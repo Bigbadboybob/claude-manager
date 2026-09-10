@@ -35,10 +35,40 @@ from mcp_server.notifications import (
 )
 
 
+def launch_permissions():
+    """Optional operator-owned policy for CM starts/resumes on this host.
+
+    Keeping this opt-in preserves intentionally restricted sessions on other
+    installations. Codex still validates its managed requirements normally.
+    """
+    path = Path.home() / ".cm" / "codex-permissions.json"
+    try:
+        policy = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    if policy != {"mode": "full-access-auto-review"}:
+        raise ValueError(f"unsupported CM Codex permissions in {path}")
+    return {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "auto_review",
+        "permissions": ":danger-full-access",
+    }
+
+
+def apply_launch_permissions(params, policy):
+    """Set explicit thread policy, without conflicting legacy sandbox fields."""
+    if policy is None:
+        return params
+    params = dict(params)
+    params.pop("sandbox", None)
+    params.update(policy)
+    return params
+
+
 class Relay:
     engine = "codex"
 
-    def __init__(self, socket: str, queue: Queue):
+    def __init__(self, socket: str, queue: Queue, permissions=None):
         self.socket = socket
         self.queue = queue
         self.upstream = None
@@ -58,6 +88,7 @@ class Relay:
         self.identity_revision = 0
         self.selecting = set()
         self.report_tasks = set()
+        self.launch_permissions = permissions
 
     def identity(self):
         return {
@@ -290,6 +321,10 @@ class Relay:
                     for request in list(self.server_requests.values()):
                         await ws.send(json.dumps(request))
                 if "id" in message and method:
+                    if method in {"thread/start", "thread/resume", "thread/fork"}:
+                        message["params"] = apply_launch_permissions(
+                            message.get("params", {}), self.launch_permissions
+                        )
                     self.requests[request_id] = method
                     if method in {
                         "thread/start",
@@ -372,7 +407,7 @@ class Relay:
         await asyncio.gather(*self.report_tasks, return_exceptions=True)
 
 
-def split_args(args):
+def split_args(args, permissions=None):
     """CM-generated embedded argv -> backend configuration + remote UI intent."""
     args = list(args)
     resume = None
@@ -392,7 +427,7 @@ def split_args(args):
             # inherit its stored permissions: Codex 0.154 rejects this flag.
             # Older viewers/daemons still send it, so normalize at the shared
             # launcher too, without injecting a backend permission override.
-            if resume is None:
+            if resume is None and permissions is None:
                 backend.extend(
                     [
                         "-c",
@@ -410,6 +445,15 @@ def split_args(args):
             raise ValueError(f"unsupported CM Codex launch argument: {arg}")
     if resume:
         frontend.extend(["resume", resume])
+    if permissions is not None:
+        # The remote resume frontend rejects permission flags. Set the backend
+        # defaults and explicit thread RPC instead; never send the YOLO flag
+        # that would override on-request with never again.
+        backend.extend([
+            "-c", 'approval_policy="on-request"',
+            "-c", 'approvals_reviewer="auto_review"',
+            "-c", 'sandbox_mode="danger-full-access"',
+        ])
     return backend, frontend
 
 
@@ -449,7 +493,8 @@ async def launch(args):
     ):
         os.environ.pop(key, None)
     queue = Queue.own()
-    backend_args, frontend_args = split_args(args.codex_args)
+    permissions = launch_permissions()
+    backend_args, frontend_args = split_args(args.codex_args, permissions)
     binary = os.environ.get("CM_CODEX_BIN", "codex")
     backend = frontend = relay = consumer = None
     stop = asyncio.Event()
@@ -488,7 +533,7 @@ async def launch(args):
                 raise RuntimeError(
                     f"Codex app-server startup timed out; see {log_path}"
                 )
-            relay = Relay(backend_socket, queue)
+            relay = Relay(backend_socket, queue, permissions)
             await relay.connect()
             async with unix_serve(
                 relay.serve_frontend,
