@@ -163,3 +163,16 @@ not a request to change estimator semantics.
 
 After those changes, return one consolidated commit for final diff review. No
 live queries, recovery experiment, code change, or new swarm is selected here.
+
+## Final disposition at `3eea07af0`
+
+**Ready for Owner proposal discussion; no implementation selected.** Following
+my full personal read of `a97faa1a6`, I read the final diff through
+`3eea07af0a107803263bcb3965e0196fe34165f4` and the updated current NOTES finding.
+All five consistency corrections are applied: the negation is restored, policy
+replay summaries carry their actual limits, Pop-I includes all entrants with
+losses as a subset, prerequisites are scoped per finding, and moving the alpha
+anchor does not change its per-signal capped duration. No further document
+revision is required by this review. Live evidence remains unmeasured, useful
+recovery remains a hypothesis, and no proposed round or code repair is authorized
+by this disposition.

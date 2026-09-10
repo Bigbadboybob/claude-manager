@@ -23,7 +23,7 @@ launched, and no candidate implementation or deployment is selected.
 
 | Effort | Responsible side | Work and output | Review / dependencies | Current status |
 |---|---|---|---|---|
-| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | All eight proposal authors launched; P1/P6 ready for Owner discussion; remaining personal reviews and revisions in progress |
+| Find work suited to swarms | predictionTrading; Swarm-Gardener coordinates the Fable brainstorm, reviews, and collaborative proposal tasks | Preserve Owner ideas separately; investigate, synthesize AI ideas, review/refine, then write one document per refined idea | Direct Owner brief received; sequence below pre-authorized for research/proposals; Initiative-Bridge personally reviews candidate documents | All eight proposal authors launched; P1/P2/P6 ready for Owner discussion; remaining personal reviews and revisions in progress |
 | Brainstorm useful CM swarm features | Initiative-Bridge, assisted by a bounded research subagent | Inspect existing capabilities and identify useful coordination improvements, with evidence of the gap and concrete discussion options | Incorporate candidate plans and SEJD feedback as they arrive; Owner selects later feature implementation | [First discussion draft](shared/cm-feature-ideas.md) read and reviewed by Initiative-Bridge; no implementation selected |
 | Learn from SEJD's coordinator | predictionTrading; Swarm-Gardener contacts SEJD-Coordinator | Ask what would help communication and swarming, capture concrete friction and useful feature/practice ideas in a feedback note | Preserve SEJD's current work and deliberate close Owner collaboration; bring transferable lessons to both sides | Feedback committed at predictionTrading `af7e3f732` and personally reviewed by Initiative-Bridge |
 
@@ -49,12 +49,12 @@ coordinator keeps the live roster; these are proposal-development statuses.
 | Topic | Intended proposal | Snapshot status |
 |---|---|---|
 | P1 | Momentum detection through explanatory ingest and useful source coverage | Final `8bbfcd823` personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
-| P2 | Useful article follow-through, blocks, and appropriate non-trades | Revised `a97faa1a6` fully personally read; [bounded consistency corrections requested](reviews/2026-09-10-p2-article-follow-through-review.md#personal-rereview-of-a97faa1a6) before Owner discussion |
+| P2 | Useful article follow-through, blocks, and appropriate non-trades | Final `3eea07af0` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p2-article-follow-through-review.md#final-disposition-at-3eea07af0), no implementation selected |
 | P3 | Production-baseline P&L improvement with bounded rounds | Revised `e616b6dea` fully personally read; [CM revisions requested](reviews/2026-09-10-p3-production-pnl-review.md) |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Initial `efddc8bce` handed off; Swarm-Gardener requested revisions; personal review pending |
 | P5 | Backtest speed and resource efficiency preserving workload and outcomes | Initial `259cb6839` handed off; Swarm-Gardener requested revisions; personal review pending |
 | P6 | Useful timely delivery from existing sources | Final `136589a7e` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p6-source-reliability-review.md#final-disposition-at-136589a7e), no implementation selected |
-| P7 | News-decision latency and cost while preserving useful outcomes | Read-only author launched; coordinator is collecting full Markdown before committed handoff |
+| P7 | News-decision latency and cost while preserving useful outcomes | Full uncommitted draft personally read; [CM revisions requested](reviews/2026-09-10-p7-news-latency-cost-review.md); coordinator writes the consolidated handoff |
 | P8 | Recurring initiatives and continuous-task organization | Read-only author launched; CM consultation supplied; full committed handoff pending |
 
 Each document must describe a plausible first improvement round and how it
@@ -75,10 +75,10 @@ implementation. Each committed candidate handoff still receives Initiative-Bridg
 personal review before later Owner selection.
 
 The authors hand off consolidated commits after addressing both coordinators'
-comments and reconciling shared boundaries. P1 `8bbfcd823` and P6 `136589a7e`
-have passed personal review and are ready for Owner discussion. P2 `a97faa1a6` and P3 `e616b6dea` have now been fully personally read;
-bounded consistency and evidence-scope corrections are requested in their reviews. P4/P5 authors are revising in response to
-Swarm-Gardener; P7/P8 full text is being collected. These handoff statuses come
+comments and reconciling shared boundaries. P1 `8bbfcd823`, P2 `3eea07af0`, and P6 `136589a7e`
+have passed personal review and are ready for Owner discussion. P3 `e616b6dea`
+and P7's full uncommitted draft have been personally read, with revisions requested. P4/P5 revised commits are available for personal review; P8 consolidated text
+is being collected. These handoff statuses come
 from their authors and coordinator, not completed personal reads. No proposal
 has been selected for implementation.
 
