@@ -46,7 +46,7 @@ reported at `2026-09-10T04:47:04Z`; the owning coordinator keeps the live roster
 
 | Topic | Intended proposal | Snapshot status |
 |---|---|---|
-| P1 | Momentum detection through explanatory ingest and useful source coverage | Running |
+| P1 | Momentum detection through explanatory ingest and useful source coverage | Draft `e426f6885` personally reviewed; [revisions requested](reviews/2026-09-10-p1-momentum-coverage-review.md) before Owner selection |
 | P2 | Useful article follow-through, blocks, and appropriate non-trades | Running |
 | P3 | Production-baseline P&L improvement with bounded rounds | Created; follows first group |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Created; follows first group |
