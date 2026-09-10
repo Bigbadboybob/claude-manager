@@ -8,8 +8,8 @@ The charter and initial infrastructure setup were approved. Native initiative
 `d381971d-0668-4ac0-8483-bf4111f3ddc2` is active with both memberships approved.
 The [project map](PROJECTS.md) records native IDs and channels. [PLAN.md](PLAN.md)
 captures Owner's initial exploration directions and continuing interactive
-brainstorm; [SETUP.md](SETUP.md) records infrastructure and the pending sidebar
-subsection.
+brainstorm; [SETUP.md](SETUP.md) records infrastructure and sidebar
+grouping status.
 
 Initiative slug: `swarm-focused-design`.
 
@@ -266,6 +266,7 @@ to configure a scheduler or migrate existing continuous tasks.
 Owner approved the combined charter and initial setup on 2026-09-10. The
 initiative is active, both coordinator tasks are linked, onboarding docs are
 committed, and channels have pinned kickoffs and Owner membership. The laptop
-sidebar subsection remains pending in [SETUP.md](SETUP.md). Owner has now
+sidebar subsection is reported created; task grouping verification remains
+pending in [SETUP.md](SETUP.md). Owner has now
 authorized the initial research and brainstorming in [PLAN.md](PLAN.md); develop
 and review candidate plans interactively before selecting new swarms.

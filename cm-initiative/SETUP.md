@@ -1,27 +1,35 @@
 # Swarm Focused Design — Setup record
 
-Status: **Infrastructure established; laptop sidebar subsection pending**,
+Status: **Infrastructure established; subsection created, task grouping verification pending**,
 2026-09-10. The [charter](CHARTER.md) is approved. This document records
 infrastructure setup. The substantive, interactive work plan is [PLAN.md](PLAN.md).
 
 Owner's further review identified two omitted setup checks: Owner must belong
 to every chat and the existing tasks need a Work / Task sidebar subsection.
-Owner membership is now verified in all three channels. The subsection is
-pending because it belongs to the laptop viewer, which this cloud session has
-no supported interface to mutate. Earlier completion statements below record
-the narrower checks done before this correction.
+Owner membership is verified in all three channels. Swarm-Gardener relayed
+that Owner created the laptop subsection and requested moving the scouts into
+it (message `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:f78d5126-3695-4e82-9b25-1cad0ae2ec59`).
+Coordinator/scout assignments have not been verified from this cloud session,
+which has no supported interface to mutate the live viewer grouping. Earlier
+completion statements below record the narrower checks done at their time.
 
 ## Remaining local sidebar step
 
 In the laptop TUI's **Work / Task sidebar**:
 
-1. Press **Alt+Shift+N** and create **Swarm Focused Design**.
+1. Select the existing **Swarm Focused Design** subsection; creation was
+   reported complete by Owner through Swarm-Gardener.
 2. Select **Swarm focused design CM**, press **Alt+E**, and set its **Section**
    field to **Swarm Focused Design**; save the form.
 3. Do the same for **Swarm focused design** on the predictionTrading side.
 
-Verify both tasks appear under this one subsection. Future child workspaces
-normally inherit their parent's section unless explicitly assigned elsewhere.
+Verify both coordinator tasks and their scout workspaces appear under this
+subsection. Child workspaces inherit through loaded task ancestry unless an
+explicit section or **none** overrides inheritance; use **inherit** when the
+parent grouping is intended. Current source also resolves cloud workspaces
+through retained session task IDs before planning workspace bindings arrive.
+A missing loaded task record still prevents ancestry traversal, so a failure
+to appear does not by itself identify a cloud-specific bug.
 Native initiative membership and the coordinator glyph do not create this
 viewer-owned grouping. Current reference: [sidebar sections](../doc/sidebar-sections.md).
 
@@ -60,7 +68,7 @@ These are responsibilities within the existing coordinator tasks.
 | predictionTrading onboarding link | Swarm-Gardener | `agent_docs/swarm-focused-design-onboarding.md` in its existing worktree | Shared docs and initiative ID | Links identify the canonical charter, local role, shared artifact index, channels, and approval boundaries | Complete; `ae3724a69` pushed and reviewed |
 | Channels and kickoff | Initiative-Bridge; Swarm-Gardener joins shared and predictionTrading channels | Three channel paths above and channel references on native records | Plan approval; initiative and docs ready | Read back all channels, pinned kickoff, participant membership, and stored channel paths | Complete; pins and memberships verified |
 | Owner chat membership | Initiative-Bridge | Membership in all three channels | Channels created; Owner identity resolved | Owner appears in all three rosters | Complete; already joined by Owner, verified on review |
-| Work / Task sidebar subsection | Laptop viewer | One Swarm Focused Design subsection containing both existing task workspaces | Supported access to the laptop TUI | Both named tasks visible within the subsection | Pending local UI steps above |
+| Work / Task sidebar subsection | Laptop viewer | One Swarm Focused Design subsection containing both existing task workspaces | Supported access to the laptop TUI | Both named tasks visible within the subsection | Subsection creation reported complete; coordinator/scout grouping verification pending |
 
 ## Documents and shared artifacts
 

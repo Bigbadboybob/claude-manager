@@ -279,3 +279,10 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   verified `080256a08`. The coordinator reports 27 docs with no missing local
   link targets and a passing 13-test targeted gate. The sidebar subsection is
   still pending Owner's local UI step, as recorded in `SETUP.md`.
+
+- **2026-09-10 — Sidebar update relayed by Swarm-Gardener:** Owner created the
+  subsection and asked that coordinator to move its scouts into it. SETUP now
+  records creation complete by report, with coordinator/scout assignments still
+  unverified here. CM supplied the current inheritance path and explicit-none
+  override behavior; no writable laptop control route or inheritance defect
+  has been established, and no viewer file was changed.
