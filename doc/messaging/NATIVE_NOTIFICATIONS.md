@@ -152,6 +152,39 @@ frontend connects over a private Unix websocket relay. CM inserts
 connection. Server approval requests and human decisions pass through unchanged.
 Native receipts require the named `function_call_output` transcript item.
 
+### Codex restart permissions (CLI 0.154)
+
+`A-R`, startup restore and the resume picker keep the selected conversation.
+Both local and cloud CM launches use Codex's `--remote` frontend. A resume
+therefore omits `--dangerously-bypass-approvals-and-sandbox`: Codex 0.154 rejects
+that combination with `Permission overrides are not supported when resuming a
+remote task.` This distinction is about Codex's frontend transport, not which
+machine hosts the checkout or where the original transcript was created.
+
+Fresh launches retain CM's existing YOLO policy. Resume argv adds no CM
+permission override to either the frontend or backend. The shared launcher
+also removes the legacy flag from older viewer/daemon argv, so updating the
+host launcher repairs their next resume without restarting other sessions.
+Codex resolves permissions: in 0.154, a new backend restores the saved approval
+policy while resolving sandbox policy from its current host configuration.
+CM does not rewrite stored transcripts or reconstruct permission profiles.
+
+The isolated real-client regression is
+`mcp_server/tests/integration_codex_resume.py` (requires aiohttp, pyte and
+websockets). It uses a private HOME, a local mock model, and disposable PTYs;
+`--legacy-argv` exercises an older viewer and `--fresh` verifies fresh YOLO
+behavior. The default verifies resumed identity, history, a completed next
+turn, and restrictive permissions. `--legacy-argv --expect-rejection` records
+the original error against a pre-fix checkout.
+
+[OpenAI's plugin documentation](https://learn.chatgpt.com/docs/plugins) says
+to start a new Codex session after installing plugins. `A-R` restarts the
+process and resumes its existing conversation; that documentation alone does
+not establish that every newly installed plugin will load into a resumed
+conversation. Use a fresh Codex session when the new plugin is still absent.
+
+### Conversation identity and recovery
+
 Successful durable `thread/start`, `thread/resume`, and `thread/fork` replies track
 the foreground conversation. Ephemeral title jobs and subagent threads are
 excluded. The daemon validates that the reported publisher is in the session's

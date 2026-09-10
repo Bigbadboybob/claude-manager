@@ -323,8 +323,11 @@ pub fn codex_args(
     let mut args: Vec<String> = Vec::new();
     if resume_session_id.is_some() {
         args.push("resume".into());
+    } else {
+        // Both local and cloud CM sessions use the native remote frontend.
+        // Codex resumes inherit saved permissions; overriding them is rejected.
+        args.push("--dangerously-bypass-approvals-and-sandbox".into());
     }
-    args.push("--dangerously-bypass-approvals-and-sandbox".into());
     // Disable codex's startup update check: when a new version is published,
     // accepting the popup tears down the TUI and exits with "Please restart
     // Codex", which inside our PTY looks like a blank/dead session.
@@ -620,6 +623,15 @@ mod tests {
         assert!(sid_pos > last_dash_c);
         // Workflow env present.
         assert!(args.iter().any(|a| a.contains(r#"CM_ROLE="manager""#)));
+        assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn codex_args_daemon_resume_inherits_saved_permissions() {
+        let args = codex_args(SpawnTarget::Daemon, "uid-x", None, Some("saved-id"));
+        assert_eq!(args.first().map(String::as_str), Some("resume"));
+        assert_eq!(args.last().map(String::as_str), Some("saved-id"));
+        assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
     }
 
     #[test]

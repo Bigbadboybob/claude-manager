@@ -774,8 +774,12 @@ pub fn build_args(
             // to rebind `transcript_path`.
             if resume_session_id.is_some() {
                 args.push("resume".into());
+            } else {
+                // The native launcher always uses Codex's remote frontend,
+                // including on a local CM host. Remote resumes reject CLI
+                // permission overrides and inherit the saved task's policy.
+                args.push("--dangerously-bypass-approvals-and-sandbox".into());
             }
-            args.push("--dangerously-bypass-approvals-and-sandbox".into());
             // Same update-check disable the TUI applies — prevents
             // codex's popup from tearing down the PTY.
             args.push("-c".into());
@@ -1739,6 +1743,7 @@ mod tests {
             "codex SESSION_ID must be the trailing positional: {:?}",
             args,
         );
+        assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
     }
 
     #[test]

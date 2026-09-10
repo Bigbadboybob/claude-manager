@@ -388,16 +388,20 @@ def split_args(args):
             backend.extend(args[index : index + 2])
             index += 2
         elif arg == "--dangerously-bypass-approvals-and-sandbox":
-            # Exactly CM's existing launch policy, applied to the backend.
-            backend.extend(
-                [
-                    "-c",
-                    'approval_policy="never"',
-                    "-c",
-                    'sandbox_mode="danger-full-access"',
-                ]
-            )
-            frontend.append(arg)
+            # Fresh sessions retain CM's launch policy. A remote resume must
+            # inherit its stored permissions: Codex 0.154 rejects this flag.
+            # Older viewers/daemons still send it, so normalize at the shared
+            # launcher too, without injecting a backend permission override.
+            if resume is None:
+                backend.extend(
+                    [
+                        "-c",
+                        'approval_policy="never"',
+                        "-c",
+                        'sandbox_mode="danger-full-access"',
+                    ]
+                )
+                frontend.append(arg)
             index += 1
         elif arg == "--no-alt-screen":
             frontend.append(arg)
