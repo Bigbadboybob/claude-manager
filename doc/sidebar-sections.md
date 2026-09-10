@@ -7,8 +7,9 @@ Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view)
 ## Agent tools: remote subsection assignment
 
 After installing the updated laptop TUI, open it once so it publishes its existing
-section catalogue to the configured daemons. Running agents do not need a
-restart; reconnect MCP to discover the new tools in an existing session.
+section catalogue to the configured daemons. The new tools appear on the next MCP connection. If your client cannot refresh
+its MCP connection in place, use the shell fallback below to keep the running
+agent session intact.
 
 ```python
 list_sidebar_sections()
@@ -49,6 +50,31 @@ unique exact section name. Use IDs when names are ambiguous or literally
 Section definitions, folding, appearance, and the saved layout remain owned by
 Owner's laptop viewer. This is not synchronization of independent viewers' layout
 preferences; use the normal Owner viewer as the publishing layout.
+
+### Existing agents with a cached MCP tool list
+
+The installed daemon RPCs also work from an existing agent's shell. Run on the
+agent's owning cloud host (`cm-sessions` or `cm-manager`), using **your own CM UID
+returned by `ping`** for the caller. Some Codex shell tool environments omit CM's
+environment variables even though the MCP connection has them, so supply the
+caller UID and host-local socket explicitly:
+
+```bash
+CM_TUI_SESSION_ID='<your own UID from ping>' \
+CM_DAEMON_SOCKET="$HOME/.cm/daemon.sock" \
+PYTHONPATH=/opt/cm-daemon python3 - <<'PYCODE'
+import json
+from mcp_server.control_client import call
+print(json.dumps(call("sidebar.list", {}), indent=2))
+# After resolving the destination and the target CM session UID:
+# print(call("sidebar.assign", {"session_id": "<scout UID>", "section": "<section ID>"}))
+PYCODE
+```
+
+This sends the same Session-caller RPC as the new tools, with the same scope
+checks and queued/observed semantics. Put the **target** UID in `session_id`,
+never in the caller environment. No Operator token or agent restart is needed.
+An updated viewer must still connect once to publish its existing catalogue.
 
 ### Delivery and recovery
 
