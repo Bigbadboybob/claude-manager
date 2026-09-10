@@ -45,7 +45,7 @@ import tomllib
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -121,6 +121,7 @@ class TaskFacts:
     branch: str | None
     repo_url: str | None
     updated_at: float | None
+    parent_task_id: str | None = None
 
     @property
     def protects(self) -> bool:
@@ -255,6 +256,9 @@ class ScanContext:
     worktree_kind: str = "manager"
     native_parents: dict[Path, NativeParentLink] = dataclasses.field(default_factory=dict)
     external_activity: dict[Path, tuple[float, ...]] = dataclasses.field(default_factory=dict)
+    immediate_paths: dict[Path, str] = dataclasses.field(default_factory=dict)
+    ownership: dict[Path, WorkspaceFacts] = dataclasses.field(default_factory=dict)
+    scope_guard: Callable[[ScanContext, Path], WorkspaceFacts] | None = None
     fetched_repos: dict[Path, bool] = dataclasses.field(default_factory=dict)
     landed_cache: dict[tuple[Path, str], LandedProof] = dataclasses.field(default_factory=dict)
 
@@ -396,6 +400,7 @@ def load_tasks(config_path: Path) -> tuple[dict[str, TaskFacts], bool, str | Non
                 branch=item.get("wip_branch") if isinstance(item.get("wip_branch"), str) else None,
                 repo_url=item.get("repo_url") if isinstance(item.get("repo_url"), str) else None,
                 updated_at=parse_timestamp(item.get("updated_at")),
+                parent_task_id=item.get("parent_task_id"),
             )
         return tasks, True, None
     except Exception as exc:  # noqa: BLE001 - fail closed and report the exact cause
@@ -1055,7 +1060,29 @@ def decision(
     if path.is_symlink() or not path.is_dir():
         return Decision(path, "block", "unsafe_path", False, details=("not a real directory",))
 
+    immediate = resolved in ctx.immediate_paths
+    if immediate:
+        try:
+            from scripts import worktree_lineage
+        except ModuleNotFoundError:
+            import worktree_lineage
+        try:
+            identity = worktree_lineage.checkout(resolved, create=False)
+            if identity['id'] != ctx.immediate_paths[resolved] or identity['primary']:
+                raise ValueError('checkout identity changed or primary checkout')
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return Decision(path, "protect", "checkout_identity_changed", False)
     workspace = ctx.workspaces.get(resolved, WorkspaceFacts())
+    extra = ctx.ownership.get(resolved)
+    if ctx.scope_guard:
+        try:
+            extra = ctx.scope_guard(ctx, resolved)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return Decision(path, "protect", "cleanup_scope_changed", False, details=(str(exc),))
+    if extra:
+        workspace = dataclasses.replace(workspace, task_ids=workspace.task_ids | extra.task_ids,
+            pinned=workspace.pinned or extra.pinned, continuous=workspace.continuous or extra.continuous)
+
     parent_link = ctx.native_parents.get(resolved)
     common: dict[str, Any] = {
         "workspace_ids": tuple(sorted(workspace.workspace_ids)),
@@ -1133,7 +1160,7 @@ def decision(
         return Decision(path, "block", "activity_unknown", False, **common)
     last_activity = max(activity)
     age_days = max(0.0, (ctx.now - last_activity) / DAY)
-    threshold = ctx.unowned_retention_days if unowned else ctx.retention_days
+    threshold = 0 if immediate else (ctx.unowned_retention_days if unowned else ctx.retention_days)
     below_retention_reason = "unowned_below_retention" if unowned else "below_retention"
     common.update(
         {
@@ -1744,6 +1771,17 @@ def reap_one(candidate: Decision, ctx: ScanContext, ledger: Path) -> tuple[bool,
             None,
         )
     size = candidate.size_bytes if candidate.size_bytes is not None else directory_size(candidate.path)
+    if ctx.scope_guard:
+        # Size scans/bundles can take time too. Revalidate scope and liveness at
+        # the final boundary, after all potentially long preservation work.
+        refresh_dynamic_state(ctx)
+        final = decision(candidate.path, ctx, refresh_processes=True)
+        if not final.eligible:
+            return False, f"final recheck changed to {final.reason}: {'; '.join(final.details)}", None
+        if final.archive_paths or final.reason in {"terminal_inactive_auto_commit", "unowned_inactive_auto_commit"}:
+            return False, "new unpreserved files appeared during cleanup; retained", None
+        if final.head != post_preserve.head or final.branch != post_preserve.branch:
+            return False, "checkout changed after preservation; retained", None
     if fresh.standalone_repo:
         try:
             shutil.rmtree(candidate.path)

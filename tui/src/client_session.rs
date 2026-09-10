@@ -635,6 +635,11 @@ pub(crate) fn rpc_continuous_control(daemon_socket: &Path, token: &str, method: 
     response.result.ok_or_else(|| anyhow::anyhow!("daemon returned no result"))
 }
 
+pub(crate) fn rpc_worktree_cleanup(socket: &Path, token: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let request = Request { id: next_request_id(), caller: Caller::operator(token), method: "worktree.cleanup".into(), params };
+    rpc_round_trip_with_read_timeout(socket, &request, Duration::from_secs(10))?.result.context("cleanup response missing result")
+}
+
 /// Catalog requests use the host's operator channel, independent of continuous tasks.
 pub(crate) fn rpc_catalog_control(
     socket: &Path, token: &str, method: &str, params: serde_json::Value,

@@ -44,3 +44,15 @@ acknowledge only the complete revision in that same scope. Channel admins/Owner
 can publish/revert with an expected revision; open editing allows other agents.
 No parent-channel inheritance or automatic wake on norms changes. See
 `doc/messaging/CHANNEL_NORMS.md` for the complete guide.
+
+## Worktree ownership and task cleanup
+
+Owner can choose **Reap this task + descendants** when completing a task in the
+work view (Alt+d). This preserves branches/WIP/artifacts and retains active,
+shared, pinned or continuous work. Raw `git worktree add` creation is tracked by
+a chained post-checkout hook. Keep inherited `CM_TUI_SESSION_ID`; do not replace
+the hook or guess historical ownership from branch ancestry. For intentionally
+hook-bypassed creation, register the inspected parent link with
+`python3 ~/.cm/worktree-tools/worktree_lineage.py register /absolute/child /absolute/parent`.
+Jobs survive viewer disconnects and record results under
+`~/.cm/worktree-cleanup/`. Details: `doc/task-worktree-cleanup.md` in CM.
