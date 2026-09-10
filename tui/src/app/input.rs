@@ -4131,7 +4131,9 @@ impl App {
                 if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
                     // An emptied name keeps the old one (matches the old
                     // rename-only behavior); color/pinned always apply.
-                    if !name.is_empty() {
+                    if !name.is_empty() && name != ws.name {
+                        // Renaming claims an adopted wrapper as a user workspace.
+                        self.auto_close_workspaces.remove(&workspace_id);
                         ws.name = name;
                     }
                     ws.color = color;

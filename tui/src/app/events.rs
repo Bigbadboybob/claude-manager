@@ -3539,6 +3539,32 @@ mod apply_manifest_diff_tests {
         assert_eq!(app.workspaces[0].tombstones.len(), 1, "history kept");
     }
 
+    #[test]
+    fn auto_close_plain_label_on_exit_preserves_task_and_history() {
+        let mut app = build_app_with_session("ts-auto-close");
+        app.workspaces[0].name = "scraper-health-4835143c".into();
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.workspaces[0].sessions[0].task_id = Some("triage-child".into());
+        let wid = app.workspaces[0].id.clone();
+        let worktree = app.workspaces[0].worktree_path.clone();
+        app.auto_close_workspaces.insert(wid.clone());
+        app.tasks.push(TaskEntry {
+            task_id: Some("triage-child".into()), name: "triage-child".into(),
+            api_status: TaskStatus::Blocked, repo_url: None, prompt: None,
+            wip_branch: None, session_id: None, blocked_at: None,
+            is_cloud: false, is_continuous: false, workspace_id: Some(wid.clone()),
+            project: None, parent_task_id: Some("triage-parent".into()),
+            worktree_mode: WorktreeMode::Inherit, metadata: None,
+        });
+        app.apply_manifest_diff(exit_diff("ts-auto-close"));
+        assert!(app.workspaces[0].is_closed);
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert_eq!(app.workspaces[0].worktree_path, worktree);
+        assert_eq!(app.workspaces[0].tombstones[0].uid, "ts-auto-close");
+        assert_eq!(app.tasks[0].api_status, TaskStatus::Blocked);
+        assert_eq!(app.tasks[0].workspace_id.as_ref(), Some(&wid));
+    }
+
     /// User-created workspaces are NOT closed by the kill-time path —
     /// the user owns their lifecycle (and empty local workspaces are a
     /// deliberate thing). Only the `agent:` prefix opts a workspace in.
@@ -5950,6 +5976,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6161,6 +6188,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6369,6 +6397,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6519,6 +6548,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6659,6 +6689,7 @@ pub(super) mod pending_workflow_events_tests {
             continuous_column_on: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),

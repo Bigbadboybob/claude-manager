@@ -359,6 +359,8 @@ pub struct App {
     /// out to loose). Absent = inherit through the task tree. Persisted as
     /// `Manifest::workspace_sections`.
     pub(crate) workspace_sections: HashMap<String, String>,
+    /// Adopted agent workspace ids, persisted independently of display names.
+    pub(crate) auto_close_workspaces: HashSet<String>,
     /// Cloud backtest runs, rendered in the continuous panel's `backtests`
     /// group instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
@@ -670,6 +672,9 @@ impl App {
         // manifest — otherwise we'd set workspace_id to a dangling id that
         // nothing resolves to.
         let known_ws_ids: HashSet<&String> = manifest.workspaces.keys().collect();
+        let auto_close_workspaces = manifest.auto_close_workspaces.iter()
+            .filter(|id| known_ws_ids.contains(id))
+            .cloned().collect();
         let manifest_bindings: HashMap<String, String> = manifest
             .bindings
             .iter()
@@ -926,6 +931,7 @@ impl App {
             task_colors,
             sections,
             workspace_sections,
+            auto_close_workspaces,
             backtest_rows: Vec::new(),
             backtests_folded: false,
             backtest_unfolded_fleets: HashSet::new(),
