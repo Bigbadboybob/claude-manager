@@ -168,14 +168,14 @@ In 0.154, a new backend can restore saved `never` approval while resolving a
 restricted, network-disabled sandbox from host defaults. That combination
 rejects approval-required tools and can unexpectedly constrain resumed work.
 
-Owner's cloud hosts opt into this policy in `~/.cm/codex-permissions.json`:
+Owner's cloud hosts opt into this policy in `~/.cm/codex-permissions.json` (updated 2026-09-10 to remove the automatic review step):
 
 ```json
-{"mode":"full-access-auto-review"}
+{"mode":"full-access-no-review"}
 ```
 
-The shared launcher applies `approvalPolicy=on-request`,
-`approvalsReviewer=auto_review`, and the `:danger-full-access` permission profile
+The shared launcher applies `approvalPolicy=never`,
+`approvalsReviewer=user`, and the `:danger-full-access` permission profile
 to thread start/resume/fork RPCs, with matching backend defaults. It sends no
 permission flag to the remote terminal frontend. This covers fresh work, A-R,
 the resume picker, startup restore and continuous-task launches on that host.
@@ -183,17 +183,12 @@ Normal turns and native notification wakeups inherit the effective thread
 settings. User changes during the running conversation remain in effect; a
 new launch or frontend resume reapplies the configured host policy.
 
-Full access allows local filesystem and command-network access. `on-request`
-allows tools requiring approval to reach automatic review; `never` would reject
-them. Automatic review can still deny an action, and browser/MCP service access
-and managed requirements retain their own checks. CM does not fabricate approval
-responses or change its own session-control grants. An invalid policy file
-refuses launch; removing the file restores the previous launch behavior.
+Full access allows local filesystem and command-network access. Configure each MCP server and app with `default_tools_approval_mode="approve"`, including any per-tool `approval_mode` overrides, before disabling review: `never` alone rejects tools that still request approval. The explicit `approve` policy authorizes tools directly, without invoking the review model. An MCP server entry in user config must include its transport (command/args or URL); a policy-only entry fails validation when CM previously supplied the transport only through launch arguments. Preserve session-specific environment values in the launch context; never copy one worker's identity into host config. Provider limits, service credentials and CM session-control grants remain independent. CM does not fabricate approval responses. An invalid host policy file refuses launch; removing it restores the previous launch behavior. The older `full-access-auto-review` mode remains supported for installations that intentionally want `on-request` plus `auto_review`.
 
 Existing loaded threads can be repaired without restarting their processes:
 connect to their existing owning app-server, verify the ID in
 `thread/loaded/list`, and call `thread/settings/update` with `threadId` and the
-three policy fields above. Wait for `thread/settings/updated` before verifying;
+three policy fields above. Use `config/batchWrite` with `reloadUserConfig=true` to apply tool approval settings to each owning backend before switching its thread policy. Wait for `thread/settings/updated` before verifying;
 the RPC acknowledgment precedes application of the update. Settings broadcasts
 refresh the normal remote terminal frontend. An in-flight turn keeps its
 captured approval/sandbox policy; the next user turn or scheduled wake gets the
@@ -201,14 +196,15 @@ repair. Do not start a second app-server writer or edit rollout JSONL to repair
 permissions. Record the prior settings for rollback and verify model, identity
 and process continuity.
 
-Older embedded Codex processes have no app-server settings endpoint. The
-noninterrupting fallback is their `/permissions` → **Approve for me** setting:
+Older embedded Codex processes have no app-server settings endpoint. Until their tool configuration has been reloaded, retain their previous `/permissions` → **Approve for me** setting:
 `on-request` plus `auto_review`, with the workspace sandbox retained. Network
 and outside-workspace commands can request automatically reviewed escalation.
 Verify the selection in the menu and leave the composer empty. This fallback
 does not provide unrestricted command access; the next normal CM restart/resume
 uses the configured full-access launcher. Do not force-restart a continuous
 orchestrator with pending work merely to remove its sandbox.
+
+Once their tool rules are loaded, **Full Access** removes the local review step. Their next normal CM restart/resume adopts the complete configured launcher policy. Preserve scheduler ownership when migrating continuous orchestrators; never start a competing writer or blindly restart pending work.
 
 The isolated real-client regression is
 `mcp_server/tests/integration_codex_resume.py` (requires aiohttp, pyte and

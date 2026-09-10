@@ -24,6 +24,11 @@ class CodexResumeArgsTests(unittest.TestCase):
                 "approvalPolicy": "on-request", "approvalsReviewer": "auto_review",
                 "permissions": ":danger-full-access",
             })
+            path.write_text(json.dumps({"mode": "full-access-no-review"}))
+            self.assertEqual(launch_permissions(), {
+                "approvalPolicy": "never", "approvalsReviewer": "user",
+                "permissions": ":danger-full-access",
+            })
             path.write_text('{"mode":"typo"}')
             with self.assertRaises(ValueError):
                 launch_permissions()
@@ -56,6 +61,18 @@ class CodexResumeArgsTests(unittest.TestCase):
         self.assertEqual(changed, {"threadId": "saved", "cwd": "/work", "model": "kept", **policy})
         self.assertEqual(original["sandbox"], "workspace-write")
         self.assertIs(apply_launch_permissions(original, None), original)
+
+    def test_no_review_resume_preserves_frontend_compatibility_and_full_access(self):
+        policy = {"approvalPolicy": "never", "approvalsReviewer": "user",
+                  "permissions": ":danger-full-access"}
+        backend, frontend = split_args(["resume", BYPASS, "--no-alt-screen", "saved-thread"], policy)
+        self.assertEqual(frontend, ["--no-alt-screen", "resume", "saved-thread"])
+        self.assertIn('approval_policy="never"', backend)
+        self.assertIn('approvals_reviewer="user"', backend)
+        self.assertNotIn('approvals_reviewer="auto_review"', backend)
+        self.assertIn('sandbox_mode="danger-full-access"', backend)
+        self.assertEqual(apply_launch_permissions({"threadId": "saved", "sandbox": "read-only"}, policy),
+                         {"threadId": "saved", **policy})
 
     def test_fresh_session_retains_yolo_on_backend_and_frontend(self):
         backend, frontend = split_args([BYPASS, "--no-alt-screen"])
