@@ -62,3 +62,21 @@ the CM provenance path, not a verdict on any run.
 Research input only. No default changed, new task filed, implementation selected,
 or deployment performed. P3/P4/P5 should incorporate the existing metadata path
 and keep runtime verification as a separately scoped future action.
+
+## Related P3 question: default runner module
+
+The same inspected CM source defaults to
+`analysis.backtests.backtest_actrader_grid` in Python
+(`mcp_server/server.py:3378`) and the daemon
+(`daemon/src/control/methods.rs:16057–16059`). The local `origin/main` snapshot
+`0f1f47a` also retains the Python default. The callable tool's description says
+"canonical grid runner" without identifying that module. This is not evidence
+of the loaded server's effective default.
+
+At predictionTrading source `91365cc40`, `git ls-tree` shows
+`analysis/backtests/backtest_production_grid.py` and no
+`analysis/backtests/backtest_actrader_grid.py`. Thus a submission that relies on
+the inspected CM default while checking out that PT revision names an absent
+module. An explicit `script` is already supported and recorded in task
+`metadata.backtest`; this is a concrete compatibility risk for omitted scripts,
+not evidence that existing submissions failed. No submission was performed.
