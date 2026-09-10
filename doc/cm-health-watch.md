@@ -32,7 +32,7 @@ an individual session failure does not prove that the whole pool is empty.
 
 The operator RPC checks daemon/holder health, missing configured task definitions,
 active-task holds/failures, and eligible idle work overdue by ten minutes. Consumer
-eligibility respects queue age and depth thresholds. Paused tasks stay paused.
+eligibility respects queue age and depth thresholds. The overdue grace starts after both queue eligibility and the scheduler's `next_fire_at`: old queued work must not trigger an alert during an intentional post-compaction delay or scheduler backoff. Work still waiting after that deadline plus the grace is overdue. Paused tasks stay paused.
 
 Migration observations correlate successful `report_done` audit events with their
 admission by sequence, session UID, and fire token. Handover-only cycles do not
