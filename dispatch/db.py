@@ -155,31 +155,10 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
         )
 
 
-async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
-                     project: str | None = None,
-                     initiative_id: str | None = None,
-                     include_archived: bool = False) -> list[dict]:
-    async with pool.acquire() as conn:
-        conditions = []
-        params = []
-        if status:
-            params.append(status)
-            conditions.append(f"status = ${len(params)}")
-        if project:
-            params.append(project)
-            conditions.append(f"project = ${len(params)}")
-        if initiative_id:
-            params.append(initiative_id)
-            conditions.append(f"initiative_id = ${len(params)}")
-        # Exclude archived rows by default: they're hidden in the TUI behind
-        # A-V and bloat the response (e.g. 262 of 431 rows / ~600KB) that the
-        # TUI re-fetches over a slow WAN. Callers needing them pass
-        # include_archived=True or filter explicitly by status='archived'.
-        if not include_archived and status != "archived":
-            conditions.append("status != 'archived'")
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        rows = await conn.fetch(
-            f"""SELECT t.*, i.slug AS initiative_slug, i.name AS initiative_name,
+# Shared SELECT for task rows: the task columns plus the embedded initiative
+# display object. Every reader that hands rows to clients (list, snapshot,
+# change delivery) must use the same shape.
+TASK_ROW_SELECT = """SELECT t.*, i.slug AS initiative_slug, i.name AS initiative_name,
                           i.status AS initiative_status, i.color AS initiative_color,
                           CASE WHEN i.id IS NULL THEN NULL ELSE
                             jsonb_build_object('id', i.id, 'slug', i.slug,
@@ -187,9 +166,9 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
                                                'color', i.color,
                                                'coordinator_task_id', i.coordinator_task_id) END AS initiative
                    FROM tasks t
-                   LEFT JOIN initiatives i ON i.id = t.initiative_id
-                   {where.replace('status', 't.status').replace('project', 't.project').replace('initiative_id', 't.initiative_id')}
-                   ORDER BY
+                   LEFT JOIN initiatives i ON i.id = t.initiative_id"""
+
+TASK_ROW_ORDER = """ORDER BY
                    CASE t.status
                        WHEN 'blocked' THEN 0
                        WHEN 'running' THEN 1
@@ -198,10 +177,162 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
                        WHEN 'done' THEN 4
                        WHEN 'archived' THEN 5
                    END,
-                   t.priority, t.created_at""",
-            *params,
-        )
-        return [_serialize(dict(r)) for r in rows]
+                   t.priority, t.created_at"""
+
+
+def _task_filter(status: str | None, project: str | None,
+                 initiative_id: str | None, include_archived: bool) -> tuple[str, list]:
+    """WHERE clause (already prefixed with `t.`) + params for the task readers."""
+    conditions = []
+    params: list = []
+    if status:
+        params.append(status)
+        conditions.append(f"t.status = ${len(params)}")
+    if project:
+        params.append(project)
+        conditions.append(f"t.project = ${len(params)}")
+    if initiative_id:
+        params.append(initiative_id)
+        conditions.append(f"t.initiative_id = ${len(params)}")
+    # Exclude archived rows by default: they're hidden in the TUI behind
+    # A-V and bloat the response (e.g. 262 of 431 rows / ~600KB) that the
+    # TUI re-fetches over a slow WAN. Callers needing them pass
+    # include_archived=True or filter explicitly by status='archived'.
+    if not include_archived and status != "archived":
+        conditions.append("t.status != 'archived'")
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    return where, params
+
+
+async def _fetch_tasks_conn(conn, status=None, project=None, initiative_id=None,
+                            include_archived=False) -> list[dict]:
+    where, params = _task_filter(status, project, initiative_id, include_archived)
+    rows = await conn.fetch(f"{TASK_ROW_SELECT} {where} {TASK_ROW_ORDER}", *params)
+    return [_serialize(dict(r)) for r in rows]
+
+
+async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
+                     project: str | None = None,
+                     initiative_id: str | None = None,
+                     include_archived: bool = False) -> list[dict]:
+    async with pool.acquire() as conn:
+        return await _fetch_tasks_conn(conn, status, project, initiative_id,
+                                       include_archived)
+
+
+# ---------------------------------------------------------------------------
+# Task change log (sql/016_task_changes.sql) — incremental task updates
+# ---------------------------------------------------------------------------
+
+def _matches_task_filter(task: dict | None, project: str | None,
+                         include_archived: bool) -> bool:
+    if task is None:
+        return False
+    if project is not None and task.get("project") != project:
+        return False
+    if not include_archived and task.get("status") == "archived":
+        return False
+    return True
+
+
+async def _change_meta_conn(conn) -> dict:
+    row = await conn.fetchrow(
+        """SELECT m.epoch, m.pruned_through,
+                  COALESCE(pg_sequence_last_value('task_changes_seq_seq'), 0) AS last_seq
+           FROM task_change_meta m"""
+    )
+    return dict(row)
+
+
+async def task_snapshot(pool: asyncpg.Pool, *, project: str | None = None,
+                        include_archived: bool = False) -> dict:
+    """Consistent full snapshot: ``cursor`` is read BEFORE the rows, so every
+    change with seq <= cursor is reflected in ``tasks`` (the rows may be newer,
+    which is harmless: later change rows re-deliver them idempotently)."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            meta = await _change_meta_conn(conn)
+            cursor = await conn.fetchval("SELECT COALESCE(max(seq), 0) FROM task_changes")
+            # Nothing logged yet (fresh log) — anchor on the sequence so a
+            # client cursor of 0 vs a real seq are distinguishable.
+            cursor = max(cursor, meta["pruned_through"])
+            tasks = await _fetch_tasks_conn(conn, project=project,
+                                            include_archived=include_archived)
+    return {"epoch": meta["epoch"], "cursor": cursor, "tasks": tasks}
+
+
+async def list_task_changes(pool: asyncpg.Pool, since: int, limit: int, *,
+                            project: str | None = None,
+                            include_archived: bool = False) -> dict:
+    """Changes strictly after ``since`` (at most ``limit`` log rows), collapsed to
+    one entry per task carrying its CURRENT row.
+
+    Returns ``{"epoch", "cursor", "changes", "more", "expired"}``. ``expired`` is
+    true when ``since`` predates retention (rows were pruned) or lies beyond the
+    sequence (a cursor from another lineage / a restored DB) — the caller must
+    resnapshot. Each change is ``{"seq", "task_id", "op", "task"}`` with
+    ``op == "upsert"`` (apply ``task``) or ``op == "remove"`` (the task was
+    deleted, or no longer matches the subscription filter, e.g. archived).
+    Ordering/idempotency: entries are in seq order; the current row is read
+    after the log page, so a delivered row is at least as new as ``cursor``.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            meta = await _change_meta_conn(conn)
+            if since < meta["pruned_through"] or since > meta["last_seq"]:
+                return {"epoch": meta["epoch"], "cursor": since, "changes": [],
+                        "more": False, "expired": True}
+            log = await conn.fetch(
+                "SELECT seq, task_id, op FROM task_changes WHERE seq > $1 "
+                "ORDER BY seq LIMIT $2",
+                since, limit + 1,
+            )
+            more = len(log) > limit
+            log = log[:limit]
+            if not log:
+                return {"epoch": meta["epoch"], "cursor": since, "changes": [],
+                        "more": False, "expired": False}
+            cursor = log[-1]["seq"]
+            # Collapse to the last log row per task, keeping seq order.
+            last_seq: dict[str, int] = {}
+            for r in log:
+                last_seq[str(r["task_id"])] = r["seq"]
+            ids = list(last_seq)
+            rows = await conn.fetch(
+                f"{TASK_ROW_SELECT} WHERE t.id = ANY($1::uuid[])", ids,
+            )
+    current = {str(r["id"]): _serialize(dict(r)) for r in rows}
+    changes = []
+    for task_id, seq in sorted(last_seq.items(), key=lambda kv: kv[1]):
+        task = current.get(task_id)
+        if _matches_task_filter(task, project, include_archived):
+            changes.append({"seq": seq, "task_id": task_id, "op": "upsert", "task": task})
+        else:
+            changes.append({"seq": seq, "task_id": task_id, "op": "remove", "task": None})
+    return {"epoch": meta["epoch"], "cursor": cursor, "changes": changes,
+            "more": more, "expired": False}
+
+
+async def prune_task_changes(pool: asyncpg.Pool, keep_seconds: float) -> int:
+    """Drop log rows older than ``keep_seconds`` and record the highest dropped
+    seq so cursors below it are reported expired. Returns rows deleted."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """WITH d AS (
+                       DELETE FROM task_changes
+                       WHERE changed_at < now() - ($1::float8 * interval '1 second')
+                       RETURNING seq)
+                   SELECT count(*) AS n, max(seq) AS max_seq FROM d""",
+                keep_seconds,
+            )
+            if not row["n"]:
+                return 0
+            await conn.execute(
+                "UPDATE task_change_meta SET pruned_through = GREATEST(pruned_through, $1)",
+                row["max_seq"],
+            )
+            return int(row["n"])
 
 
 # ---------------------------------------------------------------------------
