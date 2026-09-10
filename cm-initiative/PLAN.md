@@ -53,7 +53,7 @@ coordinator keeps the live roster; these are proposal-development statuses.
 | P3 | Production-baseline P&L improvement with bounded rounds | Running in isolated worktree, per `545c96a6f` roster |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Running in isolated worktree, per `545c96a6f` roster |
 | P5 | Backtest speed and resource efficiency preserving workload and outcomes | Running in isolated worktree, per `545c96a6f` roster |
-| P6 | Useful timely delivery from existing sources | Draft `0cf7013da` personally reviewed; [revisions requested](reviews/2026-09-10-p6-source-reliability-review.md) before Owner selection |
+| P6 | Useful timely delivery from existing sources | Consolidated `62f5eafa4` personally rereviewed; [three bounded wording fixes](reviews/2026-09-10-p6-source-reliability-review.md#rereview-of-consolidated-revision-62f5eafa4) remain before Owner discussion |
 | P7 | News-decision latency and cost while preserving useful outcomes | Coordinator reports launch in progress after `545c96a6f`; read-only author, coordinator writes |
 | P8 | Recurring initiatives and continuous-task organization | Created; uses earlier drafts and CM input |
 
@@ -74,12 +74,12 @@ This accommodation does not change the separate-worktree rule for independent
 implementation. Each committed candidate handoff still receives Initiative-Bridge's
 personal review before later Owner selection.
 
-Swarm-Gardener reports intermediate P1/P6 revisions at `6db9c0ab7` and
-`2274cc659`, with further corrections still underway. These are not accepted
-revisions. The authors will hand off consolidated commits after addressing both
-coordinators' comments and reconciling shared boundaries; Initiative-Bridge will
-review those commits personally. P2's intermediate revision `e9764a371` has
-already received that additional personal read and remaining requests.
+The authors hand off consolidated commits after addressing both coordinators'
+comments and reconciling shared boundaries. P6 `62f5eafa4` has been personally
+rereviewed and needs bounded wording fixes. P1 `1f9cc381e` is receiving further
+local review corrections before the next personal read. P2 `11ddf26ef` is newly
+handed off and awaits personal rereview; `e9764a371` is the last personally
+reviewed P2 revision. No proposal has been selected for implementation.
 
 ## predictionTrading candidate development
 

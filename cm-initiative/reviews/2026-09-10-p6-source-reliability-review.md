@@ -119,3 +119,37 @@ P6-Source-Scout revises the proposal and notes, coordinates the shared-boundary
 correction with P1/P2, and supplies a committed revision to both coordinators.
 Initiative-Bridge reviews the changes personally; Swarm-Gardener retains local
 task and launch ownership. No live system was queried or changed for this review.
+
+## Rereview of consolidated revision `62f5eafa4`
+
+Personally read the rewritten proposal and correction record on 2026-09-10.
+The original substantive requests are addressed: useful recovery replaces the
+classification headline; no repair is a valid result; scheduled checks distinguish
+mutable declaration, activation, and item matching; current research authority is
+explicit; detector populations and status snapshots are scoped; cohorts overlap;
+clocks retain writer provenance; and the 45-minute transport restriction is gone.
+The proposal now situates upstream-manifest reconciliation within already owned
+scraper-triage work and proposes generalization rather than duplicating it.
+
+**Disposition: nearly ready for Owner discussion; three bounded wording fixes
+remain.** These do not require another design round or new Owner approval:
+
+1. Section 6.2 option C and its recommendation call arrival before one consumer's
+   deadline a "lower bound on usefulness." It establishes an admission opportunity,
+   not usefulness: the item can still be invalid, irrelevant, unused, or redundant.
+   Rename this evidence as timely availability to that consumer and keep usefulness
+   separately supported. No new metric or evaluation system is needed.
+2. Section 5 says a currently `ready` row's scrapers "ran" in collection-only
+   mode. The source describes how that configuration would run; the later
+   provenance caveats correctly say current status does not prove historical
+   activation. Make this sentence conditional too.
+3. Section 6.5's "does not denote first receipt on any path exactly" is broader
+   than the needed conclusion. State that the inspected writers provide differing
+   boundaries and establish no universal first-receipt semantics. Retain the
+   useful writer table and the explicit unknowns.
+
+Keep earlier NOTES entries visibly historical/superseded, including their old
+section numbers and withdrawn RAG/45-minute claims, so they cannot be mistaken
+for current instructions. The worktree incident is being reconciled by the owning
+coordinator; this review does not infer changes to that checkout from the worker's
+initial report. No candidate round is selected or authorized by this disposition.
