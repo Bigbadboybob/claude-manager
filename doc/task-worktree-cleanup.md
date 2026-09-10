@@ -66,7 +66,10 @@ checkout to a task.
 Git can bypass post-checkout with `--no-checkout`, disabled/replaced hooks, or
 creation on an unconfigured host. Unattributed historical worktrees are left
 out of recursive cleanup. Hook conflicts are reported; CM does not overwrite
-an externally replaced or symlinked hook. After inspecting a missed checkout,
+an externally replaced or symlinked hook. Checkout-relative or checkout-local
+`core.hooksPath` hooks are also left unchanged; wrapping those would modify
+source files and would not reliably track new checkouts. Absolute shared custom
+hook directories can be chained. After inspecting a missed checkout,
 an operator/agent can explicitly register its creation parent on that host:
 
 ```bash

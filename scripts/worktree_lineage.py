@@ -167,6 +167,25 @@ def register(path: Path, parent: Path | None = None, task_ids=(), source='git-ho
 def install_hook(repo: Path) -> dict:
     """Chain the existing hook in place; never change core.hooksPath or bootstrap."""
     hook = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks/post-checkout'))
+    try:
+        configured = git(repo, 'config', '--get', 'core.hooksPath')
+    except subprocess.CalledProcessError:
+        configured = ''
+    # Relative hooks are re-resolved inside each new checkout, so wrapping one
+    # would neither track its children nor preserve a tracked hook's contents.
+    if configured and not Path(configured).is_absolute():
+        raise ValueError('leaving checkout-relative core.hooksPath unchanged; use explicit lineage registration')
+    common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+    top = Path(git(repo, 'rev-parse', '--show-toplevel')).resolve()
+    if hook.resolve().is_relative_to(top) and not hook.resolve().is_relative_to(common):
+        raise ValueError('leaving checkout-local hook unchanged; use explicit lineage registration')
+    if hook.exists():
+        try:
+            git(hook.parent, 'ls-files', '--error-unmatch', hook.name)
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise ValueError('leaving tracked hook unchanged; use explicit lineage registration')
     hook.parent.mkdir(parents=True, exist_ok=True)
     with locked(cm_home() / 'worktree-lineage' / ('hook-' + hashlib.sha256(str(hook).encode()).hexdigest() + '.lock')):
         if hook.is_symlink():

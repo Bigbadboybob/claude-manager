@@ -95,6 +95,46 @@ class CleanupTests(unittest.TestCase):
         after = lineage.records()[before['id']]
         self.assertEqual(before['parents'], after['parents'])
 
+    def test_checkout_local_hooks_are_not_modified_or_claimed_as_tracked(self):
+        hooks = self.repo / '.hooks'
+        hooks.mkdir()
+        hook = hooks / 'post-checkout'
+        original = '#!/bin/sh\nexit 0\n'
+        hook.write_text(original)
+        hook.chmod(0o755)
+        for configured in ('.hooks', str(hooks)):
+            with self.subTest(configured=configured):
+                self.git(self.repo, 'config', 'core.hooksPath', configured)
+                with self.assertRaisesRegex(ValueError, 'leaving checkout-'):
+                    lineage.install_hook(self.repo)
+                self.assertEqual(hook.read_text(), original)
+                self.assertFalse(hook.with_name('post-checkout.before-cm-lineage').exists())
+
+    def test_absolute_shared_custom_hook_directory_is_chained(self):
+        hooks = self.base / 'shared-hooks'
+        hooks.mkdir()
+        hook = hooks / 'post-checkout'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        hook.chmod(0o755)
+        self.git(self.repo, 'config', 'core.hooksPath', str(hooks))
+        lineage.install_hook(self.repo)
+        child = self.child('custom-hook-child')
+        row = next(r for r in lineage.records().values() if r['path'] == str(child))
+        self.assertIn(self.parent['id'], row['parents'])
+        self.assertIn(lineage.MARKER, hook.read_text())
+
+    def test_shared_hook_in_a_separate_dotfiles_repository_is_not_modified(self):
+        hooks = self.base / 'dotfiles'
+        hooks.mkdir()
+        self.git(hooks, 'init')
+        hook = hooks / 'post-checkout'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        self.git(hooks, 'add', 'post-checkout')
+        self.git(self.repo, 'config', 'core.hooksPath', str(hooks))
+        with self.assertRaisesRegex(ValueError, 'tracked hook'):
+            lineage.install_hook(self.repo)
+        self.assertNotIn(lineage.MARKER, hook.read_text())
+
     def test_deleted_recreated_path_gets_a_different_checkout_identity(self):
         old = self.parent['id']
         self.git(self.repo, 'worktree', 'remove', str(self.worktree))
