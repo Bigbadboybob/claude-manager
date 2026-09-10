@@ -96,3 +96,22 @@ revisions requested. Also personally read the DATABASE and waterline changes
 at `538404b5a`: producer-specific article identity, telemetry coverage limits,
 and dated economic/pricing claims are corrected. This resolves those prose
 items, without establishing live retention policy or authorizing one.
+
+## Full consolidated personal read at `380cf96f6`
+
+Personally read the complete revised PROPOSAL and NOTES. The main requests are
+addressed: described outcome populations rather than an admissions census;
+mixed drop clocks and unknown cost coverage; comparison design with shared
+resource effects; bounded equivalence; potentially valuable discarded work;
+model-conditional economics; and proposed relationships under existing owners.
+
+Requested a final root consistency pass, with no new research: shadow output
+is not served directly but can affect serving through contention; missing
+recorded span attribution does not prove no logical parent span; deterministic
+allocation needs assignment-mechanism qualification rather than a blanket ban
+on randomized hash designs; unmatched before/after can support description
+without causal attribution; receipt coverage should be scoped to the actual
+population claim; recorded spend is C2's numerator; and proposed future
+experiments are distinct from current authorization. Preserve legitimate Owner
+checkpoints rather than declaring every Owner interaction scope drift. Final
+acceptance awaits the root correction diff.

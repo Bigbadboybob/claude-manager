@@ -54,8 +54,8 @@ coordinator keeps the live roster; these are proposal-development statuses.
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Final root `d8de69d36` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p4-backtest-fidelity-review.md#final-disposition-at-root-d8de69d36), no implementation selected |
 | P5 | Backtest speed and resource efficiency preserving workload and outcomes | Final root `db4d9a726` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p5-backtest-performance-review.md#final-pin-at-root-db4d9a726), no implementation selected |
 | P6 | Useful timely delivery from existing sources | Final `136589a7e` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p6-source-reliability-review.md#final-disposition-at-136589a7e), no implementation selected |
-| P7 | News-decision latency and cost while preserving useful outcomes | Full `c4ab89af1` draft personally read (committed blobs verified against read SHA256s); [CM revisions requested](reviews/2026-09-10-p7-news-latency-cost-review.md); coordinator writes the consolidated handoff |
-| P8 | Recurring initiatives and continuous-task organization | Full `1bf555817` proposal/NOTES personally read; [CM revisions requested](reviews/2026-09-10-p8-recurring-work-review.md) |
+| P7 | News-decision latency and cost while preserving useful outcomes | Full consolidated `380cf96f6` proposal/NOTES personally read; [final root consistency corrections requested](reviews/2026-09-10-p7-news-latency-cost-review.md#full-consolidated-personal-read-at-380cf96f6) |
+| P8 | Recurring initiatives and continuous-task organization | Full consolidated `380cf96f6` proposal/NOTES personally read; [final root consistency corrections requested](reviews/2026-09-10-p8-recurring-work-review.md#full-consolidated-personal-read-at-380cf96f6) |
 
 Each document must describe a plausible first improvement round and how it
 would help Owner's goal, not stop at evidence storage or instrumentation.
@@ -77,9 +77,8 @@ personal review before later Owner selection.
 The authors hand off consolidated commits after addressing both coordinators'
 comments and reconciling shared boundaries. P1 `8bbfcd823`, P2 `3eea07af0`,
 P3 `5e8e56e9f`, P4 root `d8de69d36`, P5 root `db4d9a726`, and P6 `136589a7e`
-have passed personal review and are ready for Owner discussion. P7 `c4ab89af1`
-and P8 `1bf555817` have been fully personally read with revisions requested.
-Their consolidated revisions remain pending personal acceptance.
+have passed personal review and are ready for Owner discussion. P7 and P8 have been fully personally read at consolidated root `380cf96f6`.
+Final root consistency corrections remain pending personal acceptance.
 No proposal has been selected for implementation.
 
 ## predictionTrading candidate development

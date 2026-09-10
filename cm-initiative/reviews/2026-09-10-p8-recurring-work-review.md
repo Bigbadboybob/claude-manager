@@ -137,3 +137,25 @@ Fold this review together with Swarm-Gardener's existing review into one
 revision, updating repeated claims and NOTES. Preserve useful options and
 uncertainty without adding new required studies or expanding the current scope.
 Initiative-Bridge will personally read the consolidated changes.
+
+## Full consolidated personal read at `380cf96f6`
+
+Personally read the complete revised PROPOSAL and NOTES. The substantive six
+groups are addressed. The draft now proposes one bounded reconciliation with
+optional pointers, treats finite work and triggers independently, distinguishes
+planning rows from daemon/UI state, and preserves successful no-change work.
+Historical absence and landing claims are appropriately narrowed.
+
+Requested four final root consistency edits: P3/P4 are proposal contributors,
+not owners of evaluation/reuse policy; section 5.2's prohibition on `blocked`
+applies when no operator action is pending, matching section 8; notification
+delivery is outside this initiative while decision-record organization remains
+legitimate scope, with no convergence selected; and ordinary-task representation
+was already confirmed by this review, not a pending gate. No new research or
+author cycle is requested. Final acceptance awaits the root correction diff.
+
+Read-only CM follow-through confirms HOWTO_CONTINUOUS_TASKS.md line 67 still
+says the API does not persist kind, while current api/main.py passes kind to
+db.add_task. This is a source/runbook inconsistency; no deployed API was queried
+and no documentation repair or task mutation was performed. The proposed
+metadata concurrency concern remains unverified and is not a runtime finding.
