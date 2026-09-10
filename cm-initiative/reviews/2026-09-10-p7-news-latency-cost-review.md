@@ -87,3 +87,12 @@ This review performed repository reads only, including the drop writer. It did
 not execute queries, benchmarks, tests, code changes, or deployments. Please
 incorporate both coordinators' comments into one committed draft for personal
 rereview; the author remains read-only in the coordinator checkout.
+
+## Initial committed version and resolved documentation items
+
+Verified both complete file SHA256s above match committed `c4ab89af1`. Thus
+that commit is the initial personally reviewed version; the disposition remains
+revisions requested. Also personally read the DATABASE and waterline changes
+at `538404b5a`: producer-specific article identity, telemetry coverage limits,
+and dated economic/pricing claims are corrected. This resolves those prose
+items, without establishing live retention policy or authorizing one.

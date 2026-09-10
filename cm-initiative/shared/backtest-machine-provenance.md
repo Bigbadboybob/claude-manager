@@ -81,6 +81,28 @@ module. An explicit `script` is already supported and recorded in task
 `metadata.backtest`; this is a concrete compatibility risk for omitted scripts,
 not evidence that existing submissions failed. No submission was performed.
 
+### Existing issue and third default site (2026-09-10)
+
+At CM `4222dc8`, `api/main.py:253` defines the same default and the backtest
+creation handler applies `bt.setdefault("script", BACKTEST_DEFAULT_SCRIPT)`
+at line 289. This is a third omitted-script source path, not a deployed-state
+inspection. Explicit scripts bypass that default.
+
+Read-only CM task search and full task read found existing backlog item
+`21b75bd3-7ad8-44ef-a945-1515bafdefea`, **Fix backtest MCP defaults and fallback**,
+created 2026-08-25. Its description reports a historical omitted-script failure;
+that report was not independently reproduced here. Its brief already covers
+the canonical production runner, aligning Python/API/daemon defaults, the
+machine-class fallback, and `list_projects` fallback. This deduplicates the
+runner/machine-default finding; no additional task or repair is needed from
+this proposal research.
+
+Triage caveat for whoever later takes that item: its `project` and prompt name
+claude-manager, but its `repo_url` currently points to predictionTrading and it
+inherits a different parent task. Resolve the actual implementation checkout
+under the owning coordinator before launch. This review changed no task fields,
+started no session, and selected no repair.
+
 ## Launch timestamp boundary (source addendum, 2026-09-10)
 
 Inspected `api/dispatch_daemon.py:244-255` and `dispatch/vm.py:120-127`,

@@ -67,3 +67,17 @@ requests are bounded to the proposal and its source statements.
 This review used committed proposal documents and targeted CM source inspection.
 It ran no backtest, query, benchmark, cloud operation, or test. Return one
 consolidated revision for final personal review; no candidate is selected.
+
+## Consolidated rereview at `5317f480b`
+
+Personally read all proposal/NOTES changes from `c45592435` through
+`5317f480ba2b727d1ced68cc341c6fee44a801d1`. Substantive corrections are in place.
+Three stale formulations still contradict them: section 3.2's residual table
+still includes provisioning; section 7's B/C table still claims fleet isolation
+and a profile-readable removable share; and its E correction paragraph still
+says out-of-timer work leaves replay throughput unchanged by construction.
+Requested those in-place corrections and the corresponding NOTES sweep; no
+further research required. Final acceptance awaits the corrected diff.
+
+Personally checked predictionTrading `538404b5a`'s BACKTESTING change: the
+historical-repeatability item is resolved in those docs. No benchmark was run.
