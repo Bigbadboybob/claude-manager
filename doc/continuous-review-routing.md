@@ -2,6 +2,12 @@
 
 Owner policy, 2026-09-10: workers send routine reviews, progress, recoverable failures and completed handoffs to their orchestrator by chat DM. They do not call `notify_user` or DM/mention Owner for these events. The orchestrator reviews the evidence and advances authorized work. Only a reviewed decision or blocker that actually requires Owner may request Owner attention; existing stricter quiet policies still apply. A messaging change does not grant merge, deployment, source-enablement or spending authority.
 
+## Orchestrator names and identity
+
+Every continuous-task orchestrator uses a descriptive `<task>-orchestrator` name, for example `health-triage-orchestrator`, `scraper-triage-orchestrator` or `cm-bug-triage-orchestrator`. This convention takes precedence over the general short-codename suggestion. Choose it with the first `chat_send(name=...)`; an already named orchestrator reads `chat_open()` and calls `chat_rename(name="<task>-orchestrator", expected_name_revision=<name.revision>, request_id="<new-id>")`. Use CM's accepted name if a collision adds a suffix. Do not recreate a session to rename it.
+
+Route messages, mentions and handoffs using participant IDs, never mutable names. A rename preserves the session UID and participant ID, existing DMs/groups, memberships, watches and historical mentions. Old names remain searchable aliases. A replacement session has a new identity and must be resolved by its stable parent task binding as described below. Include this policy in every orchestrator prompt and worker brief; the deployed shared copy is `~/.cm/policies/continuous-review-routing.md`.
+
 ## Handoff and wake handling
 
 An orchestrator supplies its participant ID, current session UID and stable planning task ID in every worker brief. Resolve participants with `chat_people`; use `ping` and `list_sessions` to verify the manager/task binding. Workers send `chat_send(dm=<orchestrator participant>, request_id=<stable handoff id>, body=...)` with task ID, artifact SHA/path, checks and result, next action and any actual decision needed. Include the reviewed commit when reporting approval. On a timeout retry the identical request with the same request ID and originating daemon, rather than sending a second handoff.

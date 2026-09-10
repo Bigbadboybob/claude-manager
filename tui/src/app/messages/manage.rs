@@ -1206,7 +1206,7 @@ impl App {
                             .take(8)
                             .collect::<String>(),
                         h["summary"].as_str().unwrap_or("Initial norms"),
-                        h["actor"]["name"].as_str().unwrap_or("?"),
+                        m.actor_name(h),
                         h["created_at"].as_str().unwrap_or("")
                     )
                 })
@@ -1261,7 +1261,7 @@ impl App {
                                 " "
                             },
                             m.conversation_label(&v["conversation_id"]),
-                            v["actor"]["name"].as_str().unwrap_or("?"),
+                            m.actor_name(v),
                             v["preview"].as_str().unwrap_or("")
                         )
                     }),

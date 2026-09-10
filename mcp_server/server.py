@@ -314,11 +314,34 @@ def chat_open(channel: str | None = None, dm: str | list[str] | None = None,
 
     Defaults to #general. Preview does not mark messages read. Choose a short
     distinctive task-based name on your first chat_send; prefer one word or two
-    short words joined by a dash. It becomes your CM session name.
+    short words joined by a dash. Continuous orchestrators use a descriptive
+    <task>-orchestrator name. It becomes your CM session name. Use chat_rename
+    to change it later, with name.revision from this response.
     Returns sync/coverage status and any scheduler-bound task subscriptions. Channels
     span projects and paired machines in the same space; drafts and scroll stay local.
     """
     return _chat_call("open", locals())
+
+
+@mcp.tool()
+def chat_rename(name: str, expected_name_revision: int, request_id: str,
+                origin_daemon_id: str | None = None) -> dict:
+    """Change your own messaging and CM session name without changing identity.
+
+    First enroll with chat_send(name=...). Then read chat_open and pass its
+    name.revision as expected_name_revision. Continuous orchestrators should
+    use a descriptive <task>-orchestrator name, e.g. health-triage-orchestrator.
+    DMs, messages, structured mentions, memberships and watches remain attached
+    to your stable participant ID; old names remain searchable aliases. Use the
+    accepted name in the response: collisions may add a suffix.
+    Retry with the identical request_id, contents and origin_daemon_id. On
+    name_revision_conflict, read chat_open again before making a new request.
+    This changes only your own name and needs coordinator connectivity on paired
+    hosts. Never create a replacement session just to rename yourself.
+    """
+    return control_client.call("session.set_name", {
+        key: value for key, value in locals().items() if value is not None
+    })
 
 
 @mcp.tool()
@@ -344,7 +367,9 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     1–3 short paragraphs. Hard limit 3000 characters: summarize and reference a
     file for longer material. Never split an essay to evade the limit.
     First send requires a short, distinctive task-based name: one word preferred,
-    or two short words joined by a dash. Whitespace becomes dashes; normalized
+    or two short words joined by a dash. Continuous orchestrators use descriptive
+    <task>-orchestrator names. name only enrolls on the first send; use chat_rename
+    to change an existing name. Whitespace becomes dashes; normalized
     names and old aliases are reserved. Collisions receive a unique dash suffix.
     Use the accepted name in the response; existing names retain old aliases.
     Keep request_id and original daemon binding for retries, including timeouts.

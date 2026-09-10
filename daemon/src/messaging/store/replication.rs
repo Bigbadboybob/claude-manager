@@ -1495,6 +1495,47 @@ mod tests {
         }
     }
     #[test]
+    fn self_rename_preserves_identity_history_and_routing_across_replication_and_restart() {
+        let mut p = pair();
+        let actor = p.people[0].id.clone();
+        let peer = p.people[1].id.clone();
+        let host = p.replica.daemon_id.clone();
+        let dm = p.hub.coordinate(&host, &peer, "messaging.send", &json!({"dm":actor,"body":"Review ready","request_id":"before-dm"})).unwrap();
+        let mention = p.hub.coordinate(&host, &peer, "messaging.send", &json!({"channel":"general","body":"For Scout-a","mentions":[actor],"request_id":"before-mention"})).unwrap();
+        catch_up(&mut p);
+        let conversation = dm["event"]["conversation_id"].clone();
+        let history = p.replica.read(&actor, &json!({"conversation":conversation}), &p.people).unwrap();
+        p.replica.read(&actor, &json!({"conversation":conversation,"ack_receipt":history["receipt"]}), &p.people).unwrap();
+        let memberships = p.replica.memberships.clone();
+        let watch = p.replica.register_monitor(&actor, &json!({"scope":{"dm":peer},"request_id":"watch","mode":"continuous"}), &p.people).unwrap();
+        let rename = json!({"name":"health-triage-orchestrator","expected_name_revision":p.replica.names[&actor].revision,"request_id":"rename"});
+        let result = p.hub.coordinate(&host, &actor, "session.set_name", &rename).unwrap();
+        assert_eq!(p.hub.coordinate(&host, &actor, "session.set_name", &rename).unwrap()["event_id"], result["event_id"]);
+        assert_eq!(p.hub.coordinate(&host, &actor, "session.set_name", &json!({"name":"stale","expected_name_revision":1,"request_id":"stale"})).unwrap_err().code, "name_revision_conflict");
+        let after = p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":peer,"name":"Scout-a","body":"Approved","request_id":"after-dm"})).unwrap();
+        assert_eq!(after["event"]["conversation_id"], conversation);
+        assert_eq!(after["event"]["actor"]["id"], actor);
+        assert_eq!(after["event"]["actor"]["name"], "health-triage-orchestrator");
+        catch_up(&mut p);
+        let root = p._tmp.path().join("replica");
+        drop(p.replica);
+        p.replica = Store::open(&root).unwrap();
+        assert!(p.replica.degraded.is_none(), "{:?}", p.replica.degraded);
+        assert_eq!(p.replica.names[&actor].name, "health-triage-orchestrator");
+        assert!(p.replica.names[&actor].aliases.contains(&"Scout-a".to_string()));
+        assert_eq!(p.replica.memberships, memberships);
+        let history = p.replica.read(&actor, &json!({"conversation":conversation}), &p.people).unwrap();
+        assert_eq!(history["items"].as_array().unwrap().len(), 2);
+        let before = history["items"].as_array().unwrap().iter().find(|e| e["id"] == dm["event_id"]).unwrap();
+        assert_eq!(before["read"], true);
+        let inbox = p.replica.read(&actor, &json!({"inbox":true,"unread_only":true}), &p.people).unwrap();
+        let historical_mention = inbox["items"].as_array().unwrap().iter().find(|e| e["id"] == mention["event_id"]).unwrap();
+        assert_eq!(historical_mention["data"]["mentions"], json!([actor]));
+        let watches = p.replica.monitors(&actor, &json!({"action":"list"})).unwrap();
+        assert!(watches["items"].as_array().unwrap().iter().any(|w| w["id"] == watch["id"] && w["state"] == "active"));
+    }
+
+    #[test]
     fn messaging_channel_norms_coordinate_permissions_and_sync_without_global_corruption() {
         let mut p = pair();
         let actor = p.people[0].id.clone();
