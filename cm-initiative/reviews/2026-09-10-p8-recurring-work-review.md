@@ -159,3 +159,21 @@ says the API does not persist kind, while current api/main.py passes kind to
 db.add_task. This is a source/runbook inconsistency; no deployed API was queried
 and no documentation repair or task mutation was performed. The proposed
 metadata concurrency concern remains unverified and is not a runtime finding.
+
+## Final disposition at root `080256a08`
+
+**Ready for Owner discussion; no implementation selected.** Personally read all
+proposal/NOTES changes from the full consolidated `380cf96f6` through final
+root `080256a08`. P3/P4 contributions remain subject to existing owners;
+`blocked` requires actual operator action; decision-record organization remains
+in scope while notification delivery is excluded; and ordinary-task
+representation is settled. The final correction also distinguishes completion
+declarations from evidence, limits association claims to inspected rows, and
+keeps saturation diagnostic. Existing authorized reads acquire no invented
+approval gate; actual access limitations still apply.
+
+The candidate is one bounded reconciliation of an existing effort with optional
+pointers and a valid no-change outcome. It authorizes no migration, schedule
+change, new swarm, or action on a sibling session. The perf-loop documentation
+item is resolved in the same root revision; CM's kind-persistence runbook
+observation remains a source/documentation finding, not a live defect verdict.

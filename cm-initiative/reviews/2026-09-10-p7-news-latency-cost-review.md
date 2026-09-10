@@ -115,3 +115,18 @@ population claim; recorded spend is C2's numerator; and proposed future
 experiments are distinct from current authorization. Preserve legitimate Owner
 checkpoints rather than declaring every Owner interaction scope drift. Final
 acceptance awaits the root correction diff.
+
+## Final disposition at root `080256a08`
+
+**Ready for Owner discussion; no implementation selected.** Personally read all
+proposal/NOTES changes from the full consolidated `380cf96f6` through final
+root `080256a08`. The remaining scope and consistency corrections are addressed:
+recorded cost versus real physical attempts, missing attribution, claim-specific
+clock coverage, direct versus indirect shadow effects, valid comparison designs,
+C2's numerator, and class-appropriate evidence. Future experiments are proposals
+and legitimate Owner participation remains part of the operating model.
+
+Also read the coordinator's perf-loop documentation correction; its test-gate
+wording now distinguishes targeted iteration checks from deployment verification.
+This review ran no experiment, runtime query, test campaign or deployment.
+Acceptance concerns a bounded candidate for discussion, not a selected round.

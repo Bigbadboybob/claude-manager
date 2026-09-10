@@ -34,7 +34,7 @@ repository and session permissions still apply. Each research task gets bounded
 owned paths and records its task ID, base revision, session configuration, and
 result references when launched.
 
-## Proposal documents in progress
+## Proposal documents ready for discussion
 
 The AI synthesis and two independent reviews retained the following eight
 document topics. This is the authorized research division; it does not select
@@ -54,8 +54,8 @@ coordinator keeps the live roster; these are proposal-development statuses.
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Final root `d8de69d36` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p4-backtest-fidelity-review.md#final-disposition-at-root-d8de69d36), no implementation selected |
 | P5 | Backtest speed and resource efficiency preserving workload and outcomes | Final root `db4d9a726` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p5-backtest-performance-review.md#final-pin-at-root-db4d9a726), no implementation selected |
 | P6 | Useful timely delivery from existing sources | Final `136589a7e` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p6-source-reliability-review.md#final-disposition-at-136589a7e), no implementation selected |
-| P7 | News-decision latency and cost while preserving useful outcomes | Full consolidated `380cf96f6` proposal/NOTES personally read; [final root consistency corrections requested](reviews/2026-09-10-p7-news-latency-cost-review.md#full-consolidated-personal-read-at-380cf96f6) |
-| P8 | Recurring initiatives and continuous-task organization | Full consolidated `380cf96f6` proposal/NOTES personally read; [final root consistency corrections requested](reviews/2026-09-10-p8-recurring-work-review.md#full-consolidated-personal-read-at-380cf96f6) |
+| P7 | News-decision latency and cost while preserving useful outcomes | Final root `080256a08` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p7-news-latency-cost-review.md#final-disposition-at-root-080256a08), no implementation selected |
+| P8 | Recurring initiatives and continuous-task organization | Final root `080256a08` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p8-recurring-work-review.md#final-disposition-at-root-080256a08), no implementation selected |
 
 Each document must describe a plausible first improvement round and how it
 would help Owner's goal, not stop at evidence storage or instrumentation.
@@ -74,12 +74,13 @@ This accommodation does not change the separate-worktree rule for independent
 implementation. Each committed candidate handoff still receives Initiative-Bridge's
 personal review before later Owner selection.
 
-The authors hand off consolidated commits after addressing both coordinators'
-comments and reconciling shared boundaries. P1 `8bbfcd823`, P2 `3eea07af0`,
-P3 `5e8e56e9f`, P4 root `d8de69d36`, P5 root `db4d9a726`, and P6 `136589a7e`
-have passed personal review and are ready for Owner discussion. P7 and P8 have been fully personally read at consolidated root `380cf96f6`.
-Final root consistency corrections remain pending personal acceptance.
-No proposal has been selected for implementation.
+All eight proposal documents have passed personal review and are ready for
+Owner discussion: P1 `8bbfcd823`, P2 `3eea07af0`, P3 `5e8e56e9f`,
+P4 root `d8de69d36`, P5 root `db4d9a726`, P6 `136589a7e`, and P7/P8 root
+`080256a08`. The linked reviews record complete personal reads and the final
+consolidation diffs. The research/proposal phase is complete; choosing and
+briefing a first improvement round remains the interactive Owner discussion.
+No candidate implementation or production swarm has been selected.
 
 ## predictionTrading candidate development
 
@@ -257,3 +258,10 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   corrected its scope and major evaluation claims; remaining requests address
   signed alpha, intentional overload safeguards, historical identity, consumption,
   and authority. Both remain proposals under revision, not selected launches.
+
+- **2026-09-10 — Proposal review complete:** Initiative-Bridge personally read
+  all eight candidate documents and reviewed their final corrections. All are
+  ready for Owner discussion at the pins above; Swarm-Gardener integrates the
+  accepted documents and maintains the discussion guide. This completes the
+  authorized research/proposal review, not the ongoing initiative. Existing
+  owners and Owner's new-initiative/new-swarm checkpoints remain in force.
