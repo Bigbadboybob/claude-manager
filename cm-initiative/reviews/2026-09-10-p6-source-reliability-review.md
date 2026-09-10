@@ -153,3 +153,27 @@ section numbers and withdrawn RAG/45-minute claims, so they cannot be mistaken
 for current instructions. The worktree incident is being reconciled by the owning
 coordinator; this review does not infer changes to that checkout from the worker's
 initial report. No candidate round is selected or authorized by this disposition.
+
+## Final disposition at `136589a7e`
+
+**Ready for Owner proposal discussion; no implementation selected.** After the
+full personal read of `62f5eafa4`, I read the subsequent diffs through
+`c20434dc0` and final `136589a7e299e9069c451a9dcbf3f924794f8243`.
+All three remaining requests are addressed: consumer admission is timing
+eligibility rather than usefulness; current `ready` status describes conditional
+resolver configuration rather than observed execution; and receipt boundaries
+retain their actual writer-specific semantics without a universal absence claim.
+
+The final revision also corrects article identity and historical lag: both derived
+and caller-supplied IDs follow producer-specific contracts, and an in-place
+revision can combine an earliest receipt with an updated publication timestamp.
+The proposal preserves that uncertainty instead of calling the resulting pair
+original delivery lag. Scheduled release context supports matching without
+establishing specific content by itself.
+
+No further proposal revision is required by this review. Useful timely supply,
+overlapping cohorts, existing scraper-triage ownership, scoped Owner rulings,
+and the separation between current research and a future selected round remain
+intact. Swarm-Gardener separately confirmed no loss from the recorded checkout
+incident. This disposition does not authorize live queries, repairs, experiments,
+or a new operating swarm.
