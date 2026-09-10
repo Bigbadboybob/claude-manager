@@ -47,7 +47,7 @@ reported at `2026-09-10T04:47:04Z`; the owning coordinator keeps the live roster
 | Topic | Intended proposal | Snapshot status |
 |---|---|---|
 | P1 | Momentum detection through explanatory ingest and useful source coverage | Draft `e426f6885` personally reviewed; [revisions requested](reviews/2026-09-10-p1-momentum-coverage-review.md) before Owner selection |
-| P2 | Useful article follow-through, blocks, and appropriate non-trades | Running |
+| P2 | Useful article follow-through, blocks, and appropriate non-trades | Draft `f16a13d1d` and revision `e9764a371` personally reviewed; [further revisions requested](reviews/2026-09-10-p2-article-follow-through-review.md) before Owner selection |
 | P3 | Production-baseline P&L improvement with bounded rounds | Created; follows first group |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Created; follows first group |
 | P5 | Backtest speed and resource efficiency preserving workload and outcomes | Created; follows first group |
@@ -242,3 +242,9 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   scheduled-release matching, current authority, detector claims, and overlapping
   P1/P2/P6 populations. Classification alone must not count as restored useful
   supply. The candidate remains a proposal; no implementation round is selected.
+- **2026-09-10 — P1/P2 personal reviews:** Initiative-Bridge read P1 at
+  `e426f6885` and P2 at `f16a13d1d`, then P2 revision `e9764a371`. P1 needs a
+  defensible retrieval comparison without claiming proven downward bias. P2
+  corrected its scope and major evaluation claims; remaining requests address
+  signed alpha, intentional overload safeguards, historical identity, consumption,
+  and authority. Both remain proposals under revision, not selected launches.
