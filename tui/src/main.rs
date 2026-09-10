@@ -10,6 +10,7 @@ mod client_session;
 mod clipboard;
 mod config;
 mod control;
+mod continuous_stage;
 mod daemon_launch;
 mod host_pool;
 mod network_watch;
