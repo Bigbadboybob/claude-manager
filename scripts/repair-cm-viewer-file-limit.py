@@ -27,8 +27,8 @@ def main():
             pid = int(proc.name)
             soft, hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)
             count = len(list((proc / "fd").iterdir()))
-            target = max(soft, min(65_536, hard)) if hard != resource.RLIM_INFINITY else max(soft, 65_536)
-            if args.apply and target > soft:
+            target = soft if soft == resource.RLIM_INFINITY else max(soft, 65_536 if hard == resource.RLIM_INFINITY else min(65_536, hard))
+            if args.apply and target != soft:
                 resource.prlimit(pid, resource.RLIMIT_NOFILE, (target, hard))
             current, _ = resource.prlimit(pid, resource.RLIMIT_NOFILE)
             print(f"Viewer PID {pid}: {count} open files; soft limit {soft} -> {current}; hard limit {hard}")
