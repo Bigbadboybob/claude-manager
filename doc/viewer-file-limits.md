@@ -1,0 +1,9 @@
+# Viewer file limits and clipboard failures
+
+The laptop TUI attaches to sessions on every configured host. Each attachment uses multiple sockets, pipes and poller descriptors, so a desktop's inherited 1024-file soft limit can block Alt+s and clipboard helper subprocesses even when both cloud daemons are healthy. Startup now raises the viewer's soft `RLIMIT_NOFILE` to 65536 (capped at its existing hard limit). It never lowers an existing limit or changes the hard limit or system configuration.
+
+For an already running viewer, run `python3 scripts/repair-cm-viewer-file-limit.py` in a local laptop terminal to inspect its open-file count and limits; add `--apply` to raise only that viewer's soft limit. The helper checks the executable and owner and never restarts processes. Install the updated TUI through [TUI releases](TUI_RELEASES.md) and reopen it for the persistent startup fix.
+
+Explicit paste tries PNG via `wl-paste` on Wayland or `xclip` on X11, uploads the bytes to the selected session host, then falls back to text. File-limit errors now propagate directly instead of displaying “No clipboard image or text found.” Missing or failing helpers report a clipboard-access error, naming the attempted tools. Wayland text reads explicitly request text so an image is not interpreted as UTF-8. A truly empty successful read still displays the empty-clipboard message. These operations run on the laptop: copying successfully into another desktop application does not establish that CM's helper can spawn or access the display.
+
+Verification uses the isolated Rust runner: clipboard provider fallback/error tests, exact private PNG upload and truncated-upload rejection, and a subprocess regression that exhausts a 1024-file limit, reproduces the clipboard error, raises the limit, and verifies opening 1200 files plus spawning a child succeeds. No live manifests or desktop clipboard data are used by these tests.
