@@ -22,6 +22,7 @@ mod memory_cap;
 mod planning;
 mod preflight;
 mod push_worker;
+mod resource_limits;
 mod owner_notification;
 mod session;
 mod session_watch;
@@ -58,6 +59,9 @@ use app::{App, SIDEBAR_WIDTH};
 use config::Config;
 
 fn main() -> anyhow::Result<()> {
+    if let Err(e) = resource_limits::raise_open_file_limit() {
+        eprintln!("cm-tui: unable to raise open-file limit: {e}");
+    }
     let config = Config::load();
 
     // 10f default-flip: daemon mode is now mandatory. The TUI cannot
