@@ -266,6 +266,10 @@ impl Sandbox {
     }
 
     fn spawn_bash(&mut self, uid: &str) -> i32 {
+        self.spawn_bash_with_env(uid, serde_json::json!({}))
+    }
+
+    fn spawn_bash_with_env(&mut self, uid: &str, env: serde_json::Value) -> i32 {
         let start = self.op(
             "start_session",
             serde_json::json!({
@@ -278,7 +282,7 @@ impl Sandbox {
                 "session_type": "bash",
                 "cols": 120,
                 "rows": 40,
-                "env": {}
+                "env": env
             }),
         );
         assert!(
@@ -316,6 +320,41 @@ impl Sandbox {
         .filter(|r| r.ok)?;
         r.result?.get("sessions").and_then(|v| v.as_u64())
     }
+}
+
+#[test]
+fn pty_environment_advertises_color_from_headless_holder() {
+    let mut sb = launch_sandbox("pty-colors");
+    let pid = sb.spawn_bash("ts-c010-1");
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let environ = String::from_utf8(environ).unwrap();
+    assert!(environ.split('\0').any(|entry| entry == "TERM=xterm-256color"));
+    assert!(environ.split('\0').any(|entry| entry == "COLORTERM=truecolor"));
+    // Exercise a real application's terminfo detection on the session PTY.
+    let sent = sb.op("send_input", serde_json::json!({
+        "session_uid": "ts-c010-1",
+        "text": "printf 'CM_COLORS=%s\\n' \"$(tput colors)\"",
+        "submit": true
+    }));
+    assert!(sent.ok, "{:?}", sent.error);
+    wait_for(Instant::now() + Duration::from_secs(10), "256-color terminfo", &sb.guard, || {
+        let output = sb.op("read_session_output", serde_json::json!({"session_uid": "ts-c010-1"}));
+        output_text(&output).filter(|text| text.contains("CM_COLORS=256"))
+    });
+}
+
+#[test]
+fn pty_environment_preserves_explicit_holder_overrides() {
+    let mut sb = launch_sandbox("pty-overrides");
+    let pid = sb.spawn_bash_with_env("ts-c010-2", serde_json::json!({
+        "TERM": "vt100", "COLORTERM": "", "NO_COLOR": "1"
+    }));
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let environ = String::from_utf8(environ).unwrap();
+    for expected in ["TERM=vt100", "COLORTERM=", "NO_COLOR=1"] {
+        assert!(environ.split('\0').any(|entry| entry == expected), "missing {expected}");
+    }
+    assert!(!environ.split('\0').any(|entry| entry.starts_with("FORCE_COLOR=")));
 }
 
 /// The S4 seam through the FULL stack: a child that dies instantly
