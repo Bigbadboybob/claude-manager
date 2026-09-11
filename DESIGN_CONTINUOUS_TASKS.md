@@ -2,6 +2,8 @@
 
 > **Want to _create_ one, not understand the internals?** See **`HOWTO_CONTINUOUS_TASKS.md`** — the operator runbook (recipe, `continuous.create` params, prompt idioms, gotchas, review flow). This doc is the architecture.
 
+**Current operating contract (2026-09-11):** schedules/consumer queues admit new work; worker-to-orchestrator DMs drive routine reviews through native wakes. Periodic reconciliation and completion monitors recover missed handoffs. A message wake does not claim another batch or restart a scan. Durable lifecycle stages distinguish queued review, active review and an Owner decision; idle session activity is not approval. Unfinished tasks retain live visible sessions. Read [continuous-review-routing.md](doc/continuous-review-routing.md) for current behavior; the phase history below is not a replacement for that contract. Native delivery must be verified for existing legacy sessions, not inferred from updated prompts.
+
 **Status:** Phases 1–3 + 3b **implemented and committed** (`13139f5`, `2df9cff`, `40cec61`, `1288044`, `02dc80a`): sidebar + wire field + `kind` column; the `trigger` funnel + FRESH executor + `continuous.*` CRUD; the daemon scheduler + restart recovery + PERSISTENT executor; the stuck-story (completion signal + watchdog + investigator). Phases 1–3 validated end-to-end on a live daemon (smoke test). Phase 4 (queue) **implemented 2026-07-04** (see the Phase-4 entry + DESIGN_SCRAPER_MIGRATION.md §3 for the two naming/scope deltas). Phase 5 (migration) largely superseded by the live triage migrations; Phase 6 (fan-out/cloud) remains. Key review decisions resolved (§18).
 **Provenance:** Synthesized from a 9-agent Ultracode design panel (4 recon → 3 competing architectures → judge → synthesis), then refined through review. Winning skeleton: the *trigger-API / extensibility-first* proposal, hardened with the *reliability-first* proposal's idempotency + restart-recovery + audit machinery and the *reuse-first* proposal's primitive-unification grafts.
 
@@ -13,7 +15,7 @@ Make **continuous tasks** a first-class concept in Claude Manager: long-lived au
 
 This migrates the user's existing automations (bug / scraper / trading-behavior triage, API-change watch, scraper generation) **off** the trader/aux instances and **into** Claude Manager, where they run as real, attachable Claude PTY sessions the user can read and re-drive — and opens the door to many new ones (nightly code review, code bug-hunt, code perf-hunt, top-source audit, momentum→scraper creation, auto-backtesting).
 
-**Motivation:** the current headless harness (programmatic Claude Code) debugs worse than interactive Claude and gives no visibility. A continuous task spawns a *real* session on a real PTY that shows up in the sidebar with an idle white dot to review — fixing both problems at once.
+**Original motivation:** the headless harness (programmatic Claude Code) was harder to debug and observe. A continuous task exposes a real attachable session. The current viewer shows durable task stage separately from activity; an idle dot alone does not mean a task is ready for Owner review.
 
 ---
 
@@ -220,7 +222,7 @@ This turns a silent hang into a self-heal or a clean escalation. (Phase 3+; ride
 2. `last_run.status` in `state.json` (`Pending→Running→Done`/`Failed`/`Stuck`/`Orphaned`).
 3. Live broadcast on `manifest.watch` (`ManifestDiff::Added/Exited` carry `continuous_task_id`).
 
-**Critical discipline:** `manifest.watch` is **lossy** (bounded 32-slot `try_send`) — a reconnecting remote TUI rebuilds from a `continuous.list` / `state.json` **snapshot**, never replay. Observability the user *sees*: green spinner (running), white dot (idle/reviewable), red glyph (`Failed`/`Stuck`). **Still deferred:** a speculative `schedule_watcher` live broadcaster (over-built for v1).
+**Critical discipline:** `manifest.watch` is **lossy** (bounded 32-slot `try_send`) — a reconnecting remote TUI rebuilds from a `continuous.list` / `state.json` **snapshot**, never replay. The original activity glyphs describe running, idle and failed/stuck sessions; the current viewer adds durable stage colors and a legend. Idle alone is not review readiness. **Still deferred:** a speculative `schedule_watcher` live broadcaster (over-built for v1).
 
 ---
 

@@ -183,7 +183,13 @@ not inherited. Channel creators/admins and Owner can publish using the returned
 other agents. Acknowledge with the same channel/scope. See the
 [channel norms guide](messaging/CHANNEL_NORMS.md) for examples and Owner controls.
 
-Use your normal session chat for routine updates and questions to Owner, and channels for agent coordination. Owner reads these on their own time. Use `notify_user(message="...")` for work ready for review/deployment or decisions, approvals, and blockers needing Owner. This works in local, cloud, and continuous sessions. An updated TUI receives the retained alert when connected; `status="queued"` does not mean Owner has read it. See [Owner notifications](OWNER_NOTIFICATIONS.md). Unsolicited Owner DMs are reserved for critical, urgent issues that require privacy. The `needs-owner` tag is a quiet way to flag an item for later review, not an alert.
+Use your normal session chat for routine updates and questions to Owner, and channels for agent coordination. Owner reads these on their own time. Ordinary interactive sessions use `notify_user(message="...")` when Owner action is needed. Continuous workers send routine review/progress/handoffs to their orchestrator; only that orchestrator escalates a reviewed decision or blocker requiring Owner. An updated TUI receives retained alerts when connected; `status="queued"` does not mean Owner has read them. See [Owner notifications](OWNER_NOTIFICATIONS.md). Unsolicited Owner DMs are reserved for critical, urgent issues that require privacy. The `needs-owner` tag is a quiet way to flag an item for later review, not an alert.
+
+## Continuous worker and orchestrator handoffs
+
+Read `~/.cm/policies/continuous-review-routing.md` on your execution host. The repository source is [continuous-review-routing.md](continuous-review-routing.md). Scheduled scans and consumer queues admit new work; worker DMs wake the current parent for existing-work reviews. Drain/acknowledge the inbox before cadence gates, verify the artifact, persist the disposition, and retain periodic reconciliation and completion monitors as fallback. A message wake does not request a fresh scan. Legacy sessions can lack native delivery, so verify an observed wake and persisted review rather than assuming a successful send proves the whole path.
+
+Workers enter `review_queued`; parents enter `reviewing` and advance to `owner_review` only for a concrete Owner decision. Internal review stays planning `running`. Stage is carried by the colored task text and legend; a spinner or idle dot only describes activity. `report_done` completes your work slice (or your parent's scheduled run), not the planning task. Unfinished work keeps a live visible session; missing sessions need recovery using the existing task/worktree. Terminal work needs a settled, evidence-backed cleanup disposition, and closing a session is distinct from reaping its checkout.
 
 ## CM beyond messaging
 
