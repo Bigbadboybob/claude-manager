@@ -5,6 +5,35 @@ cells, and writes incremental buffer differences through the Crossterm backend.
 The grid is already a display model: its cell contents must not be replayed as
 terminal commands.
 
+## Cloud sessions appearing monochrome
+
+PTY children receive `TERM=xterm-256color` and `COLORTERM=truecolor` from both
+daemon spawn paths, including the holder/brain split. These describe CM's
+embedded terminal, independent of the service's environment: systemd normally
+supplies neither variable, and noninteractive SSH can supply `TERM=dumb`.
+Without them, applications such as Claude can detect no color support even
+though the viewer renders colors correctly. The old local Alacritty spawn
+path already initialized its terminal environment.
+
+Explicit per-session `TERM`/`COLORTERM` values win over these defaults. `NO_COLOR`
+and other application preferences are preserved; CM does not set `FORCE_COLOR`.
+This applies to fresh agent/shell/workflow/continuous launches and normal resumes.
+
+Deploy with a brain-only restart; no holder or laptop TUI update is needed.
+Running agents keep their existing environment and conversation. They pick up
+the defaults on their next normal restart/resume, not by reconnecting the viewer.
+Do not interrupt active agents or restart scheduler-owned continuous sessions
+just to change colors.
+
+Focused regressions inspect real holder-launched children and exercise `tput`
+color detection on both spawn paths, including explicit monochrome overrides:
+
+```bash
+CARGO_TARGET_DIR="$HOME/.cm/builds/cloud-terminal-colors" CARGO_BUILD_JOBS=2 \
+  scripts/cm-test-isolated cargo test --locked -p cm-daemon \
+  --test pty_environment --test holder_mode_e2e pty_environment -- --test-threads=1
+```
+
 ## Tabs overwriting the sidebar
 
 Alacritty retains a literal tab in the starting cell when advancing to a tab

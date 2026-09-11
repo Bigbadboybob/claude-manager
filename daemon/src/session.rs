@@ -43,6 +43,13 @@ use std::time::Instant;
 /// stream stays running regardless of buffer state.
 pub const DEFAULT_FANOUT_CAPACITY: usize = 1024 * 1024;
 
+/// Capabilities of CM's embedded terminal, independent of the daemon's own
+/// terminal (systemd has none; an SSH command may have TERM=dumb). Apply before
+/// per-session overrides in BOTH spawn paths. Leave color preferences such as
+/// NO_COLOR alone; advertising support does not force applications to use it.
+pub(crate) const PTY_ENV_DEFAULTS: [(&str, &str); 2] =
+    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+
 /// Ring buffer + subscriber list for PTY output bytes.
 ///
 /// Producer side: the daemon's PTY-reader thread calls
@@ -1538,6 +1545,9 @@ impl PendingSession {
 
         let mut cmd = CommandBuilder::new(&params.shell);
         cmd.args(&params.args);
+        for (k, v) in PTY_ENV_DEFAULTS {
+            cmd.env(k, v);
+        }
         for (k, v) in &params.env {
             cmd.env(k, v);
         }
