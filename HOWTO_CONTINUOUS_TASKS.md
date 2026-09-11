@@ -1,8 +1,8 @@
 # How-To: Create & Operate a Continuous Task
 
-Operator runbook for standing up a new **continuous task** (a persistent orchestrator that fires on a schedule, scans some surface, and spawns + drives subtasks). This is the *practical* companion to `DESIGN_CONTINUOUS_TASKS.md` (which covers the architecture: data model, scheduler, funnel, run-mode executors). Read this when you want to **create one**, not understand the internals.
+Operator runbook for creating and operating a **continuous task**: a persistent orchestrator that admits new work on its configured schedule or queue and handles worker handoffs through messaging. Scheduled reconciliation recovers missed handoffs. This is the practical companion to `DESIGN_CONTINUOUS_TASKS.md`; the current review contract is [continuous-review-routing.md](doc/continuous-review-routing.md).
 
-The five live orchestrators are your working templates — copy their `default_prompt` as a starting point:
+These are example task shapes, not a live fleet inventory. Read `continuous.list` for current tasks, schedules, pause state and `review_kind`; a retained definition may be paused. Copy a suitable current `default_prompt` and include the shared review policy:
 
 | task_id | repo | host | cadence | run_mode | review_kind |
 |---|---|---|---|---|---|
@@ -23,6 +23,7 @@ Before writing anything, pin these down — they determine everything else:
   - `local` (the laptop daemon) is right when the target repo + skills + toolchain only live locally (e.g. claude-manager's own Rust code + its `.claude/skills/` project skills). Caveat: it only fires while the laptop is up — the scheduler catches up (once, no backfill) when it's next up, which is fine for multi-hour/day cadences.
 - **run_mode.** `persistent` (the orchestrator keeps its session + context across fires, `/compact`-managed by `compact_every`; its disk memory survives) — use this for anything that drives subtasks across cycles. `fresh` respawns the session each fire (stateless-ish); rarely what you want for an orchestrator.
 - **Cadence.** `schedule: {kind: "periodic", every_secs: N}`. Match the work: triage 3–6h, digest/audit daily (86400), heavier sweeps every few days.
+- **Handoff transport.** Workers DM the current parent participant; a healthy native connection wakes that session without waiting for its next scheduled scan. Verify this independently of cadence. Existing embedded Codex sessions may lack native delivery even after their prompts are updated.
 - **What it scans → what it spawns.** The deterministic input-gather (a log sample, a DB snapshot, a changelog diff, a git-diff-since-last-run) and the lifecycle it drives subtasks through.
 - **`review_kind`.** How `/triage-review` should treat it: `"fix_first"` (queue is mostly mergeable code fixes), `"investigate_first"` (queue is mostly investigate-only proposals awaiting you), or omit (not triage-reviewable). Set it at create time so discovery is config-driven (`continuous.list` surfaces it; the skill reads it — no skill edit per new task).
 
@@ -30,12 +31,20 @@ Before writing anything, pin these down — they determine everything else:
 
 ## 1. The operator RPC helper
 
-All continuous CRUD goes over the daemon's operator socket (`~/.cm/daemon.sock`) **on the host that will own the task**. Run this on that host (e.g. `ssh cm-manager 'python3 -'`, or locally):
+Continuous CRUD goes over the daemon's operator socket (`~/.cm/daemon.sock`) **on the host that owns the task**. Prefer the maintained helper from the CM checkout; it reads that host's token without printing it:
+
+```bash
+scripts/cm-op --ssh cm-manager continuous.list '{}'
+```
+
+For a structured Python workflow, use the real host-local token, not the historical literal `"op"`:
 
 ```python
 import json, os, socket, struct
 def rpc(method, params, sock=os.path.expanduser("~/.cm/daemon.sock")):
-    req = {"id": os.urandom(6).hex(), "caller": {"token_id": "op"}, "method": method, "params": params}
+    with open(os.path.expanduser("~/.cm/operator-token")) as token_file:
+        token = token_file.read().strip()
+    req = {"id": os.urandom(6).hex(), "caller": {"token_id": token}, "method": method, "params": params}
     b = json.dumps(req).encode()
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(60); s.connect(sock)
     s.sendall(struct.pack(">I", len(b)) + b)
@@ -44,7 +53,7 @@ def rpc(method, params, sock=os.path.expanduser("~/.cm/daemon.sock")):
     s.close(); return json.loads(buf)
 ```
 
-Methods you'll use: `continuous.create`, `continuous.list`, `continuous.update`, `continuous.pause`, `continuous.run_now`, `continuous.delete`, plus session methods (`read_session_output`, `send_input`, `kill_session`, `list_sessions`). All are **operator-only**.
+Continuous CRUD methods include `continuous.create`, `continuous.list`, `continuous.update`, `continuous.pause`, `continuous.run_now` and `continuous.delete`; these require Operator access. Agent session tools have their own authenticated task/workspace scope. Operator capability does not expand the user's authorized task.
 
 ---
 
@@ -80,19 +89,20 @@ Keep these **proven idioms** (every live orchestrator uses them):
 
 - **Descriptive orchestrator identity.** Name the session `<task>-orchestrator`, e.g. `health-triage-orchestrator`; this overrides the general short-codename advice. Claim it on first `chat_send(name=...)`. Existing participants use `chat_open().name.revision` with `chat_rename`, preserving their UID, conversations, mentions and aliases. Include `~/.cm/policies/continuous-review-routing.md` in every prompt and worker brief and keep that shared policy deployed on the execution host.
 
-- **Review routing and lifecycle (Owner, 2026-09-10).** Include [continuous-review-routing.md](doc/continuous-review-routing.md) in every new orchestrator and worker brief. Routine worker handoffs go by DM to the parent and wake it immediately; keep scheduled scans/queue admission and reconciliation as fallback. Only the orchestrator escalates a reviewed decision that actually requires Owner. Maintain `metadata.continuous_stage`, actual UTC `stage_updated_at` and `next_action`; distinguish `review_queued`/`reviewing` from `owner_review`. Preserve visible live sessions while tasks remain unfinished. Activity/idle state is never a review decision.
+- **Review routing and lifecycle (Owner, 2026-09-10).** Include [continuous-review-routing.md](doc/continuous-review-routing.md) in every new orchestrator and worker brief. Routine worker handoffs go by DM to the parent; healthy native delivery wakes it as messages arrive. Drain and acknowledge the inbox before cadence gates, review only the handed-off work, and deduplicate by task ID + artifact SHA + stage. A DM does not admit a new scan or queue batch. Keep schedules, queue admission, completion monitors and periodic reconciliation. Only the orchestrator escalates a reviewed decision that actually requires Owner. Maintain `metadata.continuous_stage`, actual UTC `stage_updated_at` and `next_action`; distinguish `review_queued`/`reviewing` from `owner_review`. Preserve visible live sessions while tasks remain unfinished. Activity/idle state is never a review decision.
 
 - **You ARE the parent task; you do NOT do the work yourself** — you scan, spawn subtasks (`create_subtask` + `mcp_start_session`), and drive each along a lifecycle. Your memory is a gitignored `./.<task>/` dir (index.yaml + cycle-log.md) in your worktree that persists across cycles. First cycle: `mkdir -p .<task> && echo ".<task>/" >> "$(git rev-parse --git-path info/exclude)"`.
 - **Your lane — first paragraph.** State exactly what you own and, explicitly, what you DON'T (hand off to the other triages). Scope discipline is what keeps findings honest.
 - **Mandate-first.** "Your PRIMARY job is to FIND real issues and drive them to a fix; the GATE keeps findings honest, it is NOT a reason to file nothing." A big/expensive signal is a *dig-harder* signal, not a dismiss signal. (For investigation-first domains, add: "most findings become investigation tasks, not fixes — and a clean zero-finding cycle on a quiet window is also success; don't manufacture findings.")
 - **The GATE** — a short numbered checklist a candidate must clear before you spawn it: quantifiable (name the number), real (not noise / a documented quirk), category fits a fixed enum, actionable.
-- **Lifecycle** — `investigate → propose → implement → review → merge → monitor` (steps can collapse). Each cycle, push every open item to its next step.
-- **Step 0: sync to main** (`git fetch origin && git merge --ff-only origin/main`) — you never commit in your own worktree, so this is always a clean ff; your `.<task>/` memory is ignored and survives.
+- **Lifecycle** — `investigate → propose → implement → review → merge → monitor` (steps can collapse). Advance the relevant item on a worker handoff; reconcile all open items during scheduled cycles within their existing authority boundaries.
+- **Before a scheduled scan: sync to main** — fetch and fast-forward only when the orchestrator worktree is clean and its branch permits it. Respect the repository's shared-checkout rules; do not assume a fast-forward or overwrite another session's work. A handoff-only wake does not require starting the scan procedure.
 - **Step 1: the deterministic gather** — a script/heredoc that produces the cycle's inputs. Reproduce whatever the old cron/harness did (log sample, DB snapshot, changelog diff). Sample, don't full-scan, when the source is huge (the trader daily log is ~1.8GB — a full scan times out; use `sample_logs`).
-- **Step 2: drive open subtasks** — `list_subtasks`; derive each one's stage from **artifacts** (git working tree + committed diff + NOTES.md), NOT its self-report; record a structured block in index.yaml **every cycle**; act by stage.
-- **Planning-status convention (load-bearing for the TUI).** Set a subtask `blocked` **only** when the ball is with the operator (a committed fix awaiting review, or an explicit human decision); everything the orchestrator advances itself stays `running`; reconcile each cycle. This drives the continuous column's **⚪ needs-you vs ◇ orchestrator-has-it** indicator — breaking the convention breaks the indicator. (Full glyph legend: §"Continuous-column glyph legend" below.)
-- **Operator-directive ACK (load-bearing for the TUI).** When the operator unblocks an index issue out-of-band — clears its `blocked_reason` and leaves a dated `# OPERATOR <YYYY-MM-DD> …` comment in the entry (the `/triage-review` convention) — the TUI renders that issue as **○ dispatch pending** under you until you act. At **cycle start**, when you process such a directive, write `operator_ack: <YYYY-MM-DD>` (today, ≥ the directive date) into that issue's index entry — whether you dispatch a subtask, defer, or decide the directive needs no dispatch. The ack (or a live spawned subtask) is what clears the ○; without it the operator can't tell seen-and-handled from never-seen.
-- **Re-spawn exited agents into the SAME worktree** — `mcp_start_session(task_id=<existing subtask id from list_subtasks>, …)`, never `create_subtask` for an existing finding. An exited agent is a reason to restart work, not punt to the user.
+- **Drive subtasks from evidence** — resolve the stable planning parent/child IDs and derive stage from git, NOTES and validation artifacts. Persist each reviewed handoff immediately to task metadata and the index. On scheduled reconciliation, join bulk task rows, live session summaries, retained delivery state and the parent index first; inspect individual transcripts only for exceptions. Include terminal tasks with live workers as cleanup candidates, and open tasks without live sessions as recovery candidates. Neither mismatch alone authorizes completion or termination.
+- **Planning status and visible stage.** Internal review queues and orchestrator work stay `running`. Set `blocked` only for a concrete Owner decision after parent review. Record `review_queued`, `reviewing`, `owner_review`, `waiting` or the other shared stage values separately in metadata. The subtask label color and legend carry stage; focused text overrides that color. Idle means the session stopped working, not that review passed.
+- **Operator-directive ACK (load-bearing for the TUI).** When the operator unblocks an index issue out-of-band — clears its `blocked_reason` and leaves a dated `# OPERATOR <YYYY-MM-DD> …` comment in the entry (the `/triage-review` convention) — the TUI renders that issue as **○ dispatch pending** under you until you act. Process it on its authorized message handoff or the next scheduled reconciliation. Write `operator_ack: <YYYY-MM-DD>` (today, ≥ the directive date) when handled, whether you dispatch, defer or determine that no dispatch is needed. The ack (or a live spawned subtask) clears the ○. A message receipt alone does not prove the directive was handled.
+- **Recover unfinished tasks using the SAME task/worktree** — `mcp_start_session(task_id=<existing subtask id>, …)`, not another `create_subtask`. Resolve the current parent participant after replacement; old DMs do not transfer to a new UID. Preserve pause state and concrete infrastructure holds; record failed recovery rather than repeatedly launching a known-broken worker. Already terminal work is reviewed for cleanup, not relaunched merely because its session exited.
+- **Separate slice completion, task completion and cleanup.** Worker `report_done` reports a completed slice; parent `report_done` closes its scheduled run. Neither proves the planning task is finished. Keep unfinished tasks live and visible. After an authorized terminal disposition and settled worker activity, verify closure and use the guarded cleanup procedure in [task-worktree-cleanup.md](doc/task-worktree-cleanup.md). A retained transcript tombstone is history, and a closed worker is not proof its worktree was reaped.
 - **Adopt any pre-existing backlog** (e.g. the trader's own `index.yaml` `active` entries) with a clear dedup rule.
 - **Step N: summary → `./.<task>/cycle-log.md`** — one paragraph per cycle; this is your continuity.
 
@@ -156,6 +166,8 @@ cat "$WT/.<slug>/index.yaml"       # findings tracked correctly?
 
 Confirm it: gathered inputs correctly, applied the GATE (didn't over-file on a quiet window, didn't miss a real issue), didn't over-spawn subtasks, and set planning statuses per the convention. **A clean "0 findings" cycle on a quiet window is a valid pass** for investigation-first tasks.
 
+Also verify one actual worker-to-current-parent DM: accepted message, native wake observed, parent inbox read/acknowledgment, artifact review and persisted stage. No routine Owner notification should occur. A prompt update, idle parent or successful `chat_send` alone does not prove this path. Inspect `notification_status` for missing/uncertain delivery; preserve pending handoffs and periodic reconciliation until delivery is verified. Do not restart a busy parent just to pass the smoke test.
+
 ---
 
 ## 7. If you're MIGRATING a cron: disable it (only after the smoke test)
@@ -173,6 +185,7 @@ Never disable the old job until the new task has fired a real cycle successfully
 ## 8. Operate: verify · update · review · pause
 
 - **Health read:** `continuous.list` → per-task `run_count`, `schedule`, `next_fire_at`, `current_session_uid`, `last_outcome`, `in_flight`, `account_blocked`, `review_kind`. Or read `~/.cm/continuous-tasks/<task>/state.json` directly.
+- **Review delivery health:** inspect the current parent's native `notification_status`, pending receipts and recorded handoffs separately from scheduled-run health. A completed scheduler run does not prove worker messages were processed. Missing transport requires a supported migration/reconnect at an appropriate boundary; model/backend failures are a separate blocker. See [native notifications](doc/messaging/NATIVE_NOTIFICATIONS.md).
 - **Change a live task in place:** `continuous.update {task_id, <field>}` — **preserves `run_count` + run history** (no delete+recreate). Common: steer the `default_prompt`, set `compact_every`, change `schedule`, backfill `review_kind`. Applied fields take effect next fire; the live session keeps running.
 - **Review its output:** `/triage-review <task>` (or no-arg to enumerate reviewable tasks via `review_kind`). Fix-first tasks → walk the merge queue; investigate-first → read the proposals + decide. The orchestrator NEVER merges triage fixes itself — you do — **unless** the task is explicitly designed to auto-merge high-confidence fixes (then it gates on build+test green and pushes only `main`).
 - **Pause / manual fire / delete:** `continuous.pause {task_id, paused:true}`, `continuous.run_now {task_id}`, `continuous.delete {task_id, gc?}`.
@@ -211,17 +224,19 @@ Backstory: cm-manager's `~/.claude/.credentials.json` got truncated at 04:18; th
 
 ---
 
-## Continuous-column glyph legend
+## Continuous-column stage and activity indicators
+
+Subtask **text color** shows `metadata.continuous_stage`; the fixed legend explains Queue, Investigate, Build, Review Q, Reviewing, Needs you, Deploy, Verify, Waiting, Done and Unstaged. Focused text uses the selection highlight instead. See [the stage contract](doc/continuous-review-routing.md#visible-stages). An idle session can still be waiting for parent review, Owner review, evidence or runtime recovery.
 
 What each session row (and sub-line) in the TUI's Continuous column (`A-c`) means:
 
 | Glyph | Meaning |
 |---|---|
 | spinner (green) | Session actively producing output — orchestrator mid-cycle, or a subtask agent working. |
-| `●` (white) | **Operator action needed** — the row's planning task is raw-`blocked` (a committed fix awaiting `/triage-review`, or an explicit human decision). Load-bearing: `blocked` means *operator-action-needed*, nothing else (a merged-but-monitoring subtask goes back to `running`). |
+| `●` (white) | Legacy planning-status attention signal for `blocked`. Use the durable stage and concrete next action to distinguish reviewed Owner work from stale legacy metadata. A routine review request belongs with the parent and stays `running`. |
 | `◉` (cyan) + `↳ text` line | **Operator question parked** (`metadata.operator_question`) — the orchestrator needs an answer; the question renders inline under the row. |
 | `○` (yellow) sub-line | **Dispatch pending** — the operator unblocked an index issue (cleared `blocked_reason` + dated `OPERATOR` directive) and the orchestrator hasn't acknowledged (`operator_ack`) or spawned a live subtask for it yet. One line per issue, e.g. `○ PERF-083 · dispatch pending (2026-07-18)`. Clears on ack or dispatch (polled ~30s). |
-| `◇` (dim) | Idle, **orchestrator has it** — nothing needs you; the next fire advances it. |
+| `◇` (dim) | Idle activity indicator. Read stage/next action for who owns the next step; a message wake may advance it before the next scheduled fire. |
 | `⟳` (yellow) | Remote attach stream lost; auto-reconnecting (daemon-side work keeps running). |
 
 ---
@@ -230,18 +245,19 @@ What each session row (and sub-line) in the TUI's Continuous column (`A-c`) mean
 
 - **Auto-fire race + rate-limit modal** — §5. Verify delivery; never assume `run_count=1` means it ran.
 - **Seed detector state files before cycle-1** — §5.
-- **`uv run` in a worktree** — continuous worktrees get their own `.venv`, so `uv run` works in them. But a repo's `.env` (DB DSNs) lives in the **clone**, not the worktree — source it via `REPO_DIR="$(dirname "$(git rev-parse --git-common-dir)")"; source "$REPO_DIR/.env"`.
-- **DB access stays read-only** for prod — use the read-only role/DSN (e.g. the trader's `POSTGRES_READONLY_CONNECTION_STRING` via `ssh trader` as claude-triage), or a trusted SELECT-only script. Do NOT hand an agent a write DSN for ad-hoc `psql`. The repo's committed `postgres-remote` MCP is `--access-mode=unrestricted` — don't route agent drilldowns through it.
+- **Worktree environments** — use the target repository's bootstrap hooks/helper; do not assume each checkout gets a private `.venv` or hand-create links. predictionTrading provisions shared environment/configuration links through `scripts/python/bootstrap_worktree.py`. Inspect bindings without modifying or printing credentials.
+- **Routine DB scans are reads** — use the configured database MCP or repository query helper and its query guidance. Queue/lifecycle writes and implementation changes follow the task's existing authority; tool availability alone does not expand the work scope.
 - **`next_fire_at` drifts from any "old cron hour"** — periodic schedules fire every `every_secs` from *creation* time, not at a fixed wall-clock hour. Fine for cadence-based work; if you need a specific hour, that's a `cron`-kind schedule (see the design doc).
 - **`compact_every` boundary fires are compact-only and self-closing** — every Nth *scheduler* fire on a persistent task delivers `/compact` instead of the prompt (the cycle resumes next fire), claims **no** queue batch, and records its run already-`Done` at fire time (nothing exists to `report_done` it). The scheduler then spaces the next fire ≥10 min out so the batch/prompt paste can't land mid-summarization. (Pre-2026-07 the boundary run was recorded `Running` with no possible closer — on a persistent *Consumer* that wedged the run-active gate forever and silently consumed the boundary's batch; the scraper-opt incident.)
 - **`review_kind` on existing tasks** — backfill via `continuous.update`. New tasks: set it at create. `continuous.list` + `state.json` carry it; `/triage-review` (no-arg) discovers from it.
-- **Deploying a daemon change** (if you touch daemon code): can't `cp` over the running `/opt/cm-daemon/cm-daemon` ("Text file busy") — `sudo mv` it aside, then `cp` + `systemctl restart cm-daemon`. The restart cleanly reattaches live orchestrator PTYs (same session_uids survive). This is the procedure for the Consumer-cadence changes in §8 too: they are daemon-side, so nothing changes until the binary is swapped and restarted. Task `state.json` is untouched by the swap — a live Consumer keeps its `run_count`, `last_fired_at`, `last_run` and queue position across it.
+- **Deploying daemon changes:** follow [the holder/brain runbook](HOWTO_HOLDER_BRAIN_SPLIT.md). Routine brain deployments use `daemon.restart` through the supported deployment helper and preserve holder-owned sessions. `systemctl restart cm-daemon` is a hard service restart that can kill sessions; do not use it as a routine documentation, prompt or MCP-tool refresh. Updating guidance does not install a new TUI or migrate legacy session transports.
 
 ---
 
 ## See also
 
 - `DESIGN_CONTINUOUS_TASKS.md` — architecture, scheduler, run-mode executors, funnel, roadmap.
+- [Continuous review routing](doc/continuous-review-routing.md) — message handoffs, periodic reconciliation, quiet reviews, lifecycle stages and session retention.
 - `AGENT_ORCHESTRATION.md` — the MCP tool surface an orchestrator drives (start_session, create_subtask, list_sessions, global perms).
 - `DESIGN_CONTINUOUS_PANEL.md` — the Sessions-view continuous column; authoritative glyph legend (implementation view of the legend above).
 - The `/triage-review` skill — the human review/merge counterpart.

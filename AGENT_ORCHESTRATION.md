@@ -1,5 +1,7 @@
 # Agent Orchestration — Design Doc
 
+**Current operations:** this document retains the original architecture and implementation history. For the deployed daemon/MCP surface, use [the agent quickstart](doc/AGENT_QUICKSTART.md) and [MCP agent guide](mcp_server/AGENT_GUIDE.md). Continuous workers route routine handoffs to the current parent through native messaging; schedules admit work and reconcile missed handoffs. [Continuous review routing](doc/continuous-review-routing.md) defines review stages, quiet Owner escalation and unfinished-session retention. Follow the user's existing authority for actions; this historical design does not require a new confirmation for already-authorized work.
+
 ## Goal
 
 Give agents running inside the TUI the same control surface a human user has: spawn subtasks (in the same worktree or in a child worktree branched from the parent), spawn and manage sibling sessions, prompt and read other sessions, launch and steward workflows, and mark work done. Everything stays visible in the TUI sidebar with clear markers for "this is a subtask of X" and "this session is being driven by agent Y."
