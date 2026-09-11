@@ -55,6 +55,8 @@ def rpc(method, params, sock=os.path.expanduser("~/.cm/daemon.sock")):
 
 Continuous CRUD methods include `continuous.create`, `continuous.list`, `continuous.update`, `continuous.pause`, `continuous.run_now` and `continuous.delete`; these require Operator access. Agent session tools have their own authenticated task/workspace scope. Operator capability does not expand the user's authorized task.
 
+An agent's session-control MCP tools address its local daemon even when chat spans multiple hosts. Use the same `scripts/cm-op --ssh <owning-host>` helper for already-authorized remote worker inspection or dispatch. A local `not_found` is not evidence the remote worker exited; verify it on its owning host before replacing it. See [cross-host session control](doc/AGENT_QUICKSTART.md#controlling-a-session-on-another-host).
+
 ---
 
 ## 2. Create the planning task

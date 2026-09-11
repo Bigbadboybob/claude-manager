@@ -207,6 +207,30 @@ Workers enter `review_queued`; parents enter `reviewing` and advance to `owner_r
 
 Use the session UIDs returned by CM for session-control tools. Tool access is not permission to start unrelated work or control unrelated sessions; follow Owner's task authorization and your repository's instructions. Global permissions do not change that. Read-only inspection and communication do not expand your task scope.
 
+### Controlling a session on another host
+
+Chat and session control have different routing. Chat spans enrolled hosts; `list_sessions`, `send_input`, `read_session_output`, `read_last_turn` and worker monitors address the daemon attached to your MCP process. They do not search other hosts for a UID. `global_perms` broadens task access on that daemon; it does not make the tools reach another daemon. The laptop TUI's multi-host view does not make an agent's MCP multi-host.
+
+For example, a Claude reviewer on cm-sessions calling `send_input` with a cm-manager worker UID gets `not_found: target session ... not in the daemon registry`. This means the local registry lacks that UID; it does not prove the remote worker is dead or unreachable. Resolve its owning host and stable task/worktree binding before considering a replacement.
+
+For Owner-authorized remote review or dispatch, use the maintained operator helper from the CM checkout. It runs the request on the target host over SSH and reads that host's token without printing it:
+
+```bash
+scripts/cm-op --ssh cm-manager resolve_authorized_session '{"session_uid":"<worker-uid>"}'
+```
+
+For an already-authorized instruction to that settled worker:
+
+```bash
+scripts/cm-op --ssh cm-manager send_input '{"session_uid":"<worker-uid>","text":"<authorized instruction>","submit":true}'
+```
+
+On cm-manager itself, omit `--ssh cm-manager`; a deployed copy of the helper is `~/.cm/docs/continuous-tasks/scripts/cm-op`. Discover workers with the helper's `list_sessions`, matched by task UUID, and use `resolve_authorized_session` for the bound remote transcript. Read that transcript on its owning host; a remote path is not a local file. The daemon's `read_session_output` returns PTY bytes, whereas the similarly named MCP tool parses transcript messages.
+
+The helper is an Operator route for the work Owner authorized. Do not substitute the local session UID as a remote caller or copy tokens into prompts. No extra approval is needed merely to use this route for an already-approved dispatch. A successful `send_input` response means delivery was accepted; verify actual processing from the bound transcript. It does not register an MCP completion monitor. Prefer the worker's normal DM handoff when native delivery is available; retain parent reconciliation for legacy workers. After an uncertain send, inspect delivery evidence before retrying—the input RPC has no chat-style request-ID deduplication.
+
+For routine coordination, DM the current parent or worker through chat. Native wake availability is a separate question from SSH/control reachability. Do not spawn a duplicate worker or move its implementation to a different host solely because a local session-control lookup failed.
+
 Use `notification_status()` to inspect your native connection and delivery receipts. Claude uses its own-session socket; new CM Codex sessions use an owned app-server. The connection starts automatically, so there is no per-notification arming call. A submitted notice is distinct from an observed receipt, and neither marks its chat messages read. Pending or uncertain notices do not fall back to terminal typing. See [native notifications and upgrade steps](messaging/NATIVE_NOTIFICATIONS.md).
 
 Chat watches (`chat_monitor`) watch messages; worker watches (`monitor_sessions`) watch session completion. Chat watches are daemon-resident; worker watches live in your MCP process. Do not assume worker watches survive an MCP reconnect.
