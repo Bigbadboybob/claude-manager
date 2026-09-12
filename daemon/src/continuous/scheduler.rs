@@ -241,6 +241,8 @@ pub struct ContinuousScheduler {
     /// Account-block/wedge transcript-probe throttle: `task_id -> last probe ts`
     /// ([`TAIL_PROBE_INTERVAL_SECS`]). In-memory only.
     probe_at: Mutex<HashMap<String, u64>>,
+    /// Rate-limit unavailable-evidence diagnostics per task and run.
+    evidence_warnings: Mutex<HashMap<String, (u64, u64)>>,
     /// Account-block alert cooldown latch: `task_id -> last alert ts`
     /// ([`AUTH_REALERT_SECS`]); cleared when the task's transcript shows a
     /// healthy (non-auth-error) tail again. In-memory only — a restart
@@ -298,6 +300,7 @@ impl ContinuousScheduler {
             stall_alerts: Mutex::new(HashMap::new()),
             queue_depths: Mutex::new(HashMap::new()),
             probe_at: Mutex::new(HashMap::new()),
+            evidence_warnings: Mutex::new(HashMap::new()),
             auth_alerts: Mutex::new(HashMap::new()),
             wedge_escalations: Mutex::new(HashMap::new()),
             creds_state: Mutex::new((0, 0)),
@@ -1102,10 +1105,17 @@ impl ContinuousScheduler {
                 if tk.engine == task::Engine::Codex {
                     held.insert(tk.task_id.clone());
                     self.record_drain_diagnostic(tk, run.seq, uid, Some("Codex rollout is missing, unknown, stale or has an unclassified runtime error; no automatic close or recovery.".into()));
-                    eprintln!("cm-daemon: Codex tail evidence unavailable for {} seq {}; run remains held", tk.task_id, run.seq);
+                    let mut warnings = self.evidence_warnings.lock().unwrap_or_else(|p| p.into_inner());
+                    let emit = warnings.get(&tk.task_id).is_none_or(|(seq, last)|
+                        *seq != run.seq || now.saturating_sub(*last) >= 300);
+                    if emit {
+                        warnings.insert(tk.task_id.clone(), (run.seq, now));
+                        eprintln!("cm-daemon: Codex tail evidence unavailable for {} seq {}; run remains held (diagnostic limited to once per 5 minutes)", tk.task_id, run.seq);
+                    }
                 }
                 continue;
             };
+            self.evidence_warnings.lock().unwrap_or_else(|p| p.into_inner()).remove(&tk.task_id);
             if tail.shape == TailShape::MidTurn {
                 self.record_drain_diagnostic(tk, run.seq, uid, None);
             }
@@ -4248,12 +4258,16 @@ mod tests {
     #[test]
     fn pool_failure_durably_holds_all_schedules_without_interrupting_sessions() {
         let _tmp = with_temp_home(|| {
+            for fixture in [
+                include_str!("../../tests/fixtures/codex-0.153.4/pool_unavailable.jsonl"),
+                include_str!("../../tests/fixtures/codex-0.153.4/bridge_cooldown.jsonl"),
+            ] {
             for name in ["consumer", "periodic", "on-demand"] {
                 let state = Arc::new(Mutex::new(DaemonState::default()));
                 let sched = ContinuousScheduler::new(Arc::clone(&state));
                 let id = format!("pool-{name}");
                 let mtime = bind_transcript(&state, &id, &format!("{id}.jsonl"),
-                    &[include_str!("../../tests/fixtures/codex-0.153.4/pool_unavailable.jsonl")]);
+                    &[fixture]);
                 state.lock().unwrap().sessions.get_mut(&id).unwrap().session_type = "codex".into();
                 let mut t = running_consumer(&id, &id, RunMode::Persistent, 1, 1);
                 t.engine = Engine::Codex;
@@ -4272,6 +4286,7 @@ mod tests {
                 assert_eq!(response["reason"], "reconciliation_required");
                 assert!(!state.lock().unwrap().sessions[&id].last_exit.operator_kill_requested());
                 assert!(std::fs::read_to_string(task::runs_log_path(&id)).unwrap().contains("pool_unavailable"));
+            }
             }
         });
     }

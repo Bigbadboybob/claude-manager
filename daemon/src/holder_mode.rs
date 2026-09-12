@@ -1996,6 +1996,7 @@ pub fn adopt_at_boot(
                 workspace_id: ws_id.clone(),
                 task_id: e.task_id.clone(),
                 managed_by_uid: e.managed_by_uid.clone(),
+                continuous_task_id: e.continuous_task_id.clone(),
                 label: e.label.clone(),
                 workflow_run_id: None,
                 workflow_role: None,

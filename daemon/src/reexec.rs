@@ -2503,6 +2503,7 @@ fn swap_exit_tombstone(
         workspace_id: rec.workspace_id.clone(),
         task_id: rec.task_id.clone(),
         managed_by_uid: rec.managed_by_uid.clone(),
+        continuous_task_id: rec.continuous_task_id.clone(),
         label: rec.title.clone(),
         workflow_run_id: rec.workflow_run_id.clone(),
         workflow_role: rec.workflow_role.clone(),

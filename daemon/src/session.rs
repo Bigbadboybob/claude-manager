@@ -2754,6 +2754,26 @@ impl InputHandle {
         Ok(())
     }
 
+    /// A recovery Enter must not submit a draft typed since the agent paste.
+    /// Check under the same writer lock used to stamp human input, closing
+    /// the race between checking operator activity and writing the retry.
+    pub(crate) fn write_recovery_enter(&self, bytes: &[u8], since: Instant) -> std::io::Result<bool> {
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let _permit = crate::writer_gate::write_permit();
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        if self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|at| at >= since) {
+            return Ok(false);
+        }
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        Ok(true)
+    }
+
     /// Bump the activity clock WITHOUT writing to the PTY. The agent
     /// `send_input` path hands the actual PTY write to a detached delivery
     /// thread (settle → bracketed body → gap → kitty-Enter), but the caller

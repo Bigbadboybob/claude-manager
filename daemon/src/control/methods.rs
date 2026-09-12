@@ -1439,6 +1439,7 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             workspace_id: sess.workspace_id.clone(),
             task_id: sess.task_id.clone(),
             managed_by_uid: sess.managed_by_uid.clone(),
+            continuous_task_id: sess.continuous_task_id.clone(),
             label: sess.title.clone(),
             workflow_run_id: sess.workflow_run_id.clone(),
             workflow_role: sess.workflow_role.clone(),
@@ -1888,7 +1889,7 @@ pub fn send_input(
         // Input was delivered NOW — flip idle false synchronously even though
         // the PTY write is deferred to the delivery thread (which stamps too).
         handle.stamp_activity();
-        spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false, None);
+        spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false, Some(Arc::clone(state_arc)));
         Ok(json!({ "ok": true, "delivery": "agent-kitty-async" }))
     } else {
         let mut payload = p.text.into_bytes();
@@ -2615,6 +2616,7 @@ pub fn list_sessions(
                 "managed_by_uid": tomb.managed_by_uid,
                 "workspace_id": tomb.workspace_id,
                 "task_id": tomb.task_id,
+                "continuous_task_id": tomb.continuous_task_id,
                 "workflow_run_id": tomb.workflow_run_id,
                 "workflow_role": tomb.workflow_role,
                 "worktree_path": tomb.worktree_path,
@@ -2778,6 +2780,7 @@ pub fn resolve_authorized_session(
             "engine": engine_str(&tomb.session_type),
             "transcript_path": tomb.transcript_path.clone(),
             "generation": tomb.generation,
+            "continuous_task_id": tomb.continuous_task_id,
             "idle": true,
             "semantic_idle": true,
             "exited_at": tomb.exited_at,
@@ -7132,6 +7135,18 @@ mod operator_quiet_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn codex_delivery_recovery_enter_preserves_new_operator_draft() {
+        let (h, writes) = InputHandle::test_handle_capturing();
+        let start = Instant::now();
+        assert!(h.write_recovery_enter(b"\r", start).unwrap());
+        h.write_and_stamp_operator(b"Owner draft").unwrap();
+        assert!(!h.write_recovery_enter(b"\r", start).unwrap());
+        let captured = writes.lock().unwrap();
+        assert_eq!(captured.len(), 2, "no recovery Enter after human input");
+        assert_eq!(captured[1].1, b"Owner draft");
+    }
+
+    #[test]
     fn never_typed_passes_immediately() {
         let h = InputHandle::test_handle();
         let start = Instant::now();
@@ -7440,179 +7455,98 @@ fn spawn_agent_prompt_delivery(
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
-            let wrote =
+            if let Some(state) = confirm_state {
+                deliver_agent_body_confirmed(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
+            } else {
                 deliver_agent_body(&handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
-            // Ground-truth confirmation for FRESH codex spawns (2026-08-25):
-            // the delivery's PTY-quiet submit verification is fooled by any
-            // startup modal (directory-trust dialog, the shared-account
-            // rate-limit menu) — the Enter answers the MODAL, the dismissal
-            // repaint reads as "the agent reacted", and the prompt sits in
-            // the composer unsubmitted while the log says submitted=true.
-            // codex gives us real ground truth: its rollout file stays EMPTY
-            // until a turn actually starts, so poll that and re-drive when
-            // the submit demonstrably never happened. Fresh spawns only (a
-            // live target has no startup modal), codex only (claude has no
-            // equivalent stays-empty transcript signal, and no observed
-            // failures).
-            if wrote && fresh_spawn {
-                if let Some(state) = confirm_state {
-                    confirm_codex_prompt_delivery(&state, &handle, &session_uid, &prompt);
-                }
             }
         });
 }
 
-/// How long the codex confirm loop waits, total, from delivery return.
+/// Confirmation runs for fresh/resumed launches, persistent fires and
+/// send_input. Never clear/re-paste based on missing transcript evidence:
+/// a delayed writer could otherwise make us interrupt or duplicate real work.
 pub(crate) const CODEX_CONFIRM_MAX: std::time::Duration = std::time::Duration::from_secs(75);
-/// Re-send Enter at these offsets while the rollout is still empty. The
-/// first covers a dropped/eaten Enter with the body still in the composer
-/// (an extra Enter on an EMPTY composer is a no-op, so this can never
-/// double-submit); the second covers one more modal layer.
+// Workflow fresh-context activation has a separate persisted confirmation
+// state machine; keep its existing cadence independent of PTY prompt recovery.
 pub(crate) const CODEX_CONFIRM_ENTER_RETRIES: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(8), std::time::Duration::from_secs(18),
+];
+pub(crate) const CODEX_CONFIRM_REDELIVER_AT: std::time::Duration = std::time::Duration::from_secs(32);
+const CODEX_DELIVERY_ENTER_RETRIES: [std::time::Duration; 4] = [
     std::time::Duration::from_secs(8),
     std::time::Duration::from_secs(18),
+    std::time::Duration::from_secs(32),
+    std::time::Duration::from_secs(50),
 ];
-/// Full re-drive (Ctrl+C → body → gap → Enter) at this offset. Ctrl+C
-/// first so a body still sitting in the composer is cleared rather than
-/// doubled — verified against codex 0.149.1: C-c clears a non-empty
-/// composer without killing the process (a paste-A / C-c / paste-B /
-/// Enter sequence submits exactly B; Esc, by contrast, clears NOTHING —
-/// the same probe submitted A+B concatenated). On an empty composer one
-/// C-c just arms the quit hint, which the immediately following paste
-/// disarms.
-pub(crate) const CODEX_CONFIRM_REDELIVER_AT: std::time::Duration = std::time::Duration::from_secs(32);
 
-/// True when `uid`'s codex rollout shows a started turn: a bound
-/// `transcript_path` whose file is non-empty. codex creates the rollout
-/// only when the first turn starts (verified on 0.149.1 — the file, named
-/// for session start, appears with session_meta + the user message at
-/// FIRST SUBMIT), so "non-empty rollout" == "the prompt actually went
-/// through". `None` = the session left the registry (exited/killed): stop.
-fn codex_turn_started(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<bool> {
-    let (session_type, path) = {
-        let st = state.lock().unwrap_or_else(|p| p.into_inner());
-        let sess = st.sessions.get(uid)?;
-        (sess.session_type.clone(), sess.transcript_path.clone())
-    };
-    if session_type != "codex" {
-        // Not codex (claude spawns share this delivery path): report
-        // "started" so the confirm loop ends immediately as a no-op.
-        return Some(true);
+fn deliver_agent_body_confirmed(
+    state: &Arc<Mutex<DaemonState>>,
+    handle: &crate::session::InputHandle,
+    fanout: &Arc<crate::session::PtyByteFanout>,
+    uid: &str,
+    body: &str,
+    fresh: bool,
+    what: &str,
+) -> bool {
+    let mut evidence = None;
+    let wrote = deliver_agent_body_guarded(handle, fanout, uid, body, fresh, what, None,
+        Some(&mut || { evidence = super::codex_delivery::DeliveryEvidence::capture(state, uid, body); }));
+    if wrote {
+        if let Some(mut evidence) = evidence {
+            confirm_codex_prompt_delivery(state, handle, uid, body, &mut evidence);
+        }
     }
-    Some(
-        path.map(|p| {
-            std::fs::metadata(p)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false),
-    )
+    wrote
 }
 
-/// Post-delivery ground-truth confirmation + bounded re-drive for a fresh
-/// codex spawn's prompt. Runs on the (already detached) delivery thread.
-/// See the call-site comment for the failure class this closes.
 fn confirm_codex_prompt_delivery(
     state: &Arc<Mutex<DaemonState>>,
     handle: &crate::session::InputHandle,
-    session_uid: &str,
-    body_text: &str,
+    uid: &str,
+    body: &str,
+    evidence: &mut super::codex_delivery::DeliveryEvidence,
 ) {
-    use std::time::Instant;
-    let started = Instant::now();
-    let mut enter_retries_sent = 0usize;
-    let mut redelivered = false;
+    use super::codex_delivery::Observation;
+    let started = std::time::Instant::now();
+    let mut retries = 0;
     loop {
-        match codex_turn_started(state, session_uid) {
-            None => {
-                // Session gone (exited or killed) — nothing to confirm.
-                return;
-            }
-            Some(true) => {
-                // Turn started — the prompt went through. Only worth a log
-                // line when we had to intervene.
-                if enter_retries_sent > 0 || redelivered {
-                    eprintln!(
-                        "cm-daemon: codex prompt for {} CONFIRMED via rollout after \
-                         recovery ({} extra Enter(s), redelivered={}) at +{}s",
-                        session_uid,
-                        enter_retries_sent,
-                        redelivered,
-                        started.elapsed().as_secs(),
-                    );
-                }
-                return;
-            }
-            Some(false) => {}
-        }
-        // A restart quiesce wants writers parked, and this loop is pure
-        // robustness — end it rather than contend (the un-submitted case
-        // will be visible in the rollout's absence after the restart).
-        if crate::writer_gate::pause_requested() {
-            eprintln!(
-                "cm-daemon: codex prompt confirmation for {} ended early — \
-                 restart quiesce in progress (rollout still empty at +{}s)",
-                session_uid,
-                started.elapsed().as_secs(),
-            );
+        // Any human input after our paste ends recovery, even if they have
+        // since gone quiet. Never submit an Owner's draft or answer a modal.
+        if crate::writer_gate::pause_requested()
+            || handle.operator_quiet_for().is_some_and(|q| q < evidence.started.elapsed()) {
             return;
+        }
+        let observation = evidence.observe(state, uid, body);
+        match observation {
+            Observation::Gone => return,
+            Observation::Accepted => {
+                eprintln!("cm-daemon: codex prompt for {uid} CONFIRMED by new matching rollout receipt ({retries} extra Enter(s))");
+                return;
+            }
+            Observation::Active => {
+                eprintln!("cm-daemon: codex prompt for {uid}: new runtime activity without matching receipt; leaving active turn untouched");
+                return;
+            }
+            Observation::Pending | Observation::Unknown => {}
         }
         let elapsed = started.elapsed();
         if elapsed >= CODEX_CONFIRM_MAX {
-            eprintln!(
-                "cm-daemon: WARNING codex prompt for {} UNCONFIRMED — rollout \
-                 still empty {}s after delivery, through {} extra Enter(s) and \
-                 redelivered={}; the agent likely booted into a startup modal \
-                 (trust dialog / rate-limit menu) and is sitting promptless",
-                session_uid,
-                elapsed.as_secs(),
-                enter_retries_sent,
-                redelivered,
-            );
+            let message = format!("Codex prompt for session {uid} is unconfirmed after {}s and {retries} extra Enter(s). Inspect the composer/startup state; CM retained the session and claimed work without clearing or replaying the prompt.", elapsed.as_secs());
+            eprintln!("cm-daemon: WARNING {message}");
+            let notify = state.lock().unwrap_or_else(|p| p.into_inner()).config.notify_command.clone();
+            crate::notify::notify_operator(notify.as_deref(), "prompt-unconfirmed", &message);
             return;
         }
-        if enter_retries_sent < CODEX_CONFIRM_ENTER_RETRIES.len()
-            && elapsed >= CODEX_CONFIRM_ENTER_RETRIES[enter_retries_sent]
-        {
-            enter_retries_sent += 1;
-            eprintln!(
-                "cm-daemon: codex prompt for {} unconfirmed at +{}s — re-sending \
-                 Enter ({}/{})",
-                session_uid,
-                elapsed.as_secs(),
-                enter_retries_sent,
-                CODEX_CONFIRM_ENTER_RETRIES.len(),
-            );
-            if handle.write_and_stamp(AGENT_KITTY_ENTER).is_err() {
-                return;
-            }
-        } else if !redelivered && elapsed >= CODEX_CONFIRM_REDELIVER_AT {
-            redelivered = true;
-            // Final pre-check right before the destructive-ish step: a turn
-            // that started in the last poll interval must not be Esc'd.
-            if codex_turn_started(state, session_uid) != Some(false) {
-                continue;
-            }
-            eprintln!(
-                "cm-daemon: codex prompt for {} unconfirmed at +{}s — full \
-                 re-drive (Ctrl+C clear, re-paste body, Enter)",
-                session_uid,
-                elapsed.as_secs(),
-            );
-            // One indivisible unit, mirroring the primary delivery's
-            // body→gap→Enter contract under the writer gate.
-            let _unit = crate::writer_gate::unit_permit();
-            if handle.write_and_stamp(b"\x03").is_err() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let body = body_text.trim_end_matches(['\r', '\n']);
-            if handle.write_and_stamp(&agent_paste_payload(body)).is_err() {
-                return;
-            }
-            std::thread::sleep(AGENT_ENTER_GAP);
-            if handle.write_and_stamp(AGENT_KITTY_ENTER).is_err() {
-                return;
+        if observation == Observation::Pending && retries < CODEX_DELIVERY_ENTER_RETRIES.len()
+            && elapsed >= CODEX_DELIVERY_ENTER_RETRIES[retries] {
+            // Recheck directly before a recovery write, including operator
+            // input during filesystem observation.
+            if evidence.observe(state, uid, body) == Observation::Pending
+                && !handle.operator_quiet_for().is_some_and(|q| q < evidence.started.elapsed()) {
+                retries += 1;
+                eprintln!("cm-daemon: codex prompt for {uid} unconfirmed at +{}s — re-sending Enter ({retries}/{})", elapsed.as_secs(), CODEX_DELIVERY_ENTER_RETRIES.len());
+                if !matches!(handle.write_recovery_enter(AGENT_KITTY_ENTER, evidence.started), Ok(true)) { return; }
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -7668,7 +7602,7 @@ fn deliver_agent_body(
     fresh_spawn: bool,
     what: &str,
 ) -> bool {
-    deliver_agent_body_guarded(handle, fanout, session_uid, body_text, fresh_spawn, what, None)
+    deliver_agent_body_guarded(handle, fanout, session_uid, body_text, fresh_spawn, what, None, None)
 }
 
 fn deliver_agent_body_guarded(
@@ -7679,6 +7613,7 @@ fn deliver_agent_body_guarded(
     fresh_spawn: bool,
     what: &str,
     notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
+    before_write: Option<&mut dyn FnMut()>,
 ) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
@@ -7807,6 +7742,7 @@ fn deliver_agent_body_guarded(
         Some(guard)
     } else { None };
     let _unit = crate::writer_gate::unit_permit();
+    if let Some(before_write) = before_write { before_write(); }
     if let Err(e) = handle.write_and_stamp(&payload) {
         eprintln!(
             "cm-daemon: agent {} body write failed for {}: {}",
@@ -7982,6 +7918,7 @@ fn spawn_persistent_prompt_delivery(
     session_uid: String,
     prompt: String,
     compact: bool,
+    state: Arc<Mutex<DaemonState>>,
 ) {
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-persistent-prompt-{}", session_uid))
@@ -8019,7 +7956,8 @@ fn spawn_persistent_prompt_delivery(
                 // Compact-only fire — do NOT fall through to the prompt.
                 return;
             }
-            deliver_agent_body(
+            deliver_agent_body_confirmed(
+                &state,
                 &handle,
                 &fanout,
                 &session_uid,
@@ -11677,6 +11615,7 @@ pub fn trigger(
                     live_uid.clone(),
                     resolved_prompt.clone(),
                     compact,
+                    Arc::clone(state_arc),
                 );
             }
         }
@@ -13711,7 +13650,7 @@ pub(super) fn deliver_drain_notice(state: &Arc<Mutex<DaemonState>>, task: &crate
     };
     let Some((handle, fanout)) = target else { return; };
     let binding = super::continuous_drain::NoticeBinding { state, task_id: &task.task_id, request_id: &drain.request_id, session_uid: uid };
-    if deliver_agent_body_guarded(&handle, &fanout, uid, &text, false, "continuous stop notice", Some(&binding)) {
+    if deliver_agent_body_guarded(&handle, &fanout, uid, &text, false, "continuous stop notice", Some(&binding), None) {
         let _ = crate::continuous::task::modify(&task.task_id, |task| {
             if let Some(current) = task.drain.as_mut() {
                 if current.request_id == drain.request_id {
@@ -20377,6 +20316,83 @@ mod tests {
     /// it only under `include_exited=true`. The bug this guards: the daemon
     /// evicted exited sessions with no tombstone, so the MCP read-after-exit
     /// contract returned not_found.
+    /// Real PTY regression for the incident: old conversation history exists,
+    /// startup repaints swallow the first Enter, and the 40KB batch remains in
+    /// the composer. All three production entry points must retry only Enter.
+    #[test]
+    fn codex_delivery_recovers_parked_prompt_on_all_agent_entry_points() {
+        for route in ["fresh", "persistent", "send_input"] {
+            let dir = TempDir::new().unwrap();
+            let state = state_with_workspace("ws-delivery", &dir);
+            let uid = fresh_test_uid();
+            let rollout = dir.path().join("rollout.jsonl");
+            let receipt = dir.path().join("receipt.json");
+            let script = dir.path().join("composer.py");
+            let body = "recover batch item\n".repeat(2400);
+            std::fs::write(&rollout, format!("{}\n", json!({
+                "timestamp":"2026-09-11T00:00:00.000Z","type":"event_msg",
+                "payload":{"type":"user_message","message":body}
+            }))).unwrap();
+            std::fs::write(&script, r#"
+import datetime,json,os,pathlib,select,sys,time,tty
+rollout,receipt=map(pathlib.Path,sys.argv[1:])
+tty.setraw(0)
+os.write(1,b'\x1b[?2004h\x1b[>1uStarting MCP servers\r\n')
+time.sleep(0.3);os.write(1,b'.'*1024+b'\r\n')
+buf=b'';enters=0;paint_until=0;accepted=False
+while True:
+    ready,_,_=select.select([0],[],[],0.1)
+    if time.monotonic()<paint_until:os.write(1,b'\rStarting MCP servers...')
+    if not ready:continue
+    data=os.read(0,65536)
+    if not data:break
+    buf+=data
+    marker=b'\x1b[13u'
+    if marker not in buf:continue
+    enters+=buf.count(marker);buf=buf.replace(marker,b'')
+    if enters==1:
+        paint_until=time.monotonic()+4
+        continue
+    if not accepted:
+        text=buf.replace(b'\x1b[200~',b'').replace(b'\x1b[201~',b'').decode()
+        stamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z')
+        with rollout.open('a') as f:f.write(json.dumps({'timestamp':stamp,'type':'event_msg','payload':{'type':'user_message','message':text}})+'\n')
+        receipt.write_text(json.dumps({'enters':enters,'text':text,'ctrl_c':buf.count(b'\x03')}))
+        os.write(1,b'\rWorking on batch\r\n');accepted=True
+"#).unwrap();
+            let mut sp = crate::session::SpawnParams::new(&uid, "composer", "/usr/bin/python3");
+            sp.args = vec!["-u".into(), script.display().to_string(), rollout.display().to_string(), receipt.display().to_string()];
+            sp.workspace_id = "ws-delivery".into();
+            sp.session_type = "codex".into();
+            let mut session = crate::session::DaemonSession::spawn(sp).unwrap();
+            session.transcript_path = Some(rollout.display().to_string());
+            let handle = session.input_handle();
+            let fanout = session.fanout.clone();
+            state.lock().unwrap().sessions.insert(uid.clone(), session);
+            match route {
+                "fresh" => spawn_agent_prompt_delivery(handle, fanout, uid.clone(), body.clone(), true, Some(state.clone())),
+                "persistent" => spawn_persistent_prompt_delivery(handle, fanout, uid.clone(), body.clone(), false, state.clone()),
+                _ => { send_input(&state, &json!({"session_uid":uid,"text":body,"submit":true}), None).unwrap(); }
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&receipt) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        assert_eq!(v["text"], body.trim_end_matches(['\r', '\n']), "{route}: body sent exactly once");
+                        assert_eq!(v["ctrl_c"], 0, "{route}: never clear active context");
+                        assert_eq!(v["enters"], 2, "{route}: startup ate initial Enter, recovery supplied one");
+                        break;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "{route}: nonempty old rollout must not suppress recovery");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Let the receipt confirmation finish before dropping the fake PTY.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            kill_all_sessions(&state);
+        }
+    }
+
     #[test]
     fn read_after_exit_serves_transcript_via_tombstone() {
         let dir = TempDir::new().unwrap();
@@ -20389,6 +20405,7 @@ mod tests {
             sp.workspace_id = "ws-rae".to_string();
             sp.session_type = "claude-code".to_string();
             let mut ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+            ds.continuous_task_id = Some("ct-exit-owner".into());
             ds.transcript_path = Some("/tmp/rae-sid.jsonl".to_string());
             let mut s = state.lock().unwrap();
             s.sessions.insert(uid.clone(), ds);
@@ -20409,6 +20426,7 @@ mod tests {
         )
         .expect("resolve ok");
         assert_eq!(resolved["state"], "exited");
+        assert_eq!(resolved["continuous_task_id"], "ct-exit-owner");
         assert_eq!(resolved["transcript_path"], "/tmp/rae-sid.jsonl");
         assert_eq!(resolved["idle"], true);
         // list_sessions surfaces the exited row only with include_exited=true.
@@ -20417,9 +20435,17 @@ mod tests {
         assert!(
             with.as_array().unwrap().iter().any(|r| {
                 r["session_uid"] == uid.as_str() && r["state"] == "exited"
+                    && r["continuous_task_id"] == "ct-exit-owner"
             }),
             "include_exited=true must surface the tombstone: {with:?}",
         );
+        let tomb = state.lock().unwrap().exited_tombstone(&uid).unwrap().clone();
+        let encoded = serde_json::to_value(&tomb).unwrap();
+        let decoded: crate::state::ExitedTombstone = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.continuous_task_id.as_deref(), Some("ct-exit-owner"));
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("continuous_task_id");
+        assert!(serde_json::from_value::<crate::state::ExitedTombstone>(legacy).unwrap().continuous_task_id.is_none());
         let without = list_sessions(&state, &json!({ "include_exited": false }), None)
             .expect("list ok");
         assert!(
@@ -22194,6 +22220,7 @@ mod tests {
                 workspace_id: "ws-rv".into(),
                 task_id: Some("task-rv".into()),
                 managed_by_uid: None,
+                continuous_task_id: None,
                 label: "rv".into(),
                 workflow_run_id: None,
                 workflow_role: None,
@@ -22367,6 +22394,7 @@ mod tests {
             workspace_id: "ws-tomb".into(),
             task_id: Some("task-t".into()),
             managed_by_uid: Some("ts-ffffffffffffffff-0".into()),
+            continuous_task_id: None,
             label: "tombed".into(),
             workflow_run_id: None,
             workflow_role: None,

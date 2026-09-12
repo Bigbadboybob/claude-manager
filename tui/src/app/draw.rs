@@ -1384,7 +1384,16 @@ impl App {
         let rows = self.visual_items_continuous();
         let mut items: Vec<ListItem> = Vec::new();
         for (i, r) in rows.iter().enumerate() {
-            let ts = &self.workspaces[r.ws_idx].sessions[r.sess_idx];
+            let Some(si) = r.sess_idx else {
+                let ws = &self.workspaces[r.ws_idx];
+                let selected = self.cursor_column == SidebarColumn::Continuous && self.cursor == r.cursor();
+                let last = rows[i + 1..].iter().find(|next| next.depth <= r.depth).is_none_or(|next| next.depth < r.depth);
+                let name = crate::planning::truncate_with_ellipsis(&ws.name, (inner.width as usize).saturating_sub(19));
+                let style = if selected { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::DIM) };
+                items.push(ListItem::new(Line::from(Span::styled(format!("   {} {} (no session)", if last { "└" } else { "├" }, name), style))));
+                continue;
+            };
+            let ts = &self.workspaces[r.ws_idx].sessions[si];
             // P3 (Feature 1): a parked operator-question wins the idle glyph and
             // adds a dim inline text line below the row (see the second Line push).
             let question = self.session_question(ts);
@@ -1487,7 +1496,7 @@ impl App {
             let is_selected = self.cursor_column == SidebarColumn::Continuous
                 && matches!(
                     &self.cursor,
-                    Cursor::Session(cwi, csi) if *cwi == r.ws_idx && *csi == r.sess_idx
+                    Cursor::Session(cwi, csi) if *cwi == r.ws_idx && Some(*csi) == r.sess_idx
                 );
             let label_style = if is_selected {
                 Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
@@ -1561,7 +1570,7 @@ impl App {
         let mut state = std::mem::take(&mut self.continuous_list_state);
         if self.cursor_column == SidebarColumn::Continuous {
             let selected = match &self.cursor {
-                Cursor::Session(wi, si) => rows.iter().position(|r| r.ws_idx == *wi && r.sess_idx == *si),
+                Cursor::Session(_, _) | Cursor::Workspace(_) => rows.iter().position(|r| r.cursor() == self.cursor),
                 Cursor::Backtest(_) => self
                     .sidebar_cursor_index(&backtests)
                     .map(|index| rows.len() + index),

@@ -718,7 +718,29 @@ impl App {
             }
         }
         self.last_adopt_scan = Some(now);
+        self.converge_session_ownership();
         self.adopt_untracked_daemon_sessions();
+    }
+
+    /// A restored row may predate the daemon's ownership binding. Fill
+    /// absent tags from the current host's existing poll cache, preserving
+    /// its PTY, UID and any explicit local binding.
+    pub(super) fn converge_session_ownership(&mut self) {
+        let mut changed = false;
+        for ws in &mut self.workspaces {
+            for ts in &mut ws.sessions {
+                let Some(summary) = self.remote_session_lists.get(&ts.host_id)
+                    .and_then(|rows| rows.iter().find(|s| s.session_uid == ts.uid)) else { continue; };
+                for (current, observed) in [
+                    (&mut ts.task_id, &summary.task_id),
+                    (&mut ts.continuous_task_id, &summary.continuous_task_id),
+                    (&mut ts.managed_by_uid, &summary.managed_by_uid),
+                ] {
+                    if current.is_none() && observed.is_some() { *current = observed.clone(); changed = true; }
+                }
+            }
+        }
+        if changed { self.save_session_manifest(); self.needs_redraw = true; }
     }
 
     /// Surface agent-spawned ("phantom") daemon sessions in the sidebar.
