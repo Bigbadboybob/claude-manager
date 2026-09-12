@@ -164,57 +164,28 @@ impl Recipient {
     }
 }
 pub fn tick(state: &Arc<Mutex<DaemonState>>) {
-    let (handle, root, draining) = {
+    let (handle, root, gate, recipients) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        (s.messaging.clone(), s.messaging_root.clone(), s.draining)
+        if s.draining { return; }
+        (s.messaging.clone(), s.messaging_root.clone(), s.messaging_delivery.clone(),
+         s.sessions.keys().cloned().collect::<Vec<_>>())
     };
-    if draining {
-        return;
-    }
-    let gate = state
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .messaging_delivery
-        .clone();
-    let (groups, store_root) = {
+    {
         let _guard = gate.lock().unwrap_or_else(|p| p.into_inner());
-        let Ok(mut slot) = handle.try_lock() else {
-            return;
-        };
-        let Some(store) = slot.as_mut() else {
-            return;
-        };
+        let Ok(mut slot) = handle.try_lock() else { return; };
+        let Some(store) = slot.as_mut() else { return; };
         if store.degraded.is_some() || store.advance_monitors_at(chrono::Utc::now()).is_err() {
             return;
         }
-        if let Err(e) = reconcile(&root, store) {
-            eprintln!("cm messaging: wake reconciliation: {e}");
-            return;
-        }
-        (store.wake_intents(), store.root.clone())
-    };
-    for (uid, _) in groups {
-        // Give cancellations a boundary between recipients, and re-evaluate
-        // eligibility after acquiring it. Never keep the store locked on PTY I/O.
+    }
+    for uid in recipients {
+        // Keep the existing cancellation/publication boundary, but evaluate
+        // only this live recipient. A drain ends the tick between recipients.
         let _guard = gate.lock().unwrap_or_else(|p| p.into_inner());
-        let ids = {
-            let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(store) = slot.as_mut() else {
-                return;
-            };
-            if store.degraded.is_some() {
-                return;
-            }
-            if let Err(e) = reconcile(&root, store) {
-                eprintln!("cm messaging: wake reconciliation: {e}");
-                return;
-            }
-            store.wake_intents().remove(&uid).unwrap_or_default()
-        };
         let recipient = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
-            s.sessions
-                .get(&uid)
+            if s.draining { return; }
+            s.sessions.get(&uid)
                 .filter(|s| !s.fanout.snapshot_since(None).closed)
                 .map(|s| Recipient {
                     engine: s.session_type.clone(),
@@ -223,14 +194,24 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
                     live: Some((Arc::downgrade(state), uid.clone())),
                 })
         };
-        let Some(recipient) = recipient else {
-            continue;
+        let Some(recipient) = recipient else { continue; };
+        let (ids, store_root) = {
+            let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(store) = slot.as_mut() else { return; };
+            if store.degraded.is_some() { return; }
+            let ids = store.wake_intents_for_session(&uid);
+            if let Err(e) = reconcile_intents(&root, store, &uid, &ids) {
+                eprintln!("cm messaging: wake reconciliation for {uid}: {e}");
+                return;
+            }
+            (ids, store.root.clone())
         };
         if let Err(e) = deliver_intents(&root, &store_root, &uid, ids, &recipient) {
             eprintln!("cm messaging: wake for {uid} pending: {e}");
         }
     }
 }
+
 fn deliver_intents(
     cm_root: &Path,
     store_root: &Path,
@@ -379,7 +360,7 @@ pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()>
     if ids.is_empty() {
         return Ok(());
     }
-    let intents = store.wake_intents().remove(uid).unwrap_or_default();
+    let intents = store.wake_intents_for_session(uid);
     let path = queue_path(&store.root, uid);
     let mut q = load(&path)?;
     // Include arrivals not yet visited by the delivery worker before sealing.
@@ -442,53 +423,65 @@ pub fn monitor_status(root: &Path, uid: &str, monitor: &str) -> Value {
 
 /// Must run under the delivery gate, before committing a cancellation reply.
 /// The native queue lock serializes retraction with adapter claims.
+#[cfg(test)]
 pub fn reconcile(cm_root: &Path, store: &Store) -> io::Result<()> {
     for (uid, intents) in store.wake_intents() {
-        let path = queue_path(&store.root, &uid);
-        let mut q = load(&path)?;
-        let before = serde_json::to_value(&q)?;
-        settle(&mut q, &intents);
-        let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
-        for batch in &mut q.batches {
-            let active = batch
-                .ids
-                .iter()
-                .any(|id| eligible.contains(id.as_str()) && !batch.checked.contains(id));
-            let id = format!("chat:{}", batch.wake_id);
-            let text = active.then(|| wake_text(batch, &intents));
-            if let Some(event) =
-                crate::notifications::update_pending(cm_root, &uid, &id, text.as_deref())?
-            {
-                batch.status = native_status(&event).into();
-            } else if !active && pending(&batch.status) {
-                batch.status = "cancelled".into();
-            } else if !active
-                && matches!(
-                    batch.status.as_str(),
-                    "hook_pending" | "hook_attempt_pending"
-                )
-            {
-                let inbox = cm_root
-                    .join("inbox")
-                    .join(&uid)
-                    .join(format!("chat-{}.json", batch.wake_id));
-                let claim = inbox.with_extension("json.retired");
-                match fs::rename(&inbox, &claim) {
-                    Ok(()) => {
-                        fs::remove_file(&claim)?;
-                        fs::File::open(inbox.parent().unwrap())?.sync_all()?;
-                        batch.status = "cancelled".into();
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        batch.status = "submitted_no_retry".into()
-                    }
-                    Err(e) => return Err(e),
+        reconcile_intents(cm_root, store, &uid, &intents)?;
+    }
+    Ok(())
+}
+
+/// Agent read receipts, follows and monitor changes affect only that actor.
+/// Keep offline actors' durable queues until they resume or explicitly cancel.
+pub fn reconcile_session(cm_root: &Path, store: &Store, uid: &str) -> io::Result<()> {
+    reconcile_intents(cm_root, store, uid, &store.wake_intents_for_session(uid))
+}
+
+fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIntent]) -> io::Result<()> {
+    let path = queue_path(&store.root, uid);
+    let mut q = load(&path)?;
+    let before = serde_json::to_value(&q)?;
+    settle(&mut q, intents);
+    let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
+    for batch in &mut q.batches {
+        let active = batch
+            .ids
+            .iter()
+            .any(|id| eligible.contains(id.as_str()) && !batch.checked.contains(id));
+        let id = format!("chat:{}", batch.wake_id);
+        let text = active.then(|| wake_text(batch, intents));
+        if let Some(event) =
+            crate::notifications::update_pending(cm_root, uid, &id, text.as_deref())?
+        {
+            batch.status = native_status(&event).into();
+        } else if !active && pending(&batch.status) {
+            batch.status = "cancelled".into();
+        } else if !active
+            && matches!(
+                batch.status.as_str(),
+                "hook_pending" | "hook_attempt_pending"
+            )
+        {
+            let inbox = cm_root
+                .join("inbox")
+                .join(uid)
+                .join(format!("chat-{}.json", batch.wake_id));
+            let claim = inbox.with_extension("json.retired");
+            match fs::rename(&inbox, &claim) {
+                Ok(()) => {
+                    fs::remove_file(&claim)?;
+                    fs::File::open(inbox.parent().unwrap())?.sync_all()?;
+                    batch.status = "cancelled".into();
                 }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    batch.status = "submitted_no_retry".into()
+                }
+                Err(e) => return Err(e),
             }
         }
-        if serde_json::to_value(&q)? != before {
-            save(&path, &q)?;
-        }
+    }
+    if serde_json::to_value(&q)? != before {
+        save(&path, &q)?;
     }
     Ok(())
 }
@@ -928,6 +921,46 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn messaging_scoped_reconciliation_ignores_unrelated_history_and_preserves_cancellation() {
+        let (tmp, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "scoped-active");
+        let q = deliver(&store, tmp.path(), "codex");
+        let id = format!("chat:{}", q.batches[0].wake_id);
+        let other = store.participant_id("offline");
+        let offline = super::super::Person {
+            id: other.clone(), name: "Offline".into(), session_uid: "offline".into(),
+            kind: "agent".into(), present: false, task: None,
+        };
+        store.enroll_participants(&[offline.clone()]).unwrap();
+        dm(&mut store, &other, &[offline], "offline-pending");
+        let path = queue_path(&store.root, "offline");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"unrelated corrupt historical ledger").unwrap();
+        store.follow(&actor, &json!({"action":"set","dnd":true,"request_id":"scoped-mute"}), &people).unwrap();
+        reconcile_session(tmp.path(), &store, "b").unwrap();
+        assert_eq!(crate::notifications::get(tmp.path(), "b", &id).unwrap().unwrap()["status"], "cancelled");
+        assert_eq!(fs::read(&path).unwrap(), b"unrelated corrupt historical ledger");
+        assert_eq!(store.wake_intents_for_session("offline").len(), 1, "offline messages stay available on resume");
+    }
+
+    #[test]
+    fn messaging_delivery_tick_does_not_reconcile_sessionless_history() {
+        let (tmp, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "offline-tick");
+        let q = deliver(&store, tmp.path(), "codex");
+        let path = queue_path(&store.root, "b");
+        store.follow(&actor, &json!({"action":"set","dnd":true,"request_id":"offline-mute"}), &people).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut daemon = DaemonState::default();
+        daemon.messaging_root = store.root.clone();
+        *daemon.messaging.lock().unwrap() = Some(store);
+        let state = Arc::new(Mutex::new(daemon));
+        tick(&state);
+        assert_eq!(fs::read(&path).unwrap(), before, "background delivery visits only live sessions");
+        assert_eq!(native_event(tmp.path(), &q.batches[0]).unwrap()["status"], "pending");
+    }
+
     #[test]
     fn messaging_legacy_ambiguous_submission_is_never_replayed() {
         let t = tempfile::tempdir().unwrap();
