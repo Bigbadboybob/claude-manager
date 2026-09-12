@@ -65,6 +65,9 @@ pub struct ExitedTombstone {
     pub workspace_id: String,
     pub task_id: Option<String>,
     pub managed_by_uid: Option<String>,
+    /// Retain scheduler ownership on exits and across brain restarts.
+    #[serde(default)]
+    pub continuous_task_id: Option<String>,
     pub label: String,
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
@@ -1465,6 +1468,7 @@ mod tests {
             workspace_id: "ws".to_string(),
             task_id: None,
             managed_by_uid: None,
+            continuous_task_id: None,
             label: uid.to_string(),
             workflow_run_id: None,
             workflow_role: None,

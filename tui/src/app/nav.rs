@@ -389,8 +389,17 @@ pub(super) enum VisualItem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContinuousRow {
     pub ws_idx: usize,
-    pub sess_idx: usize,
+    pub sess_idx: Option<usize>,
     pub depth: u8,
+}
+
+impl ContinuousRow {
+    pub(super) fn cursor(&self) -> Cursor {
+        self.sess_idx.map_or(Cursor::Workspace(self.ws_idx), |si| Cursor::Session(self.ws_idx, si))
+    }
+    fn visual_item(&self) -> VisualItem {
+        self.sess_idx.map_or(VisualItem::WorkspaceHeader(self.ws_idx), |si| VisualItem::Session(self.ws_idx, si))
+    }
 }
 
 /// Uid of the session the cursor currently selects, if it's on a session row
@@ -816,6 +825,7 @@ impl App {
     ///
     pub(super) fn visual_items_status(&self) -> Vec<VisualItem> {
         let members = self.continuous_members();
+        let empty_owners = self.continuous_empty_workspace_owners();
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
@@ -831,6 +841,7 @@ impl App {
                 .filter(|si| !members.contains(&(wi, *si)))
                 .collect();
             if ws.sessions.is_empty() {
+                if empty_owners.contains_key(&wi) { continue; }
                 no_session.push(VisualItem::WorkspaceHeader(wi));
             } else if visible.is_empty() {
                 // Continuous-only workspace → nothing in the main sidebar.
@@ -1040,6 +1051,57 @@ impl App {
             .collect()
     }
 
+    /// Older adopted orchestrator rows sometimes lack task_id. The planning
+    /// workspace binding is authoritative; labels and old manager UIDs aren't.
+    fn continuous_planning_task<'a>(&'a self, ws: &'a Workspace, ts: &'a TerminalSession) -> Option<&'a str> {
+        ts.task_id.as_deref().or_else(|| self.tasks.iter().find(|t|
+            t.is_continuous && t.workspace_id.as_deref() == Some(ws.id.as_str()))
+            .and_then(|t| t.task_id.as_deref()))
+    }
+
+    /// Sessionless workspaces stay reachable under their owning orchestrator.
+    /// Resolve all bound tasks through the planning tree. Ambiguous/shared or
+    /// orphaned workspaces remain in main; closed workspaces never reappear.
+    pub(super) fn continuous_empty_workspace_owners(&self) -> std::collections::HashMap<usize, (usize, usize)> {
+        use std::collections::{HashMap, HashSet};
+        let mut anchors = HashMap::new();
+        for (wi, ws) in self.workspaces.iter().enumerate().filter(|(_, w)| !w.is_closed) {
+            for (si, ts) in ws.sessions.iter().enumerate().filter(|(_, s)| s.continuous_task_id.is_some()) {
+                if let Some(task) = self.continuous_planning_task(ws, ts) {
+                    let key = (&ws.host_id, task);
+                    if !ts.session.exited || !anchors.contains_key(&key) { anchors.insert(key, (wi, si)); }
+                }
+            }
+        }
+        let parents = self.task_parent_map();
+        let mut bound: HashMap<&str, Vec<&str>> = HashMap::new();
+        for t in &self.tasks {
+            if let (Some(ws), Some(task)) = (t.workspace_id.as_deref(), t.task_id.as_deref()) {
+                bound.entry(ws).or_default().push(task);
+            }
+        }
+        let mut result = HashMap::new();
+        for (wi, ws) in self.workspaces.iter().enumerate().filter(|(_, w)| !w.is_closed && w.sessions.is_empty()) {
+            let Some(tasks) = bound.get(ws.id.as_str()) else { continue; };
+            let mut owner = None;
+            let mut ambiguous = false;
+            for task in tasks {
+                let mut at = *task;
+                let mut seen = HashSet::new();
+                let found = loop {
+                    if !seen.insert(at) { break None; }
+                    if let Some(anchor) = anchors.get(&(&ws.host_id, at)) { break Some(*anchor); }
+                    let Some(parent) = parents.get(at) else { break None; };
+                    at = parent;
+                };
+                if found.is_none() || (owner.is_some() && owner != found) { ambiguous = true; break; }
+                owner = found;
+            }
+            if !ambiguous { if let Some(owner) = owner { result.insert(wi, owner); } }
+        }
+        result
+    }
+
     /// The set of `(ws_idx, sess_idx)` that belong to a continuous orchestrator's
     /// tree: an orchestrator itself (`continuous_task_id`), or a subtask of one
     /// — matched by `managed_by_uid == orchestrator.uid` (a direct child of the
@@ -1070,7 +1132,7 @@ impl App {
             for ts in &ws.sessions {
                 if ts.continuous_task_id.is_some() {
                     orch_uids.insert(ts.uid.as_str());
-                    if let Some(t) = ts.task_id.as_deref() {
+                    if let Some(t) = self.continuous_planning_task(ws, ts) {
                         orch_tasks.insert(t);
                     }
                 }
@@ -1130,7 +1192,7 @@ impl App {
                         wi,
                         si,
                         ts.uid.as_str(),
-                        ts.task_id.as_deref(),
+                        self.continuous_planning_task(ws, ts),
                         ts.label.as_str(),
                     ));
                 }
@@ -1138,13 +1200,14 @@ impl App {
         }
         orchestrators.sort_by(|a, b| a.4.cmp(b.4).then(a.2.cmp(b.2)));
         let parent_of = self.task_parent_map();
+        let empty_owners = self.continuous_empty_workspace_owners();
 
         use std::collections::BTreeMap;
         let mut rows = Vec::new();
         for &(owi, osi, ouid, otask, _) in &orchestrators {
             rows.push(ContinuousRow {
                 ws_idx: owi,
-                sess_idx: osi,
+                sess_idx: Some(osi),
                 depth: 0,
             });
             // This orchestrator's member sessions (excluding orchestrators
@@ -1225,11 +1288,16 @@ impl App {
                     .enumerate()
                     .map(|(idx, &(wi, si, _, _))| ContinuousRow {
                         ws_idx: wi,
-                        sess_idx: si,
+                        sess_idx: Some(si),
                         depth: if idx == 0 { 1 } else { 2 },
                     })
                     .collect();
                 groups.push((anchor_label, group_rows));
+            }
+            for (&wi, &owner) in &empty_owners {
+                if owner == (owi, osi) {
+                    groups.push((self.workspaces[wi].name.clone(), vec![ContinuousRow { ws_idx: wi, sess_idx: None, depth: 1 }]));
+                }
             }
             groups.sort_by(|a, b| a.0.cmp(&b.0));
             for (_label, group_rows) in groups {
@@ -1238,7 +1306,7 @@ impl App {
         }
         if let Some(query) = self.sidebar_filter.as_deref() {
             let query = query.to_lowercase();
-            rows.retain(|r| self.visual_item_matches(&VisualItem::Session(r.ws_idx, r.sess_idx), &query));
+            rows.retain(|r| self.visual_item_matches(&r.visual_item(), &query));
         }
         rows
     }
@@ -1285,16 +1353,16 @@ impl App {
                     .as_deref()
                     .and_then(|uid| {
                         rows.iter().find(|r| {
-                            self.workspaces[r.ws_idx].sessions[r.sess_idx].uid == uid
+                            r.sess_idx.is_some_and(|si| self.workspaces[r.ws_idx].sessions[si].uid == uid)
                         })
                     })
-                    .map(|r| Cursor::Session(r.ws_idx, r.sess_idx))
+                    .map(ContinuousRow::cursor)
                     .unwrap_or_else(|| {
                         if rows.is_empty() {
                             return Cursor::Backtest(BacktestCursor::Group);
                         }
                         let r = rows[0];
-                        Cursor::Session(r.ws_idx, r.sess_idx)
+                        r.cursor()
                     });
                 self.saved_main_cursor = Some(self.cursor.clone());
                 self.cursor = target;
@@ -1332,9 +1400,10 @@ impl App {
                 return;
             }
             let cur = match &self.cursor {
+                Cursor::Workspace(wi) => rows.iter().position(|r| r.ws_idx == *wi && r.sess_idx.is_none()).unwrap_or(0),
                 Cursor::Session(wi, si) => rows
                     .iter()
-                    .position(|r| r.ws_idx == *wi && r.sess_idx == *si)
+                    .position(|r| r.ws_idx == *wi && r.sess_idx == Some(*si))
                     .unwrap_or_else(|| (rows.len() + backtests.len()).saturating_sub(1)),
                 Cursor::Backtest(BacktestCursor::Group) => rows.len() + backtests.iter().position(|v| matches!(v, VisualItem::BacktestHeader)).unwrap_or(0),
                 Cursor::Backtest(BacktestCursor::Fleet(stem)) => rows.len() + backtests.iter().position(|v| matches!(v, VisualItem::BacktestFleet(s) if s == stem)).unwrap_or(0),
@@ -1345,7 +1414,7 @@ impl App {
             let next = (cur as i32 + direction).rem_euclid(n) as usize;
             if next < rows.len() {
                 let r = rows[next];
-                self.cursor = Cursor::Session(r.ws_idx, r.sess_idx);
+                self.cursor = r.cursor();
             } else {
                 self.cursor = match &backtests[next - rows.len()] {
                     VisualItem::BacktestHeader => Cursor::Backtest(BacktestCursor::Group),
@@ -1475,7 +1544,7 @@ impl App {
         }
         if self.continuous_column_on {
             for r in self.visual_items_continuous() {
-                rows.push((r.ws_idx, r.sess_idx, true));
+                if let Some(si) = r.sess_idx { rows.push((r.ws_idx, si, true)); }
             }
         }
         let flags: Vec<(bool, bool, bool)> = rows

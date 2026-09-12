@@ -11,6 +11,7 @@ pub enum ErrorKind {
     UsageLimited,
     ModelUnavailable,
     PoolUnavailable,
+    BridgeCooldown,
     Other,
 }
 
@@ -25,6 +26,7 @@ pub fn classify_error(error: &Value) -> ErrorKind {
         "usage_limit_exceeded" => ErrorKind::UsageLimited,
         "model_not_found" => ErrorKind::ModelUnavailable,
         _ if message.starts_with("unexpected status 503 Service Unavailable: No available accounts") => ErrorKind::PoolUnavailable,
+        _ if message.starts_with("unexpected status 503 Service Unavailable: HTTP responses session bridge is cooling down after repeated upstream timeouts") => ErrorKind::BridgeCooldown,
         _ if message.starts_with("unexpected status 401 Unauthorized:") => ErrorKind::AuthExpired,
         _ if message.starts_with("unexpected status 404 Not Found:")
             && message.to_ascii_lowercase().contains("model") =>
@@ -60,7 +62,7 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
         let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
         if matches!(
             (top, kind),
-            ("event_msg", "token_count") | ("session_meta", _)
+            ("event_msg", "token_count") | ("session_meta", _) | ("token_usage_record", _)
         ) {
             continue;
         }
@@ -93,6 +95,9 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
                         }
                         ErrorKind::PoolUnavailable => {
                             result.pool_unavailable = Some("Codex pool cannot serve this request. Check pool capacity and continuation ownership; work reconciliation is required before recovery.".into());
+                        }
+                        ErrorKind::BridgeCooldown => {
+                            result.pool_unavailable = Some("Codex thread's response bridge is cooling down after upstream timeouts. Inspect codex-lb for previous_response_not_found/continuation ownership: retrying the same thread may never recover. Preserve its transcript and reconcile claimed items/workers before replacing the thread and redelivering unfinished work; do not force_done or blindly replay the batch.".into());
                         }
                         // A configuration/transport/unknown error is an
                         // unresolved turn, not proof of abandoned work.
@@ -144,6 +149,29 @@ mod tests {
     const USAGE: &str =
         include_str!("../../tests/fixtures/codex-0.153.4/usage_limit_reached.jsonl");
     const UNKNOWN: &str = include_str!("../../tests/fixtures/codex-0.153.4/model_not_found.jsonl");
+
+    #[test]
+    fn bridge_cooldown_is_actionable_only_from_runtime_error_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let fixture = include_str!("../../tests/fixtures/codex-0.153.4/bridge_cooldown.jsonl");
+        std::fs::write(&path, fixture).unwrap();
+        let result = probe(&path, 0.0).unwrap();
+        assert_eq!(result.shape, TailShape::TurnComplete);
+        assert!(result.pool_unavailable.unwrap().contains("replacing the thread"));
+        assert!(result.auth_error.is_none() && result.usage_limit.is_none());
+        assert!(probe(&path, 2_000_000_000.0).is_none());
+        let v: Value = serde_json::from_str(fixture).unwrap();
+        assert_eq!(classify_error(&v["payload"]["error"]), ErrorKind::BridgeCooldown);
+        let prose = serde_json::json!({"timestamp":"2026-09-12T16:24:00.000Z", "type":"event_msg",
+            "payload":{"type":"agent_message","message":v["payload"]["error"]["message"]}});
+        let bookkeeping = serde_json::json!({"timestamp":"2026-09-12T16:24:01.000Z","type":"token_usage_record","payload":{"thread_id":"fixture"}});
+        std::fs::write(&path, format!("{fixture}{prose}\n{bookkeeping}\n")).unwrap();
+        let live = probe(&path, 0.0).unwrap();
+        assert_eq!(live.shape, TailShape::MidTurn);
+        assert!(live.pool_unavailable.is_none());
+        assert_eq!(classify_error(&serde_json::json!({"message":"unexpected status 503 Service Unavailable: unknown problem"})), ErrorKind::Other);
+    }
 
     #[test]
     fn real_pool_failure_is_distinct_from_account_auth_or_quota() {

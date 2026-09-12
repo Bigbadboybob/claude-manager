@@ -298,11 +298,12 @@ impl App {
         &self,
         members: &HashSet<(usize, usize)>,
     ) -> Vec<usize> {
+        let empty_owners = self.continuous_empty_workspace_owners();
         self.workspaces
             .iter()
             .enumerate()
             .filter(|(wi, ws)| {
-                if ws.is_closed || self.is_past_workspace(*wi) {
+                if ws.is_closed || self.is_past_workspace(*wi) || empty_owners.contains_key(wi) {
                     return false;
                 }
                 // A workspace whose ONLY sessions are continuous members

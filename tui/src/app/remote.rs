@@ -1717,7 +1717,7 @@ mod remote_reconnect_tests {
             .iter()
             .map(|r| {
                 (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
                     r.depth,
                 )
             })
@@ -1799,7 +1799,7 @@ mod remote_reconnect_tests {
             .iter()
             .map(|r| {
                 (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
                     r.depth,
                 )
             })
@@ -1820,6 +1820,76 @@ mod remote_reconnect_tests {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    #[test]
+    fn visual_items_continuous_keeps_sessionless_descendants_reachable() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_manager_host(&tmp.path().join("daemon.sock"));
+        app.workspaces.clear();
+        let (mut orch, _, _) = session_with_injected_exit("orch-new", manager_host(), false);
+        orch.continuous_task_id = Some("ct".into());
+        // Missing task_id is the restored/adopted-row incident shape.
+        orch.task_id = None;
+        let mut parent = workspace_with(orch);
+        parent.id = "orch-ws".into(); parent.host_id = manager_host();
+        app.workspaces.push(parent);
+        let task = |id: &str, ws: Option<&str>, parent: Option<&str>, continuous: bool| TaskEntry {
+            task_id: Some(id.into()), name: id.into(), api_status: TaskStatus::Running,
+            repo_url: None, prompt: None, wip_branch: None, session_id: None, blocked_at: None,
+            is_cloud: true, is_continuous: continuous, workspace_id: ws.map(String::from), project: None,
+            parent_task_id: parent.map(String::from), worktree_mode: WorktreeMode::Inherit, metadata: None,
+        };
+        app.tasks.push(task("orch-task", Some("orch-ws"), None, true));
+        app.tasks.push(task("middle", None, Some("orch-task"), false));
+        app.tasks.push(task("unfinished", Some("empty-ws"), Some("middle"), false));
+        let (dummy, _, _) = session_with_injected_exit("dummy", manager_host(), false);
+        let mut empty = workspace_with(dummy);
+        empty.host_id = manager_host();
+        empty.id = "empty-ws".into(); empty.name = "unfinished scraper".into(); empty.sessions.clear();
+        app.workspaces.push(empty);
+        let rows = app.visual_items_continuous();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].sess_idx, None);
+        assert_eq!(rows[1].cursor(), Cursor::Workspace(1));
+        assert!(!app.visual_items_status().iter().any(|v| matches!(v, VisualItem::WorkspaceHeader(1))));
+        assert!(!app.task_view_visible_workspaces(&app.continuous_members()).contains(&1));
+        app.continuous_column_on = true;
+        app.cursor_column = SidebarColumn::Continuous;
+        app.cursor = Cursor::Session(0, 0);
+        app.navigate(1); assert_eq!(app.cursor, Cursor::Workspace(1));
+        app.navigate(-1); assert_eq!(app.cursor, Cursor::Session(0, 0));
+        app.sidebar_filter = Some("unfinished".into());
+        assert!(app.visual_items_continuous().iter().any(|r| r.sess_idx.is_none()));
+        app.sidebar_filter = None;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("(no session)"), "sessionless row must actually render");
+        let summary = crate::client_session::DaemonSessionSummary {
+            session_uid: "orch-new".into(), label: "orchestrator".into(), session_type: "codex".into(),
+            managed_by_uid: None, workspace_id: Some("orch-ws".into()), task_id: Some("orch-task".into()),
+            workflow_run_id: None, workflow_role: None, worktree_path: None,
+            continuous_task_id: Some("ct".into()), cols: None, rows: None, global_perms: false,
+        };
+        app.remote_session_lists.insert(cm_daemon::host_id::HostId::local(), vec![summary.clone()]);
+        app.converge_session_ownership();
+        assert!(app.workspaces[0].sessions[0].task_id.is_none(), "host scope applies to cached ownership");
+        app.remote_session_lists.insert(manager_host(), vec![summary]);
+        app.converge_session_ownership();
+        assert_eq!(app.workspaces[0].sessions[0].task_id.as_deref(), Some("orch-task"));
+        assert_eq!(app.workspaces[0].sessions[0].uid, "orch-new", "repair must retain identity");
+        // Shared/unrelated work must not disappear from main.
+        app.tasks.push(task("unrelated", Some("empty-ws"), None, false));
+        assert!(app.continuous_empty_workspace_owners().is_empty());
+        assert!(app.task_view_visible_workspaces(&app.continuous_members()).contains(&1));
+        app.tasks.pop();
+        app.workspaces[1].host_id = cm_daemon::host_id::HostId::local();
+        assert!(app.continuous_empty_workspace_owners().is_empty(), "different hosts don't inherit ownership");
+        app.workspaces[1].host_id = manager_host();
+        app.workspaces[1].is_closed = true;
+        assert_eq!(app.visual_items_continuous().len(), 1);
     }
 
     /// Same-task workers (the momentum-detective shape): agent-spawned
@@ -1885,12 +1955,15 @@ mod remote_reconnect_tests {
             metadata: None,
         });
 
+        let owner_ws = app.workspaces[0].id.clone();
+        app.workspaces[0].sessions[0].task_id = None;
+        app.tasks.iter_mut().find(|t| t.is_continuous).unwrap().workspace_id = Some(owner_ws);
         let rows = app.visual_items_continuous();
         let resolved: Vec<(&str, u8)> = rows
             .iter()
             .map(|r| {
                 (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
                     r.depth,
                 )
             })
@@ -2075,7 +2148,7 @@ mod remote_reconnect_tests {
             .iter()
             .map(|r| {
                 (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
                     r.depth,
                 )
             })

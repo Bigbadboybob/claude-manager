@@ -184,6 +184,12 @@ manifest-schema bump): `scripts/cm-redeploy --hard` locally; on cm-manager
 
 ## 6. Reboots
 
+On Ubuntu hosts, install `deploy/needrestart/50-claude-manager.conf` so package
+upgrades cannot restart the holder/API unexpectedly. This prevented a repeat
+of the 2026-09-12 incident that killed 44 sessions. It needs no service restart;
+plan library/OS activation during deliberate maintenance. See
+[continuous-task restart recovery](doc/daemon-restart-recovery.md).
+
 Sessions die at a reboot (unchanged). The supervisor relaunches the **split**:
 locally the TUI reads `~/.cm/holder-binary`; on cm-manager the unit's
 `ExecStart` names the holder. Both are the "C6 flip" — the split's durability
