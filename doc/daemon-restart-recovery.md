@@ -73,6 +73,21 @@ work is never hidden merely because its worker died. Closed workspaces stay
 closed. This display change needs a laptop TUI install/relaunch; agent sessions
 keep running.
 
+The viewer retains planning ancestry for Done tasks separately from active
+work. SP-4/SP-23/SP-30-style retained sessions therefore stay under their
+continuous orchestrator after completion or a viewer restart. Completion also
+updates cached task status before cleanup, so an old Running value cannot pin
+an empty workspace indefinitely.
+
+After sustained daemon-confirmed `NotFound` responses, the viewer also settles
+old scheduler-owned incarnations and saved exits belonging to explicitly Done
+tasks, even when `managed_by_uid` is absent. Their full resume entry and original
+exit time remain in workspace tombstones; normal cleanup soft-closes the empty
+workspace without deleting its worktree or branch. Pins, focus and pending
+attaches still protect workspaces. Network failures, unfinished/unknown
+user-owned entries and workflow participants retain the existing preservation
+behavior. No daemon restart is needed for this viewer cleanup.
+
 ## Chat delivery can starve daemon deployment
 
 The September 12 investigation also found a chat delivery loop that enumerated

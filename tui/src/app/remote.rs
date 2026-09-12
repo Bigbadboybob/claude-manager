@@ -899,15 +899,22 @@ impl App {
     /// a given-up entry stayed "preserved in skipped" forever, so every
     /// killed momentum-detective worker left an EMPTY `agent: detective-*`
     /// header on the sidebar after a TUI restart (the daemon had long
-    /// dropped it; nothing could ever reattach). User-owned and workflow
-    /// entries keep the preserve behavior (offline-host data-loss guard).
+    /// dropped it; nothing could ever reattach). Also settle scheduler-owned
+    /// incarnations and saved exits of Done tasks: these can lack managed_by.
+    /// Other user-owned and workflow entries keep the preserve behavior.
     /// Returns true when the entry was settled.
     fn settle_gone_agent_entry(
         &mut self,
         ws_id: &str,
         entry: &cm_daemon::manifest::ManifestEntry,
     ) -> bool {
-        if entry.managed_by_uid.is_none() || entry.workflow_run_id.is_some() {
+        let completed_exit = entry.last_exit.is_some()
+            && entry.task_id.as_ref().is_some_and(|id| self.sidebar_done_task_ids.contains(id));
+        if entry.workflow_run_id.is_some()
+            || (entry.managed_by_uid.is_none()
+                && entry.continuous_task_id.is_none()
+                && !completed_exit)
+        {
             return false;
         }
         let Some(ws_idx) = self.workspaces.iter().position(|w| w.id == ws_id) else {
@@ -939,13 +946,13 @@ impl App {
                 last_transcript_id: entry.transcript_id.clone(),
                 worktree_path: ws.worktree_path.clone(),
                 generation: entry.generation,
-                exited_at: now,
+                exited_at: entry.last_exit.as_ref().map_or(now, |exit| exit.exited_at),
             });
         }
         self.remove_skipped_entry(ws_id, &uid);
         self.reconnecting_sessions.remove(&uid);
         eprintln!(
-            "cm-tui: agent-spawned session {} ({}) on host {} is gone on the \
+            "cm-tui: session {} ({}) on host {} is gone on the \
              daemon — tombstoned",
             uid,
             entry.label,
@@ -955,6 +962,12 @@ impl App {
         // thing pinning it; the caller drops the pending item, and this
         // entry is already out of `skipped_manifest_entries`).
         self.close_agent_marker_if_empty(ws_idx);
+        // The incremental task feed may now be quiet for hours. Once a full
+        // planning snapshot has arrived, settling the final deferred entry
+        // must release spent workspaces without waiting for another task edit.
+        if !self.sidebar_task_parents.is_empty() {
+            self.reap_spent_workspaces();
+        }
         true
     }
 
@@ -3603,6 +3616,45 @@ mod remote_reconnect_tests {
             !app.workspaces[1].is_closed,
             "the user-owned marker stays attach-pending-exempt (unchanged)",
         );
+
+        // September 12 stragglers: scheduler roots and manually resumed
+        // workers have no managed_by. A saved exit of a Done task may be
+        // settled, but neither an unfinished nor an unknown user row may.
+        app.sidebar_task_parents.insert("done-task".into(), None);
+        app.sidebar_done_task_ids.insert("done-task".into());
+        for (id, continuous, done, workflow, should_settle) in [
+            ("old-orchestrator", true, false, false, true),
+            ("completed-worker", false, true, false, true),
+            ("unfinished-worker", false, false, false, false),
+            ("workflow-worker", false, true, true, false),
+        ] {
+            let name = if continuous { format!("agent: {id}") } else { id.into() };
+            app.workspaces.push(mk_ws(id, &name));
+            let wi = app.workspaces.len() - 1;
+            let (seed, _, _) = session_with_injected_exit(id, ghost.clone(), false);
+            let mut entry = seed.to_manifest_entry();
+            entry.task_id = Some(if done { "done-task" } else { "unfinished-task" }.into());
+            entry.continuous_task_id = continuous.then(|| "momentum-detective".into());
+            entry.workflow_run_id = workflow.then(|| "active-workflow".into());
+            entry.transcript_id = Some("preserved-conversation".into());
+            entry.last_exit = Some(serde_json::from_value(serde_json::json!({
+                "code": 0, "memory_cap_kill": false, "exited_at": 1789099687.5
+            })).unwrap());
+            app.skipped_manifest_entries.insert(id.into(), vec![entry.clone()]);
+            let mut pending = PendingRemoteReattach::new(id.into(), entry);
+            pending.attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
+            app.pending_remote_reattach.push(pending);
+            app.drain_deferred_remote_reattach();
+            assert!(app.pending_remote_reattach.is_empty());
+            assert_eq!(app.workspaces[wi].is_closed, should_settle, "{id}");
+            assert_eq!(!app.skipped_manifest_entries.contains_key(id), should_settle, "{id}");
+            if should_settle {
+                let tomb = &app.workspaces[wi].tombstones[0];
+                assert_eq!(tomb.last_transcript_id.as_deref(), Some("preserved-conversation"));
+                assert_eq!(tomb.exited_at, 1789099687.5);
+                assert_eq!(tomb.entry.as_ref().unwrap().uid, id);
+            }
+        }
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = dhandle.join();

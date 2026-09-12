@@ -205,6 +205,10 @@ fn play_notification_sound() {
 pub struct App {
     pub messages: messages::Messages,
     pub tasks: Vec<TaskEntry>,
+    /// Full planning ancestry, including terminal rows excluded from `tasks`.
+    /// Retained sessions still need these edges after a worker finishes.
+    sidebar_task_parents: HashMap<String, Option<String>>,
+    sidebar_done_task_ids: HashSet<String>,
     /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
     pub workspaces: Vec<Workspace>,
     pub cursor: Cursor,
@@ -885,6 +889,8 @@ impl App {
 
         App {
             messages: messages::Messages::load(),            tasks: Vec::new(),
+            sidebar_task_parents: HashMap::new(),
+            sidebar_done_task_ids: HashSet::new(),
             workspaces: Vec::new(),
             cursor: Cursor::Workspace(0),
             cursor_column: SidebarColumn::Main,

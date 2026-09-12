@@ -1039,15 +1039,18 @@ impl App {
         }
     }
 
-    /// Map each session task_id to its `parent_task_id` (from `self.tasks`).
+    /// Map each session task_id to its `parent_task_id`, including Done tasks.
     /// The respawn-robust link a continuous subtask keeps to its orchestrator:
     /// the orchestrator session's uid changes when it respawns (fresh context /
     /// restart), but the TASK tree doesn't, so a subtask's `parent_task_id`
     /// still points at the orchestrator's task.
     fn task_parent_map(&self) -> std::collections::HashMap<&str, &str> {
-        self.tasks
+        self.sidebar_task_parents
             .iter()
-            .filter_map(|t| Some((t.task_id.as_deref()?, t.parent_task_id.as_deref()?)))
+            .filter_map(|(task, parent)| Some((task.as_str(), parent.as_deref()?)))
+            .chain(self.tasks.iter().filter_map(|t| {
+                Some((t.task_id.as_deref()?, t.parent_task_id.as_deref()?))
+            }))
             .collect()
     }
 

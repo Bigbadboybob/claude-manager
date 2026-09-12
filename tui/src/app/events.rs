@@ -2488,6 +2488,13 @@ impl App {
     /// therefore modelled as sidebar `backtest_rows` (one collapsible
     /// group) instead of workspaces — see `app/backtests.rs`.
     fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
+        // The work list below intentionally omits Done tasks. Keep their
+        // ancestry separately: a retained session must not fall out of its
+        // continuous tree merely because its planning task completed.
+        self.sidebar_task_parents = tasks.iter()
+            .map(|t| (t.id.clone(), t.parent_task_id.clone())).collect();
+        self.sidebar_done_task_ids = tasks.iter()
+            .filter(|t| t.status == "done").map(|t| t.id.clone()).collect();
         // Feed the backtests group from the FULL fetch (all statuses):
         // queued (backlog) rows and grace-lingering terminal rows are part
         // of the group, while the workspace loop below only looks at
@@ -2528,7 +2535,17 @@ impl App {
             // stay in the planning view.
             match task.status.as_str() {
                 "running" | "blocked" => {}
-                _ => continue,
+                _ => {
+                    // Update existing bindings before pruning. Otherwise a
+                    // task that just completed retains its old Running status
+                    // and pins an empty workspace until the next TUI restart.
+                    if let Some(entry) = self.tasks.iter_mut()
+                        .find(|entry| entry.task_id.as_deref() == Some(task.id.as_str()))
+                    {
+                        entry.api_status = TaskStatus::from_api(&task.status);
+                    }
+                    continue;
+                }
             }
             seen_ids.insert(task.id.clone());
 
@@ -7750,6 +7767,47 @@ mod backtest_group_tests {
         restore("HOME", orig);
         restore("CM_DAEMON_SOCKET", orig_dsock);
         restore("CM_TUI_SOCKET", orig_tsock);
+    }
+
+    #[test]
+    fn reconcile_keeps_done_worker_sessions_in_continuous_tree() {
+        with_temp_home(|home| {
+            let mut app = test_app(home);
+            app.workspaces.clear();
+            let mut orch = empty_cloud_ws("orch-ws", "orchestrator", None);
+            orch.is_cloud = false;
+            let mut session = real_session("orchestrator");
+            session.uid = "orch-new".into();
+            session.task_id = Some("orch".into());
+            session.continuous_task_id = Some("structured-scraper-creation".into());
+            orch.sessions.push(session);
+            let mut worker = empty_cloud_ws("worker-ws", "SP-30 federal register", None);
+            worker.is_cloud = false;
+            let mut session = real_session("SP-30");
+            session.task_id = Some("worker".into());
+            session.managed_by_uid = Some("orch-old".into());
+            worker.sessions.push(session);
+            app.workspaces.extend([orch, worker]);
+            let orch_task = api_task("orch", "running", "continuous", false, "orch", None);
+            let mut worker_task = api_task("worker", "running", "oneshot", false, "SP-30", None);
+            worker_task.parent_task_id = Some("orch".into());
+            app.reconcile_tasks(vec![orch_task.clone(), worker_task.clone()]);
+            let uid = app.workspaces.iter().find(|w| w.id == "worker-ws").unwrap().sessions[0].uid.clone();
+            for cold_start in [false, true] {
+                if cold_start { app.tasks.clear(); }
+                worker_task.status = "done".into();
+                app.reconcile_tasks(vec![orch_task.clone(), worker_task.clone()]);
+                let wi = app.workspaces.iter().position(|w| w.id == "worker-ws").unwrap();
+                assert!(app.continuous_members().contains(&(wi, 0)));
+                assert!(app.visual_items_continuous().iter().any(|r|
+                    r.ws_idx == wi && r.sess_idx == Some(0) && r.depth == 1));
+                assert!(!app.task_view_visible_workspaces(&app.continuous_members()).contains(&wi));
+                assert_eq!(app.workspaces[wi].sessions[0].uid, uid);
+                assert!(!app.tasks.iter().any(|t| t.task_id.as_deref() == Some("worker")),
+                    "Done tasks must not become active work or mint new workspaces");
+                assert_eq!(app.workspaces.len(), 2);
+            }
+        });
     }
 
     /// The core owner report: a running cloud backtest must NOT become a
