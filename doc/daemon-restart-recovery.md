@@ -73,6 +73,25 @@ work is never hidden merely because its worker died. Closed workspaces stay
 closed. This display change needs a laptop TUI install/relaunch; agent sessions
 keep running.
 
+## Chat delivery can starve daemon deployment
+
+The September 12 investigation also found a chat delivery loop that enumerated
+all historical participants, then rebuilt that entire wake map and reconciled
+all queues again for each participant. This held the shared chat locks long
+enough to strand messaging RPCs beyond the ten-second deployment barrier.
+
+Delivery now snapshots live session IDs, evaluates one recipient at a time,
+and checks for draining between recipients. Reads, acknowledgements, follows
+and monitor cancellations reconcile only the authenticated caller's queue.
+Durable messages for offline sessions remain available when those sessions
+resume. Publication/cancellation still shares the same gate; mutes, read
+receipts and monitor eligibility retain their existing semantics.
+
+An aborted brain deploy is still an aborted deploy: check `holder_epoch`,
+`brain_pid` and the journal rather than treating `accepted: true` as activation.
+A debugger snapshot can distinguish an old orphan PTY writer from a chat-lock
+wait. Never bypass quiescence or restart the holder to clear either condition.
+
 ## Incident evidence and verification
 
 The original operational handoff and subsequent receipts are under

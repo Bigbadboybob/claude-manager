@@ -603,7 +603,7 @@ fn execute_with_freshness(
         }
     }
     if coordinates_delivery {
-        if let Err(error) = super::delivery::reconcile(&root, store) {
+        if let Err(error) = super::delivery::reconcile_session(&root, store, &uid) {
             eprintln!("cm messaging: pending wake reconciliation: {error}");
             retraction_note = Some(format!(
                 "Change saved, but a queued hook could not yet be retracted: {error}"
