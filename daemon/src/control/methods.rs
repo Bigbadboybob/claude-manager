@@ -7622,6 +7622,7 @@ fn deliver_agent_body_guarded(
     // receiver until the session exits, so a chatty orchestrator's
     // repeated `send_input`s would strand one thread per call. Dropping
     // `rx` on return lets the fanout's next push reap the slot.
+    if fanout.snapshot_since(None).closed { return false; }
     let rx = fanout.subscribe();
     let mut tracker = crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
     // Drain PTY bytes into the tracker for `dur`, so both the observed
@@ -7741,6 +7742,7 @@ fn deliver_agent_body_guarded(
         if handle.operator_quiet_for().is_some_and(|quiet| quiet < OPERATOR_QUIET_WINDOW) { return false; }
         Some(guard)
     } else { None };
+    if fanout.snapshot_since(None).closed { return false; }
     let _unit = crate::writer_gate::unit_permit();
     if let Some(before_write) = before_write { before_write(); }
     if let Err(e) = handle.write_and_stamp(&payload) {
@@ -33129,4 +33131,18 @@ while True:
         });
     }
 
+}
+
+#[cfg(test)]
+mod orphan_prompt_tests {
+    #[test]
+    fn exited_session_never_receives_a_delayed_prompt() {
+        let (handle, writes) = crate::session::InputHandle::test_handle_capturing();
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(1024));
+        fanout.close();
+        for fresh in [false, true] {
+            assert!(!super::deliver_agent_body(&handle, &fanout, "exited", &"abandoned prompt".repeat(3000), fresh, "test"));
+        }
+        assert!(writes.lock().unwrap().is_empty(), "do not fill an orphan PTY after startup failure");
+    }
 }
