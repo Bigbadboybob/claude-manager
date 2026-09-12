@@ -31,7 +31,6 @@ impl Store {
         }
         Ok(())
     }
-    #[cfg(test)]
     pub fn wake_intents(&self) -> BTreeMap<String, Vec<WakeIntent>> {
         let mut actors: BTreeSet<String> = self
             .names

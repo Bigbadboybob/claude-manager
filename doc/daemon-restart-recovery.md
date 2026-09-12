@@ -90,7 +90,8 @@ receipts and monitor eligibility retain their existing semantics.
 An aborted brain deploy is still an aborted deploy: check `holder_epoch`,
 `brain_pid` and the journal rather than treating `accepted: true` as activation.
 A debugger snapshot can distinguish an old orphan PTY writer from a chat-lock
-wait. Never bypass quiescence or restart the holder to clear either condition.
+wait. Delayed prompt delivery now abandons closed terminals before writing,
+including a session that exited during startup/typing waits. Never bypass quiescence or restart the holder to clear either condition.
 
 ## Incident evidence and verification
 
