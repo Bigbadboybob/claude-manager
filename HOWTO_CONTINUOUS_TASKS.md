@@ -79,6 +79,12 @@ planning_task_id = json.load(urllib.request.urlopen(req, timeout=30))["id"]
 
 ---
 
+### Run identity after compaction
+
+Every non-compaction Claude/Codex dispatch includes a daemon-generated `Current CM continuous run` header with `task_id`, `run_seq`, `fire_token`, and `started_at_unix`. The header precedes the task instructions and staged-batch reference; the completion reminder follows them. Persistent periodic sessions get the same run binding as fresh and consumer sessions. Agents should read `get_continuous_context` at the start of each dispatch and treat compacted cycle summaries as history: an earlier `report_done` cannot complete the newly dispatched run. Report actual work and unresolved blockers before calling `report_done` for the current run.
+
+This does not auto-complete runs from assistant prose or relax review/drain obligations. Existing daemon completion evidence and wedge recovery still apply. Bash payloads and compact-only maintenance turns are unchanged.
+
 ## 3. Write the `default_prompt` (the heart of it)
 
 The prompt IS the orchestrator. Copy a live task's prompt as scaffolding:
