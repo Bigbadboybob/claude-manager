@@ -11075,6 +11075,43 @@ fn with_completion_instruction(
     )
 }
 
+/// Bind each agent dispatch to its newly armed run. Persistent prompts used to
+/// be byte-identical across fires, so a post-compact summary saying "done" could
+/// be mistaken for completion of the next run without any work or tool call.
+/// This is context for the agent, never evidence of completion for the daemon.
+fn with_continuous_run_context(
+    prompt: String,
+    engine: crate::continuous::task::Engine,
+    task_id: &str,
+    seq: u64,
+    fire_token: &str,
+    started_at: u64,
+    compact: bool,
+) -> String {
+    if engine == crate::continuous::task::Engine::Bash || compact {
+        return prompt;
+    }
+    let identity = json!({
+        "task_id": task_id,
+        "run_seq": seq,
+        "fire_token": fire_token,
+        "started_at_unix": started_at,
+    });
+    format!(
+        "# Current CM continuous run\n{identity}\n\n\
+         This is a NEW dispatch. Previous cycle summaries and earlier report_done \
+         calls are historical context; they do not complete this run. Read \
+         get_continuous_context now, reconcile retained work, then carry out the \
+         current instructions within the existing authorization boundaries.\n\n\
+         {prompt}\n\n---\n\
+         Close THIS run ({task_id}, seq {seq}) with report_done after its admitted \
+         work and worker obligations settle, including an empty or blocked outcome. \
+         Report actual outcomes and unresolved work. A prose statement that an \
+         older cycle finished is not a completion signal. If CM tools are unavailable, \
+         report that blocker truthfully; do not claim the run was closed."
+    )
+}
+
 /// A staged Consumer batch (Phase 4): items claimed from the task's queue and
 /// written to `<worktree>/.queue/batch-<seq>.json`, awaiting delivery + ack.
 struct ConsumerBatch {
@@ -11584,6 +11621,16 @@ pub fn trigger(
         ),
         None => resolved_prompt,
     };
+
+    let resolved_prompt = with_continuous_run_context(
+        resolved_prompt,
+        task.engine,
+        &task.task_id,
+        seq,
+        &fire_token,
+        started_at,
+        compact,
+    );
 
     // ---- Executor (branched on run_mode) -----------------------------------
     // Lock discipline: NO DaemonState mutex and NO continuous-task flock is held
@@ -28567,6 +28614,45 @@ while True:
             p,
             "bash stays exempt even as a Consumer (run-and-exit signals Done)",
         );
+    }
+
+    #[test]
+    fn continuous_run_context_distinguishes_post_compaction_dispatches() {
+        use crate::continuous::task::Engine;
+        for engine in [Engine::Claude, Engine::Codex] {
+            let body = "Keep review boundaries. Read .queue/batch-305.json.";
+            let previous = with_continuous_run_context(
+                body.into(), engine, "perf-triage", 303, "ft-303", 100, false,
+            );
+            let current = with_continuous_run_context(
+                body.into(), engine, "perf-triage", 305, "ft-305", 200, false,
+            );
+            assert_ne!(previous, current);
+            let identity: Value = serde_json::from_str(current.lines().nth(1).unwrap()).unwrap();
+            assert_eq!(identity["run_seq"], 305);
+            assert_eq!(identity["fire_token"], "ft-305");
+            assert_eq!(identity["started_at_unix"], 200);
+            assert!(current.contains(body), "task and batch instructions preserved");
+            assert!(current.contains("get_continuous_context now"));
+            assert!(current.contains("Close THIS run (perf-triage, seq 305) with report_done"));
+            assert!(!current.contains("ft-303"));
+        }
+    }
+
+    #[test]
+    fn continuous_run_context_preserves_shell_and_compaction_payloads() {
+        use crate::continuous::task::Engine;
+        let shell = "printf 'payload must remain executable\\n'";
+        assert_eq!(
+            with_continuous_run_context(shell.into(), Engine::Bash, "shell", 2, "f", 3, false),
+            shell,
+        );
+        for engine in [Engine::Claude, Engine::Codex] {
+            assert_eq!(
+                with_continuous_run_context("/compact".into(), engine, "task", 16, "f", 3, true),
+                "/compact",
+            );
+        }
     }
 
     /// (e) Staged batches are bounded: the newest `keep` by seq survive, older
