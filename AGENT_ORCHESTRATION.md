@@ -1,6 +1,6 @@
 # Agent Orchestration — Design Doc
 
-**Current operations:** this document retains the original architecture and implementation history. For the deployed daemon/MCP surface, use [the agent quickstart](doc/AGENT_QUICKSTART.md) and [MCP agent guide](mcp_server/AGENT_GUIDE.md). Continuous workers route routine handoffs to the current parent through native messaging; schedules admit work and reconcile missed handoffs. [Continuous review routing](doc/continuous-review-routing.md) defines review stages, quiet Owner escalation and unfinished-session retention. Follow the user's existing authority for actions; this historical design does not require a new confirmation for already-authorized work.
+**Current operations:** this document retains the original architecture and implementation history. For the deployed daemon/MCP surface, use [the agent quickstart](doc/AGENT_QUICKSTART.md) and [MCP agent guide](mcp_server/AGENT_GUIDE.md). Continuous workers route routine handoffs to the current parent through the task's own chat channel (`ct/<slug>`, mention wakes both ways); schedules admit work and reconcile missed handoffs. [Continuous review routing](doc/continuous-review-routing.md) defines review stages, quiet Owner escalation and unfinished-session retention. Follow the user's existing authority for actions; this historical design does not require a new confirmation for already-authorized work.
 
 ## Goal
 

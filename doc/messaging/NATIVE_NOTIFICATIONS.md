@@ -71,7 +71,13 @@ historical deduplication records and cannot hold the new latch closed. The first
 new arrival starts a new batch without replaying those old messages. Legacy
 unsubmitted work stays live and can combine with new arrivals.
 An agent must finish reading its batch; an unread batch is not periodically
-re-notified. Mute/cancellation can still retract unclaimed native work.
+re-notified. The latch is bounded, though: a batch that reached the agent
+(confirmed, submitted or uncertain) and is still unread two minutes later
+releases on its own, so the next arrival publishes a fresh wake instead of
+being swallowed for good (2026-09-14: an orchestrator's 11:01 wake absorbed a
+16:17 task-channel mention until this horizon existed). The released batch
+keeps its ids as history. Mute/cancellation can still retract unclaimed native
+work.
 
 Chat wake text and worker-completion notices instruct agents to inspect pending
 activity before responding, continue the existing task, and report only meaningful

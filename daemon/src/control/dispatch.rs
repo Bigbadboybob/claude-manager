@@ -849,6 +849,9 @@ pub fn dispatch_request(
         "continuous.checkpoint_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
+        "continuous.ensure_channel" => {
+            DispatchOutcome::Done(dispatch_continuous_ensure_channel(state, req))
+        }
         "continuous.force_done" => {
             DispatchOutcome::Done(dispatch_continuous_force_done(state, req))
         }
@@ -1326,6 +1329,19 @@ fn dispatch_continuous_run_now(state: &Arc<Mutex<DaemonState>>, req: &Request) -
 
 /// `continuous.delete` — Phase 2 CRUD. Operator-only; removes the on-disk
 /// `ContinuousTask` record directory.
+fn dispatch_continuous_ensure_channel(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.ensure_channel is Operator-callable only (task channels are scheduler-owned)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_ensure_channel(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 fn dispatch_continuous_delete(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     if let Err(resp) = require_operator(
         req,

@@ -62,15 +62,24 @@ same notification independently. Session-owned personal watches stay local.
 
 ## Continuous tasks
 
-An operator can configure an existing channel with the existing task API:
+By default (`task_channel: "auto"`) the daemon creates `ct/<slug>` for every
+continuous task and binds it; `continuous.ensure_channel {task_id}` forces or
+repairs that idempotently, and `continuous.list` reports `messaging` with the
+path, members, orchestrator and name. An operator can instead configure an
+existing channel with the existing task API:
 
 ```json
 {"task_id":"bug-triage","messaging":{"channel_id":"<channel UUID>"}}
 ```
 
-Pass this to `continuous.update` (or supply `messaging` to `continuous.create`).
-`messaging: null` removes the configured subscription. These are scheduler
-operations, not agent-supplied assertions about a task slug.
+Pass this to `continuous.update` (or supply `messaging` to `continuous.create`;
+either sets `task_channel: "manual"`). `messaging: null` removes the configured
+subscription; `task_channel: "off"` disables the channel. These are scheduler
+operations, not agent-supplied assertions about a task slug. Channel creation
+and joins are coordinator mutations: on a replica the refresh loop defers them
+until the coordinator is reachable. The daemon also assigns the bound session
+the `<task_id>-orchestrator` name (releasing it from the previous instance) and
+joins every attributable worker; see DESIGN_TASK_CHANNELS.md.
 
 The task record owns a subscription UUID, space/channel IDs, binding revision,
 and active session UID. A fresh session handover advances that revision. The

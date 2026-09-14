@@ -44,6 +44,48 @@ struct Batch {
     // receipts as history rather than blocking new wakes behind old unread IDs.
     released: bool,
     coalesced: BTreeSet<String>,
+    // When the wake first reached the agent (confirmed / submitted / uncertain).
+    // A delivered batch the agent never read stops absorbing new arrivals after
+    // `LATCH_HORIZON_SECS`, so a session that ignored one wake still gets the
+    // next one (2026-09-14: an orchestrator's 11:01 wake swallowed a 16:17
+    // mention for good).
+    #[serde(default)]
+    delivered_at: u64,
+}
+/// How long a delivered-but-unread wake batch keeps coalescing new arrivals.
+const LATCH_HORIZON_SECS: u64 = 120;
+fn delivered(status: &str) -> bool {
+    matches!(status, "confirmed" | "submitted_unverified" | "uncertain")
+}
+/// Stamp delivery times and release latches past the horizon. Released
+/// batches keep their ids as history; read receipts are separate anyway.
+fn expire_latches(q: &mut Queue, now: u64) -> bool {
+    let mut changed = false;
+    for batch in &mut q.batches {
+        if batch.released || !delivered(&batch.status) {
+            continue;
+        }
+        if batch.delivered_at == 0 {
+            batch.delivered_at = now;
+            changed = true;
+        } else if now.saturating_sub(batch.delivered_at) >= LATCH_HORIZON_SECS {
+            // Arrivals absorbed after delivery never had a wake of their own;
+            // hand the unfetched ones to a successor so `collect` re-batches
+            // them instead of treating them as covered history.
+            let orphaned: BTreeSet<String> = batch
+                .coalesced
+                .iter()
+                .filter(|id| !batch.checked.contains(*id))
+                .cloned()
+                .collect();
+            batch.ids.retain(|id| !orphaned.contains(id));
+            batch.coalesced.retain(|id| !orphaned.contains(id));
+            batch.released = true;
+            batch.sealed = true;
+            changed = true;
+        }
+    }
+    changed
 }
 fn queue_path(root: &Path, uid: &str) -> PathBuf {
     root.join("_delivery").join(format!("{}.json", digest(uid)))
@@ -219,9 +261,27 @@ fn deliver_intents(
     intents: Vec<WakeIntent>,
     r: &Recipient,
 ) -> io::Result<()> {
+    deliver_intents_at(
+        cm_root,
+        store_root,
+        uid,
+        intents,
+        r,
+        crate::continuous::task::now_unix(),
+    )
+}
+fn deliver_intents_at(
+    cm_root: &Path,
+    store_root: &Path,
+    uid: &str,
+    intents: Vec<WakeIntent>,
+    r: &Recipient,
+    now: u64,
+) -> io::Result<()> {
     let path = queue_path(store_root, uid);
     let mut q = load(&path)?;
-    if collect(&mut q, &intents) {
+    let expired = expire_latches(&mut q, now);
+    if collect(&mut q, &intents) || expired {
         save(&path, &q)?;
     }
     let first = q
@@ -232,6 +292,9 @@ fn deliver_intents(
         let id = format!("chat:{}", batch.wake_id);
         if let Some(event) = crate::notifications::get(cm_root, uid, &id)? {
             batch.status = native_status(&event).into();
+            if delivered(&batch.status) && batch.delivered_at == 0 {
+                batch.delivered_at = now;
+            }
             continue;
         }
         // Old Stop/PTY attempts must never be replayed through the new adapter.
@@ -603,6 +666,37 @@ mod tests {
             native_event(t.path(), &q.batches[1]).unwrap()["status"],
             "pending"
         );
+    }
+    #[test]
+    fn messaging_delivered_but_unread_wake_stops_latching_after_horizon() {
+        for state in ["observed", "submitted", "uncertain"] {
+            let (t, mut store, actor, people) = fixture();
+            let one = dm(&mut store, &actor, &people, "one");
+            let first = deliver(&store, t.path(), "codex");
+            set_native_status(t.path(), &first.batches[0], state);
+            let t0 = 1_000_000u64;
+            // Status is picked up and the delivery time stamped.
+            deliver_intents_at(t.path(), &store.root, "b", store.wake_intents().remove("b").unwrap_or_default(), &recipient("codex"), t0).unwrap();
+            let q = load(&queue_path(&store.root, "b")).unwrap();
+            assert_eq!(q.batches[0].delivered_at, t0, "{state}");
+            // Inside the horizon a new arrival still shares the outstanding wake.
+            let two = dm(&mut store, &actor, &people, "two");
+            deliver_intents_at(t.path(), &store.root, "b", store.wake_intents().remove("b").unwrap_or_default(), &recipient("codex"), t0 + 30).unwrap();
+            let q = load(&queue_path(&store.root, "b")).unwrap();
+            assert_eq!(q.batches.len(), 1, "{state}");
+            assert!(q.batches[0].ids.contains(&two));
+            // Past the horizon the unread batch releases and the next arrival
+            // publishes a fresh native wake.
+            let three = dm(&mut store, &actor, &people, "three");
+            deliver_intents_at(t.path(), &store.root, "b", store.wake_intents().remove("b").unwrap_or_default(), &recipient("codex"), t0 + LATCH_HORIZON_SECS + 1).unwrap();
+            let q = load(&queue_path(&store.root, "b")).unwrap();
+            assert_eq!(q.batches.len(), 2, "{state}");
+            assert!(q.batches[0].released && q.batches[0].sealed);
+            // The arrival absorbed after delivery moves to the successor.
+            assert_eq!(q.batches[0].ids, vec![one.clone()]);
+            assert_eq!(q.batches[1].ids, vec![two.clone(), three]);
+            assert_eq!(native_event(t.path(), &q.batches[1]).unwrap()["status"], "pending");
+        }
     }
     fn read_page(store: &mut Store, actor: &str, params: &Value) -> Value {
         let result = store.read(actor, params, &[]).unwrap();

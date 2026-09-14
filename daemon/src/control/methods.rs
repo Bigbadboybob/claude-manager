@@ -11087,6 +11087,7 @@ fn with_continuous_run_context(
     fire_token: &str,
     started_at: u64,
     compact: bool,
+    standing_file: Option<&str>,
 ) -> String {
     if engine == crate::continuous::task::Engine::Bash || compact {
         return prompt;
@@ -11097,13 +11098,21 @@ fn with_continuous_run_context(
         "fire_token": fire_token,
         "started_at_unix": started_at,
     });
+    let standing = match standing_file {
+        Some(f) => format!(
+            "Your standing instructions (lane, gate, lifecycle and the cycle procedure) are the \
+             \"CM continuous task standing instructions\" section of `{f}` at the worktree root, \
+             already loaded as project instructions; follow them exactly.\n\n"
+        ),
+        None => String::new(),
+    };
     format!(
         "# Current CM continuous run\n{identity}\n\n\
          This is a NEW dispatch. Previous cycle summaries and earlier report_done \
          calls are historical context; they do not complete this run. Read \
          get_continuous_context now, reconcile retained work, then carry out the \
          current instructions within the existing authorization boundaries.\n\n\
-         {prompt}\n\n---\n\
+         {standing}{prompt}\n\n---\n\
          Close THIS run ({task_id}, seq {seq}) with report_done after its admitted \
          work and worker obligations settle, including an empty or blocked outcome. \
          Report actual outcomes and unresolved work. A prose statement that an \
@@ -11410,6 +11419,19 @@ pub fn trigger(
         return Ok(json!({ "fired": false, "reason": "paused" }));
     }
 
+    // Standing instructions: refresh the engine's instruction file in the
+    // worktree before this fire so a fresh thread (and the first turn after a
+    // compaction) loads the current text. Idempotent; a failure is logged and
+    // the fire proceeds with whatever the checkout holds.
+    let standing_file = match crate::continuous::instructions::materialize(&task) {
+        Ok(path) => path.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+        Err(e) => {
+            eprintln!("cm-daemon: trigger '{}': standing instructions not written: {e}", p.task_id);
+            crate::continuous::instructions::file_name(task.engine).map(str::to_string)
+                .filter(|_| task.standing_instructions.is_some())
+        }
+    };
+
     // Resolve the prompt: explicit `prompt` > `modes[mode].prompt` >
     // `default_prompt`. Continuity across fires is the per-task NOTES.md (the
     // default prompt instructs read-NOTES-first) — Phase 2 spawns a fresh
@@ -11630,6 +11652,7 @@ pub fn trigger(
         &fire_token,
         started_at,
         compact,
+        standing_file.as_deref(),
     );
 
     // ---- Executor (branched on run_mode) -----------------------------------
@@ -12980,6 +13003,17 @@ struct ContinuousCreateParams {
     task_id: String,
     #[serde(default)]
     messaging: Option<Value>,
+    /// Channel policy (DESIGN_TASK_CHANNELS.md): `auto` (default when no
+    /// `messaging` is supplied) creates and binds `ct/<slug>`; `manual`
+    /// (default when `messaging.channel_id` is supplied) keeps the operator's
+    /// channel; `off` disables the task channel.
+    #[serde(default)]
+    task_channel: Option<crate::continuous::task::TaskChannelPolicy>,
+    /// Durable orchestrator instructions materialized as the engine's
+    /// project-instruction file before each fire (doc/continuous-standing-instructions.md).
+    /// With this set, `default_prompt` should be the short per-fire dispatch.
+    #[serde(default)]
+    standing_instructions: Option<String>,
     /// Optional backing planning-task UUID. When set, the spawned session's
     /// `task_id` is this UUID (not the slug above), so an orchestrator that
     /// spawns subtasks via `create_subtask` has a real planning parent. The
@@ -13203,7 +13237,13 @@ pub fn continuous_create(
         p.default_prompt.clone(),
     );
     task.planning_task_id = p.planning_task_id.clone();
+    task.task_channel = p.task_channel.unwrap_or(if messaging.is_some() {
+        crate::continuous::task::TaskChannelPolicy::Manual
+    } else {
+        crate::continuous::task::TaskChannelPolicy::Auto
+    });
     task.messaging = messaging;
+    task.standing_instructions = p.standing_instructions.clone().filter(|s| !s.trim().is_empty());
     task.project = p.project.clone();
     task.repo = Some(p.repo_url.clone());
     if let Some(host) = p.host.clone() {
@@ -13259,11 +13299,31 @@ pub fn continuous_create(
     // planning row is a thin mirror, so the mirror is a best-effort follow-up —
     // `continuous.create` does not depend on it.
 
+    // Standing instructions: write the engine's instruction file now so the
+    // auto-fire's fresh thread loads it. Never fatal; the fire retries it.
+    if let Err(e) = crate::continuous::instructions::materialize(&task) {
+        eprintln!("cm-daemon: continuous.create '{}': standing instructions not written: {e}", p.task_id);
+    }
+
+    // Task channel: create/attach + bind now when the messaging coordinator is
+    // reachable; otherwise the refresh loop converges on it. Never fatal — the
+    // record is already durable.
+    let channel = match crate::messaging::tasks::ensure_for_task(state_arc, &p.task_id) {
+        Ok(report) => json!({
+            "channel_id": report.channel_id,
+            "path": report.path,
+            "created": report.created,
+            "deferred": report.deferred,
+        }),
+        Err(e) => json!({"channel_id": null, "path": null, "created": false, "deferred": [e.to_string()]}),
+    };
+
     Ok(json!({
         "created": record_created,
         "task_id": p.task_id,
         "workspace_id": workspace_id,
         "worktree_path": worktree_path.to_string_lossy().into_owned(),
+        "channel": channel,
     }))
 }
 
@@ -13286,6 +13346,14 @@ struct ContinuousUpdateParams {
     /// `Some(0)` DISABLES compaction (the fire check is `n > 0`).
     #[serde(default)]
     compact_every: Option<u32>,
+    /// Channel policy; see `continuous.create`. Switching to `auto` on a task
+    /// with no binding lets the refresh loop create `ct/<slug>`.
+    #[serde(default)]
+    task_channel: Option<crate::continuous::task::TaskChannelPolicy>,
+    /// Standing instructions; an empty string clears them (and removes the
+    /// CM-written instruction file).
+    #[serde(default)]
+    standing_instructions: Option<String>,
     #[serde(default)]
     schedule: Option<crate::continuous::task::Schedule>,
     #[serde(default)]
@@ -13381,6 +13449,14 @@ pub fn continuous_update(
             }
             updated.push("messaging");
         }
+        if let Some(v) = p.task_channel {
+            t.task_channel = v;
+            updated.push("task_channel");
+        }
+        if let Some(v) = &p.standing_instructions {
+            t.standing_instructions = Some(v.clone()).filter(|s| !s.trim().is_empty());
+            updated.push("standing_instructions");
+        }
         if let Some(v) = &p.default_prompt {
             t.default_prompt = v.clone();
             updated.push("default_prompt");
@@ -13447,6 +13523,20 @@ pub fn continuous_update(
         )
     })?;
 
+    // Standing instructions changed: refresh (or drop) the engine's file now so
+    // the next fresh thread / post-compaction turn loads the current text, and
+    // so an operator can verify the checkout without firing. Never fatal.
+    if updated.contains(&"standing_instructions") {
+        if let Some(t) = crate::continuous::task::load_one(&p.task_id) {
+            if t.standing_instructions.is_some() {
+                if let Err(e) = crate::continuous::instructions::materialize(&t) {
+                    eprintln!("cm-daemon: continuous.update '{}': standing instructions not written: {e}", p.task_id);
+                }
+            } else {
+                crate::continuous::instructions::remove(&t);
+            }
+        }
+    }
     Ok(json!({ "task_id": p.task_id, "updated": updated }))
 }
 
@@ -13464,11 +13554,53 @@ pub fn continuous_list(
     _params: &Value,
 ) -> MethodResult {
     let tasks = crate::continuous::task::load_all();
+    // Channel view: member counts and the current subscription come from the
+    // messaging store; take that lock only after the state lock is released.
+    let channel_views: std::collections::BTreeMap<String, Value> = {
+        let handle = state_arc
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .messaging
+            .clone();
+        let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        tasks
+            .iter()
+            .map(|t| {
+                let v = match (&t.messaging, slot.as_ref()) {
+                    (Some(m), Some(store)) => json!({
+                        "channel_id": m.channel_id,
+                        "path": m.path.clone().or_else(|| store.channel_path_of(&m.channel_id).map(str::to_owned)),
+                        "subscription_id": m.subscription_id,
+                        "revision": m.revision,
+                        "session_uid": m.session_uid,
+                        "members": store.member_count(&m.channel_id),
+                        "orchestrator": m.session_uid.as_ref().map(|u| store.participant_id(u)),
+                        "orchestrator_name": m.session_uid.as_ref().and_then(|u| store.names.get(&store.participant_id(u)).map(|n| n.name.clone())),
+                    }),
+                    (Some(m), None) => json!({
+                        "channel_id": m.channel_id,
+                        "path": m.path,
+                        "subscription_id": m.subscription_id,
+                        "revision": m.revision,
+                        "session_uid": m.session_uid,
+                    }),
+                    (None, _) => Value::Null,
+                };
+                (t.task_id.clone(), v)
+            })
+            .collect()
+    };
     let items: Vec<Value> = tasks
         .iter()
         .map(|t| {
             json!({
                 "task_id": t.task_id,
+                "planning_task_id": t.planning_task_id,
+                "task_channel": t.task_channel,
+                "standing_instructions_bytes": t.standing_instructions.as_ref().map(String::len),
+                "instructions_file": t.standing_instructions.as_ref().and(crate::continuous::instructions::file_name(t.engine)),
+                "default_prompt_bytes": t.default_prompt.len(),
+                "messaging": channel_views.get(&t.task_id).cloned().unwrap_or(Value::Null),
                 "label": t.label,
                 "project": t.project,
                 "host_id": t.host_id,
@@ -13781,6 +13913,34 @@ pub fn continuous_run_now(
     trigger(state_arc, caller, params)
 }
 
+#[derive(Deserialize)]
+struct ContinuousEnsureChannelParams {
+    task_id: String,
+}
+
+/// `continuous.ensure_channel` — create-or-attach the task's chat channel,
+/// bind the scheduler subscription, assign the `<task>-orchestrator` name to
+/// the current session and join every attributable worker. Idempotent; the
+/// migration and repair entry point (DESIGN_TASK_CHANNELS.md). Operator-only.
+pub fn continuous_ensure_channel(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: ContinuousEnsureChannelParams = serde_json::from_value(params.clone()).map_err(|e| {
+        (
+            ErrorCode::InvalidParams,
+            format!("continuous.ensure_channel params: {}", e),
+        )
+    })?;
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.ensure_channel: {}", e)))?;
+    match crate::messaging::tasks::ensure_for_task(state_arc, &p.task_id) {
+        Ok(report) => Ok(serde_json::to_value(report).unwrap_or(Value::Null)),
+        Err(e) if e.code == "not_found" => Err((ErrorCode::NotFound, e.to_string())),
+        Err(e) => Err((ErrorCode::Internal, e.to_string())),
+    }
+}
+
 /// `continuous.delete` params.
 #[derive(serde::Deserialize)]
 struct ContinuousDeleteParams {
@@ -13837,6 +13997,11 @@ pub fn continuous_delete(
             }
         }
     }
+
+    // Archive the task channel (posting pause; history stays readable).
+    crate::messaging::tasks::archive_task_channel(state_arc, &task);
+    // Drop the CM-written standing file (a foreign file at that path is kept).
+    crate::continuous::instructions::remove(&task);
 
     // Retire the durable record. The validated task_id keeps this remove_dir_all
     // confined to `~/.cm/continuous-tasks/<id>`.
@@ -28622,10 +28787,10 @@ while True:
         for engine in [Engine::Claude, Engine::Codex] {
             let body = "Keep review boundaries. Read .queue/batch-305.json.";
             let previous = with_continuous_run_context(
-                body.into(), engine, "perf-triage", 303, "ft-303", 100, false,
+                body.into(), engine, "perf-triage", 303, "ft-303", 100, false, None,
             );
             let current = with_continuous_run_context(
-                body.into(), engine, "perf-triage", 305, "ft-305", 200, false,
+                body.into(), engine, "perf-triage", 305, "ft-305", 200, false, None,
             );
             assert_ne!(previous, current);
             let identity: Value = serde_json::from_str(current.lines().nth(1).unwrap()).unwrap();
@@ -28636,6 +28801,12 @@ while True:
             assert!(current.contains("get_continuous_context now"));
             assert!(current.contains("Close THIS run (perf-triage, seq 305) with report_done"));
             assert!(!current.contains("ft-303"));
+            assert!(!current.contains("standing instructions"), "no pointer without a standing file");
+            let pointed = with_continuous_run_context(
+                body.into(), engine, "perf-triage", 306, "ft-306", 300, false, Some("AGENTS.override.md"),
+            );
+            assert!(pointed.contains("section of `AGENTS.override.md` at the worktree root"));
+            assert!(pointed.contains(body));
         }
     }
 
@@ -28644,12 +28815,12 @@ while True:
         use crate::continuous::task::Engine;
         let shell = "printf 'payload must remain executable\\n'";
         assert_eq!(
-            with_continuous_run_context(shell.into(), Engine::Bash, "shell", 2, "f", 3, false),
+            with_continuous_run_context(shell.into(), Engine::Bash, "shell", 2, "f", 3, false, None),
             shell,
         );
         for engine in [Engine::Claude, Engine::Codex] {
             assert_eq!(
-                with_continuous_run_context("/compact".into(), engine, "task", 16, "f", 3, true),
+                with_continuous_run_context("/compact".into(), engine, "task", 16, "f", 3, true, Some("AGENTS.override.md")),
                 "/compact",
             );
         }

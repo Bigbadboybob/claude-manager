@@ -1,6 +1,6 @@
 # Owner notifications
 
-Continuous-task workers route routine review requests, progress, recoverable failures and handoffs by DM to their orchestrator. They must not notify Owner for work their orchestrator can handle. Orchestrators notify Owner only for a reviewed decision or blocker that actually needs Owner, preserving any stricter quiet policy. See [continuous reviews and stages](continuous-review-routing.md). This is agent policy; the existing self-scoped notification transport does not enforce review decisions.
+Continuous-task workers route routine review requests, progress, recoverable failures and handoffs through their task channel (`ct/<task-slug>`), mentioning their orchestrator. They must not notify Owner for work their orchestrator can handle. Orchestrators notify Owner only for a reviewed decision or blocker that actually needs Owner, preserving any stricter quiet policy. See [continuous reviews and stages](continuous-review-routing.md). This is agent policy; the existing self-scoped notification transport does not enforce review decisions.
 
 `notify_user(message="Decision needed: …")` requests attention for the calling
 session. It works for ordinary local/cloud sessions and continuous orchestrators,
