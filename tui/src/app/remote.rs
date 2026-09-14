@@ -2000,6 +2000,77 @@ mod remote_reconnect_tests {
         }
     }
 
+    /// A replaced orchestrator (bridge-cooldown recovery, A-R, supervisor
+    /// respawn) leaves an exit record that still carries `continuous_task_id`.
+    /// It must not become a second depth-0 group: the live session anchors,
+    /// the retired row nests under it, and a worker that matches BOTH (managed
+    /// by the old uid, planning child of the same parent) renders once.
+    #[test]
+    fn visual_items_continuous_folds_replaced_orchestrator_into_one_group() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+        let mk = |uid: &str, cont: Option<&str>, mgr: Option<&str>, task: Option<&str>, label: &str, exited: bool| {
+            let (mut ts, _tx, _teof) = session_with_injected_exit(uid, manager_host(), false);
+            ts.session.exited = exited;
+            ts.continuous_task_id = cont.map(String::from);
+            ts.managed_by_uid = mgr.map(String::from);
+            ts.task_id = task.map(String::from);
+            ts.label = label.into();
+            ts
+        };
+        // Old (exited) orchestrator first in the manifest, then the live one.
+        let mut ws = workspace_with(mk("ts-old-orch", Some("health-alert-triage"), None, Some("parent"), "health-alert-triage-orchestrator", true));
+        ws.sessions.push(mk("ts-new-orch", Some("health-alert-triage"), None, Some("parent"), "health-alert-triage-orchestrator", false));
+        // Worker spawned by the OLD instance on a planning child of the parent.
+        ws.sessions.push(mk("ts-fire", None, Some("ts-old-orch"), Some("child-fire"), "fire-909741f0", false));
+        app.workspaces.push(ws);
+        for (id, parent) in [("parent", None), ("child-fire", Some("parent"))] {
+            app.tasks.push(TaskEntry {
+                task_id: Some(id.into()),
+                name: id.into(),
+                api_status: TaskStatus::Running,
+                repo_url: None,
+                prompt: None,
+                wip_branch: None,
+                session_id: None,
+                blocked_at: None,
+                is_cloud: false,
+                is_continuous: parent.is_none(),
+                workspace_id: None,
+                project: None,
+                parent_task_id: parent.map(String::from),
+                worktree_mode: WorktreeMode::Inherit,
+                metadata: None,
+            });
+        }
+        let rows = app.visual_items_continuous();
+        let resolved: Vec<(&str, u8)> = rows
+            .iter()
+            .map(|r| (app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(), r.depth))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![("ts-new-orch", 0), ("ts-fire", 1), ("ts-old-orch", 1)],
+            "one anchor per continuous task; the worker renders once; the retired orchestrator nests last",
+        );
+        let uids: std::collections::HashSet<&str> = resolved.iter().map(|(u, _)| *u).collect();
+        assert_eq!(uids.len(), resolved.len(), "no session may appear on two rows");
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
     /// Dispatch-pending (○) wiring: `session_dispatch_pending` resolves the
     /// poller cache by (host, continuous_task_id) and applies the
     /// planning-liveness filter — the PERF-083 / PERF-088 exemplar from the

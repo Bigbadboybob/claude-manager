@@ -1109,8 +1109,26 @@ impl ContinuousScheduler {
                     let emit = warnings.get(&tk.task_id).is_none_or(|(seq, last)|
                         *seq != run.seq || now.saturating_sub(*last) >= 300);
                     if emit {
+                        let first_for_seq = warnings.get(&tk.task_id).is_none_or(|(seq, _)| *seq != run.seq);
                         warnings.insert(tk.task_id.clone(), (run.seq, now));
                         eprintln!("cm-daemon: Codex tail evidence unavailable for {} seq {}; run remains held (diagnostic limited to once per 5 minutes)", tk.task_id, run.seq);
+                        if first_for_seq {
+                            // Surface the held run where the task's participants
+                            // are looking (DESIGN_TASK_CHANNELS.md §6). Once per
+                            // seq; best-effort.
+                            let body = format!(
+                                "Run seq {} of {} is HELD: Codex tail evidence is unavailable (rollout missing, stale or unclassified). The scheduler will not refire or auto-close it. Orchestrator: finish the cycle and call report_done; operator: inspect the session and use continuous.force_done if it is wedged.",
+                                run.seq, tk.task_id
+                            );
+                            if let Err(e) = crate::messaging::tasks::notify_task_channel(
+                                &self.state,
+                                &tk.task_id,
+                                &format!("held-run:{}:{}", tk.task_id, run.seq),
+                                &body,
+                            ) {
+                                eprintln!("cm-daemon: held-run notice for {} seq {} not posted: {e}", tk.task_id, run.seq);
+                            }
+                        }
                     }
                 }
                 continue;

@@ -1219,6 +1219,7 @@ impl App {
                         revision_id: String::new(),
                         aliases: vec![],
                         session_uid: uid.clone(),
+                        released: false,
                     },
                 )
             })

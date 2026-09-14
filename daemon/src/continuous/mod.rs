@@ -27,6 +27,7 @@ pub mod codex_probe;
 pub mod codex_account;
 pub mod drain;
 pub mod retirement;
+pub mod instructions;
 pub mod migration;
 pub mod probe;
 pub mod queue;

@@ -205,6 +205,17 @@ pub struct ModePreset {
     pub args: Option<serde_json::Value>,
 }
 
+/// Channel-creation policy for a continuous task (see
+/// DESIGN_TASK_CHANNELS.md). Serialized lowercase; absent = `auto`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskChannelPolicy {
+    #[default]
+    Auto,
+    Manual,
+    Off,
+}
+
 /// The durable record of a continuous task. Persisted at
 /// `~/.cm/continuous-tasks/<task_id>/state.json`.
 ///
@@ -228,6 +239,18 @@ pub struct ContinuousTask {
     pub planning_task_id: Option<String>,
     #[serde(default)]
     pub messaging: Option<crate::messaging::tasks::TaskChannel>,
+    /// How the task's chat channel comes to exist. `auto` (default): the
+    /// daemon creates `ct/<slug>` and binds it (DESIGN_TASK_CHANNELS.md);
+    /// `manual`: the operator supplies `messaging.channel_id`; `off`: no
+    /// channel, no subscription.
+    #[serde(default)]
+    pub task_channel: TaskChannelPolicy,
+    /// Durable orchestrator instructions (lane, gate, lifecycle, procedure),
+    /// materialized before every fire as the engine's project-instruction file
+    /// in the worktree (`continuous::instructions`). When set, `default_prompt`
+    /// is only the short per-fire dispatch.
+    #[serde(default)]
+    pub standing_instructions: Option<String>,
     pub label: String,
     #[serde(default)]
     pub project: Option<String>,
@@ -386,6 +409,8 @@ impl ContinuousTask {
             task_id,
             planning_task_id: None,
             messaging: None,
+            task_channel: TaskChannelPolicy::Auto,
+            standing_instructions: None,
             label,
             project: None,
             host_id: "local".into(),
