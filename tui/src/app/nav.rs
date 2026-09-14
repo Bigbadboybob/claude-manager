@@ -1202,12 +1202,56 @@ impl App {
             }
         }
         orchestrators.sort_by(|a, b| a.4.cmp(b.4).then(a.2.cmp(b.2)));
+        // ONE anchor per continuous task (per host): a replaced orchestrator
+        // leaves an exit record that still carries `continuous_task_id`, and
+        // rendering it as a second depth-0 group duplicated every worker that
+        // matched by planning parent (the same session on two rows, both
+        // highlighted — 2026-09-14 after health-alert-triage's thread was
+        // replaced). The live session anchors; failing that the newest uid.
+        // Predecessors nest under the anchor as retired rows, and members are
+        // matched against every uid the task has had.
+        use std::collections::BTreeMap;
+        let mut task_groups_by_key: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+        for (idx, &(wi, si, uid, _, _)) in orchestrators.iter().enumerate() {
+            let ts = &self.workspaces[wi].sessions[si];
+            let key = (
+                format!("{:?}", self.workspaces[wi].host_id),
+                ts.continuous_task_id.clone().unwrap_or_else(|| uid.to_string()),
+            );
+            task_groups_by_key.entry(key).or_default().push(idx);
+        }
+        // (anchor idx, predecessor idxs), ordered like the anchors were.
+        let mut anchored: Vec<(usize, Vec<usize>)> = task_groups_by_key
+            .into_values()
+            .map(|mut idxs| {
+                let anchor = idxs
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        let (wi, si, ..) = orchestrators[i];
+                        !self.workspaces[wi].sessions[si].session.exited
+                    })
+                    .max_by(|&a, &b| orchestrators[a].2.cmp(orchestrators[b].2))
+                    .unwrap_or_else(|| {
+                        idxs.iter().copied().max_by(|&a, &b| orchestrators[a].2.cmp(orchestrators[b].2)).unwrap()
+                    });
+                idxs.retain(|&i| i != anchor);
+                (anchor, idxs)
+            })
+            .collect();
+        anchored.sort_by_key(|(a, _)| *a);
         let parent_of = self.task_parent_map();
         let empty_owners = self.continuous_empty_workspace_owners();
 
-        use std::collections::BTreeMap;
         let mut rows = Vec::new();
-        for &(owi, osi, ouid, otask, _) in &orchestrators {
+        for (anchor, predecessors) in &anchored {
+            let (owi, osi, ouid, otask, _) = orchestrators[*anchor];
+            let group_uids: Vec<&str> = std::iter::once(ouid)
+                .chain(predecessors.iter().map(|&i| orchestrators[i].2))
+                .collect();
+            let group_slots: Vec<(usize, usize)> = std::iter::once((owi, osi))
+                .chain(predecessors.iter().map(|&i| (orchestrators[i].0, orchestrators[i].1)))
+                .collect();
             rows.push(ContinuousRow {
                 ws_idx: owi,
                 sess_idx: Some(osi),
@@ -1227,7 +1271,10 @@ impl App {
                     if ts.continuous_task_id.is_some() {
                         continue;
                     }
-                    let by_uid = ts.managed_by_uid.as_deref() == Some(ouid);
+                    let by_uid = ts
+                        .managed_by_uid
+                        .as_deref()
+                        .is_some_and(|u| group_uids.contains(&u));
                     let by_task = otask.is_some()
                         && ts
                             .task_id
@@ -1281,7 +1328,9 @@ impl App {
             session_groups.extend(task_groups.into_values());
             // (anchor_label, group_rows) — ordered by anchor label so the
             // one-session-per-subtask ordering matches the old label sort.
-            let mut groups: Vec<(String, Vec<ContinuousRow>)> = Vec::new();
+            // (retired?, anchor_label, group_rows): retired predecessor
+            // orchestrators sort after the subtasks.
+            let mut groups: Vec<(bool, String, Vec<ContinuousRow>)> = Vec::new();
             for mut sessions in session_groups {
                 // Anchor first: agents (non-bash) before bash, then by label.
                 sessions.sort_by(|a, b| a.2.cmp(&b.2).then(a.3.cmp(b.3)));
@@ -1295,15 +1344,19 @@ impl App {
                         depth: if idx == 0 { 1 } else { 2 },
                     })
                     .collect();
-                groups.push((anchor_label, group_rows));
+                groups.push((false, anchor_label, group_rows));
             }
             for (&wi, &owner) in &empty_owners {
-                if owner == (owi, osi) {
-                    groups.push((self.workspaces[wi].name.clone(), vec![ContinuousRow { ws_idx: wi, sess_idx: None, depth: 1 }]));
+                if group_slots.contains(&owner) {
+                    groups.push((false, self.workspaces[wi].name.clone(), vec![ContinuousRow { ws_idx: wi, sess_idx: None, depth: 1 }]));
                 }
             }
-            groups.sort_by(|a, b| a.0.cmp(&b.0));
-            for (_label, group_rows) in groups {
+            for &i in predecessors {
+                let (pwi, psi, _, _, plabel) = orchestrators[i];
+                groups.push((true, plabel.to_string(), vec![ContinuousRow { ws_idx: pwi, sess_idx: Some(psi), depth: 1 }]));
+            }
+            groups.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            for (_retired, _label, group_rows) in groups {
                 rows.extend(group_rows);
             }
         }
