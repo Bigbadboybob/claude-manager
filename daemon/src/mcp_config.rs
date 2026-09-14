@@ -784,6 +784,12 @@ pub fn build_args(
             // codex's popup from tearing down the PTY.
             args.push("-c".into());
             args.push("check_for_update_on_startup=false".into());
+            // Project-doc cap: the default 32 KiB truncates a repo AGENTS.md
+            // that is already ~33 KB, and CM's continuous standing file
+            // (`AGENTS.override.md`, repo doc + orchestrator instructions)
+            // is larger still. See doc/continuous-standing-instructions.md.
+            args.push("-c".into());
+            args.push("project_doc_max_bytes=262144".into());
             args.extend(codex_overrides(session_uid, workflow, server_path_override));
             if let Some(sid) = resume_session_id {
                 args.push(sid.to_string());
