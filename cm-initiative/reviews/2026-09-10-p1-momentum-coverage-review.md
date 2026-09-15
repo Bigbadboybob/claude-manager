@@ -130,3 +130,15 @@ No further document revision is required by this personal review. Owner still
 chooses whether and how to pursue it, including evaluation definitions, resources,
 and the preferred relationship to the other proposals. No live impact or baseline
 has been established by these source reads.
+
+## Post-acceptance factual correction at `01334a397`
+
+Coverage-Scout later corrected §3.8 while checking a peer's clock claim. The
+accepted disposition above remains unchanged, but the current proposal blob is
+now `01334a397afc258e1bce34f4614da74a2edc93f1`. The correction establishes that
+`momentumEventNewsAttribution.py` can reconstruct an `Article` with a synthetic
+`received_at=event.time` and call `ArticleDB.save_or_replace`: a new UID can
+therefore land with that synthetic stamp, while the conflict update preserves an
+existing row's receipt clock. Any publish-to-receipt lag on such a new row is an
+event-time gap, not transport; prevalence was not measured. This is a factual
+erratum only, not a selected experiment or implementation.

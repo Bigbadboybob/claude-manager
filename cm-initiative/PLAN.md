@@ -48,7 +48,7 @@ coordinator keeps the live roster; these are proposal-development statuses.
 
 | Topic | Intended proposal | Snapshot status |
 |---|---|---|
-| P1 | Momentum detection through explanatory ingest and useful source coverage | Final `8bbfcd823` personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
+| P1 | Momentum detection through explanatory ingest and useful source coverage | Final `01334a397` (post-acceptance factual correction to reviewed `8bbfcd823`) personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
 | P2 | Useful article follow-through, blocks, and appropriate non-trades | Final `3eea07af0` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p2-article-follow-through-review.md#final-disposition-at-3eea07af0), no implementation selected |
 | P3 | Production-baseline P&L improvement with bounded rounds | Final `5e8e56e9f` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p3-production-pnl-review.md#final-disposition-at-5e8e56e9f), no round selected |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Final root `d8de69d36` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p4-backtest-fidelity-review.md#final-disposition-at-root-d8de69d36), no implementation selected |
@@ -265,6 +265,14 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   accepted documents and maintains the discussion guide. This completes the
   authorized research/proposal review, not the ongoing initiative. Existing
   owners and Owner's new-initiative/new-swarm checkpoints remain in force.
+
+- **2026-09-15 — P1 post-acceptance factual correction:** Coverage-Scout pushed
+  `01334a397`, correcting the §3.8 claim about synthetic `received_at` writeback
+  and documenting the asymmetric new-UID/existing-UID behavior. Initiative-Bridge
+  acknowledged the correction; the accepted P1 disposition remains unchanged,
+  and no experiment or implementation is selected. Any later availability or
+  lag round must stratify or exclude synthetic event-time receipt rows and state
+  the unmeasured prevalence.
 
 - **2026-09-10 — Integration verification:** all 16 accepted PROPOSAL/NOTES
   Git blobs match the integrated predictionTrading root `080256a08` exactly.
