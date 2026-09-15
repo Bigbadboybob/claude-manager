@@ -143,3 +143,9 @@ preserves an existing row's receipt clock. Any publish-to-receipt lag on this
 explanatory cohort is an event-time gap, not transport; prevalence was not
 measured. These are factual errata only, not a selected experiment or
 implementation.
+
+## Integrated root correction at `4a63ec632`
+
+Swarm-Gardener consolidated the final P1/P6/P7 factual wording in predictionTrading
+root `4a63ec632`. I personally read the changed P1 text and notes. This root is
+the current discussion pin; the review disposition is unchanged.

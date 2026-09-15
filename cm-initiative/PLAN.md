@@ -48,13 +48,13 @@ coordinator keeps the live roster; these are proposal-development statuses.
 
 | Topic | Intended proposal | Snapshot status |
 |---|---|---|
-| P1 | Momentum detection through explanatory ingest and useful source coverage | Final `f9327c7be` (post-acceptance factual corrections to reviewed `8bbfcd823`) personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
+| P1 | Momentum detection through explanatory ingest and useful source coverage | Integrated root `4a63ec632` (post-acceptance factual corrections to reviewed `8bbfcd823`) personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
 | P2 | Useful article follow-through, blocks, and appropriate non-trades | Final `3eea07af0` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p2-article-follow-through-review.md#final-disposition-at-3eea07af0), no implementation selected |
 | P3 | Production-baseline P&L improvement with bounded rounds | Final `5e8e56e9f` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p3-production-pnl-review.md#final-disposition-at-5e8e56e9f), no round selected |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Final root `d8de69d36` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p4-backtest-fidelity-review.md#final-disposition-at-root-d8de69d36), no implementation selected |
 | P5 | Backtest speed and resource efficiency preserving workload and outcomes | Final root `db4d9a726` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p5-backtest-performance-review.md#final-pin-at-root-db4d9a726), no implementation selected |
-| P6 | Useful timely delivery from existing sources | Final `0b622e65b` (post-acceptance factual correction to reviewed `136589a7e`); [ready for Owner discussion](reviews/2026-09-10-p6-source-reliability-review.md#final-disposition-at-136589a7e), no implementation selected |
-| P7 | News-decision latency and cost while preserving useful outcomes | Final root `080256a08` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p7-news-latency-cost-review.md#final-disposition-at-root-080256a08), no implementation selected |
+| P6 | Useful timely delivery from existing sources | Integrated root `4a63ec632` (post-acceptance factual correction to reviewed `136589a7e`); [ready for Owner discussion](reviews/2026-09-10-p6-source-reliability-review.md#final-disposition-at-136589a7e), no implementation selected |
+| P7 | News-decision latency and cost while preserving useful outcomes | Integrated root `4a63ec632` (bounded factual correction to prior reviewed root `080256a08`); [ready for Owner discussion](reviews/2026-09-10-p7-news-latency-cost-review.md#final-disposition-at-root-080256a08), no implementation selected |
 | P8 | Recurring initiatives and continuous-task organization | Final root `080256a08` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p8-recurring-work-review.md#final-disposition-at-root-080256a08), no implementation selected |
 
 Each document must describe a plausible first improvement round and how it
@@ -287,6 +287,16 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   high-causation attribution articles, while stale candidates do not reach the
   write path. Initiative-Bridge recorded this as a superseding erratum; the P1
   discussion disposition remains unchanged and no experiment is selected.
+
+- **2026-09-15 — Integrated root factual erratum:** Swarm-Gardener pushed
+  predictionTrading root `4a63ec632`, consolidating the bounded P1/P6/P7 clock
+  corrections. Initiative-Bridge personally read the changed proposal text and
+  notes. The root preserves the full copy → record → reconstructed Article →
+  save_or_replace → insert/update distinction, regular scoring at `:328`, and
+  unmeasured prevalence without importing zero-lag or severity claims. Use this
+  root for all three proposal pins; dispositions remain ready for Owner
+  discussion, with no implementation or experiment selected. Targeted checks
+  passed 13 tests; no runtime changes.
 
 - **2026-09-10 — Integration verification:** all 16 accepted PROPOSAL/NOTES
   Git blobs match the integrated predictionTrading root `080256a08` exactly.

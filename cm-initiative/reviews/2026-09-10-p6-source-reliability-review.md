@@ -189,3 +189,9 @@ calls `ArticleDB.save_or_replace`; a new UID can be inserted with synthetic
 receipt clock unchanged. Any lag distribution must therefore flag or exclude
 these seeded rows; prevalence remains unmeasured. No implementation or
 experiment was selected.
+
+## Integrated root correction at `4a63ec632`
+
+Swarm-Gardener consolidated the final P1/P6/P7 factual wording in predictionTrading
+root `4a63ec632`. I personally read the changed P6 text and notes. This root is
+the current discussion pin; the review disposition is unchanged.
