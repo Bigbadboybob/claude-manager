@@ -1275,6 +1275,8 @@ pub(crate) fn start_session_with_spawn_fn(
         entry: added_entry,
     });
 
+    crate::claude_channels::accept_own_startup(state_arc, &session_uid, &p.argv);
+
     // DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): arm the
     // per-session rollout watch for codex sessions HERE because this
     // is the one spawn funnel every path shares (mcp_start_session,

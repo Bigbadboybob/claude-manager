@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - exercised only where the dep is absent
 # Add project root to path so cli.planning_client is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mcp.server.fastmcp import FastMCP
+from mcp_server.claude_channel import NotificationMCP
 
 try:
     from cli.planning_client import PlanningClient
@@ -73,10 +73,11 @@ async def _lifespan(_server):
     if os.environ.get("CM_TUI_SESSION_ID"):
         async_monitor._persist_best_effort()
     bridge = None
-    if (os.environ.get("CM_TUI_SESSION_ID") and os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
+    if (os.environ.get("CM_TUI_SESSION_ID")
+            and (_server.channel or os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"))
             and os.environ.get("CM_AGENT_ENGINE") != "codex"):
         from mcp_server.native_claude import run
-        bridge = asyncio.create_task(run(), name="cm-native-notifications")
+        bridge = asyncio.create_task(run(_server.channel), name="cm-native-notifications")
     try:
         yield {}
     finally:
@@ -92,7 +93,7 @@ async def _lifespan(_server):
                 await bridge
 
 
-mcp = FastMCP("claude-manager", instructions=AGENT_GUIDE, lifespan=_lifespan)
+mcp = NotificationMCP("claude-manager", instructions=AGENT_GUIDE, lifespan=_lifespan)
 
 
 @mcp.tool()

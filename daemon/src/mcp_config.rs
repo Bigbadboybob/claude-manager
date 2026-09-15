@@ -582,6 +582,9 @@ pub fn write_claude_mcp_config(
     let path = dir.join("claude.json");
     let mut env = build_env(session_uid, workflow);
     env.insert("CM_AGENT_ENGINE".into(), "claude-code".into());
+    if crate::claude_channels::enabled() {
+        env.insert("CM_CLAUDE_CHANNEL".into(), "1".into());
+    }
     // Route through the drift-proof launcher; fall back to the direct
     // (python, server) pair only if the launcher can't be written —
     // see `ensure_launcher` (fail-open: never block a spawn).
@@ -732,6 +735,7 @@ pub fn build_args(
             args.push("--dangerously-skip-permissions".to_string());
             args.push("--mcp-config".to_string());
             args.push(cfg.to_string_lossy().to_string());
+            args.extend(crate::claude_channels::args(&cfg));
             // S3 (async-wait branch): inject the cm Stop hook so the
             // session reports turn-ends to the daemon and drains its
             // monitor inbox at turn boundaries. `--settings` hooks
@@ -1668,6 +1672,30 @@ mod tests {
              (sub-2c): got {:?}",
             tui_sock_in_json,
         );
+    }
+
+    #[test]
+    fn claude_channel_choice_is_frozen_for_fresh_and_resumed_launches() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        std::fs::create_dir_all(dir.path().join(".cm")).unwrap();
+        let preference = dir.path().join(".cm/claude-notifications.json");
+        for transport in ["channel", "socket"] {
+            std::fs::write(&preference, format!(r#"{{"transport":"{transport}"}}"#)).unwrap();
+            for resume in [None, Some("saved-claude-session")] {
+                let (_, args, pin) = build_args("claude-code", "ts-channel-1", None, None, resume).unwrap();
+                let cfg = Path::new(&args[args.iter().position(|a| a == "--mcp-config").unwrap() + 1]);
+                let json: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg).unwrap()).unwrap();
+                assert_eq!(json["mcpServers"]["claude-manager"]["env"]["CM_CLAUDE_CHANNEL"] == "1", transport == "channel");
+                assert_eq!(args.contains(&crate::claude_channels::FLAG.to_string()), transport == "channel");
+                assert_eq!(pin.is_some(), resume.is_none());
+                // Global changes cannot flip an already-created launch config.
+                std::fs::write(&preference, r#"{"transport":"opposite"}"#).unwrap();
+                assert_eq!(!crate::claude_channels::args(cfg).is_empty(), transport == "channel");
+                std::fs::write(&preference, format!(r#"{{"transport":"{transport}"}}"#)).unwrap();
+            }
+        }
     }
 
     // ---- P0 S3 (resume): build_args resume argv -----------------------

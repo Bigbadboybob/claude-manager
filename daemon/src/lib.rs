@@ -57,6 +57,7 @@ pub mod adopt;
 pub mod attach;
 pub mod attach_output;
 pub mod claude_trust;
+pub mod claude_channels;
 pub mod codex_trust;
 pub mod config;
 pub mod env_sanitize;

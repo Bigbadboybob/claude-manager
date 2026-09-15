@@ -330,6 +330,28 @@ def transcript_observed(
                 if engine == "claude-code":
                     content = item.get("message", {})
                     origin = item.get("origin", {})
+                    expected = binding or {}
+                    channel_server = expected.get("channel_server")
+                    if channel_server and expected.get("adapter") == "claude-mcp-channel-v1":
+                        # Claude records idle events as meta user records and
+                        # busy events as queued_command attachments. Require
+                        # native origin; a user/assistant quoting <channel> or
+                        # an enqueue record is not positive delivery evidence.
+                        attachment = item.get("attachment", {})
+                        if (
+                            item.get("type") == "user"
+                            and item.get("isMeta") is True
+                            and content.get("role") == "user"
+                            and origin == {"kind": "channel", "server": channel_server}
+                            and marker in json.dumps(content.get("content"))
+                        ) or (
+                            item.get("type") == "attachment"
+                            and attachment.get("type") == "queued_command"
+                            and attachment.get("origin") == {"kind": "channel", "server": channel_server}
+                            and marker in json.dumps(attachment.get("prompt"))
+                        ):
+                            return True
+                        continue
                     if (
                         item.get("type") == "user"
                         and content.get("role") == "user"

@@ -1,4 +1,4 @@
-"""Claude's own-child session socket. Never changes inbound policy."""
+"""Claude native notification adapters. Never changes inbound policy."""
 
 import asyncio
 import json
@@ -10,13 +10,12 @@ from mcp_server import control_client
 from mcp_server.notifications import NotSubmitted, Queue, consume, transcript_observed
 
 
-class ClaudeSocket:
+class ClaudeAdapter:
     engine = "claude-code"
+    adapter_name = "claude-own-child-v1"
 
     def __init__(self, uid: str):
         self.uid = uid
-        self.socket = os.environ["CLAUDE_CODE_MESSAGING_SOCKET"].removeprefix("uds:")
-        self.token = os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN")
         try:
             self.peer_start = (
                 Path(f"/proc/{os.getpid()}/stat")
@@ -33,10 +32,40 @@ class ClaudeSocket:
         # No socket credentials in persistent diagnostics.
         return {
             "session_uid": self.uid,
-            "adapter": "claude-own-child-v1",
+            "adapter": self.adapter_name,
             "peer_pid": os.getpid(),
             "peer_start": self.peer_start,
         }
+
+    async def observed(self, event):
+        # Re-resolve the live binding, but share one lookup across outstanding
+        # receipts. A daemon outage must not cost a timeout per queued event.
+        if time.monotonic() >= self.resolve_after:
+            try:
+                resolved = await asyncio.to_thread(
+                    control_client.call,
+                    "resolve_authorized_session",
+                    {"session_uid": self.uid},
+                    timeout=2,
+                )
+                self.transcript_path = resolved.get("transcript_path")
+            except (control_client.ControlError, control_client.TransportError):
+                self.transcript_path = None
+            self.resolve_after = time.monotonic() + 1
+        return await asyncio.to_thread(
+            transcript_observed,
+            self.transcript_path,
+            self.engine,
+            event["marker"],
+            event.get("binding"),
+        )
+
+
+class ClaudeSocket(ClaudeAdapter):
+    def __init__(self, uid: str):
+        super().__init__(uid)
+        self.socket = os.environ["CLAUDE_CODE_MESSAGING_SOCKET"].removeprefix("uds:")
+        self.token = os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN")
 
     async def send(self, event):
         try:
@@ -70,33 +99,9 @@ class ClaudeSocket:
             writer.close()
             await writer.wait_closed()
 
-    async def observed(self, event):
-        # Re-resolve the live binding, but share one lookup across outstanding
-        # receipts. A daemon outage must not cost a timeout per queued event.
-        if time.monotonic() >= self.resolve_after:
-            try:
-                resolved = await asyncio.to_thread(
-                    control_client.call,
-                    "resolve_authorized_session",
-                    {"session_uid": self.uid},
-                    timeout=2,
-                )
-                self.transcript_path = resolved.get("transcript_path")
-            except (control_client.ControlError, control_client.TransportError):
-                self.transcript_path = None
-            self.resolve_after = time.monotonic() + 1
-        return await asyncio.to_thread(
-            transcript_observed,
-            self.transcript_path,
-            self.engine,
-            event["marker"],
-            event.get("binding"),
-        )
-
-
-async def run():
+async def run(adapter=None):
     queue = Queue.own()
-    adapter = ClaudeSocket(queue.uid)
+    adapter = adapter or ClaudeSocket(queue.uid)
     while True:
         try:
             # A nested launcher can inherit an ancestor's socket environment.

@@ -2774,6 +2774,24 @@ impl InputHandle {
         Ok(true)
     }
 
+    /// CM's own channel onboarding only. Any operator input since process
+    /// creation cancels automation, including input racing the screen check.
+    pub(crate) fn write_startup_confirmation(&self, bytes: &[u8]) -> std::io::Result<bool> {
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let _permit = crate::writer_gate::write_permit();
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        if self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+            return Ok(false);
+        }
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        Ok(true)
+    }
+
     /// Bump the activity clock WITHOUT writing to the PTY. The agent
     /// `send_input` path hands the actual PTY write to a detached delivery
     /// thread (settle → bracketed body → gap → kitty-Enter), but the caller

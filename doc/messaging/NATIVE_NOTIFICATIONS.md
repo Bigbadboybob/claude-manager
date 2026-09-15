@@ -1,7 +1,8 @@
 # Native agent notifications
 
 CM's chat wakes and session-monitor completion notices share a durable local
-queue. Claude receives them through its own-child messaging socket. New Codex
+queue. Claude can receive them as MCP channel events, with its own-child
+messaging socket retained for launches without channel opt-in. New Codex
 sessions run a CM-owned app-server with the ordinary Codex remote terminal UI.
 Neither notification path types into a terminal. `notify_user` uses a separate daemon-owned queue for
 [Owner desktop/sidebar alerts](../OWNER_NOTIFICATIONS.md), including cloud and
@@ -32,7 +33,7 @@ chat receipt APIs to mark messages read.
 |---|---|
 | `pending` | No native submission has begun; cancellation can retract it. |
 | `submitting` | The attempt was persisted before native I/O. |
-| `submitted` | Socket write completed / app-server accepted the request. |
+| `submitted` | Socket/channel write completed / app-server accepted the request. |
 | `observed` | The exact marker occurs in the native inbound transcript record. |
 | `uncertain` | Submission may have happened; CM will not automatically repeat it. |
 | `cancelled` | Retracted before the consumer claimed it. |
@@ -85,6 +86,64 @@ changes, blockers or Owner decisions. They must not repeat a completed summary.
 Chat messages are read together with `chat_read(inbox=True, unread_only=True)`;
 worker completion results retain their existing separate interface. This change
 does not batch independent worker-monitor envelopes or add a new MCP tool.
+
+## Claude MCP channel delivery (preview)
+
+On eligible Claude Code installations, CM can use the native MCP
+`notifications/claude/channel` extension. The client renders a compact
+`← claude-manager: [cm-chat …] New CM chat activity; read your pending inbox.`
+event instead of the peer socket's **“Another Claude session sent a message”**
+wrapper. This is a native meta event, with `origin.kind=channel` and
+`promptSource=system`; it does not edit or submit the user's composer. Claude's
+JSONL still calls an idle event a `type=user` record internally, but marks it
+`isMeta=true` and renders it as a channel event. Busy events queue until the
+client's checkpoint. There is no monitor-rearming requirement.
+
+Inbox pagination, acknowledgements, quiet Owner updates and peer authorization
+rules live in the MCP initialization instructions. Watch-specific result IDs
+and worker-completion payloads are retained on each relevant event. The channel
+does **not** declare `claude/channel/permission` or process approval replies.
+CM's existing subscription/mute/DND/batching policy still controls enqueueing.
+
+Enable on an execution host with `~/.cm/claude-notifications.json`:
+
+```json
+{"transport":"channel"}
+```
+
+The daemon and local TUI launch builders snapshot this preference into the
+per-session MCP configuration (`CM_CLAUDE_CHANNEL=1`, Claude engine only) and
+append `--dangerously-load-development-channels server:claude-manager`. The
+daemon acknowledges only the exact **Loading development channels** startup
+dialog listing **server:claude-manager alone** with the acceptance choice
+selected. It watches the current rendered screen for at most 30 seconds,
+sends at most one Enter, and cancels if the operator has typed. It never runs
+when adopting sessions after a brain restart and never accepts a tool approval
+or a dialog listing another development channel. Changed/unrecognized dialogs
+remain visible for manual handling.
+
+Absent, malformed, or `{"transport":"socket"}` preferences use the existing
+socket adapter. Existing processes retain their launch-time transport across
+MCP reconnects. Switching them requires an intentional restart/resume of that
+Claude process; deploying the daemon/MCP does not restart agents. A laptop TUI
+update alone cannot change an existing cloud process's transport.
+
+Claude's preview availability, first-party provider requirement and organization
+policy still apply. CM does not alter these gates. The flag is a per-entry
+allowlist opt-in, not a tool-permission override. SDK v1 (`mcp<2`) retains the
+legacy MCP negotiation required for this extension. Check Claude's startup
+notice if delivery remains unverified; launch opt-in is not registration proof.
+
+`notification_status().transport.adapter` distinguishes `claude-mcp-channel-v1`
+from `claude-own-child-v1`. `channel_write_only` means the MCP write completed;
+only an actual inbound record with the CM channel origin and event marker
+earns `observed`. User/assistant quotations and queue-enqueue records do not
+count. Unverified, failed or explicitly refused channel events are never
+retried via the peer socket or terminal; inspect the retained receipt instead.
+
+References: [Claude channels](https://code.claude.com/docs/en/channels),
+[channel wire reference](https://code.claude.com/docs/en/channels-reference).
+Verified against Claude Code 2.1.271; this remains a preview protocol.
 
 ## Store and delivery contract
 
