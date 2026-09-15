@@ -1112,10 +1112,15 @@ impl ContinuousScheduler {
                         let first_for_seq = warnings.get(&tk.task_id).is_none_or(|(seq, _)| *seq != run.seq);
                         warnings.insert(tk.task_id.clone(), (run.seq, now));
                         eprintln!("cm-daemon: Codex tail evidence unavailable for {} seq {}; run remains held (diagnostic limited to once per 5 minutes)", tk.task_id, run.seq);
-                        if first_for_seq {
-                            // Surface the held run where the task's participants
-                            // are looking (DESIGN_TASK_CHANNELS.md §6). Once per
-                            // seq; best-effort.
+                        // Surface the held run where the task's participants are
+                        // looking (DESIGN_TASK_CHANNELS.md §6) — but only once
+                        // the hold has PERSISTED past the first re-check. Tail
+                        // evidence is always "unavailable" in the seconds after
+                        // a fire (the rollout has not recorded the turn yet), so
+                        // the first emission is normal; runs 680–682 of
+                        // momentum-detective completed fine after such a notice
+                        // (2026-09-14). Best-effort, once per seq.
+                        if !first_for_seq {
                             let body = format!(
                                 "Run seq {} of {} is HELD: Codex tail evidence is unavailable (rollout missing, stale or unclassified). The scheduler will not refire or auto-close it. Orchestrator: finish the cycle and call report_done; operator: inspect the session and use continuous.force_done if it is wedged.",
                                 run.seq, tk.task_id

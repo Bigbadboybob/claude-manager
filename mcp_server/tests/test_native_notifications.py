@@ -417,3 +417,31 @@ class ProcessGuardTests(unittest.TestCase):
                 guard.terminate()
                 guard.wait(timeout=6)
             guard.stdout.close()
+
+
+class FrontendAttachmentTests(unittest.TestCase):
+    """CM relaunches a terminal frontend that lost its relay websocket for good."""
+
+    def test_detach_gap_and_exit_classification(self):
+        from mcp_server.native_codex import FrontendAttachment
+
+        clock = [100.0]
+        att = FrontendAttachment(clock=lambda: clock[0])
+        # Before the first attach the frontend counts as detached since start.
+        clock[0] = 110.0
+        self.assertEqual(att.detached_for(), 10.0)
+        att.attached()
+        self.assertIsNone(att.detached_for())
+        self.assertFalse(att.exit_followed_detach())
+        # A clean quit closes the socket and exits within the settle window.
+        att.detached()
+        clock[0] = 111.0
+        self.assertFalse(att.exit_followed_detach())
+        # A stranded frontend was detached long before it finally exited.
+        clock[0] = 200.0
+        self.assertTrue(att.exit_followed_detach())
+        # Re-marking detached keeps the original timestamp.
+        att.detached()
+        self.assertEqual(att.detached_for(), 90.0)
+        att.attached()
+        self.assertIsNone(att.detached_for())
