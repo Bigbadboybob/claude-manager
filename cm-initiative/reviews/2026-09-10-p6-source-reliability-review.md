@@ -177,3 +177,15 @@ and the separation between current research and a future selected round remain
 intact. Swarm-Gardener separately confirmed no loss from the recorded checkout
 incident. This disposition does not authorize live queries, repairs, experiments,
 or a new operating swarm.
+
+## Post-acceptance factual correction at `0b622e65b`
+
+P6 later verified the complete write chain and corrected its §6.5 wording. The
+current proposal blob is `0b622e65b84b34cc7ef5a61a4d7b639eabef52b3`, superseding
+the earlier accepted pin for factual purposes while preserving this review's
+disposition. `momentumEventNewsAttribution.py` reconstructs an `Article` and
+calls `ArticleDB.save_or_replace`; a new UID can be inserted with synthetic
+`received_at=event.time`, while the conflict update leaves an existing row's
+receipt clock unchanged. Any lag distribution must therefore flag or exclude
+these seeded rows; prevalence remains unmeasured. No implementation or
+experiment was selected.
