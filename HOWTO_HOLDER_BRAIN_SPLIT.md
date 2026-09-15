@@ -68,7 +68,7 @@ again, which is how you'd notice).
 
 Sessions are never signaled. Attach streams blip and auto-reattach.
 
-**Local** — unchanged habit:
+**Local** — only when the holder runs the shared-target binary directly:
 ```
 scripts/cm-redeploy --yes
 ```
@@ -76,6 +76,14 @@ Builds the workspace release, calls `daemon.restart`; in split mode that arms
 `restart_brain` (brain quiesces → checked persist → exits → holder execs the
 pinned new binary). The script verifies `holder_epoch` +1 exactly, soaks 90s,
 and prints the 10-minute note.
+
+**Check the pin first** (`ps -o cmd -p $(pgrep -f cm-holder)`): when the holder
+runs `--brain /opt/cm-daemon/cm-daemon` — true on cm-sessions since 2026-09-12
+as well as on cm-manager — `cm-redeploy --yes` builds but re-pins the OLD
+`/opt` file (the epoch bumps and "VERIFIED" prints with unchanged code, and
+`build_id` can lag because `build.rs` reruns only on git ref changes). Use the
+cm-manager recipe below without `--ssh`, and verify with a probe that only the
+new code answers, not with `build_id`.
 
 **cm-manager** — seamless (do NOT use `cm-redeploy --manager`: that is the
 legacy stop/cp/start path and kills every session there):
