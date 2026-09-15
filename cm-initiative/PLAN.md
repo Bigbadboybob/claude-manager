@@ -48,7 +48,7 @@ coordinator keeps the live roster; these are proposal-development statuses.
 
 | Topic | Intended proposal | Snapshot status |
 |---|---|---|
-| P1 | Momentum detection through explanatory ingest and useful source coverage | Final `01334a397` (post-acceptance factual correction to reviewed `8bbfcd823`) personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
+| P1 | Momentum detection through explanatory ingest and useful source coverage | Final `f9327c7be` (post-acceptance factual corrections to reviewed `8bbfcd823`) personally read; [ready for Owner discussion](reviews/2026-09-10-p1-momentum-coverage-review.md#final-personal-read-of-8bbfcd823), not selected for implementation |
 | P2 | Useful article follow-through, blocks, and appropriate non-trades | Final `3eea07af0` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p2-article-follow-through-review.md#final-disposition-at-3eea07af0), no implementation selected |
 | P3 | Production-baseline P&L improvement with bounded rounds | Final `5e8e56e9f` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p3-production-pnl-review.md#final-disposition-at-5e8e56e9f), no round selected |
 | P4 | Backtest fidelity, reliability, and useful completed comparisons | Final root `d8de69d36` personally reviewed; [ready for Owner discussion](reviews/2026-09-10-p4-backtest-fidelity-review.md#final-disposition-at-root-d8de69d36), no implementation selected |
@@ -280,6 +280,13 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   synthetic event-time receipt stamp; existing rows retain their receipt clock.
   Initiative-Bridge acknowledged the hold and recorded the correction. No
   experiment, repair, or implementation is selected.
+
+- **2026-09-15 — P1 second post-acceptance factual correction:** Coverage-Scout
+  pushed `f9327c7be` after verifying that `:328` is unconditional after the
+  stale skip. The synthetic receipt stamp therefore applies to accepted,
+  high-causation attribution articles, while stale candidates do not reach the
+  write path. Initiative-Bridge recorded this as a superseding erratum; the P1
+  discussion disposition remains unchanged and no experiment is selected.
 
 - **2026-09-10 — Integration verification:** all 16 accepted PROPOSAL/NOTES
   Git blobs match the integrated predictionTrading root `080256a08` exactly.

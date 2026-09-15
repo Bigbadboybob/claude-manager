@@ -131,14 +131,15 @@ chooses whether and how to pursue it, including evaluation definitions, resource
 and the preferred relationship to the other proposals. No live impact or baseline
 has been established by these source reads.
 
-## Post-acceptance factual correction at `01334a397`
+## Post-acceptance factual corrections through `f9327c7be`
 
-Coverage-Scout later corrected §3.8 while checking a peer's clock claim. The
-accepted disposition above remains unchanged, but the current proposal blob is
-now `01334a397afc258e1bce34f4614da74a2edc93f1`. The correction establishes that
-`momentumEventNewsAttribution.py` can reconstruct an `Article` with a synthetic
-`received_at=event.time` and call `ArticleDB.save_or_replace`: a new UID can
-therefore land with that synthetic stamp, while the conflict update preserves an
-existing row's receipt clock. Any publish-to-receipt lag on such a new row is an
-event-time gap, not transport; prevalence was not measured. This is a factual
-erratum only, not a selected experiment or implementation.
+Coverage-Scout corrected §3.8 twice while checking peer clock claims. The
+accepted disposition above remains unchanged; the current proposal blob is
+`f9327c7be`. The verified chain is that `:328` is on the unconditional main path
+after the stale-candidate skip, and accepted high-causation attribution articles
+are reconstructed and written through `ArticleDB.save_or_replace`. A new UID can
+therefore land with synthetic `received_at=event.time`, while the conflict update
+preserves an existing row's receipt clock. Any publish-to-receipt lag on this
+explanatory cohort is an event-time gap, not transport; prevalence was not
+measured. These are factual errata only, not a selected experiment or
+implementation.
