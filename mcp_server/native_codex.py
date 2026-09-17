@@ -66,6 +66,14 @@ def launch_permissions():
 # three of 63 live panes, one of them an orchestrator whose fires are pasted
 # into that pane. CM relaunches the frontend against the same app-server after
 # this many seconds without a terminal websocket, a bounded number of times.
+# A fresh app-server answers `initialize` in well under a second when idle, but a
+# burst of spawns (five continuous replacements in 70 s on 2026-09-17) pushed it past
+# the old 10 s bound and the launcher exited 1 before any thread existed; the
+# scheduler's supervisor then respawned, and each consumer respawn claimed and lost
+# another queue batch. Only the first handshake gets the long bound; reconnect
+# handshakes keep the short one so a dead backend is still detected quickly.
+HANDSHAKE_TIMEOUT_SECS = 10
+INITIALIZE_TIMEOUT_SECS = 60
 FRONTEND_DETACH_GRACE_SECS = 45.0
 FRONTEND_RESPAWN_LIMIT = 6
 
@@ -236,14 +244,14 @@ class Relay:
             open_timeout=3,
         )
 
-        async def handshake(method, params):
+        async def handshake(method, params, timeout=HANDSHAKE_TIMEOUT_SECS):
             self.sequence += 1
             request_id = self.prefix + str(self.sequence)
             await self.upstream.send(
                 json.dumps({"id": request_id, "method": method, "params": params})
             )
             while True:
-                message = json.loads(await asyncio.wait_for(self.upstream.recv(), 10))
+                message = json.loads(await asyncio.wait_for(self.upstream.recv(), timeout))
                 if message.get("id") == request_id and (
                     "result" in message or "error" in message
                 ):
@@ -254,7 +262,7 @@ class Relay:
 
         try:
             if self.init_request is not None:
-                await handshake("initialize", self.init_request)
+                await handshake("initialize", self.init_request, timeout=INITIALIZE_TIMEOUT_SECS)
                 await self.upstream.send(json.dumps({"method": "initialized"}))
                 if self.thread:
                     result = await handshake(

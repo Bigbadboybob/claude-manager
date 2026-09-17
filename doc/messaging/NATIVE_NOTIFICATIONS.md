@@ -431,3 +431,7 @@ passed 73 messaging unit tests and 84 Python tests before deployment. Private
 binary/MCP backups, checksums, activation and stability evidence are under
 `~/.cm/deployments/chat-wake-batching-20260909T181428Z` on `cm-sessions`, with
 matching pre-deploy file backups on `cm-manager`.
+
+### Launcher startup bound (2026-09-17)
+
+The relay's first `initialize` handshake with its app-server waits `INITIALIZE_TIMEOUT_SECS` (60 s); later reconnect handshakes keep `HANDSHAKE_TIMEOUT_SECS` (10 s). Pre-fix every handshake had the 10 s bound: a burst of five continuous replacements in 70 s on cm-manager pushed app-server startup past it, the launcher exited 1 before a thread existed, the scheduler's supervisor respawned it, and each consumer respawn claimed and lost another queue batch (momentum-detective runs 699–701, 13 items re-enqueued by hand). A launcher that exits within about ten seconds of a spawn with `CM native Codex launcher: TimeoutError` on its PTY is this class.
