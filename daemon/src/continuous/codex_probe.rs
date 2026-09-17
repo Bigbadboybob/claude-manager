@@ -79,6 +79,7 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
             auth_error: None,
             usage_limit: None,
             pool_unavailable: None,
+            pool_transient: false,
         };
         match (top, kind) {
             ("event_msg", "task_complete") => {
@@ -97,6 +98,7 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
                             result.pool_unavailable = Some("Codex pool cannot serve this request. Check pool capacity and continuation ownership; work reconciliation is required before recovery.".into());
                         }
                         ErrorKind::BridgeCooldown => {
+                            result.pool_transient = true;
                             result.pool_unavailable = Some("Codex thread's response bridge is cooling down after upstream timeouts. Inspect codex-lb for previous_response_not_found/continuation ownership: retrying the same thread may never recover. Preserve its transcript and reconcile claimed items/workers before replacing the thread and redelivering unfinished work; do not force_done or blindly replay the batch.".into());
                         }
                         // A configuration/transport/unknown error is an
@@ -159,6 +161,7 @@ mod tests {
         let result = probe(&path, 0.0).unwrap();
         assert_eq!(result.shape, TailShape::TurnComplete);
         assert!(result.pool_unavailable.unwrap().contains("replacing the thread"));
+        assert!(result.pool_transient, "bridge cooldown is a transient proxy condition");
         assert!(result.auth_error.is_none() && result.usage_limit.is_none());
         assert!(probe(&path, 2_000_000_000.0).is_none());
         let v: Value = serde_json::from_str(fixture).unwrap();
@@ -182,6 +185,7 @@ mod tests {
         let observed = probe(&path, 0.0).unwrap();
         assert_eq!(observed.shape, TailShape::TurnComplete);
         assert!(observed.pool_unavailable.is_some());
+        assert!(!observed.pool_transient, "a pool-wide outage is not re-driven");
         assert!(observed.auth_error.is_none() && observed.usage_limit.is_none());
         let user = serde_json::json!({"timestamp":"2026-09-08T00:00:00.000Z","type":"event_msg",
             "payload":{"type":"user_message","message":"unexpected status 503 Service Unavailable: No available accounts"}});
