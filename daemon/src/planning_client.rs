@@ -289,6 +289,38 @@ fn build_agent() -> ureq::Agent {
     )
 }
 
+/// GET `<api>/tasks/<task_id>` and return the row's `status`, lowercased.
+/// `Ok(None)` means the planning row is gone (404) — a deleted row must not
+/// pin a checkout or a worker forever, so callers treat it as "not terminal,
+/// stop asking".
+///
+/// Deliberately ONE ROW PER CALL. `GET /tasks` returns the whole board, and a
+/// periodic full-board poll is the exact shape that cost ~80 GiB/day before
+/// 2026-09-10 (see CLAUDE.md); the sweep only ever needs the handful of tasks
+/// that currently own a live session.
+pub fn fetch_task_status(
+    task_id: &str,
+    api_url_override: Option<&str>,
+    api_token_override: Option<&str>,
+) -> Result<Option<String>, PlanningClientError> {
+    let api_url = resolve_api_url(api_url_override)?;
+    let api_token = resolve_api_token(api_token_override)?;
+    let endpoint = format!("{}/tasks/{}", api_url, task_id);
+    let response = build_agent()
+        .get(&endpoint)
+        .header("Authorization", &format!("Bearer {}", api_token))
+        .call()
+        .map_err(|e| PlanningClientError::Transport(format!("GET {}: {}", endpoint, e)))?;
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    let row: serde_json::Value = decode_json_response(response, "task row")?;
+    Ok(row
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase()))
+}
+
 /// POST to `<CM_API_URL>/tasks` with the propose-task body.
 /// Returns the API's JSON response on success (the new task
 /// row, including the assigned `id`).
