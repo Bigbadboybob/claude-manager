@@ -188,7 +188,8 @@ impl Response {
 /// **Client → server** (inbound to the daemon):
 ///   - `Input`: keystroke bytes. Payload: `{"bytes": "<base64>"}`.
 ///   - `Resize`: terminal size update. Payload:
-///     `{"cols": <u16>, "rows": <u16>}`. The daemon-side reader
+///     `{"cols": <u16>, "rows": <u16>}`, optionally with the viewer's
+///     `cell_width`/`cell_height` in pixels. The daemon-side reader
 ///     dispatches to `DaemonSession::resize` which calls
 ///     `portable-pty::MasterPty::resize` to ioctl TIOCSWINSZ on
 ///     the kernel PTY.
@@ -220,7 +221,8 @@ pub enum StreamKind {
     /// route input distinctly from output.
     Input,
     /// Client → server: terminal-size update. Payload
-    /// `{"cols": <u16>, "rows": <u16>}`.
+    /// `{"cols": <u16>, "rows": <u16>}`, optionally with
+    /// `cell_width`/`cell_height` in pixels.
     Resize,
     /// Client → server: batch hidden terminal output (every byte is retained).
     /// Negotiated by `output_flow: true` in the attach response.

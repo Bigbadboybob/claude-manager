@@ -62,6 +62,7 @@ pub mod codex_trust;
 pub mod config;
 pub mod env_sanitize;
 pub mod fanout_persist;
+pub mod graphics_file;
 pub mod continuous;
 pub mod control;
 pub mod holder_mode;

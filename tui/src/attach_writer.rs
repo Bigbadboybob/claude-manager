@@ -129,8 +129,8 @@ impl AttachWriter {
         result
     }
 
-    pub fn send_resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
-        self.with_writer(|w| w.send_resize(cols, rows))
+    pub fn send_resize(&mut self, cols: u16, rows: u16, cell_pixels: Option<(u16, u16)>) -> io::Result<()> {
+        self.with_writer(|w| w.send_resize(cols, rows, cell_pixels))
     }
 
     pub fn flush_pending(&mut self) -> io::Result<bool> {

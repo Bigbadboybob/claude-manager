@@ -28,6 +28,15 @@ pub(crate) fn terminal_config() -> TermConfig {
     }
 }
 
+/// Cell size for a pane's `WindowSize`: the outer terminal's pixels when
+/// the pane has graphics passthrough, else alacritty's 1×1 "unknown".
+fn pane_cell_pixels(graphics: bool) -> (u16, u16) {
+    graphics
+        .then(crate::graphics::outer::cell_pixels)
+        .flatten()
+        .unwrap_or((1, 1))
+}
+
 /// Proxy that forwards alacritty terminal events to a channel.
 #[derive(Clone)]
 pub struct EventProxy {
@@ -124,6 +133,9 @@ pub struct Session {
     /// for daemon-attached sessions; `None` for local-PTY sessions. See
     /// [`Self::attach_socket_hung_up`].
     pub attach_hup_fd: Option<std::os::fd::OwnedFd>,
+    /// Kitty graphics passthrough for daemon-attached panes; `None` when it
+    /// is off or for local PTYs. See doc/kitty-graphics-passthrough.md.
+    pub graphics: Option<crate::graphics::PaneGraphics>,
 }
 
 #[derive(Default)]
@@ -297,6 +309,7 @@ impl Session {
             // Local PTY session — no attach socket to watch for HUP.
             attach_hup_fd: None,
             output_control: None,
+            graphics: None,
         })
     }
 
@@ -360,6 +373,7 @@ impl Session {
             daemon_transport_eof: Some(cs.transport_eof),
             attach_hup_fd: cs.hup_fd,
             output_control: cs.output_control,
+            graphics: cs.graphics,
         })
     }
 
@@ -414,6 +428,7 @@ impl Session {
             daemon_transport_eof: Some(cs.transport_eof),
             attach_hup_fd: cs.hup_fd,
             output_control: cs.output_control,
+            graphics: cs.graphics,
         })
     }
 
@@ -523,11 +538,12 @@ impl Session {
 
     /// Notify the PTY of a terminal resize.
     pub fn resize(&self, cols: u16, rows: u16) {
+        let (cell_width, cell_height) = pane_cell_pixels(self.graphics.is_some());
         let window_size = WindowSize {
             num_lines: rows,
             num_cols: cols,
-            cell_width: 1,
-            cell_height: 1,
+            cell_width,
+            cell_height,
         };
         let _ = self.sender.send(Msg::Resize(window_size));
         self.term.lock().resize(TermSize {
@@ -545,11 +561,12 @@ impl Session {
     }
 
     fn send_pty_size(&self, cols: u16, rows: u16) {
+        let (cell_width, cell_height) = pane_cell_pixels(self.graphics.is_some());
         let _ = self.sender.send(Msg::Resize(WindowSize {
             num_cols: cols,
             num_lines: rows,
-            cell_width: 1,
-            cell_height: 1,
+            cell_width,
+            cell_height,
         }));
     }
 

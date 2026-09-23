@@ -12,6 +12,7 @@ mod config;
 mod control;
 mod continuous_stage;
 mod daemon_launch;
+mod graphics;
 mod host_pool;
 mod network_watch;
 mod hosts;
@@ -155,6 +156,9 @@ fn main() -> anyhow::Result<()> {
 
     // Setup terminal.
     enable_raw_mode()?;
+    // Kitty graphics passthrough probes the terminal and reads its replies,
+    // so it must run in raw mode before crossterm starts reading stdin.
+    graphics::outer::detect_at_startup();
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -196,6 +200,8 @@ fn main() -> anyhow::Result<()> {
     let saved_stderr = redirect_stderr_to_log();
 
     let result = run(&mut terminal, config);
+    // Dropping the app queued deletes for every pane's images.
+    let _ = graphics::outer::flush(terminal.backend_mut());
 
     // Restore terminal.
     disable_raw_mode()?;
@@ -408,6 +414,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // only on an actual bucket change.
         app.tick_idle_ages();
         app.messaging_tick();
+
+        // Kitty graphics passthrough: answer pane queries and send image
+        // bytes. Runs every tick (replies must not wait for a redraw), and
+        // always between frames, never inside a draw.
+        app.pump_graphics();
+        let _ = graphics::outer::flush(terminal.backend_mut());
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();

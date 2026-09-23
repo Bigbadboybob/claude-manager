@@ -800,6 +800,14 @@ pub fn dispatch_request(
         "create_session" => {
             DispatchOutcome::Done(dispatch_create_session(state, req))
         }
+        // Kitty graphics passthrough: a viewer on another machine pulls the
+        // file a pane's image command names (doc/kitty-graphics-passthrough.md).
+        "graphics.read_file" => DispatchOutcome::Done(
+            if let Err(response) = require_operator(req, "graphics.read_file is Operator-only") { response }
+            else { match crate::graphics_file::rpc(&req.params) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err(error) => Response::err(req.id.clone(), ErrorCode::InvalidParams, error),
+            }}),
         "snapshot.control" => DispatchOutcome::Done(
             if let Err(response) = require_operator(req, "Snapshot catalog is Operator-only") { response }
             else { match methods::snapshot_control(state, &req.params) {
@@ -2422,7 +2430,7 @@ fn bind_attach_stream(
     // session.attach already minted a ticket for a uid that has
     // since exited — surface as Conflict so the client knows the
     // attach can't proceed.
-    let (fanout_rx, last_exit) = match state.sessions.get_mut(&session_uid) {
+    let (fanout_rx, last_exit, replay_bytes) = match state.sessions.get_mut(&session_uid) {
         Some(session) => {
             // Apply the client's terminal size server-side, in the
             // same locked critical section that binds the stream.
@@ -2446,7 +2454,8 @@ fn bind_attach_stream(
                     );
                 }
             }
-            (session.fanout.subscribe_output(), session.last_exit.clone())
+            let (rx, replay_bytes) = session.fanout.subscribe_output_with_replay_len();
+            (rx, session.last_exit.clone(), replay_bytes)
         }
         None => {
             return DispatchOutcome::Done(Response::err(
@@ -2462,7 +2471,12 @@ fn bind_attach_stream(
 
     let response = Response::ok(
         req.id.clone(),
-        serde_json::json!({ "session_uid": session_uid.clone(), "output_flow": true }),
+        serde_json::json!({
+            "session_uid": session_uid.clone(),
+            "output_flow": true,
+            // Bytes of ring replay that precede live output on this stream.
+            "replay_bytes": replay_bytes,
+        }),
     );
     let handle = AttachStreamHandle {
         session_uid,
@@ -4057,6 +4071,40 @@ mod tests {
             (203, 51),
             "session.resize must resize the daemon PTY",
         );
+    }
+
+    #[test]
+    fn graphics_cell_pixels_follow_resizes_without_pixel_sizes() {
+        // Image programs read the pane's pixel size from TIOCGWINSZ. A viewer
+        // with kitty graphics reports its cell size; later resizes that carry
+        // none (session.resize repair, older viewers) must scale it, not zero it.
+        let state = state_with_session("ts-live");
+        let mut s = state.lock().unwrap();
+        let sess = s.sessions.get_mut("ts-live").expect("live session");
+        sess.resize_with_cell_pixels(100, 40, Some((10, 20))).unwrap();
+        let size = sess.pty_size();
+        assert_eq!((size.pixel_width, size.pixel_height), (1000, 800));
+        sess.resize(50, 10).unwrap();
+        let size = sess.pty_size();
+        assert_eq!((size.cols, size.rows), (50, 10));
+        assert_eq!((size.pixel_width, size.pixel_height), (500, 200));
+    }
+
+    #[test]
+    fn graphics_attach_reports_replay_length() {
+        // Viewers must not answer terminal queries replayed from the ring,
+        // so the attach response says how many leading bytes are replay.
+        let state = state_with_session("ts-live");
+        state.lock().unwrap().sessions["ts-live"].fanout.push(b"\x1b[>qold output");
+        let outcome = dispatch_request(&state, &operator_request("attach.direct", serde_json::json!({
+            "uid": "ts-live",
+        })));
+        let DispatchOutcome::AttachStream { response, handle } = outcome else {
+            panic!("expected live stream");
+        };
+        let replay = handle.fanout_rx.recv().unwrap();
+        assert!(replay.ends_with(b"\x1b[>qold output"));
+        assert_eq!(response.result.unwrap()["replay_bytes"], serde_json::json!(replay.len()));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::session::EventProxy;
@@ -14,12 +15,47 @@ use crate::session::EventProxy;
 pub struct TerminalWidget<'a> {
     term: &'a Arc<FairMutex<Term<EventProxy>>>,
     focused: bool,
+    /// Pane image id → outer image id, when the pane has kitty graphics
+    /// passthrough. Placeholder cells are rewritten through it.
+    images: Option<&'a HashMap<u32, u32>>,
 }
 
 impl<'a> TerminalWidget<'a> {
     pub fn new(term: &'a Arc<FairMutex<Term<EventProxy>>>, focused: bool) -> Self {
-        Self { term, focused }
+        Self { term, focused, images: None }
     }
+
+    pub fn images(mut self, images: Option<&'a HashMap<u32, u32>>) -> Self {
+        self.images = images;
+        self
+    }
+}
+
+/// Render a kitty Unicode-placeholder cell for the outer terminal: keep the
+/// row/column diacritics, re-encode the pane's image id as the outer id, and
+/// keep the underline colour (the placement id). A placeholder naming an
+/// image this pane never sent renders blank, so it cannot show another
+/// pane's image.
+fn render_placeholder(
+    cell: &alacritty_terminal::term::cell::Cell,
+    images: &HashMap<u32, u32>,
+    out: &mut ratatui::buffer::Cell,
+) {
+    use crate::graphics::placeholder;
+    let zerowidth = cell.zerowidth().unwrap_or(&[]);
+    let outer = placeholder::image_id(cell.fg, zerowidth).and_then(|id| images.get(&id));
+    let Some(&outer) = outer else {
+        out.set_char(' ').set_bg(convert_color(cell.bg));
+        return;
+    };
+    let mut symbol = String::from(placeholder::PLACEHOLDER);
+    symbol.extend(zerowidth.iter().take(2));
+    let (r, g, b) = placeholder::id_color(outer);
+    let mut style = Style::default().fg(Color::Rgb(r, g, b)).bg(convert_color(cell.bg));
+    if let Some(underline) = cell.underline_color() {
+        style = style.underline_color(convert_color(underline));
+    }
+    out.set_symbol(&symbol).set_style(style);
 }
 
 /// Current scrollback offset of `term`, in lines scrolled up from the live
@@ -34,6 +70,12 @@ pub fn scrollback_offset(term: &Arc<FairMutex<Term<EventProxy>>>) -> usize {
 
 impl Widget for TerminalWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // With passthrough on, a pane that has no image map of its own (a
+        // local PTY, the planning editor) must still never send raw ids: an
+        // empty map blanks its placeholder cells.
+        static NO_IMAGES: std::sync::OnceLock<HashMap<u32, u32>> = std::sync::OnceLock::new();
+        let passthrough_without_images = crate::graphics::outer::enabled()
+            .then(|| NO_IMAGES.get_or_init(HashMap::new));
         let term = self.term.lock();
         let content = term.renderable_content();
         let cursor = content.cursor;
@@ -61,6 +103,15 @@ impl Widget for TerminalWidget<'_> {
                 || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
             {
                 continue;
+            }
+
+            if let Some(images) = self.images.or(passthrough_without_images) {
+                if cell.c == crate::graphics::placeholder::PLACEHOLDER {
+                    if let Some(out) = buf.cell_mut((x, y)) {
+                        render_placeholder(cell, images, out);
+                    }
+                    continue;
+                }
             }
 
             let fg = convert_color(cell.fg);
@@ -304,6 +355,51 @@ mod tests {
                 previous = next;
             }
         }
+    }
+
+    #[test]
+    fn kitty_placeholder_cells_are_rewritten_to_outer_image_ids() {
+        crossterm::style::force_color_output(true);
+        let inner = terminal(8, 2);
+        // Image 7 (truecolor id, placement 9 in the underline colour): two
+        // cells, row 0 / columns 0 and 1. Then an id this pane never sent.
+        feed(
+            &inner,
+            "\x1b[38;2;0;0;7m\x1b[58;2;0;0;9m\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}\
+             \x1b[59m\x1b[38;5;99m\u{10EEEE}\u{0305}\u{0305}\x1b[0mx"
+                .as_bytes(),
+        );
+        let images = HashMap::from([(7, 0x12_3456)]);
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buf = Buffer::empty(area);
+        TerminalWidget::new(&inner, false).images(Some(&images)).render(area, &mut buf);
+
+        assert_eq!(buf[(0, 0)].symbol(), "\u{10EEEE}\u{0305}\u{0305}");
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(buf[(0, 0)].underline_color, Color::Rgb(0, 0, 9));
+        assert_eq!(buf[(1, 0)].symbol(), "\u{10EEEE}\u{0305}\u{030D}");
+        assert_eq!(buf[(2, 0)].symbol(), " ", "unknown ids must never reach the outer terminal");
+        assert_eq!(buf[(3, 0)].symbol(), "x");
+
+        // The bytes the outer terminal receives carry the rewritten id and
+        // the diacritics unchanged.
+        let mut bytes = Vec::new();
+        let mut backend = CrosstermBackend::new(&mut bytes);
+        backend.draw(Buffer::empty(area).diff(&buf).into_iter()).unwrap();
+        backend.flush().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("38;2;18;52;86"), "{text:?}");
+        assert!(text.contains("58;2;0;0;9m"), "{text:?}");
+        assert!(text.contains("\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}"), "{text:?}");
+        assert!(!text.contains("38;5;99"), "{text:?}");
+
+        // A pane without its own map never sends raw ids: unchanged when
+        // passthrough is off (another test in this process may turn it on),
+        // blank when it is on.
+        let mut plain = Buffer::empty(area);
+        TerminalWidget::new(&inner, false).render(area, &mut plain);
+        let expected = if crate::graphics::outer::enabled() { " " } else { "\u{10EEEE}" };
+        assert_eq!(plain[(0, 0)].symbol(), expected);
     }
 
     #[test]

@@ -1243,8 +1243,42 @@ impl App {
     // (Retired: `cycle_active_host` / `A-H` — the global active_host is gone;
     // host is a per-workspace attribute. See DESIGN_REMOVE_GLOBAL_HOST.md.)
 
+    /// Kitty graphics passthrough: handle each pane's image commands and
+    /// queries, queueing outer-terminal bytes (flushed by the main loop
+    /// between frames) and writing replies into the panes.
+    pub fn pump_graphics(&mut self) {
+        let Some(caps) = crate::graphics::outer::caps() else {
+            return;
+        };
+        let cell = crate::graphics::outer::cell_pixels();
+        for ws in &mut self.workspaces {
+            for ts in &mut ws.sessions {
+                let session = &mut ts.session;
+                let Some(graphics) = session.graphics.as_mut() else {
+                    continue;
+                };
+                let term = &session.term;
+                let out = graphics.pump(|| {
+                    use alacritty_terminal::grid::Dimensions;
+                    let term = term.lock();
+                    crate::graphics::PaneCtx {
+                        cols: term.columns() as u16,
+                        rows: term.screen_lines() as u16,
+                        cell,
+                        version: &caps.version,
+                    }
+                });
+                crate::graphics::outer::queue(&out.outer);
+                if !out.pane.is_empty() && !session.exited {
+                    let _ = session.write(&out.pane);
+                }
+            }
+        }
+    }
+
     /// Handle terminal resize.
     pub fn resize_terminals(&mut self, cols: u16, rows: u16) {
+        crate::graphics::outer::refresh_cell_size();
         self.last_term_size = (cols, rows);
         for ws in &mut self.workspaces {
             for ts in &mut ws.sessions {

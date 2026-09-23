@@ -1205,7 +1205,8 @@ impl App {
         frame.render_widget(block, area);
 
         if let Some((_, ts)) = self.active_session() {
-            let widget = TerminalWidget::new(&ts.session.term, true);
+            let widget = TerminalWidget::new(&ts.session.term, true)
+                .images(ts.session.graphics.as_ref().map(|g| g.ids()));
             frame.render_widget(widget, inner);
         } else if let Some(wi) = self.active_workspace_index() {
             let ws = &self.workspaces[wi];

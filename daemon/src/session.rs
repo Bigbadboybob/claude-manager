@@ -405,12 +405,21 @@ impl PtyByteFanout {
     /// Bounded subscription for network viewers. Replay and subscription are
     /// captured under one lock, so no PTY output can fall between them.
     pub fn subscribe_output(&self) -> crate::attach_output::OutputSubscription {
+        self.subscribe_output_with_replay_len().0
+    }
+
+    /// [`Self::subscribe_output`], plus the number of replayed bytes that
+    /// precede live output. Viewers use it to avoid answering terminal
+    /// queries that were already answered before they attached.
+    pub fn subscribe_output_with_replay_len(
+        &self,
+    ) -> (crate::attach_output::OutputSubscription, usize) {
         let (tx, rx) = crate::attach_output::channel();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let replay: Vec<u8> = inner.buffer.iter().copied().collect();
         tx.push(&replay);
         if inner.closed { tx.close(); } else { inner.output_subscribers.push(tx); }
-        rx
+        (rx, replay.len())
     }
 
     /// Test helper: number of buffered bytes.
@@ -1006,6 +1015,11 @@ pub struct DaemonSession {
     /// `control::methods::mcp_start_session`.
     pub last_cols: u16,
     pub last_rows: u16,
+    /// Viewer cell size in pixels from the last resize that carried one.
+    /// Resizes without pixel sizes (older viewers, `session.resize`) scale
+    /// it to the new grid so `TIOCGWINSZ` keeps non-zero pixel fields for
+    /// image-capable programs. See doc/kitty-graphics-passthrough.md.
+    pub last_cell_pixels: Option<(u16, u16)>,
     /// 10d-2c-1 review round-5 (F1): workflow context for the
     /// auth check on `workflow_transition` / `workflow_done`.
     /// Populated at spawn from
@@ -1951,6 +1965,7 @@ impl PendingSession {
             cgroup_prefix,
             last_cols: cols,
             last_rows: rows,
+            last_cell_pixels: None,
             // 10d-2c-1 review round-5 (F1): workflow context lands
             // on the final DaemonSession; auth via
             // `lookup_session_any` reads it from here.
@@ -2494,6 +2509,7 @@ impl AdoptedSessionBuild {
             cgroup_prefix: meta.cgroup_prefix,
             last_cols: cols,
             last_rows: rows,
+            last_cell_pixels: None,
             workflow_run_id: meta.workflow_run_id,
             workflow_role: meta.workflow_role,
             continuous_task_id: meta.continuous_task_id,
@@ -3060,7 +3076,32 @@ impl DaemonSession {
     /// caller; a missed resize is a cosmetic glitch, not a
     /// correctness bug.
     pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.resize_with_cell_pixels(cols, rows, None)
+    }
+
+    /// The kernel PTY's current window size, pixel fields included.
+    #[cfg(test)]
+    pub(crate) fn pty_size(&self) -> portable_pty::PtySize {
+        self._master.get_size().expect("TIOCGWINSZ on session master")
+    }
+
+    /// [`Self::resize`] with the viewer's cell size in pixels. `None` keeps
+    /// the last reported cell size, so the PTY's pixel fields follow the new
+    /// grid instead of dropping to zero.
+    pub fn resize_with_cell_pixels(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_pixels: Option<(u16, u16)>,
+    ) -> std::io::Result<()> {
         use portable_pty::PtySize;
+        if let Some((w, h)) = cell_pixels.filter(|&(w, h)| w > 0 && h > 0) {
+            self.last_cell_pixels = Some((w, h));
+        }
+        let (pixel_width, pixel_height) = self
+            .last_cell_pixels
+            .map(|(w, h)| (cols.saturating_mul(w), rows.saturating_mul(h)))
+            .unwrap_or((0, 0));
         // Track the latest requested size so `mcp_start_session`
         // can hand a child PTY the caller's *current* width. Stamp
         // the intent even if the TIOCSWINSZ below errors (rare;
@@ -3072,8 +3113,8 @@ impl DaemonSession {
             .resize(PtySize {
                 cols,
                 rows,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width,
+                pixel_height,
             })
             .map_err(|e| std::io::Error::other(format!("PTY resize: {}", e)))
     }

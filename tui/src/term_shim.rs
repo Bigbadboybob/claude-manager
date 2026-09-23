@@ -572,11 +572,14 @@ impl<W: Write> StreamWriter<W> {
         self.flush_pending().map(|_| ())
     }
 
-    pub fn send_resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
-        self.queue_frame(
-            StreamKind::Resize,
-            serde_json::json!({ "cols": cols, "rows": rows }),
-        )?;
+    pub fn send_resize(&mut self, cols: u16, rows: u16, cell_pixels: Option<(u16, u16)>) -> io::Result<()> {
+        let mut payload = serde_json::json!({ "cols": cols, "rows": rows });
+        // Older daemons ignore the extra fields.
+        if let Some((w, h)) = cell_pixels {
+            payload["cell_width"] = w.into();
+            payload["cell_height"] = h.into();
+        }
+        self.queue_frame(StreamKind::Resize, payload)?;
         match self.flush_pending() {
             Ok(_) | Err(_) if false => unreachable!(),
             Ok(_) => Ok(()),
@@ -1388,7 +1391,7 @@ mod tests {
         let mut sink = Vec::new();
         {
             let mut w = StreamWriter::new(&mut sink, "stream-1");
-            w.send_resize(120, 40).unwrap();
+            w.send_resize(120, 40, None).unwrap();
         }
         let frames = decode_all_frames(&sink);
         assert_eq!(frames.len(), 1);
@@ -1404,7 +1407,7 @@ mod tests {
         {
             let mut w = StreamWriter::new(&mut sink, "attach-uuid-xyz");
             w.write(b"x").unwrap();
-            w.send_resize(80, 24).unwrap();
+            w.send_resize(80, 24, None).unwrap();
         }
         let mut cursor = Cursor::new(sink.as_slice());
         for _ in 0..2 {
