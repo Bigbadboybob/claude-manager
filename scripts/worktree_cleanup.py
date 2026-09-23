@@ -215,6 +215,119 @@ def scoped_context(ctx: reaper.ScanContext, row: dict, owners: set[str], job: di
                                scope_guard=guard, process_paths=reaper.process_references(path.parent))
 
 
+#: How long ``apply`` waits for a checkout's OWN work to let go before it gives
+#: up. The operator chose "reap" at close time and should not have to come back
+#: and choose again: closing a session is asynchronous, the agent's stdio MCP
+#: child exits on its own a moment later, and under memory pressure that whole
+#: settle can take minutes (2026-09-18: 30 children killed at once were each
+#: blocked in a swap-in fault for several minutes before they noticed stdin had
+#: closed). Pre-fix ``apply`` took exactly one verdict per checkout, so a
+#: checkout whose only blocker was a process seconds from exiting was retained
+#: permanently and the operator's "reap now" silently became "keep".
+SETTLE_TIMEOUT_SECS = 300
+SETTLE_POLL_SECS = 5
+
+#: Refusals worth waiting on, and WHEN. A process reference is always worth
+#: waiting on: a process holding a checkout is either exiting or it is not, and
+#: a few minutes settles it either way. A live SESSION is only worth waiting on
+#: when this job just closed one — otherwise the session belongs to somebody
+#: still using it, and no amount of waiting changes that. Everything else
+#: (pinned, continuous, shared with another task, a non-terminal task outside
+#: the family) is a real answer, reported at once, so the operator is never
+#: left waiting on a "no" that can never become a "yes".
+SETTLES_ALWAYS = {'live_process_reference'}
+SETTLES_AFTER_CLOSING = {'live_session'}
+
+#: Preview verdicts that mean the checkout was never this job's to remove.
+#: A live process in one of these is somebody else's, so waiting is wrong.
+NOT_OURS = {'shared_with_another_task', 'primary_checkout', 'unknown_ownership'}
+
+
+def daemon_rpc(method: str, params: dict, timeout: float = 15) -> dict:
+    """One operator-framed call on the host's control socket. Same framing as
+    ``reaper.load_live_paths``; kept here rather than imported so the reaper
+    stays a read-only scanner."""
+    import socket
+    import struct
+    cm = home()
+    token = (cm / 'operator-token').read_text().strip()
+    request = json.dumps({'id': 'worktree-cleanup', 'caller': {'token_id': token},
+                          'method': method, 'params': params}).encode()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(str(cm / 'daemon.sock'))
+        sock.sendall(struct.pack('>I', len(request)) + request)
+        length = struct.unpack('>I', reaper.recv_exact(sock, 4))[0]
+        return json.loads(reaper.recv_exact(sock, length))
+
+
+def close_job_sessions(job: dict) -> list[str]:
+    """Close the sessions belonging to the tasks this job was approved for.
+
+    Choosing "reap" IS the instruction to close them; before this the job only
+    ever observed sessions, so it depended on something else having closed them
+    first and refused when nothing had. Scoped to the approved family, never to
+    a checkout's co-tenants, and best-effort: a daemon that cannot be reached
+    leaves the sessions alone and the settle loop below reports the honest
+    reason.
+    """
+    family = set(job.get('family') or ()) | job_roots(job)
+    if not family:
+        return []
+    closed: list[str] = []
+    try:
+        response = daemon_rpc('list_sessions', {})
+        rows = response.get('result') or [] if response.get('ok') else []
+    except Exception as exc:  # noqa: BLE001 - never let this fail the job
+        job.setdefault('warnings', []).append(f'could not list sessions to close: {exc}')
+        return []
+    for row in rows:
+        if not isinstance(row, dict) or row.get('task_id') not in family:
+            continue
+        # The scheduler and the workflow engine own these two lifecycles; a
+        # cleanup job must not reach into them even inside its own family.
+        if row.get('continuous_task_id') or row.get('workflow_run_id'):
+            continue
+        uid = row.get('session_uid')
+        if not isinstance(uid, str):
+            continue
+        try:
+            daemon_rpc('kill_session', {'session_uid': uid})
+            closed.append(uid)
+        except Exception as exc:  # noqa: BLE001
+            job.setdefault('warnings', []).append(f'could not close {uid}: {exc}')
+    return closed
+
+
+def settles(reason: str, row: dict, closed_any: bool) -> bool:
+    if row.get('reason') in NOT_OURS:
+        return False
+    return reason in SETTLES_ALWAYS or (closed_any and reason in SETTLES_AFTER_CLOSING)
+
+
+def settle_decision(path: Path, row: dict, job: dict, budget: dict, closed_any: bool):
+    """The candidate's verdict, waiting out refusals that are this job's own
+    work finishing. Returns the final decision; the caller reaps or records it.
+
+    ``budget`` carries one deadline shared by every checkout in the job, started
+    lazily at the first refusal worth waiting on — a job that never has to wait
+    reads no clock at all, and a wide family cannot multiply one settle window
+    into one per checkout.
+    """
+    while True:
+        ctx = base_context()
+        owners = scope_facts(ctx, row, set(job['family']), job.get('task_id'), job_roots(job)).task_ids
+        context = scoped_context(ctx, row, owners, job)
+        candidate = reaper.decision(path, context, refresh_processes=True)
+        if candidate.eligible or not settles(candidate.reason, row, closed_any):
+            return candidate, context
+        if budget.get('deadline') is None:
+            budget['deadline'] = time.monotonic() + SETTLE_TIMEOUT_SECS
+        elif time.monotonic() >= budget['deadline']:
+            return candidate, context
+        time.sleep(SETTLE_POLL_SECS)
+
+
 def preview(job: dict) -> None:
     ctx = base_context()
     root_path = Path(job['worktree_path']) if job.get('worktree_path') else None
@@ -273,6 +386,12 @@ def apply(job: dict) -> None:
         if closed or time.monotonic() >= deadline:
             break
         time.sleep(1)
+    closed = close_job_sessions(job)
+    if closed:
+        job.update(message=f'Closing {len(closed)} session(s) this task still owned, then reaping.',
+                   closed_sessions=closed)
+        write_job(job)
+    settle_budget: dict = {'deadline': None}
     result_by_id = {row['id']: row for row in job.get('results', [])}
     # Descendants physically inside a checkout must be considered first. A
     # retained nested checkout prevents removing its enclosing directory.
@@ -296,12 +415,11 @@ def apply(job: dict) -> None:
                     raise ValueError('checkout identity changed since preview')
                 if fresh['primary']:
                     raise ValueError('primary checkout is always retained')
-                ctx = base_context()
-                owners = scope_facts(ctx, row, set(job['family']), job.get('task_id'), job_roots(job)).task_ids
-                context = scoped_context(ctx, row, owners, job)
-                candidate = reaper.decision(path, context, refresh_processes=True)
+                candidate, context = settle_decision(path, row, job, settle_budget, bool(closed))
                 if not candidate.eligible:
-                    message = f'retained: {candidate.reason}'
+                    waited = settles(candidate.reason, row, bool(closed))
+                    message = (f'retained: {candidate.reason} (still held after '
+                               f'{SETTLE_TIMEOUT_SECS}s)' if waited else f'retained: {candidate.reason}')
                 else:
                     removed, message, _ = reaper.reap_one(candidate, context, home() / 'worktree-reaper.jsonl')
         except (OSError, ValueError, subprocess.SubprocessError) as exc:

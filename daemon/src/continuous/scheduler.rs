@@ -115,6 +115,16 @@ const QUEUE_DEPTH_MAX_STALE_SECS: u64 = 300;
 /// read per task per interval. Detection latency is dominated by the wedge
 /// grace / alert cooldowns, so 30 s adds nothing observable.
 const TAIL_PROBE_INTERVAL_SECS: u64 = 30;
+/// A TRANSIENT pool error (codex-lb's per-thread retry-circuit cooldown, 60 s
+/// backing off to a 600 s cap, plus its half-open lease) is re-driven on the
+/// SAME thread after this many seconds instead of raising a recovery hold at
+/// first sight. Pre-fix (2026-09-15..17) one 503 during a one-minute cooldown
+/// froze an orchestrator behind `recovery_hold` until an operator ran
+/// `continuous.reconcile` — five lanes lost 11–56 h each while codex-lb had
+/// healed within minutes.
+const TRANSIENT_POOL_RETRY_AFTER_SECS: u64 = 300;
+/// Re-drives before a persisting transient error becomes a real hold.
+const TRANSIENT_POOL_MAX_RETRIES: u32 = 2;
 
 /// Auth-expiry alert cooldown (seconds) — per task. A persistent PERIODIC
 /// task keeps re-firing into an auth-dead session (its due-gate has no
@@ -243,6 +253,10 @@ pub struct ContinuousScheduler {
     probe_at: Mutex<HashMap<String, u64>>,
     /// Rate-limit unavailable-evidence diagnostics per task and run.
     evidence_warnings: Mutex<HashMap<String, (u64, u64)>>,
+    /// Transient pool-error re-drive ledger: `task_id -> (run seq, first seen,
+    /// last action ts, re-drives so far)`. In-memory only: a restart starts
+    /// the grace over, which is the conservative direction.
+    transient_pool: Mutex<HashMap<String, (u64, u64, u64, u32)>>,
     /// Account-block alert cooldown latch: `task_id -> last alert ts`
     /// ([`AUTH_REALERT_SECS`]); cleared when the task's transcript shows a
     /// healthy (non-auth-error) tail again. In-memory only — a restart
@@ -301,6 +315,7 @@ impl ContinuousScheduler {
             queue_depths: Mutex::new(HashMap::new()),
             probe_at: Mutex::new(HashMap::new()),
             evidence_warnings: Mutex::new(HashMap::new()),
+            transient_pool: Mutex::new(HashMap::new()),
             auth_alerts: Mutex::new(HashMap::new()),
             wedge_escalations: Mutex::new(HashMap::new()),
             creds_state: Mutex::new((0, 0)),
@@ -998,6 +1013,87 @@ impl ContinuousScheduler {
     /// A `MidTurn` tail (newest record is a healthy assistant record, e.g. a
     /// long blocking tool call) is never touched. LOCK DISCIPLINE: brief
     /// probes only; `task::modify` / notify spawns run lock-free.
+    /// Re-drive a run whose newest turn ended with a TRANSIENT pool error
+    /// ([`TailProbe::pool_transient`]). Returns `true` while the transient
+    /// path still owns the run (waiting out the grace, or a re-drive was
+    /// just delivered); `false` once [`TRANSIENT_POOL_MAX_RETRIES`] re-drives
+    /// have not produced a healthy turn, at which point the caller raises
+    /// the durable recovery hold exactly as before.
+    ///
+    /// The re-drive is a short continuation prompt into the SAME session:
+    /// the thread is intact (the error only ended one turn), so a new user
+    /// message resumes it. `last_fired_at` is stamped so the tail probe's
+    /// cutoff moves past the error record and the next pass judges the new
+    /// turn, not the old failure. A delivery error counts as a spent
+    /// re-drive (the session is unreachable; the hold is the right answer).
+    fn redrive_transient_pool_error(&self, tk: &ContinuousTask, seq: u64, uid: &str, now: u64) -> bool {
+        let (first_seen, last_action, retries) = {
+            let mut ledger = self.transient_pool.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = ledger.entry(tk.task_id.clone()).or_insert((seq, now, now, 0));
+            if entry.0 != seq {
+                *entry = (seq, now, now, 0);
+            }
+            (entry.1, entry.2, entry.3)
+        };
+        if retries >= TRANSIENT_POOL_MAX_RETRIES {
+            return false;
+        }
+        if now.saturating_sub(last_action) < TRANSIENT_POOL_RETRY_AFTER_SECS {
+            if first_seen == now {
+                eprintln!(
+                    "cm-daemon: transient pool error on {} seq {seq}; re-driving the thread in {TRANSIENT_POOL_RETRY_AFTER_SECS}s (no hold yet)",
+                    tk.task_id
+                );
+            }
+            return true;
+        }
+        let text = format!(
+            "The previous turn of continuous run seq {seq} of `{}` ended with a transient Codex pool error (the proxy's per-thread cooldown; it clears within minutes). This is re-drive {} of {TRANSIENT_POOL_MAX_RETRIES}: continue the same run from where it stopped, do not start a new cycle, and close it with report_done when its admitted work settles.",
+            tk.task_id,
+            retries + 1
+        );
+        let delivery = crate::control::methods::send_input(
+            &self.state,
+            &serde_json::json!({"session_uid": uid, "text": text, "submit": true}),
+            None,
+        );
+        let outcome = match &delivery {
+            Ok(_) => "delivered".to_string(),
+            Err((_, e)) => format!("delivery failed: {e}"),
+        };
+        let _ = task::modify(&tk.task_id, |t| {
+            if t.last_run.as_ref().is_some_and(|r| r.seq == seq && r.session_uid.as_deref() == Some(uid)) {
+                t.last_fired_at = t.last_fired_at.max(now);
+            }
+        });
+        {
+            let mut ledger = self.transient_pool.lock().unwrap_or_else(|p| p.into_inner());
+            ledger.insert(tk.task_id.clone(), (seq, first_seen, now, retries + 1));
+        }
+        eprintln!("cm-daemon: transient pool error on {} seq {seq}: re-drive {} of {TRANSIENT_POOL_MAX_RETRIES} {outcome}", tk.task_id, retries + 1);
+        let _ = ContinuousRunLog::append(&RunLogLine { seq, ts: now as f64, task_id: tk.task_id.clone(),
+            event: "pool_transient_redrive".into(), fire_token: tk.last_run.as_ref().map(|r| r.fire_token.clone()), session_uid: Some(uid.into()),
+            run_mode: None, trigger_source: Some(SCHEDULER_CALLER_TOKEN.into()), status: Some("running".into()), detail: Some(outcome.into()) });
+        true
+    }
+
+    /// Surface a new recovery hold where the task's participants are looking
+    /// (DESIGN_TASK_CHANNELS.md §6). Best-effort, idempotent per run.
+    fn post_recovery_hold_notice(&self, tk: &ContinuousTask, seq: u64, detail: &str) {
+        let body = format!(
+            "Run seq {seq} of {} is HELD for recovery: {detail} The scheduler will not refire it. Operator: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`; recovery then replaces the thread automatically once the pool probe is healthy.",
+            tk.task_id
+        );
+        if let Err(e) = crate::messaging::tasks::notify_task_channel(
+            &self.state,
+            &tk.task_id,
+            &format!("recovery-hold:{}:{seq}", tk.task_id),
+            &body,
+        ) {
+            eprintln!("cm-daemon: recovery-hold notice for {} seq {seq} not posted: {e}", tk.task_id);
+        }
+    }
+
     fn auth_wedge_pass(&self, tasks: &[ContinuousTask], now: u64) -> HashSet<String> {
         use crate::continuous::probe::{self, TailShape};
 
@@ -1145,6 +1241,9 @@ impl ContinuousScheduler {
 
             if let Some(detail) = tail.pool_unavailable.as_deref() {
                 held.insert(tk.task_id.clone());
+                if tail.pool_transient && self.redrive_transient_pool_error(tk, run.seq, uid, now) {
+                    continue;
+                }
                 // Persist admission closure for every schedule, including
                 // manual run_now and restarts. Workers may still finish;
                 // retirement/replay remain gated on their separate evidence.
@@ -1164,7 +1263,9 @@ impl ContinuousScheduler {
                     recorded = true;
                 });
                 if recorded {
+                    self.transient_pool.lock().unwrap_or_else(|p| p.into_inner()).remove(&tk.task_id);
                     crate::notify::notify_operator(notify_cmd.as_deref(), "codex-pool", &format!("Continuous task '{}' held: {detail}", tk.task_id));
+                    self.post_recovery_hold_notice(tk, run.seq, detail);
                     let _ = ContinuousRunLog::append(&RunLogLine { seq: run.seq, ts: now as f64, task_id: tk.task_id.clone(),
                         event: "pool_unavailable".into(), fire_token: Some(run.fire_token.clone()), session_uid: Some(uid.into()),
                         run_mode: None, trigger_source: Some(SCHEDULER_CALLER_TOKEN.into()), status: Some("failed".into()), detail: Some(detail.into()) });
@@ -1654,6 +1755,7 @@ impl ContinuousScheduler {
             if tail.shape == crate::continuous::probe::TailShape::MidTurn || tail.auth_error.is_some() || tail.usage_limit.is_some() || tail.pool_unavailable.is_some() { return; }
         }
         let mut closed = false;
+        let mut consumer_hold = false;
         let mut closes = tk.consecutive_wedge_closes;
         let _ = task::modify(&tk.task_id, |t| {
             if t.paused || t.drain.is_some() || t.in_flight.is_some() || t.engine != tk.engine {
@@ -1672,6 +1774,7 @@ impl ContinuousScheduler {
                         t.recovery_hold = Some(task::RecoveryHold { run_seq: seq, session_uid: uid.to_string(), fire_token: run.fire_token.clone(), detected_at: now,
                             detail: "Codex turn ended without report_done. The staged batch remains held until completed and unfinished items are reconciled.".into() });
                         t.admission_revision = t.admission_revision.saturating_add(1);
+                        consumer_hold = true;
                     }
 
                     closes = t.consecutive_wedge_closes;
@@ -1679,6 +1782,9 @@ impl ContinuousScheduler {
                 }
             }
         });
+        if consumer_hold {
+            self.post_recovery_hold_notice(tk, seq, "Codex turn ended without report_done; the staged batch is held until it is reconciled.");
+        }
         if !closed {
             return; // raced with report_done / a newer fire — nothing wedged
         }
@@ -4283,7 +4389,6 @@ mod tests {
         let _tmp = with_temp_home(|| {
             for fixture in [
                 include_str!("../../tests/fixtures/codex-0.153.4/pool_unavailable.jsonl"),
-                include_str!("../../tests/fixtures/codex-0.153.4/bridge_cooldown.jsonl"),
             ] {
             for name in ["consumer", "periodic", "on-demand"] {
                 let state = Arc::new(Mutex::new(DaemonState::default()));
@@ -4311,6 +4416,66 @@ mod tests {
                 assert!(std::fs::read_to_string(task::runs_log_path(&id)).unwrap().contains("pool_unavailable"));
             }
             }
+        });
+    }
+
+    #[test]
+    fn transient_bridge_cooldown_redrives_twice_before_holding() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let id = "pool-transient".to_string();
+            let mtime = bind_transcript(&state, &id, &format!("{id}.jsonl"),
+                &[include_str!("../../tests/fixtures/codex-0.153.4/bridge_cooldown.jsonl")]);
+            state.lock().unwrap().sessions.get_mut(&id).unwrap().session_type = "codex".into();
+            let mut t = running_consumer(&id, &id, RunMode::Persistent, 1, 1);
+            t.engine = Engine::Codex;
+            task::save(&t).unwrap();
+            let t0 = mtime + 1;
+            // First sighting: held (no refire) but NO recovery hold and the run stays Running.
+            assert!(sched.auth_wedge_pass(&[t.clone()], t0).contains(&id));
+            let cur = task::load_one(&id).unwrap();
+            assert_eq!(cur.last_run.as_ref().unwrap().status, RunStatus::Running);
+            assert!(cur.recovery_hold.is_none());
+            assert!(!std::fs::read_to_string(task::runs_log_path(&id)).unwrap_or_default().contains("pool_unavailable"));
+            // Inside the grace: still no hold, no re-drive yet.
+            assert!(sched.auth_wedge_pass(&[t.clone()], t0 + TAIL_PROBE_INTERVAL_SECS + 1).contains(&id));
+            assert!(task::load_one(&id).unwrap().recovery_hold.is_none());
+            assert!(!std::fs::read_to_string(task::runs_log_path(&id)).unwrap_or_default().contains("pool_transient_redrive"));
+            // Past the grace: re-drive 1 (delivery may fail in this fixture; it still counts) and
+            // last_fired_at moves so the probe cutoff passes the error record.
+            let t1 = t0 + TRANSIENT_POOL_RETRY_AFTER_SECS + 1;
+            assert!(sched.auth_wedge_pass(&[t.clone()], t1).contains(&id));
+            let cur = task::load_one(&id).unwrap();
+            assert!(cur.recovery_hold.is_none());
+            assert_eq!(cur.last_fired_at, t1);
+            let log = std::fs::read_to_string(task::runs_log_path(&id)).unwrap();
+            assert_eq!(log.matches("pool_transient_redrive").count(), 1);
+            // The transcript did not advance (still the same error, now BEFORE the cutoff): the
+            // probe has no evidence, so the pass holds without touching the ledger. Simulate the
+            // thread failing again after the re-drive by rewinding the fire stamp so the same
+            // cooldown error is once more the newest record after the cutoff.
+            let mut t = task::load_one(&id).unwrap();
+            t.last_fired_at = 1; // back to the fixture's fire stamp: the error record is newer again
+            task::save(&t).unwrap();
+            let t2 = t1 + TRANSIENT_POOL_RETRY_AFTER_SECS + 1;
+            assert!(sched.auth_wedge_pass(&[t.clone()], t2).contains(&id));
+            let cur = task::load_one(&id).unwrap();
+            assert!(cur.recovery_hold.is_none(), "second re-drive, not yet a hold");
+            assert_eq!(std::fs::read_to_string(task::runs_log_path(&id)).unwrap().matches("pool_transient_redrive").count(), 2);
+            // Third failure after two re-drives: the durable hold is raised as before.
+            let mut t = task::load_one(&id).unwrap();
+            t.last_fired_at = 1; // back to the fixture's fire stamp: the error record is newer again
+            task::save(&t).unwrap();
+            let t3 = t2 + TRANSIENT_POOL_RETRY_AFTER_SECS + 1;
+            assert!(sched.auth_wedge_pass(&[t], t3).contains(&id));
+            let cur = task::load_one(&id).unwrap();
+            assert_eq!(cur.last_run.as_ref().unwrap().status, RunStatus::Failed);
+            assert!(cur.recovery_hold.as_ref().unwrap().detail.contains("continuation ownership"));
+            assert!(std::fs::read_to_string(task::runs_log_path(&id)).unwrap().contains("pool_unavailable"));
+            assert!(!state.lock().unwrap().sessions[&id].last_exit.operator_kill_requested());
+            // A healthy new run seq resets the ledger.
+            assert!(sched.transient_pool.lock().unwrap().get(&id).is_none());
         });
     }
 

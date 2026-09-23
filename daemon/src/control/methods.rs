@@ -16692,6 +16692,54 @@ fn wait_for_task_sessions_gone(
 /// Runs under one lock hold, like `kill_session`: the reaper's exit
 /// callback must take the same lock to build the tombstone, so every
 /// attribution is in place before any of them can be consumed, however
+/// Kill the sessions a TERMINAL task still owns — the GENERAL-ACTION twin of
+/// [`sweep_task_sessions`], which only ever runs on the `mark_subtask_done`
+/// MCP path. Every OTHER route to done (the planning-API PATCH `/triage-review`
+/// uses, the TUI's A-d, a cloud status flip) left the task's workers alive at
+/// their prompt indefinitely, and a live session in a checkout is a hard
+/// `live_session` refusal in the reaper — evaluated BEFORE any age — so the
+/// seven-day inactivity clock never started and the checkout was never
+/// reapable. Measured 2026-09-18 before this existed: 56 of 65 live sessions on
+/// cm-manager sat in a `cm-sub` checkout, 47 of them already `report_done`,
+/// some since August.
+///
+/// Returns the uids it killed. Three deliberate filters:
+/// * IDLE only — a session mid-turn on a terminal task is unusual, so leave it
+///   for a later pass rather than killing an agent mid-write. The explicit
+///   operator paths (`mark_subtask_done`, an approved reap) stay unconditional.
+/// * NEVER a continuous orchestrator (`continuous_task_id`): the scheduler owns
+///   that lifecycle, and its planning row's status says nothing about the run.
+/// * NEVER a workflow participant: the workflow engine owns those.
+pub(crate) fn sweep_terminal_task_sessions(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    killer: &str,
+) -> Vec<String> {
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let targets: Vec<String> = state
+        .sessions
+        .iter()
+        .filter(|(_, s)| {
+            s.task_id.as_deref() == Some(task_id)
+                && s.continuous_task_id.is_none()
+                && s.workflow_run_id.is_none()
+                && compute_session_state_and_idle(s).1
+        })
+        .map(|(uid, _)| uid.clone())
+        .collect();
+    let swept_at = now_unix_f64();
+    let attribution = format!("{} (terminal task)", killer);
+    for uid in &targets {
+        if let Some(sess) = state.sessions.get_mut(uid) {
+            sess.last_exit.mark_operator_kill_requested();
+            sess.set_kill_attribution(&attribution);
+            let _ = sess.kill();
+        }
+        state.record_kill_request(uid, &attribution, swept_at);
+    }
+    targets
+}
+
 /// fast the children die.
 fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -33129,6 +33177,55 @@ while True:
     /// rendered the victim's truncated transcript tail as if it were the
     /// agent's final report — the same misread the operator/agent kill
     /// paths were already fixed for.
+    #[test]
+    fn terminal_sweep_closes_plain_workers_and_spares_scheduler_owned_ones() {
+        // The general-action sweep: a task going terminal by ANY route closes
+        // the workers it still owns, because each one is a hard `live_session`
+        // refusal in the reaper and blocks the inactivity clock from starting.
+        // It must still leave the two lifecycles it does not own alone.
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut make = |uid: &str, task: &str| {
+            let mut sp = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            let mut ds = crate::session::DaemonSession::spawn(sp).expect("spawn /bin/sleep");
+            ds.task_id = Some(task.to_string());
+            // Spawn stamps activity, and the sweep only touches IDLE sessions
+            // (production's workers have been idle for days). Clear the stamp
+            // rather than sleeping out IDLE_THRESHOLD in a unit test.
+            *ds.last_activity_at.lock().unwrap() = None;
+            ds
+        };
+        state.lock().unwrap().sessions.insert("ts-w1".into(), make("ts-w1", "task-done"));
+        state.lock().unwrap().sessions.insert("ts-w2".into(), make("ts-w2", "task-done"));
+        let mut orchestrator = make("ts-orch", "task-done");
+        orchestrator.continuous_task_id = Some("bug-triage".into());
+        state.lock().unwrap().sessions.insert("ts-orch".into(), orchestrator);
+        let mut participant = make("ts-wf", "task-done");
+        participant.workflow_run_id = Some("run-1".into());
+        state.lock().unwrap().sessions.insert("ts-wf".into(), participant);
+        // A different task's worker is untouched even though it is idle.
+        state.lock().unwrap().sessions.insert("ts-other".into(), make("ts-other", "task-open"));
+
+        let mut swept = sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep");
+        swept.sort(); // `sessions` is a HashMap; the sweep's order is not a contract.
+        assert_eq!(swept, vec!["ts-w1".to_string(), "ts-w2".to_string()]);
+
+        let guard = state.lock().unwrap();
+        for spared in ["ts-orch", "ts-wf", "ts-other"] {
+            assert!(
+                !guard.sessions[spared].last_exit.operator_kill_requested(),
+                "{spared} must not be swept"
+            );
+        }
+        // Attribution reaches the tombstone so `killed_by` explains the exit
+        // rather than reading as an unexplained death.
+        for killed in ["ts-w1", "ts-w2"] {
+            assert!(guard.sessions[killed].last_exit.operator_kill_requested());
+        }
+        drop(guard);
+        kill_all_sessions(&state);
+    }
+
     #[test]
     fn memory_cap_kill_is_attributed_on_the_exit_tombstone() {
         let tmp = TempDir::new().unwrap();

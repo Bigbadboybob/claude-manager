@@ -12,6 +12,10 @@ pub enum ErrorKind {
     ModelUnavailable,
     PoolUnavailable,
     BridgeCooldown,
+    /// Upstream capacity refusal for one request ("Selected model is at
+    /// capacity", `codex_error_info: server_overloaded`). Transient: the next
+    /// turn usually succeeds; the pool and account are healthy.
+    Overloaded,
     Other,
 }
 
@@ -25,6 +29,7 @@ pub fn classify_error(error: &Value) -> ErrorKind {
         "unauthorized" => ErrorKind::AuthExpired,
         "usage_limit_exceeded" => ErrorKind::UsageLimited,
         "model_not_found" => ErrorKind::ModelUnavailable,
+        "server_overloaded" => ErrorKind::Overloaded,
         _ if message.starts_with("unexpected status 503 Service Unavailable: No available accounts") => ErrorKind::PoolUnavailable,
         _ if message.starts_with("unexpected status 503 Service Unavailable: HTTP responses session bridge is cooling down after repeated upstream timeouts") => ErrorKind::BridgeCooldown,
         _ if message.starts_with("unexpected status 401 Unauthorized:") => ErrorKind::AuthExpired,
@@ -79,6 +84,7 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
             auth_error: None,
             usage_limit: None,
             pool_unavailable: None,
+            pool_transient: false,
         };
         match (top, kind) {
             ("event_msg", "task_complete") => {
@@ -96,7 +102,12 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
                         ErrorKind::PoolUnavailable => {
                             result.pool_unavailable = Some("Codex pool cannot serve this request. Check pool capacity and continuation ownership; work reconciliation is required before recovery.".into());
                         }
+                        ErrorKind::Overloaded => {
+                            result.pool_transient = true;
+                            result.pool_unavailable = Some("Upstream reported the selected model at capacity (server_overloaded) for this turn. Transient: the scheduler re-drives the thread; a persisting refusal becomes a recovery hold.".into());
+                        }
                         ErrorKind::BridgeCooldown => {
+                            result.pool_transient = true;
                             result.pool_unavailable = Some("Codex thread's response bridge is cooling down after upstream timeouts. Inspect codex-lb for previous_response_not_found/continuation ownership: retrying the same thread may never recover. Preserve its transcript and reconcile claimed items/workers before replacing the thread and redelivering unfinished work; do not force_done or blindly replay the batch.".into());
                         }
                         // A configuration/transport/unknown error is an
@@ -151,6 +162,21 @@ mod tests {
     const UNKNOWN: &str = include_str!("../../tests/fixtures/codex-0.153.4/model_not_found.jsonl");
 
     #[test]
+    fn server_overloaded_is_a_transient_pool_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        // Shape observed live 2026-09-17 15:47Z (momentum-detective run 704, first turn).
+        let record = serde_json::json!({"timestamp":"2026-09-17T15:47:16.289Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":null,
+            "error":{"message":"Selected model is at capacity. Please try a different model.","codex_error_info":"server_overloaded"}}});
+        std::fs::write(&path, format!("{}\n", record)).unwrap();
+        let result = probe(&path, 0.0).unwrap();
+        assert_eq!(result.shape, TailShape::TurnComplete);
+        assert!(result.pool_transient);
+        assert!(result.pool_unavailable.unwrap().contains("server_overloaded"));
+        assert_eq!(classify_error(&record["payload"]["error"]), ErrorKind::Overloaded);
+    }
+
+    #[test]
     fn bridge_cooldown_is_actionable_only_from_runtime_error_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
@@ -159,6 +185,7 @@ mod tests {
         let result = probe(&path, 0.0).unwrap();
         assert_eq!(result.shape, TailShape::TurnComplete);
         assert!(result.pool_unavailable.unwrap().contains("replacing the thread"));
+        assert!(result.pool_transient, "bridge cooldown is a transient proxy condition");
         assert!(result.auth_error.is_none() && result.usage_limit.is_none());
         assert!(probe(&path, 2_000_000_000.0).is_none());
         let v: Value = serde_json::from_str(fixture).unwrap();
@@ -182,6 +209,7 @@ mod tests {
         let observed = probe(&path, 0.0).unwrap();
         assert_eq!(observed.shape, TailShape::TurnComplete);
         assert!(observed.pool_unavailable.is_some());
+        assert!(!observed.pool_transient, "a pool-wide outage is not re-driven");
         assert!(observed.auth_error.is_none() && observed.usage_limit.is_none());
         let user = serde_json::json!({"timestamp":"2026-09-08T00:00:00.000Z","type":"event_msg",
             "payload":{"type":"user_message","message":"unexpected status 503 Service Unavailable: No available accounts"}});

@@ -187,6 +187,94 @@ class CleanupTests(unittest.TestCase):
                 lineage.atomic_json(self.cm / 'worktree-lineage' / (self.parent['id'] + '.json'), self.parent)
                 self.context = original
 
+    def test_reap_waits_out_its_own_dying_session_instead_of_refusing(self):
+        """The operator chooses reap at close time and must not have to choose
+        again. Closing a session is asynchronous — the agent's stdio MCP child
+        exits a moment later, and under memory pressure that took MINUTES on
+        2026-09-18 — so a single verdict turned "reap now" into a silent "keep"."""
+        self.context.live_paths = {self.worktree}
+        calls = {'n': 0}
+        real = reaper.decision
+
+        def decide(path, ctx, **kw):
+            calls['n'] += 1
+            if calls['n'] >= 3:          # the session finally goes away
+                ctx.live_paths.discard(self.worktree)
+            return real(path, ctx, **kw)
+
+        job = self.job()
+        with patch.object(cleanup, 'SETTLE_POLL_SECS', 0), \
+             patch.object(cleanup, 'close_job_sessions', return_value=['ts-mine']), \
+             patch.object(reaper, 'decision', side_effect=decide):
+            done = self.run_apply(job)
+        self.assertTrue(done['results'][0]['removed'], done['results'][0]['message'])
+        self.assertGreaterEqual(calls['n'], 3, 'must have re-checked rather than refusing once')
+        self.assertFalse(self.worktree.exists())
+
+    def test_reap_gives_up_with_the_real_reason_when_the_session_never_dies(self):
+        self.context.live_paths = {self.worktree}
+        job = self.job()
+        with patch.object(cleanup, 'SETTLE_POLL_SECS', 0), \
+             patch.object(cleanup, 'SETTLE_TIMEOUT_SECS', -1), \
+             patch.object(cleanup, 'close_job_sessions', return_value=['ts-mine']):
+            done = self.run_apply(job)
+        row = done['results'][0]
+        self.assertFalse(row['removed'])
+        self.assertIn('live_session', row['message'])
+        self.assertIn('still held after', row['message'])
+        self.assertTrue(self.worktree.exists())
+
+    def test_a_live_session_this_job_did_not_close_is_refused_at_once(self):
+        """Waiting is only honest when we just closed something. A session we
+        did not close belongs to someone still using it."""
+        self.context.live_paths = {self.worktree}
+        started = time.monotonic()
+        with patch.object(cleanup, 'SETTLE_POLL_SECS', 5), \
+             patch.object(cleanup, 'close_job_sessions', return_value=[]):
+            done = self.run_apply(self.job())
+        self.assertLess(time.monotonic() - started, 5, 'must not wait when it closed nothing')
+        self.assertIn('live_session', done['results'][0]['message'])
+        self.assertNotIn('still held after', done['results'][0]['message'])
+
+    def test_a_refusal_that_waiting_cannot_fix_is_reported_at_once(self):
+        """Pinned, continuous and shared-with-another-task are real answers.
+        Waiting on them would strand the operator on a "no" that never flips."""
+        self.context.workspaces[self.worktree] = reaper.WorkspaceFacts(task_ids={'task-1'}, pinned=True)
+        job = self.job()
+        started = time.monotonic()
+        with patch.object(cleanup, 'SETTLE_POLL_SECS', 5), \
+             patch.object(cleanup, 'close_job_sessions', return_value=[]):
+            done = self.run_apply(job)
+        self.assertLess(time.monotonic() - started, 5, 'must not have slept on a permanent refusal')
+        self.assertIn('pinned_workspace', done['results'][0]['message'])
+        self.assertNotIn('still held after', done['results'][0]['message'])
+        self.assertTrue(self.worktree.exists())
+
+    def test_closing_is_scoped_to_the_family_and_spares_scheduler_owned_sessions(self):
+        sent = []
+
+        def rpc(method, params, timeout=15):
+            if method == 'list_sessions':
+                return {'ok': True, 'result': [
+                    {'session_uid': 'ts-mine', 'task_id': 'task-1'},
+                    {'session_uid': 'ts-orch', 'task_id': 'task-1', 'continuous_task_id': 'bug-triage'},
+                    {'session_uid': 'ts-wf', 'task_id': 'task-1', 'workflow_run_id': 'run-1'},
+                    {'session_uid': 'ts-other', 'task_id': 'task-elsewhere'},
+                ]}
+            sent.append((method, params))
+            return {'ok': True, 'result': {}}
+
+        with patch.object(cleanup, 'daemon_rpc', side_effect=rpc):
+            closed = cleanup.close_job_sessions(self.job())
+        self.assertEqual(closed, ['ts-mine'])
+        self.assertEqual(sent, [('kill_session', {'session_uid': 'ts-mine'})])
+
+    def test_an_unreachable_daemon_never_fails_the_job(self):
+        job = self.job()
+        with patch.object(cleanup, 'daemon_rpc', side_effect=OSError('socket gone')):
+            self.assertEqual(cleanup.close_job_sessions(job), [])
+        self.assertTrue(any('could not list sessions' in w for w in job.get('warnings', [])))
+
     def test_primary_checkout_is_never_removed(self):
         primary = lineage.register(self.repo, task_ids=['task-1'], inherit_session=False)
         result = self.run_apply(self.job([primary]))

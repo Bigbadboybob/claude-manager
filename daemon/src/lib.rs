@@ -84,6 +84,7 @@ pub mod reexec;
 pub mod reexec_manifest;
 pub mod restart_coordinator;
 pub mod session;
+pub mod terminal_sweep;
 pub mod session_watch;
 pub mod state;
 pub mod notifications;
@@ -1259,6 +1260,26 @@ pub fn run() -> anyhow::Result<()> {
             e,
         )
     })?;
+
+    // Spawn the terminal-task session sweep. A task reaching `done`/`archived`
+    // by ANY route must close the workers it still owns; before this existed
+    // only the `mark_subtask_done` MCP path did, so tasks finished through the
+    // planning API, the TUI or the cloud left their workers alive and every one
+    // of those pinned its checkout against the reaper forever (the reaper's
+    // `live_session` refusal is evaluated before any age, so the inactivity
+    // clock never started). Non-fatal on spawn failure, unlike the poller and
+    // the scheduler: without it the daemon still does everything it promises,
+    // it just stops tidying up after itself.
+    let sweeper = std::sync::Arc::new(terminal_sweep::TerminalTaskSweeper::new(
+        std::sync::Arc::clone(&state),
+    ));
+    if let Err(e) = sweeper.start() {
+        eprintln!(
+            "cm-daemon: terminal-task sweep thread spawn failed: {e}; continuing \
+             without it — finished tasks will keep their worker sessions, and \
+             their checkouts stay unreapable until an operator closes them"
+        );
+    }
 
     worktree_cleanup::bootstrap();
 
