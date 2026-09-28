@@ -305,6 +305,8 @@ pub struct App {
     /// the user can use the terminal's native selection (including block-select
     /// chords). Toggle with Alt+M.
     pub mouse_capture_enabled: bool,
+    /// Session owning an in-progress local drag, even if Shift is released first.
+    terminal_selection: Option<String>,
     /// Pending requests from the control socket. Drained each tick by the
     /// main loop and dispatched to method handlers. The server thread
     /// pushes; the main loop pops + replies. See `tui/src/control/`.
@@ -929,6 +931,7 @@ impl App {
             history_watcher: workflow::history::HistoryWatcher::new(),
             pending_rotations: Vec::new(),
             mouse_capture_enabled: true,
+            terminal_selection: None,
             control_queue,
             subtask_flight: None,
             defer_manifest_save: std::cell::Cell::new(false),

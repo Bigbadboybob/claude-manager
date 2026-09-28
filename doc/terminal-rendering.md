@@ -5,6 +5,24 @@ cells, and writes incremental buffer differences through the Crossterm backend.
 The grid is already a display model: its cell contents must not be replayed as
 terminal commands.
 
+## Copying from mouse-enabled clients
+
+Fullscreen Codex enables mouse tracking, so ordinary clicks, drags and scrolling
+belong to Codex. Hold **Shift** while starting a left-button drag to select text
+in CM instead. Releasing the mouse copies the selection through OSC 52 to the
+viewing terminal's clipboard. **Shift+Alt+drag** selects a rectangular block.
+The gesture stays with CM if Shift is released first, and dragging outside the
+pane clips the selection to the pane rather than including sidebar text.
+
+Some terminal emulators handle Shift+drag themselves. In that case use their
+normal copy shortcut. **Alt+Shift+M** toggles CM's mouse capture off entirely for
+native terminal selection; press it again to restore interactive mouse handling.
+Pasting uses the terminal's normal paste shortcut.
+
+This fix requires a laptop TUI update and viewer relaunch. The Codex session
+does not need a restart. The `mouse_selection` and `mouse_forwarding_tests`
+regressions cover selection/copy and continued client mouse handling.
+
 ## Cloud sessions appearing monochrome
 
 PTY children receive `TERM=xterm-256color` and `COLORTERM=truecolor` from both

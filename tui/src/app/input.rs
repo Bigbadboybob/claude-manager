@@ -2677,6 +2677,7 @@ impl App {
         if self.mouse_capture_enabled {
             let _ = execute!(stdout, DisableMouseCapture);
             self.mouse_capture_enabled = false;
+            self.terminal_selection = None;
             self.set_status_msg("Mouse capture OFF — use terminal's native selection (Alt+M to re-enable)");
         } else {
             let _ = execute!(stdout, EnableMouseCapture);
@@ -3466,31 +3467,56 @@ impl App {
     /// Returns true if the event was consumed.
     fn handle_terminal_mouse(&mut self, me: &crossterm::event::MouseEvent) -> bool {
         if !matches!(self.view_mode, ViewMode::Sessions) {
+            self.terminal_selection = None;
             return false;
         }
+        let Some((_, ts)) = self.active_session() else {
+            self.terminal_selection = None;
+            return false;
+        };
+        let uid = ts.uid.clone();
+        let term_mode = *ts.session.term.lock().mode();
+        let app_tracks_mouse = !ts.session.exited && term_mode.intersects(TermMode::MOUSE_MODE);
+        if self.terminal_selection.as_ref() != Some(&uid) {
+            self.terminal_selection = None;
+        }
+        let continuing_selection = self.terminal_selection.is_some()
+            && matches!(me.kind, MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left));
         // Terminal inner rect (after border) sits at (1,1) with last_term_size dims.
         let (term_cols, term_rows) = self.last_term_size;
-        if me.column < 1 || me.row < 1
-            || me.column > term_cols
-            || me.row > term_rows
-        {
+        if term_cols == 0 || term_rows == 0 {
+            self.terminal_selection = None;
             return false;
         }
-        let grid_col = (me.column - 1) as usize;
-        let viewport_row = (me.row - 1) as usize;
+        let outside = me.column < 1 || me.row < 1
+            || me.column > term_cols
+            || me.row > term_rows;
+        if outside && !continuing_selection {
+            return false;
+        }
+        // Complete a drag released over the border/sidebar without selecting
+        // chrome or leaving a stuck gesture behind.
+        let grid_col = (me.column.clamp(1, term_cols) - 1) as usize;
+        let viewport_row = (me.row.clamp(1, term_rows) - 1) as usize;
+        let starting_selection = matches!(me.kind, MouseEventKind::Down(MouseButton::Left))
+            && (!app_tracks_mouse || me.modifiers.contains(KeyModifiers::SHIFT));
+        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.terminal_selection = starting_selection.then_some(uid);
+        } else if matches!(me.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.terminal_selection = None;
+        }
 
         let Some(ts) = self.active_session_mut() else { return false; };
 
-        // If the inner app has enabled mouse tracking (e.g. Claude Code's
-        // fullscreen renderer, or vim/less in the alternate screen), the mouse
-        // belongs to the app: consume the event and forward it to the PTY instead
-        // of driving our own scrollback/selection. The app manages its own scroll
-        // region; in the alternate screen there is no scrollback for
-        // `scroll_display` to move anyway, so handling the wheel locally just
-        // makes it appear dead. Exited sessions always fall through to local
-        // scrollback so leftover transcripts stay scrollable.
-        let term_mode = *ts.session.term.lock().mode();
-        if !ts.session.exited && term_mode.intersects(TermMode::MOUSE_MODE) {
+        // Fullscreen clients (including Codex) own ordinary clicks and wheel
+        // events. Shift+left-drag explicitly selects in CM, so copy still works
+        // when the client captures the mouse. Latch that choice until release;
+        // releasing Shift first must not leak the end of the gesture to the PTY.
+        if app_tracks_mouse && !starting_selection && !continuing_selection {
+            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                ts.session.term.lock().selection = None;
+            }
             if let Some(bytes) =
                 encode_mouse_for_pty(me, term_mode, grid_col, viewport_row)
             {
@@ -3529,7 +3555,7 @@ impl App {
                 term.selection = Some(Selection::new(ty, point, Side::Left));
                 true
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
+            MouseEventKind::Drag(MouseButton::Left) if continuing_selection => {
                 let mut term = ts.session.term.lock();
                 let display_offset = term.grid().display_offset();
                 let point = viewport_to_point(
@@ -3541,12 +3567,12 @@ impl App {
                 }
                 true
             }
-            MouseEventKind::Up(MouseButton::Left) => {
+            MouseEventKind::Up(MouseButton::Left) if continuing_selection => {
                 let text = ts.session.term.lock().selection_to_string();
                 if let Some(text) = text {
                     if !text.is_empty() {
                         copy_to_clipboard(&text);
-                        self.set_status_msg(&format!("Copied {} chars", text.len()));
+                        self.set_status_msg(&format!("Copied {} chars", text.chars().count()));
                     }
                 }
                 true
@@ -4467,6 +4493,101 @@ mod yank_clipboard_tests {
             last_assistant_message_text(&ts, Path::new("/tmp/yankrepo"))
         });
         assert!(got.is_err());
+    }
+
+    fn mouse_app(mouse_tracking: bool) -> App {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(), api_token: String::new(),
+            gcp_project: String::new(), gcp_zone: String::new(), repos: HashMap::new(),
+        });
+        let mut ts = yank_test_session(None);
+        ts.session_type = "codex".into();
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        let mut term = ts.session.term.lock();
+        if mouse_tracking {
+            // Modes observed from the running remote Codex frontend.
+            parser.advance(&mut *term, b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1003h");
+        }
+        parser.advance(&mut *term, "héllo world".as_bytes());
+        drop(term);
+        app.workspaces = vec![Workspace {
+            id: "mouse-ws".into(), name: "mouse".into(), is_closed: false, is_cloud: false,
+            repo_url: None, worktree_path: None, main_repo_path: None,
+            worker_vm: None, worker_zone: None, host_id: crate::hosts::HostId::local(),
+            color: None, pinned: false, sessions: vec![ts], tombstones: vec![],
+        }];
+        app.cursor = Cursor::Session(0, 0);
+        app.view_mode = ViewMode::Sessions;
+        app.last_term_size = (80, 24);
+        app
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, modifiers: KeyModifiers) {
+        assert!(app.handle_event(&CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind, column, row: 1, modifiers,
+        })));
+    }
+
+    #[test]
+    fn mouse_selection_copies_from_fullscreen_codex_after_shift_released() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(true);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::SHIFT);
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 5, KeyModifiers::empty());
+            assert_eq!(app.workspaces[0].sessions[0].session.term.lock().selection_to_string().as_deref(), Some("héllo"));
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5, KeyModifiers::empty());
+            assert_eq!(app.status_msg.as_ref().map(|s| s.0.as_str()), Some("Copied 5 chars"));
+            assert!(app.terminal_selection.is_none());
+            assert!(app.workspaces[0].sessions[0].last_write_at.is_none(), "local drag must not reach Codex");
+        });
+    }
+
+    #[test]
+    fn mouse_selection_keeps_plain_drag_and_wheel_with_fullscreen_client() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(true);
+            for (kind, column) in [
+                (MouseEventKind::Down(MouseButton::Left), 1),
+                (MouseEventKind::Drag(MouseButton::Left), 5),
+                (MouseEventKind::Up(MouseButton::Left), 5),
+                (MouseEventKind::ScrollUp, 5),
+                (MouseEventKind::ScrollDown, 5),
+            ] {
+                app.workspaces[0].sessions[0].last_write_at = None;
+                mouse(&mut app, kind, column, KeyModifiers::empty());
+                assert!(app.workspaces[0].sessions[0].last_write_at.is_some(), "{kind:?} must still reach the app");
+                assert!(app.workspaces[0].sessions[0].session.term.lock().selection.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn mouse_selection_finishes_outside_pane_and_does_not_recopy_on_stray_release() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(true);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::SHIFT);
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 90, KeyModifiers::SHIFT);
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 90, KeyModifiers::empty());
+            assert_eq!(app.workspaces[0].sessions[0].session.term.lock().selection_to_string().as_deref(), Some("héllo world"));
+            assert!(app.status_msg.as_ref().is_some_and(|s| s.0 == "Copied 11 chars"));
+            assert!(app.terminal_selection.is_none());
+            app.status_msg = None;
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5, KeyModifiers::empty());
+            assert!(app.status_msg.is_none());
+        });
+    }
+
+    #[test]
+    fn mouse_selection_plain_drag_still_copies_without_app_tracking() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(false);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::empty());
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 5, KeyModifiers::empty());
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5, KeyModifiers::empty());
+            assert_eq!(app.status_msg.as_ref().map(|s| s.0.as_str()), Some("Copied 5 chars"));
+            assert!(app.workspaces[0].sessions[0].last_write_at.is_none());
+        });
     }
 }
 
