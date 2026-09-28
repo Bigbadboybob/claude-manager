@@ -1536,7 +1536,9 @@ impl Store {
             .collect::<Vec<_>>())
     }
     pub fn channel_info(&self, path: &str, id: &str) -> Value {
-        let mut channel = self.channel_at(path, id, self.position);
+        self.with_membership(id, self.channel_at(path, id, self.position))
+    }
+    fn with_membership(&self, id: &str, mut channel: Value) -> Value {
         channel["member_count"] = json!(self.memberships.get(id).map_or(0, BTreeSet::len));
         channel["membership_revision"] = json!(self.membership_revisions.get(id));
         channel
@@ -1544,8 +1546,9 @@ impl Store {
     pub fn channels(&self) -> Value {
         json!(self
             .channels
-            .iter()
-            .map(|(path, id)| self.channel_info(path, id))
+            .values()
+            .zip(self.channels_at(self.position))
+            .map(|(id, channel)| self.with_membership(id, channel))
             .collect::<Vec<_>>())
     }
     /// Channel id at an exact path, if the channel exists.
@@ -1571,23 +1574,22 @@ impl Store {
     pub fn channels_for(&mut self, actor: &str) -> Result<Vec<Value>> {
         self.load_read(actor)?;
         let mut channels = self.channels().as_array().cloned().unwrap_or_default();
+        // (unread, mentions) per conversation, from one pass over the history.
+        let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for e in self.events.iter().filter(|e| {
+            e.event["type"] == "message.create"
+                && e.event["actor"]["id"] != actor
+                && !self.reads[actor].ids.contains(strv(&e.event, "id"))
+        }) {
+            let count = counts.entry(strv(&e.event, "conversation_id")).or_default();
+            count.0 += 1;
+            count.1 += usize::from(mention_recipients(&e.event).contains(&actor));
+        }
         for channel in &mut channels {
-            let unread: Vec<_> = self
-                .events
-                .iter()
-                .filter(|e| {
-                    e.event["type"] == "message.create"
-                        && e.event["conversation_id"] == channel["id"]
-                        && e.event["actor"]["id"] != actor
-                        && !self.reads[actor].ids.contains(strv(&e.event, "id"))
-                })
-                .collect();
+            let (unread, mentions) = counts.get(strv(channel, "id")).copied().unwrap_or_default();
             self.channel_permissions(actor, channel);
-            channel["unread"] = json!(unread.len());
-            channel["mentions"] = json!(unread
-                .iter()
-                .filter(|e| mention_recipients(&e.event).contains(&actor))
-                .count());
+            channel["unread"] = json!(unread);
+            channel["mentions"] = json!(mentions);
         }
         Ok(channels)
     }
@@ -2033,12 +2035,8 @@ impl Store {
     }
     fn notification_status(&self, event: &Value) -> Value {
         let mut statuses = vec![];
-        for (uid, id, _) in self
-            .notifications()
-            .into_iter()
-            .filter(|(_, id, _)| event["id"] == *id)
-        {
-            statuses.push(super::delivery::status(&self.root, &uid, &id));
+        for (uid, intent) in self.wake_intents_for_event(strv(event, "id")) {
+            statuses.push(super::delivery::status(&self.root, &uid, &intent.event_id));
         }
         json!(statuses)
     }
