@@ -31,7 +31,9 @@ impl Store {
         }
         Ok(())
     }
-    pub fn wake_intents(&self) -> BTreeMap<String, Vec<WakeIntent>> {
+    /// Local agent recipients (actor, session uid). Owner is always passive:
+    /// the optional TUI bell is a persisted badge claim, never an injection.
+    fn wake_recipients(&self) -> Vec<(String, String)> {
         let mut actors: BTreeSet<String> = self
             .names
             .keys()
@@ -47,17 +49,34 @@ impl Store {
                     .map(str::to_owned),
             );
         }
-        let mut out = BTreeMap::new();
-        for actor in actors {
-            // Owner is always passive. The optional TUI bell is handled by a
-            // persisted badge claim, never by injecting into an agent session.
-            if actor == "owner" {
-                continue;
-            }
-            let Some(uid) = actor.strip_prefix(&format!("agent:{}:", self.daemon_id)) else {
-                continue;
-            };
-            out.insert(uid.to_owned(), self.wake_intents_for_actor(&actor));
+        let prefix = format!("agent:{}:", self.daemon_id);
+        actors
+            .into_iter()
+            .filter_map(|actor| {
+                let uid = actor.strip_prefix(&prefix)?.to_owned();
+                Some((actor, uid))
+            })
+            .collect()
+    }
+    pub fn wake_intents(&self) -> BTreeMap<String, Vec<WakeIntent>> {
+        self.wake_recipients()
+            .into_iter()
+            .map(|(actor, uid)| (uid, self.wake_intents_for_actor(&actor)))
+            .collect()
+    }
+
+    /// Intents for one event across all local recipients. A message's
+    /// delivery status needs only this; evaluating every recipient against
+    /// the whole history took seconds per displayed message.
+    pub(super) fn wake_intents_for_event(&self, event_id: &str) -> Vec<(String, WakeIntent)> {
+        let Some(e) = self.events.iter().find(|e| strv(&e.event, "id") == event_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (actor, uid) in self.wake_recipients() {
+            let mut intents = Vec::new();
+            self.event_wake_intents(&actor, self.personal.get(&actor), e, &mut intents);
+            out.extend(intents.into_iter().map(|i| (uid.clone(), i)));
         }
         out
     }
@@ -71,39 +90,50 @@ impl Store {
     fn wake_intents_for_actor(&self, actor: &str) -> Vec<WakeIntent> {
         let mut intents = Vec::new();
         let personal = self.personal.get(actor);
-        for e in self
-            .events
-            .iter()
-            .filter(|e| e.event["type"] == "message.create" && !self.replication.rejections.contains_key(strv(&e.event, "id")))
-        {
-            let (_, wake, muted) = self.preference_for_event(actor, e);
-            let id = strv(&e.event, "id");
-            if wake && !self.reads.get(actor).is_some_and(|r| r.ids.contains(id)) {
-                intents.push(WakeIntent {
-                    key: id.into(),
-                    event_id: id.into(),
-                    monitor: None,
-                });
-            }
-            if muted {
-                continue;
-            }
-            for m in personal.into_iter().flat_map(|p| p.monitors.values()) {
-                if m.notify == "wake"
-                    && !["cancelled", "dismissed"].contains(&m.state.as_str())
-                    && e.position > m.acknowledged
-                    && e.position <= m.hit_high
-                    && self.monitor_matches(actor, m, e)
-                {
-                    intents.push(WakeIntent {
-                        key: format!("monitor:{}:{id}", m.id),
-                        event_id: id.into(),
-                        monitor: Some(m.id.clone()),
-                    });
-                }
-            }
+        for e in &self.events {
+            self.event_wake_intents(actor, personal, e, &mut intents);
         }
         intents
+    }
+
+    fn event_wake_intents(
+        &self,
+        actor: &str,
+        personal: Option<&Personal>,
+        e: &Published,
+        intents: &mut Vec<WakeIntent>,
+    ) {
+        if e.event["type"] != "message.create"
+            || self.replication.rejections.contains_key(strv(&e.event, "id"))
+        {
+            return;
+        }
+        let (_, wake, muted) = self.preference_for_event(actor, e);
+        let id = strv(&e.event, "id");
+        if wake && !self.reads.get(actor).is_some_and(|r| r.ids.contains(id)) {
+            intents.push(WakeIntent {
+                key: id.into(),
+                event_id: id.into(),
+                monitor: None,
+            });
+        }
+        if muted {
+            return;
+        }
+        for m in personal.into_iter().flat_map(|p| p.monitors.values()) {
+            if m.notify == "wake"
+                && !["cancelled", "dismissed"].contains(&m.state.as_str())
+                && e.position > m.acknowledged
+                && e.position <= m.hit_high
+                && self.monitor_matches(actor, m, e)
+            {
+                intents.push(WakeIntent {
+                    key: format!("monitor:{}:{id}", m.id),
+                    event_id: id.into(),
+                    monitor: Some(m.id.clone()),
+                });
+            }
+        }
     }
 
 }
