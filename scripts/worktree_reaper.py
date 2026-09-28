@@ -37,6 +37,7 @@ import re
 import shutil
 import signal
 import socket
+import stat as statmod
 import struct
 import subprocess
 import sys
@@ -1482,22 +1483,29 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def file_inventory_record(path: Path, relative: str) -> dict[str, Any]:
+    # Only regular files are opened: a FIFO with no writer blocks open()
+    # forever, which once wedged the daily reaper (and its host lock) for days.
+    stat = path.lstat()
+    mtime = dt.datetime.fromtimestamp(stat.st_mtime, dt.UTC).isoformat()
+    if not statmod.S_ISREG(stat.st_mode):
+        return {"path": relative, "type": "special", "mode": oct(stat.st_mode), "mtime": mtime}
+    return {
+        "path": relative,
+        "type": "file",
+        "bytes": stat.st_size,
+        "sha256": sha256_file(path),
+        "mtime": mtime,
+    }
+
+
 def artifact_inventory(source: Path, relative: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     if source.is_symlink():
         records.append({"path": relative, "type": "symlink", "target": os.readlink(source)})
         return records
-    if source.is_file():
-        stat = source.stat()
-        records.append(
-            {
-                "path": relative,
-                "type": "file",
-                "bytes": stat.st_size,
-                "sha256": sha256_file(source),
-                "mtime": dt.datetime.fromtimestamp(stat.st_mtime, dt.UTC).isoformat(),
-            }
-        )
+    if not source.is_dir():
+        records.append(file_inventory_record(source, relative))
         return records
     for current, dirnames, filenames in os.walk(source, followlinks=False):
         current_path = Path(current)
@@ -1525,16 +1533,7 @@ def artifact_inventory(source: Path, relative: str) -> list[dict[str, Any]]:
                     }
                 )
                 continue
-            stat = candidate.stat()
-            records.append(
-                {
-                    "path": child_relative,
-                    "type": "file",
-                    "bytes": stat.st_size,
-                    "sha256": sha256_file(candidate),
-                    "mtime": dt.datetime.fromtimestamp(stat.st_mtime, dt.UTC).isoformat(),
-                }
-            )
+            records.append(file_inventory_record(candidate, child_relative))
     return records
 
 
