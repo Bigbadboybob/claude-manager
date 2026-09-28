@@ -80,6 +80,27 @@ impl Messages {
             || self.mode.starts_with("norm_")
             || matches!(self.mode.as_str(), "monitor_form" | "follow_form")
     }
+    /// Names the unconfirmed saved operation, e.g. "join #proj-lar", so a
+    /// refusal points at the operation that is actually blocking.
+    pub(super) fn pending_label(&self) -> String {
+        let Some(p) = &self.saved.management.pending else {
+            return String::new();
+        };
+        let action = p.params["action"].as_str().unwrap_or("");
+        let noun = match p.method.as_str() {
+            "messaging.channels" => "channel",
+            "messaging.pins" => "pin",
+            "messaging.norms" => "norms",
+            "messaging.monitor" | "messaging.monitors" => "monitor",
+            "messaging.follow" => "preferences",
+            _ => "operation",
+        };
+        let what = if action.is_empty() { noun.to_owned() } else { format!("{noun} {action}") };
+        match &p.params["conversation"] {
+            Value::Null => what,
+            id => format!("{what} {}", self.conversation_label(id)),
+        }
+    }
     pub(super) fn conversation_label(&self, id: &Value) -> String {
         if let Some(c) = self.channels.iter().find(|c| c["id"] == *id) {
             return format!("#{}", c["path"].as_str().unwrap_or("?"));
@@ -326,7 +347,10 @@ impl App {
             p["scope"] = json!(self.messages.norms_scope());
         }
         if self.messages.saved.management.pending.is_some() {
-            self.messages.error = "A saved operation is pending; press R to retry it first".into();
+            self.messages.error = format!(
+                "Unconfirmed {} is saved; press R to retry it first",
+                self.messages.pending_label()
+            );
             return;
         }
         p["request_id"] = json!(uuid::Uuid::new_v4().to_string());

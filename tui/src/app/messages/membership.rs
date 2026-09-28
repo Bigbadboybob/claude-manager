@@ -97,7 +97,10 @@ impl Messages {
 impl App {
     pub(super) fn messaging_add_member(&mut self) {
         if self.messages.saved.management.pending.is_some() {
-            self.messages.error = "A saved operation is pending; Esc then R retries it".into();
+            self.messages.error = format!(
+                "Unconfirmed {} is saved; Esc then R retries it",
+                self.messages.pending_label()
+            );
             return;
         }
         let Some(channel) = self.messages.current_channel() else {
@@ -478,6 +481,12 @@ mod tests {
         let pending = serde_json::to_value(&app.messages.saved.management.pending).unwrap();
         assert_eq!(pending["params"]["action"], "join");
         assert_eq!(pending["params"]["conversation"], "work");
+        // An unconfirmed join names itself when it blocks a later action.
+        app.messaging_membership(false);
+        assert_eq!(
+            app.messages.error,
+            "Unconfirmed channel join #work is saved; press R to retry it first"
+        );
         app.messaging_channel_result(
             "messaging.channels",
             &json!({"status":"saved", "membership":{"joined":true}, "channel":{"id":"work"}}),

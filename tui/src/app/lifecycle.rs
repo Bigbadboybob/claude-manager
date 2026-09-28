@@ -2155,164 +2155,25 @@ impl App {
             self.set_status_msg("Invalid name");
             return;
         }
-
-        let socket = match self
-            .host_pool
-            .for_host(host)
-            .ok()
-            .and_then(|h| h.socket_path())
-        {
-            Some(s) => s,
-            None => {
-                self.set_status_msg(&format!(
-                    "Remote host `{}` not reachable (no live socket)",
-                    host.as_str()
-                ));
-                return;
-            }
-        };
-
-        let (cols, rows) = self.last_term_size;
         // The TUI is the source of truth for uid + workspace identity (same
         // as the local path); the daemon auto-registers the workspace from
-        // the worktree it creates.
-        let session_uid = new_session_uid();
-        let workspace_id_pre = new_workspace_id();
-        let op_token_owned = self.host_pool.operator_token_for(host);
-        let op_token = op_token_owned.as_str();
-
-        let session_type = engine.as_session_type();
-        let wire_engine = match engine {
-            LaunchEngine::Claude => "claude-code",
-            LaunchEngine::Codex => "codex",
-        };
-        // The daemon resolves repo → worktree → argv/env. A-n is taskless.
-        let res = match crate::client_session::rpc_create_session_with_options(
-            &socket,
-            op_token,
-            &session_uid,
-            &workspace_id_pre,
-            session_type,
-            wire_engine,
-            repo_url,
-            start_branch,
-            &slug,
-            None,
-            cols,
-            rows,
-            in_place,
-            seed_from,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                self.set_status_msg(&format!("Remote create_session failed: {}", e));
-                return;
-            }
-        };
-
-        // Attach to the just-created remote session over the host's socket.
-        let worktree_path = PathBuf::from(&res.worktree_path);
-        let session = match try_attach_via_daemon_with_deps(
-            &self.host_pool,
-            &res.session_uid,
-            &res.workspace_id,
-            &worktree_path,
-            session_type,
-            session_type,
-            cols,
-            rows,
-            None,
-            None,
-            None,
-            host,
-            None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                // The daemon already started the session (and created its
-                // worktree). Mirror `ClientSession::new`'s cleanup contract:
-                // best-effort kill before bubbling so we don't leak a live,
-                // headless, unattached session on the remote host. Log the
-                // cleanup error separately; the original attach error wins.
-                if let Err(cleanup_err) = crate::client_session::rpc_kill_session(
-                    &socket,
-                    op_token,
-                    &res.session_uid,
-                ) {
-                    eprintln!(
-                        "create_remote_session cleanup: kill_session({}) failed \
-                         after attach error: {}",
-                        res.session_uid, cleanup_err,
-                    );
-                }
-                self.set_status_msg(&format!("Remote attach failed: {}", e));
-                return;
-            }
-        };
-
-        let ts = TerminalSession {
-            color: None,
-            uid: res.session_uid,
-            label: session_type.to_string(),
-            session_type: session_type.to_string(),
-            session,
-            status: SessionStatus::Running,
-            idle_since: None,
-            last_write_at: None,
-            transcript_id: if session_type == "claude" { res.resume_id } else { None },
-            generation: 0,
-            // Remote: the worktree lives on the daemon's filesystem, so the
-            // TUI can't run local JSONL detection. Transcript-path resolution
-            // for remote sessions is a follow-on (out of Phase 3 scope); the
-            // interactive PTY attach above works regardless.
-            pending_jsonl_files: None,
-            hidden: false,
+        // the worktree it creates. Checkout setup can outlast a control-RPC
+        // budget, so the create and attach run off the input thread.
+        let section = self.cursor_section_id();
+        self.start_remote_create(super::remote_create::RemoteCreateSpec {
+            host: host.clone(),
+            repo_url: repo_url.to_string(),
+            label: label.to_string(),
+            slug,
+            engine,
+            start_branch: start_branch.map(str::to_owned),
             idle_timeout_secs,
-            burst_threshold: 0,
-            pending_prompt: None,
-            pending_clear: None,
-            workflow_run_id: None,
-            workflow_role: None,
-            continuous_task_id: None,
-            last_delivery: None,
-            task_id: None,
-            notify_on_idle: false,
-            global_perms: false,
-            pending_enter: None,
-            created_at: Instant::now(),
-            managed_by_uid: None,
-            seeded_from_snapshot: seed_from.map(str::to_owned),
-            preserved_last_exit: None,
-            host_id: host.clone(),
-        };
-        let ws = Workspace {
-            color: None,
-            pinned: false,
-            id: res.workspace_id,
-            name: label.to_string(),
-            is_closed: false,
-            is_cloud: false,
-            repo_url: Some(repo_url.to_string()),
-            worktree_path: Some(worktree_path),
-            // The main checkout lives on the remote host; there is no local
-            // main repo path for a remote workspace.
-            main_repo_path: res.main_repo_path.map(PathBuf::from),
-            worker_vm: None,
-            worker_zone: None,
-            host_id: host.clone(),
-            sessions: vec![ts],
-            tombstones: Vec::new(),
-        };
-        let new_wi = self.workspaces.len();
-        let new_ws_id = ws.id.clone();
-        self.workspaces.push(ws);
-        if let Some(sid) = self.cursor_section_id() {
-            // Same A-n-inside-a-section inheritance as the local path.
-            self.workspace_sections.insert(new_ws_id, sid);
-        }
-        self.cursor = Cursor::Session(new_wi, 0);
-        self.save_session_manifest();
-        self.set_status_msg(&format!("Workspace created on `{}`", host.as_str()));
+            seed_from: seed_from.map(str::to_owned),
+            in_place,
+            uid: new_session_uid(),
+            workspace_id: new_workspace_id(),
+            section,
+        });
     }
 
     /// Attach to the active workspace (SSH for cloud, claude for local, bash fallback).
