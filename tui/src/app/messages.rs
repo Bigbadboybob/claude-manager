@@ -612,7 +612,7 @@ impl App {
         self.messages.last_refresh = Some(Instant::now());
         std::thread::spawn(move || {
             let call = |m: &str, p: Value| {
-                crate::client_session::rpc_messaging(&socket, &token, m, p)
+                crate::client_session::rpc_messaging_board(&socket, &token, m, p)
                     .map_err(|e| e.to_string())
             };
             let directory = |method: &str, mut params: Value| -> Result<Value, String> {
@@ -736,7 +736,7 @@ impl App {
                 if self.messages.management_view()
                     && self.messages.saved.management.pending.is_some()
                 {
-                    self.messages.error = "A saved operation is pending; R retries it".into();
+                    self.messages.error = format!("Unconfirmed {} is saved; R retries it", self.messages.pending_label());
                 } else {
                     self.messages.edit_text(&text.replace("\r\n", "\n"), false);
                     self.messages.keep_management_form();

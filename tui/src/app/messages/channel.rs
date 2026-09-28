@@ -236,7 +236,7 @@ impl App {
     }
     pub(super) fn messaging_channel_form(&mut self, edit: bool) {
         if self.messages.saved.management.pending.is_some() {
-            self.messages.error = "A saved operation is pending; R retries it".into();
+            self.messages.error = format!("Unconfirmed {} is saved; R retries it", self.messages.pending_label());
             return;
         }
         if edit {

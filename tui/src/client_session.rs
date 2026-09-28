@@ -4836,3 +4836,18 @@ pub fn rpc_messaging(socket: &Path, token: &str, method: &str, params: serde_jso
     let req = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
     Ok(rpc_round_trip(socket, &req)?.result.unwrap_or(serde_json::Value::Null))
 }
+
+/// Read timeout for the message board's worker thread. A replica forwards
+/// joins, channel edits, pins and hub refreshes to the coordinator and holds
+/// the reply until its own copy catches up, for up to 30s
+/// (`daemon/src/messaging/sync/mod.rs`, `Sync::request`). The 5s default gave
+/// up first: the hub committed the change, the board kept it as an unconfirmed
+/// saved operation, and every later channel action was refused behind it.
+pub const MESSAGING_BOARD_RPC_READ_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// [`rpc_messaging`] for the message board's worker thread, which may wait on
+/// the coordinator. Never call this from the UI thread.
+pub fn rpc_messaging_board(socket: &Path, token: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
+    Ok(rpc_round_trip_with_read_timeout(socket, &req, MESSAGING_BOARD_RPC_READ_TIMEOUT)?.result.unwrap_or(serde_json::Value::Null))
+}
