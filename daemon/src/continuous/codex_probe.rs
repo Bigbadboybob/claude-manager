@@ -85,6 +85,7 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
             usage_limit: None,
             pool_unavailable: None,
             pool_transient: false,
+            pool_capacity: false,
         };
         match (top, kind) {
             ("event_msg", "task_complete") => {
@@ -104,6 +105,7 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
                         }
                         ErrorKind::Overloaded => {
                             result.pool_transient = true;
+                            result.pool_capacity = true;
                             result.pool_unavailable = Some("Upstream reported the selected model at capacity (server_overloaded) for this turn. Transient: the scheduler re-drives the thread; a persisting refusal becomes a recovery hold.".into());
                         }
                         ErrorKind::BridgeCooldown => {
@@ -172,6 +174,7 @@ mod tests {
         let result = probe(&path, 0.0).unwrap();
         assert_eq!(result.shape, TailShape::TurnComplete);
         assert!(result.pool_transient);
+        assert!(result.pool_capacity, "a capacity refusal leaves the thread resumable");
         assert!(result.pool_unavailable.unwrap().contains("server_overloaded"));
         assert_eq!(classify_error(&record["payload"]["error"]), ErrorKind::Overloaded);
     }
@@ -186,6 +189,7 @@ mod tests {
         assert_eq!(result.shape, TailShape::TurnComplete);
         assert!(result.pool_unavailable.unwrap().contains("replacing the thread"));
         assert!(result.pool_transient, "bridge cooldown is a transient proxy condition");
+        assert!(!result.pool_capacity, "a bridge cooldown may never recover on the same thread");
         assert!(result.auth_error.is_none() && result.usage_limit.is_none());
         assert!(probe(&path, 2_000_000_000.0).is_none());
         let v: Value = serde_json::from_str(fixture).unwrap();
@@ -210,6 +214,7 @@ mod tests {
         assert_eq!(observed.shape, TailShape::TurnComplete);
         assert!(observed.pool_unavailable.is_some());
         assert!(!observed.pool_transient, "a pool-wide outage is not re-driven");
+        assert!(!observed.pool_capacity);
         assert!(observed.auth_error.is_none() && observed.usage_limit.is_none());
         let user = serde_json::json!({"timestamp":"2026-09-08T00:00:00.000Z","type":"event_msg",
             "payload":{"type":"user_message","message":"unexpected status 503 Service Unavailable: No available accounts"}});

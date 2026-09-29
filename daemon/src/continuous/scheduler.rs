@@ -125,6 +125,32 @@ const TAIL_PROBE_INTERVAL_SECS: u64 = 30;
 const TRANSIENT_POOL_RETRY_AFTER_SECS: u64 = 300;
 /// Re-drives before a persisting transient error becomes a real hold.
 const TRANSIENT_POOL_MAX_RETRIES: u32 = 2;
+/// First backoff (seconds) before the scheduler releases a CAPACITY
+/// (`server_overloaded`) recovery hold by resuming the same run on the same
+/// thread; doubles per consecutive release up to
+/// [`CAPACITY_HOLD_RELEASE_MAX_SECS`]. A release additionally requires a
+/// healthy pool probe that STARTED after the hold was raised. Pre-fix
+/// (2026-09-17..29) such holds never released: five orchestrators sat held
+/// for 8–12 days behind an upstream capacity blip that lasted minutes,
+/// because the only exit was an operator `continuous.reconcile`.
+const CAPACITY_HOLD_RELEASE_BASE_SECS: u64 = 1800;
+const CAPACITY_HOLD_RELEASE_MAX_SECS: u64 = 4 * 3600;
+/// How often (seconds) a held task's release eligibility is re-checked (the
+/// check reads the probe files; the held branch otherwise runs every tick).
+const HOLD_RELEASE_CHECK_INTERVAL_SECS: u64 = 60;
+/// A recovery hold older than this pages the operator (`notify_command`),
+/// then re-pages every [`STALE_HOLD_REALERT_SECS`] while it persists. The
+/// raise-time alert is a single push that is easy to miss; nothing else
+/// surfaced the 2026-09-17 holds for 12 days.
+const STALE_HOLD_ALERT_SECS: u64 = 2 * 3600;
+const STALE_HOLD_REALERT_SECS: u64 = 12 * 3600;
+
+/// Backoff before the `releases`-th+1 automatic capacity-hold release.
+fn capacity_hold_backoff(releases: u32) -> u64 {
+    CAPACITY_HOLD_RELEASE_BASE_SECS
+        .saturating_mul(1u64 << releases.min(16))
+        .min(CAPACITY_HOLD_RELEASE_MAX_SECS)
+}
 
 /// Auth-expiry alert cooldown (seconds) — per task. A persistent PERIODIC
 /// task keeps re-firing into an auth-dead session (its due-gate has no
@@ -257,6 +283,11 @@ pub struct ContinuousScheduler {
     /// last action ts, re-drives so far)`. In-memory only: a restart starts
     /// the grace over, which is the conservative direction.
     transient_pool: Mutex<HashMap<String, (u64, u64, u64, u32)>>,
+    /// Capacity-hold release check throttle: `task_id -> last check ts`.
+    hold_release_checks: Mutex<HashMap<String, u64>>,
+    /// Stale-hold page latch: `task_id -> (hold detected_at, last page ts)`.
+    /// In-memory only — a restart re-pages a still-stale hold once.
+    hold_alerts: Mutex<HashMap<String, (u64, u64)>>,
     /// Account-block alert cooldown latch: `task_id -> last alert ts`
     /// ([`AUTH_REALERT_SECS`]); cleared when the task's transcript shows a
     /// healthy (non-auth-error) tail again. In-memory only — a restart
@@ -316,6 +347,8 @@ impl ContinuousScheduler {
             probe_at: Mutex::new(HashMap::new()),
             evidence_warnings: Mutex::new(HashMap::new()),
             transient_pool: Mutex::new(HashMap::new()),
+            hold_release_checks: Mutex::new(HashMap::new()),
+            hold_alerts: Mutex::new(HashMap::new()),
             auth_alerts: Mutex::new(HashMap::new()),
             wedge_escalations: Mutex::new(HashMap::new()),
             creds_state: Mutex::new((0, 0)),
@@ -1079,11 +1112,19 @@ impl ContinuousScheduler {
 
     /// Surface a new recovery hold where the task's participants are looking
     /// (DESIGN_TASK_CHANNELS.md §6). Best-effort, idempotent per run.
-    fn post_recovery_hold_notice(&self, tk: &ContinuousTask, seq: u64, detail: &str) {
-        let body = format!(
-            "Run seq {seq} of {} is HELD for recovery: {detail} The scheduler will not refire it. Operator: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`; recovery then replaces the thread automatically once the pool probe is healthy.",
-            tk.task_id
-        );
+    fn post_recovery_hold_notice(&self, tk: &ContinuousTask, seq: u64, detail: &str, capacity: bool) {
+        let body = if capacity {
+            format!(
+                "Run seq {seq} of {} is HELD after repeated upstream capacity refusals: {detail} The scheduler resumes this same run on the same thread once a post-hold pool probe is healthy and the backoff ({} min) has elapsed; no operator action is needed unless it stays held.",
+                tk.task_id,
+                capacity_hold_backoff(tk.capacity_hold_releases) / 60
+            )
+        } else {
+            format!(
+                "Run seq {seq} of {} is HELD for recovery: {detail} The scheduler will not refire it. Operator: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`; recovery then replaces the thread automatically once the pool probe is healthy.",
+                tk.task_id
+            )
+        };
         if let Err(e) = crate::messaging::tasks::notify_task_channel(
             &self.state,
             &tk.task_id,
@@ -1092,6 +1133,193 @@ impl ContinuousScheduler {
         ) {
             eprintln!("cm-daemon: recovery-hold notice for {} seq {seq} not posted: {e}", tk.task_id);
         }
+    }
+
+    /// Release a CAPACITY recovery hold ([`task::RecoveryHold::auto_releasable`])
+    /// by resuming the SAME run on the same live thread. Returns `true` when
+    /// the hold was released this pass.
+    ///
+    /// A `server_overloaded` refusal only ends one turn: the thread, its
+    /// continuation and any claimed Consumer batch are intact, so the right
+    /// recovery is the transient re-drive with a longer backoff — not the
+    /// reconcile → retire → replace path built for continuation-ownership
+    /// failures. Pre-fix nothing ever released these holds and five
+    /// orchestrators sat held for 8–12 days (2026-09-17..29).
+    ///
+    /// Gates: hold age ≥ [`capacity_hold_backoff`] (doubling per consecutive
+    /// release since the last `Done` run), a healthy pool probe that started
+    /// after the hold (`codex_account::ok_after`, the same proof
+    /// `recover_codex` uses), the held run still identifies the hold, its
+    /// session is live and Codex, and no operator recovery/drain/pause is in
+    /// progress. The run is reopened `Running` (so its batch and `report_done`
+    /// stay valid), `last_fired_at` moves so the tail probe judges only the
+    /// new turn, the re-drive ledger resets (a renewed refusal gets the
+    /// normal two re-drives before the next hold), and a continuation prompt
+    /// is delivered. A delivery failure restores the hold unchanged.
+    fn try_release_capacity_hold(&self, tk: &ContinuousTask, now: u64) -> bool {
+        let Some(hold) = tk.recovery_hold.as_ref() else {
+            return false;
+        };
+        let quiescent = |t: &ContinuousTask| {
+            t.engine == task::Engine::Codex
+                && t.enabled
+                && !t.paused
+                && t.drain.is_none()
+                && t.in_flight.is_none()
+                && t.recovery.is_none()
+                && t.reconciliation.is_none()
+                && t.retirement.is_none()
+                && t.account_blocked.is_none()
+        };
+        let identifies = |t: &ContinuousTask, status: RunStatus| {
+            t.last_run.as_ref().is_some_and(|r| {
+                r.seq == hold.run_seq
+                    && r.fire_token == hold.fire_token
+                    && r.session_uid.as_deref() == Some(hold.session_uid.as_str())
+                    && r.status == status
+            })
+        };
+        if !hold.auto_releasable()
+            || !quiescent(tk)
+            || !identifies(tk, RunStatus::Failed)
+            || now.saturating_sub(hold.detected_at) < capacity_hold_backoff(tk.capacity_hold_releases)
+        {
+            return false;
+        }
+        {
+            let mut checks = self.hold_release_checks.lock().unwrap_or_else(|p| p.into_inner());
+            let last = checks.get(&tk.task_id).copied().unwrap_or(0);
+            if now.saturating_sub(last) < HOLD_RELEASE_CHECK_INTERVAL_SECS {
+                return false;
+            }
+            checks.insert(tk.task_id.clone(), now);
+        }
+        let live_codex = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .sessions
+                .get(&hold.session_uid)
+                .is_some_and(|s| !s.last_exit.kernel_set() && s.session_type == task::Engine::Codex.as_session_type())
+        };
+        if !live_codex {
+            // A dead thread cannot be resumed; that is reconcile territory.
+            return false;
+        }
+        let root = crate::path::dot_cm_dir();
+        if !crate::continuous::codex_account::ok_after(
+            &root.join("codex-probe-config.json"),
+            &root.join("codex-probe-state.json"),
+            hold.detected_at,
+            now as f64,
+        ) {
+            return false;
+        }
+        // Serialize with continuous.reconcile / recover_codex.
+        let Ok(_lifecycle) = task::lock_lifecycle(&tk.task_id) else {
+            return false;
+        };
+        let mut reopened = false;
+        let _ = task::modify(&tk.task_id, |t| {
+            if t.recovery_hold.as_ref() != Some(hold) || !quiescent(t) || !identifies(t, RunStatus::Failed) {
+                return;
+            }
+            if let Some(run) = t.last_run.as_mut() {
+                run.status = RunStatus::Running;
+                run.finished_at = None;
+            }
+            t.recovery_hold = None;
+            t.capacity_hold_releases = t.capacity_hold_releases.saturating_add(1);
+            t.last_fired_at = t.last_fired_at.max(now);
+            // The resumed run IS this period's cycle; don't stack a due fire
+            // (possibly days overdue) on top of it.
+            if let Schedule::Periodic { every_secs } = t.schedule {
+                t.next_fire_at = t.next_fire_at.max(now.saturating_add(every_secs));
+            }
+            t.admission_revision = t.admission_revision.saturating_add(1);
+            reopened = true;
+        });
+        if !reopened {
+            return false;
+        }
+        self.transient_pool.lock().unwrap_or_else(|p| p.into_inner()).remove(&tk.task_id);
+        self.hold_alerts.lock().unwrap_or_else(|p| p.into_inner()).remove(&tk.task_id);
+        let held_for = now.saturating_sub(hold.detected_at);
+        let text = format!(
+            "Continuous run seq {} of `{}` was held for {} min after repeated upstream capacity refusals (server_overloaded); the Codex pool probe is healthy again and the run has been reopened. Continue the same run from where it stopped (do not start a new cycle), and close it with report_done when its admitted work settles. If the work already settled while the run was held, call report_done now with a short summary.",
+            hold.run_seq,
+            tk.task_id,
+            held_for / 60
+        );
+        let delivery = crate::control::methods::send_input(
+            &self.state,
+            &serde_json::json!({"session_uid": hold.session_uid, "text": text, "submit": true}),
+            None,
+        );
+        if let Err((_, error)) = delivery {
+            let _ = task::modify(&tk.task_id, |t| {
+                if t.recovery_hold.is_none() && t.in_flight.is_none() && identifies(t, RunStatus::Running) {
+                    if let Some(run) = t.last_run.as_mut() {
+                        run.status = RunStatus::Failed;
+                        run.finished_at = Some(now);
+                    }
+                    t.recovery_hold = Some(hold.clone());
+                    t.admission_revision = t.admission_revision.saturating_add(1);
+                }
+            });
+            eprintln!("cm-daemon: capacity hold on {} seq {} not released: resume delivery failed: {error}", tk.task_id, hold.run_seq);
+            return false;
+        }
+        let detail = format!("capacity hold released after {} min; same run resumed on {}", held_for / 60, hold.session_uid);
+        eprintln!("cm-daemon: {}: {detail}", tk.task_id);
+        let _ = ContinuousRunLog::append(&RunLogLine { seq: hold.run_seq, ts: now as f64, task_id: tk.task_id.clone(),
+            event: "capacity_hold_released".into(), fire_token: Some(hold.fire_token.clone()), session_uid: Some(hold.session_uid.clone()),
+            run_mode: None, trigger_source: Some(SCHEDULER_CALLER_TOKEN.into()), status: Some("running".into()), detail: Some(detail.clone().into()) });
+        if let Err(e) = crate::messaging::tasks::notify_task_channel(
+            &self.state,
+            &tk.task_id,
+            &format!("recovery-hold-released:{}:{}:{}", tk.task_id, hold.run_seq, hold.detected_at),
+            &format!("Run seq {} of {} is no longer held: {detail}.", hold.run_seq, tk.task_id),
+        ) {
+            eprintln!("cm-daemon: hold-release notice for {} not posted: {e}", tk.task_id);
+        }
+        true
+    }
+
+    /// Page the operator when a recovery hold has persisted past
+    /// [`STALE_HOLD_ALERT_SECS`], re-paging every [`STALE_HOLD_REALERT_SECS`].
+    fn page_stale_hold(&self, tk: &ContinuousTask, now: u64, notify_cmd: Option<&str>) {
+        let Some(hold) = tk.recovery_hold.as_ref() else {
+            return;
+        };
+        let age = now.saturating_sub(hold.detected_at);
+        if age < STALE_HOLD_ALERT_SECS {
+            return;
+        }
+        {
+            let mut alerts = self.hold_alerts.lock().unwrap_or_else(|p| p.into_inner());
+            if alerts.get(&tk.task_id).is_some_and(|(detected, last)| {
+                *detected == hold.detected_at && now.saturating_sub(*last) < STALE_HOLD_REALERT_SECS
+            }) {
+                return;
+            }
+            alerts.insert(tk.task_id.clone(), (hold.detected_at, now));
+        }
+        let next = if hold.auto_releasable() {
+            "Capacity hold: the scheduler resumes it once a post-hold Codex pool probe is OK and its session is live; check the probe cron and the session."
+        } else {
+            "Operator: continuous.migration_preview -> HANDOVER_CODEX.md -> continuous.reconcile."
+        };
+        crate::notify::notify_operator(
+            notify_cmd,
+            "continuous-hold",
+            &format!(
+                "Continuous task '{}' has been HELD for {}h (run seq {}): {} {next}",
+                tk.task_id,
+                age / 3600,
+                hold.run_seq,
+                hold.detail
+            ),
+        );
     }
 
     fn auth_wedge_pass(&self, tasks: &[ContinuousTask], now: u64) -> HashSet<String> {
@@ -1113,6 +1341,10 @@ impl ContinuousScheduler {
             }
             if tk.engine == task::Engine::Codex && (tk.recovery_hold.is_some() || tk.recovery.is_some()) {
                 held.insert(tk.task_id.clone());
+                if self.try_release_capacity_hold(tk, now) {
+                    continue;
+                }
+                self.page_stale_hold(tk, now, notify_cmd.as_deref());
                 if let Err((_, error)) = crate::continuous::migration::recover_codex(&self.state, &tk.task_id, now) {
                     eprintln!("cm-daemon: Codex recovery for {} remains held: {error}", tk.task_id);
                 }
@@ -1258,14 +1490,14 @@ impl ContinuousScheduler {
                     active.finished_at = Some(now);
                     current.account_blocked = None;
                     current.recovery_hold = Some(task::RecoveryHold { run_seq: run.seq, session_uid: uid.to_string(),
-                        fire_token: run.fire_token.clone(), detected_at: now, detail: detail.into() });
+                        fire_token: run.fire_token.clone(), detected_at: now, detail: detail.into(), capacity: tail.pool_capacity });
                     current.admission_revision = current.admission_revision.saturating_add(1);
                     recorded = true;
                 });
                 if recorded {
                     self.transient_pool.lock().unwrap_or_else(|p| p.into_inner()).remove(&tk.task_id);
                     crate::notify::notify_operator(notify_cmd.as_deref(), "codex-pool", &format!("Continuous task '{}' held: {detail}", tk.task_id));
-                    self.post_recovery_hold_notice(tk, run.seq, detail);
+                    self.post_recovery_hold_notice(tk, run.seq, detail, tail.pool_capacity);
                     let _ = ContinuousRunLog::append(&RunLogLine { seq: run.seq, ts: now as f64, task_id: tk.task_id.clone(),
                         event: "pool_unavailable".into(), fire_token: Some(run.fire_token.clone()), session_uid: Some(uid.into()),
                         run_mode: None, trigger_source: Some(SCHEDULER_CALLER_TOKEN.into()), status: Some("failed".into()), detail: Some(detail.into()) });
@@ -1772,7 +2004,7 @@ impl ContinuousScheduler {
                     t.account_blocked = None;
                     if t.engine == task::Engine::Codex && matches!(t.schedule, Schedule::Consumer { .. }) {
                         t.recovery_hold = Some(task::RecoveryHold { run_seq: seq, session_uid: uid.to_string(), fire_token: run.fire_token.clone(), detected_at: now,
-                            detail: "Codex turn ended without report_done. The staged batch remains held until completed and unfinished items are reconciled.".into() });
+                            detail: "Codex turn ended without report_done. The staged batch remains held until completed and unfinished items are reconciled.".into(), capacity: false });
                         t.admission_revision = t.admission_revision.saturating_add(1);
                         consumer_hold = true;
                     }
@@ -1783,7 +2015,7 @@ impl ContinuousScheduler {
             }
         });
         if consumer_hold {
-            self.post_recovery_hold_notice(tk, seq, "Codex turn ended without report_done; the staged batch is held until it is reconciled.");
+            self.post_recovery_hold_notice(tk, seq, "Codex turn ended without report_done; the staged batch is held until it is reconciled.", false);
         }
         if !closed {
             return; // raced with report_done / a newer fire — nothing wedged
@@ -4472,10 +4704,196 @@ mod tests {
             let cur = task::load_one(&id).unwrap();
             assert_eq!(cur.last_run.as_ref().unwrap().status, RunStatus::Failed);
             assert!(cur.recovery_hold.as_ref().unwrap().detail.contains("continuation ownership"));
+            assert!(!cur.recovery_hold.as_ref().unwrap().auto_releasable(), "a bridge-cooldown hold still needs reconcile");
             assert!(std::fs::read_to_string(task::runs_log_path(&id)).unwrap().contains("pool_unavailable"));
             assert!(!state.lock().unwrap().sessions[&id].last_exit.operator_kill_requested());
             // A healthy new run seq resets the ledger.
             assert!(sched.transient_pool.lock().unwrap().get(&id).is_none());
+        });
+    }
+
+    const OVERLOADED_TURN: &str = r#"{"timestamp":"2026-09-17T15:47:16.289Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":null,"error":{"message":"Selected model is at capacity. Please try a different model.","codex_error_info":"server_overloaded"}}}"#;
+
+    /// A healthy Codex pool probe (same shape `migration` tests use) that
+    /// started at `started` and was checked at `checked`.
+    fn write_codex_probe(started: f64, checked: f64) {
+        use sha2::{Digest, Sha256};
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        let root = home.join(".cm");
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = home.join("fixture-codex");
+        std::fs::write(&binary, "test runtime").unwrap();
+        let config = serde_json::json!({"schema_version":1,"executable":binary,"executable_hash":format!("{:x}",Sha256::digest(b"test runtime")),
+            "cli_version":"0.153.4","requested_model":"gpt-5.6-sol","model_provider":"openai","configuration_id":"fixture","codex_home":home.join(".codex")});
+        let mut proof = config.clone();
+        proof.as_object_mut().unwrap().extend(serde_json::json!({"engine":"codex","status":"OK","started_at":started,"checked_at":checked,"observed_model":"gpt-5.6-sol"}).as_object().unwrap().clone());
+        std::fs::write(root.join("codex-probe-config.json"), config.to_string()).unwrap();
+        std::fs::write(root.join("codex-probe-state.json"), proof.to_string()).unwrap();
+    }
+
+    /// A Codex Consumer whose run seq 1 on live session `id` is Failed behind
+    /// a recovery hold raised at `detected_at`.
+    fn held_codex_task(state: &Arc<Mutex<DaemonState>>, id: &str, detected_at: u64, detail: &str, capacity: bool) -> ContinuousTask {
+        insert_live_session(state, id);
+        state.lock().unwrap().sessions.get_mut(id).unwrap().session_type = "codex".into();
+        let mut t = running_consumer(id, id, RunMode::Persistent, 1, 1);
+        t.engine = Engine::Codex;
+        let run = t.last_run.as_mut().unwrap();
+        run.status = RunStatus::Failed;
+        run.finished_at = Some(detected_at);
+        t.recovery_hold = Some(task::RecoveryHold {
+            run_seq: 1,
+            session_uid: id.into(),
+            fire_token: run.fire_token.clone(),
+            detected_at,
+            detail: detail.into(),
+            capacity,
+        });
+        task::save(&t).unwrap();
+        t
+    }
+
+    #[test]
+    fn capacity_hold_backoff_doubles_to_cap() {
+        assert_eq!(capacity_hold_backoff(0), CAPACITY_HOLD_RELEASE_BASE_SECS);
+        assert_eq!(capacity_hold_backoff(1), 2 * CAPACITY_HOLD_RELEASE_BASE_SECS);
+        assert_eq!(capacity_hold_backoff(3), CAPACITY_HOLD_RELEASE_MAX_SECS);
+        assert_eq!(capacity_hold_backoff(u32::MAX), CAPACITY_HOLD_RELEASE_MAX_SECS);
+    }
+
+    #[test]
+    fn legacy_overloaded_hold_is_auto_releasable_and_others_are_not() {
+        // Holds written before the `capacity` field existed (the 2026-09-17 shape).
+        let legacy: task::RecoveryHold = serde_json::from_value(serde_json::json!({"run_seq":664,"session_uid":"u","fire_token":"f","detected_at":1,
+            "detail":"Upstream reported the selected model at capacity (server_overloaded) for this turn. Transient: the scheduler re-drives the thread; a persisting refusal becomes a recovery hold."})).unwrap();
+        assert!(!legacy.capacity);
+        assert!(legacy.auto_releasable());
+        let ownership: task::RecoveryHold = serde_json::from_value(serde_json::json!({"run_seq":1,"session_uid":"u","fire_token":"f","detected_at":1,
+            "detail":"Codex pool cannot serve this request. Check pool capacity and continuation ownership; work reconciliation is required before recovery."})).unwrap();
+        assert!(!ownership.auto_releasable());
+    }
+
+    #[test]
+    fn exhausted_overloaded_redrives_raise_a_capacity_hold() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let id = "overloaded".to_string();
+            let mtime = bind_transcript(&state, &id, &format!("{id}.jsonl"), &[OVERLOADED_TURN]);
+            state.lock().unwrap().sessions.get_mut(&id).unwrap().session_type = "codex".into();
+            let mut t = running_consumer(&id, &id, RunMode::Persistent, 1, 1);
+            t.engine = Engine::Codex;
+            task::save(&t).unwrap();
+            // Both re-drives already spent for this seq.
+            sched.transient_pool.lock().unwrap().insert(id.clone(), (1, mtime, mtime, TRANSIENT_POOL_MAX_RETRIES));
+            assert!(sched.auth_wedge_pass(&[t], mtime + 1).contains(&id));
+            let hold = task::load_one(&id).unwrap().recovery_hold.unwrap();
+            assert!(hold.capacity);
+            assert!(hold.auto_releasable());
+        });
+    }
+
+    #[test]
+    fn capacity_hold_resumes_same_run_after_backoff_and_healthy_probe() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let id = "cap-hold";
+            let detected = 1_000;
+            held_codex_task(&state, id, detected, "Upstream reported the selected model at capacity (server_overloaded) for this turn.", true);
+            // Before the backoff: still held, run_now still refused.
+            let early = detected + CAPACITY_HOLD_RELEASE_BASE_SECS - 1;
+            assert!(sched.auth_wedge_pass(&task::load_all(), early).contains(id));
+            assert!(task::load_one(id).unwrap().recovery_hold.is_some());
+            // Past the backoff but no post-hold probe proof: still held.
+            let due = detected + CAPACITY_HOLD_RELEASE_BASE_SECS + 1;
+            sched.auth_wedge_pass(&task::load_all(), due);
+            assert!(task::load_one(id).unwrap().recovery_hold.is_some(), "no probe, no release");
+            // A probe that started BEFORE the hold proves nothing.
+            write_codex_probe(detected as f64 - 10.0, detected as f64 - 5.0);
+            let later = due + HOLD_RELEASE_CHECK_INTERVAL_SECS;
+            sched.auth_wedge_pass(&task::load_all(), later);
+            assert!(task::load_one(id).unwrap().recovery_hold.is_some(), "stale probe, no release");
+            // Healthy post-hold probe: the SAME run is reopened on the same thread.
+            let now = later + HOLD_RELEASE_CHECK_INTERVAL_SECS;
+            write_codex_probe(now as f64 - 20.0, now as f64 - 5.0);
+            assert!(sched.auth_wedge_pass(&task::load_all(), now).contains(id), "the release tick itself admits nothing");
+            let cur = task::load_one(id).unwrap();
+            assert!(cur.recovery_hold.is_none());
+            let run = cur.last_run.as_ref().unwrap();
+            assert_eq!((run.seq, run.status, run.finished_at), (1, RunStatus::Running, None));
+            assert_eq!(run.session_uid.as_deref(), Some(id));
+            assert_eq!(cur.current_session_uid.as_deref(), Some(id), "thread kept");
+            assert_eq!(cur.capacity_hold_releases, 1);
+            assert_eq!(cur.last_fired_at, now, "tail probe judges only the resumed turn");
+            assert!(run_active_blocks_fire(&cur), "a Consumer's reopened run still gates new claims");
+            assert!(std::fs::read_to_string(task::runs_log_path(id)).unwrap().contains("\"capacity_hold_released\""));
+            assert!(!state.lock().unwrap().sessions[id].last_exit.operator_kill_requested());
+            // A second hold on the same task waits twice as long.
+            assert_eq!(capacity_hold_backoff(cur.capacity_hold_releases), 2 * CAPACITY_HOLD_RELEASE_BASE_SECS);
+        });
+    }
+
+    #[test]
+    fn capacity_release_reopens_periodic_without_stacking_an_overdue_fire() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let id = "cap-periodic";
+            let detected = 1_000;
+            let mut t = held_codex_task(&state, id, detected, "(server_overloaded)", true);
+            t.schedule = Schedule::Periodic { every_secs: 21_600 };
+            t.next_fire_at = detected + 60; // long overdue by release time
+            task::save(&t).unwrap();
+            let now = detected + CAPACITY_HOLD_RELEASE_BASE_SECS + 1;
+            write_codex_probe(now as f64 - 20.0, now as f64 - 5.0);
+            sched.auth_wedge_pass(&task::load_all(), now);
+            let cur = task::load_one(id).unwrap();
+            assert!(cur.recovery_hold.is_none());
+            assert_eq!(cur.next_fire_at, now + 21_600);
+        });
+    }
+
+    #[test]
+    fn non_capacity_or_dead_thread_holds_stay_held_and_page_when_stale() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let detected = 1_000;
+            held_codex_task(&state, "ownership", detected,
+                "Codex pool cannot serve this request. Check pool capacity and continuation ownership; work reconciliation is required before recovery.", false);
+            held_codex_task(&state, "dead-thread", detected, "(server_overloaded)", true);
+            state.lock().unwrap().sessions.remove("dead-thread");
+            let now = detected + STALE_HOLD_ALERT_SECS + 1;
+            write_codex_probe(now as f64 - 20.0, now as f64 - 5.0);
+            sched.auth_wedge_pass(&task::load_all(), now);
+            for id in ["ownership", "dead-thread"] {
+                let cur = task::load_one(id).unwrap();
+                assert!(cur.recovery_hold.is_some(), "{id} needs reconcile");
+                assert_eq!(cur.last_run.unwrap().status, RunStatus::Failed);
+                // Stale hold paged once, latched until the re-alert window.
+                assert_eq!(sched.hold_alerts.lock().unwrap().get(id), Some(&(detected, now)));
+            }
+            sched.auth_wedge_pass(&task::load_all(), now + 60);
+            assert_eq!(sched.hold_alerts.lock().unwrap().get("ownership"), Some(&(detected, now)), "no re-page inside the window");
+            sched.auth_wedge_pass(&task::load_all(), now + STALE_HOLD_REALERT_SECS);
+            assert_eq!(sched.hold_alerts.lock().unwrap().get("ownership"), Some(&(detected, now + STALE_HOLD_REALERT_SECS)));
+        });
+    }
+
+    #[test]
+    fn capacity_hold_is_not_released_under_operator_recovery_or_pause() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = ContinuousScheduler::new(Arc::clone(&state));
+            let detected = 1_000;
+            let mut t = held_codex_task(&state, "drained", detected, "(server_overloaded)", true);
+            crate::continuous::drain::request(&mut t, 2);
+            task::save(&t).unwrap();
+            let now = detected + CAPACITY_HOLD_RELEASE_BASE_SECS + 1;
+            write_codex_probe(now as f64 - 20.0, now as f64 - 5.0);
+            sched.auth_wedge_pass(&task::load_all(), now);
+            assert!(task::load_one("drained").unwrap().recovery_hold.is_some());
         });
     }
 

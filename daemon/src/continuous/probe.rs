@@ -95,6 +95,12 @@ pub struct TailProbe {
     /// minutes) rather than a pool-wide outage. The scheduler re-drives the
     /// same thread before escalating to a recovery hold.
     pub pool_transient: bool,
+    /// `pool_unavailable` is an upstream CAPACITY refusal
+    /// (`server_overloaded`): the thread and its continuation are intact, so
+    /// once the pool is healthy again the SAME run can be resumed on the same
+    /// thread. A recovery hold raised from it is released automatically by
+    /// the scheduler (no reconciliation / thread replacement needed).
+    pub pool_capacity: bool,
 }
 
 /// Classify the transcript's tail. `None` when the file can't be read, is
@@ -156,6 +162,7 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
         usage_limit,
         pool_unavailable: None,
         pool_transient: false,
+        pool_capacity: false,
     })
 }
 
