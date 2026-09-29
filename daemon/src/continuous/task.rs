@@ -75,6 +75,22 @@ pub struct RecoveryHold {
     pub fire_token: String,
     pub detected_at: u64,
     pub detail: String,
+    /// Raised from an upstream CAPACITY refusal (`server_overloaded`) after
+    /// the transient re-drives were spent. The thread is intact, so the
+    /// scheduler releases the hold itself — resuming the SAME run on the
+    /// same thread — once a post-hold pool probe is healthy and a backoff has
+    /// elapsed (`scheduler::try_release_capacity_hold`). Every other hold
+    /// still needs `continuous.reconcile`. Absent on holds written before
+    /// 2026-09-29; those are recognised by their `server_overloaded` detail.
+    #[serde(default)]
+    pub capacity: bool,
+}
+
+impl RecoveryHold {
+    /// Whether the scheduler may release this hold without reconciliation.
+    pub fn auto_releasable(&self) -> bool {
+        self.capacity || self.detail.contains("(server_overloaded)")
+    }
 }
 
 /// When a task fires.
@@ -332,6 +348,12 @@ pub struct ContinuousTask {
     /// session exit, and an operator `continuous.force_done`.
     #[serde(default)]
     pub consecutive_wedge_closes: u32,
+    /// Capacity holds the scheduler has auto-released since the last run
+    /// that reached `Done`. Drives the release backoff (30 min doubling to a
+    /// 4 h cap) so a persisting upstream refusal cannot churn the thread.
+    /// Reset by `report_done` and operator `continuous.force_done`.
+    #[serde(default)]
+    pub capacity_hold_releases: u32,
     /// A transcript-proven Claude auth/usage blocker on the active run. While
     /// this record matches `last_run`, supervision and scheduled fires stay
     /// blocked. The scheduler clears it only after the host usage probe proves
@@ -444,6 +466,7 @@ impl ContinuousTask {
             consecutive_failures: 0,
             investigation_count: 0,
             consecutive_wedge_closes: 0,
+            capacity_hold_releases: 0,
             account_blocked: None,
             recovery_hold: None,
             recovery: None,

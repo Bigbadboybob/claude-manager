@@ -1589,6 +1589,7 @@ pub(crate) fn close_continuous_run_for_exit(
                 run.finished_at = Some(now);
                 if terminal_status == crate::continuous::task::RunStatus::Done {
                     t.consecutive_wedge_closes = 0;
+                    t.capacity_hold_releases = 0;
                 }
                 t.account_blocked = None;
                 flipped = Some((run.seq, run.fire_token.clone()));
@@ -12126,6 +12127,7 @@ pub fn report_done(
                 // A clean completion ends any wedge streak — the scheduler's
                 // consumer-wedge close limit counts CONSECUTIVE wedges only.
                 t.consecutive_wedge_closes = 0;
+                t.capacity_hold_releases = 0;
                 t.account_blocked = None;
                 if let Some(drain) = t.drain.as_mut() {
                     drain.diagnostic = None;
@@ -12249,6 +12251,7 @@ pub fn continuous_force_done(
                 // Operator intervention resets the scheduler's consumer-wedge
                 // streak (same as a clean report_done).
                 t.consecutive_wedge_closes = 0;
+                t.capacity_hold_releases = 0;
                 t.account_blocked = None;
                 marked = true;
             }
