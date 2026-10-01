@@ -260,6 +260,35 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         page = await self.changes(page["cursor"], epoch)
         self.assertEqual([(x["op"], x["task_id"]) for x in page["changes"]], [("remove", a["id"])])
 
+    async def test_reparent_under_initiative_task_inherits_initiative(self):
+        coord = await self.create("coordinator")
+        standalone = await self.create("standalone")
+        r = await self.client.post("/initiatives", json={
+            "name": "Init Reparent", "coordinator_task_id": coord["id"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        init = r.json()
+        r = await self.client.post(f"/initiatives/{init['id']}/projects", json={"project": "proj"})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.client.patch(f"/initiatives/{init['id']}/projects/proj",
+                                    json={"status": "approved"})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.client.get(f"/tasks/{coord['id']}")
+        self.assertEqual(r.json()["initiative_id"], init["id"])
+
+        # The planning editor sends only parent_task_id; the child joins the
+        # parent's initiative instead of being refused as "standalone".
+        r = await self.client.patch(f"/tasks/{standalone['id']}",
+                                    json={"parent_task_id": coord["id"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["parent_task_id"], coord["id"])
+        self.assertEqual(r.json()["initiative_id"], init["id"])
+
+        # An explicit standalone request is still refused.
+        other = await self.create("other")
+        r = await self.client.patch(f"/tasks/{other['id']}",
+                                    json={"parent_task_id": coord["id"], "initiative_id": None})
+        self.assertEqual(r.status_code, 400, r.text)
+
     async def test_initiative_display_metadata_redelivers_member_tasks(self):
         coord = await self.create("coordinator")
         member = await self.create("member")

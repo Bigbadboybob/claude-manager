@@ -769,6 +769,18 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     if not fields:
         return task
 
+    # Reparenting inherits the new parent's initiative (and project, if the
+    # task has none), mirroring create_task. Without this, moving a standalone
+    # task under an initiative task — the planning editor's `parent:` line —
+    # was rejected as "a standalone task cannot be a child of an initiative
+    # task", while agents' create_subtask (which goes through create) worked.
+    if fields.get("parent_task_id") and "initiative_id" not in fields:
+        parent = await db.get_task(pool, fields["parent_task_id"])
+        if parent:
+            fields["initiative_id"] = parent.get("initiative_id")
+            if fields.get("project", task.get("project")) is None and parent.get("project"):
+                fields["project"] = parent["project"]
+
     resolved_initiative_id = await _validate_task_initiative(
         pool,
         initiative_id=fields.get("initiative_id", task.get("initiative_id")),
