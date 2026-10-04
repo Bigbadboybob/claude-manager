@@ -160,7 +160,12 @@ def register(path: Path, parent: Path | None = None, task_ids=(), source='git-ho
         value = {**child, 'parents': sorted(parents), 'task_ids': sorted(set(old.get('task_ids', [])) | task_ids),
                  'session_uids': sorted(set(old.get('session_uids', [])) | ({uid} if uid else set())),
                  'sources': sorted(set(old.get('sources', [])) | {source}), 'created_at': old.get('created_at', time.time())}
-        atomic_json(target, value)
+        # Inventory re-registers EVERY checkout on every cleanup preview; an
+        # fsync'd rewrite of an unchanged record cost ~0.15 s each, which made a
+        # preview on a 120-checkout host a ~25 s scan (2026-10-04). Only write
+        # when something actually changed.
+        if value != old:
+            atomic_json(target, value)
     return value
 
 
