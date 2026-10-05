@@ -50,7 +50,7 @@ DEPLOYED_CM_OP = pathlib.Path.home() / ".cm/docs/continuous-tasks/scripts/cm-op"
 PREVIEW_TIMEOUT = 180.0
 #: Previews in flight at once. Each one is a host-wide inventory scan (git over
 #: every checkout); more at once only contend for the same disk and CPU.
-PREVIEW_CONCURRENCY = 6
+PREVIEW_CONCURRENCY = 2  # 6 overloaded cm-manager task-state lookups (2026-10-05: 11/11 previews timed out at 6, all clean at 2)
 #: Bound on one remote round trip (ssh + every RPC it carries). A hung call
 #: fails that round with a clear error; the next round retries it.
 CALL_TIMEOUT = 90.0
