@@ -465,6 +465,59 @@ fn messaging_sync_new_name_race_and_history_barrier_preserve_origin_and_cursor()
 }
 
 #[test]
+fn messaging_sync_equivalent_views_and_barriers_preserve_inflight_progress() {
+    use std::os::unix::net::UnixStream;
+    use std::io::{Read, Write};
+    fn send(stream: &mut UnixStream, frame: Value) {
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+        stream.write_all(&bytes).unwrap();
+    }
+    fn receive(stream: &mut UnixStream) -> Value {
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0u8; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let n = Network::new();
+    let b = &n.clients[1];
+    b.lock().unwrap().messaging_sync.take().unwrap().stop();
+    for i in 0..70 {
+        call(&n.hub, "hub-agent", "send", json!({"channel":"general","name":"Hub","body":format!("Backlog {i}"),"request_id":format!("churn-{i}")}));
+    }
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let local_root = b.lock().unwrap().messaging_root.clone();
+    let config = Config::load(&local_root).unwrap().unwrap();
+    let token = fs::read_to_string(config.token_file.unwrap()).unwrap();
+    let (host, actor, space) = with_store(b, |s| (s.daemon_id.clone(), s.participant_id("client-1"), s.space_id.clone()));
+    let people = json!([{"id":actor,"name":"Scout-1","session_uid":"client-1","present":true,"kind":"agent"}]);
+    let mut socket = UnixStream::connect(root.join("messaging-sync.sock")).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    send(&mut socket, json!({"kind":"hello","daemon_id":host,"space_id":space,"token":token,"people":people,"interests":["general"],"resume":null}));
+    assert_eq!(receive(&mut socket)["kind"], "hello");
+    let bulk = receive(&mut socket);
+    assert_eq!(bulk["kind"], "batch");
+    assert_eq!(bulk["page"]["complete"], false);
+    let general = with_store(&n.hub, |s| s.channel_id_at_path("general").unwrap().to_owned());
+    // Open a path view, use its id alias, then expire it. Membership already
+    // covers this channel, so none may invalidate the unacknowledged page.
+    for interests in [json!([general]), json!([]), json!(["general"])] {
+        send(&mut socket, json!({"kind":"interests","interests":interests}));
+        send(&mut socket, json!({"kind":"call","id":"barrier","actor":actor,"method":"sync.barrier","params":{"interests":["general"]},"people":people}));
+        let reply = receive(&mut socket);
+        assert_eq!(reply["kind"], "reply", "selector churn must not send another page: {reply}");
+        assert_eq!(reply["revision"], bulk["revision"], "same scopes must keep revision: {reply}");
+        assert_eq!(reply["result"]["caught_up"], true);
+    }
+    send(&mut socket, json!({"kind":"ack","cursor":bulk["page"]["cursor"],"revision":bulk["revision"],"dependency_offset":bulk["page"]["dependency_offset"]}));
+    let next = receive(&mut socket);
+    assert_eq!(next["kind"], "batch", "{next}");
+    assert_eq!(next["revision"], bulk["revision"]);
+    assert!(next["page"]["cursor"].as_u64().unwrap() > bulk["page"]["cursor"].as_u64().unwrap(), "history must advance after the original ACK: {next}");
+}
+
+#[test]
 fn messaging_sync_prioritizes_new_dm_while_bulk_page_is_in_flight() {
     use std::io::{Read, Write};
     fn send(stream: &mut std::os::unix::net::UnixStream, frame: Value) {

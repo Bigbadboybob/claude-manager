@@ -218,6 +218,27 @@ struct Subscription {
     sent: Option<(u64, u64, usize)>,
 }
 
+impl Subscription {
+    fn resolve(&mut self, store: &Store, host: &str) -> Result<()> {
+        let resolved = store.host_transport_interests(host, &self.interests)?;
+        self.set_resolved(resolved);
+        Ok(())
+    }
+
+    fn set_resolved(&mut self, resolved: BTreeSet<String>) {
+        // Paths, ids and temporary views can name the same conversations.
+        // Rewinding for selector churn starves history catch-up (and every
+        // coordinated call waiting on its barrier) on a busy replica.
+        if resolved != self.resolved {
+            self.resolved = resolved;
+            self.revision += 1;
+            self.cursor = 0;
+            self.dependency_offset = 0;
+            self.sent = None;
+        }
+    }
+}
+
 pub(super) fn serve(runtime: Arc<Runtime>) -> Result<()> {
     let socket = runtime.root.join("messaging-sync.sock");
     if socket.exists() {
@@ -425,14 +446,10 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                 "interests" => {
                     let interests: BTreeSet<String> =
                         serde_json::from_value(frame["interests"].clone())?;
+                    let slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
                     let mut sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
-                    if interests != sub.interests {
-                        sub.interests = interests;
-                        sub.revision += 1;
-                        sub.cursor = 0;
-                        sub.dependency_offset = 0;
-                        sub.sent = None;
-                    }
+                    sub.interests = interests;
+                    sub.resolve(slot.as_ref().unwrap(), &host)?;
                     runtime.signal.signal();
                 }
                 "upload" => {
@@ -462,7 +479,7 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                             "Peer directory exceeds 512 live participants",
                         ));
                     }
-                    let (outcome, barrier) = {
+                    let (outcome, barrier, revision) = {
                         let mut slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
                         let store = slot.as_mut().unwrap();
                         if !store.host_authorized(&host, None) {
@@ -480,10 +497,6 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                                 serde_json::from_value(frame["params"]["interests"].clone())?;
                             let mut sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
                             sub.interests.extend(requested);
-                            sub.revision += 1;
-                            sub.cursor = 0;
-                            sub.dependency_offset = 0;
-                            sub.sent = None;
                             Ok(json!({"caught_up":true}))
                         } else {
                             store.coordinate(&host, actor, method, &frame["params"])
@@ -493,12 +506,13 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                                 v["owner_snapshot"] = store.owner_snapshot()?;
                             }
                         }
-                        (result, store.publication_position())
+                        // Resolve under the same store lock as the mutation.
+                        // A new membership must invalidate old coverage before
+                        // its reply can be released by the replica's barrier.
+                        let mut sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
+                        sub.resolve(store, &host)?;
+                        (result, store.publication_position(), sub.revision)
                     };
-                    let revision = subscription
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .revision;
                     let reply = match outcome {
                         Ok(result) => {
                             json!({"kind":"reply","id":frame["id"],"result":result,"barrier":barrier,"revision":revision})
@@ -667,15 +681,11 @@ fn push_loop(
             (resolved, high, page, live)
         };
         let mut sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
-        if sub.revision != revision {
+        if sub.revision != revision || sub.interests != interests {
             continue;
         }
         if resolved != sub.resolved {
-            sub.resolved = resolved;
-            sub.revision += 1;
-            sub.cursor = 0;
-            sub.dependency_offset = 0;
-            sub.sent = None;
+            sub.set_resolved(resolved);
             drop(sub);
             continue;
         }

@@ -213,9 +213,11 @@ def _git_origin_url() -> str:
 
 
 def _chat_call(method: str, params: dict) -> dict:
+    # The daemon's coordinator deadline is 30s. Leave time for it to return
+    # outcome_unknown and retry guidance instead of masking that with socket IO.
     return control_client.call("messaging." + method, {
         key: value for key, value in params.items() if value is not None
-    })
+    }, timeout=45.0)
 
 
 @mcp.tool()
