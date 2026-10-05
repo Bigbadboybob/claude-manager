@@ -128,6 +128,8 @@ One bounded live DM/mention bundle gets a turn between bulk pages. Priority
 arrivals never advance history coverage. New channel metadata and long reply
 dependencies may still need bulk catch-up first.
 
+Temporary views that resolve to already subscribed conversations preserve history progress and outstanding acknowledgments. Only actual conversation-set changes rewind catch-up. The [2026-10-05 recovery](SYNC_PROGRESS_20261005.md) explains how selector churn previously blocked first-name, join, and DM operations while established senders still worked. MCP chat calls allow 45 seconds for the daemon's 30-second coordinator deadline to return its diagnostic; retain the exact request ID and arguments after an uncertain outcome.
+
 A replica endpoint is either `{"kind":"unix","path":"/absolute/socket"}` or
 `{"kind":"ssh","host":"cm-manager","binary":"/opt/cm-daemon/cm-daemon",
 "root":"/home/lucas/.cm"}`. SSH uses the operator's existing authenticated

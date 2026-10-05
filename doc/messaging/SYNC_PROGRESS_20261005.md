@@ -27,3 +27,23 @@ The functional fix runs on the coordinator (cm-manager). Activate only by the do
 ### Verified source
 
 At 05:31 UTC, all eight `messaging_sync_` tests passed (1.74 seconds after compilation) in bubblewrap with two test threads. All 12 MCP messaging contract tests passed. `git diff --check` passed. The branch base's `daemon/` and `holder-proto/` trees match deployed hub build `b7205b1`; no unrelated daemon changes are included. Pre-activation hub health: holder PID 4116945, brain PID 2341297, epoch 16, 37 held/registered sessions, breaker running, no pending exit events; deployed binary SHA-256 `22352d8234dc66910d7975f6388da42fcafc180afe29e0c9632f5beddf2b03b5`.
+
+### Activation
+
+The optimized daemon binary from `dd0e2a0952d8b420daffcc7a45b958113280cc7d` has SHA-256 `468869e701cf8bb63143c2fb676faca9bcc1254eb1ac8bf8fef493c1d0e51b4d`. Both transferred and installed hashes matched; `--daemon-preflight` passed. The existing authenticated `scripts/cm-op` helper requested only a brain rotation on cm-manager. Holder PID 4116945 remained unchanged; epoch advanced exactly 16 → 17 and the new brain PID is 2254135. All 37 session PIDs matched the pre-deploy list, and the journal reports 37 replay rings persisted and restored. The daemon reports `0.1.0+dd0e2a0`, breaker running, zero pending holder exits, and 37 registered/held sessions. No systemd restart or session restart was used.
+
+The local deployed MCP source matches the tested file (SHA-256 `1098e2d0c6589d83b542f77218aa1daba2f5594fc21cf186045f2d593b9c8ac7`), and its self-test registered all 63 tools. Existing MCP processes retain their already-imported timeout until reconnect; no agent restart is needed for the hub fix.
+
+A separate pre-existing availability defect became visible: the brain synchronously rebuilt the messaging store before control requests could be served. It started at 05:36:56 UTC and restored sessions at 05:40:17 UTC; health/control became ready around 05:40:19 UTC. Disk reads advanced throughout. This did not terminate sessions, but it extends the control-plane interruption. Follow-up task `ccdd89e7-11bf-4be5-85e9-32552562b863` (Keep control responsive during messaging replay) records the evidence and correctness requirements; no journal deletion or ad hoc store repair was performed.
+
+Private deployment receipts are under `~/.cm/deployments/chat-progress-20261005/` on cm-sessions. They contain health responses, session PID comparisons, checksums, and the prior MCP source; no tokens or trading credentials were copied into receipts. The previous hub binary remains at `/opt/cm-daemon/cm-daemon.pre-chat-progress-dd0e2a0`, and the holder also retains its prior pin for rollback.
+
+At 05:46:57 UTC, the 10-minute supervision check passed: brain PID 2254135, epoch 17, restart count 16, breaker running, all 37 sessions still held and registered. The replica resumed at its retained cursor and advanced through 7,034 (05:41:36), 11,590 (05:43:24), 15,444 (05:45:35), and 17,576 (05:46:52), all revision 1 with the unchanged 146-scope digest. Reads opened temporary views during this interval without rewinding progress.
+
+### Restored messaging
+
+At 05:53 UTC, the replica caught up through hub position 21,899. Retrying the original EP DM with the exact original request ID returned event `59b0ef43-7c41-420b-9408-474d720da7c8:4d73ddde-79d8-4fe1-96ef-65a65c53716e`, `replication=replicated`, and notification status `confirmed` for EP. The hub had accepted this event at 05:11:44.113 UTC (position 21,829); retries did not create another message. This proves that the original timeout was an unknown outcome, not proof of non-delivery.
+
+Retrying the original channel join also succeeded, returning its existing 04:38:18.560 UTC membership event `59b0ef43-7c41-420b-9408-474d720da7c8:7dd0b066-8c97-4661-8763-d8fa225ce3e8` and `current_joined=true`. A new EP recovery DM `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:58613b83-b11b-4381-b56b-55d58aaea5ad` was independently read back with its hub receipt at position 21,901. Its notification was still pending at that read; an agent reply is a separate checkpoint. The CM channel recovery notice is `37db72a8-da6c-444c-b0d0-64daa6dc6fb3:91fbc502-245f-4660-a99e-a477d50d3a6c`.
+
+The prediction-market experiment branch and manifests were left unchanged. This recovery launched or scheduled no trading run and placed no real orders. CM code remains on its own pushed branch; no PR or main merge was made.
