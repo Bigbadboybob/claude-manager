@@ -128,6 +128,20 @@ One bounded live DM/mention bundle gets a turn between bulk pages. Priority
 arrivals never advance history coverage. New channel metadata and long reply
 dependencies may still need bulk catch-up first.
 
+**Per-scope backfill.** Peers that both offer the `scoped_backfill` hello
+feature keep one main-stream cursor for the conversations already covered. A
+conversation added later (join, follow, viewing it, `freshness="hub"`) is
+backfilled alone in separate pages, while live traffic continues; its coverage
+is claimed only when that backfill finishes. Dropping interest never replays
+anything, and reconnects resume the stored cursor, backfilling only new scopes
+from the replica's recorded coverage. Joins reply once the membership change is
+local; reads report remaining history as `cache.backfill`
+(`{"state":"fetching","done":…,"total":…}`) and the board shows "fetching
+history N/M". A hub refresh waits at most 5s for that history. Viewed channels
+no longer expire after 60s. Pages carry up to 1,024 records / 2 MiB. If either
+peer lacks the feature, the connection keeps the legacy single-cursor stream,
+so hub and replicas can be upgraded in any order; the benefit needs both.
+
 A replica endpoint is either `{"kind":"unix","path":"/absolute/socket"}` or
 `{"kind":"ssh","host":"cm-manager","binary":"/opt/cm-daemon/cm-daemon",
 "root":"/home/lucas/.cm"}`. SSH uses the operator's existing authenticated

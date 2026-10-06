@@ -1410,9 +1410,7 @@ fn client_reader(
                 {
                     let mut slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
                     let store = slot.as_mut().unwrap();
-                    for wire in items {
-                        store.ingest_replica(wire)?;
-                    }
+                    store.ingest_replica_page(items)?;
                 }
                 // Sparse priority delivery is an arrival, not coverage. The
                 // following bulk acknowledgement bounds this lane as well.
@@ -1439,8 +1437,8 @@ fn client_reader(
                 {
                     let mut slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
                     let store = slot.as_mut().unwrap();
+                    store.ingest_replica_page(items)?;
                     for wire in items {
-                        store.ingest_replica(wire)?;
                         if let Some(id) = wire["receipt"]["event_id"].as_str() {
                             inflight
                                 .lock()
@@ -1448,11 +1446,19 @@ fn client_reader(
                                 .remove(id);
                         }
                     }
-                    for scope in &scopes {
-                        store.record_coverage(scope, generation, next)?;
-                    }
-                    store.record_coverage("metadata", generation, next)?;
-                    store.record_download_checkpoint(generation, next, next_revision, &scopes)?;
+                    // Scoped hubs list only fully covered scopes here; a
+                    // backfilling scope is claimed when its backfill completes.
+                    let list: Vec<&str> = scopes
+                        .iter()
+                        .map(String::as_str)
+                        .chain(["metadata"])
+                        .collect();
+                    store.record_coverage_batch(
+                        &list,
+                        generation,
+                        next,
+                        Some((next, next_revision, &scopes)),
+                    )?;
                     store.set_sync_connection(true, None);
                 }
                 cursor = next;
@@ -1490,9 +1496,7 @@ fn client_reader(
                 {
                     let mut slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
                     let store = slot.as_mut().unwrap();
-                    for wire in items {
-                        store.ingest_replica(wire)?;
-                    }
+                    store.ingest_replica_page(items)?;
                     // Coverage is claimed only for a finished backfill; partial
                     // progress is reported separately and never as coverage.
                     if complete {

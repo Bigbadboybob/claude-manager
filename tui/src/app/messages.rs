@@ -399,6 +399,15 @@ impl Messages {
             format!(" · {connection}")
         }
     }
+    /// Refresh faster while a conversation's history is still arriving, so the
+    /// board fills in as the hub backfill progresses.
+    fn refresh_interval(&self) -> Duration {
+        if self.cache["backfill"].is_object() {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(3)
+        }
+    }
     fn query(&self) -> Value {
         let mut p = self.target.clone();
         if let Some(f) = self.filter.as_object() {
@@ -511,19 +520,8 @@ impl App {
                             if let Some(reason) = v["degraded"].as_str() {
                                 self.messages.error = format!("Storage is read only: {reason}");
                             }
-                            self.messages.status = if self.messages.items.is_empty() {
-                                if v["coverage"] == "partial" {
-                                    "History not cached · G fetches from hub".into()
-                                } else {
-                                    "No messages in cached history".into()
-                                }
-                            } else {
-                                format!(
-                                    "{} messages · {}",
-                                    self.messages.items.len(),
-                                    v["coverage"].as_str().unwrap_or("unknown")
-                                )
-                            };
+                            self.messages.status =
+                                read_status(self.messages.items.len(), &v);
                         }
                         "messaging.send" => {
                             if let Some((key, request)) = self.messages.pending_send.take() {
@@ -581,7 +579,7 @@ impl App {
             && self
                 .messages
                 .last_refresh
-                .is_none_or(|t| t.elapsed() > Duration::from_secs(3))
+                .is_none_or(|t| t.elapsed() > self.messages.refresh_interval())
         {
             self.messaging_refresh_target();
         }
@@ -1566,6 +1564,32 @@ impl App {
     }
 }
 
+/// Status line for a conversation read. A replica reports history that is
+/// still arriving from the hub as `cache.backfill`; show progress instead of
+/// "not cached" so a fresh join reads as joined and loading.
+fn read_status(count: usize, v: &Value) -> String {
+    let backfill = &v["cache"]["backfill"];
+    let fetching = backfill.is_object().then(|| {
+        match (backfill["done"].as_u64(), backfill["total"].as_u64()) {
+            (Some(done), Some(total)) => format!("fetching history {done}/{total}"),
+            _ => "fetching history".to_owned(),
+        }
+    });
+    let joined = v["target"]["joined"] == true;
+    match (count, fetching) {
+        (0, Some(fetching)) if joined => format!("Joined · {fetching}"),
+        (0, Some(fetching)) => {
+            let mut s = fetching;
+            s[..1].make_ascii_uppercase();
+            s
+        }
+        (n, Some(fetching)) => format!("{n} messages · {fetching}"),
+        (0, None) if v["coverage"] == "partial" => "History not cached · G fetches from hub".into(),
+        (0, None) => "No messages in cached history".into(),
+        (n, None) => format!("{n} messages · {}", v["coverage"].as_str().unwrap_or("unknown")),
+    }
+}
+
 fn chat_block(title: impl Into<String>, focused: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -1642,6 +1666,22 @@ fn wrap_draft(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn messaging_read_status_shows_backfill_progress_instead_of_uncached() {
+        let fetching = json!({"coverage":"backfilling","target":{"joined":true},
+            "cache":{"status":"backfilling","backfill":{"state":"fetching","done":1024,"total":6300}}});
+        assert_eq!(read_status(0, &fetching), "Joined · fetching history 1024/6300");
+        assert_eq!(read_status(7, &fetching), "7 messages · fetching history 1024/6300");
+        let requested = json!({"coverage":"backfilling","cache":{"backfill":{"state":"requested"}}});
+        assert_eq!(read_status(0, &requested), "Fetching history");
+        let legacy = json!({"coverage":"partial","cache":{"status":"partial"}});
+        assert_eq!(read_status(0, &legacy), "History not cached · G fetches from hub");
+        assert_eq!(read_status(3, &json!({"coverage":"complete"})), "3 messages · complete");
+        let mut m = Messages::default();
+        assert_eq!(m.refresh_interval(), Duration::from_secs(3));
+        m.cache = fetching["cache"].clone();
+        assert_eq!(m.refresh_interval(), Duration::from_secs(1));
+    }
     pub(super) struct Home {
         old: Option<std::ffi::OsString>,
         _temp: tempfile::TempDir,
