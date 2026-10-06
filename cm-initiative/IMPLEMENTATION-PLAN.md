@@ -1,6 +1,6 @@
 # Implementation plan: coordination support
 
-Status: **draft for Owner review**, 2026-10-06. Implements the Owner-approved
+Status: **approved by Owner, in progress**, 2026-10-06. Implements the Owner-approved
 [coordination brief](shared/coordination-brief.md). Three detailed area plans,
 each grounded in the current code (file:line citations), sit beside this file:
 
@@ -148,14 +148,15 @@ assigns slices, reviews each before merge, runs deploys in order, and records
 progress here. EP's #gpu-utilization swarm is the first real user after
 Milestone A.
 
-## 5. Open questions for Owner
+## 5. Owner decisions (2026-10-06)
 
-1. Full staffing (eight lanes) or the three-lane start?
-2. Should Swarm-Coord merge and deploy each reviewed slice itself (hub-first
-   order, brain-only restarts), or bring each deploy to Owner first?
-3. Existing Codex sessions only get accurate state after an in-place restart
-   (A-R). Should EP's lanes be restarted at Milestone A, or left until they
-   naturally turn over?
+1. **Light staffing**, no time pressure: three lanes — **state-core** (Codex),
+   **items** (Claude; takes the items-daemon slices too), **messaging**
+   (Claude; also W0d). Other slices are picked up by these lanes in wave order.
+2. **Swarm-Coord merges and deploys** each reviewed slice itself, hub first,
+   brain-only restarts.
+3. **Existing Codex lanes are restarted** at Milestone A; Swarm-Coord gives
+   Owner the list and Owner does the restarts.
 
 ## 6. Main risks
 
