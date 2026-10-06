@@ -415,6 +415,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // only on an actual bucket change.
         app.tick_idle_ages();
         app.messaging_tick();
+        app.availability_tick();
 
         // Kitty graphics passthrough: answer pane queries and send image
         // bytes. Runs every tick (replies must not wait for a redraw), and

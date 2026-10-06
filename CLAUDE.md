@@ -164,6 +164,7 @@ A workflow is a TOML-defined state machine of agent roles running as sibling ses
 ## Other TUI keybindings
 
 Global:
+- `F7` — **Owner availability** picker (away / around / focused / on-call / unset; 1–5 or ↑/↓ + Enter, Esc cancels). The status bar shows the level, e.g. `● focused 14m`; agents read it from `ping()` and `notify_user` is gated by it. See [Owner notifications](doc/OWNER_NOTIFICATIONS.md#owner-availability).
 - `A-t` — toggle Sessions / Planning
 - `A-?` — show/hide shortcut hints in Sessions and Planning; saved in `~/.cm/tui-sessions.json` and restored on viewer restart
 - `A-q` — quit

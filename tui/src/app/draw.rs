@@ -137,6 +137,7 @@ impl App {
         if self.messages.visible {
             self.draw_messages(frame);
             self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
             return;
         }
         let area = frame.area();
@@ -432,6 +433,7 @@ impl App {
             Rect { width: terminal_width, ..area }
         } else { area };
         self.global_settings.draw(frame, settings_area);
+        self.draw_availability(frame, area);
     }
 
     /// Minimal dialog for renaming a task from the sidebar.
@@ -2455,12 +2457,15 @@ impl App {
 
         let left1 = format!(" {} ", conn_indicator);
         let left2 = "claude-manager ";
+        // Owner availability (F7), e.g. `● focused 14m`; absent while unset.
+        let availability = self.availability.status_span();
+        let availability_width = availability.as_ref().map_or(0, |s| s.content.chars().count() as u16);
         let right = format!(" {}r {}b {}q ", running, blocked, backlog);
 
         // Width math from the ACTUAL span contents (every glyph used here is
         // single-cell, so char count == display width) — no hardcoded
         // left-side constant to drift out of sync.
-        let left_used = (left1.chars().count() + left2.chars().count()) as u16;
+        let left_used = (left1.chars().count() + left2.chars().count()) as u16 + availability_width;
         let right_width = right.chars().count() as u16;
         let center_width = center.chars().count() as u16;
         let mouse_width = mouse_indicator.chars().count() as u16;
@@ -2483,6 +2488,7 @@ impl App {
         let mut spans = vec![
             Span::styled(left1, Style::default().fg(conn_color)),
             Span::styled(left2, Style::default().fg(theme::DIM)),
+            availability.unwrap_or_else(|| Span::raw("")),
             Span::styled(
                 mouse_indicator,
                 Style::default().fg(theme::BADGE_FG).bg(theme::ATTN).add_modifier(Modifier::BOLD),

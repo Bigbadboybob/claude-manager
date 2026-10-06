@@ -1436,6 +1436,20 @@ impl HostPool {
     /// startup freeze this code removes. Lock contention surfaces as `None`
     /// (not-ready-yet); the drain re-probes next tick once the spawn frees
     /// the lock.
+    /// Every configured host, the default first, then the rest by name.
+    pub fn host_ids(&self) -> Vec<HostId> {
+        let mut rest: Vec<HostId> = self
+            .entries
+            .keys()
+            .filter(|h| **h != self.default_host_id)
+            .cloned()
+            .collect();
+        rest.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        let mut out = vec![self.default_host_id.clone()];
+        out.extend(rest);
+        out
+    }
+
     pub fn live_socket_path(&self, host_id: &HostId) -> Option<PathBuf> {
         self.entries
             .get(host_id)

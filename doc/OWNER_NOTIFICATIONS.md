@@ -49,7 +49,13 @@ operator acknowledges it. No agent can acknowledge another session's alert.
 
 Owner sets how reachable they are: `away` (emergencies only), `around`
 (blocking and above), `focused` (decisions and above) or `on-call` (everything).
-Set it with `scripts/cm-availability <level> [--note "..."]` on a host whose
+In the TUI press **F7** (any view): 1–5 or ↑/↓ + Enter sets, Esc cancels. The
+picker asks the laptop daemon first and falls back to the other configured
+hosts if that daemon predates availability. The status bar shows the current
+level and its age (`● focused 14m`); nothing is shown while unset. When a level
+change releases several held requests at once, the desktop shows one "N held
+requests released" notification instead of one per request.
+Or set it with `scripts/cm-availability <level> [--note "..."]` on a host whose
 daemon serves Owner (cloud hosts: `ssh cm-manager cm-availability away`, once
 installed to `~/.cm/bin/`); with no argument it prints the current level, and
 `unset` returns to the default. The level is an Owner-only messaging event

@@ -295,6 +295,16 @@ pub fn exposure_at(record: &Value, now: DateTime<Utc>) -> Value {
     out
 }
 
+/// Recompute `age_s` of an exposure value (e.g. one a viewer received over
+/// RPC) from its `changed_at`, for display.
+pub fn with_current_age(exposure: &Value) -> Value {
+    let mut v = exposure.clone();
+    if let Some(t) = v["changed_at"].as_str().and_then(|t| DateTime::parse_from_rfc3339(t).ok()) {
+        v["age_s"] = json!((Utc::now() - t.with_timezone(&Utc)).num_seconds().max(0));
+    }
+    v
+}
+
 /// Read the projected level for `ping`: lock-free and network-free. A missing
 /// or unreadable projection reads as unset.
 pub fn exposure(cm_root: &Path) -> Value {
