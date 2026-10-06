@@ -196,7 +196,9 @@ reviews, merges to main and deploys (hub first).
 | W1a items API | items | reviewed PASS (+fixes 9f1aa85) | 9f1aa85 | API live on cm-manager 19:17Z; `GET /boards` 200 |
 | W1b agent_state core | state-core | reviewed PASS (+fixes) | 8223700 | cm-manager + cm-sessions 23:20Z (c61f920) |
 | W2a items daemon proxy + MCP tools | items | reviewed PASS (follow-ups in W2b) | 5e24d12 | cm-manager + cm-sessions 23:20Z |
-| W2b heartbeat + push delivery | items | in progress | | |
+| W2b heartbeat + push delivery | items | reviewed PASS (+fixes) | 8411958, baee959 | API+018 cm-manager 23:40Z; brains cm-manager 23:44Z, cm-sessions 23:52Z; heartbeats 200 |
+| W2c flag engine | items | in progress | | |
+| Prompt confirmation (start_session) | state-core | re-review | | |
 | W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | cm-manager + cm-sessions 23:20Z; Claude sessions on source=presence |
 | W2e Codex relay state + 0.160 parsers | state-core | reviewed PASS (+6 fixes) | cef633b, c61f920 | cm-manager + cm-sessions 23:20Z; existing Codex sessions need A-R |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
@@ -226,3 +228,9 @@ and deployed, because I never told it to start W2a. Exactly the failure the boar
 right after: errored 1, idle 26, starting 8, working 13. The new presence state immediately
 showed the items lane idle since 22:00Z: it had paused on memory pressure and asked its
 question only in its own session. Norm added: lanes post blockers in the channel.
+
+Deploy-path bug found 23:44Z (pre-existing, holder): on cm-sessions `daemon.restart` armed the
+new pinned brain fd, then the holder saw the outgoing brain's socket reset as a crash
+("brain declared dead ... respawning current pin") and exec'd the OLD binary. Epoch bumped,
+build_id unchanged. A second daemon.restart worked. Always verify build_id / /proc exe sha
+after a deploy. Needs a holder fix (follow-up task).
