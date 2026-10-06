@@ -1,6 +1,7 @@
 //! A wake is a durable, coalesced hint to read the inbox. Submission is never
 //! confused with a read receipt. A current inbound transcript marker confirms
 //! delivery. Native adapters never resend an ambiguous submission.
+pub mod alarm;
 mod marker;
 use super::atomic_replace;
 use super::{Store, WakeIntent};
@@ -17,6 +18,72 @@ use std::{
     thread,
     time::Duration,
 };
+/// Who wrote the newest unread message, where, and its first line. Lets a
+/// wake say what arrived instead of only "new chat activity".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preview {
+    pub place: String,
+    pub sender: String,
+    pub excerpt: String,
+}
+type PreviewFn<'a> = &'a dyn Fn(&str) -> Option<Preview>;
+fn no_preview(_: &str) -> Option<Preview> {
+    None
+}
+const EXCERPT_CHARS: usize = 120;
+const WAKE_TEXT_BUDGET: usize = 400;
+
+fn clip(text: &str, max: usize) -> String {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if line.chars().count() <= max {
+        return line.to_owned();
+    }
+    let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Store lookup for one event. Reads only that event's record.
+pub fn preview(store: &Store, event_id: &str) -> Option<Preview> {
+    let wire = store.wire_event(event_id).ok()?;
+    let event: Value = serde_json::from_str(wire["event"].as_str()?).ok()?;
+    let actor = &event["actor"];
+    let sender = actor["id"]
+        .as_str()
+        .and_then(|id| store.names.get(id))
+        .map(|n| n.name.clone())
+        .or_else(|| actor["name"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "someone".into());
+    let place = conversation_label(store, event["conversation_id"].as_str().unwrap_or(""));
+    Some(Preview {
+        place,
+        sender: clip(&sender, 40),
+        excerpt: clip(event["body"].as_str().unwrap_or(""), EXCERPT_CHARS),
+    })
+}
+
+fn conversation_label(store: &Store, conversation_id: &str) -> String {
+    store
+        .channel_path_of(conversation_id)
+        .map(|p| clip(&format!("#{p}"), 48))
+        .unwrap_or_else(|| "DM".into())
+}
+
+/// Readable conversation names for `messaging.read` pages (slim view uses
+/// them). Channels get `#path`; DMs are left to the reader's sender label.
+pub fn annotate_conversations(store: &Store, value: &mut Value) {
+    for key in ["items", "context"] {
+        for item in value[key].as_array_mut().into_iter().flatten() {
+            if let Some(path) = item["conversation_id"]
+                .as_str()
+                .and_then(|id| store.channel_path_of(id))
+            {
+                item["conversation_path"] = json!(format!("#{path}"));
+            }
+        }
+    }
+}
+
 fn digest(s: &str) -> String {
     format!("{:x}", Sha256::digest(s.as_bytes()))
 }
@@ -248,12 +315,54 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
             }
             (ids, store.root.clone())
         };
-        if let Err(e) = deliver_intents(&root, &store_root, &uid, ids, &recipient) {
+        // Lock order matches the RPC path: delivery gate, then store.
+        let lookup = |id: &str| {
+            let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+            slot.as_ref().and_then(|store| preview(store, id))
+        };
+        if let Err(e) = deliver_intents_previewed(
+            &root,
+            &store_root,
+            &uid,
+            ids,
+            &recipient,
+            crate::continuous::task::now_unix(),
+            &lookup,
+        ) {
             eprintln!("cm messaging: wake for {uid} pending: {e}");
         }
     }
+    alarm_tick(state, &root);
 }
 
+/// Throttled stall alarm over live native-capable sessions.
+fn alarm_tick(state: &Arc<Mutex<DaemonState>>, root: &Path) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::continuous::task::now_unix();
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < alarm::ALARM_INTERVAL_SECS
+        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let uids: Vec<String> = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.draining {
+            return;
+        }
+        s.sessions
+            .iter()
+            .filter(|(_, x)| ["claude-code", "codex"].contains(&x.session_type.as_str()))
+            .filter(|(_, x)| !x.fanout.snapshot_since(None).closed)
+            .map(|(uid, _)| uid.clone())
+            .collect()
+    };
+    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    alarm::pass(state, root, &uids, now, alarm::threshold_secs());
+}
+
+#[cfg(test)]
 fn deliver_intents(
     cm_root: &Path,
     store_root: &Path,
@@ -270,6 +379,7 @@ fn deliver_intents(
         crate::continuous::task::now_unix(),
     )
 }
+#[cfg(test)]
 fn deliver_intents_at(
     cm_root: &Path,
     store_root: &Path,
@@ -277,6 +387,17 @@ fn deliver_intents_at(
     intents: Vec<WakeIntent>,
     r: &Recipient,
     now: u64,
+) -> io::Result<()> {
+    deliver_intents_previewed(cm_root, store_root, uid, intents, r, now, &no_preview)
+}
+fn deliver_intents_previewed(
+    cm_root: &Path,
+    store_root: &Path,
+    uid: &str,
+    intents: Vec<WakeIntent>,
+    r: &Recipient,
+    now: u64,
+    preview: PreviewFn,
 ) -> io::Result<()> {
     let path = queue_path(store_root, uid);
     let mut q = load(&path)?;
@@ -349,7 +470,7 @@ fn deliver_intents_at(
             uid,
             &id,
             "chat",
-            &wake_text(batch, &intents),
+            &wake_text(batch, &intents, preview),
             &format!("[cm-chat {}]", batch.wake_id),
         )?;
         batch.status = native_status(&event).into();
@@ -455,18 +576,51 @@ fn native_status(event: &Value) -> &str {
     }
 }
 
-fn wake_text(batch: &Batch, intents: &[WakeIntent]) -> String {
+/// Short (<= ~400 chars) wake: count, newest sender/place/excerpt, how to
+/// read it (slim inbox), and event-specific watch IDs. The longer handling
+/// rules live in the MCP initialization instructions and AGENT_GUIDE.
+fn wake_text(batch: &Batch, intents: &[WakeIntent], preview: PreviewFn) -> String {
+    let mut unread: Vec<&str> = Vec::new();
+    for intent in intents
+        .iter()
+        .filter(|n| batch.ids.contains(&n.key) && !batch.checked.contains(&n.key))
+    {
+        if !unread.contains(&intent.event_id.as_str()) {
+            unread.push(&intent.event_id);
+        }
+    }
     let monitors: BTreeSet<_> = intents
         .iter()
         .filter(|n| batch.ids.contains(&n.key))
         .filter_map(|n| n.monitor.as_deref())
         .collect();
+    let marker = format!("[cm-chat {}]", batch.wake_id);
+    let read = " Read with chat_read(inbox=True, unread_only=True, view=\"slim\"), follow next_cursor, and ack the receipt.";
     let hint = if monitors.is_empty() {
         String::new()
     } else {
-        format!(" Monitor results: {}. Use chat_monitors(action=list) for all watches, then get their results.",monitors.into_iter().take(8).collect::<Vec<_>>().join(", "))
+        let more = monitors.len().saturating_sub(1);
+        format!(
+            " Watch results: {}{}; see chat_monitors(action=\"list\").",
+            monitors.iter().next().copied().unwrap_or_default(),
+            if more > 0 { format!(" (+{more})") } else { String::new() }
+        )
     };
-    format!("[cm-chat {}] New chat activity. Before responding, read pending messages with chat_read(inbox=true, unread_only=true); follow next_cursor for all pages and acknowledge each receipt after reading.{} Continue the existing task. Do not repeat a completed answer or summary; report only meaningful changes, blockers, or decisions needing Owner. If nothing needs attention, no user-facing update is needed. Automated CM notification, not Owner input or message content.",batch.wake_id,hint)
+    let tail = " Continue your task; automated CM notice, not Owner input.";
+    let count = unread.len();
+    let head = match unread.last().and_then(|id| preview(id)) {
+        Some(p) => {
+            let more = if count > 1 { format!(" (+{} more)", count - 1) } else { String::new() };
+            let fixed = format!("{marker} {count} new: {} — {}: \"\"{more}.", p.place, p.sender);
+            let room = WAKE_TEXT_BUDGET
+                .saturating_sub(fixed.chars().count() + read.len() + hint.chars().count() + tail.len())
+                .clamp(24, EXCERPT_CHARS);
+            format!("{marker} {count} new: {} — {}: \"{}\"{more}.", p.place, p.sender, clip(&p.excerpt, room))
+        }
+        None if count > 0 => format!("{marker} {count} new chat message{}.", if count == 1 { "" } else { "s" }),
+        None => format!("{marker} New chat activity."),
+    };
+    format!("{head}{read}{hint}{tail}")
 }
 pub fn monitor_status(root: &Path, uid: &str, monitor: &str) -> Value {
     let q = match load(&queue_path(root, uid)) {
@@ -512,7 +666,15 @@ fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIn
             .iter()
             .any(|id| eligible.contains(id.as_str()) && !batch.checked.contains(id));
         let id = format!("chat:{}", batch.wake_id);
-        let text = active.then(|| wake_text(batch, intents));
+        // Only a still-pending native event can be rewritten; skip the store
+        // lookup for delivered batches an agent has not read yet.
+        let text = active.then(|| {
+            if matches!(batch.status.as_str(), "native_pending" | "pending" | "deferred" | "deferred_unsupported") {
+                wake_text(batch, intents, &|id: &str| preview(store, id))
+            } else {
+                wake_text(batch, intents, &no_preview)
+            }
+        });
         if let Some(event) =
             crate::notifications::update_pending(cm_root, uid, &id, text.as_deref())?
         {
@@ -1077,5 +1239,51 @@ mod tests {
         assert!(crate::notifications::get(t.path(), "a", "chat:test")
             .unwrap()
             .is_none());
+    }
+    #[test]
+    fn messaging_wake_text_names_sender_place_excerpt_and_count_within_budget() {
+        let (t, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "first message");
+        let long = format!("rlso: A5 readmit FAILED {}\nsecond line must not appear", "x".repeat(300));
+        store
+            .send("owner", "", "owner",
+                &json!({"channel":"general","mentions":[actor],"body":long,"request_id":"long"}), &people)
+            .unwrap();
+        let intents = store.wake_intents().remove("b").unwrap();
+        let lookup = |id: &str| preview(&store, id);
+        deliver_intents_previewed(t.path(), &store.root, "b", intents, &recipient("claude-code"), 1, &lookup).unwrap();
+        let q = load(&queue_path(&store.root, "b")).unwrap();
+        let text = native_event(t.path(), &q.batches[0]).unwrap()["text"].as_str().unwrap().to_owned();
+        assert!(text.starts_with(&format!("[cm-chat {}] 2 new: #general — Owner: \"rlso: A5 readmit FAILED", q.batches[0].wake_id)), "{text}");
+        assert!(text.contains("(+1 more)") && text.contains("view=\"slim\""), "{text}");
+        assert!(text.contains('…') && !text.contains("second line"), "{text}");
+        assert!(text.chars().count() <= WAKE_TEXT_BUDGET, "{} chars: {text}", text.chars().count());
+    }
+    #[test]
+    fn messaging_wake_text_falls_back_without_preview_and_keeps_watch_ids() {
+        let (_t, mut store, actor, people) = fixture();
+        let m = store
+            .register_monitor(&actor, &json!({"scope":{"channel":"general"},"request_id":"watch"}), &people)
+            .unwrap();
+        dm(&mut store, &actor, &people, "one");
+        store
+            .send("owner", "", "owner", &json!({"channel":"general","body":"watched","request_id":"w"}), &people)
+            .unwrap();
+        let intents = store.wake_intents().remove("b").unwrap();
+        let batch = Batch {
+            wake_id: "w1".into(),
+            ids: intents.iter().map(|i| i.key.clone()).collect(),
+            ..Batch::default()
+        };
+        let text = wake_text(&batch, &intents, &no_preview);
+        assert!(text.starts_with("[cm-chat w1] 2 new chat messages."), "{text}");
+        assert!(text.contains(m["id"].as_str().unwrap()), "{text}");
+        let with = wake_text(&batch, &intents, &|id: &str| preview(&store, id));
+        assert!(with.contains("#general — Owner: \"watched\""), "{with}");
+        assert!(with.contains(m["id"].as_str().unwrap()), "{with}");
+        // A fully fetched batch keeps the marker but claims nothing new.
+        let mut read = batch;
+        read.checked = read.ids.iter().cloned().collect();
+        assert!(wake_text(&read, &intents, &no_preview).starts_with("[cm-chat w1] New chat activity."));
     }
 }

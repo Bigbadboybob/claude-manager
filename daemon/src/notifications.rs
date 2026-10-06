@@ -111,6 +111,28 @@ pub fn publish(
     }
     Ok(event)
 }
+/// All retained events plus the consumer's `transport.json` heartbeat, read
+/// under the queue lock. A missing queue directory is an empty queue.
+pub fn snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<Value>)> {
+    let dir = directory(root, uid);
+    if !dir.is_dir() {
+        return Ok((Vec::new(), None));
+    }
+    let _guard = lock(root, uid)?;
+    let mut events = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|x| x == "json")
+            && entry.file_name() != "transport.json"
+        {
+            if let Ok(Some(value)) = read(&entry.path()) {
+                events.push(value);
+            }
+        }
+    }
+    let transport = read(&dir.join("transport.json")).ok().flatten();
+    Ok((events, transport))
+}
 /// Only unclaimed events can be rewritten or retracted. A submitted native
 /// frame cannot be recalled; leave the receipt state intact.
 pub fn update_pending(

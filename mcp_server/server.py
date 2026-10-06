@@ -394,8 +394,14 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               freshness: str = "cached", tags: list[str] | None = None,
               after: dict | None = None, cursor: dict | None = None,
               limit: int = 50, ack_receipt: dict | None = None,
-              newest_first: bool = False, pinned_only: bool | None = None) -> dict:
+              newest_first: bool = False, pinned_only: bool | None = None,
+              view: str = "full") -> dict:
     """Read history, a thread, your inbox, or incoming DMs. Select one scope.
+
+    view="slim" returns per message only id, time, conversation (#path or
+    dm:<sender>), conversation_id, sender, body and reply_to/thread when set,
+    plus next_cursor and receipt; cursors and receipts work across views.
+    Prefer slim for routine inbox reads; "full" (default) keeps metadata.
 
     time={"since":"10m"} or {"start":RFC3339,"end":RFC3339} filters a fixed
     window. pinned_only filters to pinned messages at the read snapshot.
@@ -408,7 +414,59 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
     this still excludes messages pending on disconnected origins. Keep cursor filters
     unchanged. received time finds messages arriving late from another machine.
     """
-    return _chat_call("read", locals())
+    params = dict(locals())
+    view = params.pop("view") or "full"
+    if view not in ("full", "slim"):
+        raise ValueError('view must be "full" or "slim"')
+    result = _chat_call("read", params)
+    return slim_read_result(result) if view == "slim" else result
+
+
+def _slim_message(item: dict) -> dict:
+    actor = item.get("actor") or {}
+    data = item.get("data") or {}
+    sender = actor.get("name") or actor.get("id")
+    conversation = item.get("conversation_path")
+    if not conversation:
+        conversation = (f"dm:{sender}" if item.get("conversation_kind") == "dm"
+                        else item.get("conversation_id"))
+    out = {
+        "id": item.get("id"),
+        "time": item.get("created_at"),
+        "conversation": conversation,
+        "conversation_id": item.get("conversation_id"),
+        "sender": sender,
+        "body": item.get("body"),
+    }
+    if data.get("reply_to"):
+        out["reply_to"] = data["reply_to"]
+    if data.get("thread_root"):
+        out["thread"] = data["thread_root"]
+    return out
+
+
+# Top-level fields a slim reader still needs to paginate, acknowledge, and
+# notice degraded coverage or pending watch results.
+_SLIM_KEEP = ("next_cursor", "receipt", "position", "coverage", "degraded",
+              "delivery_note", "error")
+
+
+def slim_read_result(result: dict) -> dict:
+    """MCP-side projection of a full chat_read page: no replication, pin,
+    norms or metadata blobs. The daemon response is unchanged."""
+    if not isinstance(result, dict) or "items" not in result:
+        return result
+    out = {key: result[key] for key in _SLIM_KEEP if result.get(key) is not None}
+    out["view"] = "slim"
+    out["items"] = [_slim_message(item) for item in result.get("items") or []]
+    if result.get("context"):
+        out["context"] = [_slim_message(item) for item in result["context"]]
+    monitors = result.get("monitor_status")
+    if isinstance(monitors, dict) and monitors.get("unacknowledged"):
+        out["monitor_status"] = {"unacknowledged": monitors["unacknowledged"]}
+    if isinstance(monitors, dict) and monitors.get("recently_expired"):
+        out.setdefault("monitor_status", {})["recently_expired"] = monitors["recently_expired"]
+    return out
 
 
 @mcp.tool()
