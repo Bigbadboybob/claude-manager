@@ -192,9 +192,16 @@ reviews, merges to main and deploys (hub first).
 | W0b viewer input vs idle | state-core | reviewed PASS | c2fdd91 | batched with wave 0 |
 | W0c-items contract | items | reviewed PASS | 92a5a28 | doc only |
 | W0c-state contract | state-core | reviewed PASS | bc76c50 | doc only |
-| W0d orchestration docs | msgfix | in progress | | |
-| W1a items API | items | in progress | | |
-| W1b agent_state core | state-core | in progress | | |
-| W1c messaging send side | msgfix | queued | | |
+| W0d orchestration docs | msgfix | reviewed PASS | f1009f9 | skill installed on cm-sessions; policy docs pending |
+| W1a items API | items | reviewed PASS (+fixes 9f1aa85) | 9f1aa85 | API live on cm-manager 19:17Z; `GET /boards` 200 |
+| W1b agent_state core | state-core | review: 2 blockers being fixed | | |
+| W1c messaging send side | msgfix | in progress | | |
 
 Note: both Claude lanes' launch prompts were silently dropped at start_session (status file idle since spawn, no transcript, monitor timed out ~35 min later); redelivered with send_input 18:47Z. Follow-up: start_session should confirm the turn started (state-core, after W2d).
+
+Wave-0 brain deploy: cm-manager (hub) done 19:06Z on f1009f9 (epoch 19, 39 sessions).
+**Incident:** the hub's new brain took ~6 min loading the message store (~56k files)
+before answering RPCs, so cm-sessions lost hub sync 19:06–19:12Z (messages queued
+locally and flushed; none lost). cm-sessions deploy held until after EP's 23:00Z freeze,
+with advance notice in #cm-general. Follow-up: make hub brain start non-blocking for
+messaging (lazy/background store load).
