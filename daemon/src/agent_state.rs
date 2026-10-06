@@ -1785,7 +1785,9 @@ mod tests {
         let mut state = session_state();
         state.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
         let uid = "ts-agent-state";
-        let now = unix_now();
+        // Whole seconds make the exact structural equality below independent
+        // of sub-microsecond f64 rounding in JSON deserialization.
+        let now = unix_now().floor();
         {
             let mut c = state.sessions[uid].agent_state.lock().unwrap();
             c.apply(hook(HookEvent::UserPromptSubmit, now - 20.0), now)

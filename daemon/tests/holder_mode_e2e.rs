@@ -989,7 +989,10 @@ fn brain_deploy_via_daemon_restart_rides_sessions_through() {
         serde_json::json!({"session_uid": uid}),
     ).result.unwrap()["agent_state"].clone();
     assert_eq!(after_state["turn_seq"], before_state["turn_seq"], "turn sequence survives brain adoption");
-    assert_eq!(after_state["since"], before_state["since"], "state age survives brain adoption");
+    assert!(
+        (after_state["since"].as_f64().unwrap() - before_state["since"].as_f64().unwrap()).abs() < 0.000001,
+        "state age survives brain adoption within JSON float precision"
+    );
 
     // The replay ring rode through: the pre-deploy marker is in the
     // new brain's fanout from the moment it is healthy, no new output
