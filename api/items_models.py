@@ -98,24 +98,10 @@ class ItemResolveBody(_Strict):
     message: str | None = Field(default=None, max_length=1000)
 
 
-class HeartbeatSession(_Strict):
-    pid: Short
-    session_uid: Short
-    task_id: Short | None = None
-    name: Short | None = None
-    engine: str | None = Field(default=None, max_length=40)
-    state: str = Field(min_length=1, max_length=40)
-    # Relative durations: the API's clock decides, so host skew never matters.
-    state_age_s: float | None = Field(default=None, ge=0, le=10**9)
-    idle_for_s: float | None = Field(default=None, ge=0, le=10**9)
-    age_s: float | None = Field(default=None, ge=0, le=10**9)
-    reported_done: bool = False
-    killed_by: Short | None = None
-    agent_state: dict | None = None
-
-
 class HeartbeatBody(_Strict):
-    host_label: Short | None = None
-    sessions: list[HeartbeatSession] = Field(default_factory=list, max_length=2000)
-    exited: list[Short] = Field(default_factory=list, max_length=2000)
+    # Rows are validated one by one in dispatch.items_db.heartbeat: one bad
+    # row is clipped or dropped, never the whole host's beat.
+    host_label: str | None = None
+    sessions: list[dict] = Field(default_factory=list, max_length=2000)
+    exited: list[str] = Field(default_factory=list, max_length=2000)
     acked_push_ids: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list, max_length=1000)

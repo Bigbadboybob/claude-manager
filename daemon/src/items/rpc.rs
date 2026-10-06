@@ -509,12 +509,14 @@ fn item_resolve(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> R
     Ok(out)
 }
 
-/// Sessions spawned by `launch`, keyed by (caller pid, request_id), so a
+/// Sessions spawned by `launch`, keyed by (caller pid, board, item, request_id), so a
 /// retried launch whose final reassign failed reassigns instead of spawning
 /// a second worker. In memory: a brain restart forgets it, and the error
 /// message names the uid for a manual reassign.
-fn launches() -> &'static Mutex<std::collections::VecDeque<((String, String), Value)>> {
-    static LAUNCHES: std::sync::OnceLock<Mutex<std::collections::VecDeque<((String, String), Value)>>> =
+type LaunchKey = (String, String, i64, String);
+
+fn launches() -> &'static Mutex<std::collections::VecDeque<(LaunchKey, Value)>> {
+    static LAUNCHES: std::sync::OnceLock<Mutex<std::collections::VecDeque<(LaunchKey, Value)>>> =
         std::sync::OnceLock::new();
     LAUNCHES.get_or_init(Mutex::default)
 }
@@ -531,7 +533,7 @@ fn launch(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value, slug: &str
         ));
     }
     let request_id = params.get("request_id").and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty());
-    let key = request_id.map(|r| (ctx.pid.clone(), r.to_string()));
+    let key = request_id.map(|r| (ctx.pid.clone(), slug.to_string(), n, r.to_string()));
     if let Some(key) = &key {
         let remembered = launches().lock().unwrap_or_else(|p| p.into_inner());
         if let Some((_, prior)) = remembered.iter().find(|(k, _)| k == key) {

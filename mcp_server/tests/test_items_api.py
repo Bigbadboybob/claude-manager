@@ -17,6 +17,7 @@ import asyncio
 import os
 import unittest
 import uuid
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -361,8 +362,40 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         await self.beat([])
         row = (await self.fetch("SELECT exited_at FROM session_states"))[0]
         self.assertIsNone(row["exited_at"])
-        r = await self.post("/hosts/d1/heartbeat", {"sessions": [self.row("y", daemon="d2")]})
-        self.assertEqual(r.status_code, 422)
+        reply = await self.beat([self.row("y", daemon="d2"), self.row("ok")])
+        self.assertEqual(reply["dropped_sessions"],
+                         [{"pid": "agent:d2:y-uid", "reason": "pid does not belong to this daemon"}])
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM session_states WHERE daemon_id = 'd1'")), 1)
+
+    async def test_one_bad_row_is_clipped_or_dropped_not_the_whole_beat(self):
+        long = {**self.row("lane"), "name": "n" * 500, "engine": "e" * 90, "state_age_s": "soon"}
+        reply = await self.beat([long, {"pid": 7}, self.row("orch")], host_label="h" * 300)
+        self.assertEqual(len(reply["dropped_sessions"]), 1)
+        rows = {r["pid"]: r for r in await self.fetch("SELECT * FROM session_states")}
+        self.assertEqual(len(rows["agent:d1:lane-uid"]["name"]), 200)
+        self.assertEqual(len(rows["agent:d1:lane-uid"]["engine"]), 40)
+        self.assertIsNone(rows["agent:d1:lane-uid"]["state_since"])
+        self.assertEqual(len(rows["agent:d1:orch-uid"]["host_label"]), 200)
+
+    async def test_unacked_push_is_given_up_after_max_attempts(self):
+        await self.create({"title": "a", "holders": [LANE]})
+        for _ in range(items_db.MAX_PUSH_ATTEMPTS):
+            self.assertEqual(len((await self.beat([]))["pushes"]), 1)
+        self.assertEqual((await self.beat([]))["pushes"], [])
+        row = (await self.fetch("SELECT delivered_at, dropped_reason, attempts FROM item_pushes"))[0]
+        self.assertIsNotNone(row["delivered_at"])
+        self.assertEqual(row["dropped_reason"], f"not acked after {items_db.MAX_PUSH_ATTEMPTS} attempts")
+
+    async def test_stuck_pushes_do_not_starve_newer_ones(self):
+        with mock.patch.object(items_db, "MAX_PUSHES_PER_BEAT", 2):
+            for i in range(3):
+                await self.create({"title": f"t{i}", "holders": [LANE]})
+            first = [p["id"] for p in (await self.beat([]))["pushes"]]
+            self.assertEqual(len(first), 2)
+            for _ in range(items_db.MAX_PUSH_ATTEMPTS):
+                await self.beat([])
+            later = [p["id"] for p in (await self.beat([]))["pushes"]]
+            self.assertTrue(later and not set(later) & set(first))
 
     async def test_pushes_are_returned_until_acked(self):
         await self.create({"title": "a", "holders": [LANE]})

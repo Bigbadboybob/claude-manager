@@ -633,6 +633,45 @@ async def held_items(pool, holder_pid: str, *, open_only: bool = True) -> list[d
 # ---- host heartbeat and push pickup (doc §3, §5) ---------------------------
 
 MAX_PUSHES_PER_BEAT = 100
+# A push handed out this many times without an ack is given up on (dropped
+# with a reason) so it cannot starve newer ones (~5 min at 30 s beats).
+MAX_PUSH_ATTEMPTS = 10
+_TEXT_LIMITS = {"session_uid": 200, "task_id": 200, "name": 200, "engine": 40,
+                "state": 40, "killed_by": 200}
+
+
+def _clip(value, limit: int):
+    if value is None:
+        return None
+    text = str(value)
+    return text[:limit] if text else None
+
+
+def _seconds(value):
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    return x if 0 <= x <= 10**9 else None
+
+
+def _session_row(raw, prefix: str) -> tuple[dict | None, str | None]:
+    """One heartbeat row, clipped to the column limits, or why it was dropped."""
+    if not isinstance(raw, dict):
+        return None, "not an object"
+    pid = raw.get("pid")
+    if not isinstance(pid, str) or not pid.startswith(prefix) or len(pid) > 300:
+        return None, "pid does not belong to this daemon"
+    row = {k: _clip(raw.get(k), n) for k, n in _TEXT_LIMITS.items()}
+    if not row["session_uid"] or not row["state"]:
+        return None, "session_uid and state are required"
+    row["pid"] = pid
+    for key in ("state_age_s", "idle_for_s", "age_s"):
+        row[key] = _seconds(raw.get(key))
+    row["reported_done"] = raw.get("reported_done") is True
+    agent_state = raw.get("agent_state")
+    row["agent_state"] = agent_state if isinstance(agent_state, dict) else None
+    return row, None
 
 
 def _uuid_or_none(value):
@@ -652,10 +691,17 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
     write no item events or flags (the flag engine does, under the lock).
     """
     prefix = f"agent:{daemon_id}:"
-    for s in sessions:
-        if not s["pid"].startswith(prefix):
-            raise ItemsError(422, "invalid_field",
-                             f"pid {s['pid']} does not belong to daemon {daemon_id}", field="pid")
+    rows, dropped = [], []
+    for raw in sessions:
+        row, reason = _session_row(raw, prefix)
+        if row is None:
+            dropped.append({"pid": str(raw.get("pid"))[:200] if isinstance(raw, dict) else None,
+                            "reason": reason})
+        else:
+            rows.append(row)
+    sessions = rows
+    host_label = _clip(host_label, 200)
+    exited = [e[:200] for e in exited if isinstance(e, str)]
     now = utcnow()
 
     def ago(seconds):
@@ -703,15 +749,29 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                         WHERE daemon_id = $1 AND id = ANY($2::bigint[]) AND delivered_at IS NULL""",
                     daemon_id, list(acked_push_ids), now,
                 )
-        rows = await conn.fetch(
-            """SELECT p.id, p.session_uid, p.pid, p.kind, p.text, p.owner_alert,
-                      p.board_id, b.slug AS board
-                 FROM item_pushes p LEFT JOIN boards b ON b.id = p.board_id
-                WHERE p.daemon_id = $1 AND p.delivered_at IS NULL
-                ORDER BY p.id LIMIT $2""",
-            daemon_id, MAX_PUSHES_PER_BEAT,
-        )
-    return {
-        "pushes": [_str_ids(dict(r)) for r in rows],
+            # Give up on pushes handed out too often without an ack.
+            await conn.execute(
+                """UPDATE item_pushes
+                      SET delivered_at = $3,
+                          dropped_reason = 'not acked after ' || attempts || ' attempts'
+                    WHERE daemon_id = $1 AND delivered_at IS NULL AND attempts >= $2""",
+                daemon_id, MAX_PUSH_ATTEMPTS, now,
+            )
+            rows = await conn.fetch(
+                """UPDATE item_pushes p SET attempts = p.attempts + 1
+                     FROM (SELECT id FROM item_pushes
+                            WHERE daemon_id = $1 AND delivered_at IS NULL
+                            ORDER BY id LIMIT $2) pending
+                    WHERE p.id = pending.id
+                RETURNING p.id, p.session_uid, p.pid, p.kind, p.text, p.owner_alert,
+                          p.board_id, p.attempts,
+                          (SELECT slug FROM boards b WHERE b.id = p.board_id) AS board""",
+                daemon_id, MAX_PUSHES_PER_BEAT,
+            )
+    out = {
+        "pushes": sorted((_str_ids(dict(r)) for r in rows), key=lambda r: r["id"]),
         "server_time": iso(now),
     }
+    if dropped:
+        out["dropped_sessions"] = dropped
+    return out

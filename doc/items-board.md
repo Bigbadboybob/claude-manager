@@ -218,14 +218,21 @@ oldest_s}}`.
 
 **Heartbeat state row:** `{pid, session_uid, task_id, name, engine, state,
 state_age_s, idle_for_s, age_s?, reported_done, killed_by?, agent_state?}`;
-every `pid` must be `agent:<daemon_id>:…` of the posting daemon (else 422).
-The snapshot is complete for that daemon: its other live rows, and pids in
+rows are checked one by one: a row whose `pid` is not `agent:<daemon_id>:…` of
+the posting daemon, or that lacks `session_uid`/`state`, is dropped and listed
+in the reply's `dropped_sessions`; over-long text is clipped and bad numbers
+read as null, so one bad row never fails the host's beat. TUI-owned sessions
+are sent with state `unknown`. The snapshot is complete for that daemon: its
+other live rows, and pids in
 `exited`, are marked exited; a pid that reappears is live again. Acks only
 settle that daemon's own pushes. The daemon beats every 30 s and 2 s after a
 poke; it publishes each push as notification id `board-push:<id>` with marker
 `[cm-board <board>]`, sends `owner_alert` pushes to Owner escalation (urgency
-`blocking`), acks pushes for sessions that cannot receive them (gone, bash),
-and acks everything on the next beat.
+`blocking`, key `board:<board>:<uid>` so it never merges with the session's
+own `notify_user` alert), acks pushes for sessions that cannot receive them
+(gone, bash, unsendable text), and acks everything on the next beat. Each
+hand-out counts an attempt; after 10 unacked attempts the API settles the push
+with a `dropped_reason`, so a stuck push cannot starve newer ones.
 
 `item_resolve` actions: `nudge` (push + snooze; needs a holder), `reassign`
 (replace holders), `block` (`blocked_by`, or `blocked_on` + `check_back`),

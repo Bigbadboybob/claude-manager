@@ -105,5 +105,5 @@ async def heartbeat(body: HeartbeatBody, request: Request,
                     daemon_id: str = Path(min_length=1, max_length=200)):
     return await _call(items_db.heartbeat(
         _pool(request), daemon_id, host_label=body.host_label,
-        sessions=[s.model_dump() for s in body.sessions], exited=body.exited,
+        sessions=body.sessions, exited=body.exited,
         acked_push_ids=body.acked_push_ids))

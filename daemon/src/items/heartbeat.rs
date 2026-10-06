@@ -70,6 +70,11 @@ pub(crate) struct Snapshot {
     pub root: PathBuf,
 }
 
+/// At most `limit` characters (the API clips too; this keeps rows small).
+fn clip(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
 /// Session rows in the heartbeat wire shape. `now` is Unix seconds.
 pub(crate) fn session_row(
     daemon_id: &str,
@@ -87,8 +92,8 @@ pub(crate) fn session_row(
         "pid": format!("agent:{daemon_id}:{uid}"),
         "session_uid": uid,
         "task_id": task_id,
-        "name": name,
-        "engine": engine,
+        "name": clip(name, 200),
+        "engine": clip(engine, 40),
         "state": state,
         "state_age_s": age,
         "idle_for_s": if state == "idle" { json!(age) } else { Value::Null },
@@ -105,7 +110,7 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Option<Snapshot> {
     };
     let s = state.lock().unwrap_or_else(|p| p.into_inner());
     let now = crate::agent_state::unix_now();
-    let sessions = s
+    let mut sessions: Vec<Value> = s
         .sessions
         .iter()
         .map(|(uid, sess)| {
@@ -127,6 +132,24 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Option<Snapshot> {
             )
         })
         .collect();
+    // TUI-owned rows have no engine state here; report them as unknown
+    // rather than letting the board treat their holders as gone.
+    for (uid, t) in s.tui_sessions.iter().filter(|(uid, _)| !s.sessions.contains_key(*uid)) {
+        let name = s
+            .messaging_names
+            .get(uid)
+            .map(|n| n.name.clone())
+            .or_else(|| t.label.clone())
+            .unwrap_or_else(|| uid.clone());
+        sessions.push(json!({
+            "pid": format!("agent:{daemon_id}:{uid}"),
+            "session_uid": uid,
+            "task_id": t.task_id,
+            "name": clip(&name, 200),
+            "engine": t.session_type.as_deref().map(|e| clip(e, 40)),
+            "state": "unknown",
+        }));
+    }
     let api = Api::from_config(&s.config.api_url, &s.config.api_token).ok();
     Some(Snapshot {
         daemon_id,
@@ -164,7 +187,7 @@ pub(crate) enum Plan {
     /// Native notification into a live agent session.
     Publish { uid: String, id: String, text: String, marker: String },
     /// Owner escalation on the target session's row.
-    Escalate { uid: Option<String>, source: String, text: String },
+    Escalate { uid: Option<String>, source: String, dedupe_key: String, text: String },
     /// Nothing can receive it here (session gone, or a bash pane): ack it.
     Drop { reason: String },
 }
@@ -177,8 +200,11 @@ pub(crate) fn plan(push: &Value, engine_of: impl Fn(&str) -> Option<String>) -> 
     let board = push["board"].as_str().unwrap_or("board");
     if push["owner_alert"] == true {
         let source = format!("board:{}", push["board_id"].as_str().unwrap_or(board));
+        // Keyed by board and session so a pending notify_user alert on the
+        // same session neither swallows nor is replaced by this one.
+        let dedupe_key = format!("board:{board}:{uid}");
         let uid = engine_of(&uid).map(|_| uid);
-        return Plan::Escalate { uid, source, text };
+        return Plan::Escalate { uid, source, dedupe_key, text };
     }
     match engine_of(&uid).as_deref() {
         Some("claude-code" | "codex") => Plan::Publish {
@@ -254,14 +280,15 @@ impl Beat {
                     Ok(_) => true,
                     Err(e) => {
                         eprintln!("cm items: push {id} to {uid}: {e}");
-                        // A content conflict on the same id can never succeed.
-                        e.kind() == std::io::ErrorKind::AlreadyExists
+                        // A content conflict or an unsendable text can never
+                        // succeed: settle it. Other errors retry; the API
+                        // gives up after a bounded number of attempts.
+                        matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::InvalidInput)
                     }
                 }
             }
-            Plan::Escalate { uid, source, text } => {
+            Plan::Escalate { uid, source, dedupe_key, text } => {
                 let s = state.lock().unwrap_or_else(|p| p.into_inner());
-                let dedupe_key = uid.clone().unwrap_or_else(|| source.clone());
                 match owner_attention::escalate(
                     &s,
                     Escalation {
@@ -326,11 +353,13 @@ mod tests {
         assert_eq!(plan(&alert, |_| Some("codex".into())), Plan::Escalate {
             uid: Some("u1".into()),
             source: "board:b-1".into(),
+            dedupe_key: "board:sfd:u1".into(),
             text: "[cm-board sfd] hi".into(),
         });
         assert_eq!(plan(&alert, |_| None), Plan::Escalate {
             uid: None,
             source: "board:b-1".into(),
+            dedupe_key: "board:sfd:u1".into(),
             text: "[cm-board sfd] hi".into(),
         });
     }
@@ -353,8 +382,11 @@ mod tests {
         assert_eq!(row["agent_state"]["turn_seq"], 3);
         let mut working = st.clone();
         working.state = crate::agent_state::State::Working;
-        let row = session_row("d1", "u1", "lane", None, "codex", &working, false, 1600.0);
+        let long = "x".repeat(500);
+        let row = session_row("d1", "u1", &long, None, &long, &working, false, 1600.0);
         assert!(row["idle_for_s"].is_null());
+        assert_eq!(row["name"].as_str().unwrap().chars().count(), 200);
+        assert_eq!(row["engine"].as_str().unwrap().chars().count(), 40);
     }
 
     #[test]
@@ -415,7 +447,8 @@ mod tests {
         assert!(beat.acks.is_empty());
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies[0]["acked_push_ids"], json!([]));
-        assert_eq!(bodies[0]["sessions"], json!([]));
+        assert_eq!(bodies[0]["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(bodies[0]["sessions"][0]["state"], "unknown"); // TUI-only row
         assert_eq!(bodies[1]["acked_push_ids"], json!([41, 42]));
     }
 }
