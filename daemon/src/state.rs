@@ -397,6 +397,7 @@ pub struct DaemonState {
     /// spawning sessions. Indexed by the stable session uid that
     /// already lives on `ManifestEntry` / `TerminalSession`.
     pub sessions: HashMap<String, DaemonSession>,
+    pub agent_state_runtime: Arc<crate::agent_state::Runtime>,
     /// H3 (restart hardening): drain mode. While true, spawn-shaped
     /// operations (`mcp_start_session`, `session.revive`) refuse and
     /// the continuous scheduler's tick no-ops, so an operator can bring
@@ -794,6 +795,7 @@ impl Default for DaemonState {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
+            agent_state_runtime: Arc::new(crate::agent_state::Runtime::default()),
             recently_exited: VecDeque::new(),
             resume_history: Mutex::new(Default::default()),
             resume_claims: Default::default(),

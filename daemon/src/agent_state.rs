@@ -5,7 +5,7 @@ use crate::manifest::ManifestDiff;
 use crate::session::DaemonSession;
 use crate::state::DaemonState;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -452,7 +452,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                 State::Working
             } else if presence
                 .is_some_and(|p| matches!(p.status, PresenceStatus::Busy | PresenceStatus::Shell))
-                || relay.is_some_and(|r| r.child_active || !r.background.jobs.is_empty())
+                || relay.is_some_and(|r| r.child_active || !input.background.jobs.is_empty())
                 || (source == Source::Hooks && !input.background.jobs.is_empty())
             {
                 State::WorkingBackground
@@ -558,7 +558,7 @@ pub struct StateCell {
     epoch: Option<String>,
     seq: u64,
     retired_epochs: BTreeSet<String>,
-    prompt_ids: BTreeSet<String>,
+    prompt_ids: VecDeque<String>,
     pending_starts: u64,
     #[serde(skip)]
     published: Option<AgentState>,
@@ -583,7 +583,7 @@ impl StateCell {
             epoch: None,
             seq: 0,
             retired_epochs: BTreeSet::new(),
-            prompt_ids: BTreeSet::new(),
+            prompt_ids: VecDeque::new(),
             pending_starts: 0,
             published: None,
         }
@@ -611,6 +611,7 @@ impl StateCell {
         state
     }
     pub fn apply(&mut self, report: Report, now: f64) -> Result<Applied, String> {
+        validate_report_bounds(&report)?;
         let mut applied = Applied::default();
         match report {
             Report::Snapshot {
@@ -627,6 +628,12 @@ impl StateCell {
                     return Ok(applied);
                 }
                 let same_epoch = self.epoch.as_ref() == Some(&epoch);
+                if !same_epoch
+                    && self.epoch.is_some()
+                    && self.retired_epochs.len() >= MAX_RETIRED_EPOCHS
+                {
+                    return Err("relay epoch history is full; restart the session before another relay epoch".into());
+                }
                 let prior = self.inputs.relay.as_ref();
                 let prior_turns = if same_epoch {
                     prior.map_or(0, |r| r.turn_seq)
@@ -692,7 +699,10 @@ impl StateCell {
                             return Ok(applied);
                         }
                         if let Some(id) = payload.prompt_id {
-                            self.prompt_ids.insert(id);
+                            if self.prompt_ids.len() == MAX_PROMPT_IDS {
+                                self.prompt_ids.pop_front();
+                            }
+                            self.prompt_ids.push_back(id);
                         }
                         self.inputs.hooks.prompt_at = Some(at);
                         self.engine_starts(1, at);
@@ -757,6 +767,79 @@ impl StateCell {
         Ok(applied)
     }
 }
+const MAX_PROMPT_IDS: usize = 256;
+const MAX_RETIRED_EPOCHS: usize = 64;
+const MAX_TEXT_BYTES: usize = 4096;
+const MAX_ID_BYTES: usize = 256;
+const MAX_BACKGROUND_ENTRIES: usize = 256;
+
+fn bounded(text: Option<&str>, cap: usize, field: &str) -> Result<(), String> {
+    if text.is_some_and(|text| text.len() > cap) {
+        Err(format!("{field} exceeds {cap} UTF-8 bytes"))
+    } else {
+        Ok(())
+    }
+}
+fn background_bounds(bg: &Background) -> Result<(), String> {
+    if bg.jobs.len() > MAX_BACKGROUND_ENTRIES
+        || bg.crons.len() > MAX_BACKGROUND_ENTRIES
+        || bg.ended.len() > 10
+    {
+        return Err("background exceeds 256 jobs/crons or 10 ended jobs".into());
+    }
+    for job in &bg.jobs {
+        bounded(Some(&job.id), MAX_ID_BYTES, "job id")?;
+        bounded(Some(&job.label), MAX_TEXT_BYTES, "job label")?;
+    }
+    for cron in &bg.crons {
+        bounded(Some(&cron.id), MAX_ID_BYTES, "cron id")?;
+        bounded(Some(&cron.schedule), MAX_TEXT_BYTES, "cron schedule")?;
+    }
+    for job in &bg.ended {
+        bounded(Some(&job.id), MAX_ID_BYTES, "ended job id")?;
+        bounded(Some(&job.label), MAX_TEXT_BYTES, "ended job label")?;
+    }
+    Ok(())
+}
+fn validate_report_bounds(report: &Report) -> Result<(), String> {
+    match report {
+        Report::Hook { payload, .. } => {
+            bounded(payload.prompt_id.as_deref(), MAX_ID_BYTES, "prompt_id")?;
+            for (field, text) in [
+                ("transcript_path", &payload.transcript_path),
+                ("waiting_for", &payload.waiting_for),
+                ("error_kind", &payload.error_kind),
+                ("tool_name", &payload.tool_name),
+                ("notification_type", &payload.notification_type),
+            ] {
+                bounded(text.as_deref(), MAX_TEXT_BYTES, field)?;
+            }
+            if let Some(bg) = &payload.background {
+                background_bounds(bg)?;
+            }
+        }
+        Report::Snapshot {
+            epoch, snapshot, ..
+        } => {
+            bounded(Some(epoch), 36, "epoch")?;
+            bounded(
+                snapshot.engine_version.as_deref(),
+                MAX_ID_BYTES,
+                "engine_version",
+            )?;
+            bounded(snapshot.error_kind.as_deref(), MAX_TEXT_BYTES, "error_kind")?;
+            if snapshot.active_flags.len() > 16 || snapshot.pending_requests.len() > 256 {
+                return Err("snapshot exceeds 16 active flags or 256 pending requests".into());
+            }
+            for flag in &snapshot.active_flags {
+                bounded(Some(flag), MAX_ID_BYTES, "active flag")?;
+            }
+            background_bounds(&snapshot.background)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_time(at: Option<f64>, now: f64) -> Result<(), String> {
     if at.is_some_and(|at| !at.is_finite() || at < 0.0 || at > now + 5.0) {
         Err("timestamps must be finite Unix seconds, no more than 5 seconds in the future".into())
@@ -824,7 +907,31 @@ pub fn current(session: &DaemonSession) -> AgentState {
     cell.inputs.exited = session.last_exit.kernel_set();
     cell.recompute(unix_now())
 }
-/// Caller holds DaemonState; subscribers cannot miss the update/snapshot seam.
+/// The tick is the only publisher. Reports coalesce a latest value per session;
+/// the bounded drain leaves room for unrelated lifecycle diffs in the watcher.
+const MAX_STATE_DIFFS_PER_TICK: usize = crate::manifest::MANIFEST_WATCH_BUFFER / 4;
+const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+#[derive(Default)]
+struct Publisher {
+    started: bool,
+    pending: BTreeMap<String, (AgentStateCell, AgentState)>,
+    order: VecDeque<String>,
+}
+#[derive(Default)]
+struct Persistence {
+    last_attempt: Option<Instant>,
+    saved: Option<String>,
+}
+#[derive(Default)]
+pub struct Runtime {
+    publisher: Mutex<Publisher>,
+    // Lock order is persistence gate -> DaemonState. Disk writes keep only the
+    // gate; a checked restart waits outside DaemonState and always lands last.
+    persistence: Mutex<Persistence>,
+}
+
+/// Caller holds DaemonState. The first observation is a baseline, not a diff:
+/// manifest subscribers already receive current state in their initial snapshot.
 pub fn recompute_and_publish(state: &DaemonState, uid: &str) {
     let Some(session) = state.sessions.get(uid) else {
         return;
@@ -834,31 +941,168 @@ pub fn recompute_and_publish(state: &DaemonState, uid: &str) {
         .agent_state
         .lock()
         .unwrap_or_else(|p| p.into_inner());
+    let mut publisher = state
+        .agent_state_runtime
+        .publisher
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if cell.published.is_none() && !publisher.started {
+        cell.published = Some(next);
+        return;
+    }
     if cell
         .published
         .as_ref()
-        .is_none_or(|old| !old.publication_eq(&next))
+        .is_some_and(|published| published.publication_eq(&next))
     {
+        if publisher.pending.remove(uid).is_some() {
+            publisher.order.retain(|queued| queued != uid);
+        }
+    } else {
+        if !publisher.pending.contains_key(uid) {
+            publisher.order.push_back(uid.to_string());
+        }
+        publisher
+            .pending
+            .insert(uid.to_string(), (Arc::clone(&session.agent_state), next));
+    }
+}
+fn flush_publishes(state: &DaemonState) {
+    let mut publisher = state
+        .agent_state_runtime
+        .publisher
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    publisher.started = true;
+    // Dead/replaced sessions never publish after their exit/revive lifecycle diff.
+    publisher.pending.retain(|uid, (cell, _)| {
+        state
+            .sessions
+            .get(uid)
+            .is_some_and(|s| Arc::ptr_eq(&s.agent_state, cell))
+    });
+    let live: BTreeSet<_> = publisher.pending.keys().cloned().collect();
+    publisher.order.retain(|uid| live.contains(uid));
+    let mut sent = 0;
+    while sent < MAX_STATE_DIFFS_PER_TICK {
+        let Some(uid) = publisher.order.pop_front() else {
+            break;
+        };
+        let Some((cell, next)) = publisher.pending.remove(&uid) else {
+            continue;
+        };
         state.manifest_watcher.broadcast(ManifestDiff::Updated {
-            uid: uid.to_string(),
+            uid,
             entry: serde_json::json!({"agent_state": next}),
         });
-        cell.published = Some(next);
+        cell.lock().unwrap_or_else(|p| p.into_inner()).published = Some(next);
+        sent += 1;
     }
 }
 pub fn snapshot(state: &DaemonState) -> BTreeMap<String, AgentState> {
     state
         .sessions
         .iter()
-        .map(|(uid, session)| (uid.clone(), current(session)))
+        .map(|(uid, session)| {
+            let next = current(session);
+            let mut cell = session
+                .agent_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if cell.published.is_none() {
+                cell.published = Some(next.clone());
+            }
+            (uid.clone(), next)
+        })
         .collect()
 }
 
+/// Restart facts only: no PTY clocks, transient progress samples, duplicate
+/// derived state or publication caches. Source observations retain freshness.
+#[derive(Serialize, Deserialize)]
+struct RestartRecord {
+    child_start_time: Option<u64>,
+    spawned_at: f64,
+    state: State,
+    source: Source,
+    since: f64,
+    stalled_since: Option<f64>,
+    turn_seq: u64,
+    latest_start: Option<f64>,
+    hooks: HookEdges,
+    background: Background,
+    presence: Option<PresenceObs>,
+    relay: Option<RelaySnapshot>,
+    epoch: Option<String>,
+    seq: u64,
+    retired_epochs: BTreeSet<String>,
+    prompt_ids: VecDeque<String>,
+    pending_starts: u64,
+}
+impl RestartRecord {
+    fn capture(session: &DaemonSession) -> Self {
+        let state = current(session);
+        let c = session
+            .agent_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut relay = c.inputs.relay.clone();
+        // The normalized background lives once, in inputs.background.
+        if let Some(r) = &mut relay {
+            r.background = Background::default();
+        }
+        Self {
+            child_start_time: c.child_start_time,
+            spawned_at: c.inputs.spawned_at,
+            state: state.state,
+            source: state.source,
+            since: state.since,
+            stalled_since: state.stalled_since,
+            turn_seq: c.inputs.turn_seq,
+            latest_start: c.inputs.latest_start,
+            hooks: c.inputs.hooks.clone(),
+            background: c.inputs.background.clone(),
+            presence: c.inputs.presence.clone(),
+            relay,
+            epoch: c.epoch.clone(),
+            seq: c.seq,
+            retired_epochs: c.retired_epochs.clone(),
+            prompt_ids: c.prompt_ids.clone(),
+            pending_starts: c.pending_starts,
+        }
+    }
+    fn restore(self, cell: &mut StateCell, legacy: LegacyObs, now: f64) {
+        cell.inputs = Inputs {
+            spawned_at: self.spawned_at,
+            exited: false,
+            legacy,
+            presence: self.presence,
+            hooks: self.hooks,
+            relay: self.relay,
+            turn_seq: self.turn_seq,
+            latest_start: self.latest_start,
+            background: self.background,
+            last_progress_at: Some(self.stalled_since.map_or(now, |at| at - 900.0)),
+            previous: None,
+        };
+        let mut state = derive(&cell.inputs, now);
+        if state.state == self.state && state.source == self.source {
+            state.since = self.since;
+        }
+        cell.inputs.previous = Some(state);
+        cell.epoch = self.epoch;
+        cell.seq = self.seq;
+        cell.retired_epochs = self.retired_epochs;
+        cell.prompt_ids = self.prompt_ids;
+        cell.pending_starts = self.pending_starts;
+        cell.published = None;
+    }
+}
 #[derive(Serialize, Deserialize)]
 struct Sidecar {
     version: u32,
     boot_id: String,
-    sessions: BTreeMap<String, StateCell>,
+    sessions: BTreeMap<String, RestartRecord>,
 }
 fn boot_id() -> std::io::Result<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map(|id| id.trim().to_string())
@@ -869,37 +1113,66 @@ fn path(state: &DaemonState) -> Option<PathBuf> {
         .as_ref()
         .map(|p| p.with_file_name("daemon-agent-state.json"))
 }
-fn encode(state: &DaemonState) -> std::io::Result<String> {
-    let sessions = state
+fn capture(state: &DaemonState) -> BTreeMap<String, RestartRecord> {
+    state
         .sessions
         .iter()
-        .map(|(uid, s)| {
-            current(s);
-            (
-                uid.clone(),
-                s.agent_state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone(),
-            )
-        })
-        .collect();
-    serde_json::to_string(&Sidecar {
-        version: 1,
+        .map(|(uid, s)| (uid.clone(), RestartRecord::capture(s)))
+        .collect()
+}
+fn persist_with(
+    state: &Arc<Mutex<DaemonState>>,
+    force: bool,
+    now: Instant,
+    write: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let runtime = Arc::clone(
+        &state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_state_runtime,
+    );
+    let mut persistence = runtime
+        .persistence
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if !force
+        && persistence
+            .last_attempt
+            .is_some_and(|at| now.saturating_duration_since(at) < PERSIST_INTERVAL)
+    {
+        return Ok(());
+    }
+    let (path, sessions) = {
+        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+        if !force && state.restarting {
+            return Ok(());
+        }
+        let Some(path) = path(&state) else {
+            return Ok(());
+        };
+        (path, capture(&state))
+    };
+    persistence.last_attempt = Some(now);
+    let encoded = serde_json::to_string(&Sidecar {
+        version: 2,
         boot_id: boot_id()?,
         sessions,
     })
-    .map_err(std::io::Error::other)
-}
-/// Final checked flush also runs under the restart writer/reader barriers.
-pub fn save_checked(state: &DaemonState) -> std::io::Result<()> {
-    if let Some(path) = path(state) {
-        crate::state::write_json_atomic(&path, &encode(state)?, true)?;
+    .map_err(std::io::Error::other)?;
+    if force || persistence.saved.as_ref() != Some(&encoded) {
+        write(&path, &encoded)?;
+        persistence.saved = Some(encoded);
     }
     Ok(())
 }
-/// Called once after adoption, before serving RPCs or starting the tick. Never
-/// transfers state to another process, even when the stable CM UID is reused.
+/// Call outside DaemonState while the restart writer/reader barriers are held.
+/// The gate waits for any older tick write, then this fresh checked flush wins.
+pub fn save_checked(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
+    persist_with(state, true, Instant::now(), |path, json| {
+        crate::state::write_json_atomic(path, json, true)
+    })
+}
 pub fn restore(state: &DaemonState) -> std::io::Result<usize> {
     let Some(path) = path(state) else {
         return Ok(0);
@@ -910,18 +1183,26 @@ pub fn restore(state: &DaemonState) -> std::io::Result<usize> {
         Err(e) => return Err(e),
     };
     let sidecar: Sidecar = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
-    if sidecar.version != 1 || sidecar.boot_id != boot_id()? {
+    if sidecar.version != 2 || sidecar.boot_id != boot_id()? {
         return Ok(0);
     }
     let mut restored = 0;
     for (uid, saved) in sidecar.sessions {
         if let Some(session) = state.sessions.get(&uid) {
+            let legacy = legacy(session);
             let mut cell = session
                 .agent_state
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if saved.child_start_time.is_some() && saved.child_start_time == cell.child_start_time {
-                *cell = saved;
+                if saved.prompt_ids.len() > MAX_PROMPT_IDS
+                    || saved.retired_epochs.len() > MAX_RETIRED_EPOCHS
+                {
+                    return Err(std::io::Error::other(
+                        "agent state sidecar exceeds history limits",
+                    ));
+                }
+                saved.restore(&mut cell, legacy, unix_now());
                 restored += 1;
             }
         }
@@ -930,7 +1211,7 @@ pub fn restore(state: &DaemonState) -> std::io::Result<usize> {
 }
 /// Stat transcript/subagent growth outside the daemon mutex; verify cell identity
 /// again before applying, since a UID may have been revived while stat ran.
-pub fn tick(state: &Arc<Mutex<DaemonState>>, saved: &mut Option<String>) -> std::io::Result<()> {
+pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
     let probes: Vec<_> = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         if st.restarting {
@@ -986,29 +1267,24 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>, saved: &mut Option<String>) -> std:
             recompute_and_publish(&st, &uid);
         }
     }
-    if let Some(path) = path(&st) {
-        let encoded = encode(&st)?;
-        if saved.as_ref() != Some(&encoded) {
-            crate::state::write_json_atomic(&path, &encoded, true)?;
-            *saved = Some(encoded);
-        }
-    }
-    Ok(())
+    flush_publishes(&st);
+    drop(st);
+    persist_with(state, false, Instant::now(), |path, json| {
+        crate::state::write_json_atomic(path, json, true)
+    })
 }
+
 pub fn start(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
     let weak = Arc::downgrade(state);
     std::thread::Builder::new()
         .name("cm-agent-state".into())
-        .spawn(move || {
-            let mut saved = None;
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                let Some(state) = weak.upgrade() else {
-                    break;
-                };
-                if let Err(e) = tick(&state, &mut saved) {
-                    eprintln!("cm-daemon: agent state tick: {e}");
-                }
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(state) = weak.upgrade() else {
+                break;
+            };
+            if let Err(e) = tick(&state) {
+                eprintln!("cm-daemon: agent state tick: {e}");
             }
         })?;
     Ok(())
@@ -1180,7 +1456,7 @@ mod tests {
         assert_eq!(derive(&retry, 1000.0).detail.retrying, Some(true));
         cases.push(("retrying error", retry, State::Working));
         let mut bg = relay(RelayStatus::Idle);
-        bg.relay.as_mut().unwrap().background.jobs.push(job("bg"));
+        bg.background.jobs.push(job("bg"));
         cases.push(("background terminal", bg, State::WorkingBackground));
         let mut child = relay(RelayStatus::Idle);
         child.relay.as_mut().unwrap().child_active = true;
@@ -1449,6 +1725,7 @@ mod tests {
         let state = session_state();
         let uid = "ts-agent-state";
         let (rx, _guard) = state.manifest_watcher.subscribe();
+        snapshot(&state);
         let cell = &state.sessions[uid].agent_state;
         let epoch = uuid::Uuid::new_v4().to_string();
         let now = unix_now();
@@ -1464,6 +1741,7 @@ mod tests {
             .apply(report(&epoch, 1, r.clone()), now)
             .unwrap();
         recompute_and_publish(&state, uid);
+        flush_publishes(&state);
         assert!(matches!(
             rx.try_recv().unwrap(),
             ManifestDiff::Updated { .. }
@@ -1473,6 +1751,7 @@ mod tests {
             .apply(report(&epoch, 2, r.clone()), now + 0.1)
             .unwrap();
         recompute_and_publish(&state, uid);
+        flush_publishes(&state);
         assert!(rx.try_recv().is_err(), "observation-only heartbeat");
         let mut next = r;
         next.turn_seq = 2;
@@ -1482,6 +1761,7 @@ mod tests {
             .apply(report(&epoch, 3, next), now + 0.2)
             .unwrap();
         recompute_and_publish(&state, uid);
+        flush_publishes(&state);
         assert!(
             rx.try_recv().is_ok(),
             "new turn while still working must publish"
@@ -1492,6 +1772,7 @@ mod tests {
             c.inputs.last_progress_at = Some(now - 1000.0);
         }
         recompute_and_publish(&state, uid);
+        flush_publishes(&state);
         let ManifestDiff::Updated { entry, .. } = rx.try_recv().unwrap() else {
             panic!("updated");
         };
@@ -1524,7 +1805,9 @@ mod tests {
             );
         }
         let before = current(&state.sessions[uid]);
+        let state = Arc::new(Mutex::new(state));
         save_checked(&state).unwrap();
+        let state = state.lock().unwrap();
         let identity = state.sessions[uid]
             .agent_state
             .lock()
@@ -1593,7 +1876,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         state.lock().unwrap().daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
-        tick(&state, &mut None).unwrap();
+        tick(&state).unwrap();
         let ManifestDiff::Updated { entry, .. } = handle.diff_rx.try_recv().unwrap() else {
             panic!("state diff");
         };
@@ -1603,10 +1886,286 @@ mod tests {
             &std::fs::read(dir.path().join("daemon-agent-state.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(stored["sessions"]["ts-agent-state"]["turn_seq"], 1);
+    }
+
+    #[test]
+    fn fifty_sessions_seed_silently_and_coalesce_to_bounded_ticks() {
+        let mut state = DaemonState::new();
+        let now = unix_now();
+        for n in 0..50 {
+            let uid = format!("ts-state-burst-{n}");
+            let mut params = crate::session::SpawnParams::new(&uid, "burst", "/bin/sleep");
+            params.args = vec!["120".into()];
+            let session = DaemonSession::spawn(params).unwrap();
+            state.sessions.insert(uid, session);
+        }
+        let (rx, _guard) = state.manifest_watcher.subscribe();
+        let state = Arc::new(Mutex::new(state));
+        tick(&state).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "first tick is a silent baseline for all 50 sessions"
+        );
         assert_eq!(
-            stored["sessions"]["ts-agent-state"]["inputs"]["turn_seq"],
+            state
+                .lock()
+                .unwrap()
+                .manifest_watcher
+                .subscriber_slot_count(),
             1
         );
+        {
+            let st = state.lock().unwrap();
+            for (uid, session) in &st.sessions {
+                for round in 1..=3 {
+                    session
+                        .agent_state
+                        .lock()
+                        .unwrap()
+                        .apply(
+                            hook(HookEvent::UserPromptSubmit, now + round as f64 / 10.0),
+                            now + 1.0,
+                        )
+                        .unwrap();
+                    recompute_and_publish(&st, uid);
+                }
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "RPC-shaped recomputations do not broadcast a burst"
+            );
+            let publisher = st.agent_state_runtime.publisher.lock().unwrap();
+            assert_eq!(publisher.pending.len(), 50);
+            assert_eq!(publisher.order.len(), 50, "one queue entry per UID");
+        }
+        let mut seen = BTreeSet::new();
+        for _ in 0..7 {
+            tick(&state).unwrap();
+            let updates: Vec<_> = rx.try_iter().collect();
+            assert!(updates.len() <= MAX_STATE_DIFFS_PER_TICK);
+            for update in updates {
+                let ManifestDiff::Updated { uid, entry } = update else {
+                    panic!("state update");
+                };
+                assert_eq!(
+                    entry["agent_state"]["turn_seq"], 3,
+                    "only latest value is sent"
+                );
+                assert!(
+                    seen.insert(uid),
+                    "no duplicate emission without a state change"
+                );
+            }
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .manifest_watcher
+                    .subscriber_slot_count(),
+                1
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            50,
+            "bounded draining must also make progress for every session"
+        );
+    }
+
+    #[test]
+    fn sidecar_skips_pty_clock_churn_debounces_and_writes_outside_state_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = session_state();
+        st.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let state = Arc::new(Mutex::new(st));
+        let writes = std::cell::RefCell::new(Vec::new());
+        let write = |_: &std::path::Path, json: &str| {
+            assert!(
+                state.try_lock().is_ok(),
+                "fsync callback must not hold DaemonState"
+            );
+            writes.borrow_mut().push(json.to_string());
+            Ok(())
+        };
+        let start = Instant::now();
+        persist_with(&state, false, start, write).unwrap();
+        for n in 1..=6 {
+            *state.lock().unwrap().sessions["ts-agent-state"]
+                .last_activity_at
+                .lock()
+                .unwrap() = Some(Instant::now());
+            persist_with(&state, false, start + Duration::from_secs(n), write).unwrap();
+        }
+        assert_eq!(
+            writes.borrow().len(),
+            1,
+            "PTY repaint clocks do not dirty restart facts"
+        );
+        let json: serde_json::Value = serde_json::from_str(&writes.borrow()[0]).unwrap();
+        let record = &json["sessions"]["ts-agent-state"];
+        for key in [
+            "inputs",
+            "previous",
+            "legacy",
+            "published",
+            "last_progress_at",
+        ] {
+            assert!(
+                record.get(key).is_none(),
+                "transient {key} must not be persisted"
+            );
+        }
+        state.lock().unwrap().sessions["ts-agent-state"]
+            .input_handle()
+            .stamp_activity();
+        persist_with(&state, false, start + Duration::from_secs(7), write).unwrap();
+        assert_eq!(
+            writes.borrow().len(),
+            1,
+            "dirty record waits for 5-second debounce"
+        );
+        persist_with(&state, false, start + Duration::from_secs(10), write).unwrap();
+        assert_eq!(writes.borrow().len(), 2);
+        persist_with(&state, true, start + Duration::from_secs(11), write).unwrap();
+        assert_eq!(
+            writes.borrow().len(),
+            3,
+            "checked restart flush bypasses debounce"
+        );
+    }
+
+    #[test]
+    fn final_restart_write_follows_in_flight_periodic_write() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = session_state();
+        st.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let state = Arc::new(Mutex::new(st));
+        let (writing_tx, writing_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let s = Arc::clone(&state);
+        let writer = std::thread::spawn(move || {
+            persist_with(&s, false, Instant::now(), |path, json| {
+                writing_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                crate::state::write_json_atomic(path, json, true)
+            })
+        });
+        writing_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions["ts-agent-state"]
+                .input_handle()
+                .stamp_activity();
+            st.restarting = true;
+        }
+        let (start_tx, start_rx) = mpsc::channel();
+        let s = Arc::clone(&state);
+        let finalizer = std::thread::spawn(move || {
+            start_tx.send(()).unwrap();
+            save_checked(&s)
+        });
+        start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.try_lock().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "waiting final flush cannot monopolize DaemonState"
+            );
+            std::thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        finalizer.join().unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("daemon-agent-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["sessions"]["ts-agent-state"]["turn_seq"], 1,
+            "older captured snapshot must not overwrite the checked final state"
+        );
+    }
+
+    #[test]
+    fn report_history_and_free_text_are_bounded_without_losing_epoch_rejection() {
+        let mut c = StateCell::new(0.0, Some(42));
+        for n in 0..MAX_PROMPT_IDS + 10 {
+            c.apply(
+                Report::Hook {
+                    event: HookEvent::UserPromptSubmit,
+                    payload: HookPayload {
+                        prompt_id: Some(format!("p-{n}")),
+                        observed_at: Some(n as f64 + 1.0),
+                        ..Default::default()
+                    },
+                },
+                1000.0,
+            )
+            .unwrap();
+        }
+        assert_eq!(c.prompt_ids.len(), MAX_PROMPT_IDS);
+        assert_eq!(c.prompt_ids.front().unwrap(), "p-10");
+        assert!(
+            !c.apply(hook(HookEvent::UserPromptSubmit, 1.0), 1000.0)
+                .unwrap()
+                .accepted
+        );
+        let first = uuid::Uuid::new_v4().to_string();
+        c.apply(report(&first, 1, RelaySnapshot::default()), 1000.0)
+            .unwrap();
+        for _ in 0..MAX_RETIRED_EPOCHS {
+            c.apply(
+                report(
+                    &uuid::Uuid::new_v4().to_string(),
+                    1,
+                    RelaySnapshot::default(),
+                ),
+                1000.0,
+            )
+            .unwrap();
+        }
+        let before = serde_json::to_value(&c).unwrap();
+        assert!(c
+            .apply(
+                report(
+                    &uuid::Uuid::new_v4().to_string(),
+                    1,
+                    RelaySnapshot::default()
+                ),
+                1000.0
+            )
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            before,
+            "overflow is atomic"
+        );
+        assert!(
+            !c.apply(report(&first, u64::MAX, RelaySnapshot::default()), 1000.0)
+                .unwrap()
+                .accepted
+        );
+        for oversized in [
+            Report::Hook {
+                event: HookEvent::StopFailure,
+                payload: HookPayload {
+                    error_kind: Some("x".repeat(MAX_TEXT_BYTES + 1)),
+                    ..Default::default()
+                },
+            },
+            Report::Hook {
+                event: HookEvent::UserPromptSubmit,
+                payload: HookPayload {
+                    prompt_id: Some("x".repeat(MAX_ID_BYTES + 1)),
+                    ..Default::default()
+                },
+            },
+        ] {
+            assert!(c.apply(oversized, 1000.0).is_err());
+            assert_eq!(serde_json::to_value(&c).unwrap(), before);
+        }
     }
 
     #[test]

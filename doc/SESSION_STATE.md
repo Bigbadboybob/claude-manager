@@ -144,3 +144,22 @@ report. Accepted turn edges also update the legacy semantic-idle clocks. Changes
 to state, detail, background, turn counters, last turn or stall markers publish
 manifest diffs; observation-only heartbeats do not. Read surfaces and reconnect
 snapshots still return current observation times.
+
+State publication is coalesced to the latest value per session and drained at
+most eight updates per one-second tick, leaving buffer space for lifecycle
+changes. The first observation after brain adoption is seeded silently; each
+subscriber's initial snapshot supplies those states. Large simultaneous changes
+may take several ticks to reach every viewer; direct reads are current.
+
+The sidecar stores restart facts rather than PTY activity clocks or derived-state
+caches. Periodic serialization/fsync runs outside the daemon lock, at most once
+per five seconds, and unchanged records do not rewrite the file. A checked
+restart flush bypasses that debounce and is ordered after any periodic write.
+
+Producer limits: 256 recent prompt IDs (oldest evicted; event timestamps still
+reject late prompts), 64 retired relay epochs, 256 bytes per ID/version/flag,
+4,096 UTF-8 bytes per free-text field, 256 jobs/crons/pending requests, 16 active
+flags and ten ended jobs. Oversized reports are rejected without applying them.
+Retired epoch replay protection is never evicted: after 64 epoch retirements,
+a further fresh epoch is refused until the session restarts; reports from the
+current epoch continue to work.

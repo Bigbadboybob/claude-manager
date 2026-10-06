@@ -2860,6 +2860,8 @@ pub fn session_agent_report(
     if !correct_engine {
         return Err((ErrorCode::InvalidParams, "report kind does not match the session engine".into()));
     }
+    // Establish a pre-report baseline even if the periodic tick has not run yet.
+    crate::agent_state::recompute_and_publish(&state, &p.session_uid);
     let applied = session.agent_state.lock().unwrap_or_else(|p| p.into_inner())
         .apply(p.report, crate::agent_state::unix_now())
         .map_err(|e| (ErrorCode::InvalidParams, e))?;
