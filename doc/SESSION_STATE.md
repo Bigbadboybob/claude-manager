@@ -163,3 +163,27 @@ flags and ten ended jobs. Oversized reports are rejected without applying them.
 Retired epoch replay protection is never evicted: after 64 epoch retirements,
 a further fresh epoch is refused until the session restarts; reports from the
 current epoch continue to work.
+
+## Claude presence reader (S2)
+
+The daemon checks `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, or
+`~/.claude/sessions/<pid>.json`, once per state tick. It requires `kind=interactive`,
+the expected PID, and `procStart` matching a live process. A wrapper with no PID
+file may use one unambiguous interactive descendant. Dead processes, PID reuse,
+malformed files, unknown statuses and a lost previously observed source produce
+`unknown`. Claude versions with no presence file retain the existing fallback.
+Optional fields and unknown metadata such as `tempo` do not override `status`.
+`statusUpdatedAt` is converted from milliseconds to wire-format Unix seconds.
+
+Unchanged files reuse parsed data; process identity is still checked every tick.
+Transcript reads are bounded and cached by path and file metadata. Busy sessions
+without prompt hooks use the tail to distinguish foreground from background
+work; an unreadable tail cannot prove the main turn closed. Error verdicts apply
+only when presence says idle, and clear when a newer prompt replaces the error
+tail. The reader recognizes synthetic API-error tags plus the existing auth and
+usage-limit banners. All file/proc reads run outside the daemon registry lock.
+
+Presence files are limited to 64 KiB; wrapper scans to 4,096 directory entries
+and 64 ancestry links. An incomplete or ambiguous scan returns unknown. Existing
+Claude sessions gain this source on the next brain restart; no session restart
+or MCP reconnect is needed.

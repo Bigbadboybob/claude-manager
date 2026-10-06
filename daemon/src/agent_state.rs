@@ -925,6 +925,7 @@ struct Persistence {
 #[derive(Default)]
 pub struct Runtime {
     publisher: Mutex<Publisher>,
+    presence: Mutex<crate::claude_presence::Reader>,
     // Lock order is persistence gate -> DaemonState. Disk writes keep only the
     // gate; a checked restart waits outside DaemonState and always lands last.
     persistence: Mutex<Persistence>,
@@ -1212,12 +1213,31 @@ pub fn restore(state: &DaemonState) -> std::io::Result<usize> {
 /// Stat transcript/subagent growth outside the daemon mutex; verify cell identity
 /// again before applying, since a UID may have been revived while stat ran.
 pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
-    let probes: Vec<_> = {
+    let (runtime, targets, probes) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         if st.restarting {
             return Ok(());
         }
-        st.sessions
+        let targets: Vec<_> = st
+            .sessions
+            .iter()
+            .filter_map(|(uid, s)| {
+                if s.session_type != "claude-code" || s.last_exit.kernel_set() {
+                    return None;
+                }
+                let cell = s.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+                Some(crate::claude_presence::Target {
+                    uid: uid.clone(),
+                    pid: s.pid as u32,
+                    child_start_time: cell.child_start_time,
+                    transcript: s.transcript_path.as_ref().map(PathBuf::from),
+                    had_presence: cell.inputs.presence.is_some(),
+                    needs_turn_probe: cell.inputs.hooks.prompt_at.is_none(),
+                })
+            })
+            .collect();
+        let probes: Vec<_> = st
+            .sessions
             .iter()
             .map(|(uid, s)| {
                 (
@@ -1226,8 +1246,19 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
                     s.transcript_path.clone(),
                 )
             })
-            .collect()
+            .collect();
+        (Arc::clone(&st.agent_state_runtime), targets, probes)
     };
+    let observations = runtime
+        .presence
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .observe(&targets, unix_now());
+    let mut observations: BTreeMap<_, _> = targets
+        .into_iter()
+        .zip(observations)
+        .map(|(target, observation)| (target.uid, (target.transcript, observation)))
+        .collect();
     let progress: Vec<_> = probes
         .into_iter()
         .map(|(uid, cell, path)| {
@@ -1263,6 +1294,21 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
             {
                 let mut cell = cell.lock().unwrap_or_else(|p| p.into_inner());
                 cell.inputs.last_progress_at = max_time(cell.inputs.last_progress_at, progress_at);
+                if let Some((transcript, Some(observation))) = observations.remove(&uid) {
+                    // A transcript may rotate during the unlocked read. Keep the
+                    // source, but never carry a verdict from the old transcript.
+                    let mut observation = observation;
+                    if st.sessions[&uid]
+                        .transcript_path
+                        .as_ref()
+                        .map(PathBuf::from)
+                        != transcript
+                    {
+                        observation.main_turn_open = None;
+                        observation.transcript_error = None;
+                    }
+                    cell.inputs.presence = Some(observation);
+                }
             }
             recompute_and_publish(&st, &uid);
         }
@@ -1718,6 +1764,56 @@ mod tests {
         let mut state = DaemonState::new();
         state.sessions.insert(session.uid.clone(), session);
         state
+    }
+
+    #[test]
+    fn claude_presence_tick_publishes_status_and_source_loss_for_existing_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(session_state()));
+        let uid = "ts-agent-state";
+        let (pid, identity, rx, _guard) = {
+            let st = state.lock().unwrap();
+            *st.agent_state_runtime.presence.lock().unwrap() = crate::claude_presence::Reader::new(
+                dir.path().to_path_buf(),
+                PathBuf::from("/proc"),
+            );
+            let s = &st.sessions[uid];
+            let identity = s.agent_state.lock().unwrap().child_start_time.unwrap();
+            let (rx, guard) = st.manifest_watcher.subscribe();
+            snapshot(&st);
+            (s.pid, identity, rx, guard)
+        };
+        let path = dir.path().join(format!("{pid}.json"));
+        let since = unix_now().floor() - 10.0;
+        let mut file = serde_json::json!({"pid":pid,"procStart":identity.to_string(),"kind":"interactive","version":"2.1.291","status":"waiting","waitingFor":"permission prompt","statusUpdatedAt":since * 1000.0});
+        std::fs::write(&path, file.to_string()).unwrap();
+        tick(&state).unwrap();
+        let ManifestDiff::Updated { entry, .. } = rx.try_recv().unwrap() else {
+            panic!("state update");
+        };
+        assert_eq!(entry["agent_state"]["state"], "waiting-on-human");
+        assert_eq!(entry["agent_state"]["source"], "presence");
+        assert_eq!(
+            entry["agent_state"]["detail"]["waiting_for"],
+            "permission prompt"
+        );
+        tick(&state).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "unchanged status heartbeat does not publish"
+        );
+        file["status"] = "idle".into();
+        std::fs::write(&path, file.to_string()).unwrap();
+        tick(&state).unwrap();
+        let next = current(&state.lock().unwrap().sessions[uid]);
+        assert_eq!(next.state, State::Idle);
+        assert_eq!(next.since, since);
+        std::fs::remove_file(&path).unwrap();
+        tick(&state).unwrap();
+        assert_eq!(
+            current(&state.lock().unwrap().sessions[uid]).state,
+            State::Unknown
+        );
     }
 
     #[test]
