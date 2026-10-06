@@ -160,7 +160,7 @@ Adding a project creates a `proposed` membership. Activation of a cross-project 
 
 ### Task and subtask launch
 
-Task launch continues to use the existing task/session authorization model. Initiative membership supplies context and filtering; it does not grant global session permissions or authorize an agent to spawn arbitrary tasks. The `setup-project` skill remains responsible for the conversational Owner gate before creating and launching initial subtasks.
+Task launch continues to use the existing task/session authorization model. Initiative membership supplies context and filtering; it does not grant global session permissions or authorize an agent to spawn arbitrary tasks. The `setup-initiative` skill remains responsible for the conversational Owner gate before creating and launching initial subtasks.
 
 ### Audit
 
@@ -239,7 +239,7 @@ The initiative object points to, but does not replace, git-backed coordination f
 
 `CHARTER.md` is the Owner-approved purpose and boundaries. `PLAN.md` tracks tasks, milestones, decisions, and open questions. `PROTOCOL.md` defines merge, communication, verification, and checkpoint rules. `PROJECTS.md` maps project names to worktrees, coordinator tasks, and channels. `shared/` contains artifacts used by more than one project side.
 
-The existing `project-setup` skill remains appropriate for a single codebase hub. The `setup-project` skill is the initiative entry point and calls the initiative API; `cm-initiative/` and channels are the git-backed and communication surfaces attached to the first-class record.
+The existing `project-setup` skill remains appropriate for a single codebase hub. The `setup-initiative` skill is the initiative entry point and calls the initiative API; `cm-initiative/` and channels are the git-backed and communication surfaces attached to the first-class record.
 
 ## 11. TUI planning experience
 
@@ -290,7 +290,7 @@ No new “swarm” or “workstream” column is needed.
 2. **API model:** add Pydantic models, CRUD, membership validation, lifecycle authorization, task filters, and response summaries.
 3. **MCP:** add read/propose tools and initiative-aware task/subtask fields. Keep old task calls valid.
 4. **TUI:** render initiative labels and hierarchy, then add create/edit/approve flows.
-5. **Skill:** update `setup-project` to create a draft initiative, wait for charter and plan approval, approve/provision channels, and attach tasks by `initiative_id`.
+5. **Skill:** update `setup-initiative` to create a draft initiative, wait for charter and plan approval, approve/provision channels, and attach tasks by `initiative_id`.
 6. **First migration:** create the Swarm Design initiative as a draft, attach Claude Manager and Prediction Trading as proposed memberships, review the charter, then activate it through the Owner flow.
 7. **Backfill:** do not guess initiative membership for existing tasks. They remain standalone until explicitly attached.
 

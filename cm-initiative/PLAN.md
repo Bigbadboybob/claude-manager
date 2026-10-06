@@ -1,8 +1,11 @@
 # Swarm Focused Design — Work plan
 
-Status: **Initial exploration authorized; planning remains interactive**,
-2026-09-10. Owner supplied the initial directions below and then briefed
-Swarm-Gardener directly with the research sequence recorded here. The
+Status: **New predictionTrading swarms paused by Owner, 2026-10-06.** The
+P1–P8 proposals and the [Owner review guide](https://github.com/Bigbadboybob/predictionTrading/blob/74090499c/agent_docs/swarm-focused-design/OWNER-REVIEW.md)
+are kept as-is for later; no round is selected. Owner's token budget and current
+priority go to the execution-pipeline work. The active thread here is CM
+coordination support for existing orchestrators: see the
+[coordination brief](shared/coordination-brief.md). The
 [charter](CHARTER.md) remains the agreed goal. Infrastructure history is in
 [SETUP.md](SETUP.md); it is not the substantive work plan.
 
@@ -336,3 +339,12 @@ These are discussion topics, not a prerequisite questionnaire for Owner.
   an applied receipt, and no pending request. Both coordinators and all nine
   research scouts are now grouped. [SETUP.md](SETUP.md) records the evidence;
   setup is complete, with candidate selection still an interactive Owner step.
+
+- **2026-10-06 — Owner:** after a pause of about three weeks, paused starting
+  new predictionTrading swarms. The OWNER-REVIEW guide is good and stays the
+  entry point when this resumes; no proposal or first round is selected, and
+  Swarm-Gardener has no open work. Reason: limited token budget and higher
+  priority on the execution-pipeline initiative. Owner asked Swarm-Coord (new
+  coordinator session) to draft a CM brief on tracking small units of
+  orchestrated work, Owner availability and notification rules, drawn from
+  Owner's notes and EP's 2026-10-06 handoff; Owner is reviewing it.
