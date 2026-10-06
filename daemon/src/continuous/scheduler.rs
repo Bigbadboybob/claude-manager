@@ -1426,7 +1426,12 @@ impl ContinuousScheduler {
             };
             let tail = match tk.engine {
                 task::Engine::Claude => probe::probe_transcript_tail(&path),
-                task::Engine::Codex => crate::continuous::codex_probe::probe(&path, run.started_at.max(tk.last_fired_at) as f64),
+                task::Engine::Codex => {
+                    let after = run.started_at.max(tk.last_fired_at) as f64;
+                    crate::continuous::codex_probe::prefer_relay(
+                        crate::continuous::codex_probe::probe(&path, after),
+                        self.codex_relay_finished(uid, after, now as f64))
+                },
                 task::Engine::Bash => None,
             };
             let Some(tail) = tail else {
@@ -1983,7 +1988,10 @@ impl ContinuousScheduler {
                 let input = *session.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
                 input.map(|at| crate::control::methods::now_unix_f64() - at.elapsed().as_secs_f64()).unwrap_or(0.0)
             };
-            let Some(tail) = crate::continuous::codex_probe::probe(&path, after.max(tk.last_fired_at as f64)) else { return; };
+            let after = after.max(tk.last_fired_at as f64);
+            let Some(tail) = crate::continuous::codex_probe::prefer_relay(
+                crate::continuous::codex_probe::probe(&path, after),
+                self.codex_relay_finished(uid, after, now as f64)) else { return; };
             if tail.shape == crate::continuous::probe::TailShape::MidTurn || tail.auth_error.is_some() || tail.usage_limit.is_some() || tail.pool_unavailable.is_some() { return; }
         }
         let mut closed = false;
@@ -2492,6 +2500,13 @@ impl ContinuousScheduler {
             .sessions
             .get(uid)
             .map_or(true, |s| s.last_exit.kernel_set())
+    }
+
+    fn codex_relay_finished(&self, uid: &str, after: f64, now: f64) -> Option<bool> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let session = state.sessions.get(uid)?;
+        let cell = session.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+        crate::continuous::completion::codex_relay_finished_after(&cell, after, now)
     }
 
     /// Brief, read-only lookup of a session's resolved transcript path — used by
@@ -4576,7 +4591,24 @@ mod tests {
             let journal = crate::path::dot_cm_dir().join("monitor-state").join(format!("{uid}.json"));
             std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
             std::fs::write(&journal, serde_json::json!({"schema_version":1,"coverage_version":1,"session_uid":uid,"revision":1,"producers":{"p":{"records":{}}}}).to_string()).unwrap();
+            let tick = now + TAIL_PROBE_INTERVAL_SECS + 1;
+            let cell = Arc::clone(&state.lock().unwrap().sessions[uid].agent_state);
+            cell.lock().unwrap().inputs.relay = Some(crate::agent_state::RelaySnapshot {
+                backend_connected: true, foreground: crate::agent_state::RelayStatus::Active,
+                observed_at: tick as f64,
+                last_turn: crate::agent_state::LastTurn { ended_at: Some(tick as f64 - 1.0), status: Some(crate::agent_state::TurnStatus::Completed) },
+                ..Default::default()
+            });
             sched.auth_wedge_pass(&task::load_all(), now + TAIL_PROBE_INTERVAL_SECS + 1);
+            assert_eq!(task::load_one(&t.task_id).unwrap().last_run.unwrap().status, RunStatus::Running, "active relay overrides old rollout completion");
+            let tick = tick + TAIL_PROBE_INTERVAL_SECS + 1;
+            {
+                let mut cell = cell.lock().unwrap();
+                let relay = cell.inputs.relay.as_mut().unwrap();
+                relay.foreground = crate::agent_state::RelayStatus::Idle;
+                relay.observed_at = tick as f64;
+            }
+            sched.auth_wedge_pass(&task::load_all(), tick);
             let closed = task::load_one(&t.task_id).unwrap();
             assert_eq!(closed.last_run.as_ref().unwrap().status, RunStatus::Failed);
             assert_eq!(closed.recovery_hold.as_ref().unwrap().run_seq, 1);

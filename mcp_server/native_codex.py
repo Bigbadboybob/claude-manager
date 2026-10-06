@@ -28,6 +28,7 @@ from websockets.asyncio.server import unix_serve
 from websockets.exceptions import ConnectionClosed
 
 from mcp_server import control_client
+from mcp_server.codex_state import CodexState, selectable
 from mcp_server.notifications import (
     NotSubmitted,
     Queue,
@@ -112,6 +113,21 @@ def apply_launch_permissions(params, policy):
     return params
 
 
+class NativeRPCError(RuntimeError):
+    def __init__(self, error):
+        super().__init__("Codex rejected native RPC")
+        self.error = error
+
+    @property
+    def unsupported(self):
+        message = self.error.get("message", "")
+        return self.error.get("code") == -32601 or (
+            self.error.get("code") == -32600
+            and "thread/backgroundTerminals/list" in message
+            and "unknown variant" in message
+        )
+
+
 class Relay:
     engine = "codex"
 
@@ -135,7 +151,14 @@ class Relay:
         self.reader = None
         self.identity_revision = 0
         self.selecting = set()
-        self.report_tasks = set()
+        self.state = CodexState()
+        self.report_epoch = str(uuid.uuid4())
+        self.report_seq = 0
+        self.report_dirty = asyncio.Event()
+        self.background_dirty = asyncio.Event()
+        self.publisher = None
+        self.background_poller = None
+        self.background_supported = None
         self.launch_permissions = permissions
 
     def identity(self):
@@ -159,6 +182,9 @@ class Relay:
             open_timeout=5,
         )
         self.connected.set()
+        self.state.connection(True)
+        self.publisher = asyncio.create_task(self.publish_state())
+        self.background_poller = asyncio.create_task(self.poll_background())
         self.reader = asyncio.create_task(self.read())
 
     async def call(self, method: str, params: dict, timeout=30):
@@ -174,7 +200,8 @@ class Relay:
             )
             result = await asyncio.wait_for(future, timeout)
             if "error" in result:
-                raise RuntimeError("Codex rejected native RPC")
+                raise NativeRPCError(result["error"])
+            self.observe(result, method=method, params=params)
             return result["result"]
         finally:
             self.pending.pop(request_id, None)
@@ -184,29 +211,78 @@ class Relay:
             with suppress(ConnectionClosed):
                 await self.frontend.send(json.dumps(message))
 
-    def report(self, continuing: bool):
-        if not self.thread:
-            return
-        params = {
-            "session_uid": self.queue.uid,
-            "continuing": continuing,
-            "transcript_path": self.thread.get("path"),
-        }
+    def observe(self, message, *, method=None, params=None, select=False):
+        self.state.observe(message, time.time(), method=method, params=params, select=select)
+        # Streaming deltas carry no state; avoid a daemon RPC per token.
+        if method in {"initialize", "thread/start", "thread/resume", "thread/fork", "thread/read", "turn/start"} or message.get("method") in {
+            "thread/started", "thread/status/changed", "turn/started", "turn/completed",
+            "error", "serverRequest/resolved",
+        } or ("id" in message and "method" in message):
+            self.report_dirty.set()
+        if select or message.get("method") == "turn/completed":
+            self.background_dirty.set()
 
-        async def work():
-            # Registry publication can race the initial frontend handshake.
-            for _ in range(10):
-                try:
-                    await asyncio.to_thread(
-                        control_client.call, "session.turn_ended", params, timeout=2
-                    )
-                    return
-                except (control_client.ControlError, control_client.TransportError):
-                    await asyncio.sleep(0.5)
+    async def publish_state(self):
+        """One in-flight call. A retry always takes the latest model value."""
+        delay = 0.5
+        while not self.closing:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self.report_dirty.wait(), 30)
+            self.report_dirty.clear()
+            if not self.state.foreground:
+                continue
+            self.report_seq += 1
+            params = {"session_uid": self.queue.uid, "kind": "snapshot",
+                      "epoch": self.report_epoch, "seq": self.report_seq,
+                      "snapshot": self.state.snapshot()}
+            try:
+                await asyncio.to_thread(control_client.call, "session.agent_report", params, timeout=2)
+                delay = 0.5
+            except (control_client.ControlError, control_client.TransportError):
+                self.report_dirty.set()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 5)
 
-        task = asyncio.create_task(work())
-        self.report_tasks.add(task)
-        task.add_done_callback(self.report_tasks.discard)
+    async def poll_background(self):
+        while not self.closing:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self.background_dirty.wait(), 30)
+            self.background_dirty.clear()
+            if not self.connected.is_set() or not self.state.foreground or self.background_supported is False:
+                continue
+            uid = self.state.foreground
+            rows, cursors, cursor = [], set(), None
+            complete = False
+            try:
+                for _ in range(16):
+                    result = await self.call("thread/backgroundTerminals/list", {
+                        "threadId": uid, "cursor": cursor, "limit": 100,
+                    }, timeout=5)
+                    if not isinstance(result, dict):
+                        break
+                    page = result.get("data")
+                    if not isinstance(page, list) or not all(isinstance(t, dict) for t in page):
+                        break
+                    self.background_supported = True
+                    rows.extend(page)
+                    if "nextCursor" not in result:
+                        break
+                    cursor = result.get("nextCursor")
+                    if len(rows) > 256:
+                        break
+                    if cursor is None:
+                        complete = True
+                        break
+                    if not isinstance(cursor, str) or cursor in cursors:
+                        break
+                    cursors.add(cursor)
+            except NativeRPCError as exc:
+                if exc.unsupported:
+                    self.background_supported = False
+            except (TimeoutError, ConnectionError, ConnectionClosed, OSError, NotSubmitted):
+                pass
+            self.state.background(uid, rows, time.time(), complete=complete)
+            self.report_dirty.set()
 
     async def read(self):
         while not self.closing:
@@ -214,6 +290,8 @@ class Relay:
             if self.closing:
                 return
             self.connected.clear()
+            self.state.connection(False)
+            self.report_dirty.set()
             self.queue.health(self.engine, "disconnected", **self.identity())
             for request_id in list(self.requests):
                 await self.to_frontend(
@@ -257,7 +335,10 @@ class Relay:
                 ):
                     if "error" in message:
                         raise RuntimeError("native reconnect rejected")
+                    self.observe(message, method=method, params=params)
                     return message["result"]
+                self.observe(message)
+                self.track_server_request(message)
                 await self.to_frontend(message)
 
         try:
@@ -276,6 +357,9 @@ class Relay:
                     }
                     self.ready.set()
             self.connected.set()
+            self.state.connection(True)
+            self.report_dirty.set()
+            self.background_dirty.set()
             self.queue.health(self.engine, self.health_status(), **self.identity())
         except BaseException:
             await self.upstream.close()
@@ -293,11 +377,16 @@ class Relay:
                     if not future.done():
                         future.set_result(message)
                     continue
-                method = (
+                if isinstance(request_id, str) and request_id.startswith(self.prefix):
+                    # A timed-out poll may reply later. Relay-owned IDs never
+                    # enter the terminal frontend's RPC namespace.
+                    continue
+                request = (
                     self.requests.pop(request_id, None)
                     if "result" in message or "error" in message
                     else None
                 )
+                method, request_params = request if request else (None, None)
                 if method == "initialize" and "result" in message:
                     self.init_result = message["result"]
                 if method in {"thread/start", "thread/resume", "thread/fork"}:
@@ -306,9 +395,7 @@ class Relay:
                     # Codex's TUI also starts ephemeral title-generation jobs.
                     # Those are never the operator's conversation.
                     if (
-                        thread
-                        and not thread.get("ephemeral")
-                        and not thread.get("parentThreadId")
+                        thread and selectable(thread)
                     ):
                         self.thread = {
                             key: thread.get(key) for key in ("id", "path", "status")
@@ -316,17 +403,9 @@ class Relay:
                         self.identity_revision += 1
                         self.ready.set()
                         self.queue.health(self.engine, "ready", **self.identity())
-                        self.report(thread.get("status", {}).get("type") == "active")
-                event = message.get("method")
-                params = message.get("params", {})
-                if event in {"turn/started", "turn/completed"} and params.get(
-                    "threadId"
-                ) == (self.thread or {}).get("id"):
-                    self.report(event == "turn/started")
-                if "id" in message and "method" in message:
-                    self.server_requests[request_id] = message
-                if event == "serverRequest/resolved":
-                    self.server_requests.pop(params.get("requestId"), None)
+                self.observe(message, method=method, params=request_params,
+                             select=method in {"thread/start", "thread/resume", "thread/fork"})
+                self.track_server_request(message)
                 await self.to_frontend(message)
         except (ConnectionClosed, OSError, ValueError):
             pass
@@ -337,6 +416,12 @@ class Relay:
                     future.set_exception(
                         ConnectionError("native backend connection lost")
                     )
+
+    def track_server_request(self, message):
+        if "id" in message and "method" in message:
+            self.server_requests[message["id"]] = message
+        if message.get("method") == "serverRequest/resolved":
+            self.server_requests.pop(message.get("params", {}).get("requestId"), None)
 
     async def detached_for(self, grace):
         """Resolve once no terminal frontend has been attached for `grace` seconds."""
@@ -387,7 +472,7 @@ class Relay:
                         message["params"] = apply_launch_permissions(
                             message.get("params", {}), self.launch_permissions
                         )
-                    self.requests[request_id] = method
+                    self.requests[request_id] = (method, message.get("params", {}))
                     if method in {
                         "thread/start",
                         "thread/resume",
@@ -466,9 +551,10 @@ class Relay:
         if self.reader:
             self.reader.cancel()
             await asyncio.gather(self.reader, return_exceptions=True)
-        for task in list(self.report_tasks):
+        tasks = [t for t in (self.publisher, self.background_poller) if t]
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*self.report_tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def split_args(args, permissions=None):

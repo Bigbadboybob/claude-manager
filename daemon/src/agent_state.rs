@@ -123,7 +123,9 @@ impl Background {
         // A missing job proves an ending only when both enumerations are complete.
         if self.complete && next.complete {
             for old in &self.jobs {
-                if !next.jobs.iter().any(|job| job.id == old.id) {
+                if !next.jobs.iter().any(|job| job.id == old.id)
+                    && !next.ended.iter().any(|end| end.id == old.id && end.ended_at >= old.first_seen_at)
+                {
                     self.ended.push(EndedJob {
                         id: old.id.clone(),
                         label: old.label.clone(),
@@ -1400,6 +1402,39 @@ mod tests {
             seq,
             snapshot,
         }
+    }
+
+    #[test]
+    fn recorded_codex_relay_snapshots_apply_to_the_wire_contract() {
+        for (wire, expected) in [
+            (include_str!("../tests/fixtures/codex-0.160.1/snapshot-background.json"), State::WorkingBackground),
+            (include_str!("../tests/fixtures/codex-0.160.1/snapshot-waiting.json"), State::WaitingOnHuman),
+        ] {
+            let snapshot: RelaySnapshot = serde_json::from_str(wire).unwrap();
+            let now = snapshot.turn_started_at.unwrap().max(snapshot.last_turn.ended_at.unwrap_or(0.0)) + 30.0;
+            let mut cell = StateCell::new(now - 120.0, None);
+            cell.apply(report(&uuid::Uuid::new_v4().to_string(), 1, snapshot), now).unwrap();
+            assert_eq!(cell.recompute(now).state, expected);
+        }
+    }
+
+    #[test]
+    fn relay_terminal_end_is_not_duplicated_at_daemon_receipt_time() {
+        let snapshot: RelaySnapshot = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.160.1/snapshot-background.json"
+        )).unwrap();
+        let mut background = snapshot.background;
+        let job = &background.jobs[0];
+        let ended_at = job.first_seen_at + 10.0;
+        let next = Background {
+            complete: true, observed_at: Some(ended_at),
+            ended: vec![EndedJob { id: job.id.clone(), label: job.label.clone(), ended_at }],
+            ..Default::default()
+        };
+        background.update(next.clone(), ended_at + 2.0);
+        background.update(next, ended_at + 3.0);
+        assert_eq!(background.ended.len(), 1);
+        assert_eq!(background.ended[0].ended_at, ended_at);
     }
     fn hook(event: HookEvent, at: f64) -> Report {
         Report::Hook {

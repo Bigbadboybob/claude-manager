@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -18,7 +19,8 @@ sys.path[:0] = [
     str(REPO),
     str(REPO / "doc/messaging/research/native-delivery-2026-09-07/codex"),
 ]
-os.environ["CM_CODEX_RESEARCH_ROOT"] = tempfile.mkdtemp(prefix="cm-native-protocol-")
+if "CM_CODEX_RESEARCH_ROOT" not in os.environ:
+    os.environ["CM_CODEX_RESEARCH_ROOT"] = tempfile.mkdtemp(prefix="cm-native-protocol-")
 os.environ.setdefault("CM_CODEX_BIN", shutil.which("codex") or "codex")
 from harness import BIN, Mock, ROOT, config, make_env
 from ws_appserver_tui import WSRPC
@@ -30,7 +32,16 @@ from mcp_server import control_client
 
 # This protocol fixture has no daemon. Never inherit the developer session's
 # control socket for synthetic turn-state reports.
-control_client.call = lambda *_args, **_kwargs: {"ok": True}
+reports = []
+
+
+def capture_report(method, params, **kwargs):
+    assert method == "session.agent_report"
+    reports.append(params)
+    return {"ok": True}
+
+
+control_client.call = capture_report
 
 
 async def main():
@@ -120,6 +131,50 @@ async def main():
                 for r in model.requests
             )
             assert result["active_checkpoint"]
+            await eventually(lambda: reports and reports[-1]["snapshot"]["last_turn"]["status"] == "completed")
+            assert relay.state.snapshot()["foreground"] == "idle"
+            assert relay.state.snapshot()["turn_seq"] >= 1
+            assert relay.state.snapshot()["engine_version"] in subprocess.check_output([BIN, "--version"], text=True)
+            await eventually(lambda: relay.state.background_complete or relay.background_supported is False)
+            result["relay_completion_and_background_probe"] = {
+                "background_supported": relay.background_supported,
+                "turn_seq": relay.state.turn_seq,
+            }
+
+            # A yielded command outlives the foreground turn. The experimental
+            # terminal list must expose it and later record its disappearance.
+            first_background = True
+
+            async def background_reply(request, data, number):
+                nonlocal first_background
+                if first_background:
+                    first_background = False
+                    return await model.reply(request, tool={
+                        "name": "exec", "namespace": "functions",
+                        "input": 'text(await tools.exec_command({cmd:"sleep 4; echo BACKGROUND_DONE",yield_time_ms:1000}));',
+                    })
+                return await model.reply(request, "BACKGROUND_STARTED")
+
+            model.handler = background_reply
+            position = len(client.events)
+            await client.call("turn/start", {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "BACKGROUND_FIXTURE"}],
+            })
+            await client.wait_event("turn/completed", after=position)
+            await eventually(lambda: relay.state.snapshot()["background"]["jobs"])
+            job = relay.state.snapshot()["background"]["jobs"][0]
+            assert job["kind"] == "terminal" and job["id"]
+            assert job["wakes_agent"] is False
+            foreground_turns = relay.state.turn_seq
+            await asyncio.sleep(4)
+            relay.background_dirty.set()
+            await eventually(lambda: relay.state.snapshot()["background"]["ended"])
+            assert relay.state.turn_seq == foreground_turns
+            result["background_terminal_appears_and_ends_without_wake"] = {
+                "passed": True, "pid_available": job.get("pid") is not None,
+            }
+            model.handler = reply
 
             # Drop only the bridge connection. The model backend/process/thread
             # stays in place; reconnect must not create a second conversation.
@@ -211,6 +266,7 @@ async def main():
             await eventually(lambda: queue.get("approval")["status"] == "submitted")
             await asyncio.sleep(0.25)
             assert request["id"] in relay.server_requests
+            assert any(r["kind"] == "approval" for r in relay.state.snapshot()["pending_requests"])
             assert not any(
                 e.get("method") == "turn/completed"
                 and e.get("params", {}).get("threadId") == approval_id
@@ -219,6 +275,12 @@ async def main():
             await client.send({"id": request["id"], "result": {"decision": "accept"}})
             await client.wait_event("turn/completed", after=position, timeout=15)
             result["approval_preserved_and_routed"] = True
+            await eventually(lambda: not relay.state.snapshot()["pending_requests"])
+            await eventually(lambda: reports[-1]["snapshot"]["foreground"] == "idle")
+            assert all(b["seq"] > a["seq"] for a, b in zip(reports, reports[1:]))
+            assert len({r["epoch"] for r in reports}) == 1
+            result["ordered_snapshots"] = len(reports)
+            (directory / "state-reports.json").write_text(json.dumps(reports, indent=2))
             print(json.dumps(result, indent=2), flush=True)
             (directory / "results.json").write_text(json.dumps(result, indent=2))
             await client.close()

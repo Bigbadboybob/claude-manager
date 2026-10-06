@@ -132,6 +132,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # Session-caller self-target; feeds `semantic_idle` in
     # resolve_authorized_session. No TUI handler — always daemon-routed.
     "session.turn_ended",
+    "session.agent_report",
     # PTY resize (TIOCSWINSZ). Operator-only, TUI-called over the daemon
     # socket on (re)attach; no MCP tool routes it. Listed for dispatch-
     # surface alignment only.

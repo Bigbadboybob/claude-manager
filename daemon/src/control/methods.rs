@@ -13818,8 +13818,11 @@ pub(crate) fn capture_drain_sessions(
             if let Some(s) = state.sessions.get(&uid) {
                 let done = s.reported_done();
                 if s.session_type == "codex" {
-                    if let (Some(path), Some(report)) = (&s.transcript_path, &done) {
-                        codex_checks.push((uid.clone(), path.clone(), report.at_unix));
+                    if let Some(report) = &done {
+                        let finished = crate::continuous::completion::codex_relay_finished_after(
+                            &s.agent_state.lock().unwrap_or_else(|p| p.into_inner()),
+                            report.at_unix, now_unix_f64());
+                        codex_checks.push((uid.clone(), s.transcript_path.clone(), report.at_unix, finished));
                     }
                 }
                 let end = *s.last_turn_end_at.lock().unwrap_or_else(|p| p.into_inner());
@@ -13852,9 +13855,10 @@ pub(crate) fn capture_drain_sessions(
         observations.sort_by(|a, b| a.session_uid.cmp(&b.session_uid));
         observations
     };
-    for (uid, path, after) in codex_checks {
+    for (uid, path, after, relay_finished) in codex_checks {
         if let Some(session) = sessions.iter_mut().find(|s| s.session_uid == uid) {
-            session.final_turn_ended = crate::continuous::completion::codex_turn_finished_after(&path, after);
+            session.final_turn_ended = relay_finished.unwrap_or_else(|| path.is_some_and(|path|
+                crate::continuous::completion::codex_turn_finished_after(&path, after)));
         }
     }
     sessions

@@ -1,4 +1,4 @@
-//! Codex rollout observations grounded in the pinned 0.153.4 fixtures.
+//! Codex rollout observations grounded in 0.153.4 and 0.160.1 fixtures.
 //! Errors must come from runtime error objects, never assistant prose.
 use super::probe::{TailProbe, TailShape};
 use serde_json::Value;
@@ -42,6 +42,48 @@ pub fn classify_error(error: &Value) -> ErrorKind {
     }
 }
 
+/// Known bookkeeping only. Unknown records still block an older completion.
+/// Shared with drain completion so the two readers cannot drift apart.
+pub(super) fn bookkeeping(value: &Value) -> bool {
+    let top = value.get("type").and_then(Value::as_str).unwrap_or("");
+    let kind = value.pointer("/payload/type").and_then(Value::as_str).unwrap_or("");
+    matches!((top, kind),
+        ("session_meta" | "token_usage_record" | "world_state" | "turn_context"
+        | "compacted" | "inter_agent_communication_metadata", _)
+        | ("event_msg", "token_count" | "thread_settings_applied" | "thread_goal_updated")
+        | ("response_item", "agent_message"))
+        || (top == "event_msg" && kind == "item_completed"
+            && matches!(value.pointer("/payload/item/type").and_then(Value::as_str),
+                Some("ContextCompaction" | "SubAgentActivity" | "FileChange"
+                | "CollabAgentToolCall" | "Extension" | "ImageView")))
+}
+
+/// Require relay completion when available, retaining runtime account/pool holds.
+/// None means a legacy session; false includes unavailable authoritative state.
+pub fn prefer_relay(tail: Option<TailProbe>, finished: Option<bool>) -> Option<TailProbe> {
+    if tail.as_ref().is_some_and(|t| t.auth_error.is_some() || t.usage_limit.is_some()
+        || t.pool_unavailable.is_some() || t.api_error.is_some()) {
+        return tail;
+    }
+    match finished {
+        None => tail,
+        Some(finished) => {
+            // Unclassified runtime errors/unknown records remain a hold even
+            // when a preceding relay completion is still within its TTL.
+            let mut tail = tail?;
+            // The relay heartbeat may precede a newly written prompt/tool.
+            // Conflicting active evidence must not become completion merely
+            // because an older snapshot is still within its freshness window.
+            tail.shape = if finished && tail.shape == TailShape::TurnComplete {
+                TailShape::TurnComplete
+            } else {
+                TailShape::MidTurn
+            };
+            Some(tail)
+        }
+    }
+}
+
 /// Newest substantive event after this run's delivery. Unknown/partial JSON
 /// cannot be skipped to discover an older completion behind active work.
 pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
@@ -62,15 +104,12 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
         .take(200)
     {
         let value: Value = serde_json::from_str(line).ok()?;
+        if bookkeeping(&value) {
+            continue;
+        }
         let top = value.get("type")?.as_str()?;
         let payload = value.get("payload")?;
         let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
-        if matches!(
-            (top, kind),
-            ("event_msg", "token_count") | ("session_meta", _) | ("token_usage_record", _)
-        ) {
-            continue;
-        }
         let stamp = value.get("timestamp")?.as_str()?;
         if !stamp.ends_with('Z') {
             return None;
@@ -165,6 +204,53 @@ mod tests {
     const UNKNOWN: &str = include_str!("../../tests/fixtures/codex-0.153.4/model_not_found.jsonl");
 
     #[test]
+    fn relay_preference_preserves_account_pool_and_unknown_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        for fixture in [AUTH, USAGE, include_str!("../../tests/fixtures/codex-0.153.4/pool_unavailable.jsonl")] {
+            std::fs::write(&path, fixture).unwrap();
+            let tail = prefer_relay(probe(&path, 0.0), Some(true)).unwrap();
+            assert!(tail.auth_error.is_some() || tail.usage_limit.is_some() || tail.pool_unavailable.is_some());
+        }
+        std::fs::write(&path, UNKNOWN).unwrap();
+        assert!(prefer_relay(probe(&path, 0.0), Some(true)).is_none());
+        std::fs::write(&path, SUCCESS).unwrap();
+        assert_eq!(prefer_relay(probe(&path, 0.0), Some(false)).unwrap().shape, TailShape::MidTurn);
+        let user = serde_json::json!({"timestamp":"2026-10-06T22:00:00Z", "type":"event_msg", "payload":{"type":"user_message","message":"new work"}});
+        std::fs::write(&path, format!("{SUCCESS}\n{user}\n")).unwrap();
+        assert_eq!(prefer_relay(probe(&path, 0.0), Some(true)).unwrap().shape, TailShape::MidTurn);
+    }
+
+    #[test]
+    fn newer_bookkeeping_is_shared_with_completion_unknown_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let complete = r#"{"timestamp":"2026-10-06T22:00:00.500Z","type":"event_msg","payload":{"type":"task_complete"}}"#;
+        let mut rows = Vec::new();
+        for top in ["world_state", "turn_context", "compacted", "inter_agent_communication_metadata"] {
+            rows.push(serde_json::json!({"type":top,"payload":{}}));
+        }
+        for kind in ["thread_settings_applied", "thread_goal_updated"] {
+            rows.push(serde_json::json!({"type":"event_msg","payload":{"type":kind}}));
+        }
+        rows.push(serde_json::json!({"type":"response_item","payload":{"type":"agent_message"}}));
+        for kind in ["ContextCompaction", "SubAgentActivity", "FileChange", "CollabAgentToolCall", "Extension", "ImageView"] {
+            rows.push(serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":kind}}}));
+        }
+        for row in rows {
+            std::fs::write(&path, format!("{complete}\n{row}\n")).unwrap();
+            assert_eq!(probe(&path, 0.0).unwrap().shape, TailShape::TurnComplete);
+            assert!(super::super::completion::codex_turn_finished_after(path.to_str().unwrap(), 0.0));
+        }
+        for row in [serde_json::json!({"type":"new_unknown","payload":{}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UnknownTool"}}})] {
+            std::fs::write(&path, format!("{complete}\n{row}\n")).unwrap();
+            assert!(probe(&path, 0.0).is_none());
+            assert!(!super::super::completion::codex_turn_finished_after(path.to_str().unwrap(), 0.0));
+        }
+    }
+
+    #[test]
     fn server_overloaded_is_a_transient_pool_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
@@ -231,6 +317,8 @@ mod tests {
         let path = dir.path().join("rollout.jsonl");
         for (fixture, auth, usage) in [
             (SUCCESS, false, false),
+            (include_str!("../../tests/fixtures/codex-0.160.1/success-background.jsonl"), false, false),
+            (include_str!("../../tests/fixtures/codex-0.160.1/approval-success.jsonl"), false, false),
             (AUTH, true, false),
             (USAGE, false, true),
         ] {
@@ -239,6 +327,7 @@ mod tests {
             assert_eq!(result.shape, TailShape::TurnComplete);
             assert_eq!(result.auth_error.is_some(), auth);
             assert_eq!(result.usage_limit.is_some(), usage);
+            assert_eq!(super::super::completion::codex_turn_finished_after(path.to_str().unwrap(), 0.0), !auth && !usage);
             assert!(
                 probe(&path, 2_000_000_000.0).is_none(),
                 "an old turn cannot close a newer delivery"

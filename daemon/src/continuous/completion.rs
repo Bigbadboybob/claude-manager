@@ -172,6 +172,22 @@ pub fn load_session_monitors(
     evidence
 }
 
+/// An observed relay remains authoritative when stale/disconnected: that is
+/// unknown, never permission to fall back to an older rollout completion.
+pub fn codex_relay_finished_after(cell: &crate::agent_state::StateCell, after: f64, now: f64) -> Option<bool> {
+    use crate::agent_state::{RelayStatus, RequestKind, TurnStatus};
+    let relay = cell.inputs.relay.as_ref()?;
+    Some(after.is_finite() && relay.backend_connected && now - relay.observed_at <= 90.0
+        && relay.foreground == RelayStatus::Idle && !relay.child_active
+        && relay.background.jobs.is_empty()
+        && !relay.pending_requests.iter().any(|r| matches!(r.kind, RequestKind::Approval | RequestKind::UserInput | RequestKind::Elicitation))
+        && !relay.active_flags.iter().any(|f| matches!(f.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
+        && relay.last_turn.status == Some(TurnStatus::Completed)
+        && relay.last_turn.ended_at.is_some_and(|end| end >= after
+            && cell.inputs.latest_start.is_none_or(|start| start <= end)
+            && relay.turn_started_at.is_none_or(|start| start <= end)))
+}
+
 /// Codex's explicit task_complete after the latest input/report. Bookkeeping
 /// after completion is harmless; a new prompt, tool call, or partial JSON is
 /// not. Bound the read and use the bound rollout path (including /compact).
@@ -194,6 +210,9 @@ pub fn codex_turn_finished_after(path: &str, after: f64) -> bool {
             .take(200)
         {
             let record: serde_json::Value = serde_json::from_str(line).ok()?;
+            if super::codex_probe::bookkeeping(&record) {
+                continue;
+            }
             let top = record.get("type")?.as_str()?;
             let kind = record
                 .pointer("/payload/type")
@@ -214,7 +233,6 @@ pub fn codex_turn_finished_after(path: &str, after: f64) -> bool {
                     let ms = crate::workflow::history::iso8601_to_ms(stamp)?;
                     return Some(ms as f64 >= (after * 1000.0).ceil());
                 }
-                ("event_msg", "token_count") | ("session_meta", _) => {}
                 _ => return Some(false),
             }
         }
@@ -226,6 +244,46 @@ pub fn codex_turn_finished_after(path: &str, after: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_completion_rejects_new_input_stale_waiting_and_background_work() {
+        use crate::agent_state::{LastTurn, RelaySnapshot, RelayStatus, StateCell, TurnStatus};
+        let mut cell = StateCell::new(100.0, None);
+        assert_eq!(codex_relay_finished_after(&cell, 100.0, 103.0), None);
+        cell.inputs.relay = Some(RelaySnapshot {
+            backend_connected: true, foreground: RelayStatus::Idle,
+            observed_at: 102.0, turn_started_at: Some(100.0),
+            last_turn: LastTurn { ended_at: Some(102.0), status: Some(TurnStatus::Completed) },
+            ..Default::default()
+        });
+        assert_eq!(codex_relay_finished_after(&cell, 101.0, 103.0), Some(true));
+        assert_eq!(codex_relay_finished_after(&cell, 103.0, 103.0), Some(false));
+        assert_eq!(codex_relay_finished_after(&cell, 101.0, 193.0), Some(false));
+        cell.note_input(103.0);
+        assert_eq!(codex_relay_finished_after(&cell, 101.0, 103.0), Some(false));
+        cell.inputs.latest_start = None;
+        let base = cell.inputs.relay.clone().unwrap();
+        for variant in 0..7 {
+            let mut relay = base.clone();
+            match variant {
+                0 => relay.backend_connected = false,
+                1 => relay.foreground = RelayStatus::Active,
+                2 => relay.child_active = true,
+                3 => relay.active_flags.push("waitingOnApproval".into()),
+                4 => relay.last_turn.status = Some(TurnStatus::Failed),
+                5 => relay.pending_requests.push(crate::agent_state::PendingRequest {
+                    kind: crate::agent_state::RequestKind::UserInput, since: 102.0,
+                }),
+                _ => relay.background.jobs.push(crate::agent_state::Job {
+                    id: "7".into(), kind: crate::agent_state::JobKind::Terminal,
+                    label: "sleep 30".into(), first_seen_at: 101.0,
+                    pid: None, cpu: None, wakes_agent: false,
+                }),
+            }
+            cell.inputs.relay = Some(relay);
+            assert_eq!(codex_relay_finished_after(&cell, 101.0, 103.0), Some(false));
+        }
+    }
 
     #[test]
     fn codex_completion_requires_explicit_final_event_after_report() {

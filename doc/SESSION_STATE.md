@@ -164,6 +164,32 @@ Retired epoch replay protection is never evicted: after 64 epoch retirements,
 a further fresh epoch is refused until the session restarts; reports from the
 current epoch continue to work.
 
+## Codex relay (S4/S5)
+
+The native app-server relay owns a pure thread-tree model and one ordered
+snapshot publisher. It sends the latest value on changes and every 30 seconds;
+daemon failures retry the newest value with bounded backoff. Disconnects report
+`backend_connected=false`. Approval/input/elicitation requests stay pending until
+the backend resolves them; tool calls and auth refresh do not imply human waits.
+Status notifications take precedence over the older turn-event fallback.
+
+Background terminals are polled after turn completion and every 30 seconds with
+pagination. A method-not-found response disables polling; failures, incomplete
+pages or unavailable support set `complete=false`. Command labels are bounded;
+PID/CPU fields are included only when the backend supplies them. Disappearances
+between complete enumerations enter the ten-job history. No terminal completion
+wake is enabled. The thread/request model is bounded at 256 entries; exhaustion
+reports unknown rather than silently dropping live evidence.
+
+Drain completion prefers relay end evidence. Scheduler probes also consult it,
+while keeping transcript account/pool errors and unclassified records as holds.
+An active, stale, disconnected, waiting or background relay cannot establish
+completion. Legacy relays continue through the rollout parser, which ignores
+only known bookkeeping. Unknown records still block old completion evidence.
+
+Deployment requires the complete MCP payload and daemon code. Existing Codex
+sessions need A-R to load the new relay; new sessions use it at launch.
+
 ## Claude presence reader (S2)
 
 The daemon checks `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, or
