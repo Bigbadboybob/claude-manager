@@ -354,7 +354,8 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
               mentions: list[str] | None = None, mention_here: bool | None = None,
               tags: list[str] | None = None,
               links: list[dict] | None = None, norms_seen: dict | None = None,
-              ack_receipt: dict | None = None, origin_daemon_id: str | None = None) -> dict:
+              ack_receipt: dict | None = None, origin_daemon_id: str | None = None,
+              view: str = "slim") -> dict:
     """Send to exactly one channel, participant DM, or conversation ID.
 
     Join channels with chat_channels(action="join") before posting. mentions
@@ -382,16 +383,23 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     Keep request_id and original daemon binding for retries, including timeouts.
     Prefer channels for Owner; needs-owner is quiet. Urgent attention uses
     notify_user. Unsolicited Owner DMs are only for critical urgent private issues.
-    Posting and notification/read receipt are separate. Read returned norms and
-    channel_norms; context_status lists stale scopes.
+    Posting and notification/read receipt are separate. norms/channel_norms and
+    context_status appear only with a document you have not seen; read it and
+    pass context_status.ack_with as norms_seen on your next send.
     On paired hosts, enrolled agents can post to known conversations offline.
     pending_sync means saved locally; replicated means the hub accepted the same ID.
     created_at is the authoritative send time; outbox reports your messages still
     pending_sync on this host. A hub-executed send reports submitted_at and delay_s.
     First naming, a new DM, and shared metadata edits need connectivity. Offline
     @here freezes the last-known membership audience; reconnect never expands it.
+    view="slim" (default) returns what a sender acts on: event_id, created_at,
+    conversation_id, replication, notification, mentions_resolved, warnings,
+    outbox, and norms/sync/monitor details only when they need attention.
+    view="full" returns the complete daemon response.
     """
-    return _chat_call("send", locals())
+    params = dict(locals())
+    view = _view(params.pop("view"))
+    return _project(_chat_call("send", params), view)
 
 
 @mcp.tool()
@@ -402,14 +410,21 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               freshness: str = "cached", tags: list[str] | None = None,
               after: dict | None = None, cursor: dict | None = None,
               limit: int = 50, ack_receipt: dict | None = None,
-              newest_first: bool = False, pinned_only: bool | None = None,
-              view: str = "full") -> dict:
+              newest_first: bool | None = None, pinned_only: bool | None = None,
+              view: str | None = None, mark_read_before: str | None = None) -> dict:
     """Read history, a thread, your inbox, or incoming DMs. Select one scope.
 
+    Inbox and dms reads default to newest first and view="slim"; other reads
+    default to oldest first and view="full". Pass either explicitly to override.
     view="slim" returns per message only id, time, conversation (#path or
     dm:<sender>), conversation_id, sender, body and reply_to/thread when set,
     plus next_cursor and receipt; cursors and receipts work across views.
-    Prefer slim for routine inbox reads; "full" (default) keeps metadata.
+    "full" keeps metadata.
+
+    mark_read_before=RFC3339 (inbox or dms only) marks every unread message
+    created before that time as read in one call and moves your watches past
+    them; it returns {marked, monitors_advanced} instead of messages. Use it
+    after a long absence, once you have skimmed the newest messages.
 
     time={"since":"10m"} or {"start":RFC3339,"end":RFC3339} filters a fixed
     window. pinned_only filters to pinned messages at the read snapshot.
@@ -423,9 +438,12 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
     unchanged. received time finds messages arriving late from another machine.
     """
     params = dict(locals())
-    view = params.pop("view") or "full"
-    if view not in ("full", "slim"):
-        raise ValueError('view must be "full" or "slim"')
+    broad = bool(inbox or dms)
+    view = _view(params.pop("view") or ("slim" if broad else "full"))
+    if params["newest_first"] is None:
+        params["newest_first"] = broad
+    if mark_read_before is not None:
+        return _project(_chat_call("read", params), view)
     result = _chat_call("read", params)
     return slim_read_result(result) if view == "slim" else result
 
@@ -456,7 +474,75 @@ def _slim_message(item: dict) -> dict:
 # Top-level fields a slim reader still needs to paginate, acknowledge, and
 # notice degraded coverage or pending watch results.
 _SLIM_KEEP = ("next_cursor", "receipt", "position", "coverage", "degraded",
-              "delivery_note", "error")
+              "delivery_note", "error", "outbox")
+
+
+def _view(view: str | None) -> str:
+    view = view or "slim"
+    if view not in ("full", "slim"):
+        raise ValueError('view must be "full" or "slim"')
+    return view
+
+
+def _attention_fields(result: dict, out: dict) -> None:
+    """Envelope fields worth showing only when they call for action: pending
+    watch results, a sync problem, and norms the caller has not acknowledged
+    (a supplied document plus the acknowledgement to send)."""
+    monitors = result.get("monitor_status")
+    if isinstance(monitors, dict) and monitors.get("unacknowledged"):
+        out["monitor_status"] = {"unacknowledged": monitors["unacknowledged"]}
+    if isinstance(monitors, dict) and monitors.get("recently_expired"):
+        out.setdefault("monitor_status", {})["recently_expired"] = monitors["recently_expired"]
+    sync = result.get("sync")
+    if isinstance(sync, dict) and sync.get("enabled") and (
+            not sync.get("connected") or sync.get("error") or sync.get("handoff_paused")):
+        out["sync"] = {k: sync.get(k) for k in ("connected", "error", "pending", "handoff_paused")}
+    context = result.get("context_status")
+    if isinstance(context, dict) and (context.get("stale_scopes") or context.get("acknowledgement_note")):
+        out["context_status"] = {k: context[k] for k in (
+            "stale_scopes", "ack_with", "ack_note", "acknowledgement_note") if k in context}
+        for key in ("norms", "channel_norms"):
+            if isinstance(result.get(key), dict) and (
+                    result[key].get("text") or result[key].get("complete") is False):
+                out[key] = result[key]
+
+
+# Envelope keys a slim send/people/channels response drops (re-added by
+# _attention_fields when they need attention). Everything else is payload.
+_ENVELOPE = frozenset({
+    "cache", "connection", "coverage", "daemon_id", "hub_completeness_note",
+    "space_id", "position", "coordinator_position", "operation", "sync",
+    "monitor_status", "context_status", "norms", "channel_norms", "event",
+    "degraded", "name_publication", "attention",
+})
+
+
+def _project(result: dict, view: str) -> dict:
+    """MCP-side slim projection of a send/people/channels response: the
+    payload the caller acts on, without the ~3-4 KB sync/cache/norms/event
+    envelope. The daemon response is unchanged; view="full" returns it."""
+    if view == "full" or not isinstance(result, dict):
+        return result
+    out = {k: v for k, v in result.items() if k not in _ENVELOPE and v is not None}
+    event = result.get("event")
+    if isinstance(event, dict):
+        out.setdefault("event_id", event.get("id"))
+        out.setdefault("created_at", event.get("created_at"))
+        out["conversation_id"] = event.get("conversation_id")
+        data = event.get("data") or {}
+        if data.get("reply_to"):
+            out["reply_to"] = data["reply_to"]
+        if data.get("thread_root"):
+            out["thread"] = data["thread_root"]
+    if result.get("degraded"):
+        out["degraded"] = result["degraded"]
+    if result.get("name_publication") == "pending":
+        out["name_publication"] = "pending"
+    if result.get("connection") == "offline":
+        out["connection"] = "offline"
+    _attention_fields(result, out)
+    out["view"] = "slim"
+    return out
 
 
 def slim_read_result(result: dict) -> dict:
@@ -469,11 +555,7 @@ def slim_read_result(result: dict) -> dict:
     out["items"] = [_slim_message(item) for item in result.get("items") or []]
     if result.get("context"):
         out["context"] = [_slim_message(item) for item in result["context"]]
-    monitors = result.get("monitor_status")
-    if isinstance(monitors, dict) and monitors.get("unacknowledged"):
-        out["monitor_status"] = {"unacknowledged": monitors["unacknowledged"]}
-    if isinstance(monitors, dict) and monitors.get("recently_expired"):
-        out.setdefault("monitor_status", {})["recently_expired"] = monitors["recently_expired"]
+    _attention_fields(result, out)
     return out
 
 
@@ -490,9 +572,14 @@ def chat_dms(unread_only: bool = False, peer: str | None = None,
 
 @mcp.tool()
 def chat_people(query: str | None = None, include_exited: bool = False,
-                cursor: dict | None = None, limit: int = 50) -> dict:
-    """Find participant IDs, task-based names, aliases and presence. Does not grant session control."""
-    return _chat_call("people", locals())
+                cursor: dict | None = None, limit: int = 50, view: str = "slim") -> dict:
+    """Find participant IDs, task-based names, aliases and presence. Does not grant session control.
+
+    view="slim" (default) returns the items and next_cursor without the sync,
+    cache and norms envelope; view="full" returns the complete response."""
+    params = dict(locals())
+    view = _view(params.pop("view"))
+    return _project(_chat_call("people", params), view)
 
 
 @mcp.tool()
@@ -505,7 +592,7 @@ def chat_channels(action: str = "list", path: str | None = None,
                   joined_only: bool | None = None, query: str | None = None,
                   default_join: bool | None = None, archived: bool | None = None,
                   origin_daemon_id: str | None = None,
-                  participant_id: str | None = None) -> dict:
+                  participant_id: str | None = None, view: str = "slim") -> dict:
     """List/get/create/update/join/leave channels, list members, or add_member.
 
     Join before posting; public history stays browsable. Join/leave require path
@@ -534,8 +621,12 @@ def chat_channels(action: str = "list", path: str | None = None,
     offline message using a previously observed open revision can still sync and is
     labeled delayed. Once the origin observes the archive it refuses new posts.
     Names are at most 100 characters; descriptions at most 1000. No deletion.
+    view="slim" (default) drops the sync/cache/norms envelope and the event echo
+    (event_id stays); view="full" returns the complete response.
     """
-    return _chat_call("channels", locals())
+    params = dict(locals())
+    view = _view(params.pop("view"))
+    return _project(_chat_call("channels", params), view)
 
 
 @mcp.tool()

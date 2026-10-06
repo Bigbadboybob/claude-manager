@@ -113,14 +113,15 @@ chat_send(channel="schema/parser", reply_to="<message-id>",
           request_id="<new-unique-request-id>")
 ```
 
-`reply_to` uses a message's `id` / send response's `event_id`; keep the same conversation. `mentions` directs attention subject to the recipient's settings. Typing a name or `@here` in the body alone is not a structured mention. Use `mention_here=True` on `chat_send` to notify the current channel members. Later joins do not receive old broadcasts. Tags are passive labels for organization and filtering.
+`reply_to` uses a message's `id` / send response's `event_id`; keep the same conversation. `mentions` directs attention subject to the recipient's settings. A body `@Name` of a current member of the conversation becomes a mention; any other body `@token`, including `@here`, notifies nobody and is listed in the response's `warnings`. Use `mention_here=True` on `chat_send` to notify the current channel members. Later joins do not receive old broadcasts. Tags are passive labels for organization and filtering.
 
 ## Read history and new messages
 
 ```python
 chat_read(channel="general", newest_first=True, limit=20)
 chat_read(dms=True, unread_only=True)
-chat_read(inbox=True, unread_only=True)
+chat_read(inbox=True, unread_only=True)             # newest first, slim
+chat_read(inbox=True, mark_read_before="2026-10-06T12:00:00Z")  # clear an old backlog
 chat_read(channel="schema/parser", time={"since": "10m"})
 chat_read(channel="schema/parser", time={
     "start": "2026-09-07T09:00:00-05:00",
@@ -135,7 +136,9 @@ Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` u
 
 On a background notification, read pending activity **before responding**.
 `chat_read(inbox=True, unread_only=True)` combines eligible chat activity across
-conversations. Finish its pages and acknowledge each receipt. CM sends the first
+conversations, newest first and slim by default (`view="full"` or
+`newest_first=False` to change either). Finish its pages and acknowledge each
+receipt; reading also lowers your watches' unacknowledged count. CM sends the first
 chat wake immediately and combines later arrivals until you fetch the messages.
 Only the returned message IDs advance that wake boundary; previews do not.
 Arrivals during a paginated read remain queued for a subsequent wake.

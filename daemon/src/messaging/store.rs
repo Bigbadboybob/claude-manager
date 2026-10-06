@@ -33,6 +33,7 @@ mod norms;
 pub use norms::textual_diff as norms_diff;
 mod channels;
 mod membership;
+mod inbox;
 mod mentions;
 mod preferences;
 mod watches;
@@ -1701,6 +1702,9 @@ impl Store {
     pub fn read(&mut self, actor: &str, p: &Value, people: &[Person]) -> Result<Value> {
         if !p.is_object() {
             return Err(err("invalid_params", "Expected an object"));
+        }
+        if p.get("mark_read_before").is_some_and(|v| !v.is_null()) {
+            return self.mark_read_before(actor, p, people);
         }
         let mut normalized;
         let p = if p["inbox"] != true

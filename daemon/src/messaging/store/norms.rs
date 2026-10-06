@@ -221,6 +221,7 @@ impl Store {
                 }
             }
         }
+        let norms_request = selected_scope.is_some();
         if let Some(object) = result.as_object_mut() {
             object.remove("norms");
         }
@@ -229,6 +230,7 @@ impl Store {
         }
         let mut state = self.personal_state(actor);
         let mut dirty = false;
+        let mut supplied = false;
         for scope in &scopes {
             let doc = self.current_norms(scope);
             let revision = strv(&doc, "revision").to_owned();
@@ -248,6 +250,7 @@ impl Store {
                     result[key] = json!({"revision":revision,"scope":scope,"complete":false,"read_with":{"tool":"chat_norms","action":"read","scope":scope}});
                 }
                 dirty |= state.norms_offered.insert(revision);
+                supplied = true;
             }
         }
         if dirty {
@@ -255,7 +258,38 @@ impl Store {
                 context_error = Some(e.to_string());
             }
         }
-        result["context_status"] = self.scoped_norms_status(actor, &scopes);
+        // Agents see context_status only when it carries something to act on:
+        // a document (or a pointer to one) supplied in this response, an
+        // explicit norms request or acknowledgement, or an error. Before, every
+        // response repeated `stale_scopes` until an acknowledgement agents
+        // rarely made, with no instruction attached. Owner's viewer keeps the
+        // status on every response (it drives the stale-norms indicator).
+        let wanted = actor == "owner"
+            || force
+            || supplied
+            || context_error.is_some()
+            || p["norms_seen"].is_object()
+            || norms_request;
+        if !wanted {
+            return result;
+        }
+        let mut status = self.scoped_norms_status(actor, &scopes);
+        let stale: Vec<String> = status["stale_scopes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        status["unacknowledged_scopes"] = json!(stale);
+        if !stale.is_empty() {
+            let mut seen = json!({});
+            for scope in &stale {
+                seen[scope] = status["current"][scope].clone();
+            }
+            status["ack_with"] = json!({"norms_seen": seen});
+            status["ack_note"] = json!("After reading the supplied norms, pass ack_with.norms_seen on your next chat_send; later diffs start from that revision. Nothing is gated on it.");
+        }
+        result["context_status"] = status;
         if let Some(error) = context_error {
             result["context_status"]["acknowledgement_note"] = json!(error);
         }
@@ -641,6 +675,36 @@ mod tests {
             "invalid_cursor"
         );
         assert!(s.change_norms("owner","owner","Owner",&json!({"action":"revert","scope":sb,"revision":first["revision"],"expected_revision":s.current_norms(&sb)["revision"],"summary":"Wrong scope","request_id":"bad-revert"})).is_err());
+    }
+    #[test]
+    fn agent_context_status_appears_only_with_a_supplied_document() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = Store::open(t.path()).unwrap();
+        let first = s.context_response("reader", &json!({"channel":"general"}), json!({}), false);
+        let global = first["norms"]["revision"].clone();
+        assert_eq!(first["context_status"]["stale_scopes"], json!(["global"]));
+        assert_eq!(first["context_status"]["unacknowledged_scopes"], json!(["global"]));
+        assert_eq!(first["context_status"]["ack_with"], json!({"norms_seen":{"global":global}}));
+        // Nothing new to read: an ordinary call stays quiet even though the
+        // reader has not acknowledged yet.
+        let quiet = s.context_response("reader", &json!({"channel":"general"}), json!({}), false);
+        assert!(quiet.get("context_status").is_none());
+        assert!(quiet.get("norms").is_none());
+        // Owner's viewer keeps the status on every response.
+        s.context_response("owner", &json!({"channel":"general"}), json!({}), false);
+        assert!(s.context_response("owner", &json!({"channel":"general"}), json!({}), false)["context_status"].is_object());
+        // A changed revision brings it back, with the acknowledgement to send.
+        let next = publish(&mut s, "owner", "global", "New convention.\n", "rev2");
+        let notice = s.context_response("reader", &json!({"channel":"general"}), json!({}), false);
+        assert_eq!(notice["norms"]["revision"], next["revision"]);
+        assert_eq!(notice["context_status"]["ack_with"]["norms_seen"]["global"], next["revision"]);
+        // Acknowledging through norms_seen is confirmed once, then quiet again.
+        let acked = s.context_response("reader",
+            &json!({"channel":"general","norms_seen":{"global":next["revision"]}}), json!({}), false);
+        assert_eq!(acked["context_status"]["changed"], false);
+        assert!(acked["context_status"].get("ack_with").is_none());
+        assert!(s.context_response("reader", &json!({"channel":"general"}), json!({}), false)
+            .get("context_status").is_none());
     }
     #[test]
     fn messaging_channel_norms_context_budget_no_inheritance_and_exact_acknowledgement() {

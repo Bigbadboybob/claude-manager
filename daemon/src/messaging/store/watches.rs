@@ -267,6 +267,11 @@ impl Store {
     }
 
     fn monitor_summary(&self, actor: &str, m: &Monitor) -> Value {
+        // A hit the reader has already read (an inbox page acknowledged, or a
+        // bulk mark_read_before) is not outstanding, even before the monitor's
+        // own result receipt is acknowledged: the two ack systems used to be
+        // independent, so reading never lowered this count.
+        let read = self.reads.get(actor).map(|r| &r.ids);
         let unseen = self
             .events
             .iter()
@@ -274,6 +279,7 @@ impl Store {
                 e.position > m.acknowledged
                     && e.position <= m.hit_high
                     && self.monitor_matches(actor, m, e)
+                    && !read.is_some_and(|r| r.contains(strv(&e.event, "id")))
             })
             .count();
         let delivery = actor

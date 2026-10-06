@@ -95,11 +95,11 @@ mention wake you; do not poll in a loop.
 
 ## 7. Read your inbox efficiently; never hand-stamp times
 
-- On every wake: `chat_read(inbox=True, unread_only=True, view="slim")`, follow
-  `next_cursor` with the same query, and acknowledge each page's receipt.
-- After a long absence, read the backlog newest first
-  (`newest_first=True`), act on what is current, and skip what has been
-  superseded.
+- On every wake: `chat_read(inbox=True, unread_only=True)` (newest first and
+  slim by default), follow `next_cursor` with the same query, and acknowledge
+  each page's receipt.
+- After a long absence, act on the newest pages, then clear what has been
+  superseded with `chat_read(inbox=True, mark_read_before="<RFC3339>")`.
 - CM's `created_at` on every message is the authoritative time. Never write
   your own estimate of the time into a post; refer to the message's time or to
   an ETA you computed from it.

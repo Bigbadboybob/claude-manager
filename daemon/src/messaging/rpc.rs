@@ -506,6 +506,9 @@ fn execute_with_freshness(
                     result["position"] = submission_position;
                     annotate_forward_delay(&mut result, submitted_at);
                 }
+                if let Some(o) = result.as_object_mut() {
+                    o.remove("_marked_ids");
+                }
                 if let Some(snapshot) = result.get("owner_snapshot").cloned() {
                     store.apply_owner_snapshot(&snapshot)?;
                 }
@@ -612,6 +615,19 @@ fn execute_with_freshness(
     };
     project_names(state, store, true);
     let mut retraction_note = None;
+    // A bulk mark settles pending wakes for every message it marked, exactly
+    // like supplying those messages in a page would.
+    let mut result = result.map(|mut value| {
+        if let Some(ids) = value.as_object_mut().and_then(|o| o.remove("_marked_ids")) {
+            value["items"] = json!(ids
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|id| json!({"id":id}))
+                .collect::<Vec<_>>());
+        }
+        value
+    });
     if kind != "owner" && req.method == "messaging.read" {
         if let Ok(value) = &result {
             if let Err(error) = super::delivery::read_boundary(store, &uid, value) {
@@ -619,6 +635,14 @@ fn execute_with_freshness(
                 retraction_note = Some("Messages supplied, but the notification boundary could not be saved; retry the read.".into());
             }
         }
+    }
+    if p.get("mark_read_before").is_some_and(|v| !v.is_null()) {
+        result = result.map(|mut value| {
+            if let Some(o) = value.as_object_mut() {
+                o.remove("items");
+            }
+            value
+        });
     }
     if coordinates_delivery {
         if let Err(error) = super::delivery::reconcile_session(&root, store, &uid) {
@@ -639,6 +663,11 @@ fn execute_with_freshness(
                 .map(|s| s["monitor_status"].clone())
                 .unwrap_or(json!({"state":"uncached","execution_host":store.coordinator_id()}))
         } else {
+            // Read receipts lower the outstanding count; make sure they are
+            // loaded even for methods that never touched them.
+            if let Err(error) = store.load_reads(&actor) {
+                eprintln!("cm messaging: load read receipts: {error}");
+            }
             store.monitor_status(&actor)
         };
         store.decorate_sync_response(p, &mut value);
@@ -853,6 +882,49 @@ mod tests {
                 .len(),
             1
         );
+    }
+    #[test]
+    fn mark_read_before_clears_backlog_monitor_count_and_pending_wakes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        let b_id = call(&state, "b", "open", json!({})).unwrap()["actor_id"].clone();
+        call(&state, "b", "send", json!({"channel":"general","name":"Reader","body":"here","request_id":"hello"})).unwrap();
+        call(&state, "b", "monitor", json!({"scope":{"dms":true},"mode":"continuous","request_id":"dm-watch"})).unwrap();
+        let mut times = vec![];
+        for (i, name) in [(1, Some("Publisher")), (2, None), (3, None)] {
+            let mut q = json!({"dm":b_id,"body":format!("update {i}"),"request_id":format!("dm-{i}")});
+            if let Some(n) = name {
+                q["name"] = json!(n);
+            }
+            times.push(call(&state, "a", "send", q).unwrap()["created_at"].as_str().unwrap().to_owned());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = call(&state, "b", "monitors", json!({})).unwrap();
+        assert_eq!(before["monitor_status"]["unacknowledged"], 3);
+        // Everything created before the third message is marked in one call.
+        let marked = call(&state, "b", "read", json!({"inbox":true,"mark_read_before":times[2]})).unwrap();
+        assert_eq!(marked["marked"], 2);
+        assert_eq!(marked["monitors_advanced"], 1);
+        assert!(marked["items"].is_null() && marked.get("_marked_ids").is_none());
+        assert_eq!(marked["monitor_status"]["unacknowledged"], 1);
+        let rest = call(&state, "b", "read", json!({"inbox":true,"unread_only":true})).unwrap();
+        assert_eq!(rest["items"].as_array().unwrap().len(), 1);
+        assert_eq!(rest["items"][0]["body"], "update 3");
+        // Pending wakes for the marked messages were settled like a read.
+        use sha2::Digest;
+        let uid_hash = format!("{:x}", sha2::Sha256::digest(b"b"));
+        let ledger = root.path().join("messages/main/_delivery").join(format!("{uid_hash}.json"));
+        let q: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        let checked: usize = q["batches"].as_array().unwrap().iter()
+            .map(|b| b["checked"].as_array().unwrap().len()).sum();
+        assert!(checked >= 2, "{q}");
+        // Acknowledging the last page lowers the watch count too: reading is
+        // enough, no separate monitor receipt needed.
+        let after = call(&state, "b", "read", json!({"inbox":true,"unread_only":true,"ack_receipt":rest["receipt"]})).unwrap();
+        assert!(after["items"].as_array().unwrap().is_empty());
+        assert_eq!(after["monitor_status"]["unacknowledged"], 0);
+        // Only inbox/dms reads accept the bulk mark.
+        assert_eq!(call(&state, "b", "read", json!({"channel":"general","mark_read_before":times[2]})).unwrap_err().code, "invalid_target");
     }
     #[test]
     fn messaging_channel_norms_authentication_and_scoped_context_through_rpc() {
