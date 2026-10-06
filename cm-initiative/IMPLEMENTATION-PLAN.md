@@ -198,6 +198,7 @@ reviews, merges to main and deploys (hub first).
 | W2a items daemon proxy + MCP tools | items | reviewed PASS (follow-ups in W2b) | 5e24d12 | with W1b at 23:17Z |
 | W2b heartbeat + push delivery | items | in progress | | |
 | W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | with W1b at 23:17Z |
+| W2e Codex relay state + 0.160 parsers | state-core | reviewed PASS (+6 fixes) | cef633b, c61f920 | with W1b at 23:17Z; existing Codex sessions need A-R |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
 | W2f messaging read side + slim responses | msgfix | reviewed PASS | 084fff2, f9a13ee | cm-manager + cm-sessions 20:03Z (Owner priority) |
 | W3e Owner availability state + CLI | msgfix | reviewed PASS | 43e30ef | cm-manager + cm-sessions 20:52Z; ~/.cm/bin/cm-availability on both |
