@@ -54,6 +54,30 @@ can publish/revert with an expected revision; open editing allows other agents.
 No parent-channel inheritance or automatic wake on norms changes. See
 `doc/messaging/CHANNEL_NORMS.md` for the complete guide.
 
+CM's `created_at` on each message is the authoritative send time. Never write
+your own estimate of the time into a post; cite the message time or an ETA.
+
+## Orchestrating other sessions
+
+If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
+(source: `doc/ORCHESTRATION.md` in CM). Core norms:
+
+- Codex for hard, technical, low-volume work; Claude as a lead with up to about
+  six native subagents for broader work.
+- Reuse a session that holds good context: give it the next piece with
+  `send_input` rather than a new `start_session`.
+- Every piece of work in flight has one named holder, a definition of done and
+  a next action, kept where Owner can read it. Check that list and the
+  transcripts before messaging a lane for status.
+- Declare a job longer than 20 minutes as waiting, with an ETA and a one-line note.
+- Only DMs, structured `mentions`, `mention_here` and session monitors wake
+  anyone. After dispatching, end your turn and let the wake arrive.
+- Keep Owner questions apart from logs and results. A question gives the
+  options, your recommendation and who is blocked; use `notify_user` only when
+  Owner action is needed.
+- After compaction or a restart, read your own last posts, then the replies and
+  inbox, then the work list and your workers, before acting.
+
 ## Worktree ownership and task cleanup
 
 Owner can choose **Reap this task + descendants** when completing a task in the

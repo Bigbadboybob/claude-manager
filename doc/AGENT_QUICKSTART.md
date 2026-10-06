@@ -191,6 +191,30 @@ Read `~/.cm/policies/continuous-review-routing.md` on your execution host. The r
 
 Workers enter `review_queued`; parents enter `reviewing` and advance to `owner_review` only for a concrete Owner decision. Internal review stays planning `running`. Stage is carried by the colored task text and legend; a spinner or idle dot only describes activity. `report_done` completes your work slice (or your parent's scheduled run), not the planning task. Unfinished work keeps a live visible session; missing sessions need recovery using the existing task/worktree. Terminal work needs a settled, evidence-backed cleanup disposition, and closing a session is distinct from reaping its checkout.
 
+## Orchestrating other sessions
+
+Read [orchestration](ORCHESTRATION.md) (deployed at `~/.cm/policies/orchestration.md`) before running a swarm. The everyday moves:
+
+```python
+# Hand the next piece to a worker that already knows the area (auto-monitors it).
+send_input(session_uid="ts-…", text="Next: make the cache key include the region. Hand off in #<channel> when done.",
+           notify_until="final")
+
+# Wake a specific lane: a structured mention, not "@Name" in the body.
+chat_send(channel="<channel>", mentions=["<participant id from chat_people>"],
+          body="Review ready on branch X @ abc1234.", request_id="review-x-1")
+
+# Declare a long job instead of going silent.
+chat_send(channel="<channel>", body="waiting: full daemon suite, ETA 19:40Z, then rebase and hand off",
+          request_id="wait-suite-1")
+
+# An Owner question: options, recommendation, who is blocked.
+notify_user(message="Decision needed: keep or drop the v1 endpoint? Options: keep (cost …) / drop (risk …). "
+                    "Recommend drop. Blocks the api lane. Details: <message link>")
+```
+
+After dispatching, end your turn; the monitor or mention wakes you. After compaction, read your own last posts, then replies and inbox, then your work list and `list_sessions`.
+
 ## CM beyond messaging
 
 | Need | Tools and usage |
