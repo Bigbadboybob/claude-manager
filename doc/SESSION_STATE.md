@@ -113,7 +113,7 @@ During a brain restart the RPC returns conflict; retry the latest report.
  snapshot: {backend_connected: bool, foreground: idle | active | systemError,
             turn_seq: u64, turn_started_at?: unix_s,
             last_turn: {ended_at: unix_s | null, status: completed | interrupted | failed | null},
-            engine_version?, active_flags?: [string], child_active?: bool,
+            engine_version?, transcript_path?, active_flags?: [string], child_active?: bool,
             pending_requests?: [{kind: approval | user_input | elicitation |
                                        tool_call | auth_refresh, since: unix_s}],
             retrying?: bool, error_kind?, background?}}
@@ -172,6 +172,11 @@ daemon failures retry the newest value with bounded backoff. Disconnects report
 `backend_connected=false`. Approval/input/elicitation requests stay pending until
 the backend resolves them; tool calls and auth refresh do not imply human waits.
 Status notifications take precedence over the older turn-event fallback.
+State-model or publisher failures are contained and logged; snapshots stop while
+native wake delivery and frontend forwarding continue. An old daemon without
+`session.agent_report` receives ordered legacy turn edges; capability retries
+back off from one to ten minutes. Optional `transcript_path` triggers the existing
+ownership scan on path changes; heartbeats alone do not repeat that scan.
 
 Background terminals are polled after turn completion and every 30 seconds with
 pagination. A method-not-found response disables polling; failures, incomplete
@@ -180,11 +185,14 @@ PID/CPU fields are included only when the backend supplies them. Disappearances
 between complete enumerations enter the ten-job history. No terminal completion
 wake is enabled. The thread/request model is bounded at 256 entries; exhaustion
 reports unknown rather than silently dropping live evidence.
+That overflow state clears when closed threads or resolved requests free capacity.
 
 Drain completion prefers relay end evidence. Scheduler probes also consult it,
 while keeping transcript account/pool errors and unclassified records as holds.
 An active, stale, disconnected, waiting or background relay cannot establish
-completion. Legacy relays continue through the rollout parser, which ignores
+completion. Drain alone returns to the bounded transcript check after 90 seconds
+of stale/disconnected relay evidence; the UI remains unknown and scheduler
+recovery stays conservative. Legacy relays continue through the rollout parser, which ignores
 only known bookkeeping. Unknown records still block old completion evidence.
 
 Deployment requires the complete MCP payload and daemon code. Existing Codex

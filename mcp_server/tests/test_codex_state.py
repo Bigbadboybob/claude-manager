@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from mcp_server.codex_state import CodexState, REQUEST_KINDS
 from mcp_server.native_codex import Relay, NativeRPCError
@@ -208,6 +208,23 @@ class ModelTests(unittest.TestCase):
             state.load_thread({"id": str(i)}, 100)
         self.assertEqual(len(state.threads), 256)
         self.assertFalse(state.snapshot()["backend_connected"])
+        event(state, "thread/closed", {"threadId": "0"})
+        self.assertTrue(state.snapshot()["backend_connected"])
+
+    def test_request_overflow_clears_after_resolution(self):
+        state = selected()
+        for i in range(257):
+            state.observe(
+                {
+                    "id": i,
+                    "method": "item/tool/requestUserInput",
+                    "params": {"threadId": "main"},
+                },
+                101,
+            )
+        self.assertFalse(state.snapshot()["backend_connected"])
+        event(state, "serverRequest/resolved", {"requestId": 0})
+        self.assertTrue(state.snapshot()["backend_connected"])
 
     def test_background_method_detection_does_not_disable_transient_errors(self):
         self.assertTrue(NativeRPCError({"code": -32601}).unsupported)
@@ -239,6 +256,205 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
         relay.state = selected()
         relay.connected.set()
         return relay
+
+    async def test_observer_failure_keeps_forwarding_and_native_wakes_alive(self):
+        relay = self.relay()
+        relay.thread = {"id": "main", "path": "/fixture.jsonl"}
+        messages = [
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": "main",
+                    "turn": {"id": "t1", "status": "inProgress"},
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "main",
+                    "turn": {"id": "t1", "status": "completed"},
+                },
+            },
+        ]
+
+        async def incoming():
+            for message in messages:
+                yield json.dumps(message)
+
+        relay.upstream = incoming()
+        forwarded = []
+
+        async def forward(message):
+            forwarded.append(message)
+
+        relay.to_frontend = forward
+        with (
+            patch.object(
+                relay.state, "observe", side_effect=RuntimeError("fixture model bug")
+            ),
+            patch("builtins.print", side_effect=OSError("closed stderr")),
+        ):
+            await relay.read_connection()
+        self.assertEqual(forwarded, messages)
+        self.assertFalse(relay.state_enabled)
+        relay.ready.set()
+        relay.call = AsyncMock(return_value={"turn": {"id": "wake"}})
+        receipt = await relay.send({"binding": {"thread_id": "main"}, "text": "wake"})
+        self.assertEqual(receipt["turn_id"], "wake")
+
+    async def test_publisher_and_poller_faults_disable_snapshots_without_task_exit(
+        self,
+    ):
+        for component in ("snapshot", "background"):
+            relay = self.relay()
+            relay.call = AsyncMock(return_value={"data": [], "nextCursor": None})
+            with patch.object(
+                relay.state, component, side_effect=RuntimeError("fixture bug")
+            ):
+                if component == "snapshot":
+                    relay.publisher = asyncio.create_task(relay.publish_state())
+                    relay.report_dirty.set()
+                    task = relay.publisher
+                else:
+                    relay.background_poller = asyncio.create_task(
+                        relay.poll_background()
+                    )
+                    relay.background_dirty.set()
+                    task = relay.background_poller
+                try:
+                    for _ in range(100):
+                        if not relay.state_enabled:
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertFalse(relay.state_enabled)
+                    self.assertFalse(task.done())
+                finally:
+                    await relay.close()
+
+    async def test_old_brain_receives_turn_edges_with_capability_backoff(self):
+        relay = self.relay()
+        relay.thread = {"id": "main", "path": "/fixture.jsonl"}
+        relay.observe(
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": "main",
+                    "turn": {"id": "t", "status": "inProgress"},
+                },
+            }
+        )
+        calls = []
+
+        def old_brain(method, params, **kwargs):
+            calls.append((method, params))
+            if method == "session.agent_report":
+                raise control_client.ControlError("unknown_method", "old brain")
+            return {"ok": True}
+
+        with patch.object(control_client, "call", old_brain):
+            await relay.publish_once()
+            retry_at = relay.legacy_until
+            await relay.publish_once()
+            relay.observe(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "main",
+                        "turn": {"id": "t", "status": "completed"},
+                    },
+                }
+            )
+            await relay.publish_once()
+        self.assertEqual(
+            [method for method, _ in calls],
+            ["session.agent_report", "session.turn_ended", "session.turn_ended"],
+        )
+        self.assertTrue(calls[1][1]["continuing"])
+        self.assertFalse(calls[2][1]["continuing"])
+        self.assertEqual(relay.legacy_until, retry_at)
+        self.assertEqual(relay.legacy_probe_delay, 120)
+        relay.legacy_until = 0
+        with patch.object(
+            control_client, "call", return_value={"ok": True}
+        ) as upgraded:
+            await relay.publish_once()
+            self.assertEqual(upgraded.call_args.args[0], "session.agent_report")
+        self.assertEqual(relay.legacy_probe_delay, 60)
+
+    async def test_invalid_snapshot_rejection_disables_reports_without_stopping_task(
+        self,
+    ):
+        relay = self.relay()
+        with patch.object(
+            control_client,
+            "call",
+            side_effect=control_client.ControlError("invalid_params", "bad snapshot"),
+        ) as rpc:
+            relay.publisher = asyncio.create_task(relay.publish_state())
+            relay.report_dirty.set()
+            try:
+                for _ in range(100):
+                    if not relay.state_enabled:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertFalse(relay.state_enabled)
+                self.assertFalse(relay.publisher.done())
+                self.assertEqual(rpc.call_count, 1)
+            finally:
+                await relay.close()
+
+    async def test_handshake_filters_late_poll_replies_despite_observer_failure(self):
+        relay = self.relay()
+        relay.init_request = {}
+        relay.queue.health = lambda *args, **kwargs: None
+        relay.thread = {"id": "main", "path": "/fixture.jsonl"}
+
+        class Socket:
+            def __init__(self):
+                self.messages = []
+
+            async def send(self, raw):
+                request = json.loads(raw)
+                if "id" in request:
+                    result = (
+                        {}
+                        if request["method"] == "initialize"
+                        else {
+                            "thread": {
+                                "id": "main",
+                                "path": "/fixture.jsonl",
+                                "status": {"type": "idle"},
+                            }
+                        }
+                    )
+                    self.messages += [
+                        {
+                            "id": relay.prefix + "old-poll",
+                            "result": {"data": [], "nextCursor": None},
+                        },
+                        {"id": request["id"], "result": result},
+                    ]
+
+            async def recv(self):
+                return json.dumps(self.messages.pop(0))
+
+            async def close(self):
+                pass
+
+        relay.to_frontend = AsyncMock()
+        with (
+            patch(
+                "mcp_server.native_codex.unix_connect", AsyncMock(return_value=Socket())
+            ),
+            patch.object(
+                relay.state, "observe", side_effect=RuntimeError("fixture bug")
+            ),
+        ):
+            await relay.reconnect()
+        relay.to_frontend.assert_not_awaited()
+        self.assertTrue(relay.connected.is_set())
+        self.assertTrue(relay.ready.is_set())
+        self.assertFalse(relay.state_enabled)
 
     async def test_delayed_failure_retries_latest_without_concurrent_stale_report(self):
         relay = self.relay()

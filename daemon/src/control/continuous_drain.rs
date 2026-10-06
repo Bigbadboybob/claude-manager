@@ -55,7 +55,7 @@ pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
         let after = last_input
             .map(|at| super::methods::now_unix_f64() - at.elapsed().as_secs_f64())
             .unwrap_or(0.0);
-        let relay_finished = completion::codex_relay_finished_after(
+        let relay_finished = completion::codex_drain_relay_finished_after(
             &session.agent_state.lock().unwrap_or_else(|p| p.into_inner()),
             after, super::methods::now_unix_f64());
         (

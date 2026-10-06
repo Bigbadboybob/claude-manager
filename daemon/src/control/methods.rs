@@ -2873,7 +2873,7 @@ pub fn session_agent_report(
     }
     let agent_state = crate::agent_state::current(&state.sessions[&p.session_uid]);
     drop(state);
-    if applied.accepted && native_codex {
+    if applied.accepted && native_codex && applied.refresh_rollout {
         crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
     }
     Ok(json!({"ok": true, "applied": applied.accepted, "agent_state": agent_state}))
@@ -13819,7 +13819,7 @@ pub(crate) fn capture_drain_sessions(
                 let done = s.reported_done();
                 if s.session_type == "codex" {
                     if let Some(report) = &done {
-                        let finished = crate::continuous::completion::codex_relay_finished_after(
+                        let finished = crate::continuous::completion::codex_drain_relay_finished_after(
                             &s.agent_state.lock().unwrap_or_else(|p| p.into_inner()),
                             report.at_unix, now_unix_f64());
                         codex_checks.push((uid.clone(), s.transcript_path.clone(), report.at_unix, finished));

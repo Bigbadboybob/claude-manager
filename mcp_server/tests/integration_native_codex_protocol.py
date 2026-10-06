@@ -36,8 +36,9 @@ reports = []
 
 
 def capture_report(method, params, **kwargs):
-    assert method == "session.agent_report"
-    reports.append(params)
+    assert method in {"session.agent_report", "session.turn_ended"}
+    if method == "session.agent_report":
+        reports.append(params)
     return {"ok": True}
 
 
@@ -281,6 +282,22 @@ async def main():
             assert len({r["epoch"] for r in reports}) == 1
             result["ordered_snapshots"] = len(reports)
             (directory / "state-reports.json").write_text(json.dumps(reports, indent=2))
+            # Telemetry is optional to the relay's primary wake-delivery job.
+            # A broken model must not interrupt the owning backend connection.
+            def broken_observer(*args, **kwargs):
+                raise RuntimeError("injected state observer failure")
+
+            relay.state.observe = broken_observer
+            position = len(client.events)
+            queue.publish("state-failure", "fixture",
+                          "[fixture state-failure] automated native wake",
+                          "[fixture state-failure]")
+            await eventually(lambda: queue.get("state-failure")["status"] == "observed", 10)
+            await client.wait_event("turn/completed", after=position, timeout=15)
+            assert not relay.state_enabled
+            assert not relay.reader.done()
+            assert relay.connected.is_set()
+            result["native_wake_survives_observer_exception"] = True
             print(json.dumps(result, indent=2), flush=True)
             (directory / "results.json").write_text(json.dumps(result, indent=2))
             await client.close()

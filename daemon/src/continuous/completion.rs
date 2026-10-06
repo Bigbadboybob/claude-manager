@@ -241,9 +241,52 @@ pub fn codex_turn_finished_after(path: &str, after: f64) -> bool {
     read() == Some(true)
 }
 
+/// Drain keeps the short uncertainty hold, then resumes its existing bounded
+/// transcript check if the relay cannot provide usable evidence for 90 seconds.
+/// This does not change the UI's unknown state or scheduler recovery policy.
+pub fn codex_drain_relay_finished_after(cell: &crate::agent_state::StateCell, after: f64, now: f64) -> Option<bool> {
+    use crate::agent_state::{Source, State};
+    let relay = cell.inputs.relay.as_ref()?;
+    if now - relay.observed_at > 90.0 {
+        return None;
+    }
+    if !relay.backend_connected {
+        let unavailable_since = cell.inputs.previous.as_ref()
+            .filter(|s| s.source == Source::Relay && s.state == State::Unknown)
+            .map_or(relay.observed_at, |s| s.since);
+        if now - unavailable_since > 90.0 {
+            return None;
+        }
+    }
+    codex_relay_finished_after(cell, after, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_falls_back_only_after_relay_uncertainty_exceeds_ninety_seconds() {
+        use crate::agent_state::{RelaySnapshot, StateCell};
+        let mut cell = StateCell::new(0.0, None);
+        cell.inputs.relay = Some(RelaySnapshot { backend_connected: false,
+            observed_at: 100.0, ..Default::default() });
+        cell.recompute(100.0);
+        assert_eq!(codex_drain_relay_finished_after(&cell, 0.0, 189.0), Some(false));
+        // Disconnected heartbeats do not restart the uncertainty clock.
+        cell.inputs.relay.as_mut().unwrap().observed_at = 190.0;
+        cell.recompute(190.0);
+        assert_eq!(codex_drain_relay_finished_after(&cell, 0.0, 191.0), None);
+        assert_eq!(codex_relay_finished_after(&cell, 0.0, 191.0), Some(false), "scheduler stays conservative");
+        cell.inputs.relay.as_mut().unwrap().backend_connected = true;
+        assert_eq!(codex_drain_relay_finished_after(&cell, 0.0, 281.0), None);
+        let path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(path.path(), include_str!("../../tests/fixtures/codex-0.160.1/success-background.jsonl")).unwrap();
+        let drain = codex_drain_relay_finished_after(&cell, 0.0, 281.0)
+            .unwrap_or_else(|| codex_turn_finished_after(path.path().to_str().unwrap(), 0.0));
+        assert!(drain);
+        assert!(!codex_turn_finished_after(path.path().to_str().unwrap(), 2_000_000_000.0));
+    }
 
     #[test]
     fn relay_completion_rejects_new_input_stale_waiting_and_background_work() {

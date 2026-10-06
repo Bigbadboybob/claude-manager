@@ -265,6 +265,8 @@ pub struct RelaySnapshot {
     #[serde(default)]
     pub observed_at: f64,
     pub engine_version: Option<String>,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
     pub turn_seq: u64,
     pub turn_started_at: Option<f64>,
     pub last_turn: LastTurn,
@@ -562,6 +564,7 @@ pub struct Applied {
     pub accepted: bool,
     pub started: bool,
     pub ended: bool,
+    pub refresh_rollout: bool,
     pub transcript_path: Option<String>,
 }
 pub type AgentStateCell = Arc<Mutex<StateCell>>;
@@ -668,6 +671,8 @@ impl StateCell {
                 applied.ended = snapshot.last_turn.ended_at.is_some()
                     && !newer(snapshot.turn_started_at, snapshot.last_turn.ended_at)
                     && (!same_epoch || prior.is_none_or(|r| r.last_turn != snapshot.last_turn));
+                applied.refresh_rollout = applied.started || applied.ended
+                    || prior.is_none_or(|r| r.transcript_path != snapshot.transcript_path);
                 let at = snapshot.turn_started_at.unwrap_or_else(|| {
                     if snapshot.foreground == RelayStatus::Active {
                         now
@@ -842,6 +847,7 @@ fn validate_report_bounds(report: &Report) -> Result<(), String> {
                 "engine_version",
             )?;
             bounded(snapshot.error_kind.as_deref(), MAX_TEXT_BYTES, "error_kind")?;
+            bounded(snapshot.transcript_path.as_deref(), MAX_TEXT_BYTES, "transcript_path")?;
             if snapshot.active_flags.len() > 16 || snapshot.pending_requests.len() > 256 {
                 return Err("snapshot exceeds 16 active flags or 256 pending requests".into());
             }
@@ -1435,6 +1441,25 @@ mod tests {
         background.update(next, ended_at + 3.0);
         assert_eq!(background.ended.len(), 1);
         assert_eq!(background.ended[0].ended_at, ended_at);
+    }
+
+    #[test]
+    fn relay_heartbeats_do_not_request_rollout_scans() {
+        let mut cell = StateCell::new(100.0, None);
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let mut snapshot = RelaySnapshot { backend_connected: true,
+            transcript_path: Some("/fixture/first.jsonl".into()), ..Default::default() };
+        assert!(cell.apply(report(&epoch, 1, snapshot.clone()), 101.0).unwrap().refresh_rollout);
+        assert!(!cell.apply(report(&epoch, 2, snapshot.clone()), 102.0).unwrap().refresh_rollout);
+        snapshot.transcript_path = Some("/fixture/second.jsonl".into());
+        assert!(cell.apply(report(&epoch, 3, snapshot.clone()), 103.0).unwrap().refresh_rollout);
+        assert!(!cell.apply(report(&epoch, 3, snapshot.clone()), 104.0).unwrap().refresh_rollout);
+        snapshot.turn_seq = 1;
+        snapshot.turn_started_at = Some(105.0);
+        assert!(cell.apply(report(&epoch, 4, snapshot.clone()), 105.0).unwrap().refresh_rollout);
+        snapshot.last_turn = LastTurn { ended_at: Some(106.0), status: Some(TurnStatus::Completed) };
+        assert!(cell.apply(report(&epoch, 5, snapshot.clone()), 106.0).unwrap().refresh_rollout);
+        assert!(!cell.apply(report(&epoch, 6, snapshot), 107.0).unwrap().refresh_rollout);
     }
     fn hook(event: HookEvent, at: f64) -> Report {
         Report::Hook {

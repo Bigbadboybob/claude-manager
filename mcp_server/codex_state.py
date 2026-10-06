@@ -77,7 +77,16 @@ class CodexState:
         self.background_complete = False
         self.background_at = None
         self.ended = []
-        self.overflow = False
+        self.thread_overflow = False
+        self.request_overflow = False
+
+    @property
+    def overflow(self):
+        if len(self.threads) < LIMIT:
+            self.thread_overflow = False
+        if len(self.requests) < LIMIT:
+            self.request_overflow = False
+        return self.thread_overflow or self.request_overflow
 
     def connection(self, connected):
         self.connected = connected
@@ -106,9 +115,10 @@ class CodexState:
                 )
                 if victim is not None:
                     del self.threads[victim]
+                    self.thread_overflow = False
             if len(self.threads) >= LIMIT:
                 # Do not silently forget an active child or human request.
-                self.overflow = True
+                self.thread_overflow = True
                 return None
             self.threads[uid] = Thread()
         return self.threads[uid]
@@ -228,10 +238,17 @@ class CodexState:
                     thread.retrying = bool(data.get("willRetry"))
         elif event == "serverRequest/resolved":
             self.requests.pop(data.get("requestId"), None)
+        elif event == "thread/closed":
+            if uid != self.foreground and not any(
+                t.parent == uid for t in self.threads.values()
+            ):
+                self.threads.pop(uid, None)
+            elif uid in self.threads:
+                self.status(self.threads[uid], {"type": "notLoaded"})
         if "id" in message and event in REQUEST_KINDS:
             if message["id"] not in self.requests:
                 if len(self.requests) >= LIMIT:
-                    self.overflow = True
+                    self.request_overflow = True
                 else:
                     self.requests[message["id"]] = (uid, REQUEST_KINDS[event], now)
 
