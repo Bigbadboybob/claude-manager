@@ -13,6 +13,9 @@ rules both parsers share —
 - Codex `event_msg`/`agent_message` mirrors the canonical `response_item`
   assistant 1:1; both parsers drop the mirror so a turn counts **once**.
 - Codex `event_msg` lifecycle records (`task_complete`) are dropped.
+- Codex assistant messages with empty text (the empty `phase:"final_answer"`
+  record Codex writes after a turn whose reply was `commentary`) are dropped,
+  so the commentary stays the last assistant turn.
 - Claude `isMeta` records and pure-`tool_result` user turns are dropped.
 
 NOT pinned here: tool-call rendering. The two parsers **diverge by design** —

@@ -58,10 +58,13 @@ def render_message(v: dict) -> Optional[Message]:
     payload = v.get("payload") or {}
     payload_type = payload.get("type", "") if isinstance(payload, dict) else ""
 
-    # function_call / function_call_output render as Tool one-liners.
+    # function_call / function_call_output render as Tool one-liners, as
+    # do their freeform `custom_tool_call` twins (Codex's `exec` tool).
     if top_type == "response_item" and payload_type in (
         "function_call",
         "function_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
     ):
         name = payload.get("name") if isinstance(payload, dict) else None
         return Message(
@@ -96,7 +99,13 @@ def render_message(v: dict) -> Optional[Message]:
     rendered = _render_content(content_val)
     if rendered is None:
         return None
-    return Message(role=role, content=rendered, ts=_extract_ts(v))
+    phase = payload.get("phase") if isinstance(payload, dict) else None
+    return Message(
+        role=role,
+        content=rendered,
+        ts=_extract_ts(v),
+        phase=phase if isinstance(phase, str) else None,
+    )
 
 
 def _render_content(content) -> Optional[str]:
@@ -113,7 +122,13 @@ def _render_content(content) -> Optional[str]:
         t = item.get("type", "")
         if t in ("text", "output_text", "input_text"):
             text = item.get("text")
-            if isinstance(text, str):
+            # Codex writes empty `final_answer` messages
+            # (`[{"type":"output_text","text":""}]`) after a turn whose
+            # real reply was the preceding `commentary` message. Keeping
+            # the empty part made an empty Message that masked that reply
+            # in read_last_turn and monitor fires. The Rust parsers drop
+            # these too (`tui/src/agent/codex.rs::render_content`).
+            if isinstance(text, str) and text.strip():
                 parts.append(text)
     if not parts:
         return None

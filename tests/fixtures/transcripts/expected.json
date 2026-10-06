@@ -4,7 +4,7 @@
     "assistant": ["hi, how can I help?", "done"]
   },
   "codex": {
-    "user": ["add a smoke test"],
-    "assistant": ["added the smoke test"]
+    "user": ["add a smoke test", "check the logs"],
+    "assistant": ["added the smoke test", "logs are clean"]
   }
 }

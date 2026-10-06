@@ -19,9 +19,16 @@ class Message:
     role: Role
     content: str
     ts: float = 0.0
+    # Codex assistant messages carry a `phase` ("commentary" /
+    # "final_answer"); None for every other engine/role. Serialized only
+    # when set, so Claude payloads keep their shape.
+    phase: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {"role": self.role.value, "content": self.content, "ts": self.ts}
+        d = {"role": self.role.value, "content": self.content, "ts": self.ts}
+        if self.phase is not None:
+            d["phase"] = self.phase
+        return d
 
 
 @dataclass

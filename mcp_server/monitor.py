@@ -279,9 +279,11 @@ def _read_all_messages(engine: str, path: str, generation: int):
 
 
 def _last_assistant(messages) -> dict | None:
-    """The last assistant message in `messages` as a dict, or None."""
+    """The last assistant message with visible text in `messages` as a
+    dict, or None. Whitespace-only messages are skipped so an empty
+    trailing record never masks the real reply."""
     for m in reversed(messages):
-        if m.role == Role.ASSISTANT:
+        if m.role == Role.ASSISTANT and m.content.strip():
             return m.to_dict()
     return None
 
