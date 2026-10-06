@@ -190,9 +190,11 @@ reviews, merges to main and deploys (hub first).
 |---|---|---|---|---|
 | W0a Codex empty last turn | msgfix | in progress | | |
 | W0b viewer input vs idle | state-core | reviewed PASS | c2fdd91 | batched with wave 0 |
-| W0c-items contract | items | in progress | | |
+| W0c-items contract | items | reviewed PASS | 92a5a28 | doc only |
 | W0c-state contract | state-core | reviewed PASS | bc76c50 | doc only |
 | W0d orchestration docs | msgfix | queued | | |
-| W1a items API | items | queued | | |
+| W1a items API | items | in progress | | |
 | W1b agent_state core | state-core | in progress | | |
 | W1c messaging send side | msgfix | queued | | |
+
+Note: both Claude lanes' launch prompts were silently dropped at start_session (status file idle since spawn, no transcript, monitor timed out ~35 min later); redelivered with send_input 18:47Z. Follow-up: start_session should confirm the turn started (state-core, after W2d).
