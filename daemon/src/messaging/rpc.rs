@@ -482,6 +482,18 @@ fn execute_with_freshness(
             // fence. Capture it before the round trip so even a fast response
             // delivered ahead of bulk history cannot be skipped.
             let submission_position = store.position_token(store.publication_position());
+            // A barrier on a scoped hub backfills just this conversation; it
+            // waits briefly for that history, then replies with progress.
+            let history = sync.scoped().then(|| {
+                let scopes = interest
+                    .as_deref()
+                    .filter(|i| !i.starts_with("thread:"))
+                    .map(|i| store.channel_id_at_path(i).unwrap_or(i).to_owned());
+                (
+                    scopes.into_iter().collect(),
+                    super::sync::BARRIER_HISTORY_WAIT,
+                )
+            });
             drop(slot);
             drop(_delivery_guard);
             if forward {
@@ -498,12 +510,14 @@ fn execute_with_freshness(
                 project_names(state, store, true);
                 result = store.context_response(&actor, p, result, false);
                 store.decorate_sync_response(p, &mut result);
+                annotate_backfill(Some(&sync), store, p, &mut result);
                 return Ok(result);
             }
-            sync.request(
+            sync.request_scoped(
                 &actor,
                 "sync.barrier",
                 &json!({"interests":interest.into_iter().collect::<Vec<_>>()}),
+                history,
             )?;
             return execute_with_freshness(state, req, true);
         }
@@ -625,6 +639,7 @@ fn execute_with_freshness(
             store.monitor_status(&actor)
         };
         store.decorate_sync_response(p, &mut value);
+        annotate_backfill(sync.as_ref(), store, p, &mut value);
         if let Some(note) = retraction_note {
             value["delivery_note"] = json!(note);
         }
@@ -639,6 +654,47 @@ fn execute_with_freshness(
         }
         value
     })
+}
+
+/// Report a conversation whose history is still arriving from the hub, so a
+/// client can say "fetching history N/M" instead of "not cached". Applies to
+/// scoped-backfill hub connections only; older hubs report coverage as before.
+fn annotate_backfill(
+    sync: Option<&Arc<super::sync::Runtime>>,
+    store: &Store,
+    p: &Value,
+    value: &mut Value,
+) {
+    let Some(sync) = sync.filter(|s| s.scoped()) else {
+        return;
+    };
+    if !value.is_object() || store.is_coordinator() {
+        return;
+    }
+    let Some(interest) = store.query_interest(p).filter(|i| !i.starts_with("thread:")) else {
+        return;
+    };
+    let scope = store.channel_id_at_path(&interest).unwrap_or(&interest);
+    let backfill = match sync.backfill_status(scope) {
+        Some(b) => json!({"state":"fetching","done":b.done,"total":b.total}),
+        // Reading an uncovered channel registers interest; the hub starts its
+        // backfill within a round trip.
+        None if value["cache"]["status"] == "partial"
+            && store.channel_path_of(scope).is_some()
+            && sync.connected.load(std::sync::atomic::Ordering::Acquire) =>
+        {
+            json!({"state":"requested"})
+        }
+        None => return,
+    };
+    value["cache"]["status"] = json!("backfilling");
+    value["cache"]["backfill"] = backfill;
+    if value.get("coverage").is_some() {
+        value["coverage"] = json!("backfilling");
+    }
+    if let Some(recent) = value.get_mut("recent") {
+        annotate_backfill(Some(sync), store, p, recent);
+    }
 }
 
 #[cfg(test)]

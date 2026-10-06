@@ -570,3 +570,492 @@ fn messaging_sync_prioritizes_new_dm_while_bulk_page_is_in_flight() {
         "bulk still gets a turn"
     );
 }
+
+const FEATURE: &str = transport::FEATURE_SCOPED;
+fn send_frame(stream: &mut std::os::unix::net::UnixStream, frame: &Value) {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(frame).unwrap();
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&bytes).unwrap();
+}
+fn receive_frame(stream: &mut std::os::unix::net::UnixStream) -> Value {
+    use std::io::Read;
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).unwrap();
+    let mut bytes = vec![0u8; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut bytes).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+fn runtime(state: &Arc<Mutex<DaemonState>>) -> Arc<Runtime> {
+    state.lock().unwrap().messaging_sync.clone().unwrap()
+}
+/// Post `count` messages to a new hub channel the replicas do not follow.
+fn hub_channel(n: &Network, path: &str, count: usize) -> (String, Vec<String>) {
+    let channel = call(
+        &n.hub,
+        "hub-agent",
+        "channels",
+        json!({"action":"create","path":path,"request_id":format!("create-{path}")}),
+    );
+    let cid = channel["channel"]["id"].as_str().unwrap().to_owned();
+    let ids = (0..count)
+        .map(|i| {
+            call(
+                &n.hub,
+                "hub-agent",
+                "send",
+                json!({"channel":path,"name":"Hub","body":format!("{path} {i}"),"request_id":format!("{path}-{i}")}),
+            )["event_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    (cid, ids)
+}
+/// Post to #general and wait until `state` ingested it: everything the hub
+/// published before it has then been through the main stream.
+fn settle(n: &Network, state: &Arc<Mutex<DaemonState>>, key: &str) {
+    let marker = call(
+        &n.hub,
+        "hub-agent",
+        "send",
+        json!({"channel":"general","name":"Hub","body":key,"request_id":key}),
+    );
+    let id = marker["event_id"].as_str().unwrap().to_owned();
+    wait_for(|| with_store(state, |s| s.wire_event(&id).is_ok()));
+}
+fn all_present(state: &Arc<Mutex<DaemonState>>, ids: &[String]) -> bool {
+    with_store(state, |s| ids.iter().all(|id| s.wire_event(id).is_ok()))
+}
+/// Records whether the replica's main-stream cursor ever moved backwards.
+struct CursorWatch {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<bool>>,
+}
+impl CursorWatch {
+    fn start(runtime: Arc<Runtime>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut last = runtime.stream_cursor.load(Ordering::Acquire);
+            let mut regressed = false;
+            while !flag.load(Ordering::Acquire) {
+                let now = runtime.stream_cursor.load(Ordering::Acquire);
+                regressed |= now < last;
+                last = now;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            regressed
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+    fn regressed(mut self) -> bool {
+        self.stop.store(true, Ordering::Release);
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+#[test]
+fn messaging_sync_interest_growth_backfills_only_the_new_scope() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    let rt = runtime(b);
+    assert!(rt.scoped(), "current peers negotiate scoped backfill");
+    let (cid, ids) = hub_channel(&n, "big", 150);
+    let (_, unrelated) = hub_channel(&n, "unrelated", 3);
+    settle(&n, b, "settled-before-growth");
+    assert!(with_store(b, |s| s.wire_event(&ids[0]).is_err()));
+    let revision = with_store(b, |s| s.download_checkpoint()["revision"].clone());
+    let before = rt.stream_cursor.load(Ordering::Acquire);
+    let watch = CursorWatch::start(rt.clone());
+    // `G` on one channel: a hub-freshness read. Small history arrives within
+    // the barrier's bounded wait, so the read already returns it.
+    let read = call(
+        b,
+        "client-1",
+        "read",
+        json!({"channel":"big","freshness":"hub","limit":200}),
+    );
+    assert_eq!(read["items"].as_array().unwrap().len(), 150, "{read}");
+    assert!(all_present(b, &ids));
+    assert!(with_store(b, |s| s.cached_coverage(&cid)["checkpoint"]["through"].is_u64()));
+    settle(&n, b, "settled-after-growth");
+    assert!(!watch.regressed(), "main stream cursor was reset");
+    assert!(rt.stream_cursor.load(Ordering::Acquire) >= before);
+    // A legacy subscription bumps the revision and replays from zero.
+    assert_eq!(
+        with_store(b, |s| s.download_checkpoint()["revision"].clone()),
+        revision
+    );
+    let state = rt.backfills.lock().unwrap().get(&cid).cloned().unwrap();
+    assert!(state.complete && state.total == 150 && state.done == 150, "{state:?}");
+    assert_eq!(rt.backfills.lock().unwrap().len(), 1, "only the new scope");
+    assert!(with_store(b, |s| unrelated.iter().all(|id| s.wire_event(id).is_err())));
+}
+
+#[test]
+fn messaging_sync_released_view_never_replays_and_readding_fetches_only_the_gap() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    let rt = runtime(b);
+    let (cid, mut ids) = hub_channel(&n, "big", 40);
+    rpc(b, "client-1", "read", json!({"channel":"big"}));
+    wait_for(|| all_present(b, &ids));
+    wait_for(|| rt.backfill_status(&cid).is_none());
+    let first = rt.backfills.lock().unwrap().get(&cid).cloned().unwrap();
+    let revision = with_store(b, |s| s.download_checkpoint()["revision"].clone());
+    let watch = CursorWatch::start(rt.clone());
+    // What the 60s expiry used to do: drop the view. The hub must not replay.
+    rt.views.lock().unwrap().clear();
+    rt.signal.signal();
+    // The client loop sends the changed interests before any queued call, so
+    // the hub has processed the release once this barrier replies.
+    call(b, "client-1", "read", json!({"channel":"general","freshness":"hub"}));
+    for i in 0..5 {
+        ids.push(
+            call(
+                &n.hub,
+                "hub-agent",
+                "send",
+                json!({"channel":"big","body":format!("gap {i}"),"request_id":format!("gap-{i}")}),
+            )["event_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    settle(&n, b, "after-release");
+    assert!(
+        with_store(b, |s| s.wire_event(&ids[40]).is_err()),
+        "a released scope stops streaming"
+    );
+    // Viewing again backfills only what was missed, never the whole channel.
+    rpc(b, "client-1", "read", json!({"channel":"big"}));
+    wait_for(|| all_present(b, &ids));
+    settle(&n, b, "after-readd");
+    assert!(!watch.regressed(), "main stream cursor was reset");
+    assert_eq!(
+        with_store(b, |s| s.download_checkpoint()["revision"].clone()),
+        revision
+    );
+    let second = rt.backfills.lock().unwrap().get(&cid).cloned().unwrap();
+    assert!(second.id > first.id, "{first:?} {second:?}");
+    assert_eq!(second.total, 5, "{second:?}");
+}
+
+#[test]
+fn messaging_sync_join_replies_before_history_and_history_follows() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    b.lock().unwrap().messaging_sync.take().unwrap().stop();
+    let (cid, ids) = hub_channel(&n, "big", 120);
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let local_root = b.lock().unwrap().messaging_root.clone();
+    let config = Config::load(&local_root).unwrap().unwrap();
+    let token = fs::read_to_string(config.token_file.unwrap()).unwrap();
+    let (host, actor, space) = with_store(b, |s| {
+        (
+            s.daemon_id.clone(),
+            s.participant_id("client-1"),
+            s.space_id.clone(),
+        )
+    });
+    let (generation, position, scopes) = with_store(&n.hub, |s| {
+        (
+            s.generation.clone(),
+            s.publication_position(),
+            s.host_transport_interests(&host, &BTreeSet::new()).unwrap(),
+        )
+    });
+    // Catch b's store up to the hub's position through the page API, then
+    // resume as a caught-up scoped replica.
+    let mut after = with_store(b, |s| s.download_checkpoint()["cursor"].as_u64().unwrap_or(0));
+    loop {
+        let page = with_store(&n.hub, |s| s.export_page(&host, &scopes, after, position).unwrap());
+        with_store(b, |s| {
+            for wire in page["items"].as_array().unwrap() {
+                s.ingest_replica(wire).unwrap();
+            }
+        });
+        after = page["cursor"].as_u64().unwrap();
+        if page["complete"] == true {
+            break;
+        }
+    }
+    let person = json!([{"id":actor,"name":"Scout-1","session_uid":"client-1","present":true,"kind":"agent"}]);
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(root.join("messaging-sync.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    send_frame(
+        &mut socket,
+        &json!({"kind":"hello","daemon_id":host,"space_id":space,"token":token,"people":person,
+            "interests":[],"features":[FEATURE],"resume":{"generation":generation,"cursor":position,"scopes":scopes}}),
+    );
+    let hello = receive_frame(&mut socket);
+    assert_eq!(hello["features"], json!([FEATURE]), "{hello}");
+    assert_eq!(hello["cursor"], position, "resumed, not replayed");
+    send_frame(
+        &mut socket,
+        &json!({"kind":"call","id":"join","actor":actor,"method":"messaging.channels",
+            "params":{"action":"join","conversation":cid,"request_id":"join-big"},"people":person}),
+    );
+    // Nothing is acknowledged before the reply: it cannot wait for history.
+    let mut pending = std::collections::VecDeque::new();
+    let reply = loop {
+        let frame = receive_frame(&mut socket);
+        if frame["kind"] == "reply" {
+            break frame;
+        }
+        pending.push_back(frame);
+    };
+    assert!(reply["error"].is_null(), "{reply}");
+    assert_eq!(reply["backfill_started"], json!([cid]));
+    assert_eq!(reply["backfills"][&cid]["total"], 120);
+    assert_eq!(reply["backfills"][&cid]["complete"], false);
+    let barrier = reply["barrier"].as_u64().unwrap();
+    // The main stream resumes above the old cursor and brings the membership
+    // event; the backfill lane brings exactly the channel's history.
+    let (mut backfilled, mut main_through, mut complete) = (0, position, false);
+    while !complete || main_through < barrier {
+        let frame = pending
+            .pop_front()
+            .unwrap_or_else(|| receive_frame(&mut socket));
+        match frame["kind"].as_str().unwrap() {
+            "batch" => {
+                let page = &frame["page"];
+                assert!(page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|w| w["position"].as_u64().unwrap() > position));
+                with_store(b, |s| {
+                    for wire in page["items"].as_array().unwrap() {
+                        s.ingest_replica(wire).unwrap();
+                    }
+                });
+                main_through = page["cursor"].as_u64().unwrap();
+                send_frame(
+                    &mut socket,
+                    &json!({"kind":"ack","cursor":page["cursor"],"revision":frame["revision"],"dependency_offset":page["dependency_offset"]}),
+                );
+            }
+            "backfill" => {
+                assert_eq!(frame["scope"], cid);
+                let page = &frame["page"];
+                with_store(b, |s| {
+                    for wire in page["items"].as_array().unwrap() {
+                        s.ingest_replica(wire).unwrap();
+                    }
+                });
+                backfilled += page["items"].as_array().unwrap().len();
+                complete = frame["complete"] == true;
+                send_frame(
+                    &mut socket,
+                    &json!({"kind":"backfill_ack","scope":cid,"id":frame["id"],"cursor":page["cursor"],"dependency_offset":page["dependency_offset"]}),
+                );
+            }
+            "backfills" | "live" | "owner_snapshot" | "pong" => {}
+            other => panic!("unexpected frame {other}: {frame}"),
+        }
+    }
+    assert_eq!(backfilled, 120, "exactly the channel's history");
+    assert!(all_present(b, &ids));
+}
+
+#[test]
+fn messaging_sync_join_through_replica_returns_and_history_arrives() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    let rt = runtime(b);
+    let (cid, ids) = hub_channel(&n, "big", 200);
+    settle(&n, b, "before-join");
+    let started = Instant::now();
+    let joined = call(
+        b,
+        "client-1",
+        "channels",
+        json!({"action":"join","conversation":cid,"request_id":"join-big"}),
+    );
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(5), "join took {elapsed:?}");
+    assert!(joined["error"].is_null(), "{joined}");
+    wait_for(|| all_present(b, &ids));
+    wait_for(|| rt.backfill_status(&cid).is_none());
+    let read = call(b, "client-1", "read", json!({"channel":"big","limit":5}));
+    assert_eq!(read["cache"]["status"], "complete_through_checkpoint", "{read}");
+    assert!(read["cache"]["backfill"].is_null());
+}
+
+#[test]
+fn messaging_sync_legacy_replica_keeps_single_cursor_protocol() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    b.lock().unwrap().messaging_sync.take().unwrap().stop();
+    hub_channel(&n, "big", 3);
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let local_root = b.lock().unwrap().messaging_root.clone();
+    let config = Config::load(&local_root).unwrap().unwrap();
+    let token = fs::read_to_string(config.token_file.unwrap()).unwrap();
+    let (host, actor, space) = with_store(b, |s| {
+        (s.daemon_id.clone(), s.participant_id("client-1"), s.space_id.clone())
+    });
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(root.join("messaging-sync.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    send_frame(
+        &mut socket,
+        &json!({"kind":"hello","daemon_id":host,"space_id":space,"token":token,
+            "people":[{"id":actor,"name":"Scout-1","session_uid":"client-1","present":true,"kind":"agent"}],
+            "interests":["general"],"resume":null}),
+    );
+    let hello = receive_frame(&mut socket);
+    assert!(hello["features"].is_null(), "no feature offered to an old peer");
+    let first = receive_frame(&mut socket);
+    assert_eq!(first["kind"], "batch");
+    assert_eq!(first["revision"], 1);
+    send_frame(
+        &mut socket,
+        &json!({"kind":"interests","interests":["general","big"]}),
+    );
+    send_frame(
+        &mut socket,
+        &json!({"kind":"ack","cursor":first["page"]["cursor"],"revision":1,"dependency_offset":first["page"]["dependency_offset"]}),
+    );
+    // Legacy semantics: an interest change restarts the stream at zero under a
+    // new revision, and no scoped frames are ever sent.
+    let next = loop {
+        let frame = receive_frame(&mut socket);
+        assert!(
+            !matches!(frame["kind"].as_str(), Some("backfill" | "backfills")),
+            "{frame}"
+        );
+        if frame["kind"] == "batch" && frame["revision"].as_u64().unwrap() > 1 {
+            break frame;
+        }
+    };
+    let first_position = next["page"]["items"][0]["position"].as_u64().unwrap();
+    assert!(first_position <= 5, "replayed from zero: {first_position}");
+}
+
+#[test]
+fn messaging_sync_scoped_replica_falls_back_with_a_legacy_hub() {
+    use std::os::unix::net::UnixListener;
+    let tmp = tempfile::tempdir().unwrap();
+    let hub_store = Store::open(&tmp.path().join("hub")).unwrap();
+    let descriptor = hub_store.space_descriptor();
+    let generation = hub_store.generation.clone();
+    let root = tmp.path().join("replica");
+    drop(Store::provision_replica(&root, &descriptor).unwrap());
+    let socket_path = tmp.path().join("legacy-hub.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    fs::write(root.join("sync-token"), uuid::Uuid::new_v4().to_string()).unwrap();
+    let config = json!({"version":1,"configured":true,"coordinator_id":descriptor["coordinator_id"],
+        "space_id":descriptor["space_id"],"endpoint":{"kind":"unix","path":socket_path},
+        "token_file":root.join("sync-token")});
+    fs::write(root.join("messaging-sync.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let replica = state(&root, "client");
+    super::super::rpc::initialize(&replica).unwrap();
+    start(&replica);
+    let (mut hub, _) = listener.accept().unwrap();
+    hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let hello = receive_frame(&mut hub);
+    assert_eq!(hello["features"], json!([FEATURE]));
+    // A hub from before the feature answers with the old hello shape.
+    send_frame(
+        &mut hub,
+        &json!({"kind":"hello","coordinator_id":descriptor["coordinator_id"],"space_id":descriptor["space_id"],
+            "generation":generation,"cursor":0,"revision":1}),
+    );
+    send_frame(
+        &mut hub,
+        &json!({"kind":"batch","revision":1,"scopes":[],"page":{"items":[],"cursor":0,"dependency_offset":0,
+            "through":0,"complete":true,"generation":generation,"space_id":descriptor["space_id"]}}),
+    );
+    let ack = loop {
+        let frame = receive_frame(&mut hub);
+        if frame["kind"] == "ack" {
+            break frame;
+        }
+    };
+    assert_eq!(ack["revision"], 1);
+    let rt = runtime(&replica);
+    assert!(!rt.scoped());
+    // A barrier with a legacy hub uses the old cursor/revision fence only.
+    let caller = rt.clone();
+    let barrier = std::thread::spawn(move || {
+        caller.request_scoped(
+            "owner",
+            "sync.barrier",
+            &json!({"interests":["general"]}),
+            Some((vec!["general".into()], Duration::from_secs(5))),
+        )
+    });
+    let request = loop {
+        let frame = receive_frame(&mut hub);
+        if frame["kind"] == "call" {
+            break frame;
+        }
+    };
+    let started = Instant::now();
+    send_frame(
+        &mut hub,
+        &json!({"kind":"reply","id":request["id"],"result":{"caught_up":true},"barrier":0,"revision":1}),
+    );
+    assert_eq!(barrier.join().unwrap().unwrap()["caught_up"], true);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let stopped = replica.lock().unwrap().messaging_sync.take();
+    if let Some(r) = stopped {
+        r.stop();
+    }
+}
+
+/// Timing probe (not a gate): join a channel with `CM_SYNC_PROBE_MESSAGES`
+/// (default 6300) messages over a local socket.
+#[test]
+#[ignore]
+fn messaging_sync_probe_large_channel_join_timing() {
+    let count = std::env::var("CM_SYNC_PROBE_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6300);
+    let n = Network::new();
+    let b = &n.clients[1];
+    let rt = runtime(b);
+    let made = Instant::now();
+    let (cid, ids) = hub_channel(&n, "big", count);
+    eprintln!("probe: created {count} hub messages in {:?}", made.elapsed());
+    settle(&n, b, "before-join");
+    let started = Instant::now();
+    let joined = call(
+        b,
+        "client-1",
+        "channels",
+        json!({"action":"join","conversation":cid,"request_id":"join-big"}),
+    );
+    let reply = started.elapsed();
+    let progress = call(b, "client-1", "read", json!({"channel":"big","limit":5}));
+    eprintln!(
+        "probe: join replied in {reply:?}; cache {} (join result cache {})",
+        progress["cache"], joined["cache"]
+    );
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while rt.backfill_status(&cid).is_some() || !all_present(b, &ids[ids.len() - 1..]) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!(
+        "probe: history of {count} complete {:?} after join",
+        started.elapsed()
+    );
+    assert!(all_present(b, &ids));
+}
