@@ -5064,7 +5064,10 @@ pub fn rpc_messaging(socket: &Path, token: &str, method: &str, params: serde_jso
 /// Read timeout for the message board's worker thread. A replica forwards
 /// joins, channel edits, pins and hub refreshes to the coordinator and holds
 /// the reply until its own copy catches up, for up to 30s
-/// (`daemon/src/messaging/sync/mod.rs`, `Sync::request`). The 5s default gave
+/// (`daemon/src/messaging/sync/mod.rs`, `Sync::request`). With a hub that
+/// negotiates `scoped_backfill`, joins reply once the membership change is
+/// local and history follows (reported as `cache.backfill`); a hub refresh
+/// waits at most 5s for history. Older hubs still hold the reply. The 5s default gave
 /// up first: the hub committed the change, the board kept it as an unconfirmed
 /// saved operation, and every later channel action was refused behind it.
 pub const MESSAGING_BOARD_RPC_READ_TIMEOUT: Duration = Duration::from_secs(45);

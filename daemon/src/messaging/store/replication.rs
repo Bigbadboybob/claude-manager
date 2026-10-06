@@ -145,6 +145,10 @@ impl ChangeSignal {
     }
 }
 
+/// Legacy page bounds `(records, bytes)`. Scoped-backfill subscriptions pass
+/// larger bounds from the transport (`sync::transport::BULK_PAGE`).
+const LEGACY_PAGE: (usize, usize) = (64, 256 * 1024);
+
 pub(super) struct Replication {
     pub coordinator_id: String,
     pub coordinator_lineage: BTreeSet<String>,
@@ -1553,16 +1557,98 @@ impl Store {
         }
         Ok(json!({"items":items,"scanned":through}))
     }
-    /// At most 64 records / 256 KiB. `dependency_offset` resumes a long parent
-    /// chain without claiming coverage for an incompletely delivered message.
-    /// On reconnect it is safe to replay from offset zero: IDs are immutable.
+    /// At most [`LEGACY_PAGE`]. `dependency_offset`
+    /// resumes a long parent chain without claiming coverage for an incompletely
+    /// delivered message. On reconnect it is safe to replay from offset zero:
+    /// IDs are immutable.
     pub fn export_slice(
         &self,
         host: &str,
         interests: &BTreeSet<String>,
         after: u64,
         through: u64,
+        dependency_offset: usize,
+    ) -> Result<Value> {
+        self.export_slice_by(host, after, through, dependency_offset, LEGACY_PAGE, |p| {
+            self.eligible_for_host(host, interests, &p.event)
+        })
+    }
+    /// Main-stream page for a scoped-backfill subscription. `covered` scopes
+    /// stream in full; a scope in `joined` streams only after the position its
+    /// separate backfill reaches, so the two lanes never depend on each other's
+    /// page boundaries. Eligibility is a pure function of position, which keeps
+    /// `dependency_offset` stable while scopes are added.
+    pub fn export_scoped_slice(
+        &self,
+        host: &str,
+        covered: &BTreeSet<String>,
+        joined: &BTreeMap<String, u64>,
+        after: u64,
+        through: u64,
+        dependency_offset: usize,
+        limit: (usize, usize),
+    ) -> Result<Value> {
+        let singles = joined
+            .iter()
+            .map(|(scope, from)| (scope.as_str(), (*from, BTreeSet::from([scope.clone()]))))
+            .collect::<BTreeMap<_, _>>();
+        self.export_slice_by(host, after, through, dependency_offset, limit, |p| {
+            self.eligible_for_host(host, covered, &p.event)
+                || singles
+                    .get(strv(&p.event, "conversation_id"))
+                    .is_some_and(|(from, single)| {
+                        p.position > *from && self.eligible_for_host(host, single, &p.event)
+                    })
+        })
+    }
+    /// One page of a single scope's history backfill: only that conversation's
+    /// messages (with their reply chains). Metadata reaches the replica through
+    /// the main stream, which the caller bounds `through` by.
+    pub fn export_backfill(
+        &self,
+        host: &str,
+        scope: &str,
+        after: u64,
+        through: u64,
+        dependency_offset: usize,
+        limit: (usize, usize),
+    ) -> Result<Value> {
+        let single = BTreeSet::from([scope.to_owned()]);
+        self.export_slice_by(host, after, through, dependency_offset, limit, |p| {
+            Self::backfill_member(scope, &p.event)
+                && self.eligible_for_host(host, &single, &p.event)
+        })
+    }
+    fn backfill_member(scope: &str, e: &Value) -> bool {
+        e["type"] == "message.create" && strv(e, "conversation_id") == scope
+    }
+    /// Messages of `scope` in `(after, through]`, for backfill progress.
+    pub fn scope_message_count(&self, scope: &str, after: u64, through: u64) -> u64 {
+        self.events
+            .iter()
+            .filter(|p| p.position > after && p.position <= through)
+            .filter(|p| Self::backfill_member(scope, &p.event))
+            .count() as u64
+    }
+    /// Per-scope coverage this replica holds in `generation`; a hub uses it to
+    /// start a re-added scope's backfill where the earlier coverage ended.
+    pub fn transport_coverage_hints(&self, generation: &str) -> BTreeMap<String, u64> {
+        self.replication
+            .coverage
+            .iter()
+            .filter(|(scope, _)| !matches!(scope.as_str(), "transport" | "metadata" | "*"))
+            .filter(|(_, v)| v["generation"] == generation && v["complete"] == true)
+            .filter_map(|(scope, v)| Some((scope.clone(), v["through"].as_u64()?)))
+            .collect()
+    }
+    fn export_slice_by(
+        &self,
+        host: &str,
+        after: u64,
+        through: u64,
         mut dependency_offset: usize,
+        (max_items, max_bytes): (usize, usize),
+        eligible: impl Fn(&Published) -> bool,
     ) -> Result<Value> {
         if !self.host_authorized(host, None) {
             return Err(err("host_revoked", "Messaging host is not enrolled"));
@@ -1579,7 +1665,7 @@ impl Store {
             .iter()
             .filter(|p| p.position > after && p.position <= through)
         {
-            if self.eligible_for_host(host, interests, &p.event) {
+            if eligible(p) {
                 let mut ids = self.dependency_ids(&p.event)?;
                 ids.push(required(&p.event, "id")?);
                 if dependency_offset >= ids.len() {
@@ -1594,7 +1680,9 @@ impl Store {
                     }
                     let wire = self.wire_event(id)?;
                     let size = serde_json::to_vec(&wire)?.len();
-                    if !items.is_empty() && (items.len() >= 64 || bytes + size > 256 * 1024) {
+                    if !items.is_empty()
+                        && (items.len() >= max_items || bytes + size > max_bytes)
+                    {
                         return Ok(
                             json!({"items":items,"cursor":cursor,"dependency_offset":offset,"through":through,"complete":false,"generation":self.generation,"space_id":self.space_id}),
                         );
