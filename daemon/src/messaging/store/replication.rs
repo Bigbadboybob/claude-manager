@@ -270,6 +270,37 @@ impl Store {
             "last_reconciled":self.replication.last_reconciled,"error":self.replication.error,
             "handoff_paused":self.messaging_frozen(),"pending":self.events.iter().filter(|e| e.event["origin_daemon_id"] == self.daemon_id && !self.replication.receipts.contains_key(strv(&e.event,"id")) && !self.replication.rejections.contains_key(strv(&e.event,"id"))).count()})
     }
+    /// The caller's own events saved on this replica but not yet accepted by
+    /// the hub: `{pending_sync, oldest_age_s, oldest_event_id}`, or None when
+    /// nothing is waiting (and always None on the hub or a standalone host,
+    /// whose events are authoritative where they are written).
+    pub fn outbox_status(&self, actor: &str) -> Option<Value> {
+        if self.is_coordinator() || !self.sync_enabled() {
+            return None;
+        }
+        let mut pending = 0usize;
+        let mut oldest: Option<(&str, &str)> = None;
+        for e in &self.events {
+            let id = strv(&e.event, "id");
+            if e.event["origin_daemon_id"] != self.daemon_id
+                || e.event["actor"]["id"] != actor
+                || self.replication.receipts.contains_key(id)
+                || self.replication.rejections.contains_key(id)
+            {
+                continue;
+            }
+            pending += 1;
+            let at = strv(&e.event, "created_at");
+            if oldest.is_none_or(|(_, o)| at < o) {
+                oldest = Some((id, at));
+            }
+        }
+        let (id, at) = oldest?;
+        let age = DateTime::parse_from_rfc3339(at)
+            .map(|t| (Utc::now() - t.with_timezone(&Utc)).num_seconds().max(0))
+            .ok();
+        Some(json!({"pending_sync":pending,"oldest_age_s":age,"oldest_event_id":id}))
+    }
     pub fn set_sync_connection(&mut self, connected: bool, error: Option<String>) {
         self.replication.connected = connected;
         self.replication.error = error;
@@ -2021,6 +2052,42 @@ mod tests {
             p.replica.cached_coverage("general")["checkpoint"]["through"],
             50
         );
+    }
+    #[test]
+    fn outbox_counts_own_pending_messages_until_the_hub_accepts_them() {
+        let mut p = pair();
+        let (a, b) = (p.people[0].id.clone(), p.people[1].id.clone());
+        assert!(p.replica.outbox_status(&a).is_none());
+        p.replica.set_sync_connection(false, Some("storage_error: connection reset".into()));
+        for key in ["o1", "o2"] {
+            p.replica
+                .send(&a, "a", "agent", &json!({"channel":"general","body":"Offline","request_id":key}), &p.people)
+                .unwrap();
+        }
+        let outbox = p.replica.outbox_status(&a).unwrap();
+        assert_eq!(outbox["pending_sync"], 2);
+        assert!(outbox["oldest_age_s"].as_i64().is_some_and(|s| s >= 0));
+        assert!(outbox["oldest_event_id"].is_string());
+        // Another participant's view of the same replica is unaffected.
+        assert!(p.replica.outbox_status(&b).is_none());
+        // The hub's own events are authoritative where written.
+        assert!(p.hub.outbox_status(&a).is_none());
+        // A body-promoted mention keeps the ID-only stored shape, so the hub's
+        // mention-audience validation accepts it; receipts drain the outbox.
+        let promoted = p
+            .replica
+            .send(&a, "a", "agent", &json!({"channel":"general","body":"@Scout-b over to you","request_id":"o3"}), &p.people)
+            .unwrap();
+        assert_eq!(promoted["event"]["data"]["mentions"], json!([b]));
+        assert_eq!(p.replica.outbox_status(&a).unwrap()["pending_sync"], 3);
+        for wire in p.replica.pending_uploads(64).unwrap() {
+            let receipt = p.hub.accept_upload(&p.replica.daemon_id, &wire).unwrap();
+            p.replica.record_receipt(&receipt).unwrap();
+        }
+        let id = promoted["event_id"].as_str().unwrap();
+        assert!(mention_recipients(&p.hub.events.iter().find(|e| e.event["id"] == id).unwrap().event)
+            .contains(&b.as_str()));
+        assert!(p.replica.outbox_status(&a).is_none());
     }
     #[test]
     fn offline_messages_and_monitors_survive_receipt_loss_and_origin_restart() {

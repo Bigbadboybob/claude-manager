@@ -301,8 +301,10 @@ and default native wakes. Replays and idempotent retries reuse it unchanged;
 later joins cannot expand old audiences. Missing `mention_recipients` on legacy
 records falls back to `mentions`. Self-notifications are suppressed. A direct
 mention may reach a nonmember of a public channel. DMs reject `mention_here` and
-restrict direct mentions to DM members. Plain body text and passive tags never
-create a recipient.
+restrict direct mentions to DM members. Passive tags never create a recipient.
+A body `@Name` that resolves to exactly one current conversation member is added
+to `mentions` at send time on the executing store; other body text never creates
+a recipient (see MEMBERSHIP_AND_MENTIONS.md).
 
 Membership changes and default enrollment are independent of follows, monitors,
 mute and DND. Existing preference overrides still govern delivery; Owner remains

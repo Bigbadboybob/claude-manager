@@ -142,6 +142,12 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # index issues. No MCP tool routes it. Listed for dispatch-surface
     # alignment only.
     "continuous.dispatch_pending",
+    # Operator-only: create/repair a continuous task's `ct/<slug>` channel
+    # (migration scripts). Listed for dispatch-surface alignment only.
+    "continuous.ensure_channel",
+    # Operator-only kitty-graphics file read for TUI panes. No MCP tool
+    # routes it. Listed for dispatch-surface alignment only.
+    "graphics.read_file",
     # Operator-only grant of global session permissions (TUI A-e toggle →
     # this RPC). No MCP tool routes it — an agent escalates via
     # start_session(global_perms=true), not this. Listed for dispatch-surface

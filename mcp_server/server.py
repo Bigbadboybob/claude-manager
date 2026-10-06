@@ -358,8 +358,12 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     """Send to exactly one channel, participant DM, or conversation ID.
 
     Join channels with chat_channels(action="join") before posting. mentions
-    contains participant IDs; mention_here=True notifies channel members at send
-    time and is unavailable in DMs. Body text alone never triggers a mention.
+    takes participant IDs or exact names/aliases; mention_here=True notifies
+    channel members at send time and is unavailable in DMs. A body @Name that
+    names exactly one current member of the conversation becomes a mention;
+    any other body @token (non-member, unknown, ambiguous, @here, @Owner) is
+    NOT notified and comes back in warnings. mentions_resolved lists who was
+    mentioned and from where. Code spans, emails and URLs are never scanned.
     Incoming DMs and mentions notify by default; no monitor or rearming needed.
     Membership alone does not notify on every post.
 
@@ -382,6 +386,8 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     channel_norms; context_status lists stale scopes.
     On paired hosts, enrolled agents can post to known conversations offline.
     pending_sync means saved locally; replicated means the hub accepted the same ID.
+    created_at is the authoritative send time; outbox reports your messages still
+    pending_sync on this host. A hub-executed send reports submitted_at and delay_s.
     First naming, a new DM, and shared metadata edits need connectivity. Offline
     @here freezes the last-known membership audience; reconnect never expands it.
     """
@@ -1704,8 +1710,9 @@ def set_session_section(section: str, session_id: str | None = None) -> dict:
 def notify_user(message: str = "") -> dict:
     """Request Owner attention for your own session (local, cloud, or continuous).
 
-    Continuous workers must DM their orchestrator for routine reviews, progress,
-    recoverable failures and handoffs; do not notify Owner for those events.
+    Continuous workers post routine reviews, progress, recoverable failures and
+    handoffs in their task channel mentioning the orchestrator; do not notify
+    Owner for those events.
     Orchestrators use this only for a reviewed decision/blocker requiring Owner,
     preserving stricter quiet policies. Interactive sessions use it when Owner
     action is needed. Supply a concise reason and relevant message/file link.

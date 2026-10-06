@@ -33,6 +33,7 @@ mod norms;
 pub use norms::textual_diff as norms_diff;
 mod channels;
 mod membership;
+mod mentions;
 mod preferences;
 mod watches;
 use membership::mention_recipients;
@@ -1195,44 +1196,14 @@ impl Store {
         }
         let mut members = vec![actor.to_owned()];
         for peer in peers {
-            let peer = if peer == "owner"
-                || self.names.contains_key(&peer)
-                || people.iter().any(|x| x.id == peer)
-            {
-                peer
-            } else {
-                let mut hits: Vec<_> = self
-                    .names
-                    .iter()
-                    .filter(|(_, n)| {
-                        normalize(&n.name) == normalize(&peer)
-                            || n.aliases.iter().any(|a| normalize(a) == normalize(&peer))
-                    })
-                    .collect();
-                // Honor exact legacy names/aliases first: before this policy,
-                // "Build Scout" and "Build-Scout" could belong to different IDs.
-                if hits.is_empty() {
-                    hits = self
-                        .names
-                        .iter()
-                        .filter(|(_, n)| {
-                            name_key(&n.name) == name_key(&peer)
-                                || n.aliases.iter().any(|a| name_key(a) == name_key(&peer))
-                        })
-                        .collect();
-                }
-                // A released name (a task's superseded orchestrator) yields to
-                // the participant that holds it now.
-                if hits.len() > 1 && hits.iter().any(|(_, n)| !n.released) {
-                    hits.retain(|(_, n)| !n.released);
-                }
-                if hits.len() != 1 {
+            let peer = match self.resolve_participant_ref(&peer, people) {
+                mentions::ParticipantRef::Found(id) => id,
+                _ => {
                     return Err(err(
                         "not_found",
                         "Peer not found; use chat_people to resolve a participant ID",
-                    ));
+                    ))
                 }
-                hits[0].0.clone()
             };
             if members.contains(&peer) {
                 return Err(err(
@@ -1322,7 +1293,9 @@ impl Store {
     ) -> Result<Value> {
         let (key, digest, prior) = self.request(actor, p, "message.create")?;
         if let Some(e) = prior {
-            return Ok(self.send_response(&e));
+            let mut result = self.send_response(&e);
+            self.annotate_retry_mentions(actor, p, people, &e, &mut result);
+            return Ok(result);
         }
         if !self.is_coordinator()
             && self
@@ -1408,20 +1381,11 @@ impl Store {
                     .collect::<Vec<_>>()
             })
             .or_else(|| self.conversations.get(&conv).cloned());
-        let mentions: BTreeSet<String> = p["mentions"].as_array().into_iter().flatten()
-            .filter_map(Value::as_str).map(str::to_owned).collect();
-        for m in &mentions {
-            let id = m.as_str();
-            if !people.iter().any(|x| x.id == id) && !self.names.contains_key(id) && id != "owner" {
-                return Err(err("not_found", "Mention participant not found"));
-            }
-            if members.as_ref().is_some_and(|v| !v.iter().any(|x| x == id)) {
-                return Err(err(
-                    "invalid_mention",
-                    "DM mentions are restricted to its members",
-                ));
-            }
-        }
+        let mentions::MentionPlan {
+            mentions,
+            resolved: mentions_resolved,
+            warnings: mention_warnings,
+        } = self.plan_mentions(actor, &conv, members.as_ref(), p, &body, people)?;
         let mention_here = p["mention_here"] == true;
         if mention_here && members.is_some() {
             return Err(err(
@@ -1518,10 +1482,11 @@ impl Store {
         if let Err(e) = repair {
             result["projection_status"] = json!(e.to_string());
         }
+        mentions::annotate(&mut result, mentions_resolved, mention_warnings);
         Ok(result)
     }
     fn send_response(&self, e: &Value) -> Value {
-        json!({"event":e,"event_id":e["id"],"name":e["actor"]["name"],"operation":{"space_id":self.space_id,"actor_id":e["actor"]["id"],"origin_daemon_id":e["request"]["origin_daemon_id"],"request_id":e["request"]["key"]},"position":self.position_token(self.position),"replication":self.event_replication(strv(e,"id"))["status"],"sync":self.sync_status(),"notification":self.notification_status(e),"name_publication":if e["data"]["identity_claim"].is_null() || self.events.iter().any(|v|v.event["type"]=="identity.update" && v.event["data"]["identity"]==e["data"]["identity_claim"]){"published"}else{"pending"},"norms":self.norms})
+        json!({"event":e,"event_id":e["id"],"created_at":e["created_at"],"name":e["actor"]["name"],"operation":{"space_id":self.space_id,"actor_id":e["actor"]["id"],"origin_daemon_id":e["request"]["origin_daemon_id"],"request_id":e["request"]["key"]},"position":self.position_token(self.position),"replication":self.event_replication(strv(e,"id"))["status"],"sync":self.sync_status(),"notification":self.notification_status(e),"name_publication":if e["data"]["identity_claim"].is_null() || self.events.iter().any(|v|v.event["type"]=="identity.update" && v.event["data"]["identity"]==e["data"]["identity_claim"]){"published"}else{"pending"},"norms":self.norms})
     }
     pub fn rename(&mut self, actor: &str, uid: &str, p: &Value) -> Result<Value> {
         let initiator = p["_authenticated_actor"].as_str().unwrap_or(actor);

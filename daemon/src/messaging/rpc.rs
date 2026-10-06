@@ -497,12 +497,14 @@ fn execute_with_freshness(
             drop(slot);
             drop(_delivery_guard);
             if forward {
+                let submitted_at = chrono::Utc::now();
                 let mut result = sync.request(&actor, &req.method, &forwarded)?;
                 let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
                 let store = slot.as_mut().unwrap();
                 if req.method == "messaging.send" {
                     result["coordinator_position"] = result["position"].clone();
                     result["position"] = submission_position;
+                    annotate_forward_delay(&mut result, submitted_at);
                 }
                 if let Some(snapshot) = result.get("owner_snapshot").cloned() {
                     store.apply_owner_snapshot(&snapshot)?;
@@ -510,6 +512,7 @@ fn execute_with_freshness(
                 project_names(state, store, true);
                 result = store.context_response(&actor, p, result, false);
                 store.decorate_sync_response(p, &mut result);
+                annotate_outbox(store, &actor, &mut result);
                 annotate_backfill(Some(&sync), store, p, &mut result);
                 return Ok(result);
             }
@@ -639,6 +642,7 @@ fn execute_with_freshness(
             store.monitor_status(&actor)
         };
         store.decorate_sync_response(p, &mut value);
+        annotate_outbox(store, &actor, &mut value);
         annotate_backfill(sync.as_ref(), store, p, &mut value);
         if req.method == "messaging.read" {
             super::delivery::annotate_conversations(store, &mut value);
@@ -657,6 +661,39 @@ fn execute_with_freshness(
         }
         value
     })
+}
+
+/// A send executed on the hub is stamped with the hub's `created_at`. Tell the
+/// sender when it submitted and, when the hub stamped it more than a minute
+/// later (a stalled link), by how much: `created_at` stays authoritative.
+fn annotate_forward_delay(result: &mut Value, submitted_at: chrono::DateTime<chrono::Utc>) {
+    if !result.is_object() {
+        return;
+    }
+    result["submitted_at"] = json!(submitted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let created = result["created_at"]
+        .as_str()
+        .or_else(|| result["event"]["created_at"].as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    if let Some(created) = created {
+        let delay = (created.with_timezone(&chrono::Utc) - submitted_at).num_seconds();
+        if delay > 60 {
+            result["delay_s"] = json!(delay);
+            result["delay_note"] = json!(format!("The hub stamped this message {delay}s after you submitted it; its created_at is the authoritative send time"));
+        }
+    }
+}
+
+/// Own messages still waiting for the hub (`pending_sync`), on every messaging
+/// response, so a stalled link is visible to the sender rather than silent.
+/// Only scanned when the replica reports anything pending at all.
+fn annotate_outbox(store: &Store, actor: &str, value: &mut Value) {
+    if !value.is_object() || value["sync"]["pending"].as_u64().unwrap_or(0) == 0 {
+        return;
+    }
+    if let Some(outbox) = store.outbox_status(actor) {
+        value["outbox"] = outbox;
+    }
 }
 
 /// Report a conversation whose history is still arriving from the hub, so a
@@ -703,6 +740,21 @@ fn annotate_backfill(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwarded_send_reports_submission_time_and_hub_delay() {
+        let submitted = chrono::DateTime::parse_from_rfc3339("2026-10-06T15:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut prompt = json!({"created_at":"2026-10-06T15:00:02.000Z"});
+        annotate_forward_delay(&mut prompt, submitted);
+        assert_eq!(prompt["submitted_at"], "2026-10-06T15:00:00.000Z");
+        assert!(prompt.get("delay_s").is_none());
+        // Older hubs only carry created_at inside the event.
+        let mut stalled = json!({"event":{"created_at":"2026-10-06T15:40:00.000Z"}});
+        annotate_forward_delay(&mut stalled, submitted);
+        assert_eq!(stalled["delay_s"], 2400);
+        assert!(stalled["delay_note"].as_str().unwrap().contains("authoritative"));
+    }
     fn setup(root: &std::path::Path) -> Arc<Mutex<DaemonState>> {
         let mut state = DaemonState::default();
         state.messaging_root = root.into();

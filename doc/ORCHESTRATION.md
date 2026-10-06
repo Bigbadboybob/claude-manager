@@ -63,16 +63,19 @@ declaration and follows up when the ETA passes.
 | Action | Wakes |
 |---|---|
 | DM (`chat_send(dm=...)`) | the recipient(s) |
-| `chat_send(mentions=["<participant id>"])` | each mentioned participant |
+| `chat_send(mentions=["<participant id or exact name>"])` | each mentioned participant |
 | `chat_send(mention_here=True)` | current channel members |
 | `start_session` / `send_input` (auto monitor) | you, when the worker's turn ends (`notify_until="final"`: when it calls `report_done` or exits) |
 | `monitor_sessions(...)` | you, on the condition you set |
 | `notify_user(message=...)` | Owner, through the TUI alert |
-| `@Name` in a message body | **nobody** |
+| `@Name` in a message body | that participant, **only** if it names exactly one current member of the conversation; otherwise nobody, and the send returns a warning |
 | Tags, channel membership, a pinned message | nobody |
 
-Anything that must make someone act uses a DM or a structured mention with a
-participant ID (`chat_people(query=...)` resolves names; IDs survive renames).
+Anything that must make someone act uses a DM or a mention. Read
+`mentions_resolved` and `warnings` on every send: a warning means someone you
+named was not notified (not a member, unknown or ambiguous name, `@here`,
+`@Owner`). Use `chat_people(query=...)` and participant IDs when in doubt; IDs
+survive renames.
 After dispatching or prompting workers, end your turn and let the monitor or the
 mention wake you; do not poll in a loop.
 

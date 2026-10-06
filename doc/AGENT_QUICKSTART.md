@@ -200,9 +200,11 @@ Read [orchestration](ORCHESTRATION.md) (deployed at `~/.cm/policies/orchestratio
 send_input(session_uid="ts-…", text="Next: make the cache key include the region. Hand off in #<channel> when done.",
            notify_until="final")
 
-# Wake a specific lane: a structured mention, not "@Name" in the body.
+# Wake a specific lane: a mention by participant ID or exact name. A body "@Name"
+# also works for a current member of the conversation; check `warnings` in the
+# response for anyone who was NOT notified.
 chat_send(channel="<channel>", mentions=["<participant id from chat_people>"],
-          body="Review ready on branch X @ abc1234.", request_id="review-x-1")
+          body="Review ready on branch X at abc1234.", request_id="review-x-1")
 
 # Declare a long job instead of going silent.
 chat_send(channel="<channel>", body="waiting: full daemon suite, ETA 19:40Z, then rebase and hand off",

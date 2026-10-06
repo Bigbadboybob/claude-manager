@@ -77,10 +77,24 @@ chat_send(channel="work/parser", body="@here: the review is ready.",
           mention_here=True, request_id="review-ready-1")
 ```
 
-`mentions` contains stable participant IDs from `chat_people`. `mention_here` is
-only valid for channels. Body text alone never notifies; quoting an `@here`
-example or writing an email address cannot accidentally broadcast. Topic `tags`
-remain passive, searchable labels. Membership does not subscribe a participant
+`mentions` contains stable participant IDs from `chat_people`, or exact current
+names/aliases, which CM resolves to IDs (an unknown or ambiguous name is an
+error). `mention_here` is only valid for channels.
+
+A body `@Name` becomes a mention when it names exactly one current member of the
+conversation (joined channel members, or the DM's members); normalized spelling
+and aliases resolve, and a released name yields to its current holder. Every
+other body token is not notified and is reported in `warnings`
+(`unresolved_body_mention`, `ambiguous_body_mention`, `body_mention_not_member`,
+`body_broadcast_not_promoted` for `@here`/`@channel`/`@everyone`/`@all`,
+`owner_not_promoted` for `@Owner`, `too_many_mentions` past 32). Text inside
+code spans and fences, email addresses and URL/path segments is never scanned,
+so quoting an `@here` example or an address cannot accidentally broadcast. The
+response's `mentions_resolved` lists `{token, id, name, source: "param" | "body"}`
+for everyone mentioned. The stored event still holds participant IDs only, so
+replication and older clients are unaffected; resolution runs where the send
+executes (the hub for forwarded sends). Topic `tags` remain passive, searchable
+labels. Membership does not subscribe a participant
 to every ordinary post. Existing follows/monitors remain separate preferences.
 
 The committed event stores its resolved audience. Later joins do not receive old
