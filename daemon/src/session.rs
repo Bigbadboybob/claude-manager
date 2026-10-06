@@ -1089,8 +1089,9 @@ pub struct DaemonSession {
     /// operator first types; control-plane `send_input` (agent- or
     /// workflow-driven) never stamps it.
     pub last_operator_input_at: SharedLastActivity,
-    /// Last time ANY input (operator typing, agent-prompt delivery,
-    /// bash send) was written/accepted for this PTY. Paired with
+    /// Last time submitted operator input, agent-prompt delivery, or
+    /// a bash send was written/accepted for this PTY. Viewer navigation
+    /// and unsubmitted drafts do not count. Paired with
     /// `last_turn_end_at` to derive `semantic_idle`: a turn-end
     /// reported AFTER the last input means the agent is at its
     /// prompt, whatever the PTY-output heuristic says.
@@ -2735,6 +2736,30 @@ fn stamp_now(cell: &SharedLastActivity) {
     *slot = Some(Instant::now());
 }
 
+/// The viewer sends either a raw Enter or a kitty keyboard Enter (CSI 13 u,
+/// optionally with numeric modifier/event parameters). Other terminal input
+/// is activity for delivery timing, but does not start an agent turn.
+fn contains_operator_submit(bytes: &[u8]) -> bool {
+    bytes.contains(&b'\r')
+        || bytes.windows(4).enumerate().any(|(i, prefix)| {
+            if prefix != b"\x1b[13" {
+                return false;
+            }
+            let tail = &bytes[i + 4..];
+            if tail.starts_with(b"u") {
+                return true;
+            }
+            let Some(params) = tail.strip_prefix(b";") else {
+                return false;
+            };
+            let end = params
+                .iter()
+                .take_while(|&&b| b.is_ascii_digit() || b == b':' || b == b';')
+                .count();
+            end > 0 && params.get(end) == Some(&b'u')
+        })
+}
+
 impl InputHandle {
     /// Write `bytes` to the PTY then stamp activity. Stamp is
     /// AFTER the write so a failed write doesn't lie about
@@ -2831,7 +2856,9 @@ impl InputHandle {
     /// [`write_and_stamp`](Self::write_and_stamp) for OPERATOR input
     /// (the attach stream — a human typing). Additionally stamps
     /// `last_operator_input_at` so the agent-prompt delivery threads
-    /// can defer injection while the operator is actively typing.
+    /// can defer injection while the operator is actively typing. Only
+    /// a submit key stamps `last_input_at`: drafts and navigation must
+    /// preserve semantic idle and the agent's done report.
     pub fn write_and_stamp_operator(&self, bytes: &[u8]) -> std::io::Result<()> {
         let _permit = crate::writer_gate::write_permit();
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
@@ -2841,7 +2868,9 @@ impl InputHandle {
         writer.write_all(bytes)?;
         writer.flush()?;
         stamp_now(&self.last_activity_at);
-        stamp_now(&self.last_input_at);
+        if contains_operator_submit(bytes) {
+            stamp_now(&self.last_input_at);
+        }
         Ok(())
     }
 
@@ -2971,8 +3000,8 @@ impl DaemonSession {
     /// Superseding is the whole reason this is a method rather than a
     /// field read: input delivered after a report means the session was
     /// given new work, so it is no longer done. Deriving that from
-    /// `last_input_at` (which every input path already stamps — operator
-    /// typing, agent prompt delivery, bash sends) rather than clearing
+    /// `last_input_at` (stamped by operator submissions, agent prompt
+    /// delivery and bash sends) rather than clearing
     /// the flag at each of those call sites means a new input path
     /// cannot forget to invalidate the report. Same comparison
     /// [`Self::semantic_idle`] makes for turn ends.

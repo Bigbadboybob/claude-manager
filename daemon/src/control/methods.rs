@@ -33066,6 +33066,74 @@ while True:
         kill_all_sessions(&state);
     }
 
+    #[test]
+    fn viewer_input_preserves_semantic_idle_and_report_done_until_submit() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let uid = "ts-viewer-input";
+        insert_session(&state, uid, "ws-rep");
+        let handle = {
+            let s = state.lock().unwrap();
+            let session = &s.sessions[uid];
+            session.input_handle().stamp_activity();
+            session.stamp_turn_end();
+            session.input_handle()
+        };
+        report_done(&state, &Caller::session(uid), &json!({"reason": "finished"}))
+            .expect("report");
+        let baseline = *state.lock().unwrap().sessions[uid].last_input_at.lock().unwrap();
+
+        for bytes in [
+            b"\x1b[A".as_slice(), // arrow
+            b"\x1b[<64;10;20M",  // mouse wheel
+            b"\x1b",            // Escape
+            b"unsubmitted draft",
+            b"\x1b[I\x1b[O",    // focus in/out
+            b"\x1b[13;20R",     // cursor-position query reply
+            b"\x1b[113u",       // kitty q, not Enter
+            b"\x1b[130u",       // another key, not an Enter prefix match
+            b"\x1b[13;2R",      // query reply, not kitty Enter
+            b"\x1b[200~two\nlines\x1b[201~", // bracketed draft paste
+        ] {
+            let before = std::time::Instant::now();
+            handle.write_and_stamp_operator(bytes).expect("viewer write");
+            {
+                let s = state.lock().unwrap();
+                let session = &s.sessions[uid];
+                assert_eq!(*session.last_input_at.lock().unwrap(), baseline, "{bytes:?}");
+                assert!(session.last_activity_at.lock().unwrap().unwrap() >= before);
+                assert!(session.last_operator_input_at.lock().unwrap().unwrap() >= before);
+            }
+            let resolved = resolve_authorized_session(
+                &state, &json!({"session_uid": uid}), None,
+            ).expect("resolve");
+            assert_eq!(resolved["semantic_idle"], true, "{bytes:?}");
+            assert_eq!(resolved["reported_done"], true, "{bytes:?}");
+            assert_eq!(resolved["report_reason"], "finished", "{bytes:?}");
+        }
+
+        for bytes in [
+            b"\r".as_slice(),
+            b"\x1b[13u",
+            b"\x1b[13;2u",
+            b"\x1b[13;1:1u",
+            b"follow-up\r",
+            b"follow-up\x1b[13u",
+        ] {
+            state.lock().unwrap().sessions[uid].stamp_turn_end();
+            report_done(&state, &Caller::session(uid), &json!({})).expect("re-report");
+            let before = std::time::Instant::now();
+            handle.write_and_stamp_operator(bytes).expect("submit");
+            assert!(state.lock().unwrap().sessions[uid]
+                .last_input_at.lock().unwrap().unwrap() >= before);
+            let resolved = resolve_authorized_session(
+                &state, &json!({"session_uid": uid}), None,
+            ).expect("resolve");
+            assert_eq!(resolved["semantic_idle"], false, "{bytes:?}");
+            assert_eq!(resolved["reported_done"], false, "{bytes:?}");
+        }
+        kill_all_sessions(&state);
+    }
+
     /// New input supersedes the report: an orchestrator that hands a
     /// finished worker follow-up work must not keep reading "reported"
     /// (and a `mode="final"` monitor re-armed on it must not
