@@ -141,6 +141,67 @@ pub fn notify(state: &DaemonState, req: &Request) -> Response {
     )
 }
 
+/// Daemon-originated alert for `uid` (e.g. a stalled native notification
+/// path, where the agent itself cannot be relied on to call notify_user).
+/// Never displaces a pending alert: returns `Ok(None)` while one exists so
+/// the caller can retry after Owner acknowledges it.
+pub fn raise_system(state: &DaemonState, uid: &str, message: &str) -> Result<Option<String>, String> {
+    let mut alerts = snapshot(state)?;
+    if alerts.contains_key(uid) || alerts.len() >= 4096 {
+        return Ok(None);
+    }
+    let message: String = if message.len() > 4096 {
+        let mut end = 4096;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message[..end].into()
+    } else {
+        message.into()
+    };
+    let (label, task_id, continuous_task_id) = if let Some(s) = state.sessions.get(uid) {
+        (s.title.clone(), s.task_id.clone(), s.continuous_task_id.clone())
+    } else {
+        let tui = state.tui_sessions.get(uid);
+        (
+            tui.and_then(|s| s.label.clone()).unwrap_or_else(|| uid.to_owned()),
+            tui.and_then(|s| s.task_id.clone()),
+            None,
+        )
+    };
+    let alert = Alert {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_uid: uid.to_owned(),
+        label,
+        message,
+        task_id,
+        continuous_task_id,
+    };
+    alerts.insert(uid.to_owned(), alert.clone());
+    save(state, &alerts)?;
+    state.manifest_watcher.broadcast(ManifestDiff::Updated {
+        uid: uid.to_owned(),
+        entry: serde_json::json!({"owner_attention": alert}),
+    });
+    Ok(Some(alert.id))
+}
+
+/// Withdraw a daemon-originated alert once its condition cleared. The ID
+/// comparison leaves any newer alert (including an agent's own) in place.
+pub fn clear_system(state: &DaemonState, uid: &str, alert_id: &str) -> Result<bool, String> {
+    let mut alerts = snapshot(state)?;
+    if !alerts.get(uid).is_some_and(|a| a.id == alert_id) {
+        return Ok(false);
+    }
+    alerts.remove(uid);
+    save(state, &alerts)?;
+    state.manifest_watcher.broadcast(ManifestDiff::Updated {
+        uid: uid.to_owned(),
+        entry: serde_json::json!({"owner_attention": null}),
+    });
+    Ok(true)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AckParams {

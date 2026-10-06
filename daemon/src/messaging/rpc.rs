@@ -625,6 +625,9 @@ fn execute_with_freshness(
             store.monitor_status(&actor)
         };
         store.decorate_sync_response(p, &mut value);
+        if req.method == "messaging.read" {
+            super::delivery::annotate_conversations(store, &mut value);
+        }
         if let Some(note) = retraction_note {
             value["delivery_note"] = json!(note);
         }

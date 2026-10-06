@@ -47,7 +47,7 @@ class ClaudeChannelTests(unittest.IsolatedAsyncioTestCase):
             tools = (await outbound_read.receive()).message.root.result
             self.assertEqual(tools["tools"][0]["name"], "fixture")
             receipt = await server.channel.send({"id": "wake", "source": "chat",
-                "marker": "[cm-chat wake]", "text": "long standard instructions"})
+                "marker": "[cm-chat wake]", "text": "long standard instructions " * 40})
             wire = (await outbound_read.receive()).message.root.model_dump(exclude_none=True)
             self.assertEqual(wire, {"jsonrpc": "2.0", "method": "notifications/claude/channel",
                 "params": {"content": "[cm-chat wake] New CM chat activity; read your pending inbox.",
@@ -66,7 +66,7 @@ class ClaudeChannelTests(unittest.IsolatedAsyncioTestCase):
     async def test_waits_for_connection_and_preserves_watch_details(self):
         channel = ClaudeChannel("fixture")
         event = {"id": "wake", "source": "chat", "marker": "[cm-chat wake]",
-                 "text": "boilerplate. Monitor results: watch-1. Use chat_monitors(action=list) for all watches, then get their results. Continue the existing task."}
+                 "text": "boilerplate. " * 60 + "Monitor results: watch-1. Use chat_monitors(action=list) for all watches, then get their results. Continue the existing task."}
         with self.assertRaises(NotSubmitted):
             await channel.send(event)
         channel.session = mock.Mock(send_notification=mock.AsyncMock())
