@@ -54,6 +54,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod adopt;
+pub mod agent_state;
 pub mod attach;
 pub mod attach_output;
 pub mod claude_trust;
@@ -1202,6 +1203,13 @@ pub fn run() -> anyhow::Result<()> {
         None => control::methods::restore_sessions(&state),
     }
     } // !holder_active
+
+    // Restore only after all holder/re-exec adoption and fresh restoration.
+    // Starting the tick earlier could overwrite the sidecar with an empty registry.
+    if let Err(e) = agent_state::restore(&state.lock().unwrap_or_else(|p| p.into_inner())) {
+        eprintln!("cm-daemon: could not restore agent state: {e}");
+    }
+    agent_state::start(&state)?;
 
     if let Err(e) = messaging::rpc::initialize(&state) {
         eprintln!("cm-daemon: messaging pending: {e}");

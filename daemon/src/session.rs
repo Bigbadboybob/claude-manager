@@ -959,6 +959,7 @@ impl LastExitProbe {
 pub struct DaemonSession {
     pub uid: String,
     pub title: String,
+    pub agent_state: crate::agent_state::AgentStateCell,
     /// Holder-minted process identity when this session is
     /// holder-owned (split mode) — the key every holder verb and the
     /// phase-7 `rollback_record` stream use. `None` in monolith mode.
@@ -1953,6 +1954,7 @@ impl PendingSession {
         };
 
         Ok(DaemonSession {
+            agent_state: crate::agent_state::StateCell::for_process(pid),
             holder_incarnation: None,
             uid,
             title,
@@ -2496,6 +2498,7 @@ impl AdoptedSessionBuild {
         };
 
         Ok(DaemonSession {
+            agent_state: crate::agent_state::StateCell::for_process(pid),
             holder_incarnation: None,
             title: meta.title,
             // Phase 4b (R11): the full v2 record lands verbatim — no
@@ -2725,6 +2728,7 @@ impl Drop for PendingSession {
 /// load-bearing.
 pub struct InputHandle {
     session_uid: Option<String>,
+    agent_state: crate::agent_state::AgentStateCell,
     writer: SessionWriter,
     last_activity_at: SharedLastActivity,
     last_operator_input_at: SharedLastActivity,
@@ -2851,6 +2855,12 @@ impl InputHandle {
         if self.session_uid.as_deref().is_some_and(|uid| crate::continuous::retirement::ensure_open(uid).is_err()) { return; }
         stamp_now(&self.last_activity_at);
         stamp_now(&self.last_input_at);
+        self.note_turn_start();
+    }
+
+    pub(crate) fn note_turn_start(&self) {
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+            .note_input(crate::agent_state::unix_now());
     }
 
     /// [`write_and_stamp`](Self::write_and_stamp) for OPERATOR input
@@ -2870,6 +2880,7 @@ impl InputHandle {
         stamp_now(&self.last_activity_at);
         if contains_operator_submit(bytes) {
             stamp_now(&self.last_input_at);
+            self.note_turn_start();
         }
         Ok(())
     }
@@ -2902,6 +2913,9 @@ impl InputHandle {
     pub(crate) fn test_handle() -> Self {
         InputHandle {
             session_uid: None,
+            agent_state: Arc::new(Mutex::new(crate::agent_state::StateCell::new(
+                crate::agent_state::unix_now(), None,
+            ))),
             writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
             last_activity_at: Arc::new(Mutex::new(None)),
             last_operator_input_at: Arc::new(Mutex::new(None)),
@@ -2933,6 +2947,9 @@ impl InputHandle {
             Arc::new(Mutex::new(Vec::new()));
         let handle = InputHandle {
             session_uid: None,
+            agent_state: Arc::new(Mutex::new(crate::agent_state::StateCell::new(
+                crate::agent_state::unix_now(), None,
+            ))),
             writer: Arc::new(Mutex::new(Box::new(CapturingWriter(
                 Arc::clone(&captured),
             )))),
@@ -2963,6 +2980,7 @@ impl DaemonSession {
     pub fn input_handle(&self) -> InputHandle {
         InputHandle {
             session_uid: Some(self.uid.clone()),
+            agent_state: Arc::clone(&self.agent_state),
             writer: Arc::clone(&self.writer),
             last_activity_at: Arc::clone(&self.last_activity_at),
             last_operator_input_at: Arc::clone(&self.last_operator_input_at),
@@ -2974,6 +2992,12 @@ impl DaemonSession {
     /// → `session.turn_ended`).
     pub fn stamp_turn_end(&self) {
         stamp_now(&self.last_turn_end_at);
+    }
+
+    /// An engine start mirrors legacy clocks without counting the same turn twice.
+    pub(crate) fn stamp_engine_activity(&self) {
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
     }
 
     /// Record the agent's own "my work is finished" report

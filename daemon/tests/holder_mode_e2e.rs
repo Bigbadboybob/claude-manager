@@ -940,6 +940,12 @@ fn brain_deploy_via_daemon_restart_rides_sessions_through() {
         },
     );
 
+    let before_state = sb.op(
+        "resolve_authorized_session",
+        serde_json::json!({"session_uid": uid}),
+    ).result.unwrap()["agent_state"].clone();
+    assert_eq!(before_state["turn_seq"], 1, "accepted send_input counted once");
+
     // Deploy "the new brain" (same binary — the mechanism under
     // test, not the code delta).
     let t0 = Instant::now();
@@ -977,6 +983,13 @@ fn brain_deploy_via_daemon_restart_rides_sessions_through() {
     assert!(downtime < Duration::from_secs(30), "{downtime:?}");
     assert_eq!(proc_starttime(bash_pid), Some(bash_start), "session disturbed");
     assert_eq!(proc_ppid(bash_pid), Some(sb.holder_pid));
+
+    let after_state = sb.op(
+        "resolve_authorized_session",
+        serde_json::json!({"session_uid": uid}),
+    ).result.unwrap()["agent_state"].clone();
+    assert_eq!(after_state["turn_seq"], before_state["turn_seq"], "turn sequence survives brain adoption");
+    assert_eq!(after_state["since"], before_state["since"], "state age survives brain adoption");
 
     // The replay ring rode through: the pre-deploy marker is in the
     // new brain's fanout from the moment it is healthy, no new output

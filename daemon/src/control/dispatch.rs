@@ -628,6 +628,17 @@ pub fn dispatch_request(
         "session.turn_ended" => {
             DispatchOutcome::Done(dispatch_session_turn_ended(state, req))
         }
+        "session.agent_report" => {
+            let caller_uid = match &req.caller {
+                Caller::Operator(_) => None,
+                Caller::Session(s) => Some(s.session_uid.as_str()),
+            };
+            let response = match methods::session_agent_report(state, &req.params, caller_uid) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+            };
+            DispatchOutcome::Done(response)
+        }
 
         // Sub-2b-1 review #1: TUI pushes the discovered
         // transcript path post-detection so the resolver can
@@ -2553,6 +2564,7 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
             eprintln!("cm-daemon: {e}; sidebar requests unavailable in snapshot");
         }).ok(),
         "owner_attention": owner_attention,
+        "agent_states": crate::agent_state::snapshot(state),
         "workspaces": state.workspaces,
         "bindings": state.bindings,
         "messaging_names": state.messaging_names,

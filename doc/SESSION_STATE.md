@@ -92,3 +92,55 @@ existing PTY boolean. `semantic_idle` remains available. Consequently `idle=true
 is a compatibility signal, not proof of true idle: new consumers must inspect
 `agent_state.state`, especially for waiting, error, background work and unknown.
 The board's holder-idle clock counts only `state=idle`.
+
+## Producer RPC (S1)
+
+`session.agent_report` accepts a Session caller only for its own `session_uid`;
+control permission over descendants does not allow reporting their engine state.
+Operator callers may report for diagnostics. Hooks must target a `claude-code`
+session and snapshots a `codex` session. Reports larger than 256 KiB, unknown
+kinds/events/statuses, invalid timestamps and mismatched engines are rejected.
+During a brain restart the RPC returns conflict; retry the latest report.
+
+```text
+{session_uid, kind: "hook", event: UserPromptSubmit | Stop | StopFailure |
+                                  PermissionRequest | Notification,
+ payload: {observed_at?, prompt_id?, continuing?, transcript_path?,
+           waiting_for?, error_kind?, resumes_at?, tool_name?, notification_type?,
+           background?}}
+
+{session_uid, kind: "snapshot", epoch: UUID, seq: u64,
+ snapshot: {backend_connected: bool, foreground: idle | active | systemError,
+            turn_seq: u64, turn_started_at?: unix_s,
+            last_turn: {ended_at: unix_s | null, status: completed | interrupted | failed | null},
+            engine_version?, active_flags?: [string], child_active?: bool,
+            pending_requests?: [{kind: approval | user_input | elicitation |
+                                       tool_call | auth_refresh, since: unix_s}],
+            retrying?: bool, error_kind?, background?}}
+```
+
+Hook payloads use the normalized fields above; future hook adapters translate
+engine-specific fields. `observed_at` defaults to receipt time; adapters should
+capture it at the event so delayed hooks retain their order. `prompt_id` suppresses
+duplicate prompt submissions. Notification edges apply only to
+`permission_prompt`, `elicitation_dialog` and `idle_prompt`; unrelated notices
+are ignored. A Stop with `continuing=true` starts another turn instead of
+advertising semantic idle. Transcript rebinding retains the existing containment
+check against the session's workspace.
+
+Snapshots are complete latest values. Missing optional flags/lists mean empty;
+missing background means enumeration unavailable. `backend_connected`,
+`foreground`, `turn_seq` and `last_turn` are required. The relay's `turn_seq` counts
+foreground starts within its epoch, even when publication coalesces start/end
+notifications; it must not regress. The daemon's session counter survives relay
+epochs and counts CM input plus its corresponding engine start once. A fresh UUID
+starts an epoch; within it only increasing `seq` values apply. Retired epochs and
+repeated/older sequence numbers are ignored. Freshness uses daemon receipt time,
+not a producer-supplied heartbeat timestamp.
+
+The response is `{ok: true, applied: bool, agent_state: ...}`. Ignored duplicates
+return `applied=false` without stamping legacy activity or cancelling a done
+report. Accepted turn edges also update the legacy semantic-idle clocks. Changes
+to state, detail, background, turn counters, last turn or stall markers publish
+manifest diffs; observation-only heartbeats do not. Read surfaces and reconnect
+snapshots still return current observation times.

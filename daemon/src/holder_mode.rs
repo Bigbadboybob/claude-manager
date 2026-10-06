@@ -1407,6 +1407,12 @@ fn spawn_deploy_thread(
                     guard.abort();
                     return;
                 }
+                if let Err(e) = crate::agent_state::save_checked(&st) {
+                    eprintln!("cm-daemon: brain deploy ABORTED (agent state persist): {e}");
+                    drop(st);
+                    guard.abort();
+                    return;
+                }
                 // Replay rings (best-effort, never aborts): the reader
                 // gate is frozen above, so every ring is at rest — the
                 // next brain seeds each adopted session's fanout from

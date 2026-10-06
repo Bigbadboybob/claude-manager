@@ -956,6 +956,8 @@ pub(crate) fn persist_all_checked(
                         e
                     )
                 })?;
+                crate::agent_state::save_checked(&st)
+                    .map_err(|e| anyhow::anyhow!("checked persist of agent state failed: {e}"))?;
                 // Replay rings (best-effort, never aborts the swap) —
                 // the readers are frozen by now, so every ring is at
                 // rest; the new image seeds adopted fanouts from them.

@@ -1903,6 +1903,7 @@ pub fn send_input(
                 format!("send_input write to PTY: {}", e),
             )
         })?;
+        handle.note_turn_start();
         Ok(json!({ "ok": true }))
     }
 }
@@ -2452,7 +2453,9 @@ pub fn list_sessions(
         // `wait_for_session_idle` (which polls list_sessions) and
         // `read_session_output` (which resolves via
         // resolve_authorized_session) agree.
-        let (state_str, idle) = compute_session_state_and_idle(session);
+        let (state_str, pty_idle) = compute_session_state_and_idle(session);
+        let agent_state = crate::agent_state::current(session);
+        let idle = agent_state.compatibility_idle(pty_idle);
         // UX item 4a: the agent's own done signal, so a listing caller can
         // tell "delivered its final report" from "idle mid-workflow" without
         // reading the transcript and pattern-matching for a verdict line.
@@ -2464,6 +2467,8 @@ pub fn list_sessions(
             "type": session.session_type,
             "state": state_str,
             "idle": idle,
+            "pty_idle": pty_idle,
+            "agent_state": agent_state,
             "reported_done": report.is_some(),
             "reported_done_at": report.as_ref().map(|r| r.at_unix),
             "report_reason": report.as_ref().and_then(|r| r.reason.clone()),
@@ -2616,6 +2621,8 @@ pub fn list_sessions(
                 "type": tomb.session_type,
                 "state": "exited",
                 "idle": true,
+                "pty_idle": true,
+                "agent_state": {"state": "exited"},
                 "managed_by_uid": tomb.managed_by_uid,
                 "workspace_id": tomb.workspace_id,
                 "task_id": tomb.task_id,
@@ -2744,7 +2751,9 @@ pub fn resolve_authorized_session(
     // Auth passed (or Operator caller). Resolve the target: live session first,
     // then a recently-exited tombstone (read-after-exit), else NotFound.
     if let Some(session) = state.sessions.get(&p.session_uid) {
-        let (state_str, idle) = compute_session_state_and_idle(session);
+        let (state_str, pty_idle) = compute_session_state_and_idle(session);
+        let agent_state = crate::agent_state::current(session);
+        let idle = agent_state.compatibility_idle(pty_idle);
         // Sub-2b-1 review-r#2 #2: surface the generation counter
         // so the Python `read_session_output` tool's cursor
         // (`v1:<generation>:<offset>`) resets when the underlying
@@ -2759,6 +2768,8 @@ pub fn resolve_authorized_session(
             "transcript_path": session.transcript_path.clone(),
             "generation": session.generation,
             "idle": idle,
+            "pty_idle": pty_idle,
+            "agent_state": agent_state,
             // Hook-derived turn-boundary signal (S3): null = no hook
             // data, true = last turn-end postdates last input (at the
             // prompt regardless of PTY spinner noise), false = a turn
@@ -2785,6 +2796,8 @@ pub fn resolve_authorized_session(
             "generation": tomb.generation,
             "continuous_task_id": tomb.continuous_task_id,
             "idle": true,
+            "pty_idle": true,
+            "agent_state": {"state": "exited"},
             "semantic_idle": true,
             "exited_at": tomb.exited_at,
             "killed": tomb.killed,
@@ -2806,6 +2819,63 @@ pub fn resolve_authorized_session(
 // ============================================================
 // session.turn_ended — the cm Stop hook's self-report (S3)
 // ============================================================
+
+#[derive(Deserialize)]
+struct SessionAgentReportParams {
+    session_uid: String,
+    #[serde(flatten)]
+    report: crate::agent_state::Report,
+}
+
+/// Agent sources may publish only their own state. Operator access is retained
+/// for diagnostics; normal control scope never grants the right to forge a
+/// descendant's engine observations.
+pub fn session_agent_report(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    if params.to_string().len() > 256 * 1024 {
+        return Err((ErrorCode::InvalidParams, "agent report exceeds 256 KiB".into()));
+    }
+    let p: SessionAgentReportParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("session.agent_report params: {e}")))?;
+    if caller_uid.is_some_and(|uid| uid != p.session_uid) {
+        return Err((ErrorCode::Unauthorized, "session.agent_report is self-only".into()));
+    }
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if state.restarting {
+        return Err((ErrorCode::Conflict, "brain restart in progress; retry the latest report".into()));
+    }
+    let session = state.sessions.get(&p.session_uid)
+        .ok_or_else(|| (ErrorCode::NotFound, format!("session '{}' not in daemon registry", p.session_uid)))?;
+    if session.last_exit.kernel_set() {
+        return Err((ErrorCode::Conflict, "session has exited".into()));
+    }
+    let native_codex = session.session_type == "codex";
+    let correct_engine = match &p.report {
+        crate::agent_state::Report::Hook { .. } => session.session_type == "claude-code",
+        crate::agent_state::Report::Snapshot { .. } => native_codex,
+    };
+    if !correct_engine {
+        return Err((ErrorCode::InvalidParams, "report kind does not match the session engine".into()));
+    }
+    let applied = session.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+        .apply(p.report, crate::agent_state::unix_now())
+        .map_err(|e| (ErrorCode::InvalidParams, e))?;
+    if applied.accepted {
+        if applied.started { session.stamp_engine_activity(); }
+        if applied.ended { session.stamp_turn_end(); }
+        rebind_reported_transcript(&mut state, &p.session_uid, applied.transcript_path.as_deref());
+        crate::agent_state::recompute_and_publish(&state, &p.session_uid);
+    }
+    let agent_state = crate::agent_state::current(&state.sessions[&p.session_uid]);
+    drop(state);
+    if applied.accepted && native_codex {
+        crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
+    }
+    Ok(json!({"ok": true, "applied": applied.accepted, "agent_state": agent_state}))
+}
 
 #[derive(Deserialize)]
 struct SessionTurnEndedParams {
@@ -2869,6 +2939,20 @@ pub fn session_turn_ended(
         session.stamp_turn_end();
     }
     let native_codex = session.session_type == "codex";
+    rebind_reported_transcript(&mut state, &p.session_uid, p.transcript_path.as_deref());
+    drop(state);
+    if native_codex {
+        // The native launcher reports the selected thread immediately. The
+        // existing /proc ownership check validates its exact rollout before
+        // persisting/broadcasting the resume identity.
+        crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
+    }
+    Ok(json!({ "ok": true }))
+}
+
+
+fn rebind_reported_transcript(state: &mut DaemonState, session_uid: &str, reported: Option<&str>) {
+    let Some(session) = state.sessions.get(session_uid) else { return; };
     // fix-stale-resume: refresh the recorded resume key from the hook's
     // report. Unlike `session.set_transcript_path` (Operator-only, because
     // the TUI is authoritative for path conventions) this is a SELF-report
@@ -2877,9 +2961,7 @@ pub fn session_turn_ended(
     // the directory check below bounds WHICH file may be claimed. Without
     // that second check a session could name another session's transcript
     // and turn its own `read_session_output` into a cross-session read.
-    let reported = p
-        .transcript_path
-        .as_deref()
+    let reported = reported
         .map(str::trim)
         .filter(|s| !s.is_empty());
     if let Some(reported) = reported {
@@ -2897,7 +2979,7 @@ pub fn session_turn_ended(
         if changed {
             let reported = reported.to_string();
             let mut entry = None;
-            if let Some(session) = state.sessions.get_mut(&p.session_uid) {
+            if let Some(session) = state.sessions.get_mut(session_uid) {
                 // Mirror `set_transcript_path`: a real rotation bumps the
                 // generation so an agent's read cursor is invalidated.
                 session.generation = session.generation.saturating_add(1);
@@ -2911,18 +2993,10 @@ pub fn session_turn_ended(
             // manifest row (what A-R and a user-owned restore resume
             // from) follows the in-pane `/resume` within one turn.
             if let Some(entry) = entry {
-                broadcast_transcript_updated(&state, &p.session_uid, entry);
+                broadcast_transcript_updated(state, session_uid, entry);
             }
         }
     }
-    drop(state);
-    if native_codex {
-        // The native launcher reports the selected thread immediately. The
-        // existing /proc ownership check validates its exact rollout before
-        // persisting/broadcasting the resume identity.
-        crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
-    }
-    Ok(json!({ "ok": true }))
 }
 
 /// Sub-2b-1 (review #2): PTY-quiet threshold for daemon-side
@@ -3710,6 +3784,11 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         None => (false, "preflight has not run".to_string()),
     };
     let total = state.sessions.len();
+    let mut sessions_by_state = std::collections::BTreeMap::<String, usize>::new();
+    for session in state.sessions.values() {
+        let state = crate::agent_state::current(session);
+        *sessions_by_state.entry(state.state.as_str().to_string()).or_default() += 1;
+    }
     // A session with no transcript has never reported a turn-end, which is
     // exactly the shape the incident produced. Surfacing the split makes
     // "restored 19, none of them ready" legible at a glance.
@@ -3786,6 +3865,7 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "mcp_detail": mcp_detail,
         "sessions": total,
         "sessions_with_transcript": with_transcript,
+        "sessions_by_state": sessions_by_state,
         "workspaces": state.workspaces.len(),
         "draining": state.draining,
         // DESIGN_SEAMLESS_RESTART phase 2d: a restart attempt is in
@@ -20855,7 +20935,8 @@ while True:
             "uid": fresh_test_uid(),
             "workspace_id": ws_id,
             "label": "test-bash",
-            "argv": ["/bin/bash"],
+            "argv": ["/bin/bash", "--noprofile", "--norc"],
+            "session_type": "bash",
             "working_dir": working_dir,
         });
         let result = start_session(state, &params).expect("spawn bash");
@@ -33063,6 +33144,93 @@ while True:
         assert_eq!(row["reported_done"], true);
         assert_eq!(row["report_reason"], "migration merged");
 
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn agent_report_is_self_scoped_and_keeps_background_legacy_idle() {
+        let state = make_state_arc();
+        let uid = "ts-state-rpc";
+        insert_session(&state, uid, "ws-state");
+        insert_session(&state, "ts-state-other", "ws-state");
+        {
+            let mut s = state.lock().unwrap();
+            s.sessions.get_mut(uid).unwrap().session_type = "codex".into();
+            s.sessions.get_mut("ts-state-other").unwrap().global_perms = true;
+        }
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let now = now_unix_f64();
+        let mut params = json!({"session_uid": uid, "kind": "snapshot", "epoch": epoch, "seq": 1,
+            "snapshot": {"backend_connected": true, "foreground": "idle", "turn_seq": 1,
+                "turn_started_at": now - 5.0,
+                "last_turn": {"ended_at": now - 3.0, "status": "completed"},
+                "child_active": true}});
+        assert_eq!(session_agent_report(&state, &params, Some("ts-state-other")).unwrap_err().0,
+            ErrorCode::Unauthorized, "even global permissions cannot forge another session's engine state");
+        let answer = session_agent_report(&state, &params, Some(uid)).unwrap();
+        assert_eq!(answer["applied"], true);
+        assert_eq!(answer["agent_state"]["state"], "working-background");
+        let resolved = resolve_authorized_session(&state, &json!({"session_uid": uid}), Some(uid)).unwrap();
+        assert_eq!(resolved["idle"], true, "old turn_end monitors may finish with live background work");
+        assert_eq!(resolved["pty_idle"], false, "raw clock was stamped by the engine start");
+        assert_eq!(resolved["semantic_idle"], true);
+        let rows = list_sessions(&state, &json!({}), None).unwrap();
+        let row = rows.as_array().unwrap().iter().find(|row| row["session_uid"] == uid).unwrap();
+        assert_eq!(row["agent_state"], resolved["agent_state"]);
+        assert_eq!(row["idle"], true);
+        assert_eq!(row["pty_idle"], false);
+        report_done(&state, &Caller::session(uid), &json!({"reason": "done"})).unwrap();
+        assert_eq!(session_agent_report(&state, &params, None).unwrap()["applied"], false,
+            "duplicate report does not cancel report_done");
+        assert!(state.lock().unwrap().sessions[uid].reported_done().is_some());
+        params["seq"] = json!(2);
+        params["snapshot"]["turn_seq"] = json!(2);
+        params["snapshot"]["turn_started_at"] = json!(now_unix_f64());
+        params["snapshot"]["foreground"] = json!("active");
+        let answer = session_agent_report(&state, &params, None).unwrap();
+        assert_eq!(answer["agent_state"]["state"], "working");
+        assert_eq!(answer["agent_state"]["turn_seq"], 2);
+        assert!(!state.lock().unwrap().sessions[uid].reported_done().is_some());
+        assert_eq!(state.lock().unwrap().sessions[uid].semantic_idle(), Some(false));
+        state.lock().unwrap().restarting = true;
+        assert_eq!(session_agent_report(&state, &params, Some(uid)).unwrap_err().0, ErrorCode::Conflict);
+        state.lock().unwrap().restarting = false;
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn agent_report_hooks_rebind_transcript_and_clear_failure_on_new_prompt() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-hooks", &dir);
+        let uid = "ts-hook-state";
+        insert_session(&state, uid, "ws-hooks");
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
+        let now = now_unix_f64();
+        let make = |event: &str, at: f64| json!({"session_uid": uid, "kind": "hook", "event": event,
+            "payload": {"observed_at": at}});
+        session_agent_report(&state, &make("UserPromptSubmit", now - 5.0), Some(uid)).unwrap();
+        let error = session_agent_report(&state, &make("StopFailure", now - 3.0), Some(uid)).unwrap();
+        assert_eq!(error["agent_state"]["state"], "errored");
+        assert_eq!(state.lock().unwrap().sessions[uid].semantic_idle(), Some(true));
+        let working = session_agent_report(&state, &make("UserPromptSubmit", now), Some(uid)).unwrap();
+        assert_eq!(working["agent_state"]["state"], "working");
+        assert_eq!(working["agent_state"]["turn_seq"], 2);
+        assert_eq!(state.lock().unwrap().sessions[uid].semantic_idle(), Some(false));
+        let mut late_stop = make("Stop", now - 1.0);
+        late_stop["payload"]["transcript_path"] = json!("/unrelated/session.jsonl");
+        session_agent_report(&state, &late_stop, Some(uid)).unwrap();
+        assert!(state.lock().unwrap().sessions[uid].transcript_path.is_none());
+        assert_eq!(state.lock().unwrap().sessions[uid].semantic_idle(), Some(false));
+        let own_dir = crate::transcript_detect::claude_transcript_dir_for(dir.path()).unwrap();
+        let path = own_dir.join("state-hook-conversation.jsonl");
+        let mut stop = make("Stop", now_unix_f64());
+        stop["payload"]["transcript_path"] = json!(path.to_string_lossy());
+        session_agent_report(&state, &stop, Some(uid)).unwrap();
+        let s = state.lock().unwrap();
+        assert_eq!(s.sessions[uid].transcript_path.as_deref(), path.to_str());
+        assert_eq!(s.sessions[uid].generation, 1);
+        assert_eq!(s.sessions[uid].semantic_idle(), Some(true));
+        drop(s);
         kill_all_sessions(&state);
     }
 
