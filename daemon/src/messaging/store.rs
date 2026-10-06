@@ -33,6 +33,7 @@ mod norms;
 pub use norms::textual_diff as norms_diff;
 mod channels;
 mod membership;
+mod availability;
 mod inbox;
 mod mentions;
 mod preferences;
@@ -279,6 +280,8 @@ pub struct Store {
     reads: BTreeMap<String, ReadState>,
     personal: BTreeMap<String, Personal>,
     pub norms: Value,
+    /// Latest `owner.availability` record (Null until Owner sets a level).
+    pub owner_availability: Value,
     channel_norms: BTreeMap<String, Value>,
     enrollment_revision: String,
     owner_identity_revision: String,
@@ -364,6 +367,7 @@ impl Store {
             reads: BTreeMap::new(),
             personal: BTreeMap::new(),
             norms: json!({}),
+            owner_availability: Value::Null,
             channel_norms: BTreeMap::new(),
             enrollment_revision: required(&meta, "enrollment_revision")?,
             owner_identity_revision: required(&meta, "owner_identity_revision")?,
@@ -698,6 +702,9 @@ impl Store {
             {
                 self.names.insert(id, v);
             }
+        }
+        if e["type"] == crate::owner_availability::EVENT_TYPE {
+            self.reduce_owner_availability(e)?;
         }
         if e["type"] == "norms.update" {
             if e["data"]["scope"] == "global" {

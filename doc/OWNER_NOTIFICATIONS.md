@@ -45,6 +45,25 @@ alerts. An alert from an exited ordinary session still gets its desktop
 notification on connection, even if its row is gone. It remains stored until an
 operator acknowledges it. No agent can acknowledge another session's alert.
 
+## Owner availability
+
+Owner sets how reachable they are: `away` (emergencies only), `around`
+(blocking and above), `focused` (decisions and above) or `on-call` (everything).
+Set it with `scripts/cm-availability <level> [--note "..."]` on a host whose
+daemon serves Owner (cloud hosts: `ssh cm-manager cm-availability away`, once
+installed to `~/.cm/bin/`); with no argument it prints the current level, and
+`unset` returns to the default. The level is an Owner-only messaging event
+(`owner.availability`) published on the messaging hub and replicated to every
+enrolled host; each daemon projects the latest value to
+`~/.cm/messages/main/OWNER_AVAILABILITY.json`. Agents read it from `ping()` and
+`chat_open()` as `owner_availability: {level, set, changed_at, age_s, previous,
+source, owner_note}`. The RPC is `messaging.availability {action: get | set,
+level, note?, source?, request_id}`; `set` requires the Owner/operator caller.
+
+Unset delivers every alert, exactly as before. The level does not gate
+`notify_user` yet; urgency-based holding and release on a level change arrive
+with the gated `notify_user` change, which this section will describe.
+
 ## Routing and authorization
 
 `notify_user` is in the MCP daemon routing set. Cloud sessions whose legacy

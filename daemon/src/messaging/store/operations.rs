@@ -55,7 +55,7 @@ pub(super) fn finish_install(root: &Path) -> Result<()> {
     Ok(())
 }
 impl Store {
-    fn cm_root(&self) -> &Path {
+    pub(super) fn cm_root(&self) -> &Path {
         self.root.parent().unwrap().parent().unwrap()
     }
     pub fn messaging_frozen(&self) -> bool {

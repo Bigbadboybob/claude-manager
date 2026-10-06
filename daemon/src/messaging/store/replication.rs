@@ -787,6 +787,9 @@ impl Store {
                     .map_err(|_| err("invalid_record", "Invalid channel UUID"))?;
             }
         }
+        if e["type"] == crate::owner_availability::EVENT_TYPE {
+            Self::validate_owner_availability(e)?;
+        }
         if e["type"] == "host.update" {
             if e["actor"]["id"] != "system" {
                 return Err(err("invalid_record", "Host enrollment is system-owned"));
@@ -1080,6 +1083,7 @@ impl Store {
             "messaging.follow" if actor == "owner" => self.follow(actor, p, &people),
             "messaging.channels" => self.channel_action(actor, p, &people),
             "messaging.pins" => self.pins(actor, p, &people),
+            "messaging.availability" if actor == "owner" => self.availability(actor, p),
             "messaging.norms" => {
                 let name = self
                     .names
@@ -2067,6 +2071,30 @@ mod tests {
         );
     }
     #[test]
+    fn owner_availability_replicates_to_every_host_and_is_hub_only() {
+        let mut p = pair();
+        let set = json!({"action":"set","level":"around","note":"in meetings","request_id":"avail-1"});
+        // A replica forwards the change to the hub instead of publishing it.
+        assert!(p.replica.needs_coordinator("owner", "messaging.availability", &set, &p.people).unwrap());
+        assert!(!p.replica.needs_coordinator("owner", "messaging.availability", &json!({"action":"get"}), &p.people).unwrap());
+        assert_eq!(p.replica.availability("owner", &set).unwrap_err().code, "coordinator_required");
+        // Agents cannot set it through the hub either.
+        let agent = p.people[0].id.clone();
+        assert!(p.hub.coordinate(&p.replica.daemon_id, &agent, "messaging.availability", &set).is_err());
+        let hub = p.hub.availability("owner", &set).unwrap();
+        assert_eq!(hub["owner_availability"]["level"], "around");
+        catch_up(&mut p);
+        assert_eq!(p.replica.owner_availability["level"], "around");
+        assert_eq!(p.replica.owner_availability["note"], "in meetings");
+        let projected = crate::owner_availability::exposure(p.replica.cm_root());
+        assert_eq!(projected["level"], "around");
+        assert_eq!(projected["owner_note"], "in meetings");
+        // A forged Owner record cannot be replicated in by another author.
+        let mut forged = p.hub.events.iter().find(|e| e.event["type"] == "owner.availability").unwrap().event.clone();
+        forged["actor"]["id"] = json!(agent);
+        assert!(p.replica.preflight_projection(&forged).is_err());
+    }
+    #[test]
     fn outbox_counts_own_pending_messages_until_the_hub_accepts_them() {
         let mut p = pair();
         let (a, b) = (p.people[0].id.clone(), p.people[1].id.clone());
@@ -2574,6 +2602,7 @@ impl Store {
                 Some("pin" | "unpin" | "set" | "remove")
             ),
             "messaging.norms" => matches!(p["action"].as_str(), Some("publish" | "revert")),
+            "messaging.availability" => p["action"] == "set",
             "session.set_name" => true,
             "messaging.follow" | "messaging.monitor" | "messaging.monitors" if actor == "owner" => {
                 true

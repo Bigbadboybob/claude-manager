@@ -1100,7 +1100,14 @@ def ping() -> dict:
         {pong, uid, caller_kind,
          global_perms: bool,        # ← do you have global permissions?
          task_id: str | null,       # ← the task you're bound to (if any)
-         workspace_id: str | null}  # ← the workspace you live in
+         workspace_id: str | null,  # ← the workspace you live in
+         owner_availability: {level, set, changed_at, age_s, ...}}
+
+    `owner_availability.level` is how reachable Owner is right now:
+    away (emergencies only), around (blocking and above), focused
+    (decisions and above), on-call (everything), or null when unset
+    (every alert is delivered). Check it before asking Owner anything;
+    chat_open reports the same value.
 
     `global_perms` is the one to check before you try to drive another
     task's sessions: when true, you can prompt / read / kill / spawn

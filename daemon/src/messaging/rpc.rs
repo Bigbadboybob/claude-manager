@@ -565,6 +565,7 @@ fn execute_with_freshness(
         "messaging.monitor" => store.register_monitor(&actor, p, &people),
         "messaging.monitors" => store.monitors(&actor, p),
         "messaging.follow" => store.follow(&actor, p, &people),
+        "messaging.availability" => store.availability(&actor, p),
         "messaging.people" => {
             let mut value = store.people(&people);
             if let Some(items) = value.as_array_mut() {
@@ -591,7 +592,7 @@ fn execute_with_freshness(
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":super::tasks::orientation(store,&graph,&uid),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":super::tasks::orientation(store,&graph,&uid),"owner_availability":crate::owner_availability::exposure_at(&store.owner_availability, chrono::Utc::now()),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {

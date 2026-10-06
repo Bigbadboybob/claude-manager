@@ -415,6 +415,7 @@ pub fn dispatch_request(
         "messaging.monitor" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.availability" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "sidebar.list" | "sidebar.assign" => {
             if matches!(req.caller, Caller::Operator(_)) {
@@ -2776,6 +2777,7 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             // round-trip. An unknown uid (e.g. post-restart) still
             // pongs, with `global_perms=false` and null scope.
             let st = state.lock().unwrap_or_else(|p| p.into_inner());
+            let messaging_root = st.messaging_root.clone();
             let (
                 global_perms,
                 task_id,
@@ -2808,6 +2810,10 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     }
                     None => (false, None, None, None, None, None, None, None, None),
                 };
+            drop(st);
+            // Owner availability from the messaging store's projection: a
+            // small local file, so ping stays lock-free and network-free.
+            let owner_availability = crate::owner_availability::exposure(&messaging_root);
             Response::ok(
                 req.id.clone(),
                 serde_json::json!({
@@ -2823,6 +2829,7 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     "workflow_role": workflow_role,
                     "managed_by_session_id": managed_by_session_id,
                     "worktree_path": worktree_path,
+                    "owner_availability": owner_availability,
                 }),
             )
         }
@@ -3497,11 +3504,14 @@ mod tests {
         assert_eq!(result["workflow_role"], serde_json::Value::Null);
         assert_eq!(result["managed_by_session_id"], serde_json::Value::Null);
         assert_eq!(result["worktree_path"], serde_json::Value::Null);
+        // Owner availability is always present; unset until Owner picks a level.
+        assert!(result["owner_availability"]["set"].is_boolean());
+        assert!(result["owner_availability"].get("level").is_some());
         assert_eq!(
             result.as_object().map(|o| o.len()),
-            Some(12),
-            "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context. \
-             Any other key drift would be a client-visible change.",
+            Some(13),
+            "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context, \
+             owner_availability. Any other key drift would be a client-visible change.",
         );
     }
 

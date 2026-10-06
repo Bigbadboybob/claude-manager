@@ -90,6 +90,10 @@ mention wake you; do not poll in a loop.
 - Use `notify_user(message=...)` with a concise reason and a link to the
   message or file when Owner action is needed. Ask only when it really needs
   Owner; decisions inside the authorized task are yours to make.
+- Check `ping().owner_availability.level` first: `away` (emergencies only),
+  `around` (blocking and above), `focused` (decisions and above), `on-call`
+  (everything); null means Owner has not set one. When Owner is away or around,
+  keep working on what you can and batch the rest.
 - Do not DM or mention Owner for visibility. The `needs-owner` tag marks a
   nonurgent item for later review and does not notify.
 
