@@ -22,6 +22,7 @@ MAX_BLOCKED_ON = 200
 MAX_LINKS = 20
 MAX_LINK = 500
 MAX_ITEMS_PER_CALL = 50
+MAX_N = 2**31 - 1
 
 # Board settings a nudge snoozes each flag kind for; anything else uses repush_s.
 SNOOZE_SETTING = {
@@ -206,6 +207,7 @@ class BoardTx:
         self.deps_changed: set[int] = set()
         self.events: list[dict] = []
         self.flags_raised: list[dict] = []
+        self.flags_detail: list[dict] = []
         self.flags_resolved: list[dict] = []
         self.pushes: list[dict] = []
         self.unblocked: list[int] = []
@@ -254,6 +256,10 @@ class BoardTx:
 
     def raise_flag(self, it: Item, kind: str, detail: dict | None = None):
         if kind in it.open_flags:
+            if detail is not None and it.open_flags[kind].get("detail") != detail:
+                it.open_flags[kind]["detail"] = detail
+                self.flags_detail.append({"n": it.n, "kind": kind, "detail": detail})
+                self._event(it, "flag_updated", new={"kind": kind, "detail": detail})
             return
         it.open_flags[kind] = {"raised_at": self.now, "detail": detail}
         self.flags_raised.append({"n": it.n, "kind": kind, "detail": detail})
@@ -337,8 +343,10 @@ class BoardTx:
             raise invalid("invalid_field", f"at most {MAX_ITEMS_PER_CALL} items per call",
                           field="ns")
         fields = dict(fields)
-        holders = fields.pop("holders", None) if "holders" in fields else None
-        replace = None if holders is None else [_holder(h) for h in holders]
+        # A `holders` key replaces the list; an explicit null clears it.
+        replace = None
+        if "holders" in fields:
+            replace = [_holder(h) for h in (fields.pop("holders") or [])]
         adds = [_holder(h) for h in (add_holders or [])]
         removes = [h if isinstance(h, str) else _holder(h)["pid"] for h in (remove_holders or [])]
         out = []
@@ -399,7 +407,9 @@ class BoardTx:
         blockers_given = "blocked_by" in fields
         if blockers_given:
             wanted = fields["blocked_by"] or []
-            if not isinstance(wanted, list) or not all(isinstance(b, int) for b in wanted):
+            if not isinstance(wanted, list) or not all(
+                    isinstance(b, int) and not isinstance(b, bool) and 0 < b <= MAX_N
+                    for b in wanted):
                 raise invalid("invalid_field", "blocked_by must be a list of item numbers",
                               field="blocked_by")
             for b in wanted:
@@ -423,8 +433,14 @@ class BoardTx:
             if creating:
                 status = "active" if new_holders else "open"
             elif holders_changed and status not in CLOSED:
-                if not new_holders:
+                if not new_holders and status == "active":
                     status = "open"
+                elif not new_holders:
+                    # Blocked/waiting keep their blockers or ETA; stale and
+                    # overdue still reach the orchestrator.
+                    self.warnings.append(
+                        f"#{n} has no holder now; it stays {status}"
+                    )
                 elif status == "open":
                     status = "active"
             if status not in CLOSED:

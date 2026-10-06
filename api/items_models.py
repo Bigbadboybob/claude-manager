@@ -5,7 +5,16 @@ rules in `dispatch.items_rules` do the semantic validation, so these models
 only fix the wire shape.
 """
 
+from typing import Annotated
+
 from pydantic import BaseModel, ConfigDict, Field
+
+# Bounds keep oversized values a 422 rather than a driver error (int4 columns).
+ItemNumber = Annotated[int, Field(ge=1, le=2**31 - 1)]
+Short = Annotated[str, Field(max_length=200)]
+Reason = Annotated[str, Field(max_length=500)]
+When = Annotated[str, Field(max_length=64)]
+Seconds = Annotated[int, Field(ge=1, le=30 * 24 * 3600)]
 
 
 class _Strict(BaseModel):
@@ -14,17 +23,17 @@ class _Strict(BaseModel):
 
 class Actor(_Strict):
     pid: str = Field(min_length=1, max_length=200)
-    name: str | None = None
-    session_uid: str | None = None
-    daemon_id: str | None = None
-    task_id: str | None = None
+    name: Short | None = None
+    session_uid: Short | None = None
+    daemon_id: Short | None = None
+    task_id: Short | None = None
 
 
 class Holder(_Strict):
     pid: str = Field(min_length=1, max_length=200)
-    name: str | None = None
-    session_uid: str | None = None
-    daemon_id: str | None = None
+    name: Short | None = None
+    session_uid: Short | None = None
+    daemon_id: Short | None = None
 
 
 class ItemFields(_Strict):
@@ -32,11 +41,11 @@ class ItemFields(_Strict):
     status: str | None = None
     note: str | None = None
     group: str | None = None
-    holders: list[Holder] | None = None
-    blocked_by: list[int] | None = None
+    holders: list[Holder] | None = Field(default=None, max_length=50)
+    blocked_by: list[ItemNumber] | None = Field(default=None, max_length=50)
     blocked_on: str | None = None
-    check_back: str | None = None
-    eta: str | None = None
+    check_back: When | None = None
+    eta: When | None = None
     links: list[str] | None = None
 
 
@@ -45,20 +54,20 @@ class ItemSpec(ItemFields):
 
 
 class BoardResolveBody(_Strict):
-    task_id: str | None = None
-    ref: str | None = None
+    task_id: Short | None = None
+    ref: Short | None = None
 
 
 class BoardPatchBody(_Strict):
     actor: Actor
-    name: str | None = None
-    orchestrator_pid: str | None = None
-    idle_s: int | None = None
-    stale_s: int | None = None
-    unassigned_s: int | None = None
-    repush_s: int | None = None
-    escalate_s: int | None = None
-    digest_s: int | None = None
+    name: Short | None = None
+    orchestrator_pid: Short | None = None
+    idle_s: Seconds | None = None
+    stale_s: Seconds | None = None
+    unassigned_s: Seconds | None = None
+    repush_s: Seconds | None = None
+    escalate_s: Seconds | None = None
+    digest_s: Seconds | None = None
     holder_idle_enabled: bool | None = None
 
 
@@ -69,20 +78,20 @@ class ItemsCreateBody(_Strict):
 
 class ItemsPatchBody(_Strict):
     actor: Actor
-    ns: list[int] = Field(min_length=1, max_length=50)
+    ns: list[ItemNumber] = Field(min_length=1, max_length=50)
     set: ItemFields = Field(default_factory=ItemFields)
-    add_holders: list[Holder] | None = None
-    remove_holders: list[str] | None = None
-    reason: str | None = None
+    add_holders: list[Holder] | None = Field(default=None, max_length=50)
+    remove_holders: list[Short] | None = Field(default=None, max_length=50)
+    reason: Reason | None = None
 
 
 class ItemResolveBody(_Strict):
     actor: Actor
-    action: str
-    kind: str | None = None
-    holders: list[Holder] | None = None
-    blocked_by: list[int] | None = None
+    action: str = Field(max_length=32)
+    kind: str | None = Field(default=None, max_length=64)
+    holders: list[Holder] | None = Field(default=None, max_length=50)
+    blocked_by: list[ItemNumber] | None = Field(default=None, max_length=50)
     blocked_on: str | None = None
-    check_back: str | None = None
-    reason: str | None = None
-    message: str | None = None
+    check_back: When | None = None
+    reason: Reason | None = None
+    message: str | None = Field(default=None, max_length=1000)

@@ -248,6 +248,12 @@ async def _apply(conn, tx: BoardTx) -> None:
             tx.items[f["n"]].id, f["kind"], now, tx.actor["pid"], f["resolution"],
             f["snooze_until"],
         )
+    for f in tx.flags_detail:
+        await conn.execute(
+            """UPDATE item_flags SET detail = $3
+                WHERE item_id = $1 AND kind = $2 AND resolved_at IS NULL""",
+            tx.items[f["n"]].id, f["kind"], f["detail"],
+        )
     for f in tx.flags_raised:
         await conn.execute(
             """INSERT INTO item_flags (item_id, kind, detail, raised_at)
@@ -337,6 +343,9 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
                 raise ItemsError(422, "invalid_field", f"{key} must be a boolean", field=key)
             sets[key] = value
         elif key == "orchestrator_pid":
+            if value is not None and (not isinstance(value, str) or len(value) > 200):
+                raise ItemsError(422, "invalid_field", "orchestrator_pid is at most 200 characters",
+                                 field=key)
             sets[key] = value or None
         elif key == "name":
             if not isinstance(value, str) or not value.strip() or len(value) > 200:

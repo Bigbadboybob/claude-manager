@@ -88,6 +88,34 @@ class NumberingAndDefaults(unittest.TestCase):
         b.set(1, add_holders=[LANE])
         self.assertEqual(b[1].status, "active")
 
+    def test_explicit_null_holders_clears(self):
+        b = Board()
+        b.create("x")
+        tx = b.tx()
+        tx.update([1], {"holders": None})
+        self.assertEqual(b[1].holders, [])
+        self.assertEqual(b[1].status, "open")
+
+    def test_last_holder_leaving_blocked_or_waiting_keeps_status(self):
+        b = Board()
+        b.create("a", "b", "c")
+        b.set(2, blocked_by=[1])
+        tx = b.set(2, holders=[])
+        self.assertEqual((b[2].status, b[2].blocked_by), ("blocked", {1}))
+        self.assertTrue(tx.warnings)
+        b.set(3, eta="2h")
+        b.set(3, remove_holders=[ORCH["pid"]])
+        self.assertEqual(b[3].status, "waiting")
+        self.assertIsNotNone(b[3].eta_at)
+
+    def test_out_of_range_blocker_refused(self):
+        b = Board()
+        b.create("a", "b")
+        for bad in ([2**31], [0], [True]):
+            with self.assertRaises(ItemsError) as cm:
+                b.set(2, blocked_by=bad)
+            self.assertEqual(cm.exception.status, 422)
+
     def test_title_is_required_and_bounded(self):
         b = Board()
         with self.assertRaises(ItemsError) as cm:
@@ -229,6 +257,16 @@ class DoneAndDropped(unittest.TestCase):
         self.assertIn("blocker_dropped", self.b[2].open_flags)
         self.assertEqual(tx.flags_raised[0]["detail"], {"blockers": [1]})
         self.assertEqual(self.b[2].status, "blocked")
+
+    def test_second_dropped_blocker_updates_flag_detail(self):
+        self.b.create("c")
+        self.b.set(2, blocked_by=[1, 3])
+        self.b.set(1, status="dropped")
+        tx = self.b.set(3, status="dropped")
+        self.assertEqual(self.b[2].open_flags["blocker_dropped"]["detail"], {"blockers": [1, 3]})
+        self.assertEqual(tx.flags_detail, [{"n": 2, "kind": "blocker_dropped",
+                                            "detail": {"blockers": [1, 3]}}])
+        self.assertEqual(tx.flags_raised, [])
 
     def test_repointing_clears_blocker_dropped(self):
         self.b.create("c")

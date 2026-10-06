@@ -55,7 +55,9 @@ and `board.version = max(item_events.id)` for the board. Flag raise/resolve
 also writes an event, so the version covers flags.
 
 1. **Defaults and shorthands.** No holder given → the caller. `holder="none"`
-   (empty holders) on a non-closed item sets `open` unless a status is given.
+   (`holders: []` or `null`) on an `active` item sets `open` unless a status is
+   given; a `blocked` or `waiting` item keeps its status, blockers and ETA,
+   with a warning (stale/overdue still reach the orchestrator).
    Adding a holder to an `open` item sets `active` unless a status is given.
    Without an explicit status, a non-empty `blocked_by` or `blocked_on` sets
    `blocked`, an `eta` sets `waiting`, and clearing the last blocker of a
@@ -137,7 +139,8 @@ Computed every 30 s by the engine in the API process (a pure
 from `holder_idle`. Nothing exempts `holder_gone`. Since `blocked_by` cannot
 form a cycle, every waiting chain ends at an unexempt item.
 
-**Lifecycle.** At most one open flag per `(item, kind)`. A flag auto-resolves
+**Lifecycle.** At most one open flag per `(item, kind)`; re-raising an open
+flag with new detail updates the detail (event `flag_updated`). A flag auto-resolves
 with resolution `cleared` when its condition stops holding, `closed` when the
 item closes, or the action name when resolved by `item_resolve`. `nudge` sets
 `snooze_until = now + <that kind's threshold>`; the flag is resolved and may
@@ -199,6 +202,10 @@ FastAPI's standard 422.
 `holders` on the wire are resolved objects `{pid, name, session_uid,
 daemon_id}`; name resolution happens in the daemon. `set` accepts the item
 fields of §1 plus `eta` / `check_back` input forms; `null` clears a field.
+
+Bounds: item numbers 1…2³¹−1, ≤ 50 numbers/holders per list, `reason` ≤ 500,
+`message` ≤ 1000, ids and names ≤ 200, `eta`/`check_back` ≤ 64; thresholds
+1 s…30 days. Out of range is a 422.
 
 **Board header:** `{id, slug, name, initiative_id, root_task_id, version,
 orchestrator: {pid, name, state} | null, settings, health: {unresolved,

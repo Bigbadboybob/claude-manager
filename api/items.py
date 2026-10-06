@@ -4,7 +4,7 @@ Agents reach these endpoints only through their host daemon, which stamps the
 `actor`; the API trusts it under the shared bearer token.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
 from api.auth import verify_token
 from api.items_models import (
@@ -49,7 +49,7 @@ async def list_boards(request: Request, open_only: bool = Query(False)):
 @router.get("/boards/{ref}")
 async def read_board(
     ref: str, request: Request,
-    since_version: int | None = Query(None),
+    since_version: int | None = Query(None, ge=0, le=2**63 - 1),
     archived: bool = Query(False),
     q: str | None = Query(None, max_length=200),
     history: int = Query(0, ge=0, le=items_db.MAX_HISTORY),
@@ -83,7 +83,8 @@ async def update_items(ref: str, body: ItemsPatchBody, request: Request):
 
 
 @router.post("/boards/{ref}/items/{n}/resolve")
-async def resolve_item(ref: str, n: int, body: ItemResolveBody, request: Request):
+async def resolve_item(ref: str, body: ItemResolveBody, request: Request,
+                       n: int = Path(ge=1, le=2**31 - 1)):
     return await _call(items_db.resolve_item(
         _pool(request), ref, body.actor.model_dump(), n, body.action,
         kind=body.kind,
@@ -93,6 +94,6 @@ async def resolve_item(ref: str, n: int, body: ItemResolveBody, request: Request
 
 
 @router.get("/items")
-async def held_items(request: Request, holder_pid: str = Query(..., min_length=1),
+async def held_items(request: Request, holder_pid: str = Query(..., min_length=1, max_length=200),
                      open: bool = Query(True)):
     return await _call(items_db.held_items(_pool(request), holder_pid, open_only=open))

@@ -261,6 +261,38 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         kinds = [p["kind"] for p in await self.fetch("SELECT kind FROM item_pushes ORDER BY id")]
         self.assertEqual(kinds, ["assigned", "nudge"])
 
+    async def test_null_holders_clears_over_http(self):
+        await self.create("a")
+        r = await self.patch(1, holders=None)
+        self.assertEqual(r.json()["items"][0]["holders"], [])
+        self.assertEqual(r.json()["items"][0]["status"], "open")
+        self.assertEqual(await self.fetch("SELECT 1 FROM item_holders"), [])
+
+    async def test_second_dropped_blocker_persists_flag_detail(self):
+        await self.create("a", "b", "c")
+        await self.patch(2, blocked_by=[1, 3])
+        await self.patch(1, status="dropped")
+        await self.patch(3, status="dropped")
+        flags = await self.fetch("SELECT detail FROM item_flags WHERE resolved_at IS NULL")
+        self.assertEqual([f["detail"] for f in flags], [{"blockers": [1, 3]}])
+
+    async def test_out_of_range_inputs_are_422_not_500(self):
+        await self.create("a", "b")
+        cases = [
+            self.post(f"/boards/{self.ref}/items/{2**40}/resolve", {"actor": ORCH, "action": "drop"}),
+            self.patch(2, blocked_by=[2**40], ok=False),
+            self.patch([2**31], note="x", ok=False),
+            self.patch(2, note="x", reason="r" * 501, ok=False),
+            self.post(f"/boards/{self.ref}/items/1/resolve",
+                      {"actor": ORCH, "action": "nudge", "message": "m" * 1001}),
+            self.http.patch(f"/boards/{self.ref}", json={
+                "actor": {"pid": "owner"}, "orchestrator_pid": "p" * 201}),
+            self.http.patch(f"/boards/{self.ref}", json={
+                "actor": {"pid": "owner"}, "idle_s": 2**40}),
+        ]
+        for r in await asyncio.gather(*cases):
+            self.assertEqual(r.status_code, 422, r.text)
+
     # ---- reads ----------------------------------------------------------
     async def test_read_version_holder_state_and_closed_strip(self):
         await self.create({"title": "a", "group": "RL", "holders": [LANE]}, "b")
