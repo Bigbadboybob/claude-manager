@@ -40,6 +40,203 @@ impl Level {
     }
 }
 
+/// How much a request to Owner matters, least to most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Urgency {
+    Fyi,
+    Decision,
+    Blocking,
+    Emergency,
+}
+
+impl Urgency {
+    pub const ALL: [Urgency; 4] = [Urgency::Fyi, Urgency::Decision, Urgency::Blocking, Urgency::Emergency];
+
+    pub fn parse(s: &str) -> Option<Urgency> {
+        Self::ALL.into_iter().find(|u| u.as_str() == s)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Urgency::Fyi => "fyi",
+            Urgency::Decision => "decision",
+            Urgency::Blocking => "blocking",
+            Urgency::Emergency => "emergency",
+        }
+    }
+}
+
+/// The least urgency a level delivers immediately (Owner decision
+/// 2026-10-06): away → emergency, around → blocking, focused → decision,
+/// on-call → everything.
+pub fn bar(level: Level) -> Urgency {
+    match level {
+        Level::Away => Urgency::Emergency,
+        Level::Around => Urgency::Blocking,
+        Level::Focused => Urgency::Decision,
+        Level::OnCall => Urgency::Fyi,
+    }
+}
+
+/// Unset delivers everything (legacy behavior).
+pub fn delivers(level: Option<Level>, urgency: Urgency) -> bool {
+    level.is_none_or(|l| urgency >= bar(l))
+}
+
+/// The least reachable level at which `urgency` is delivered.
+pub fn release_level(urgency: Urgency) -> Level {
+    Level::ALL
+        .into_iter()
+        .find(|l| urgency >= bar(*l))
+        .unwrap_or(Level::OnCall)
+}
+
+/// `(level, event_id)` from the projection; `(None, None)` when unset or
+/// unreadable.
+pub fn current(cm_root: &Path) -> (Option<Level>, Option<String>) {
+    let record = std::fs::read(projection_path(cm_root))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .unwrap_or(Value::Null);
+    (
+        record["level"].as_str().and_then(Level::parse),
+        record["event_id"].as_str().map(str::to_owned),
+    )
+}
+
+/// Sessions an evaluator elsewhere (the work-item board) wants woken when the
+/// level changes, keyed by its source. In memory: the board re-registers.
+static REGISTERED: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub fn register_orchestrators(source: &str, uids: Vec<String>) {
+    REGISTERED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(source.to_owned(), uids);
+}
+
+fn registered() -> Vec<String> {
+    REGISTERED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+fn applied_path(cm_root: &Path) -> PathBuf {
+    cm_root.join("owner-availability-applied.json")
+}
+
+/// Delivery-worker hook: when the replicated level changed since this daemon
+/// last applied it (also after restarts and for changes that arrived from
+/// the hub), release held Owner requests the new level delivers and wake the
+/// sessions that coordinate work. Runs on every host; cheap when unchanged
+/// (one small file read).
+pub fn tick(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>) {
+    let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+    let (level, event_id) = current(&root);
+    let applied: Value = std::fs::read(applied_path(&root))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    let first_run = applied.is_null();
+    if !first_run && applied["event_id"].as_str() == event_id.as_deref() {
+        return;
+    }
+    let previous = applied["level"].as_str().and_then(Level::parse);
+    let outcome = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.draining {
+            return;
+        }
+        crate::owner_attention::release_for_level(&s, level)
+    };
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("cm owner availability: release held requests: {e}");
+            return;
+        }
+    };
+    // First run after an upgrade: adopt the current level without waking
+    // anyone (nothing was held under the old daemon).
+    if !first_run {
+        wake(state, &root, previous, level, event_id.as_deref().unwrap_or("unset"), &outcome);
+    }
+    let record = json!({"event_id": event_id, "level": level.map(Level::as_str)});
+    if let Err(e) = crate::state::write_json_atomic(&applied_path(&root), &record.to_string(), true) {
+        eprintln!("cm owner availability: record applied level: {e}");
+    }
+}
+
+fn wake(
+    state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>,
+    root: &Path,
+    previous: Option<Level>,
+    level: Option<Level>,
+    revision: &str,
+    outcome: &crate::owner_attention::ReleaseOutcome,
+) {
+    let name = |l: Option<Level>| l.map(Level::as_str).unwrap_or("unset");
+    // (a) continuous orchestrators, (b) initiative coordinators, (c) board
+    // registrations, (d) sessions with held or released requests.
+    let mut targets: std::collections::BTreeSet<String> = crate::continuous::task::load_all()
+        .into_iter()
+        .filter(|t| !t.paused)
+        .filter_map(|t| t.current_session_uid)
+        .collect();
+    targets.extend(registered());
+    targets.extend(outcome.released.keys().cloned());
+    targets.extend(outcome.still_held.keys().cloned());
+    let (live, api_url, api_token): (std::collections::BTreeMap<String, Option<String>>, String, String) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            s.sessions.iter().map(|(uid, x)| (uid.clone(), x.task_id.clone())).collect(),
+            s.config.api_url.clone(),
+            s.config.api_token.clone(),
+        )
+    };
+    match crate::planning_client::fetch_active_coordinator_tasks(Some(&api_url), Some(&api_token)) {
+        Ok(tasks) => targets.extend(
+            live.iter()
+                .filter(|(_, task)| task.as_ref().is_some_and(|t| tasks.contains(t)))
+                .map(|(uid, _)| uid.clone()),
+        ),
+        Err(e) => eprintln!(
+            "cm owner availability: initiative coordinators unavailable ({}); waking continuous and registered orchestrators only",
+            e.to_method_err().1
+        ),
+    }
+    let at = Utc::now().format("%H:%MZ");
+    for uid in targets.iter().filter(|u| live.contains_key(*u)) {
+        let mut text = format!(
+            "Owner availability: {}→{} at {at}.",
+            name(previous),
+            name(level)
+        );
+        let released = outcome.released.get(uid).copied().unwrap_or(0);
+        let held = outcome.still_held.get(uid).copied().unwrap_or(0);
+        if released > 0 || held > 0 {
+            text.push_str(&format!(" {released} of your requests were released; {held} still held."));
+        }
+        text.push_str(" Check ping().owner_availability before asking Owner; continue your task.");
+        let marker = format!("[cm-owner-availability {revision}]");
+        if let Err(e) = crate::notifications::publish(
+            root,
+            uid,
+            &format!("owner-availability:{revision}"),
+            "owner",
+            &text,
+            &marker,
+        ) {
+            eprintln!("cm owner availability: wake {uid}: {e}");
+        }
+    }
+}
+
 /// The messaging event type carrying a level change.
 pub const EVENT_TYPE: &str = "owner.availability";
 /// Longest accepted note, in characters.
@@ -97,6 +294,26 @@ pub fn exposure(cm_root: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bars_follow_the_owner_mapping() {
+        use Urgency::*;
+        for (level, delivered) in [
+            (Level::Away, vec![Emergency]),
+            (Level::Around, vec![Blocking, Emergency]),
+            (Level::Focused, vec![Decision, Blocking, Emergency]),
+            (Level::OnCall, vec![Fyi, Decision, Blocking, Emergency]),
+        ] {
+            for u in Urgency::ALL {
+                assert_eq!(delivers(Some(level), u), delivered.contains(&u), "{level:?} {u:?}");
+            }
+        }
+        assert!(Urgency::ALL.into_iter().all(|u| delivers(None, u)));
+        assert_eq!(release_level(Emergency), Level::Away);
+        assert_eq!(release_level(Blocking), Level::Around);
+        assert_eq!(release_level(Decision), Level::Focused);
+        assert_eq!(release_level(Fyi), Level::OnCall);
+    }
 
     #[test]
     fn levels_order_and_round_trip() {

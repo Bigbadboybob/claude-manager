@@ -259,6 +259,16 @@ impl ManifestWatcher {
     /// `SyncSender` BLOCKS when full, which would freeze the
     /// broadcaster (and thus whichever lock the caller is
     /// holding — typically `DaemonState`).
+    /// Connected `manifest.watch` subscribers (viewers). Owner attention uses
+    /// it to tell "a TUI will show this alert" from "nobody is watching".
+    pub fn subscriber_count(&self) -> usize {
+        self.inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
     pub fn broadcast(&self, diff: ManifestDiff) {
         let mut subs = self
             .inner

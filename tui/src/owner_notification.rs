@@ -23,6 +23,7 @@ mod tests {
             message: "Review ready".into(),
             task_id: None,
             continuous_task_id: None,
+            ..Default::default()
         }
     }
     #[test]

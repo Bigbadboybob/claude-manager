@@ -1805,7 +1805,7 @@ def set_session_section(section: str, session_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-def notify_user(message: str = "") -> dict:
+def notify_user(message: str = "", urgency: str = "decision") -> dict:
     """Request Owner attention for your own session (local, cloud, or continuous).
 
     Continuous workers post routine reviews, progress, recoverable failures and
@@ -1817,18 +1817,32 @@ def notify_user(message: str = "") -> dict:
     Routine progress stays in session chat; this does not authorize deployment,
     session control, or unsolicited Owner DMs.
 
-    The daemon retains the alert until Owner selects the session. A connected
+    urgency is honest: "fyi" (no action needed soon), "decision" (default:
+    Owner must choose something), "blocking" (you or others cannot proceed),
+    "emergency" (harm or loss is happening now; also pushed to Owner's phone).
+    Owner's availability (ping().owner_availability.level) decides delivery:
+    away delivers emergencies only, around blocking+, focused decision+,
+    on-call everything; unset delivers everything. The result says
+    delivery="immediate" or delivery="held" with release_when (the level that
+    will deliver it). Held is not lost: keep working, and you are woken when a
+    level change releases it. Repeated held requests keep the latest text.
+
+    A delivered alert stays until Owner selects the session. A connected
     updated TUI submits the normal desktop notification and blinks the sidebar;
-    otherwise delivery waits for reconnection. Alt+g jumps to attention, including
-    continuous tasks. Identical pending reasons coalesce; a changed reason raises
-    a new alert. Returns status="queued", not proof of desktop delivery/read.
+    otherwise delivery waits for reconnection (blocking and emergency requests
+    also reach notify_command when no viewer is connected). Identical pending
+    reasons coalesce; a changed reason raises a new alert. status="queued" is
+    not proof of desktop delivery/read.
 
     message is optional (maximum 4096 UTF-8 bytes). Identity and label come from
     the live caller, never a target parameter; no global permission is required.
-    Desktop/DND preferences, notify_on_idle, chat mutes/follows, and Telegram
-    escalation settings are unchanged. See doc/OWNER_NOTIFICATIONS.md.
+    See doc/OWNER_NOTIFICATIONS.md.
     """
-    return control_client.call("notify_user", {"message": message})
+    params = {"message": message}
+    # Omit the default so a daemon predating urgency still accepts the call.
+    if urgency != "decision":
+        params["urgency"] = urgency
+    return control_client.call("notify_user", params)
 
 
 @mcp.tool()

@@ -2975,6 +2975,7 @@ mod apply_manifest_diff_tests {
         cm_daemon::owner_attention::Alert {
             id: id.into(), session_uid: uid.into(), label: "Task".into(),
             message: "Ready for review".into(), task_id: None, continuous_task_id: None,
+            ..Default::default()
         }
     }
 

@@ -445,6 +445,20 @@ pub fn dispatch_request(
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             DispatchOutcome::Done(crate::owner_attention::acknowledge(&s, req))
         }
+        "owner_attention.escalate" => {
+            if let Err(resp) = require_operator(req, "Owner attention escalation is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::escalate_rpc(&s, req))
+        }
+        "owner_attention.withdraw" => {
+            if let Err(resp) = require_operator(req, "Owner attention withdrawal is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::withdraw_rpc(&s, req))
+        }
         // Reads the caller's session (when known) to report its own scope.
         "ping" => DispatchOutcome::Done(dispatch_ping(state, req)),
 

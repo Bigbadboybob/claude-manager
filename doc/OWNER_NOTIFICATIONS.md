@@ -60,9 +60,44 @@ enrolled host; each daemon projects the latest value to
 source, owner_note}`. The RPC is `messaging.availability {action: get | set,
 level, note?, source?, request_id}`; `set` requires the Owner/operator caller.
 
-Unset delivers every alert, exactly as before. The level does not gate
-`notify_user` yet; urgency-based holding and release on a level change arrive
-with the gated `notify_user` change, which this section will describe.
+### The gate
+
+`notify_user(message, urgency)` takes `fyi`, `decision` (default), `blocking`
+or `emergency`. A request is delivered when its urgency meets the level's bar:
+
+| Level | Delivered | Held |
+|---|---|---|
+| unset | everything | nothing |
+| on-call | everything | nothing |
+| focused | decision, blocking, emergency | fyi |
+| around | blocking, emergency | fyi, decision |
+| away | emergency | fyi, decision, blocking |
+
+The result is `{status:"queued", delivery:"immediate"|"held", alert_id,
+urgency, owner_availability, release_when?}`. Held requests live in
+`~/.cm/owner-attention-held.json` (latest per session plus a count, bounded like
+the delivered queue), never in `owner-attention.json`, so viewers never show
+them. When the level changes (set locally or replicated from the hub), every
+daemon's delivery worker releases the held requests the new level delivers into
+the normal queue, marked `released_at` (merged into a pending alert for the same
+session, up to 4,096 bytes), and wakes once per revision: continuous
+orchestrators, live sessions bound to an active initiative's coordinator task,
+sessions the work-item board registered, and sessions with held or released
+requests. `~/.cm/owner-availability-applied.json` records the last applied
+revision; the first run after an upgrade adopts the current level silently.
+
+Out-of-band push (`notify_command`, e.g. Telegram, tag `owner-attention`):
+every `emergency`, and every delivered `blocking` request while no viewer is
+connected. Pushes are rate-limited to one per alert key per 10 minutes.
+
+Daemon-side sources use the same gate through `owner_attention::escalate()` /
+`withdraw()` (Operator RPCs `owner_attention.escalate` / `owner_attention.withdraw`
+for evaluators elsewhere). The notification stall alarm and the outbox alarm
+(a session's own messages still `pending_sync` after 15 minutes) escalate as
+`blocking`. **Behavior change:** under `away` both alarms are held until Owner
+becomes more reachable; with no viewer connected and the level unset, on-call or
+around they also reach `notify_command`. Escalations never displace an agent's
+own pending request.
 
 ## Routing and authorization
 

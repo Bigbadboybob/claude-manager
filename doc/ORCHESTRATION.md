@@ -67,7 +67,7 @@ declaration and follows up when the ETA passes.
 | `chat_send(mention_here=True)` | current channel members |
 | `start_session` / `send_input` (auto monitor) | you, when the worker's turn ends (`notify_until="final"`: when it calls `report_done` or exits) |
 | `monitor_sessions(...)` | you, on the condition you set |
-| `notify_user(message=...)` | Owner, through the TUI alert |
+| `notify_user(message=..., urgency=...)` | Owner, through the TUI alert, if the urgency meets Owner's availability; otherwise held until it does (emergency also pushes to Owner's phone) |
 | `@Name` in a message body | that participant, **only** if it names exactly one current member of the conversation; otherwise nobody, and the send returns a warning |
 | Tags, channel membership, a pinned message | nobody |
 
@@ -87,13 +87,15 @@ mention wake you; do not poll in a loop.
 - An Owner question states the options, your recommendation and who is blocked
   until it is answered. One question per decision; batch independent questions
   in one request.
-- Use `notify_user(message=...)` with a concise reason and a link to the
-  message or file when Owner action is needed. Ask only when it really needs
+- Use `notify_user(message=..., urgency=...)` with a concise reason, a link to
+  the message or file, and an honest urgency (`fyi`, `decision`, `blocking`,
+  `emergency`) when Owner action is needed. Ask only when it really needs
   Owner; decisions inside the authorized task are yours to make.
 - Check `ping().owner_availability.level` first: `away` (emergencies only),
   `around` (blocking and above), `focused` (decisions and above), `on-call`
-  (everything); null means Owner has not set one. When Owner is away or around,
-  keep working on what you can and batch the rest.
+  (everything); null means Owner has not set one. A request below the bar comes
+  back `delivery="held"`: keep working on what you can; you are woken when it
+  is released.
 - Do not DM or mention Owner for visibility. The `needs-owner` tag marks a
   nonurgent item for later review and does not notify.
 

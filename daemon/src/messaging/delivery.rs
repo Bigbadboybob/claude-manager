@@ -273,6 +273,9 @@ impl Recipient {
     }
 }
 pub fn tick(state: &Arc<Mutex<DaemonState>>) {
+    // Owner availability changes (local or replicated) release held Owner
+    // requests and wake coordinators; independent of the store lock below.
+    crate::owner_availability::tick(state);
     let (handle, root, gate, recipients) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         if s.draining { return; }
@@ -360,6 +363,19 @@ fn alarm_tick(state: &Arc<Mutex<DaemonState>>, root: &Path) {
     };
     let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
     alarm::pass(state, root, &uids, now, alarm::threshold_secs());
+    // Sender-side: a session's own messages stuck pending_sync (hub link
+    // stalled). Skipped this round if the store is busy.
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let outboxes: Option<Vec<(String, Option<serde_json::Value>)>> = handle.try_lock().ok().and_then(|slot| {
+        slot.as_ref().map(|store| {
+            uids.iter()
+                .map(|uid| (uid.clone(), store.outbox_status(&store.participant_id(uid))))
+                .collect()
+        })
+    });
+    if let Some(outboxes) = outboxes {
+        alarm::outbox_pass(state, root, &outboxes, alarm::OUTBOX_ALERT_SECS);
+    }
 }
 
 #[cfg(test)]

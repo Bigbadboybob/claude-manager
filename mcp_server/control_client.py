@@ -146,6 +146,9 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # Operator-only: create/repair a continuous task's `ct/<slug>` channel
     # (migration scripts). Listed for dispatch-surface alignment only.
     "continuous.ensure_channel",
+    # Operator-only shared Owner-attention gate for evaluators outside the
+    # daemon (work-item board). No MCP tool routes them. Alignment only.
+    "owner_attention.escalate", "owner_attention.withdraw",
     # Operator-only kitty-graphics file read for TUI panes. No MCP tool
     # routes it. Listed for dispatch-surface alignment only.
     "graphics.read_file",

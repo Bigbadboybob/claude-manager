@@ -197,6 +197,95 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
     }
 }
 
+/// A session's own messages pending_sync this long raise a sender-side alarm.
+pub const OUTBOX_ALERT_SECS: i64 = 900;
+
+fn outbox_state_path(root: &Path) -> PathBuf {
+    root.join("notifications").join("outbox-alarms.state")
+}
+
+/// Sender-side alarm (EP A2): messages a session sent that the hub has not
+/// accepted for `threshold` seconds. One blocking escalation per episode,
+/// withdrawn when the outbox drains. `outboxes` pairs each live session with
+/// its `Store::outbox_status`.
+pub fn outbox_pass(
+    state: &Arc<Mutex<DaemonState>>,
+    root: &Path,
+    outboxes: &[(String, Option<Value>)],
+    threshold: i64,
+) {
+    let mut episodes: BTreeMap<String, Episode> = fs::read(outbox_state_path(root))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let before = episodes.clone();
+    let s = state.lock().unwrap_or_else(|p| p.into_inner());
+    if s.draining {
+        return;
+    }
+    for (uid, outbox) in outboxes {
+        let stalled = outbox
+            .as_ref()
+            .filter(|o| o["oldest_age_s"].as_i64().is_some_and(|a| a >= threshold));
+        match stalled {
+            Some(o) => {
+                let episode = episodes.entry(uid.clone()).or_insert_with(|| Episode {
+                    since: crate::continuous::task::now_unix(),
+                    reason: "pending_sync".into(),
+                    alert_id: None,
+                });
+                if episode.alert_id.is_some() {
+                    continue;
+                }
+                let label = s
+                    .sessions
+                    .get(uid)
+                    .map(|x| x.title.clone())
+                    .unwrap_or_else(|| uid.clone());
+                let age = o["oldest_age_s"].as_i64().unwrap_or(0).max(0) as u64;
+                let summary = format!(
+                    "Messages from {label} ({uid}) have waited {} for the messaging hub ({} pending). The hub link may be stalled; check chat_open().sync on this host and the hub daemon.",
+                    human(age),
+                    o["pending_sync"]
+                );
+                let e = crate::owner_attention::Escalation {
+                    source: format!("outbox:{uid}"),
+                    dedupe_key: uid.clone(),
+                    urgency: crate::owner_availability::Urgency::Blocking,
+                    summary,
+                    session_uid: Some(uid.clone()),
+                    task_id: None,
+                };
+                match crate::owner_attention::escalate(&s, e) {
+                    Ok(crate::owner_attention::GateOutcome::Delivered { alert_id })
+                    | Ok(crate::owner_attention::GateOutcome::Held { alert_id, .. }) => {
+                        eprintln!("cm messaging: outbox alarm for {uid}: oldest pending {age}s");
+                        episode.alert_id = Some(alert_id);
+                    }
+                    Ok(crate::owner_attention::GateOutcome::Coalesced { .. }) => {}
+                    Err(e) => eprintln!("cm messaging: outbox alarm for {uid}: {e}"),
+                }
+            }
+            None => {
+                if let Some(Episode { alert_id: Some(id), .. }) = episodes.remove(uid) {
+                    if let Err(e) = crate::owner_attention::withdraw(&s, uid, &id) {
+                        eprintln!("cm messaging: clear outbox alarm for {uid}: {e}");
+                    }
+                }
+            }
+        }
+    }
+    episodes.retain(|uid, _| outboxes.iter().any(|(u, _)| u == uid));
+    if episodes != before {
+        let saved = fs::create_dir_all(root.join("notifications")).and_then(|_| {
+            crate::messaging::atomic_replace(&outbox_state_path(root), &serde_json::to_value(&episodes)?)
+        });
+        if let Err(e) = saved {
+            eprintln!("cm messaging: outbox alarm state: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +368,35 @@ mod tests {
         assert!(alerts(&state).is_empty());
     }
 
+    #[test]
+    fn outbox_alarm_raises_once_per_episode_and_withdraws_when_drained() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
+        daemon.messaging_root = root.to_path_buf();
+        let state = Arc::new(Mutex::new(daemon));
+        let alerts = |s: &Arc<Mutex<DaemonState>>| crate::owner_attention::snapshot(&s.lock().unwrap()).unwrap();
+        let uid = "ts-sender".to_string();
+        let fresh = vec![(uid.clone(), Some(json!({"pending_sync":1,"oldest_age_s":120})))];
+        outbox_pass(&state, root, &fresh, OUTBOX_ALERT_SECS);
+        assert!(alerts(&state).is_empty(), "inside the horizon");
+        let stuck = vec![(uid.clone(), Some(json!({"pending_sync":3,"oldest_age_s":1800})))];
+        outbox_pass(&state, root, &stuck, OUTBOX_ALERT_SECS);
+        let first = alerts(&state)[&uid].clone();
+        assert!(first.message.contains("30m") && first.message.contains("3 pending"), "{}", first.message);
+        assert_eq!(first.urgency.as_deref(), Some("blocking"));
+        // Same episode: Owner acknowledged, never re-raised.
+        crate::owner_attention::clear_system(&state.lock().unwrap(), &uid, &first.id).unwrap();
+        outbox_pass(&state, root, &stuck, OUTBOX_ALERT_SECS);
+        assert!(alerts(&state).is_empty());
+        // Drained: the episode ends; a new stall raises again and drains clean.
+        outbox_pass(&state, root, &[(uid.clone(), None)], OUTBOX_ALERT_SECS);
+        outbox_pass(&state, root, &stuck, OUTBOX_ALERT_SECS);
+        assert_ne!(alerts(&state)[&uid].id, first.id);
+        outbox_pass(&state, root, &[(uid.clone(), None)], OUTBOX_ALERT_SECS);
+        assert!(alerts(&state).is_empty());
+    }
     #[test]
     fn notifications_stall_alarm_never_displaces_an_agent_alert() {
         let dir = tempfile::tempdir().unwrap();

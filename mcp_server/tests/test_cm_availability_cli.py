@@ -54,3 +54,14 @@ class CmAvailabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotifyUserUrgencyTests(unittest.TestCase):
+    def test_default_urgency_is_omitted_for_older_daemons_and_others_pass_through(self):
+        from mcp_server import control_client, server
+
+        with mock.patch.object(control_client, "call", return_value={"ok": True}) as call:
+            server.notify_user("Need a decision")
+            self.assertEqual(call.call_args.args, ("notify_user", {"message": "Need a decision"}))
+            server.notify_user("prod down", urgency="emergency")
+            self.assertEqual(call.call_args.args[1], {"message": "prod down", "urgency": "emergency"})
