@@ -196,6 +196,7 @@ reviews, merges to main and deploys (hub first).
 | W1a items API | items | reviewed PASS (+fixes 9f1aa85) | 9f1aa85 | API live on cm-manager 19:17Z; `GET /boards` 200 |
 | W1b agent_state core | state-core | review: 2 blockers being fixed | | |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
+| W2f messaging read side + slim responses | msgfix | reviewed PASS | 084fff2, f9a13ee | cm-manager + cm-sessions 20:03Z (Owner priority) |
 
 Note: both Claude lanes' launch prompts were silently dropped at start_session (status file idle since spawn, no transcript, monitor timed out ~35 min later); redelivered with send_input 18:47Z. Follow-up: start_session should confirm the turn started (state-core, after W2d).
 
