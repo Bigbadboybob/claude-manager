@@ -199,6 +199,7 @@ reviews, merges to main and deploys (hub first).
 | W2f messaging read side + slim responses | msgfix | reviewed PASS | 084fff2, f9a13ee | cm-manager + cm-sessions 20:03Z (Owner priority) |
 | W3e Owner availability state + CLI | msgfix | reviewed PASS | 43e30ef | cm-manager + cm-sessions 20:52Z; ~/.cm/bin/cm-availability on both |
 | W4a gated notify_user | msgfix | reviewed PASS (+fixes) | fb7f9a3, e8eaede | cm-manager + cm-sessions 20:52Z |
+| W4b TUI F7 picker + status level + release digest | msgfix | reviewed PASS | 9ef0e15 | release staged ~/.cm/releases/tui-9ef0e15; awaiting Owner laptop install |
 
 Note: both Claude lanes' launch prompts were silently dropped at start_session (status file idle since spawn, no transcript, monitor timed out ~35 min later); redelivered with send_input 18:47Z. Follow-up: start_session should confirm the turn started (state-core, after W2d).
 
@@ -212,3 +213,7 @@ messaging (lazy/background store load).
 19:35–19:37Z: Owner-prioritized deploy of a11adcc (wave 0 + W1c) to cm-manager, then
 cm-sessions, with advance notice. Hub came back in ~20 s this time (store warm in page
 cache); cm-sessions in ~90 s. Laptop daemon still on the old build (next TUI release).
+
+Coordinator miss (21:31Z): the items lane sat idle ~2 h after its W1a fixes were merged
+and deployed, because I never told it to start W2a. Exactly the failure the board's
+`holder_idle` flag targets. Restarted at 21:31Z.
