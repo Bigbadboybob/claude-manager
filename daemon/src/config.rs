@@ -406,6 +406,10 @@ impl Default for SchedulerConfig {
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Project Claude presence into the legacy idle boolean. Disable and call
+    /// daemon.reload_config to restore PTY-based idle while keeping agent_state.
+    #[serde(default = "default_presence_idle_enabled")]
+    pub presence_idle_enabled: bool,
     /// Absolute path to `mcp_server/server.py`. The daemon
     /// injects this into every agent's `CM_MCP_SERVER` env so
     /// the agent's MCP runtime knows where to find the
@@ -482,6 +486,8 @@ pub struct DaemonConfig {
     pub notify_command: Option<String>,
 }
 
+fn default_presence_idle_enabled() -> bool { true }
+
 impl DaemonConfig {
     /// Effective clone directory: the configured `repos_dir`, or the
     /// `~/.cm/repos` default when unset. Daemon-cloned repos live here —
@@ -500,6 +506,7 @@ impl DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            presence_idle_enabled: default_presence_idle_enabled(),
             mcp_server_path: String::new(),
             api_url: String::new(),
             api_token: String::new(),
@@ -786,6 +793,7 @@ mode = "ssh-trust"
     #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            presence_idle_enabled: false,
             mcp_server_path: "/opt/x.py".into(),
             api_url: "http://h:8000".into(),
             api_token: "tok".into(),
@@ -808,6 +816,7 @@ mode = "ssh-trust"
         let reparsed: DaemonConfig =
             toml::from_str(&toml_text).expect("de");
         assert_eq!(reparsed.mcp_server_path, original.mcp_server_path);
+        assert_eq!(reparsed.presence_idle_enabled, original.presence_idle_enabled);
         assert_eq!(reparsed.api_url, original.api_url);
         assert_eq!(reparsed.api_token, original.api_token);
         assert_eq!(reparsed.log_path, original.log_path);

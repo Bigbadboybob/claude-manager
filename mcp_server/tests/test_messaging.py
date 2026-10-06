@@ -111,6 +111,18 @@ class MessagingToolsTests(unittest.TestCase):
         self.assertTrue(result["timed_out"])
         self.assertIn("binding_warning", result["state"])
 
+    def test_workflow_wait_counts_only_explicit_agent_idle_as_stuck(self):
+        binding = {"daemon_session_uid": "actual"}
+        for state in ("working", "working-background", "waiting-on-human", "errored", "unknown", "starting"):
+            with self.subTest(state=state):
+                result = self.run_wait(binding, [{"session_uid": "actual", "idle": True,
+                                                "agent_state": {"state": state}}])
+                self.assertTrue(result["timed_out"])
+                self.assertFalse(result["stuck"])
+        result = self.run_wait(binding, [{"session_uid": "actual", "idle": False,
+                                        "agent_state": {"state": "idle"}}])
+        self.assertTrue(result["stuck"], "explicit state wins over compatibility idle")
+
     def test_stop_hook_reports_continuation_for_inbox_work(self):
         from mcp_server.hooks import cm_stop_hook as hook
         import io

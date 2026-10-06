@@ -48,8 +48,41 @@ struct PresenceFile {
 }
 struct CachedFile {
     stamp: Stamp,
-    value: Option<PresenceFile>,
+    value: FileValue,
+    last_good: Option<PresenceFile>,
+    parse_failures: u8,
     tick: u64,
+}
+#[derive(Clone)]
+enum FileValue {
+    Valid(PresenceFile),
+    ParseFailure,
+    Invalid,
+}
+impl CachedFile {
+    fn observed(&mut self, tick: u64) -> Result<Option<PresenceFile>, ()> {
+        if self.tick != tick {
+            self.tick = tick;
+            match &self.value {
+                FileValue::Valid(file) => {
+                    self.parse_failures = 0;
+                    self.last_good = Some(file.clone());
+                }
+                FileValue::ParseFailure => {
+                    self.parse_failures = self.parse_failures.saturating_add(1);
+                }
+                FileValue::Invalid => {
+                    self.parse_failures = 0;
+                    self.last_good = None;
+                }
+            }
+        }
+        match &self.value {
+            FileValue::Valid(file) => Ok(Some(file.clone())),
+            FileValue::ParseFailure if self.parse_failures < 2 => Ok(self.last_good.clone()),
+            _ => Err(()),
+        }
+    }
 }
 struct CachedTail {
     identity: (u32, Option<u64>),
@@ -110,18 +143,17 @@ impl Reader {
         observations
     }
 
-    fn file(&mut self, pid: u32, now: f64) -> Option<PresenceFile> {
+    fn file(&mut self, pid: u32, now: f64) -> Result<Option<PresenceFile>, ()> {
         let path = self.root.join(format!("{pid}.json"));
-        let stamp = Stamp::read(&path)?;
+        let stamp = Stamp::read(&path).ok_or(())?;
         if let Some(cached) = self.files.get_mut(&path).filter(|c| c.stamp == stamp) {
-            cached.tick = self.tick;
-            return cached.value.clone();
+            return cached.observed(self.tick);
         }
         #[cfg(test)]
         {
             self.parses += 1;
         }
-        let value = (|| {
+        let value = (|| -> Option<FileValue> {
             if stamp.len > MAX_FILE_BYTES {
                 return None;
             }
@@ -134,17 +166,25 @@ impl Reader {
             if bytes.len() as u64 > MAX_FILE_BYTES {
                 return None;
             }
-            parse(&bytes, now)
-        })();
-        self.files.insert(
-            path,
-            CachedFile {
-                stamp,
-                value: value.clone(),
-                tick: self.tick,
-            },
-        );
-        value
+            Some(match serde_json::from_slice(&bytes) {
+                Ok(value) => parse(value, now)
+                    .map(FileValue::Valid)
+                    .unwrap_or(FileValue::Invalid),
+                Err(_) => FileValue::ParseFailure,
+            })
+        })()
+        .unwrap_or(FileValue::Invalid);
+        let previous = self.files.remove(&path);
+        let mut cached = CachedFile {
+            stamp,
+            value,
+            last_good: previous.as_ref().and_then(|c| c.last_good.clone()),
+            parse_failures: previous.as_ref().map_or(0, |c| c.parse_failures),
+            tick: self.tick.wrapping_sub(1),
+        };
+        let result = cached.observed(self.tick);
+        self.files.insert(path, cached);
+        result
     }
 
     fn process(&self, pid: u32) -> Option<(u32, u64)> {
@@ -214,10 +254,14 @@ impl Reader {
         self.directory = Some(result.clone());
         result
     }
-    fn validated(&mut self, pid: u32, now: f64) -> Option<PresenceObs> {
+    fn validated(&mut self, pid: u32, now: f64) -> Result<Option<PresenceObs>, ()> {
         let file = self.file(pid, now)?;
-        let (_, start) = self.process(pid)?;
-        (file.pid == pid && file.proc_start == start).then_some(file.observation)
+        let (_, start) = self.process(pid).ok_or(())?;
+        match file {
+            Some(file) if file.pid == pid && file.proc_start == start => Ok(Some(file.observation)),
+            Some(_) => Err(()),
+            None => Ok(None),
+        }
     }
     fn sample(&mut self, target: &Target, now: f64) -> Option<PresenceObs> {
         let invalid = || PresenceObs {
@@ -238,24 +282,33 @@ impl Reader {
         }
         let direct = self.root.join(format!("{}.json", target.pid));
         let mut observation = match std::fs::symlink_metadata(&direct) {
-            Ok(_) => self.validated(target.pid, now).unwrap_or_else(invalid),
+            Ok(_) => match self.validated(target.pid, now) {
+                Ok(Some(observation)) => observation,
+                Ok(None) => return None, // First parse failure: retain current source.
+                Err(()) => invalid(),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Wrapper launches have no root PID file. Only an unambiguous,
                 // live interactive descendant can supply the root's state.
                 let mut candidates = Vec::new();
                 let mut invalid_descendant = false;
+                let mut deferred_descendant = false;
                 if let Ok(pids) = self.directory_pids() {
                     for pid in pids {
                         if !self.descendant(pid, target.pid) {
                             continue;
                         }
                         match self.validated(pid, now) {
-                            Some(p) => candidates.push(p),
-                            None => invalid_descendant = true,
+                            Ok(Some(p)) => candidates.push(p),
+                            Ok(None) => deferred_descendant = true,
+                            Err(()) => invalid_descendant = true,
                         }
                     }
                 } else {
                     return Some(invalid());
+                }
+                if deferred_descendant && !invalid_descendant {
+                    return None;
                 }
                 if candidates.len() == 1 && !invalid_descendant {
                     candidates.pop().unwrap()
@@ -337,8 +390,7 @@ fn short(value: Option<&serde_json::Value>, cap: usize) -> Option<String> {
         .filter(|s| s.len() <= cap)
         .map(str::to_string)
 }
-fn parse(bytes: &[u8], now: f64) -> Option<PresenceFile> {
-    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+fn parse(v: serde_json::Value, now: f64) -> Option<PresenceFile> {
     if v.get("kind")?.as_str()? != "interactive" {
         return None;
     }
@@ -470,6 +522,9 @@ mod tests {
         ] {
             let mut f = Fixture::new();
             f.install(name);
+            if name == "truncated" {
+                assert!(f.sample().is_none(), "first partial read deferred");
+            }
             assert_eq!(f.state(), expected, "{name}");
             if name == "idle" {
                 let p = f.sample().unwrap();
@@ -501,7 +556,14 @@ mod tests {
         f.process(1001, 1, 42, "Z");
         assert_eq!(f.state(), State::Unknown, "zombie is not live");
         f.process(1001, 1, 42, "S");
+        f.install("idle");
+        assert_eq!(f.state(), State::Idle);
         f.install("truncated");
+        assert_eq!(
+            f.state(),
+            State::Idle,
+            "one partial write keeps the last valid observation"
+        );
         assert_eq!(f.state(), State::Unknown);
         f.install("idle");
         assert_eq!(f.state(), State::Idle, "recovery is observed");
@@ -510,6 +572,42 @@ mod tests {
             f.state(),
             State::Unknown,
             "source loss never falls back to idle"
+        );
+    }
+
+    #[test]
+    fn partial_writes_require_two_ticks_and_recovery_resets_the_streak() {
+        let mut f = Fixture::new();
+        f.install("busy");
+        assert_eq!(f.state(), State::Working);
+        f.install("truncated");
+        assert_eq!(
+            f.state(),
+            State::Working,
+            "first parse failure retains busy"
+        );
+        assert!(
+            f.reader.validated(1001, 1000.0).unwrap().is_some(),
+            "same tick is not a second failure"
+        );
+        assert_eq!(
+            f.state(),
+            State::Unknown,
+            "unchanged corrupt JSON counts again next tick"
+        );
+        f.install("busy");
+        assert_eq!(f.state(), State::Working);
+        f.install("truncated");
+        assert_eq!(
+            f.state(),
+            State::Working,
+            "successful parse resets failure streak"
+        );
+        f.process(1001, 1, 43, "S");
+        assert_eq!(
+            f.state(),
+            State::Unknown,
+            "identity failures are never debounced"
         );
     }
 

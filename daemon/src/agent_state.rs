@@ -163,7 +163,10 @@ pub struct AgentState {
     pub stalled_since: Option<f64>,
 }
 impl AgentState {
-    pub fn compatibility_idle(&self, pty_idle: bool) -> bool {
+    pub fn compatibility_idle(&self, pty_idle: bool, presence_enabled: bool) -> bool {
+        if self.state == State::Unknown || (self.source == Source::Presence && !presence_enabled) {
+            return pty_idle;
+        }
         if self.source.engine_reported() {
             !matches!(self.state, State::Working | State::Starting)
         } else {
@@ -326,7 +329,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             None,
         )
     };
-    let start = if source.engine_reported() {
+    let start = if source.engine_reported() && source != Source::Presence {
         input.latest_start
     } else {
         max_time(input.latest_start, input.legacy.input_at)
@@ -351,6 +354,14 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
     };
     let mut detail = Detail::default();
     let mut entered = observed_at;
+    // A cached presence file predates a submitted prompt even when we just
+    // reread it. Hold the delivery gap until the engine changes status, with a
+    // bounded escape if the prompt was dropped. Poll timestamps are not edges.
+    let presence_input_pending = presence.is_some_and(|p| {
+        p.valid
+            && p.status != PresenceStatus::Unknown
+            && start.is_some_and(|at| at > p.status_updated_at && now - at < 10.0)
+    });
     let state = if input.exited {
         entered = now;
         State::Exited
@@ -367,6 +378,9 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             .filter(|r| r.backend_connected)
             .map_or(observed_at, |r| r.observed_at + 90.0);
         State::Unknown
+    } else if presence_input_pending {
+        entered = start.unwrap_or(observed_at);
+        State::Working
     } else if source.engine_reported() {
         let pending = relay.and_then(|r| {
             r.pending_requests.iter().find(|p| {
@@ -388,9 +402,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         if pending.is_some()
             || flag.is_some()
             || hook_wait
-            || presence.is_some_and(|p| {
-                p.status == PresenceStatus::Waiting && !newer(start, Some(p.status_updated_at))
-            })
+            || presence.is_some_and(|p| p.status == PresenceStatus::Waiting)
         {
             detail.waiting_for = pending
                 .map(|p| format!("{:?}", p.kind))
@@ -1597,7 +1609,7 @@ mod tests {
             (State::Idle, 1001.0, Source::Pty)
         );
         assert!(
-            !idle.compatibility_idle(false),
+            !idle.compatibility_idle(false, true),
             "fallback keeps raw PTY compatibility"
         );
         let mut bg = relay(RelayStatus::Idle);
@@ -1605,7 +1617,7 @@ mod tests {
         let state = derive(&bg, 1000.0);
         assert_eq!(state.state, State::WorkingBackground);
         assert!(
-            state.compatibility_idle(false),
+            state.compatibility_idle(false, true),
             "legacy turn_end monitors may fire while background work continues"
         );
         let mut fresh = StateCell::new(990.0, None).inputs;
@@ -1615,6 +1627,61 @@ mod tests {
             State::WaitingOnHuman,
             "trust dialog engine report beats starting"
         );
+    }
+
+    #[test]
+    fn presence_pending_input_uses_status_edge_has_bound_and_preserves_waiting() {
+        for status in [
+            PresenceStatus::Idle,
+            PresenceStatus::Waiting,
+            PresenceStatus::Shell,
+            PresenceStatus::Busy,
+        ] {
+            let mut i = presence(status);
+            i.presence.as_mut().unwrap().main_turn_open = Some(false);
+            i.latest_start = Some(1000.0);
+            i.hooks.waiting_at = Some(980.0);
+            for now in [1000.0, 1001.0, 1002.0, 1009.9] {
+                // The tick observes the same status again; freshness is not
+                // evidence that the queued body/Enter started the next turn.
+                i.presence.as_mut().unwrap().observed_at = now;
+                let state = derive(&i, now);
+                assert_eq!(state.state, State::Working);
+                assert!(!state.compatibility_idle(true, true));
+                i.previous = Some(state);
+            }
+            let expected = match status {
+                PresenceStatus::Waiting => State::WaitingOnHuman,
+                PresenceStatus::Idle => State::Idle,
+                _ => State::WorkingBackground,
+            };
+            assert_eq!(derive(&i, 1010.0).state, expected, "pending is bounded");
+            i.presence.as_mut().unwrap().status = PresenceStatus::Idle;
+            i.presence.as_mut().unwrap().status_updated_at = 1002.0;
+            i.previous = None;
+            assert_eq!(
+                derive(&i, 1004.0).state,
+                State::Idle,
+                "new status closes delivery gap"
+            );
+        }
+    }
+
+    #[test]
+    fn presence_rollback_and_unknown_compatibility_follow_pty() {
+        let mut i = presence(PresenceStatus::Idle);
+        let idle = derive(&i, 1000.0);
+        assert!(idle.compatibility_idle(false, true));
+        assert!(!idle.compatibility_idle(false, false));
+        assert!(idle.compatibility_idle(true, false));
+        i.presence.as_mut().unwrap().valid = false;
+        let unknown = derive(&i, 1000.0);
+        assert_eq!(unknown.state, State::Unknown);
+        assert!(!unknown.compatibility_idle(false, true));
+        assert!(unknown.compatibility_idle(true, true));
+        let mut r = relay(RelayStatus::Idle);
+        r.relay.as_mut().unwrap().backend_connected = false;
+        assert!(!derive(&r, 1000.0).compatibility_idle(false, true));
     }
 
     #[test]

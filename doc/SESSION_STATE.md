@@ -87,8 +87,8 @@ by session UID and child start time; they must not transfer to a replacement chi
 ## Compatibility
 
 `pty_idle` always exposes raw PTY quietness. For engine-reported state, the legacy
-`idle` boolean is `state` outside `{working, starting}`; fallback retains the
-existing PTY boolean. `semantic_idle` remains available. Consequently `idle=true`
+`idle` boolean is `state` outside `{working, starting}`; `unknown` and fallback
+retain the existing PTY boolean. `semantic_idle` remains available. Consequently `idle=true`
 is a compatibility signal, not proof of true idle: new consumers must inspect
 `agent_state.state`, especially for waiting, error, background work and unknown.
 The board's holder-idle clock counts only `state=idle`.
@@ -171,7 +171,9 @@ The daemon checks `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, or
 the expected PID, and `procStart` matching a live process. A wrapper with no PID
 file may use one unambiguous interactive descendant. Dead processes, PID reuse,
 malformed files, unknown statuses and a lost previously observed source produce
-`unknown`. Claude versions with no presence file retain the existing fallback.
+`unknown`. A partial JSON write is tolerated for one tick, retaining the last
+valid observation; two consecutive parse failures yield unknown. Identity
+failures are immediate. Claude versions with no presence file retain the existing fallback.
 Optional fields and unknown metadata such as `tempo` do not override `status`.
 `statusUpdatedAt` is converted from milliseconds to wire-format Unix seconds.
 
@@ -187,3 +189,16 @@ Presence files are limited to 64 KiB; wrapper scans to 4,096 directory entries
 and 64 ancestry links. An incomplete or ambiguous scan returns unknown. Existing
 Claude sessions gain this source on the next brain restart; no session restart
 or MCP reconnect is needed.
+
+After input newer than `statusUpdatedAt`, an unchanged valid presence is
+treated as working for up to ten seconds while async prompt delivery settles.
+Repeated file observations do not end that guard. An unchanged waiting status
+returns to waiting-on-human after the guard, until the engine changes status.
+
+`presence_idle_enabled = true` is the default in daemon.toml. For a quick
+compatibility rollback, set it to false and call `daemon.reload_config` (or send
+SIGHUP to the brain). Presence sessions then return raw `pty_idle` as their
+legacy `idle` boolean; `agent_state` continues to report the engine state.
+The MCP workflow stuck check uses explicit `agent_state.state == "idle"` when
+available, so background work, waiting and unknown are never declared stuck on
+the strength of the compatibility boolean alone.

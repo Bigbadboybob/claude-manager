@@ -2447,7 +2447,12 @@ async def wait_for_workflow_stop(
                     state["binding_warning"] = "Active role has no unambiguous stable session binding"
             for session in sessions:
                 if active_uid and session.get("session_uid") == active_uid:
-                    active_idle = bool(session.get("idle", False))
+                    agent_state = session.get("agent_state")
+                    active_idle = (
+                        agent_state.get("state") == "idle"
+                        if isinstance(agent_state, dict)
+                        else bool(session.get("idle", False))
+                    )
                     break
 
         now = time.monotonic()

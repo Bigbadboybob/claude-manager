@@ -2455,7 +2455,7 @@ pub fn list_sessions(
         // resolve_authorized_session) agree.
         let (state_str, pty_idle) = compute_session_state_and_idle(session);
         let agent_state = crate::agent_state::current(session);
-        let idle = agent_state.compatibility_idle(pty_idle);
+        let idle = agent_state.compatibility_idle(pty_idle, state.config.presence_idle_enabled);
         // UX item 4a: the agent's own done signal, so a listing caller can
         // tell "delivered its final report" from "idle mid-workflow" without
         // reading the transcript and pattern-matching for a verdict line.
@@ -2753,7 +2753,7 @@ pub fn resolve_authorized_session(
     if let Some(session) = state.sessions.get(&p.session_uid) {
         let (state_str, pty_idle) = compute_session_state_and_idle(session);
         let agent_state = crate::agent_state::current(session);
-        let idle = agent_state.compatibility_idle(pty_idle);
+        let idle = agent_state.compatibility_idle(pty_idle, state.config.presence_idle_enabled);
         // Sub-2b-1 review-r#2 #2: surface the generation counter
         // so the Python `read_session_output` tool's cursor
         // (`v1:<generation>:<offset>`) resets when the underlying
@@ -19346,6 +19346,7 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                presence_idle_enabled: true,
                 mcp_server_path:
                     "/opt/cm-daemon/mcp_server/server.py".to_string(),
                 api_url: "http://10.150.0.2:8000".to_string(),
@@ -21007,6 +21008,11 @@ while True:
         {
             let mut s = state.lock().unwrap();
             s.sessions.get_mut(&uid).unwrap().session_type = "claude-code".to_string();
+            s.sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
+                valid: true, status: crate::agent_state::PresenceStatus::Idle,
+                observed_at: now_unix_f64(), status_updated_at: now_unix_f64() - 60.0,
+                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None,
+            });
         }
         let params = json!({ "session_uid": &uid, "text": "implement the fix" });
         let result = send_input(&state, &params, None).expect("send_input ok");
@@ -21015,6 +21021,16 @@ while True:
             result["delivery"], "agent-kitty-async",
             "agent sessions submit via the async kitty-Enter path, not a bare newline",
         );
+        // Simulate the next presence tick seeing the same old idle file during
+        // async body/Enter delivery. Both MCP read paths must stay non-idle.
+        state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap()
+            .inputs.presence.as_mut().unwrap().observed_at = now_unix_f64();
+        let resolved = resolve_authorized_session(&state, &json!({"session_uid": uid}), None).unwrap();
+        assert_eq!(resolved["agent_state"]["state"], "working");
+        assert_eq!(resolved["idle"], false);
+        let rows = list_sessions(&state, &json!({}), None).unwrap();
+        let row = rows.as_array().unwrap().iter().find(|row| row["session_uid"] == uid).unwrap();
+        assert_eq!(row["idle"], false);
         kill_all_sessions(&state);
     }
 
@@ -21759,6 +21775,7 @@ while True:
             std::fs::write(
                 &cfg_path,
                 "mcp_server_path = \"/new/server.py\"\n\
+                 presence_idle_enabled = false\n\
                  api_url = \"http://example:8000\"\n\
                  [auth]\nmode = \"token\"\n",
             )
@@ -21779,6 +21796,7 @@ while True:
                 .collect();
             assert!(changed.contains(&"mcp_server_path"), "{:?}", changed);
             assert!(changed.contains(&"api_url"), "{:?}", changed);
+            assert!(changed.contains(&"presence_idle_enabled"), "{:?}", changed);
             let restart: Vec<&str> = out["requires_restart"]
                 .as_array()
                 .unwrap()
@@ -21792,6 +21810,7 @@ while True:
             let st = state.lock().unwrap();
             assert_eq!(st.config.mcp_server_path, "/new/server.py");
             assert_eq!(st.config.api_url, "http://example:8000");
+            assert!(!st.config.presence_idle_enabled);
             assert_eq!(
                 st.config.auth.mode,
                 crate::config::AuthMode::SshTrust,
@@ -33198,6 +33217,43 @@ while True:
         state.lock().unwrap().restarting = true;
         assert_eq!(session_agent_report(&state, &params, Some(uid)).unwrap_err().0, ErrorCode::Conflict);
         state.lock().unwrap().restarting = false;
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn presence_compatibility_rollback_and_unknown_reach_both_read_surfaces() {
+        let state = make_state_arc();
+        let uid = "ts-presence-rollback";
+        insert_session(&state, uid, "ws-state");
+        {
+            let st = state.lock().unwrap();
+            let session = &st.sessions[uid];
+            *session.last_activity_at.lock().unwrap() = Some(std::time::Instant::now());
+            session.agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
+                valid: true, status: crate::agent_state::PresenceStatus::Idle,
+                observed_at: now_unix_f64(), status_updated_at: now_unix_f64() - 60.0,
+                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None,
+            });
+        }
+        let reads = |expected_state: &str, expected_idle: bool| {
+            let resolved = resolve_authorized_session(&state, &json!({"session_uid": uid}), None).unwrap();
+            let rows = list_sessions(&state, &json!({}), None).unwrap();
+            let row = rows.as_array().unwrap().iter().find(|row| row["session_uid"] == uid).unwrap();
+            for result in [&resolved, row] {
+                assert_eq!(result["agent_state"]["state"], expected_state);
+                assert_eq!(result["idle"], expected_idle);
+                assert_eq!(result["pty_idle"], false);
+            }
+        };
+        reads("idle", true);
+        state.lock().unwrap().config.presence_idle_enabled = false;
+        reads("idle", false);
+        {
+            let mut st = state.lock().unwrap();
+            st.config.presence_idle_enabled = true;
+            st.sessions[uid].agent_state.lock().unwrap().inputs.presence.as_mut().unwrap().valid = false;
+        }
+        reads("unknown", false);
         kill_all_sessions(&state);
     }
 

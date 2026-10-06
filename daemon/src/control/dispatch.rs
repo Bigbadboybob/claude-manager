@@ -9636,6 +9636,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                presence_idle_enabled: true,
                 mcp_server_path: String::new(),
                 api_url: cfg_url.clone(),
                 api_token: "cfg-tok-threaded".into(),
@@ -9695,6 +9696,7 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+            presence_idle_enabled: true,
             mcp_server_path: String::new(),
             api_url: format!("http://127.0.0.1:{}", port),
             api_token: "bt-test-token".into(),
