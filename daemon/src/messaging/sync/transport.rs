@@ -371,6 +371,27 @@ fn has_feature(frame: &Value, feature: &str) -> bool {
         .is_some_and(|f| f.iter().any(|v| v == feature))
 }
 
+impl Subscription {
+    fn resolve(&mut self, store: &Store, host: &str) -> Result<()> {
+        let resolved = store.host_transport_interests(host, &self.interests)?;
+        self.set_resolved(resolved);
+        Ok(())
+    }
+
+    fn set_resolved(&mut self, resolved: BTreeSet<String>) {
+        // Paths, ids and temporary views can name the same conversations.
+        // Rewinding for selector churn starves history catch-up (and every
+        // coordinated call waiting on its barrier) on a busy replica.
+        if resolved != self.resolved {
+            self.resolved = resolved;
+            self.revision += 1;
+            self.cursor = 0;
+            self.dependency_offset = 0;
+            self.sent = None;
+        }
+    }
+}
+
 pub(super) fn serve(runtime: Arc<Runtime>) -> Result<()> {
     let socket = runtime.root.join("messaging-sync.sock");
     if socket.exists() {
@@ -658,14 +679,10 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                 "interests" => {
                     let interests: BTreeSet<String> =
                         serde_json::from_value(frame["interests"].clone())?;
+                    let slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
                     let mut sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
-                    if interests != sub.interests {
-                        sub.interests = interests;
-                        sub.revision += 1;
-                        sub.cursor = 0;
-                        sub.dependency_offset = 0;
-                        sub.sent = None;
-                    }
+                    sub.interests = interests;
+                    sub.resolve(slot.as_ref().unwrap(), &host)?;
                     runtime.signal.signal();
                 }
                 "upload" => {
@@ -713,12 +730,6 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                                 serde_json::from_value(frame["params"]["interests"].clone())?;
                             let mut sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
                             sub.interests.extend(requested);
-                            if !sub.scoped {
-                                sub.revision += 1;
-                                sub.cursor = 0;
-                                sub.dependency_offset = 0;
-                                sub.sent = None;
-                            }
                             Ok(json!({"caught_up":true}))
                         } else {
                             store.coordinate(&host, actor, method, &frame["params"])
@@ -731,11 +742,20 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                         // Scoped: start any backfill this call implies (a join,
                         // a barrier's new interest) before replying, so the
                         // reply can tell the replica what history is coming.
+                        // Legacy: resolve under the same store lock as the
+                        // mutation, so a new membership invalidates old
+                        // coverage before the replica's barrier can release
+                        // the reply; unchanged conversations never rewind.
                         let mut sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
-                        let backfills = if sub.scoped && result.is_ok() {
-                            let started = sub.reconcile(store, &host)?;
-                            Some((sub.backfill_states(), started))
+                        let backfills = if sub.scoped {
+                            if result.is_ok() {
+                                let started = sub.reconcile(store, &host)?;
+                                Some((sub.backfill_states(), started))
+                            } else {
+                                None
+                            }
                         } else {
+                            sub.resolve(store, &host)?;
                             None
                         };
                         (result, store.publication_position(), sub.revision, backfills)
@@ -921,15 +941,11 @@ fn push_loop(
             (resolved, high, page, live)
         };
         let mut sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
-        if sub.revision != revision {
+        if sub.revision != revision || sub.interests != interests {
             continue;
         }
         if resolved != sub.resolved {
-            sub.resolved = resolved;
-            sub.revision += 1;
-            sub.cursor = 0;
-            sub.dependency_offset = 0;
-            sub.sent = None;
+            sub.set_resolved(resolved);
             drop(sub);
             continue;
         }

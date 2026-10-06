@@ -7,6 +7,15 @@ from mcp_server import server, control_client
 
 
 class MessagingToolsTests(unittest.TestCase):
+    def test_chat_deadline_allows_daemon_timeout_to_reach_caller(self):
+        error = control_client.ControlError("outcome_unknown", "retry the same request ID")
+        with patch.object(control_client, "call", side_effect=error) as call:
+            with self.assertRaises(control_client.ControlError) as raised:
+                server.chat_send("Ready.", "same-request", channel="general")
+            self.assertIs(raised.exception, error)
+            self.assertGreater(call.call_args.kwargs["timeout"], 30.0)
+            self.assertEqual(call.call_args.args[1]["request_id"], "same-request")
+
     def test_rename_uses_authenticated_identity_and_preserves_retry_and_revision(self):
         with patch.object(control_client, "call", return_value={"name": "health-triage-orchestrator"}) as call:
             params = dict(name="health-triage-orchestrator", expected_name_revision=4,
