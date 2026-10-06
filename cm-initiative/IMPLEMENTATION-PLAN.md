@@ -194,7 +194,7 @@ reviews, merges to main and deploys (hub first).
 | W0c-state contract | state-core | reviewed PASS | bc76c50 | doc only |
 | W0d orchestration docs | msgfix | reviewed PASS | f1009f9 | policies + skill on cm-manager + cm-sessions 19:38Z |
 | W1a items API | items | reviewed PASS (+fixes 9f1aa85) | 9f1aa85 | API live on cm-manager 19:17Z; `GET /boards` 200 |
-| W1b agent_state core | state-core | review: 2 blockers being fixed | | |
+| W1b agent_state core | state-core | reviewed PASS (+fixes) | 8223700 | scheduled after EP 23:00Z freeze (23:17Z) |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
 | W2f messaging read side + slim responses | msgfix | reviewed PASS | 084fff2, f9a13ee | cm-manager + cm-sessions 20:03Z (Owner priority) |
 | W3e Owner availability state + CLI | msgfix | reviewed PASS | 43e30ef | cm-manager + cm-sessions 20:52Z; ~/.cm/bin/cm-availability on both |
