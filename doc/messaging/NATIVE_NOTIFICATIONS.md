@@ -83,7 +83,7 @@ work.
 Chat wake text and worker-completion notices instruct agents to inspect pending
 activity before responding, continue the existing task, and report only meaningful
 changes, blockers or Owner decisions. They must not repeat a completed summary.
-Chat messages are read together with `chat_read(inbox=True, unread_only=True)`;
+Chat messages are read together with `chat_read(inbox=True, unread_only=True, view="slim")`;
 worker completion results retain their existing separate interface. This change
 does not batch independent worker-monitor envelopes or add a new MCP tool.
 
@@ -91,7 +91,7 @@ does not batch independent worker-monitor envelopes or add a new MCP tool.
 
 On eligible Claude Code installations, CM can use the native MCP
 `notifications/claude/channel` extension. The client renders a compact
-`← claude-manager: [cm-chat …] New CM chat activity; read your pending inbox.`
+`← claude-manager: [cm-chat …] 2 new: #channel — sender: "first line…"` summary
 event instead of the peer socket's **“Another Claude session sent a message”**
 wrapper. This is a native meta event, with `origin.kind=channel` and
 `promptSource=system`; it does not edit or submit the user's composer. Claude's
@@ -144,6 +144,70 @@ retried via the peer socket or terminal; inspect the retained receipt instead.
 References: [Claude channels](https://code.claude.com/docs/en/channels),
 [channel wire reference](https://code.claude.com/docs/en/channels-reference).
 Verified against Claude Code 2.1.271; this remains a preview protocol.
+
+## Consumer handoff, delivery health and the stall alarm
+
+**Incident (2026-10-06).** Claude forked a running conversation into a new
+process (`claude bg-pty-host … --session-id <new> --fork-session --resume <old>`;
+the old transcript gained a `continued-in` record). The new client started its
+own CM MCP server, but the old client's server kept `consumer.lock` and kept
+writing channel events to a client that only logged `queue-operation enqueue`.
+66 notices stayed `submitted` for seven hours while `notification_status`
+reported connected/ready. The forked client was also launched **without**
+`--dangerously-load-development-channels server:claude-manager`, so even the
+new server's channel events were silently dropped.
+
+**Handoff.** A consumer waiting for `consumer.lock` files
+`takeover-<pid>.request` in the queue directory only while its own Claude
+session id (`CLAUDE_CODE_SESSION_ID`, else the parent's `--session-id`) is the
+daemon-bound transcript. The holder releases the lock only when it also has
+positive staleness evidence of its own: the bound transcript is not its
+session, its own transcript has a `continued-in` record, or three of its
+unobserved submissions were only enqueued (no later dequeue/remove). A holder
+keeps the lock at least 30 seconds after acquiring it, and a consumer that
+just handed off stands aside while its successor's request is fresh, so two
+live processes cannot alternate. The handed-off process stays a passive
+waiter and files no request (its session is not the bound one). An in-pane
+resume in the same process changes the bound transcript but starts no second
+MCP server, so there is no successor and no handoff.
+
+**Health.** `notification_status().health` is `ready`, `disconnected` or
+`degraded` with `reasons`: `unobserved_submissions` (submissions newer than
+the latest observation, unobserved for 5 minutes;
+`CM_NOTIFY_UNOBSERVED_DEGRADED_S`), `transcript_mismatch` (with stalled work
+or other evidence; alone it is informational), and `channels_disabled`.
+`transport.connected` is false while degraded. A later observation ends the
+condition; older lost submissions remain as history.
+
+**Channels disabled.** A channel consumer inspects its parent Claude
+process's command line (directly, or through CM's launcher shell). If the
+client lacks the `server:claude-manager` development-channel flag, the
+consumer keeps notices `pending` (still retractable, never ambiguously
+submitted) and reports `degraded: channels_disabled`. Unknown parentage is not
+evidence. A Claude bg/fork hand-off loses the channel flag; recover with CM
+**A-R** (restart/resume in place), which relaunches with the flag and the same
+UID and conversation. Reconnecting MCP does not change the client's flags.
+
+**Owner alarm.** The daemon delivery worker checks live Claude/Codex sessions
+every 30 seconds from the queue files themselves, so it works when the MCP
+process is the broken part. When a session's submissions stay unobserved (or,
+under `channels_disabled`, its notices stay pending) for 15 minutes
+(`CM_NOTIFY_STALL_ALERT_SECS` in the brain's environment), it raises one
+[Owner alert](../OWNER_NOTIFICATIONS.md) per episode naming the session, the
+count, the duration and the reason. Episode state is kept in
+`~/.cm/notifications/stall-alarms.state`. Acknowledging the alert does not
+re-raise it in the same episode; the next observation clears the episode and
+withdraws the alarm's own alert. It never replaces a pending agent alert for
+that session; it retries after Owner acknowledges that one.
+
+**Wake text.** Chat wakes now summarize the newest unread item (≤400 chars):
+`[cm-chat <id>] 3 new: #gpu-utilization — rl-scale-out: "rlso: A5 readmit
+FAILED…" (+2 more). Read with chat_read(inbox=True, unread_only=True,
+view="slim"), follow next_cursor, and ack the receipt.` plus at most one watch
+ID. The Claude channel adapter passes this text through unchanged (legacy long
+text is still reduced to the marker plus watch IDs). Batching and latch
+semantics are unchanged. `chat_read(view="slim")` is an MCP-side projection;
+the daemon adds `conversation_path` to read items for it.
 
 ## Store and delivery contract
 

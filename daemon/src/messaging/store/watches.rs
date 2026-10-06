@@ -580,6 +580,20 @@ impl Store {
             .filter(|m| m.state != "dismissed")
             .map(|m| self.monitor_summary(actor, m))
             .collect();
-        json!({"active":summaries.iter().filter(|m|m["state"] == "active").count(),"unacknowledged":summaries.iter().filter_map(|m|m["unacknowledged"].as_u64()).sum::<u64>(),"badges":summaries.iter().filter(|m|m["notify"] != "none").filter_map(|m|m["unacknowledged"].as_u64()).sum::<u64>()})
+        // Expiry is silent by design (no wake); surface recent expiries on
+        // every messaging response so an agent can re-arm a lapsed watch.
+        let horizon = Utc::now() - chrono::Duration::hours(24);
+        let mut expired: Vec<_> = state
+            .monitors
+            .values()
+            .filter(|m| m.state == "expired")
+            .filter_map(|m| {
+                let at = parse_time(m.expires_at.as_deref()?).ok()?;
+                (at >= horizon).then(|| (at, json!({"id":m.id,"scope":m.scope,"mode":m.mode,"expired_at":m.expires_at})))
+            })
+            .collect();
+        expired.sort_by(|a, b| b.0.cmp(&a.0));
+        let recently_expired: Vec<_> = expired.into_iter().take(5).map(|(_, v)| v).collect();
+        json!({"recently_expired":recently_expired,"active":summaries.iter().filter(|m|m["state"] == "active").count(),"unacknowledged":summaries.iter().filter_map(|m|m["unacknowledged"].as_u64()).sum::<u64>(),"badges":summaries.iter().filter(|m|m["notify"] != "none").filter_map(|m|m["unacknowledged"].as_u64()).sum::<u64>()})
     }
 }
