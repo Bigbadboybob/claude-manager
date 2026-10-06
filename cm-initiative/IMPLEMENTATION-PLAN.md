@@ -188,14 +188,14 @@ reviews, merges to main and deploys (hub first).
 
 | Slice | Lane | Status | Merged | Deployed |
 |---|---|---|---|---|
-| W0a Codex empty last turn | msgfix | reviewed PASS | 8ff296e | batched with wave 0 (MCP payload) |
-| W0b viewer input vs idle | state-core | reviewed PASS | c2fdd91 | batched with wave 0 |
+| W0a Codex empty last turn | msgfix | reviewed PASS | 8ff296e | cm-manager + cm-sessions 19:37Z |
+| W0b viewer input vs idle | state-core | reviewed PASS | c2fdd91 | cm-manager + cm-sessions 19:37Z |
 | W0c-items contract | items | reviewed PASS | 92a5a28 | doc only |
 | W0c-state contract | state-core | reviewed PASS | bc76c50 | doc only |
-| W0d orchestration docs | msgfix | reviewed PASS | f1009f9 | skill installed on cm-sessions; policy docs pending |
+| W0d orchestration docs | msgfix | reviewed PASS | f1009f9 | policies + skill on cm-manager + cm-sessions 19:38Z |
 | W1a items API | items | reviewed PASS (+fixes 9f1aa85) | 9f1aa85 | API live on cm-manager 19:17Z; `GET /boards` 200 |
 | W1b agent_state core | state-core | review: 2 blockers being fixed | | |
-| W1c messaging send side | msgfix | in progress | | |
+| W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
 
 Note: both Claude lanes' launch prompts were silently dropped at start_session (status file idle since spawn, no transcript, monitor timed out ~35 min later); redelivered with send_input 18:47Z. Follow-up: start_session should confirm the turn started (state-core, after W2d).
 
@@ -205,3 +205,7 @@ before answering RPCs, so cm-sessions lost hub sync 19:06–19:12Z (messages que
 locally and flushed; none lost). cm-sessions deploy held until after EP's 23:00Z freeze,
 with advance notice in #cm-general. Follow-up: make hub brain start non-blocking for
 messaging (lazy/background store load).
+
+19:35–19:37Z: Owner-prioritized deploy of a11adcc (wave 0 + W1c) to cm-manager, then
+cm-sessions, with advance notice. Hub came back in ~20 s this time (store warm in page
+cache); cm-sessions in ~90 s. Laptop daemon still on the old build (next TUI release).
