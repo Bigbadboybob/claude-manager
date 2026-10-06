@@ -197,7 +197,7 @@ reviews, merges to main and deploys (hub first).
 | W1b agent_state core | state-core | reviewed PASS (+fixes) | 8223700 | scheduled after EP 23:00Z freeze (23:17Z) |
 | W2a items daemon proxy + MCP tools | items | reviewed PASS (follow-ups in W2b) | 5e24d12 | with W1b at 23:17Z |
 | W2b heartbeat + push delivery | items | in progress | | |
-| W2d Claude status-file reader | state-core | in progress | | |
+| W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | with W1b at 23:17Z |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
 | W2f messaging read side + slim responses | msgfix | reviewed PASS | 084fff2, f9a13ee | cm-manager + cm-sessions 20:03Z (Owner priority) |
 | W3e Owner availability state + CLI | msgfix | reviewed PASS | 43e30ef | cm-manager + cm-sessions 20:52Z; ~/.cm/bin/cm-availability on both |
