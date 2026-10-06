@@ -21178,10 +21178,11 @@ while True:
         let state = state_with_workspace("ws-rso-2", &dir);
         let uid = spawn_bash(&state, "ws-rso-2");
 
-        // First marker.
+        // Split each marker in the command so PTY echo cannot satisfy the
+        // wait before bash has actually emitted that marker's output.
         let _ = send_input(
             &state,
-            &json!({ "session_uid": &uid, "text": "echo CURSOR-A" }),
+            &json!({ "session_uid": &uid, "text": "printf 'CURSOR-%s\\n' A" }),
             None,
         )
         .unwrap();
@@ -21191,7 +21192,7 @@ while True:
         // Second marker, then snapshot since the first cursor.
         let _ = send_input(
             &state,
-            &json!({ "session_uid": &uid, "text": "echo CURSOR-B-marker" }),
+            &json!({ "session_uid": &uid, "text": "printf 'CURSOR-%s\\n' B-marker" }),
             None,
         )
         .unwrap();
