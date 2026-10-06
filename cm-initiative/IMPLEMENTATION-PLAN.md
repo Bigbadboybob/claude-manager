@@ -191,8 +191,8 @@ reviews, merges to main and deploys (hub first).
 | W0a Codex empty last turn | msgfix | in progress | | |
 | W0b viewer input vs idle | state-core | reviewed PASS | c2fdd91 | batched with wave 0 |
 | W0c-items contract | items | in progress | | |
-| W0c-state contract | state-core | in progress | | |
+| W0c-state contract | state-core | reviewed PASS | bc76c50 | doc only |
 | W0d orchestration docs | msgfix | queued | | |
 | W1a items API | items | queued | | |
-| W1b agent_state core | state-core | queued | | |
+| W1b agent_state core | state-core | in progress | | |
 | W1c messaging send side | msgfix | queued | | |
