@@ -189,9 +189,9 @@ reviews, merges to main and deploys (hub first).
 | Slice | Lane | Status | Merged | Deployed |
 |---|---|---|---|---|
 | W0a Codex empty last turn | msgfix | in progress | | |
-| W0b viewer input vs idle | state-core | in progress | | |
+| W0b viewer input vs idle | state-core | reviewed PASS | c2fdd91 | batched with wave 0 |
 | W0c-items contract | items | in progress | | |
-| W0c-state contract | state-core | queued | | |
+| W0c-state contract | state-core | in progress | | |
 | W0d orchestration docs | msgfix | queued | | |
 | W1a items API | items | queued | | |
 | W1b agent_state core | state-core | queued | | |
