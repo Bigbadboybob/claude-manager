@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::unix::{
@@ -107,6 +107,11 @@ fn mkdir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 fn write_file(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
+    write_file_synced(path, bytes, replace, true)
+}
+/// `sync_dir=false` leaves the parent directory fsync to the caller, which
+/// must perform it before anything depends on the new name being durable.
+fn write_file_synced(path: &Path, bytes: &[u8], replace: bool, sync_dir: bool) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("missing parent"))?;
@@ -126,7 +131,10 @@ fn write_file(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
             fs::hard_link(&temp, path)?;
             fs::remove_file(&temp)?;
         }
-        File::open(parent)?.sync_all()
+        if sync_dir {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     })();
     let _ = fs::remove_file(temp);
     result
@@ -247,8 +255,17 @@ pub struct Store {
     pub degraded: Option<String>,
     replication: replication::Replication,
     task_bindings: BTreeMap<String, TaskBinding>,
+    /// Background deletion of superseded legacy coverage journal files.
+    /// Declared before `_lock`: dropping the store stops it before the
+    /// writer lock is released.
+    compactor: Option<replication::Compactor>,
     _lock: File,
     events: Vec<Published>,
+    /// Event ID -> index into `events` (append-only, so indices are stable).
+    event_index: HashMap<String, usize>,
+    /// Replica ingest page in progress: journal records wait here until the
+    /// page's event files and directories are durable (see `ingest_replica_page`).
+    ingest_batch: Option<replication::IngestBatch>,
     channels: BTreeMap<String, String>,
     memberships: BTreeMap<String, BTreeSet<String>>,
     membership_revisions: BTreeMap<String, String>,
@@ -331,6 +348,9 @@ impl Store {
             )?,
             _lock: lock,
             events: Vec::new(),
+            event_index: HashMap::new(),
+            ingest_batch: None,
+            compactor: None,
             channels: BTreeMap::new(),
             memberships: BTreeMap::new(),
             membership_revisions: BTreeMap::new(),
@@ -508,13 +528,20 @@ impl Store {
         Ok(dir.join("_events").join(format!("{origin}--{event}.json")))
     }
     fn rebuild(&mut self) -> Result<()> {
+        let index = self.load_journal_index();
         let mut paths = fs::read_dir(self.journal_dir())?
             .map(|x| x.map(|e| e.path()))
             .collect::<io::Result<Vec<_>>>()?;
         paths.sort();
-        let mut seen = BTreeSet::new();
+        let mut scan = replication::JournalScan::default();
         for path in paths {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            // Coverage records folded into the checkpoint by an earlier
+            // compaction are skipped by name, without reading them.
+            if let Some(pos) = index.as_ref().and_then(|index| index.superseded(&path)) {
+                scan.superseded.push(pos);
                 continue;
             }
             let j = load(&path)?;
@@ -536,8 +563,10 @@ impl Store {
             if j["kind"] != "publish" {
                 self.apply_replication_journal(&j)?;
                 self.position = pos;
+                scan.observe(pos, &j);
                 continue;
             }
+            scan.observe(pos, &j);
             let rel = required(&j["data"], "event_path")?;
             if Path::new(&rel).is_absolute()
                 || Path::new(&rel)
@@ -553,7 +582,7 @@ impl Store {
             let event: Value = serde_json::from_slice(&bytes)?;
             if event["id"] != j["event_id"]
                 || event["space_id"] != self.space_id
-                || !seen.insert(required(&event, "id")?)
+                || self.event_index.contains_key(&required(&event, "id")?)
             {
                 return Err(err("invalid_record", "Duplicate event or wrong space"));
             }
@@ -594,13 +623,25 @@ impl Store {
             self.position = pos;
             self.apply_replication_journal(&j)?;
             self.reduce(&event)?;
-            self.events.push(Published {
+            self.push_published(Published {
                 event,
                 position: pos,
                 received_at: required(&j["data"], "received_at")?,
             });
         }
-        Ok(())
+        self.finish_journal_scan(index, scan)
+    }
+    fn push_published(&mut self, published: Published) {
+        self.event_index
+            .insert(strv(&published.event, "id").to_owned(), self.events.len());
+        self.events.push(published);
+    }
+    /// O(1) lookup of a retained publication by event ID.
+    fn published(&self, id: &str) -> Option<&Published> {
+        self.event_index.get(id).map(|&i| &self.events[i])
+    }
+    fn has_event(&self, id: &str) -> bool {
+        self.event_index.contains_key(id)
     }
     fn reduce(&mut self, e: &Value) -> Result<()> {
         if let Some(items) = e["data"]["channels"].as_array() {
@@ -689,13 +730,15 @@ impl Store {
             &self.root.join("NORMS.md"),
             strv(&self.norms, "text").as_bytes(),
         )?;
-        for (path, id) in &self.channels {
+        // One history pass for every channel (`channel_info` per channel
+        // replayed the whole history once per channel on every ingest).
+        for ((path, id), channel) in self.channels.iter().zip(self.channels_at(self.position)) {
             if let Some(doc) = self.channel_norms.get(&format!("channel:{id}")) {
                 project_file(&self.root.join("channels").join(path).join("NORMS.md"), strv(doc,"text").as_bytes())?;
             }
             project_json(
                 &self.root.join("channels").join(path).join("CHANNEL.json"),
-                &self.channel_info(path, id),
+                &self.with_membership(id, channel),
             )?;
         }
         for (id, members) in &self.conversations {
@@ -723,7 +766,7 @@ impl Store {
             .map(|s| serde_json::from_str::<Value>(s))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for event in missing {
-            if !self.events.iter().any(|p| p.event["id"] == event["id"]) {
+            if !self.has_event(strv(&event, "id")) {
                 self.commit(event)?;
             }
         }
@@ -784,7 +827,15 @@ impl Store {
         }
         // Expiry and message publication share this writer lock. A closed
         // watch retains the arrival fence captured before a later publication.
-        self.advance_monitors_at(Utc::now())?;
+        // (A replica ingest page advances once when it begins and once after
+        // its records are durable.)
+        let batched = self.ingest_batch.is_some();
+        if !self.ingest_batch.as_ref().is_some_and(|b| b.advanced) {
+            self.advance_monitors_at(Utc::now())?;
+            if let Some(batch) = self.ingest_batch.as_mut() {
+                batch.advanced = true;
+            }
+        }
         let path = self.event_path(&event)?;
         if bytes.len() > 65536 {
             return Err(err("event_too_large", "Serialized event exceeds 64 KiB"));
@@ -802,13 +853,21 @@ impl Store {
         let receipt = receipt.or_else(|| self.is_coordinator().then(|| json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"event_id":event["id"],"event_sha256":hash(&bytes)})));
         let j = json!({"protocol":1,"replica_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"recorded_at":received,"kind":"publish","event_id":event["id"],"event_sha256":hash(&bytes),"data":{"source":source,"received_at":received,"logical_clock":self.clock,"event_path":path.strip_prefix(&self.root).unwrap().to_string_lossy(),"hub_receipt":receipt}});
         // No reader sees the body until the durable publication record exists.
+        // Within an ingest page the journal record is queued: the page flush
+        // makes every body and its directory durable before any record, and
+        // the store lock is held until then, so the ordering is unchanged.
+        let journal_path = self.journal_dir().join(format!("{pos:020}.json"));
         let result = (|| -> io::Result<()> {
-            write_file(&path, &bytes, false)?;
-            write_file(
-                &self.journal_dir().join(format!("{pos:020}.json")),
-                &serde_json::to_vec_pretty(&j)?,
-                false,
-            )
+            let record = serde_json::to_vec_pretty(&j)?;
+            if let Some(batch) = self.ingest_batch.as_mut() {
+                write_file_synced(&path, &bytes, false, false)?;
+                batch.dirs.insert(path.parent().unwrap().to_path_buf());
+                batch.journal.push((journal_path, record));
+                Ok(())
+            } else {
+                write_file(&path, &bytes, false)?;
+                write_file(&journal_path, &record, false)
+            }
         })();
         if let Err(e) = result {
             self.degraded = Some(format!("Publication outcome requires reconciliation: {e}"));
@@ -820,11 +879,14 @@ impl Store {
             self.degraded = Some(e.to_string());
             return Err(e);
         }
-        self.events.push(Published {
+        self.push_published(Published {
             event: event.clone(),
             position: pos,
             received_at: received,
         });
+        if batched {
+            return Ok(event);
+        }
         // A durable message stays successful if a derived checkpoint fails;
         // restart replays from the prior saved monitor scan position.
         if let Err(e) = self.advance_monitors_at(Utc::now()) {
