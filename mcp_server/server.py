@@ -1517,6 +1517,53 @@ def list_sessions_grouped(
     return {"you": you, "total": len(sessions), "workspaces": workspaces}
 
 
+async def _await_launch_confirmation(
+    session_uid: str, receipt: dict, *, socket_path,
+    timeout_s: float = 120.0, interval: float = 0.5,
+) -> dict:
+    """Poll the receipt on the exact daemon that spawned this process.
+
+    A missing/replaced receipt (including brain adoption) is not confirmation.
+    The daemon owns the one guarded retry; the MCP layer never re-pastes.
+    """
+    receipt = dict(receipt)
+    receipt_id = receipt.get("id")
+    deadline = time.monotonic() + timeout_s
+
+    def failed(reason: str) -> dict:
+        return {**receipt, "status": "unconfirmed", "submitted": False,
+                "confirmed_by": None, "reason": reason}
+
+    if not receipt_id:
+        return failed("invalid_confirmation_receipt")
+    while True:
+        if receipt.get("status") == "confirmed" and receipt.get("submitted") is True:
+            return receipt
+        if receipt.get("status") == "unconfirmed":
+            return {**receipt, "submitted": False}
+        if receipt.get("status") != "pending":
+            return failed("invalid_confirmation_receipt")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return failed("confirmation_timeout")
+        try:
+            resolved = await asyncio.to_thread(
+                control_client.call, "resolve_authorized_session",
+                {"session_uid": session_uid}, socket_path=socket_path,
+                timeout=min(5.0, remaining),
+            )
+        except (control_client.ControlError, control_client.TransportError):
+            return failed("confirmation_unavailable")
+        if not isinstance(resolved, dict) or resolved.get("state") == "exited":
+            return failed("session_gone")
+        current = resolved.get("prompt_delivery")
+        if not isinstance(current, dict) or current.get("id") != receipt_id:
+            return failed("confirmation_lost_or_session_replaced")
+        receipt = dict(current)
+        if receipt.get("status") == "pending":
+            await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+
 @mcp.tool()
 async def start_session(
     type: str,
@@ -1542,9 +1589,10 @@ async def start_session(
     spawns, waits for the initial `prompt`'s reply, and returns the
     worker's final message inline, so you don't have to hand-write the
     spawn → `wait_for_session_idle` → `read_last_turn` sequence (and its
-    post-send race). Leave `wait=false` (default) for fire-and-forget
-    spawns you'll drive yourself. `isolated=true` additionally gives the
-    worker its own git worktree in one call — the analogue of
+    post-send race). With either `wait` value, an initial agent prompt
+    first waits for submission confirmation (up to 120 seconds). `wait=false`
+    returns after that confirmation, without waiting for the worker's reply.
+    `isolated=true` additionally gives the worker its own git worktree — the analogue of
     `Agent(isolation="worktree")`.
 
     Args:
@@ -1558,9 +1606,9 @@ async def start_session(
             returns after it goes quiet with `last_message=null`.
         label: Sidebar label for the new session.
         prompt: Optional initial prompt to deliver once the session is
-            ready (queued via the same PendingWrite drainer the workflow
-            activation flow uses). For a bash session this is just a
-            command line. Required in practice when `wait=true` — there's
+            ready. CM confirms a new engine turn or an exact transcript
+            receipt, with one guarded Enter retry if needed. For a bash session
+            this is just a command line. Required in practice when `wait=true` — there's
             nothing to wait for otherwise.
             **Omit it to launch a planning task as written**: when
             `prompt` is empty/absent AND you named a task EXPLICITLY
@@ -1664,6 +1712,12 @@ async def start_session(
           - `prompt_source` — "caller" (your `prompt`), "task" (the
             bound task's stored prompt, auto-delivered because you
             passed none), or "none" (spawned promptless).
+          - `submitted` / `prompt_delivery` — on updated daemons, initial
+            agent prompts report whether submission was confirmed, its source,
+            attempt count and failure reason. False means unconfirmed; the
+            session is retained for inspection. No reply wait or auto-monitor
+            starts on failure. Older daemons omit these fields. `prompt_source`
+            describes the selected text and does not prove it was submitted.
           - `shared_workspace` / `warning` / `workspace_shared_with` —
             present ONLY when `allow_shared_workspace=true` actually put
             the worker in your own checkout. `workspace_shared_with` is
@@ -1764,6 +1818,16 @@ async def start_session(
         control_client.call, method, params, socket_path=route.path
     )
 
+    # Do this before arming a monitor: an unsubmitted worker must not leave
+    # a watch which later mistakes a startup redraw for completion.
+    launch_receipt = spawn.get("prompt_delivery") if isinstance(spawn, dict) else None
+    if isinstance(launch_receipt, dict) and spawn.get("session_uid"):
+        launch_receipt = await _await_launch_confirmation(
+            spawn["session_uid"], launch_receipt, socket_path=route.path,
+        )
+        spawn["prompt_delivery"] = launch_receipt
+        spawn["submitted"] = launch_receipt["submitted"]
+
     # ux-5c: the server tells us which prompt (if any) the child was
     # actually handed — "caller" (the `prompt` arg), "task" (the task's
     # own stored prompt, auto-delivered because we passed none while
@@ -1808,6 +1872,8 @@ async def start_session(
                 "worktree_path",
                 "task_id",
                 "prompt_source",
+                "submitted",
+                "prompt_delivery",
                 "shared_workspace",
                 "warning",
                 "workspace_shared_with",
@@ -1817,6 +1883,11 @@ async def start_session(
                 if spawn.get(key) is not None and d.get(key) is None:
                     d[key] = spawn[key]
         return d
+
+    if isinstance(launch_receipt, dict) and not launch_receipt["submitted"]:
+        if wait:
+            spawn.update(completed=False, timed_out=False, last_message=None)
+        return _with_isolation(spawn)
 
     if not wait:
         spawn_uid = spawn.get("session_uid") if isinstance(spawn, dict) else None
@@ -1838,6 +1909,10 @@ async def start_session(
                         else f"worker '{label}' finished its initial prompt"
                     ),
                     source="auto",
+                    # This is a fresh session's first prompt. It may already
+                    # have finished while confirmation was in flight, so use
+                    # a level watch (also catches an early report_done).
+                    edge=not isinstance(launch_receipt, dict),
                 )
             except async_monitor.RegistrationError as e:
                 spawn["monitor"] = {"error": e.code, "message": str(e)}

@@ -129,6 +129,33 @@ class _MonitorEnv(unittest.TestCase):
 
 
 class RegisterAndFireTests(_MonitorEnv):
+    def test_launch_finished_before_confirmation_still_fires(self):
+        from mcp_server.server import start_session
+
+        def call(method, params=None, **kw):
+            if method == "mcp_start_session":
+                return {"session_uid": self.WORKER, "prompt_source": "caller",
+                        "prompt_delivery": {"id": "launch", "status": "pending", "submitted": False}}
+            result = self._fake_call(method, params, **kw)
+            if method == "resolve_authorized_session":
+                result["prompt_delivery"] = {"id": "launch", "status": "confirmed", "submitted": True}
+            return result
+
+        async def scenario():
+            result = await start_session("claude-code", "fast worker", prompt="go")
+            rec = async_monitor._MONITORS[result["monitor"]["monitor_id"]]
+            await asyncio.wait_for(rec["task"], 5)
+            return rec
+
+        with mock.patch.object(control_client, "call", side_effect=call), mock.patch.object(
+            control_client, "resolve_socket_route",
+            return_value=control_client.SocketRoute(path=None, chose_daemon=True),
+        ):
+            rec = asyncio.run(scenario())
+        self.assertEqual(rec["state"], "delivered")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("WORKER DONE: 42", self.sent[0]["text"])
+
     def test_fire_delivers_marker_and_reply_to_caller(self):
         async def scenario():
             # edge=False: the scaffold's worker is ALREADY finished, and

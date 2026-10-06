@@ -960,6 +960,8 @@ pub struct DaemonSession {
     pub uid: String,
     pub title: String,
     pub agent_state: crate::agent_state::AgentStateCell,
+    /// Initial MCP launch prompt receipt; absence after adoption is unknown.
+    pub prompt_delivery: Option<crate::control::prompt_delivery::Ticket>,
     /// Holder-minted process identity when this session is
     /// holder-owned (split mode) — the key every holder verb and the
     /// phase-7 `rollback_record` stream use. `None` in monolith mode.
@@ -1955,6 +1957,7 @@ impl PendingSession {
 
         Ok(DaemonSession {
             agent_state: crate::agent_state::StateCell::for_process(pid),
+            prompt_delivery: None,
             holder_incarnation: None,
             uid,
             title,
@@ -2499,6 +2502,7 @@ impl AdoptedSessionBuild {
 
         Ok(DaemonSession {
             agent_state: crate::agent_state::StateCell::for_process(pid),
+            prompt_delivery: None,
             holder_incarnation: None,
             title: meta.title,
             // Phase 4b (R11): the full v2 record lands verbatim — no
@@ -2799,7 +2803,8 @@ impl InputHandle {
         Ok(())
     }
 
-    /// A recovery Enter must not submit a draft typed since the agent paste.
+    /// A recovery Enter (or initial launch paste) must not touch a draft
+    /// typed since automation began.
     /// Check under the same writer lock used to stamp human input, closing
     /// the race between checking operator activity and writing the retry.
     pub(crate) fn write_recovery_enter(&self, bytes: &[u8], since: Instant) -> std::io::Result<bool> {

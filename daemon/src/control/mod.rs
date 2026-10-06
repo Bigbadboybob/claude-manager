@@ -19,6 +19,7 @@
 
 pub mod auth;
 mod codex_delivery;
+pub mod prompt_delivery;
 pub mod continuous_drain;
 pub mod dispatch;
 pub mod methods;

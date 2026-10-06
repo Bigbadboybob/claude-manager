@@ -93,6 +93,38 @@ is a compatibility signal, not proof of true idle: new consumers must inspect
 `agent_state.state`, especially for waiting, error, background work and unknown.
 The board's holder-idle clock counts only `state=idle`.
 
+## Initial prompt confirmation
+
+For an initial Claude or Codex prompt, `mcp_start_session` returns a per-launch
+`prompt_delivery` receipt and `submitted` boolean. The same receipt is available
+through `resolve_authorized_session`:
+
+```text
+{id: UUID, status: pending | confirmed | unconfirmed, submitted: bool,
+ attempts: 0 | 1 | 2, confirmed_by: relay | hooks | presence | transcript | null,
+ reason: string | null}
+```
+
+The MCP `start_session` tool polls this receipt on the original daemon, with a
+120-second cap, for both `wait` values. Only a fresh engine turn edge or a new
+exact prompt record confirms submission. CM's own `turn_seq` increment and PTY
+repaint alone do not. Delivery allows one alternate-encoding Enter retry after
+ten seconds, with a 25-second confirmation window and a 90-second total delivery
+guard. It never re-pastes the body. Operator input, process replacement/exit,
+restart pause, unrelated transcript activity or unreadable evidence cancels
+recovery. The first transcript binding is allowed; later rotations are not.
+
+`submitted=false` means confirmation failed, not proof the engine received
+nothing. The session and worktree remain available for inspection; the tool
+skips its reply wait and auto-monitor. Successful launches arm a completion
+watch that also catches a first turn or done report that finished during the
+confirmation wait. Receipts are ephemeral: a daemon restart loses a pending
+receipt and the caller reports unconfirmed. Old daemons omit these fields and
+retain their previous behavior. `prompt_source` identifies the selected text,
+not proof of its submission. Promptless and bash launches keep their existing
+behavior. Deployment needs the daemon brain and complete MCP payload; callers
+reconnect MCP to load the tool's confirmation wait.
+
 ## Producer RPC (S1)
 
 `session.agent_report` accepts a Session caller only for its own `session_uid`;
