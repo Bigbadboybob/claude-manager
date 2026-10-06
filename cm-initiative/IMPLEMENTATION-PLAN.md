@@ -171,3 +171,28 @@ Milestone A.
   change is announced.
 - Body `@Name` promotion could wake people quoted in prose: restricted to
   conversation members and exact names, skips code spans, always reported back.
+
+## 7. Progress
+
+Lanes (subtasks of 3b58ab69, worktrees cut from origin/main `c09b239`):
+
+| Lane | Session | Task | Branch worktree |
+|---|---|---|---|
+| state-core (Codex) | ts-18dc037d730aafd8-d | d103ad60 | cm-sub-swarm-focused-design-cm-state-core-4802fe0 |
+| items (Claude) | ts-18dc037e5a39099d-e | a1830143 | cm-sub-swarm-focused-design-cm-items-7fbf738 |
+| msgfix (Claude) | ts-18dc037f83e30601-f | 09c2c2d0 | cm-sub-swarm-focused-design-cm-messaging-fixes-b46b0aa |
+
+Shared lane rules: `~/.local/share/swarm-coord/LANE-PREAMBLE.md`. Lanes hand off
+each slice in `#initiative/swarm-focused-design/claude-manager`; Swarm-Coord
+reviews, merges to main and deploys (hub first).
+
+| Slice | Lane | Status | Merged | Deployed |
+|---|---|---|---|---|
+| W0a Codex empty last turn | msgfix | in progress | | |
+| W0b viewer input vs idle | state-core | in progress | | |
+| W0c-items contract | items | in progress | | |
+| W0c-state contract | state-core | queued | | |
+| W0d orchestration docs | msgfix | queued | | |
+| W1a items API | items | queued | | |
+| W1b agent_state core | state-core | queued | | |
+| W1c messaging send side | msgfix | queued | | |
