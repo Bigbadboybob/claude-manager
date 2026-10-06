@@ -43,6 +43,8 @@ pub(crate) struct Ctx {
     pub owner: bool,
     pub global: bool,
     pub engine: Option<String>,
+    /// Owned by this daemon's registry (spawnable-from), not a TUI-only row.
+    pub daemon_owned: bool,
     pub daemon_id: String,
     /// Every known participant: `{id, name, session_uid, aliases?, released?, present}`.
     pub people: Vec<Value>,
@@ -66,10 +68,10 @@ impl Ctx {
                     let uid = c.session_uid.clone();
                     if let Some(sess) = s.sessions.get(&uid) {
                         Some((uid, sess.title.clone(), sess.task_id.clone(), sess.global_perms,
-                              Some(sess.session_type.clone())))
+                              Some(sess.session_type.clone()), true))
                     } else if let Some(t) = s.tui_sessions.get(&uid) {
                         Some((uid.clone(), t.label.clone().unwrap_or(uid), t.task_id.clone(),
-                              t.global_perms, t.session_type.clone()))
+                              t.global_perms, t.session_type.clone(), false))
                     } else {
                         return Err((
                             ErrorCode::Unauthorized,
@@ -127,11 +129,12 @@ impl Ctx {
                 owner: true,
                 global: true,
                 engine: None,
+                daemon_owned: false,
                 daemon_id,
                 people,
                 api,
             },
-            Some((uid, title, task_id, global, engine)) => Ctx {
+            Some((uid, title, task_id, global, engine, daemon_owned)) => Ctx {
                 pid: format!("agent:{daemon_id}:{uid}"),
                 name: my_name.unwrap_or(title),
                 uid: Some(uid),
@@ -139,6 +142,7 @@ impl Ctx {
                 owner: false,
                 global,
                 engine,
+                daemon_owned,
                 daemon_id,
                 people,
                 api,
@@ -368,6 +372,9 @@ fn holder_label(h: &Value) -> Value {
 
 fn write_reply(board_slug: &str, reply: &Value, items_key: &str) -> Value {
     let mut out = json!({"board": board_slug});
+    if reply["replayed"] == true {
+        out["replayed"] = json!(true);
+    }
     if let Some(items) = reply[items_key].as_array() {
         out["items"] = json!(items.iter().map(compact).collect::<Vec<_>>());
     }
@@ -404,7 +411,11 @@ fn item_create(ctx: &Ctx, params: &Value) -> RpcResult {
             Value::Object(spec)
         })
         .collect();
-    let reply = ctx.api.post(&format!("/boards/{slug}/items"), &json!({"actor": ctx.actor(), "items": specs}))?;
+    let mut body = json!({"actor": ctx.actor(), "items": specs});
+    if let Some(request_id) = params.get("request_id").and_then(Value::as_str).filter(|r| !r.trim().is_empty()) {
+        body["request_id"] = json!(request_id.trim());
+    }
+    let reply = ctx.api.post(&format!("/boards/{slug}/items"), &body)?;
     Ok(write_reply(&slug, &reply, "items"))
 }
 
@@ -466,50 +477,24 @@ fn item_resolve(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> R
     }
     let mut launched = Value::Null;
     if action == "launch" {
-        let Some(uid) = ctx.uid.as_deref() else {
-            return Err(bad("launch needs a session caller; Owner launches from the TUI"));
-        };
-        let engine = match params.get("engine").and_then(Value::as_str) {
-            Some(e) if !e.trim().is_empty() => normalize_engine(e)?,
-            _ => match ctx.engine.as_deref() {
-                Some("codex") => "codex",
-                Some("claude-code") | Some("claude") => "claude-code",
-                _ => return Err(bad("pass engine=codex or engine=claude (the caller is not an agent session)")),
-            },
-        };
-        let read = ctx.api.get(&format!("/boards/{slug}"), &[])?;
-        let item = read["items"]
-            .as_array()
-            .and_then(|items| items.iter().find(|i| i["n"] == n))
-            .ok_or_else(|| (ErrorCode::NotFound, format!("no open item #{n} on board {slug}")))?;
-        let title = item["title"].as_str().unwrap_or_default();
-        let mut prompt = format!("item #{n} ({slug}): {title}");
-        if let Some(message) = params.get("message").and_then(Value::as_str).filter(|m| !m.trim().is_empty()) {
-            prompt.push_str("\n\n");
-            prompt.push_str(message);
-        }
-        prompt.push_str(&format!(
-            "\n\nYou hold this item. Keep it current with item_set({n}, ..., board=\"{slug}\"), \
-             mark it waiting with an eta for long jobs, and close it with item_set({n}, \"done\", board=\"{slug}\")."
-        ));
-        // Without task_id the worker joins the caller's task and checkout, as
-        // start_session does; a task_id gives it that task's own worktree.
-        let mut spawn_params = json!({"type": engine, "label": format!("item-{n}"), "prompt": prompt});
-        if let Some(task_id) = params.get("task_id").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
-            spawn_params["task_id"] = json!(task_id.trim());
-        }
-        let spawn = crate::control::methods::mcp_start_session(state, &spawn_params, Some(uid))?;
-        let new_uid = spawn["uid"]
-            .as_str()
-            .or_else(|| spawn["session_uid"].as_str())
-            .ok_or_else(|| (ErrorCode::Internal, format!("launch: spawn returned no uid: {spawn}")))?
-            .to_string();
-        let pid = format!("agent:{}:{new_uid}", ctx.daemon_id);
+        launched = launch(state, ctx, params, &slug, n)?;
         body["action"] = json!("reassign");
-        body["holders"] = json!([holder_value(&pid, Some(&format!("item-{n}")))]);
-        launched = json!({"uid": new_uid, "engine": engine, "pid": pid});
+        body["holders"] = json!([holder_value(launched["pid"].as_str().unwrap_or_default(), Some(&format!("item-{n}")))]);
     }
-    let reply = ctx.api.post(&format!("/boards/{slug}/items/{n}/resolve"), &body)?;
+    let reply = ctx.api.post(&format!("/boards/{slug}/items/{n}/resolve"), &body).map_err(|(code, message)| {
+        if launched.is_null() {
+            (code, message)
+        } else {
+            // The worker exists; say so, and let a retry with the same
+            // request_id reassign instead of spawning again.
+            (code, format!(
+                "{message} — the launched session {} is running but is not yet the holder; retry \
+                 with the same request_id, or item_resolve({n}, \"reassign\", holder=\"{}\")",
+                launched["uid"].as_str().unwrap_or("?"),
+                launched["uid"].as_str().unwrap_or("?"),
+            ))
+        }
+    })?;
     let mut out = json!({
         "board": slug,
         "item": compact(&reply["item"]),
@@ -522,6 +507,92 @@ fn item_resolve(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> R
         out["warnings"] = reply["warnings"].clone();
     }
     Ok(out)
+}
+
+/// Sessions spawned by `launch`, keyed by (caller pid, request_id), so a
+/// retried launch whose final reassign failed reassigns instead of spawning
+/// a second worker. In memory: a brain restart forgets it, and the error
+/// message names the uid for a manual reassign.
+fn launches() -> &'static Mutex<std::collections::VecDeque<((String, String), Value)>> {
+    static LAUNCHES: std::sync::OnceLock<Mutex<std::collections::VecDeque<((String, String), Value)>>> =
+        std::sync::OnceLock::new();
+    LAUNCHES.get_or_init(Mutex::default)
+}
+const MAX_REMEMBERED_LAUNCHES: usize = 256;
+
+fn launch(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value, slug: &str, n: i64) -> RpcResult {
+    let Some(uid) = ctx.uid.as_deref() else {
+        return Err(bad("launch needs a session caller; Owner launches from the TUI"));
+    };
+    if !ctx.daemon_owned {
+        return Err(bad(
+            "launch spawns from a daemon-owned session, and this one is TUI-owned: start the \
+             worker with start_session, then item_resolve(n, \"reassign\", holder=<its uid>)",
+        ));
+    }
+    let request_id = params.get("request_id").and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty());
+    let key = request_id.map(|r| (ctx.pid.clone(), r.to_string()));
+    if let Some(key) = &key {
+        let remembered = launches().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, prior)) = remembered.iter().find(|(k, _)| k == key) {
+            let mut prior = prior.clone();
+            prior["replayed"] = json!(true);
+            return Ok(prior);
+        }
+    }
+    let engine = match params.get("engine").and_then(Value::as_str) {
+        Some(e) if !e.trim().is_empty() => normalize_engine(e)?,
+        _ => match ctx.engine.as_deref() {
+            Some("codex") => "codex",
+            Some("claude-code") | Some("claude") => "claude-code",
+            _ => return Err(bad("pass engine=codex or engine=claude (the caller is not an agent session)")),
+        },
+    };
+    let read = ctx.api.get(&format!("/boards/{slug}"), &[])?;
+    let item = read["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["n"] == n))
+        .ok_or_else(|| (ErrorCode::NotFound, format!("no open item #{n} on board {slug}")))?;
+    let title = item["title"].as_str().unwrap_or_default();
+    let mut prompt = format!("item #{n} ({slug}): {title}");
+    if let Some(message) = params.get("message").and_then(Value::as_str).filter(|m| !m.trim().is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(message);
+    }
+    prompt.push_str(&format!(
+        "\n\nYou hold this item. Keep it current with item_set({n}, ..., board=\"{slug}\"), \
+         mark it waiting with an eta for long jobs, and close it with item_set({n}, \"done\", board=\"{slug}\")."
+    ));
+    // Without task_id the worker joins the caller's task and checkout, as
+    // start_session does; a task_id gives it that task's own worktree.
+    let mut spawn_params = json!({"type": engine, "label": format!("item-{n}"), "prompt": prompt});
+    if let Some(task_id) = params.get("task_id").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+        spawn_params["task_id"] = json!(task_id.trim());
+    }
+    let spawn = crate::control::methods::mcp_start_session(state, &spawn_params, Some(uid))?;
+    let new_uid = spawn["uid"]
+        .as_str()
+        .or_else(|| spawn["session_uid"].as_str())
+        .ok_or_else(|| (ErrorCode::Internal, format!("launch: spawn returned no uid: {spawn}")))?
+        .to_string();
+    let mut launched = json!({
+        "uid": new_uid,
+        "engine": engine,
+        "pid": format!("agent:{}:{new_uid}", ctx.daemon_id),
+    });
+    for key in ["worktree_path", "task_id", "shared_workspace", "workspace_shared_with", "warning", "worktree_warning", "worktree_recreated"] {
+        if let Some(v) = spawn.get(key).filter(|v| !v.is_null()) {
+            launched[key] = v.clone();
+        }
+    }
+    if let Some(key) = key {
+        let mut remembered = launches().lock().unwrap_or_else(|p| p.into_inner());
+        remembered.push_back((key, launched.clone()));
+        while remembered.len() > MAX_REMEMBERED_LAUNCHES {
+            remembered.pop_front();
+        }
+    }
+    Ok(launched)
 }
 
 // ---- board() --------------------------------------------------------------
@@ -735,6 +806,7 @@ mod tests {
             owner: false,
             global: false,
             engine: Some("codex".into()),
+            daemon_owned: true,
             daemon_id: "d1".into(),
             people,
             api: Api::from_config("http://127.0.0.1:9", "tok").unwrap(),
@@ -905,7 +977,7 @@ mod tests {
             state.tui_sessions.insert(
                 uid.into(),
                 serde_json::from_value(json!({"uid":uid,"label":uid.trim_end_matches("-uid"),
-                                              "task_id":task,"session_type":"codex"}))
+                                              "task_id":task,"type":"codex"}))
                 .unwrap(),
             );
         }
@@ -1030,6 +1102,33 @@ mod tests {
         let bare = Arc::new(Mutex::new(bare));
         let resp = call(&bare, "me-uid", "board.read", json!({}));
         assert!(resp.error.unwrap().message.starts_with("daemon_id_unavailable"));
+    }
+
+    #[test]
+    fn tui_owned_callers_get_a_clear_launch_error() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|_, _, _| (200, BOARD.into()));
+        let state = state_with_session(root.path(), &url);
+        let resp = call(&state, "me-uid", "item.resolve", json!({"n":1,"action":"launch"}));
+        let err = resp.error.unwrap();
+        assert!(matches!(err.code, ErrorCode::InvalidParams));
+        assert!(err.message.contains("TUI-owned"), "{}", err.message);
+        assert!(!seen.lock().unwrap().iter().any(|(_, p, _)| p.ends_with("/resolve") && p != "/boards/resolve"));
+    }
+
+    #[test]
+    fn create_passes_the_request_id_and_reports_replays() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|_, path, _| match path {
+            "/boards/resolve" => (200, BOARD.into()),
+            _ => (200, r#"{"items":[{"n":1,"title":"a","status":"active","holders":[]}],"replayed":true}"#.into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let resp = call(&state, "me-uid", "item.create", json!({"title":"a","request_id":"rq-9"}));
+        assert_eq!(resp.result.unwrap()["replayed"], true);
+        assert_eq!(seen.lock().unwrap()[1].2["request_id"], "rq-9");
     }
 
     #[test]

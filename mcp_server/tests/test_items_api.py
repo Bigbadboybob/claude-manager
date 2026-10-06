@@ -52,7 +52,10 @@ class MigrationText(unittest.TestCase):
         self.assertNotRegex(body, r"CREATE (UNIQUE )?INDEX (?!IF NOT EXISTS)")
 
     def test_migration_number_is_unique(self):
-        self.assertEqual(len(list((ROOT / "sql").glob("017_*.sql"))), 1)
+        for n in ("017", "018"):
+            self.assertEqual(len(list((ROOT / "sql").glob(f"{n}_*.sql"))), 1)
+        text = (ROOT / "sql" / "018_item_requests.sql").read_text()
+        self.assertIn("CREATE TABLE IF NOT EXISTS item_requests", text)
 
 
 @unittest.skipUnless(DSN, "set CM_ITEMS_TEST_DSN to a scratch Postgres database")
@@ -179,6 +182,27 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         rows = await self.fetch("SELECT next_number FROM boards")
         self.assertEqual(rows[0]["next_number"], 9)
 
+    async def test_create_with_request_id_replays_instead_of_duplicating(self):
+        body = {"actor": ORCH, "items": [{"title": "a"}, {"title": "b"}], "request_id": "rq-1"}
+        first = await self.post(f"/boards/{self.ref}/items", body)
+        await self.patch(1, note="edited since")
+        again = await self.post(f"/boards/{self.ref}/items", body)
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertTrue(again.json()["replayed"])
+        self.assertEqual([i["n"] for i in again.json()["items"]], [1, 2])
+        self.assertEqual(again.json()["items"][0]["note"], "edited since")
+        self.assertNotIn("replayed", first.json())
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM items")), 2)
+        other = await self.post(f"/boards/{self.ref}/items", {**body, "request_id": "rq-2"})
+        self.assertEqual([i["n"] for i in other.json()["items"]], [3, 4])
+
+    async def test_concurrent_retries_with_one_request_id_create_once(self):
+        body = {"actor": ORCH, "items": [{"title": "a"}], "request_id": "rq-c"}
+        replies = await asyncio.gather(*(self.post(f"/boards/{self.ref}/items", body)
+                                         for _ in range(4)))
+        self.assertEqual({r.json()["items"][0]["n"] for r in replies}, {1})
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM items")), 1)
+
     async def test_failed_batch_writes_nothing(self):
         r = await self.create("ok", {"title": "bad", "blocked_by": [42]}, ok=False)
         self.assertEqual(r.status_code, 422)
@@ -292,6 +316,69 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         ]
         for r in await asyncio.gather(*cases):
             self.assertEqual(r.status_code, 422, r.text)
+
+    # ---- heartbeat -------------------------------------------------------
+    async def beat(self, sessions, daemon="d1", **kw):
+        r = await self.post(f"/hosts/{daemon}/heartbeat", {"host_label": "sessions",
+                                                           "sessions": sessions, **kw})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def row(self, name, state="idle", daemon="d1", **kw):
+        return {"pid": f"agent:{daemon}:{name}-uid", "session_uid": f"{name}-uid",
+                "task_id": self.root, "name": name, "engine": "codex", "state": state,
+                "state_age_s": 600, **kw}
+
+    async def test_heartbeat_upserts_states_with_server_clock(self):
+        await self.beat([self.row("lane", idle_for_s=600, age_s=3600,
+                                  agent_state={"state": "idle"})])
+        row = (await self.fetch("SELECT * FROM session_states"))[0]
+        now = datetime.now(timezone.utc)
+        self.assertEqual((row["state"], row["host_label"], str(row["task_id"])),
+                         ("idle", "sessions", self.root))
+        self.assertAlmostEqual((now - row["state_since"]).total_seconds(), 600, delta=5)
+        self.assertAlmostEqual((now - row["started_at"]).total_seconds(), 3600, delta=5)
+        self.assertIsNone(row["exited_at"])
+        self.assertEqual(row["agent_state"], {"state": "idle"})
+        await self.beat([self.row("lane", state="working", state_age_s=5)])
+        row = (await self.fetch("SELECT state, started_at FROM session_states"))[0]
+        self.assertEqual(row["state"], "working")
+        self.assertIsNotNone(row["started_at"])  # kept when a beat omits age_s
+
+    async def test_missing_from_snapshot_is_exited_and_revival_clears_it(self):
+        await self.beat([self.row("lane"), self.row("orch")])
+        await self.beat([self.row("orch")])
+        rows = {r["pid"]: r for r in await self.fetch("SELECT * FROM session_states")}
+        self.assertIsNotNone(rows["agent:d1:lane-uid"]["exited_at"])
+        self.assertEqual(rows["agent:d1:lane-uid"]["state"], "exited")
+        self.assertIsNone(rows["agent:d1:orch-uid"]["exited_at"])
+        await self.beat([self.row("orch"), self.row("lane")])
+        row = (await self.fetch("SELECT exited_at FROM session_states WHERE pid = 'agent:d1:lane-uid'"))[0]
+        self.assertIsNone(row["exited_at"])
+
+    async def test_other_daemons_rows_untouched_and_foreign_pids_refused(self):
+        await self.beat([self.row("x", daemon="d2")], daemon="d2")
+        await self.beat([])
+        row = (await self.fetch("SELECT exited_at FROM session_states"))[0]
+        self.assertIsNone(row["exited_at"])
+        r = await self.post("/hosts/d1/heartbeat", {"sessions": [self.row("y", daemon="d2")]})
+        self.assertEqual(r.status_code, 422)
+
+    async def test_pushes_are_returned_until_acked(self):
+        await self.create({"title": "a", "holders": [LANE]})
+        await self.beat([])
+        reply = await self.beat([], daemon="d1")
+        pushes = reply["pushes"]
+        self.assertEqual([(p["kind"], p["session_uid"], p["board"]) for p in pushes],
+                         [("assigned", "lane-uid", self.ref)])
+        self.assertTrue(pushes[0]["text"].startswith(f"[cm-board {self.ref}]"))
+        again = await self.beat([])
+        self.assertEqual([p["id"] for p in again["pushes"]], [pushes[0]["id"]])
+        # Another daemon cannot ack it.
+        await self.beat([], daemon="d2", acked_push_ids=[pushes[0]["id"]])
+        self.assertEqual(len((await self.beat([]))["pushes"]), 1)
+        done = await self.beat([], acked_push_ids=[pushes[0]["id"]])
+        self.assertEqual(done["pushes"], [])
 
     # ---- reads ----------------------------------------------------------
     async def test_read_version_holder_state_and_closed_strip(self):

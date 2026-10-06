@@ -301,9 +301,37 @@ def _write_reply(tx: BoardTx, ns) -> dict:
     }
 
 
-async def create_items(pool, ref: str, actor: dict, specs: list[dict]) -> dict:
-    tx, ns = await _write(pool, ref, actor, (), lambda tx: tx.create(specs))
-    return _write_reply(tx, ns)
+async def create_items(pool, ref: str, actor: dict, specs: list[dict], *,
+                       request_id: str | None = None) -> dict:
+    """Create items; a repeated `request_id` on the same board replays the
+    first attempt's reply (current state of the items it made)."""
+    if not request_id:
+        tx, ns = await _write(pool, ref, actor, (), lambda tx: tx.create(specs))
+        return _write_reply(tx, ns)
+    now = utcnow()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            board = await _board_by_ref(conn, ref, lock=True)
+            prior = await conn.fetchval(
+                "SELECT numbers FROM item_requests WHERE board_id = $1 AND request_id = $2",
+                uuid.UUID(board["id"]), request_id,
+            )
+            if prior is not None:
+                items = await _load_items(conn, board["id"], list(prior))
+                tx = BoardTx(board, items, actor, now)
+                reply = _write_reply(tx, [n for n in prior if n in items])
+                reply["replayed"] = True
+                return reply
+            items = await _load_items(conn, board["id"])
+            tx = BoardTx(board, items, actor, now)
+            ns = tx.create(specs)
+            await _apply(conn, tx)
+            await conn.execute(
+                """INSERT INTO item_requests (board_id, request_id, actor_pid, numbers, created_at)
+                   VALUES ($1, $2, $3, $4, $5)""",
+                uuid.UUID(board["id"]), request_id, actor["pid"], ns, now,
+            )
+            return _write_reply(tx, ns)
 
 
 async def update_items(pool, ref: str, actor: dict, ns: list[int], fields: dict, *,
@@ -600,3 +628,90 @@ async def held_items(pool, holder_pid: str, *, open_only: bool = True) -> list[d
         )
     return [{"board": r["slug"], "n": r["number"], "title": r["title"],
              "status": r["status"]} for r in rows]
+
+
+# ---- host heartbeat and push pickup (doc §3, §5) ---------------------------
+
+MAX_PUSHES_PER_BEAT = 100
+
+
+def _uuid_or_none(value):
+    try:
+        return uuid.UUID(str(value)) if value else None
+    except ValueError:
+        return None
+
+
+async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: list[dict],
+                    exited: list[str], acked_push_ids: list[int]) -> dict:
+    """Record one daemon's full session snapshot, ack delivered pushes, and
+    return the pushes still pending for it.
+
+    The snapshot is complete for that daemon: a pid of this daemon that is
+    missing from it is marked exited. Holder states take no board lock: they
+    write no item events or flags (the flag engine does, under the lock).
+    """
+    prefix = f"agent:{daemon_id}:"
+    for s in sessions:
+        if not s["pid"].startswith(prefix):
+            raise ItemsError(422, "invalid_field",
+                             f"pid {s['pid']} does not belong to daemon {daemon_id}", field="pid")
+    now = utcnow()
+
+    def ago(seconds):
+        return None if seconds is None else now - timedelta(seconds=float(seconds))
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for s in sessions:
+                gone = s["state"] == "exited"
+                await conn.execute(
+                    """INSERT INTO session_states (pid, daemon_id, session_uid, host_label, task_id,
+                                                   name, engine, state, state_since, idle_since,
+                                                   reported_done, killed_by, agent_state,
+                                                   started_at, exited_at, reported_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                               CASE WHEN $15 THEN $16::timestamptz END, $16)
+                       ON CONFLICT (pid) DO UPDATE SET
+                           daemon_id = EXCLUDED.daemon_id, session_uid = EXCLUDED.session_uid,
+                           host_label = EXCLUDED.host_label, task_id = EXCLUDED.task_id,
+                           name = EXCLUDED.name, engine = EXCLUDED.engine, state = EXCLUDED.state,
+                           state_since = EXCLUDED.state_since, idle_since = EXCLUDED.idle_since,
+                           reported_done = EXCLUDED.reported_done, killed_by = EXCLUDED.killed_by,
+                           agent_state = EXCLUDED.agent_state,
+                           started_at = COALESCE(EXCLUDED.started_at, session_states.started_at),
+                           exited_at = CASE WHEN $15
+                                            THEN COALESCE(session_states.exited_at, $16::timestamptz)
+                                       END,
+                           reported_at = EXCLUDED.reported_at""",
+                    s["pid"], daemon_id, s["session_uid"], host_label,
+                    _uuid_or_none(s.get("task_id")), s.get("name"), s.get("engine"), s["state"],
+                    ago(s.get("state_age_s")), ago(s.get("idle_for_s")),
+                    bool(s.get("reported_done")), s.get("killed_by"), s.get("agent_state"),
+                    ago(s.get("age_s")), gone, now,
+                )
+            live = [s["pid"] for s in sessions if s["state"] != "exited"]
+            await conn.execute(
+                """UPDATE session_states SET exited_at = $3, state = 'exited', reported_at = $3
+                    WHERE daemon_id = $1 AND exited_at IS NULL
+                      AND (NOT (pid = ANY($2::text[])) OR pid = ANY($4::text[]))""",
+                daemon_id, live, now, list(exited),
+            )
+            if acked_push_ids:
+                await conn.execute(
+                    """UPDATE item_pushes SET delivered_at = $3
+                        WHERE daemon_id = $1 AND id = ANY($2::bigint[]) AND delivered_at IS NULL""",
+                    daemon_id, list(acked_push_ids), now,
+                )
+        rows = await conn.fetch(
+            """SELECT p.id, p.session_uid, p.pid, p.kind, p.text, p.owner_alert,
+                      p.board_id, b.slug AS board
+                 FROM item_pushes p LEFT JOIN boards b ON b.id = p.board_id
+                WHERE p.daemon_id = $1 AND p.delivered_at IS NULL
+                ORDER BY p.id LIMIT $2""",
+            daemon_id, MAX_PUSHES_PER_BEAT,
+        )
+    return {
+        "pushes": [_str_ids(dict(r)) for r in rows],
+        "server_time": iso(now),
+    }

@@ -6,4 +6,10 @@
 //! checks editing rights, stamps the `actor`, and forwards.
 
 pub mod api;
+pub mod heartbeat;
 pub mod rpc;
+
+/// Start the items background work (the holder-state heartbeat).
+pub fn start(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>) {
+    heartbeat::start(state);
+}

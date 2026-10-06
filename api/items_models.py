@@ -74,6 +74,7 @@ class BoardPatchBody(_Strict):
 class ItemsCreateBody(_Strict):
     actor: Actor
     items: list[ItemSpec] = Field(min_length=1, max_length=50)
+    request_id: Short | None = None
 
 
 class ItemsPatchBody(_Strict):
@@ -95,3 +96,26 @@ class ItemResolveBody(_Strict):
     check_back: When | None = None
     reason: Reason | None = None
     message: str | None = Field(default=None, max_length=1000)
+
+
+class HeartbeatSession(_Strict):
+    pid: Short
+    session_uid: Short
+    task_id: Short | None = None
+    name: Short | None = None
+    engine: str | None = Field(default=None, max_length=40)
+    state: str = Field(min_length=1, max_length=40)
+    # Relative durations: the API's clock decides, so host skew never matters.
+    state_age_s: float | None = Field(default=None, ge=0, le=10**9)
+    idle_for_s: float | None = Field(default=None, ge=0, le=10**9)
+    age_s: float | None = Field(default=None, ge=0, le=10**9)
+    reported_done: bool = False
+    killed_by: Short | None = None
+    agent_state: dict | None = None
+
+
+class HeartbeatBody(_Strict):
+    host_label: Short | None = None
+    sessions: list[HeartbeatSession] = Field(default_factory=list, max_length=2000)
+    exited: list[Short] = Field(default_factory=list, max_length=2000)
+    acked_push_ids: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list, max_length=1000)

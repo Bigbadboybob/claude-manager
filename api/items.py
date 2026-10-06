@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from api.auth import verify_token
 from api.items_models import (
     BoardPatchBody,
+    HeartbeatBody,
     BoardResolveBody,
     ItemResolveBody,
     ItemsCreateBody,
@@ -70,7 +71,7 @@ async def patch_board(ref: str, body: BoardPatchBody, request: Request):
 async def create_items(ref: str, body: ItemsCreateBody, request: Request):
     specs = [spec.model_dump(exclude_unset=True) for spec in body.items]
     return await _call(items_db.create_items(
-        _pool(request), ref, body.actor.model_dump(), specs))
+        _pool(request), ref, body.actor.model_dump(), specs, request_id=body.request_id))
 
 
 @router.patch("/boards/{ref}/items")
@@ -97,3 +98,12 @@ async def resolve_item(ref: str, body: ItemResolveBody, request: Request,
 async def held_items(request: Request, holder_pid: str = Query(..., min_length=1, max_length=200),
                      open: bool = Query(True)):
     return await _call(items_db.held_items(_pool(request), holder_pid, open_only=open))
+
+
+@router.post("/hosts/{daemon_id}/heartbeat")
+async def heartbeat(body: HeartbeatBody, request: Request,
+                    daemon_id: str = Path(min_length=1, max_length=200)):
+    return await _call(items_db.heartbeat(
+        _pool(request), daemon_id, host_label=body.host_label,
+        sessions=[s.model_dump() for s in body.sessions], exited=body.exited,
+        acked_push_ids=body.acked_push_ids))

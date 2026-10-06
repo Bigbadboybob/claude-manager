@@ -52,7 +52,9 @@ All writes for one board run in one transaction holding the board row
 (`SELECT … FOR UPDATE`). Every change appends an `item_events` row
 `{id, item n, actor, type, prev, new, reason, at}`; that table is the history
 and `board.version = max(item_events.id)` for the board. Flag raise/resolve
-also writes an event, so the version covers flags.
+also writes an event, so the version covers flags. Holder states are not
+events: a `since_version` reader that shows live holder state should still
+re-read fully every ~30 s.
 
 1. **Defaults and shorthands.** No holder given → the caller. `holder="none"`
    (`holders: []` or `null`) on an `active` item sets `open` unless a status is
@@ -193,11 +195,11 @@ FastAPI's standard 422.
 | `GET /boards` | `?open_only=true` | `[board header]` |
 | `GET /boards/{ref}` | `?since_version=&archived=false&q=&history=0` | `{board, items, flags, recently_closed, free_capacity}` (+ `archived` when `archived=true`) or `{unchanged: true, version}` |
 | `PATCH /boards/{ref}` | `{actor, settings…, orchestrator_pid?}` | `board` header |
-| `POST /boards/{ref}/items` | `{actor, items: [{title, holders?, status?, note?, group?, blocked_by?, blocked_on?, eta?, check_back?, links?}]}` (≤ 50, all-or-nothing) | `{board, items, unblocked, warnings}` |
+| `POST /boards/{ref}/items` | `{actor, items: [{title, holders?, status?, note?, group?, blocked_by?, blocked_on?, eta?, check_back?, links?}], request_id?}` (≤ 50, all-or-nothing) | `{board, items, unblocked, warnings}`; a repeated `request_id` on the board returns the first call's items with `replayed: true` |
 | `PATCH /boards/{ref}/items` | `{actor, ns: [n], set: {…}, add_holders?, remove_holders?, reason?}` | `{items, unblocked: [n], warnings: [str]}` |
 | `POST /boards/{ref}/items/{n}/resolve` | `{actor, action, kind?, holders?, blocked_by?, blocked_on?, check_back?, reason?, message?}` | `{board, item, flags_resolved: [kind], unblocked, warnings}` |
 | `GET /items` | `?holder_pid=&open=true` | `[{board, n, title, status}]` |
-| `POST /hosts/{daemon_id}/heartbeat` | `{host_label, sessions: [state row], exited: [pid], acked_push_ids: [id]}` | `{pushes: [push]}` |
+| `POST /hosts/{daemon_id}/heartbeat` | `{host_label, sessions: [state row], exited: [pid], acked_push_ids: [id]}` | `{pushes: [{id, session_uid, pid, kind, text, owner_alert, board_id, board}], server_time}` (≤ 100 per beat) |
 
 `holders` on the wire are resolved objects `{pid, name, session_uid,
 daemon_id}`; name resolution happens in the daemon. `set` accepts the item
@@ -215,8 +217,15 @@ oldest_s}}`.
 `flags: [kind]`, `blocks: [n]`, and with `history=N` the last N events.
 
 **Heartbeat state row:** `{pid, session_uid, task_id, name, engine, state,
-state_age_s, idle_for_s, reported_done, killed_by, agent_state?}`; the snapshot
-is complete for that daemon.
+state_age_s, idle_for_s, age_s?, reported_done, killed_by?, agent_state?}`;
+every `pid` must be `agent:<daemon_id>:…` of the posting daemon (else 422).
+The snapshot is complete for that daemon: its other live rows, and pids in
+`exited`, are marked exited; a pid that reappears is live again. Acks only
+settle that daemon's own pushes. The daemon beats every 30 s and 2 s after a
+poke; it publishes each push as notification id `board-push:<id>` with marker
+`[cm-board <board>]`, sends `owner_alert` pushes to Owner escalation (urgency
+`blocking`), acks pushes for sessions that cannot receive them (gone, bash),
+and acks everything on the next beat.
 
 `item_resolve` actions: `nudge` (push + snooze; needs a holder), `reassign`
 (replace holders), `block` (`blocked_by`, or `blocked_on` + `check_back`),
@@ -273,6 +282,14 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop",
   and checkout unless `task_id` names a task (whose worktree it then gets).
   The daemon route registers no completion monitor;
   the item's flags are the follow-up.
+- `item` and `item_resolve(launch)` carry a `request_id` (the MCP tool makes
+  one when omitted). A retried launch with the same id reassigns the worker
+  it already spawned instead of starting another (remembered in the daemon
+  until a brain restart); if the final reassign fails, the error names the
+  spawned uid. `launched` passes through the spawn's `worktree_path`,
+  `shared_workspace`, `workspace_shared_with` and warnings. A TUI-owned
+  caller cannot launch (it is not in the daemon's spawn registry). The MCP
+  timeouts (90 s, 180 s for launch) exceed the worst-case call chain.
 - `report_done` additionally returns `held_items: [{n, board, title, status}]`
   for the caller's open items with the hint "close (item_set n done) or hand
   back (item_set n holder=none)". An API failure appears as `held_items_error`

@@ -9,6 +9,7 @@ import re
 import socket
 import sys
 import time
+import uuid
 
 # Optional: full JSON-Schema validation for the `schema=` structured-output
 # option on the spawn-and-run / send-and-wait tools. Absent on the lean
@@ -216,10 +217,24 @@ def _git_origin_url() -> str:
 # Daemon-only: the daemon knows the caller, stamps the actor and resolves
 # holder names; there is no PlanningClient fallback.
 
-def _items_call(method: str, params: dict) -> dict:
-    return control_client.call(method, {
-        key: value for key, value in params.items() if value is not None
-    }, timeout=30.0)
+# Worst case is several 8 s planning-API calls in a row, plus a spawn for
+# item_resolve(launch). A client timeout shorter than that would hide a write
+# that already happened, so these exceed it.
+_ITEMS_TIMEOUT_S = 90.0
+_ITEMS_LAUNCH_TIMEOUT_S = 180.0
+
+
+def _items_call(method: str, params: dict, timeout: float = _ITEMS_TIMEOUT_S) -> dict:
+    params = {key: value for key, value in params.items() if value is not None}
+    try:
+        return control_client.call(method, params, timeout=timeout)
+    except control_client.TransportError as exc:
+        if "request_id" in params:
+            raise control_client.TransportError(
+                f"{exc} (the call may have completed; retry with request_id="
+                f"{params['request_id']!r} to avoid a duplicate)"
+            ) from exc
+        raise
 
 
 @mcp.tool()
@@ -234,6 +249,7 @@ def item(
     eta: str | None = None,
     links: list[str] | None = None,
     board: str | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Create one work item, or several from a list of titles, on your board.
 
@@ -247,9 +263,15 @@ def item(
     board (no cycles); blocked_on is free text ("EP GO") and gets no idle or
     stale exemption.
 
-    Returns {board, items: [{n, title, status, holders}]}.
+    request_id makes a retry safe: the same id returns the first call's items
+    instead of creating duplicates (one is generated when omitted and named
+    in any transport error).
+
+    Returns {board, items: [{n, title, status, holders}], replayed?}.
     """
-    return _items_call("item.create", locals())
+    params = dict(locals())
+    params["request_id"] = request_id or uuid.uuid4().hex
+    return _items_call("item.create", params)
 
 
 @mcp.tool()
@@ -322,6 +344,7 @@ def item_resolve(
     kind: str | None = None,
     task_id: str | None = None,
     board: str | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Resolve an item's flags (orchestrators) with one action:
 
@@ -336,9 +359,15 @@ def item_resolve(
     - drop: cancel it with a reason.
 
     kind limits the action to one flag kind; by default it resolves all of
-    the item's open flags. Returns {item, flag_resolved, launched?}.
+    the item's open flags. A launch retried with the same request_id reassigns
+    the already-spawned worker instead of starting another. Returns
+    {item, flag_resolved, launched?: {uid, engine, worktree_path, warning?…}}.
     """
-    return _items_call("item.resolve", locals())
+    params = dict(locals())
+    if action == "launch":
+        params["request_id"] = request_id or uuid.uuid4().hex
+        return _items_call("item.resolve", params, timeout=_ITEMS_LAUNCH_TIMEOUT_S)
+    return _items_call("item.resolve", params)
 
 
 def _chat_call(method: str, params: dict) -> dict:
