@@ -318,6 +318,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "sidebar.list",
     "get_initiative",
     "backtest.result",
+    "board.read",
     "continuous.list",
     "continuous.context",
     "continuous.dispatch_pending",
@@ -809,6 +810,14 @@ pub fn dispatch_request(
         // so headless agents work without `cli/`.
         "backtest.submit" => DispatchOutcome::Done(dispatch_backtest_submit(state, req)),
         "backtest.result" => DispatchOutcome::Done(dispatch_backtest_result(state, req)),
+
+        // Work items and boards (doc/items-board.md): Session + Operator
+        // callable proxies to the planning API. The daemon stamps the
+        // caller's participant id as the actor and resolves holder names;
+        // editing rights are checked in `items::rpc`.
+        "item.create" | "item.set" | "item.resolve" | "board.read" => {
+            DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
+        }
 
         // remote-session-execution Phase 1: Operator-only daemon RPCs
         // that resolve every path on the daemon's own filesystem, so the

@@ -68,6 +68,7 @@ pub mod continuous;
 pub mod control;
 pub mod holder_mode;
 pub mod host_id;
+pub mod items;
 pub mod manifest;
 pub mod messaging;
 pub mod mcp_config;

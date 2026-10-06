@@ -315,6 +315,13 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # daemon-routed under a daemon pin.
     "backtest.submit",
     "backtest.result",
+    # Work items and boards (doc/items-board.md): daemon-only proxies to the
+    # planning API. The daemon stamps the caller as actor and resolves holder
+    # names; there is no TUI handler and no PlanningClient fallback.
+    "item.create",
+    "item.set",
+    "item.resolve",
+    "board.read",
 })
 
 

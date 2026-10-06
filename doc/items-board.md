@@ -252,18 +252,27 @@ board(board=None, view="slim", mine=False, group=None, include_closed=True,
 
 item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop",
              holder=None, blocked_by=None, blocked_on=None, check_back=None,
-             reason=None, engine=None, message=None)
+             reason=None, engine=None, message=None, kind=None, task_id=None,
+             board=None)
   -> {item, flag_resolved}
 ```
 
 - A bare string as `item_set`'s second argument is `status`.
+- MCP arguments left out are unchanged. An empty string clears `note`,
+  `group`, `blocked_on`, `check_back` or `eta`; `blocked_by=[]` clears
+  blockers; `holder="none"` hands the item back.
+- `board.read` also takes `since_version` (for the TUI's poll) and then may
+  answer `{unchanged: true, version}`.
 - `board(view="slim")` returns one line per item, flags first, then by group:
   `#14 active "fuse SEJD" @rl-scale-out[idle 24m] ⚑holder_idle · waiting on JP`.
   `view="full"` returns the item dicts with the last 5 events each.
 - `item_resolve(launch)` spawns through the normal `start_session` path under
   the caller's permissions (`engine` defaults to the caller's own engine), with
   prompt `item #<n> (<board>): <title>` plus `message`, then makes the new
-  session the sole holder.
+  session the sole holder. Like `start_session`, it joins the caller's task
+  and checkout unless `task_id` names a task (whose worktree it then gets).
+  The daemon route registers no completion monitor;
+  the item's flags are the follow-up.
 - `report_done` additionally returns `held_items: [{n, board, title, status}]`
   for the caller's open items with the hint "close (item_set n done) or hand
   back (item_set n holder=none)". An API failure appears as `held_items_error`

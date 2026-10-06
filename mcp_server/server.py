@@ -212,6 +212,135 @@ def _git_origin_url() -> str:
     return result.stdout.strip()
 
 
+# ---- Work items and boards (doc/items-board.md) ---------------------------
+# Daemon-only: the daemon knows the caller, stamps the actor and resolves
+# holder names; there is no PlanningClient fallback.
+
+def _items_call(method: str, params: dict) -> dict:
+    return control_client.call(method, {
+        key: value for key, value in params.items() if value is not None
+    }, timeout=30.0)
+
+
+@mcp.tool()
+def item(
+    title: str | list[str],
+    holder: str | list[str] | None = None,
+    status: str | None = None,
+    note: str | None = None,
+    group: str | None = None,
+    blocked_by: list[int] | None = None,
+    blocked_on: str | None = None,
+    eta: str | None = None,
+    links: list[str] | None = None,
+    board: str | None = None,
+) -> dict:
+    """Create one work item, or several from a list of titles, on your board.
+
+    If you are doing something, it has an item. Items are small units of work
+    (not planning tasks) on a shared board: your initiative's, else your
+    top-level task's. The holder defaults to you; name others by chat name,
+    session uid or participant id, or holder="none" to leave it unassigned.
+    status: open/active/waiting/blocked/done/dropped (default active).
+    eta ("40m", "2h" or a time) marks a long job as waiting, which keeps it
+    from being flagged idle. blocked_by takes open item numbers on the same
+    board (no cycles); blocked_on is free text ("EP GO") and gets no idle or
+    stale exemption.
+
+    Returns {board, items: [{n, title, status, holders}]}.
+    """
+    return _items_call("item.create", locals())
+
+
+@mcp.tool()
+def item_set(
+    n: int | list[int],
+    status: str | None = None,
+    note: str | None = None,
+    holder: str | list[str] | None = None,
+    add_holder: str | list[str] | None = None,
+    remove_holder: str | list[str] | None = None,
+    group: str | None = None,
+    blocked_by: list[int] | None = None,
+    blocked_on: str | None = None,
+    check_back: str | None = None,
+    eta: str | None = None,
+    title: str | None = None,
+    links: list[str] | None = None,
+    reason: str | None = None,
+    board: str | None = None,
+) -> dict:
+    """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
+    note="needs EP GO"), item_set(15, blocked_by=[14]),
+    item_set(14, "waiting", eta="40m", note="full C2 run").
+
+    holder replaces the holders ("none" hands the item back); add_holder /
+    remove_holder adjust them. An empty string clears note, group or
+    blocked_on; blocked_by=[] clears blockers. Marking an item done unblocks
+    items waiting only on it and wakes their holders. Anyone on the board may
+    edit any item; history is kept, so give a reason for drops and handoffs.
+
+    Returns {board, items, unblocked?, warnings?}.
+    """
+    return _items_call("item.set", locals())
+
+
+@mcp.tool()
+def board(
+    board: str | None = None,
+    view: str = "slim",
+    mine: bool = False,
+    group: str | None = None,
+    include_closed: bool = True,
+    archived: bool = False,
+    query: str | None = None,
+) -> dict:
+    """Read your board: flags first, then items by group, recently closed
+    items (24 h) and free capacity (sessions on the board holding no active
+    item). Each item shows its holders' live state, e.g.
+    `#14 active "fuse SEJD" [RL] @rl-scale-out[idle 24m] ⚑holder_idle`.
+
+    view="full" returns item dicts with their last 5 history events.
+    mine=True keeps only your items; group filters by heading; archived=True
+    adds archived items; query searches titles, notes and groups. Any
+    session may read any board by slug.
+    """
+    return _items_call("board.read", locals())
+
+
+@mcp.tool()
+def item_resolve(
+    n: int,
+    action: str,
+    holder: str | list[str] | None = None,
+    blocked_by: list[int] | None = None,
+    blocked_on: str | None = None,
+    check_back: str | None = None,
+    reason: str | None = None,
+    engine: str | None = None,
+    message: str | None = None,
+    kind: str | None = None,
+    task_id: str | None = None,
+    board: str | None = None,
+) -> dict:
+    """Resolve an item's flags (orchestrators) with one action:
+
+    - nudge: send the holder a standard update/close/hand-back prompt
+      (plus `message`) and snooze the flag;
+    - reassign: give it to `holder`;
+    - launch: start a new session (`engine` codex or claude, default your
+      own engine) with the item as its prompt and make it the holder. It
+      joins your task and checkout unless `task_id` names a task, whose own
+      worktree it then gets (minted if needed), as with start_session;
+    - block: blocked_by items, or blocked_on text with a check_back time;
+    - drop: cancel it with a reason.
+
+    kind limits the action to one flag kind; by default it resolves all of
+    the item's open flags. Returns {item, flag_resolved, launched?}.
+    """
+    return _items_call("item.resolve", locals())
+
+
 def _chat_call(method: str, params: dict) -> dict:
     # The daemon's coordinator deadline is 30s. Leave time for it to return
     # outcome_unknown and retry guidance instead of masking that with socket IO.
