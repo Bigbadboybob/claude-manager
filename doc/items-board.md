@@ -109,9 +109,14 @@ Only `state=idle` counts toward idle; `unknown` is never idle and never gone.
 
 ## 4. Flags
 
-Computed every 30 s by the engine in the API process (a pure
-`compute_flags(item, holders, states, deps, board, now)`), except
-`blocker_dropped`, which the write path raises. Thresholds are per board:
+Computed every 30 s by the engine in the API process (`api/board_engine.py`,
+a pure `compute_flags(item, states, items, board, now, live_daemons)`), for
+each board with unarchived items. Each pass takes the board-row lock and
+writes through the same rules as the write path (actor
+`system:board-engine`), so raises and clears are history events and move the
+board version. Flag details are stable (names, numbers, times; never
+durations), so an unchanged condition writes nothing. `blocker_dropped` is
+also raised by the write path. Thresholds are per board:
 
 | Board setting | Default |
 |---|---|
@@ -127,10 +132,10 @@ Computed every 30 s by the engine in the API process (a pure
 | Kind | Raised when |
 |---|---|
 | `unassigned` | `open`, no holders, older than `unassigned_s` |
-| `holder_gone` | item `active`/`waiting`/`blocked` and any holder is `exited` or has no state row; applies even while blocked |
+| `holder_gone` | item `active`/`waiting`/`blocked` and any holder is `exited`, or has no state row while its daemon is heartbeating (a daemon not yet sending heartbeats leaves its holders `unknown`); applies even while blocked |
 | `holder_idle` | `active`, every holder `idle` with `now − max(idle_since, clock_reset_at, touched_at) ≥ idle_s` |
 | `holder_waiting_on_human` / `holder_errored` | any holder in `waiting-on-human` / `errored` |
-| `stale` | `active` or `blocked`, `now − max(touched_at, clock_reset_at) ≥ stale_s`; for `waiting` the threshold is `max(stale_s, eta_at − waiting_set_at)` |
+| `stale` | `active`, `blocked` or `waiting`, `now − max(touched_at, clock_reset_at) ≥ stale_s`; for `waiting` the threshold is `max(stale_s, eta_at − waiting_set_at)` |
 | `overdue` | `waiting` and `now > eta_at + 0.25·(eta_at − waiting_set_at)` |
 | `check_back` | `blocked_on` set and `check_back_at` passed |
 | `blocker_dropped` | a blocker of this item was dropped |
@@ -162,7 +167,7 @@ dedupe, owner_alert}`; the target's own daemon receives it in its heartbeat
 reply and delivers it with
 `notifications::publish(root, uid, "board-push:<id>", "board", text, "[cm-board <slug>]")`
 — idempotent per id — or, when `owner_alert`, through Owner escalation
-(`owner_attention::raise_system` today, `escalate()` once it lands). Delivered
+(`owner_attention::escalate()`). Delivered
 ids are acked on the next beat; unacked rows are re-sent.
 
 | Kind | To | When |
@@ -170,16 +175,16 @@ ids are acked on the next beat; unacked rows are re-sent.
 | `assigned` | new holder | added by someone else |
 | `unblocked` | holders | last blocker done |
 | `nudge` | holders | `item_resolve(nudge)` |
-| `overdue` | holder first, orchestrator after `repush_s` | flag |
-| `board` | orchestrator | new flags immediately; unresolved flags every `repush_s`; done/dropped/blocked events batched at most once per `digest_s`. One row per orchestrator per tick |
-| `escalation` (`owner_alert`) | Owner via the orchestrator's daemon (else coordinator's last daemon) | orchestrator `idle`/`unknown`/`exited` and oldest unresolved flag older than `escalate_s`; once per flag |
+| `overdue` | holder when raised; orchestrator once the flag is `repush_s` old | flag |
+| `board` | orchestrator | new flags immediately; unresolved flags every `repush_s`; done/dropped/blocked events by others than the orchestrator, batched over a `digest_s` window. One row per orchestrator per tick; no push without a live orchestrator |
+| `escalation` (`owner_alert`) | Owner via the orchestrator's daemon (else the coordinator's most recent session, live or not) | no orchestrator, or it is `idle`/`unknown`/gone, and flags unresolved for `escalate_s`; once per flag (`escalated_at`) |
 
 Text stays under ~1 KB, e.g.
 `[cm-board sfd] 2 flags: #14 holder_idle (rl-scale-out idle 24m); #9 stale 2h10m · 3 done (#3,#5,#6). board() / item_resolve(n, action)`.
 
 **Close-out.** Items closed for 24 h get `archived_at` (off the board, still
-searchable with `archived=true`). Delivered pushes older than 7 days and state
-rows exited more than 7 days ago are pruned.
+searchable with `archived=true`). Delivered pushes, state rows exited and
+`item_requests` keys older than 7 days are pruned (about every 10 minutes).
 
 ## 6. Planning API (`api/items.py`)
 
