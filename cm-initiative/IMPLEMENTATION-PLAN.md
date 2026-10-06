@@ -194,11 +194,11 @@ reviews, merges to main and deploys (hub first).
 | W0c-state contract | state-core | reviewed PASS | bc76c50 | doc only |
 | W0d orchestration docs | msgfix | reviewed PASS | f1009f9 | policies + skill on cm-manager + cm-sessions 19:38Z |
 | W1a items API | items | reviewed PASS (+fixes 9f1aa85) | 9f1aa85 | API live on cm-manager 19:17Z; `GET /boards` 200 |
-| W1b agent_state core | state-core | reviewed PASS (+fixes) | 8223700 | scheduled after EP 23:00Z freeze (23:17Z) |
-| W2a items daemon proxy + MCP tools | items | reviewed PASS (follow-ups in W2b) | 5e24d12 | with W1b at 23:17Z |
+| W1b agent_state core | state-core | reviewed PASS (+fixes) | 8223700 | cm-manager + cm-sessions 23:20Z (c61f920) |
+| W2a items daemon proxy + MCP tools | items | reviewed PASS (follow-ups in W2b) | 5e24d12 | cm-manager + cm-sessions 23:20Z |
 | W2b heartbeat + push delivery | items | in progress | | |
-| W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | with W1b at 23:17Z |
-| W2e Codex relay state + 0.160 parsers | state-core | reviewed PASS (+6 fixes) | cef633b, c61f920 | with W1b at 23:17Z; existing Codex sessions need A-R |
+| W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | cm-manager + cm-sessions 23:20Z; Claude sessions on source=presence |
+| W2e Codex relay state + 0.160 parsers | state-core | reviewed PASS (+6 fixes) | cef633b, c61f920 | cm-manager + cm-sessions 23:20Z; existing Codex sessions need A-R |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
 | W2f messaging read side + slim responses | msgfix | reviewed PASS | 084fff2, f9a13ee | cm-manager + cm-sessions 20:03Z (Owner priority) |
 | W3e Owner availability state + CLI | msgfix | reviewed PASS | 43e30ef | cm-manager + cm-sessions 20:52Z; ~/.cm/bin/cm-availability on both |
@@ -221,3 +221,8 @@ cache); cm-sessions in ~90 s. Laptop daemon still on the old build (next TUI rel
 Coordinator miss (21:31Z): the items lane sat idle ~2 h after its W1a fixes were merged
 and deployed, because I never told it to start W2a. Exactly the failure the board's
 `holder_idle` flag targets. Restarted at 21:31Z.
+
+23:20Z: c61f920 (W1b+W2a+W2d+W2e) live on both cloud hosts. cm-sessions sessions_by_state
+right after: errored 1, idle 26, starting 8, working 13. The new presence state immediately
+showed the items lane idle since 22:00Z: it had paused on memory pressure and asked its
+question only in its own session. Norm added: lanes post blockers in the channel.
