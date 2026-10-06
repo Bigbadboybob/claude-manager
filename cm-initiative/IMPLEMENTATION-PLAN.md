@@ -197,8 +197,8 @@ reviews, merges to main and deploys (hub first).
 | W1b agent_state core | state-core | review: 2 blockers being fixed | | |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
 | W2f messaging read side + slim responses | msgfix | reviewed PASS | 084fff2, f9a13ee | cm-manager + cm-sessions 20:03Z (Owner priority) |
-| W3e Owner availability state + CLI | msgfix | reviewed PASS | 43e30ef | next batch (with W1b) |
-| W4a gated notify_user | msgfix | in progress | | |
+| W3e Owner availability state + CLI | msgfix | reviewed PASS | 43e30ef | cm-manager + cm-sessions 20:52Z; ~/.cm/bin/cm-availability on both |
+| W4a gated notify_user | msgfix | reviewed PASS (+fixes) | fb7f9a3, e8eaede | cm-manager + cm-sessions 20:52Z |
 
 Note: both Claude lanes' launch prompts were silently dropped at start_session (status file idle since spawn, no transcript, monitor timed out ~35 min later); redelivered with send_input 18:47Z. Follow-up: start_session should confirm the turn started (state-core, after W2d).
 
