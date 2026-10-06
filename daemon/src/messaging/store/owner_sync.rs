@@ -72,18 +72,12 @@ impl Store {
         }
         let local = self.check_position(position)?;
         // A local position is not a global arrival fence. Translate to the most
-        // recent retained hub checkpoint known at that exact local boundary.
-        for n in (1..=local).rev() {
-            let path = self.journal_dir().join(format!("{n:020}.json"));
-            if !path.exists() {
-                continue;
-            }
-            let j = load(&path)?;
-            if j["kind"] == "coverage" && j["data"]["scope"] == "transport" {
-                return Ok(
-                    json!({"space_id":self.space_id,"replica_id":self.coordinator_id(),"generation":j["data"]["generation"],"position":j["data"]["cursor"].as_u64().unwrap_or(0)}),
-                );
-            }
+        // recent retained hub checkpoint known at that local boundary (an
+        // older one only widens the monitor's start; it never skips).
+        if let Some(mark) = self.transport_mark_at(local) {
+            return Ok(
+                json!({"space_id":self.space_id,"replica_id":self.coordinator_id(),"generation":mark["generation"],"position":mark["cursor"].as_u64().unwrap_or(0)}),
+            );
         }
         Err(err(
             "resync_required",

@@ -332,9 +332,14 @@ impl Store {
         };
         mkdir(&output)?;
         let mut files = BTreeMap::<String, String>::new();
+        let index = self.load_journal_index();
         for entry in fs::read_dir(self.journal_dir())? {
             let path = entry?.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            // Superseded coverage records may be mid-deletion; never seed them.
+            if index.as_ref().is_some_and(|i| i.superseded(&path).is_some()) {
                 continue;
             }
             let rel = path
