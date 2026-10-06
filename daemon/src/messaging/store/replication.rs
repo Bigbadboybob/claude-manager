@@ -283,6 +283,43 @@ impl Store {
     pub fn outbox_status(&self, actor: &str) -> Option<Value> {
         self.outbox_status_at(actor, Utc::now())
     }
+    /// Every actor's overdue outbox in ONE pass over the events (the alarm's
+    /// path: per-actor scans of a 2M-event store under its lock stalled the
+    /// delivery worker). Only actors with something overdue appear.
+    pub fn outbox_overdue(&self) -> BTreeMap<String, Value> {
+        let mut out = BTreeMap::new();
+        if self.is_coordinator() || !self.sync_enabled() {
+            return out;
+        }
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::seconds(OUTBOX_GRACE_S);
+        let mut acc: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
+        for e in &self.events {
+            if e.event["origin_daemon_id"] != self.daemon_id {
+                continue;
+            }
+            let id = strv(&e.event, "id");
+            if self.replication.receipts.contains_key(id) || self.replication.rejections.contains_key(id) {
+                continue;
+            }
+            let at = strv(&e.event, "created_at");
+            if DateTime::parse_from_rfc3339(at).is_ok_and(|t| t.with_timezone(&Utc) > cutoff) {
+                continue;
+            }
+            let entry = acc.entry(strv(&e.event["actor"], "id")).or_insert((0, at));
+            entry.0 += 1;
+            if at < entry.1 {
+                entry.1 = at;
+            }
+        }
+        for (actor, (pending, oldest)) in acc {
+            let age = DateTime::parse_from_rfc3339(oldest)
+                .map(|t| (now - t.with_timezone(&Utc)).num_seconds().max(0))
+                .ok();
+            out.insert(actor.to_owned(), json!({"pending_sync":pending,"oldest_age_s":age}));
+        }
+        out
+    }
     pub(super) fn outbox_status_at(&self, actor: &str, now: DateTime<Utc>) -> Option<Value> {
         if self.is_coordinator() || !self.sync_enabled() {
             return None;

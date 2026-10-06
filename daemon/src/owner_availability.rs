@@ -147,6 +147,13 @@ pub fn tick(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>)
         return;
     }
     let previous = applied["level"].as_str().and_then(Level::parse);
+    // A failing release (unreadable/unwritable held store) retries with
+    // backoff rather than on every 2 s tick.
+    static RETRY: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0)); // (next_at, delay)
+    let now = crate::continuous::task::now_unix();
+    if RETRY.lock().unwrap_or_else(|p| p.into_inner()).0 > now {
+        return;
+    }
     let outcome = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         if s.draining {
@@ -155,15 +162,22 @@ pub fn tick(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>)
         crate::owner_attention::release_for_level(&s, level)
     };
     let outcome = match outcome {
-        Ok(o) => o,
+        Ok(o) => {
+            *RETRY.lock().unwrap_or_else(|p| p.into_inner()) = (0, 0);
+            o
+        }
         Err(e) => {
-            eprintln!("cm owner availability: release held requests: {e}");
+            let mut retry = RETRY.lock().unwrap_or_else(|p| p.into_inner());
+            let delay = (retry.1 * 2).clamp(10, 600);
+            *retry = (now + delay, delay);
+            eprintln!("cm owner availability: release held requests (retry in {delay}s): {e}");
             return;
         }
     };
-    // First run after an upgrade: adopt the current level without waking
-    // anyone (nothing was held under the old daemon).
-    if !first_run {
+    // First run after an upgrade adopts the current level without waking
+    // anyone (nothing was held under the old daemon); re-setting the same
+    // level is a new revision but no change, so it wakes nobody either.
+    if !first_run && previous != level {
         wake(state, &root, previous, level, event_id.as_deref().unwrap_or("unset"), &outcome);
     }
     let record = json!({"event_id": event_id, "level": level.map(Level::as_str)});

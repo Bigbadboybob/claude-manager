@@ -83,21 +83,26 @@ the normal queue, marked `released_at` (merged into a pending alert for the same
 session, up to 4,096 bytes), and wakes once per revision: continuous
 orchestrators, live sessions bound to an active initiative's coordinator task,
 sessions the work-item board registered, and sessions with held or released
-requests. `~/.cm/owner-availability-applied.json` records the last applied
-revision; the first run after an upgrade adopts the current level silently.
+requests. Wakes happen only when the level value changes: re-setting the same
+level, or the first run after an upgrade, wakes nobody.
+`~/.cm/owner-availability-applied.json` records the last applied revision.
 
 Out-of-band push (`notify_command`, e.g. Telegram, tag `owner-attention`):
-every `emergency`, and every delivered `blocking` request while no viewer is
-connected. Pushes are rate-limited to one per alert key per 10 minutes.
+every `emergency`; and, once Owner has set a level, every delivered `blocking`
+request while no viewer is connected. While the level is unset nothing else
+pushes, so behavior is unchanged until Owner first sets one. Pushes are
+rate-limited to one per alert key per 10 minutes.
 
 Daemon-side sources use the same gate through `owner_attention::escalate()` /
 `withdraw()` (Operator RPCs `owner_attention.escalate` / `owner_attention.withdraw`
-for evaluators elsewhere). The notification stall alarm and the outbox alarm
-(a session's own messages still `pending_sync` after 15 minutes) escalate as
-`blocking`. **Behavior change:** under `away` both alarms are held until Owner
-becomes more reachable; with no viewer connected and the level unset, on-call or
-around they also reach `notify_command`. Escalations never displace an agent's
-own pending request.
+for evaluators elsewhere). The notification stall alarm (per session) and the
+outbox alarm (one per host per episode: this host's messages still
+`pending_sync` after 15 minutes, i.e. a stalled hub link) escalate as
+`blocking`. **Behavior change once a level is set:** under `away` both alarms
+are held until Owner becomes more reachable; under `on-call` or `around` with
+no viewer connected they also reach `notify_command`. Escalations never
+displace an agent's own pending request, and a released held request merges
+into a pending alert without changing its ID or lowering its urgency.
 
 ## Routing and authorization
 

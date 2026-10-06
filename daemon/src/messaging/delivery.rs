@@ -368,8 +368,9 @@ fn alarm_tick(state: &Arc<Mutex<DaemonState>>, root: &Path) {
     let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
     let outboxes: Option<Vec<(String, Option<serde_json::Value>)>> = handle.try_lock().ok().and_then(|slot| {
         slot.as_ref().map(|store| {
+            let overdue = store.outbox_overdue();
             uids.iter()
-                .map(|uid| (uid.clone(), store.outbox_status(&store.participant_id(uid))))
+                .map(|uid| (uid.clone(), overdue.get(&store.participant_id(uid)).cloned()))
                 .collect()
         })
     });

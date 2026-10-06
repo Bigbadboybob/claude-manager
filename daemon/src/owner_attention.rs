@@ -121,12 +121,15 @@ fn broadcast(state: &DaemonState, key: &str, alert: Option<&Alert>) {
     });
 }
 
-/// Out-of-band push (`notify_command`, e.g. Telegram) for an emergency, or for
-/// a delivered blocking request when no viewer is connected to show it.
-/// Rate-limited per key so a misused `emergency` cannot spam the phone.
+/// Out-of-band push (`notify_command`, e.g. Telegram) for an emergency, or —
+/// once Owner has set an availability level — for a delivered blocking
+/// request when no viewer is connected to show it. While the level is unset
+/// nothing but emergencies pushes, so behavior is unchanged until Owner opts
+/// in. Rate-limited per key so a misused `emergency` cannot spam the phone.
 fn maybe_push(state: &DaemonState, key: &str, alert: &Alert, urgency: Urgency, delivered: bool) {
     let viewer = state.manifest_watcher.subscriber_count() > 0;
-    if !(urgency == Urgency::Emergency || delivered && urgency >= Urgency::Blocking && !viewer) {
+    let level_set = level_now(state).is_some();
+    if !(urgency == Urgency::Emergency || level_set && delivered && urgency >= Urgency::Blocking && !viewer) {
         return;
     }
     static LAST: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
@@ -429,15 +432,27 @@ pub fn release_for_level(state: &DaemonState, level: Option<Level>) -> Result<Re
             out.still_held.insert(h.alert.session_uid.clone(), h.count as usize);
             return true;
         }
-        let mut alert = h.alert.clone();
-        alert.released_at = Some(now.clone());
+        let mut released = h.alert.clone();
+        released.released_at = Some(now.clone());
         if h.count > 1 {
-            alert.message = truncate(&format!("{} ({} requests held; this is the latest)", alert.message, h.count));
+            released.message = truncate(&format!("{} ({} requests held; this is the latest)", released.message, h.count));
         }
-        if let Some(pending) = alerts.get(key) {
-            alert.message = truncate(&format!("{}\n\n[released] {}", pending.message, alert.message));
-        }
-        alert.id = uuid::Uuid::new_v4().to_string();
+        let alert = match alerts.get(key) {
+            // A newer delivered alert keeps its identity (so its raiser can
+            // still withdraw it) and the higher urgency; the released text is
+            // appended to it, never written over it.
+            Some(pending) => {
+                let mut merged = pending.clone();
+                merged.message = truncate(&format!("{}\n\n[released] {}", pending.message, released.message));
+                merged.released_at = Some(now.clone());
+                let rank = |a: &Alert| a.urgency.as_deref().and_then(Urgency::parse).unwrap_or(Urgency::Decision);
+                if rank(&released) > rank(pending) {
+                    merged.urgency = released.urgency.clone();
+                }
+                merged
+            }
+            None => released,
+        };
         out.released.insert(alert.session_uid.clone(), h.count as usize);
         alerts.insert(key.clone(), alert);
         changed.push(key.clone());
@@ -643,7 +658,7 @@ mod tests {
         assert_eq!(h["local"].count, 2);
         assert_eq!(h["local"].alert.urgency.as_deref(), Some("decision"), "a later fyi never downgrades");
         // An emergency still gets through, and stays pending for the merge.
-        notify_with(&state, "local", "prod down", "emergency");
+        let emergency = notify_with(&state, "local", "prod down", "emergency");
         // around: decision still held.
         let out = release_for_level(&state.lock().unwrap(), Some(Level::Around)).unwrap();
         assert!(out.released.is_empty());
@@ -653,7 +668,9 @@ mod tests {
         assert_eq!(out.released["local"], 2);
         let alerts = snapshot(&state.lock().unwrap()).unwrap();
         let a = &alerts["local"];
-        assert!(a.released_at.is_some() && a.held_since.is_some());
+        assert!(a.released_at.is_some());
+        assert_eq!(a.urgency.as_deref(), Some("emergency"), "the newer, higher urgency is kept");
+        assert_eq!(serde_json::json!(a.id), emergency["alert_id"], "a merge keeps the pending alert's id");
         assert!(a.message.starts_with("prod down") && a.message.contains("[released] also: rename?"), "{}", a.message);
         assert!(a.message.contains("2 requests held"));
         assert!(held(&state).is_empty());
@@ -719,11 +736,18 @@ mod tests {
         // Rate limited per key.
         notify_with(&state, "push-a", "still down", "emergency");
         assert_eq!(pushes().lines().count(), 1);
-        state.lock().unwrap().tui_sessions.insert("push-b".into(),
-            serde_json::from_value(serde_json::json!({"uid":"push-b","label":"Blocker"})).unwrap());
+        for uid in ["push-b", "push-c"] {
+            state.lock().unwrap().tui_sessions.insert(uid.into(),
+                serde_json::from_value(serde_json::json!({"uid":uid,"label":"Blocker"})).unwrap());
+        }
+        // Unset level: no new pushes beyond emergencies (behavior unchanged).
         set_level(&state, None, "r2");
         notify_with(&state, "push-b", "need creds", "blocking");
-        assert!(pushes().contains("[blocking] Blocker: need creds"));
+        assert!(!pushes().contains("need creds"));
+        // Once Owner set a level, an unwatched delivered blocking request pushes.
+        set_level(&state, Some("on-call"), "r3");
+        notify_with(&state, "push-c", "need keys", "blocking");
+        assert!(pushes().contains("[blocking] Blocker: need keys"));
     }
     #[test]
     fn level_change_releases_and_wakes_holders_once_per_revision() {
@@ -746,6 +770,10 @@ mod tests {
         let text = events[0]["text"].as_str().unwrap();
         assert!(text.contains("away→focused") && text.contains("1 of your requests were released"), "{text}");
         // Unchanged revision: no second wake.
+        crate::owner_availability::tick(&state);
+        assert_eq!(wakes().len(), 1);
+        // Re-setting the same level is a new revision but no change: no wake.
+        set_level(&state, Some("focused"), "r3");
         crate::owner_availability::tick(&state);
         assert_eq!(wakes().len(), 1);
     }

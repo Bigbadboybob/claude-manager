@@ -65,3 +65,26 @@ class NotifyUserUrgencyTests(unittest.TestCase):
             self.assertEqual(call.call_args.args, ("notify_user", {"message": "Need a decision"}))
             server.notify_user("prod down", urgency="emergency")
             self.assertEqual(call.call_args.args[1], {"message": "prod down", "urgency": "emergency"})
+
+    def test_old_daemon_rejecting_urgency_gets_a_retry_without_it(self):
+        from mcp_server import control_client, server
+
+        calls = []
+
+        def fake(method, params):
+            calls.append(dict(params))
+            if "urgency" in params:
+                raise control_client.ControlError(
+                    "invalid_params", "unknown field `urgency`, expected `message`")
+            return {"ok": True, "status": "queued"}
+
+        with mock.patch.object(control_client, "call", side_effect=fake):
+            out = server.notify_user("disk full", urgency="blocking")
+        self.assertEqual(calls, [{"message": "disk full", "urgency": "blocking"}, {"message": "disk full"}])
+        self.assertEqual(out["status"], "queued")
+        self.assertIn("predates urgency", out["urgency_ignored"])
+        # Other errors still surface.
+        with mock.patch.object(control_client, "call",
+                               side_effect=control_client.ControlError("unauthorized", "not live")):
+            with self.assertRaises(control_client.ControlError):
+                server.notify_user("x", urgency="blocking")

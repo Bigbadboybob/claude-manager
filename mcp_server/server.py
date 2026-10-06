@@ -1842,7 +1842,19 @@ def notify_user(message: str = "", urgency: str = "decision") -> dict:
     # Omit the default so a daemon predating urgency still accepts the call.
     if urgency != "decision":
         params["urgency"] = urgency
-    return control_client.call("notify_user", params)
+    try:
+        return control_client.call("notify_user", params)
+    except control_client.ControlError as e:
+        # A daemon predating urgency rejects the unknown field; never fail the
+        # request over it. Deliver it ungated and say so.
+        if "urgency" not in params or "urgency" not in str(e) or "unknown field" not in str(e):
+            raise
+        result = control_client.call("notify_user", {"message": message})
+        if isinstance(result, dict):
+            result["urgency_ignored"] = (
+                "This host's daemon predates urgency; the request was delivered without it."
+            )
+        return result
 
 
 @mcp.tool()
