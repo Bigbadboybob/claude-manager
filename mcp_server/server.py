@@ -389,7 +389,7 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     On paired hosts, enrolled agents can post to known conversations offline.
     pending_sync means saved locally; replicated means the hub accepted the same ID.
     created_at is the authoritative send time; outbox reports your messages still
-    pending_sync on this host. A hub-executed send reports submitted_at and delay_s.
+    pending_sync on this host after a minute. A hub-executed send reports submitted_at and delay_s.
     First naming, a new DM, and shared metadata edits need connectivity. Offline
     @here freezes the last-known membership audience; reconnect never expands it.
     view="slim" (default) returns what a sender acts on: event_id, created_at,

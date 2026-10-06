@@ -59,8 +59,8 @@ No parent-channel inheritance or automatic wake on norms changes. See
 CM's `created_at` on each message is the authoritative send time (a send
 response repeats it at top level). Never write your own estimate of the time
 into a post; cite the message time or an ETA. On a paired host, `outbox` in a
-messaging response counts your messages still `pending_sync` and the age of
-the oldest; a growing age means the hub link is stalled.
+messaging response counts your messages still `pending_sync` after a minute
+and the age of the oldest; a growing age means the hub link is stalled.
 
 ## Orchestrating other sessions
 
