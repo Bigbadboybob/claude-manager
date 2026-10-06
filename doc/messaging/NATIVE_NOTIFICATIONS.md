@@ -1,10 +1,12 @@
 # Native agent notifications
 
 CM's chat wakes and session-monitor completion notices share a durable local
-queue. Claude receives them through its own-child messaging socket. New Codex
+queue. Claude can receive them as MCP channel events, with its own-child
+messaging socket retained for launches without channel opt-in. New Codex
 sessions run a CM-owned app-server with the ordinary Codex remote terminal UI.
-Neither notification path types into a terminal. `notify_user` still sends
-human-facing desktop/sidebar alerts.
+Neither notification path types into a terminal. `notify_user` uses a separate daemon-owned queue for
+[Owner desktop/sidebar alerts](../OWNER_NOTIFICATIONS.md), including cloud and
+continuous sessions. It does not use the native agent queue or change chat preferences.
 
 Installing this implementation does not migrate an already running embedded
 Codex process. Channel membership, tagging UX, and an Owner overview of all
@@ -31,7 +33,7 @@ chat receipt APIs to mark messages read.
 |---|---|
 | `pending` | No native submission has begun; cancellation can retract it. |
 | `submitting` | The attempt was persisted before native I/O. |
-| `submitted` | Socket write completed / app-server accepted the request. |
+| `submitted` | Socket/channel write completed / app-server accepted the request. |
 | `observed` | The exact marker occurs in the native inbound transcript record. |
 | `uncertain` | Submission may have happened; CM will not automatically repeat it. |
 | `cancelled` | Retracted before the consumer claimed it. |
@@ -70,14 +72,142 @@ historical deduplication records and cannot hold the new latch closed. The first
 new arrival starts a new batch without replaying those old messages. Legacy
 unsubmitted work stays live and can combine with new arrivals.
 An agent must finish reading its batch; an unread batch is not periodically
-re-notified. Mute/cancellation can still retract unclaimed native work.
+re-notified. The latch is bounded, though: a batch that reached the agent
+(confirmed, submitted or uncertain) and is still unread two minutes later
+releases on its own, so the next arrival publishes a fresh wake instead of
+being swallowed for good (2026-09-14: an orchestrator's 11:01 wake absorbed a
+16:17 task-channel mention until this horizon existed). The released batch
+keeps its ids as history. Mute/cancellation can still retract unclaimed native
+work.
 
 Chat wake text and worker-completion notices instruct agents to inspect pending
 activity before responding, continue the existing task, and report only meaningful
 changes, blockers or Owner decisions. They must not repeat a completed summary.
-Chat messages are read together with `chat_read(inbox=True, unread_only=True)`;
+Chat messages are read together with `chat_read(inbox=True, unread_only=True, view="slim")`;
 worker completion results retain their existing separate interface. This change
 does not batch independent worker-monitor envelopes or add a new MCP tool.
+
+## Claude MCP channel delivery (preview)
+
+On eligible Claude Code installations, CM can use the native MCP
+`notifications/claude/channel` extension. The client renders a compact
+`← claude-manager: [cm-chat …] 2 new: #channel — sender: "first line…"` summary
+event instead of the peer socket's **“Another Claude session sent a message”**
+wrapper. This is a native meta event, with `origin.kind=channel` and
+`promptSource=system`; it does not edit or submit the user's composer. Claude's
+JSONL still calls an idle event a `type=user` record internally, but marks it
+`isMeta=true` and renders it as a channel event. Busy events queue until the
+client's checkpoint. There is no monitor-rearming requirement.
+
+Inbox pagination, acknowledgements, quiet Owner updates and peer authorization
+rules live in the MCP initialization instructions. Watch-specific result IDs
+and worker-completion payloads are retained on each relevant event. The channel
+does **not** declare `claude/channel/permission` or process approval replies.
+CM's existing subscription/mute/DND/batching policy still controls enqueueing.
+
+Enable on an execution host with `~/.cm/claude-notifications.json`:
+
+```json
+{"transport":"channel"}
+```
+
+The daemon and local TUI launch builders snapshot this preference into the
+per-session MCP configuration (`CM_CLAUDE_CHANNEL=1`, Claude engine only) and
+append `--dangerously-load-development-channels server:claude-manager`. The
+daemon acknowledges only the exact **Loading development channels** startup
+dialog listing **server:claude-manager alone** with the acceptance choice
+selected. It watches the current rendered screen for at most 30 seconds,
+sends at most one Enter, and cancels if the operator has typed. It never runs
+when adopting sessions after a brain restart and never accepts a tool approval
+or a dialog listing another development channel. Changed/unrecognized dialogs
+remain visible for manual handling.
+
+Absent, malformed, or `{"transport":"socket"}` preferences use the existing
+socket adapter. Existing processes retain their launch-time transport across
+MCP reconnects. Switching them requires an intentional restart/resume of that
+Claude process; deploying the daemon/MCP does not restart agents. A laptop TUI
+update alone cannot change an existing cloud process's transport.
+
+Claude's preview availability, first-party provider requirement and organization
+policy still apply. CM does not alter these gates. The flag is a per-entry
+allowlist opt-in, not a tool-permission override. SDK v1 (`mcp<2`) retains the
+legacy MCP negotiation required for this extension. Check Claude's startup
+notice if delivery remains unverified; launch opt-in is not registration proof.
+
+`notification_status().transport.adapter` distinguishes `claude-mcp-channel-v1`
+from `claude-own-child-v1`. `channel_write_only` means the MCP write completed;
+only an actual inbound record with the CM channel origin and event marker
+earns `observed`. User/assistant quotations and queue-enqueue records do not
+count. Unverified, failed or explicitly refused channel events are never
+retried via the peer socket or terminal; inspect the retained receipt instead.
+
+References: [Claude channels](https://code.claude.com/docs/en/channels),
+[channel wire reference](https://code.claude.com/docs/en/channels-reference).
+Verified against Claude Code 2.1.271; this remains a preview protocol.
+
+## Consumer handoff, delivery health and the stall alarm
+
+**Incident (2026-10-06).** Claude forked a running conversation into a new
+process (`claude bg-pty-host … --session-id <new> --fork-session --resume <old>`;
+the old transcript gained a `continued-in` record). The new client started its
+own CM MCP server, but the old client's server kept `consumer.lock` and kept
+writing channel events to a client that only logged `queue-operation enqueue`.
+66 notices stayed `submitted` for seven hours while `notification_status`
+reported connected/ready. The forked client was also launched **without**
+`--dangerously-load-development-channels server:claude-manager`, so even the
+new server's channel events were silently dropped.
+
+**Handoff.** A consumer waiting for `consumer.lock` files
+`takeover-<pid>.request` in the queue directory only while its own Claude
+session id (`CLAUDE_CODE_SESSION_ID`, else the parent's `--session-id`) is the
+daemon-bound transcript. The holder releases the lock only when it also has
+positive staleness evidence of its own: the bound transcript is not its
+session, its own transcript has a `continued-in` record, or three of its
+unobserved submissions were only enqueued (no later dequeue/remove). A holder
+keeps the lock at least 30 seconds after acquiring it, and a consumer that
+just handed off stands aside while its successor's request is fresh, so two
+live processes cannot alternate. The handed-off process stays a passive
+waiter and files no request (its session is not the bound one). An in-pane
+resume in the same process changes the bound transcript but starts no second
+MCP server, so there is no successor and no handoff.
+
+**Health.** `notification_status().health` is `ready`, `disconnected` or
+`degraded` with `reasons`: `unobserved_submissions` (submissions newer than
+the latest observation, unobserved for 5 minutes;
+`CM_NOTIFY_UNOBSERVED_DEGRADED_S`), `transcript_mismatch` (with stalled work
+or other evidence; alone it is informational), and `channels_disabled`.
+`transport.connected` is false while degraded. A later observation ends the
+condition; older lost submissions remain as history.
+
+**Channels disabled.** A channel consumer inspects its parent Claude
+process's command line (directly, or through CM's launcher shell). If the
+client lacks the `server:claude-manager` development-channel flag, the
+consumer keeps notices `pending` (still retractable, never ambiguously
+submitted) and reports `degraded: channels_disabled`. Unknown parentage is not
+evidence. A Claude bg/fork hand-off loses the channel flag; recover with CM
+**A-R** (restart/resume in place), which relaunches with the flag and the same
+UID and conversation. Reconnecting MCP does not change the client's flags.
+
+**Owner alarm.** The daemon delivery worker checks live Claude/Codex sessions
+every 30 seconds from the queue files themselves, so it works when the MCP
+process is the broken part. When a session's submissions stay unobserved (or,
+under `channels_disabled`, its notices stay pending) for 15 minutes
+(`CM_NOTIFY_STALL_ALERT_SECS` in the brain's environment), it raises one
+[Owner alert](../OWNER_NOTIFICATIONS.md) per episode naming the session, the
+count, the duration and the reason. Episode state is kept in
+`~/.cm/notifications/stall-alarms.state`. Acknowledging the alert does not
+re-raise it in the same episode; the next observation clears the episode and
+withdraws the alarm's own alert. It never replaces a pending agent alert for
+that session; it retries after Owner acknowledges that one.
+
+**Wake text.** Chat wakes now summarize the newest unread item (≤400 chars):
+`[cm-chat <id>] 3 new: #gpu-utilization — rl-scale-out: "rlso: A5 readmit
+FAILED…" (+2 more). Read with chat_read(inbox=True, unread_only=True,
+view="slim"), follow next_cursor, and ack the receipt.` plus at most one watch
+ID. The Claude channel adapter passes this text through unchanged (legacy long
+text is still reduced to the marker plus watch IDs). Batching and latch
+semantics are unchanged. `chat_read(view="slim")` is an MCP-side projection;
+the daemon adds `conversation_path` to read items for it.
 
 ## Store and delivery contract
 
@@ -150,6 +280,75 @@ frontend connects over a private Unix websocket relay. CM inserts
 `turn/start(input=[], toolOutput={name:"cm_notification", …})` on that same
 connection. Server approval requests and human decisions pass through unchanged.
 Native receipts require the named `function_call_output` transcript item.
+
+### Codex restart permissions (CLI 0.154)
+
+`A-R`, startup restore and the resume picker keep the selected conversation.
+Both local and cloud CM launches use Codex's `--remote` frontend. A resume
+therefore omits `--dangerously-bypass-approvals-and-sandbox`: Codex 0.154 rejects
+that combination with `Permission overrides are not supported when resuming a
+remote task.` This distinction is about Codex's frontend transport, not which
+machine hosts the checkout or where the original transcript was created.
+
+Without an explicit CM host policy, fresh launches retain the existing YOLO
+behavior and resumes inherit saved approval/current host sandbox settings.
+The launcher removes the legacy resume flag from older viewers and daemons.
+In 0.154, a new backend can restore saved `never` approval while resolving a
+restricted, network-disabled sandbox from host defaults. That combination
+rejects approval-required tools and can unexpectedly constrain resumed work.
+
+Owner's cloud hosts opt into this policy in `~/.cm/codex-permissions.json` (updated 2026-09-10 to remove the automatic review step):
+
+```json
+{"mode":"full-access-no-review"}
+```
+
+The shared launcher applies `approvalPolicy=never`,
+`approvalsReviewer=user`, and the `:danger-full-access` permission profile
+to thread start/resume/fork RPCs, with matching backend defaults. It sends no
+permission flag to the remote terminal frontend. This covers fresh work, A-R,
+the resume picker, startup restore and continuous-task launches on that host.
+Normal turns and native notification wakeups inherit the effective thread
+settings. User changes during the running conversation remain in effect; a
+new launch or frontend resume reapplies the configured host policy.
+
+Full access allows local filesystem and command-network access. Configure each MCP server and app with `default_tools_approval_mode="approve"`, including any per-tool `approval_mode` overrides, before disabling review: `never` alone rejects tools that still request approval. The explicit `approve` policy authorizes tools directly, without invoking the review model. An MCP server entry in user config must include its transport (command/args or URL); a policy-only entry fails validation when CM previously supplied the transport only through launch arguments. Preserve session-specific environment values in the launch context; never copy one worker's identity into host config. Provider limits, service credentials and CM session-control grants remain independent. CM does not fabricate approval responses. An invalid host policy file refuses launch; removing it restores the previous launch behavior. The older `full-access-auto-review` mode remains supported for installations that intentionally want `on-request` plus `auto_review`.
+
+Existing loaded threads can be repaired without restarting their processes:
+connect to their existing owning app-server, verify the ID in
+`thread/loaded/list`, and call `thread/settings/update` with `threadId` and the
+three policy fields above. Use `config/batchWrite` with `reloadUserConfig=true` to apply tool approval settings to each owning backend before switching its thread policy. Wait for `thread/settings/updated` before verifying;
+the RPC acknowledgment precedes application of the update. Settings broadcasts
+refresh the normal remote terminal frontend. An in-flight turn keeps its
+captured approval/sandbox policy; the next user turn or scheduled wake gets the
+repair. Do not start a second app-server writer or edit rollout JSONL to repair
+permissions. Record the prior settings for rollback and verify model, identity
+and process continuity.
+
+Older embedded Codex 0.153.4 processes have no external app-server settings endpoint. Their existing TUI can reload the tool configuration without a restart: at an idle boundary with an empty composer, open `/experimental` and press Enter with every feature left unchanged. That UI submits the current feature settings through `experimentalFeature/enablement/set`, whose handler reloads loaded-thread runtime configuration. Verify that the menu values still match the intended host settings before saving; the September 10 fleet had both Network proxy and Prevent sleep unchecked. Then select `/permissions` → **Full Access**, confirm the full-access dialog, reopen the menu to verify **Full Access (current)**, and exit the menu with an empty composer. A disposable real-client test changed an MCP transport marker and proved the next tool call used the refreshed transport in the same process. Selecting the same model does **not** provide this reload: session-default-only writes deliberately skip it. `/mcp` displays inventory and has no reload command.
+
+For continuous orchestrators, briefly pause new schedule admission only around the idle UI operation and restore the original pause state afterward. Leave busy sessions pending until their turn ends. Verify a subsequent live MCP call and the next turn's `never`/`user`/`danger-full-access` context, preserving process and conversation identity. The next normal CM restart/resume also adopts the configured launcher policy. Never start a competing writer or blindly restart pending work.
+
+The isolated real-client regression is
+`mcp_server/tests/integration_codex_resume.py` (requires aiohttp, pyte and
+websockets). It uses a private HOME, a local mock model, and disposable PTYs;
+`--legacy-argv` exercises an older viewer and `--fresh` verifies fresh YOLO
+behavior. The default verifies resumed identity, history, a completed next
+turn, and restrictive permissions on a host without this opt-in.
+`--cm-policy` verifies restoration from saved `never`/read-only state to full
+access with automatic review, including a native notification wake;
+`--live-repair` verifies settings broadcast adoption by the existing terminal
+and actual network access plus writes outside the workspace.
+`--legacy-argv --expect-rejection` records the original error against a pre-fix
+checkout.
+
+[OpenAI's plugin documentation](https://learn.chatgpt.com/docs/plugins) says
+to start a new Codex session after installing plugins. `A-R` restarts the
+process and resumes its existing conversation; that documentation alone does
+not establish that every newly installed plugin will load into a resumed
+conversation. Use a fresh Codex session when the new plugin is still absent.
+
+### Conversation identity and recovery
 
 Successful durable `thread/start`, `thread/resume`, and `thread/fork` replies track
 the foreground conversation. Ephemeral title jobs and subagent threads are
@@ -296,3 +495,7 @@ passed 73 messaging unit tests and 84 Python tests before deployment. Private
 binary/MCP backups, checksums, activation and stability evidence are under
 `~/.cm/deployments/chat-wake-batching-20260909T181428Z` on `cm-sessions`, with
 matching pre-deploy file backups on `cm-manager`.
+
+### Launcher startup bound (2026-09-17)
+
+The relay's first `initialize` handshake with its app-server waits `INITIALIZE_TIMEOUT_SECS` (60 s); later reconnect handshakes keep `HANDSHAKE_TIMEOUT_SECS` (10 s). Pre-fix every handshake had the 10 s bound: a burst of five continuous replacements in 70 s on cm-manager pushed app-server startup past it, the launcher exited 1 before a thread existed, the scheduler's supervisor respawned it, and each consumer respawn claimed and lost another queue batch (momentum-detective runs 699–701, 13 items re-enqueued by hand). A launcher that exits within about ten seconds of a spawn with `CM native Codex launcher: TimeoutError` on its PTY is this class.

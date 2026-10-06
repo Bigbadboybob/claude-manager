@@ -315,6 +315,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "list_tasks",
     "get_task",
     "list_initiatives",
+    "sidebar.list",
     "get_initiative",
     "backtest.result",
     "continuous.list",
@@ -415,8 +416,35 @@ pub fn dispatch_request(
         "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        // Reads the caller's session (when known) to report its
-        // own perms + scope; still pongs for unknown callers.
+        "sidebar.list" | "sidebar.assign" => {
+            if matches!(req.caller, Caller::Operator(_)) {
+                if let Err(resp) = require_operator(req, "Sidebar Operator calls require an authenticated Operator") {
+                    return DispatchOutcome::Done(resp);
+                }
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::sidebar::dispatch(&s, req))
+        }
+        "sidebar.publish" => {
+            if let Err(resp) = require_operator(req, "Sidebar publication is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::sidebar::dispatch(&s, req))
+        }
+        // Explicit Owner attention is self-scoped and survives viewer disconnects.
+        "notify_user" => {
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::notify(&s, req))
+        }
+        "owner_attention.ack" => {
+            if let Err(resp) = require_operator(req, "Owner attention acknowledgement is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::acknowledge(&s, req))
+        }
+        // Reads the caller's session (when known) to report its own scope.
         "ping" => DispatchOutcome::Done(dispatch_ping(state, req)),
 
         // `start_session` manages its own locking. The reaper
@@ -763,9 +791,23 @@ pub fn dispatch_request(
         // existing workspace's worktree. Both delegate to the shared
         // `start_session` spawn core. Session callers get Unauthorized —
         // agents use the Session-callable `mcp_start_session`.
+        "worktree.cleanup" => DispatchOutcome::Done(
+            if let Err(response) = require_operator(req, "Worktree cleanup is Operator-only") { response }
+            else { match crate::worktree_cleanup::rpc(&req.params) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err(error) => Response::err(req.id.clone(), ErrorCode::InvalidParams, error),
+            }}),
         "create_session" => {
             DispatchOutcome::Done(dispatch_create_session(state, req))
         }
+        // Kitty graphics passthrough: a viewer on another machine pulls the
+        // file a pane's image command names (doc/kitty-graphics-passthrough.md).
+        "graphics.read_file" => DispatchOutcome::Done(
+            if let Err(response) = require_operator(req, "graphics.read_file is Operator-only") { response }
+            else { match crate::graphics_file::rpc(&req.params) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err(error) => Response::err(req.id.clone(), ErrorCode::InvalidParams, error),
+            }}),
         "snapshot.control" => DispatchOutcome::Done(
             if let Err(response) = require_operator(req, "Snapshot catalog is Operator-only") { response }
             else { match methods::snapshot_control(state, &req.params) {
@@ -782,7 +824,7 @@ pub fn dispatch_request(
                 }
             })
         }
-        "add_session" => {
+        "add_session" | "session.resume" => {
             DispatchOutcome::Done(dispatch_add_session(state, req))
         }
 
@@ -815,6 +857,9 @@ pub fn dispatch_request(
         "continuous.checkpoint_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
+        "continuous.ensure_channel" => {
+            DispatchOutcome::Done(dispatch_continuous_ensure_channel(state, req))
+        }
         "continuous.force_done" => {
             DispatchOutcome::Done(dispatch_continuous_force_done(state, req))
         }
@@ -1132,6 +1177,9 @@ fn dispatch_add_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
     ) {
         return resp;
     }
+    if req.method == "session.resume" && req.params.get("resume_id").and_then(serde_json::Value::as_str).is_none() {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.resume requires resume_id");
+    }
     match methods::add_session(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
@@ -1289,6 +1337,19 @@ fn dispatch_continuous_run_now(state: &Arc<Mutex<DaemonState>>, req: &Request) -
 
 /// `continuous.delete` — Phase 2 CRUD. Operator-only; removes the on-disk
 /// `ContinuousTask` record directory.
+fn dispatch_continuous_ensure_channel(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.ensure_channel is Operator-callable only (task channels are scheduler-owned)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_ensure_channel(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 fn dispatch_continuous_delete(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     if let Err(resp) = require_operator(
         req,
@@ -2369,7 +2430,7 @@ fn bind_attach_stream(
     // session.attach already minted a ticket for a uid that has
     // since exited — surface as Conflict so the client knows the
     // attach can't proceed.
-    let (fanout_rx, last_exit) = match state.sessions.get_mut(&session_uid) {
+    let (fanout_rx, last_exit, replay_bytes) = match state.sessions.get_mut(&session_uid) {
         Some(session) => {
             // Apply the client's terminal size server-side, in the
             // same locked critical section that binds the stream.
@@ -2393,7 +2454,8 @@ fn bind_attach_stream(
                     );
                 }
             }
-            (session.fanout.subscribe_output(), session.last_exit.clone())
+            let (rx, replay_bytes) = session.fanout.subscribe_output_with_replay_len();
+            (rx, session.last_exit.clone(), replay_bytes)
         }
         None => {
             return DispatchOutcome::Done(Response::err(
@@ -2409,7 +2471,12 @@ fn bind_attach_stream(
 
     let response = Response::ok(
         req.id.clone(),
-        serde_json::json!({ "session_uid": session_uid.clone(), "output_flow": true }),
+        serde_json::json!({
+            "session_uid": session_uid.clone(),
+            "output_flow": true,
+            // Bytes of ring replay that precede live output on this stream.
+            "replay_bytes": replay_bytes,
+        }),
     );
     let handle = AttachStreamHandle {
         session_uid,
@@ -2458,7 +2525,19 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
     // to the lock duration we'd save with a typed serialize-from-
     // ref (workspaces is dozens of entries in normal use). Build
     // the JSON payload structure the client will deserialize.
+    let owner_attention = match crate::owner_attention::snapshot(state) {
+        Ok(alerts) => Some(alerts),
+        Err(e) => {
+            // A damaged attention sidecar must not disable session/exit updates.
+            eprintln!("cm-daemon: {e}; Owner alerts unavailable in manifest snapshot");
+            None
+        }
+    };
     let snapshot_payload = serde_json::json!({
+        "sidebar_assignments": crate::sidebar::snapshot(state).map_err(|(_, e)| {
+            eprintln!("cm-daemon: {e}; sidebar requests unavailable in snapshot");
+        }).ok(),
+        "owner_attention": owner_attention,
         "workspaces": state.workspaces,
         "bindings": state.bindings,
         "messaging_names": state.messaging_names,
@@ -2788,6 +2867,32 @@ mod tests {
         Arc::new(Mutex::new(s))
     }
 
+    #[test]
+    fn worktree_cleanup_rejects_session_callers_before_launching_helper() {
+        with_temp_home_dispatch(|| {
+            for action in ["preview", "apply", "status"] {
+                let response = dispatch_request(&make_state(), &session_request("worktree.cleanup",
+                    serde_json::json!({"action":action}), "ts-agent")).into_response();
+                assert_eq!(response.error.unwrap().code, ErrorCode::Unauthorized);
+            }
+            assert!(!std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cm/worktree-tools").exists());
+        });
+    }
+
+    #[test]
+    fn worktree_cleanup_operator_reads_host_local_receipt() {
+        with_temp_home_dispatch(|| {
+            let id = "ac815fc6-4fb2-4df4-9246-b81d149f44ef";
+            let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cm/worktree-cleanup");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{id}.json")), serde_json::json!({"id":id,"phase":"complete","results":[]}).to_string()).unwrap();
+            let response = dispatch_request(&make_state(), &operator_request("worktree.cleanup",
+                serde_json::json!({"action":"status","id":id}))).into_response();
+            assert!(response.ok, "{response:?}");
+            assert_eq!(response.result.unwrap()["phase"], "complete");
+        });
+    }
+
     // --- restart quiescence barrier (DESIGN_SEAMLESS_RESTART 2d) ------
 
     /// Barrier probe. `entered_total` is cumulative, so it can prove a
@@ -2902,6 +3007,7 @@ mod tests {
             "send_input",
             "kill_session",
             "session.revive",
+            "session.resume",
             "session.attach",
             "create_session",
             "add_session",
@@ -3968,6 +4074,40 @@ mod tests {
     }
 
     #[test]
+    fn graphics_cell_pixels_follow_resizes_without_pixel_sizes() {
+        // Image programs read the pane's pixel size from TIOCGWINSZ. A viewer
+        // with kitty graphics reports its cell size; later resizes that carry
+        // none (session.resize repair, older viewers) must scale it, not zero it.
+        let state = state_with_session("ts-live");
+        let mut s = state.lock().unwrap();
+        let sess = s.sessions.get_mut("ts-live").expect("live session");
+        sess.resize_with_cell_pixels(100, 40, Some((10, 20))).unwrap();
+        let size = sess.pty_size();
+        assert_eq!((size.pixel_width, size.pixel_height), (1000, 800));
+        sess.resize(50, 10).unwrap();
+        let size = sess.pty_size();
+        assert_eq!((size.cols, size.rows), (50, 10));
+        assert_eq!((size.pixel_width, size.pixel_height), (500, 200));
+    }
+
+    #[test]
+    fn graphics_attach_reports_replay_length() {
+        // Viewers must not answer terminal queries replayed from the ring,
+        // so the attach response says how many leading bytes are replay.
+        let state = state_with_session("ts-live");
+        state.lock().unwrap().sessions["ts-live"].fanout.push(b"\x1b[>qold output");
+        let outcome = dispatch_request(&state, &operator_request("attach.direct", serde_json::json!({
+            "uid": "ts-live",
+        })));
+        let DispatchOutcome::AttachStream { response, handle } = outcome else {
+            panic!("expected live stream");
+        };
+        let replay = handle.fanout_rx.recv().unwrap();
+        assert!(replay.ends_with(b"\x1b[>qold output"));
+        assert_eq!(response.result.unwrap()["replay_bytes"], serde_json::json!(replay.len()));
+    }
+
+    #[test]
     fn session_resize_session_caller_is_unauthorized() {
         // Operator-only: agents have no resize use case and a Session
         // caller resizing a sibling's PTY is pure griefing surface.
@@ -4224,6 +4364,18 @@ mod tests {
             ErrorCode::InvalidParams,
             "operator caller with malformed params should reach the methods layer",
         );
+    }
+
+    #[test]
+    fn resume_identity_operator_only_and_requires_a_conversation() {
+        let state = make_state();
+        let req = session_request("session.resume", serde_json::json!({"resume_id":"a"}), "ts-agent");
+        let denied = dispatch_request(&state, &req).into_response();
+        assert_eq!(denied.error.unwrap().code, ErrorCode::Unauthorized);
+        let req = operator_request("session.resume", serde_json::json!({}));
+        let missing = dispatch_request(&state, &req).into_response();
+        assert_eq!(missing.error.unwrap().code, ErrorCode::InvalidParams);
+        assert!(state.lock().unwrap().sessions.is_empty());
     }
 
     #[test]

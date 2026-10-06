@@ -194,6 +194,9 @@ pub fn write_claude_mcp_config(
     let path = dir.join("claude.json");
     let mut env = build_env(target, session_uid, workflow.as_ref());
     env.insert("CM_AGENT_ENGINE".into(), "claude-code".into());
+    if cm_daemon::claude_channels::enabled() {
+        env.insert("CM_CLAUDE_CHANNEL".into(), "1".into());
+    }
     // Route through the shared drift-proof launcher (`~/.cm/mcp/
     // launcher.sh`) — this config is frozen for the life of the agent
     // process, and a baked interpreter/checkout path here broke every
@@ -290,6 +293,7 @@ pub fn claude_args(
     args.push("--dangerously-skip-permissions".to_string());
     args.push("--mcp-config".to_string());
     args.push(mcp_config_path.to_string_lossy().to_string());
+    args.extend(cm_daemon::claude_channels::args(mcp_config_path));
     // S3 (async-wait branch): inject the cm Stop hook — identical
     // settings JSON to the daemon-side `build_args` twin (turn-end
     // reports + monitor-inbox drain; `--settings` hooks MERGE with
@@ -323,8 +327,11 @@ pub fn codex_args(
     let mut args: Vec<String> = Vec::new();
     if resume_session_id.is_some() {
         args.push("resume".into());
+    } else {
+        // Both local and cloud CM sessions use the native remote frontend.
+        // Codex resumes inherit saved permissions; overriding them is rejected.
+        args.push("--dangerously-bypass-approvals-and-sandbox".into());
     }
-    args.push("--dangerously-bypass-approvals-and-sandbox".into());
     // Disable codex's startup update check: when a new version is published,
     // accepting the popup tears down the TUI and exits with "Please restart
     // Codex", which inside our PTY looks like a blank/dead session.
@@ -620,6 +627,15 @@ mod tests {
         assert!(sid_pos > last_dash_c);
         // Workflow env present.
         assert!(args.iter().any(|a| a.contains(r#"CM_ROLE="manager""#)));
+        assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn codex_args_daemon_resume_inherits_saved_permissions() {
+        let args = codex_args(SpawnTarget::Daemon, "uid-x", None, Some("saved-id"));
+        assert_eq!(args.first().map(String::as_str), Some("resume"));
+        assert_eq!(args.last().map(String::as_str), Some("saved-id"));
+        assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
     }
 
     #[test]
@@ -644,6 +660,17 @@ mod tests {
         assert!(args.contains(&"--mcp-config".to_string()));
         assert!(args.contains(&"/tmp/x.json".to_string()));
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn claude_args_include_channel_opt_in_from_frozen_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(&path, r#"{"mcpServers":{"claude-manager":{"env":{"CM_CLAUDE_CHANNEL":"1"}}}}"#).unwrap();
+        for resume in [None, Some("saved")] {
+            let args = claude_args(&path, resume, &[]);
+            assert!(args.windows(2).any(|w| w[0] == cm_daemon::claude_channels::FLAG && w[1] == cm_daemon::claude_channels::ENTRY));
+        }
     }
 
     #[test]

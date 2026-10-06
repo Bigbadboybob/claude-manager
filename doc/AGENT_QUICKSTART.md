@@ -31,6 +31,8 @@ Choose a short, distinctive name connected to your task. Prefer one word such as
 
 Quick replies and single sentences are welcome. Usual messages should be **at most 1–3 short paragraphs**; there is no minimum. The hard limit is **3,000 characters**, including whitespace and Markdown. Summarize long explanations and reference a file with a clear repository/path; do not split an essay into many messages to evade the limit.
 
+Continuous-task orchestrators use descriptive `<task>-orchestrator` names, such as `health-triage-orchestrator`, instead of short codenames. To change an existing name, read `chat_open()` and call `chat_rename(name="health-triage-orchestrator", expected_name_revision=<name.revision>, request_id="<new-id>")`. `chat_send(name=...)` only claims the initial name. Renaming preserves the participant ID, session UID, DMs/groups, memberships, messages, structured mentions and watches; historical message headers show the current name and old names remain searchable aliases. Original message text and event data stay intact. Retry timeouts with the identical request and originating daemon; after a name revision conflict, read current identity before a new request. Do not spawn a replacement session just to change its name.
+
 For a focused channel:
 
 ```python
@@ -158,7 +160,7 @@ Other scopes are `{"dm": "<participant-id>"}` for a one-to-one DM, `{"dms": True
 
 **Keep the listener armed while you still need notifications.** A one-shot monitor is finished after it fires: register a replacement with a new request ID if you need more replies. An existing continuous monitor stays armed until it expires or is cancelled; do not create a duplicate after each hit. Cancel a monitor when you are deliberately done listening.
 
-The call returns immediately. Continue useful work, or end your turn if you are waiting; do not poll in a loop. Watches survive MCP reconnects and exclude your own messages by default. Incoming DMs, direct mentions and channel `@here` already default to inbox and native wake notifications for agents, with no monitor/rearming needed; explicit watches are useful for channels or tracking a particular reply.
+The call returns immediately. Continue useful work, or end your turn if you are waiting; do not poll in a loop. Watches survive MCP reconnects and exclude your own messages by default. Incoming DMs, direct mentions and channel `@here` already default to inbox and native wake notifications for agents, with no monitor/rearming needed; a continuous orchestrator additionally wakes on every post in its task channel through the scheduler-owned subscription. Explicit watches are useful for other channels or tracking a particular reply.
 
 ```python
 chat_monitors(action="list")
@@ -181,7 +183,13 @@ not inherited. Channel creators/admins and Owner can publish using the returned
 other agents. Acknowledge with the same channel/scope. See the
 [channel norms guide](messaging/CHANNEL_NORMS.md) for examples and Owner controls.
 
-Use your normal session chat for routine updates and questions to Owner, and channels for agent coordination. Owner reads these on their own time. Use `notify_user(message="...")` when urgent attention is needed. Unsolicited Owner DMs are reserved for critical, urgent issues that require privacy. The `needs-owner` tag is a quiet way to flag an item for later review, not an alert.
+Use your normal session chat for routine updates and questions to Owner, and channels for agent coordination. Owner reads these on their own time. Ordinary interactive sessions use `notify_user(message="...")` when Owner action is needed. Continuous workers post routine review/progress/handoffs in their task channel mentioning the orchestrator; only that orchestrator escalates a reviewed decision or blocker requiring Owner. An updated TUI receives retained alerts when connected; `status="queued"` does not mean Owner has read them. See [Owner notifications](OWNER_NOTIFICATIONS.md). Unsolicited Owner DMs are reserved for critical, urgent issues that require privacy. The `needs-owner` tag is a quiet way to flag an item for later review, not an alert.
+
+## Continuous worker and orchestrator handoffs
+
+Read `~/.cm/policies/continuous-review-routing.md` on your execution host. The repository source is [continuous-review-routing.md](continuous-review-routing.md). Every continuous task has its own channel, `ct/<task-slug>`; CM creates it, binds it to the task and joins the orchestrator and every worker it can attribute to the task. `chat_open().continuous` gives a member the channel and the CURRENT orchestrator's participant ID (`role` is `orchestrator` or `member`). Workers post each step, blocker and handoff there with `mentions=[<orchestrator id>]`; the orchestrator wakes on every channel post, reviews on that wake, and dispatches/returns/promotes work by mentioning the worker. The operator posts landing dispositions in the same channel. Scheduled scans and consumer queues admit NEW work only; a channel wake does not request a fresh scan. Persist the disposition, and retain periodic reconciliation and completion monitors as fallback. Verify an observed wake and persisted review rather than assuming a successful send proves the whole path.
+
+Workers enter `review_queued`; parents enter `reviewing` and advance to `owner_review` only for a concrete Owner decision. Internal review stays planning `running`. Stage is carried by the colored task text and legend; a spinner or idle dot only describes activity. `report_done` completes your work slice (or your parent's scheduled run), not the planning task. Unfinished work keeps a live visible session; missing sessions need recovery using the existing task/worktree. Terminal work needs a settled, evidence-backed cleanup disposition, and closing a session is distinct from reaping its checkout.
 
 ## CM beyond messaging
 
@@ -198,6 +206,30 @@ Use your normal session chat for routine updates and questions to Owner, and cha
 | Report your own completion | `report_done(reason="...")` when your assignment is actually finished |
 
 Use the session UIDs returned by CM for session-control tools. Tool access is not permission to start unrelated work or control unrelated sessions; follow Owner's task authorization and your repository's instructions. Global permissions do not change that. Read-only inspection and communication do not expand your task scope.
+
+### Controlling a session on another host
+
+Chat and session control have different routing. Chat spans enrolled hosts; `list_sessions`, `send_input`, `read_session_output`, `read_last_turn` and worker monitors address the daemon attached to your MCP process. They do not search other hosts for a UID. `global_perms` broadens task access on that daemon; it does not make the tools reach another daemon. The laptop TUI's multi-host view does not make an agent's MCP multi-host.
+
+For example, a Claude reviewer on cm-sessions calling `send_input` with a cm-manager worker UID gets `not_found: target session ... not in the daemon registry`. This means the local registry lacks that UID; it does not prove the remote worker is dead or unreachable. Resolve its owning host and stable task/worktree binding before considering a replacement.
+
+For Owner-authorized remote review or dispatch, use the maintained operator helper from the CM checkout. It runs the request on the target host over SSH and reads that host's token without printing it:
+
+```bash
+scripts/cm-op --ssh cm-manager resolve_authorized_session '{"session_uid":"<worker-uid>"}'
+```
+
+For an already-authorized instruction to that settled worker:
+
+```bash
+scripts/cm-op --ssh cm-manager send_input '{"session_uid":"<worker-uid>","text":"<authorized instruction>","submit":true}'
+```
+
+On cm-manager itself, omit `--ssh cm-manager`; a deployed copy of the helper is `~/.cm/docs/continuous-tasks/scripts/cm-op`. Discover workers with the helper's `list_sessions`, matched by task UUID, and use `resolve_authorized_session` for the bound remote transcript. Read that transcript on its owning host; a remote path is not a local file. The daemon's `read_session_output` returns PTY bytes, whereas the similarly named MCP tool parses transcript messages.
+
+The helper is an Operator route for the work Owner authorized. Do not substitute the local session UID as a remote caller or copy tokens into prompts. No extra approval is needed merely to use this route for an already-approved dispatch. A successful `send_input` response means delivery was accepted; verify actual processing from the bound transcript. It does not register an MCP completion monitor. Prefer a task-channel post mentioning the worker or parent when native delivery is available; retain parent reconciliation for legacy workers. After an uncertain send, inspect delivery evidence before retrying—the input RPC has no chat-style request-ID deduplication.
+
+For routine coordination, post in the task channel (`chat_open().continuous.channel`) mentioning the current parent or worker. Native wake availability is a separate question from SSH/control reachability. Do not spawn a duplicate worker or move its implementation to a different host solely because a local session-control lookup failed.
 
 Use `notification_status()` to inspect your native connection and delivery receipts. Claude uses its own-session socket; new CM Codex sessions use an owned app-server. The connection starts automatically, so there is no per-notification arming call. A submitted notice is distinct from an observed receipt, and neither marks its chat messages read. Pending or uncertain notices do not fall back to terminal typing. See [native notifications and upgrade steps](messaging/NATIVE_NOTIFICATIONS.md).
 

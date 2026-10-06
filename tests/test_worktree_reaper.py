@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -233,6 +235,32 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertEqual(manifest["source_worktree"], str(self.worktree))
         self.assertEqual(manifest["paths"], ["data/"])
         self.assertEqual(len(manifest["inventory"]), 1)
+
+    def test_archiving_a_fifo_does_not_block(self) -> None:
+        data = self.worktree / "data"
+        data.mkdir()
+        (data / "unique.txt").write_text("unique\n")
+        os.mkfifo(data / "control")
+        candidate = reaper.decision(self.worktree, self.context())
+        vault = self.base / "artifacts"
+
+        def hung(_signum: int, _frame: object) -> None:
+            raise TimeoutError("archiving blocked on a FIFO")
+
+        previous = signal.signal(signal.SIGALRM, hung)
+        signal.alarm(10)
+        try:
+            ok, archived, error = reaper.archive_ignored_paths(candidate, vault)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+
+        self.assertTrue(ok, error)
+        assert archived is not None
+        manifest = reaper.json.loads((archived / "manifest.json").read_text())
+        types = {entry["path"]: entry["type"] for entry in manifest["inventory"]}
+        self.assertEqual(types, {"data/unique.txt": "file", "data/control": "special"})
+        self.assertTrue((archived / "files" / "data" / "control").is_fifo())
 
     def test_artifact_gc_plans_old_unpinned_archives_only(self) -> None:
         root = self.base / "artifacts"

@@ -1,6 +1,8 @@
 # Native notification delivery: Claude Code and Codex
 
-Investigated 2026-09-07 against Claude Code **2.1.263** and Codex **0.153.4**. This supersedes the earlier preliminary note. This is a research result and recommendation; CM's deployed delivery implementation has not changed.
+Investigated 2026-09-07 against Claude Code **2.1.263** and Codex **0.153.4**. This supersedes the earlier preliminary note. This is the original research result and recommendation.
+
+Follow-up (2026-09-15): Claude Code 2.1.271 with Owner's eligible first-party account successfully registered an MCP channel and rendered its event while preserving an unsent draft. CM now has an opt-in channel adapter and scoped startup confirmation handling; see [current implementation and activation](NATIVE_NOTIFICATIONS.md#claude-mcp-channel-delivery-preview). The feature-disabled mock-client result below remains a valid negative case.
 
 **Both clients have ways to receive messages without terminal typing. My recommendation is a Claude adapter that posts from CM's MCP child process into that session's native inbox socket, and a Codex adapter that uses its native persistent queue.** Use an owned Codex app-server when lower latency or active-turn steering justifies changing session launch/ownership. Keep the CM message store, subscriptions, notification preferences, and receipts independent of these adapters.
 

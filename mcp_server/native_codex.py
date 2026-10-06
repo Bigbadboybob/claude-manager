@@ -16,6 +16,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import suppress
 from pathlib import Path
@@ -35,14 +36,91 @@ from mcp_server.notifications import (
 )
 
 
+def launch_permissions():
+    """Optional operator-owned policy for CM starts/resumes on this host.
+
+    Keeping this opt-in preserves intentionally restricted sessions on other
+    installations. Codex still validates its managed requirements normally.
+    """
+    path = Path.home() / ".cm" / "codex-permissions.json"
+    try:
+        policy = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    if policy == {"mode": "full-access-auto-review"}:
+        approval_policy, reviewer = "on-request", "auto_review"
+    elif policy == {"mode": "full-access-no-review"}:
+        approval_policy, reviewer = "never", "user"
+    else:
+        raise ValueError(f"unsupported CM Codex permissions in {path}")
+    return {
+        "approvalPolicy": approval_policy,
+        "approvalsReviewer": reviewer,
+        "permissions": ":danger-full-access",
+    }
+
+
+# A frontend that lost its relay websocket retries a few times on its own,
+# then gives up for good ("Reconnect failed — check the endpoint, then
+# relaunch") while the app-server thread stays healthy. Observed 2026-09-15 on
+# three of 63 live panes, one of them an orchestrator whose fires are pasted
+# into that pane. CM relaunches the frontend against the same app-server after
+# this many seconds without a terminal websocket, a bounded number of times.
+# A fresh app-server answers `initialize` in well under a second when idle, but a
+# burst of spawns (five continuous replacements in 70 s on 2026-09-17) pushed it past
+# the old 10 s bound and the launcher exited 1 before any thread existed; the
+# scheduler's supervisor then respawned, and each consumer respawn claimed and lost
+# another queue batch. Only the first handshake gets the long bound; reconnect
+# handshakes keep the short one so a dead backend is still detected quickly.
+HANDSHAKE_TIMEOUT_SECS = 10
+INITIALIZE_TIMEOUT_SECS = 60
+FRONTEND_DETACH_GRACE_SECS = 45.0
+FRONTEND_RESPAWN_LIMIT = 6
+
+
+class FrontendAttachment:
+    """Relay-side bookkeeping of whether a terminal frontend is attached."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.detached_since = clock()
+
+    def attached(self):
+        self.detached_since = None
+
+    def detached(self):
+        if self.detached_since is None:
+            self.detached_since = self.clock()
+
+    def detached_for(self):
+        return None if self.detached_since is None else self.clock() - self.detached_since
+
+    def exit_followed_detach(self, settle_secs=5.0):
+        """A frontend that quit while already detached for longer than a clean
+        close-then-exit takes was stranded, not dismissed by the operator."""
+        gap = self.detached_for()
+        return gap is not None and gap > settle_secs
+
+
+def apply_launch_permissions(params, policy):
+    """Set explicit thread policy, without conflicting legacy sandbox fields."""
+    if policy is None:
+        return params
+    params = dict(params)
+    params.pop("sandbox", None)
+    params.update(policy)
+    return params
+
+
 class Relay:
     engine = "codex"
 
-    def __init__(self, socket: str, queue: Queue):
+    def __init__(self, socket: str, queue: Queue, permissions=None):
         self.socket = socket
         self.queue = queue
         self.upstream = None
         self.frontend = None
+        self.attachment = FrontendAttachment()
         self.thread = None
         self.init_request = None
         self.init_result = None
@@ -58,6 +136,7 @@ class Relay:
         self.identity_revision = 0
         self.selecting = set()
         self.report_tasks = set()
+        self.launch_permissions = permissions
 
     def identity(self):
         return {
@@ -165,14 +244,14 @@ class Relay:
             open_timeout=3,
         )
 
-        async def handshake(method, params):
+        async def handshake(method, params, timeout=HANDSHAKE_TIMEOUT_SECS):
             self.sequence += 1
             request_id = self.prefix + str(self.sequence)
             await self.upstream.send(
                 json.dumps({"id": request_id, "method": method, "params": params})
             )
             while True:
-                message = json.loads(await asyncio.wait_for(self.upstream.recv(), 10))
+                message = json.loads(await asyncio.wait_for(self.upstream.recv(), timeout))
                 if message.get("id") == request_id and (
                     "result" in message or "error" in message
                 ):
@@ -183,7 +262,7 @@ class Relay:
 
         try:
             if self.init_request is not None:
-                await handshake("initialize", self.init_request)
+                await handshake("initialize", self.init_request, timeout=INITIALIZE_TIMEOUT_SECS)
                 await self.upstream.send(json.dumps({"method": "initialized"}))
                 if self.thread:
                     result = await handshake(
@@ -259,13 +338,27 @@ class Relay:
                         ConnectionError("native backend connection lost")
                     )
 
+    async def detached_for(self, grace):
+        """Resolve once no terminal frontend has been attached for `grace` seconds."""
+        while True:
+            gap = self.attachment.detached_for()
+            if gap is not None and gap >= grace:
+                return
+            await asyncio.sleep(1.0)
+
     async def serve_frontend(self, ws):
         if self.frontend:
-            await ws.close(
-                code=1013, reason="CM session already has a terminal frontend"
-            )
-            return
+            # The newest terminal wins: a frontend that dropped its websocket
+            # without a close frame and reconnects from the same process must
+            # not be refused because the relay still holds the dead socket.
+            stale = self.frontend
+            self.frontend = None
+            with suppress(ConnectionClosed, OSError):
+                await stale.close(
+                    code=1012, reason="superseded by a newer CM terminal frontend"
+                )
         self.frontend = ws
+        self.attachment.attached()
         try:
             async for raw in ws:
                 message = json.loads(raw)
@@ -290,6 +383,10 @@ class Relay:
                     for request in list(self.server_requests.values()):
                         await ws.send(json.dumps(request))
                 if "id" in message and method:
+                    if method in {"thread/start", "thread/resume", "thread/fork"}:
+                        message["params"] = apply_launch_permissions(
+                            message.get("params", {}), self.launch_permissions
+                        )
                     self.requests[request_id] = method
                     if method in {
                         "thread/start",
@@ -319,7 +416,9 @@ class Relay:
         except (ConnectionClosed, OSError):
             pass
         finally:
-            self.frontend = None
+            if self.frontend is ws:
+                self.frontend = None
+                self.attachment.detached()
 
     async def send(self, event):
         if not self.ready.is_set() or self.selecting or not self.thread:
@@ -372,7 +471,7 @@ class Relay:
         await asyncio.gather(*self.report_tasks, return_exceptions=True)
 
 
-def split_args(args):
+def split_args(args, permissions=None):
     """CM-generated embedded argv -> backend configuration + remote UI intent."""
     args = list(args)
     resume = None
@@ -388,16 +487,20 @@ def split_args(args):
             backend.extend(args[index : index + 2])
             index += 2
         elif arg == "--dangerously-bypass-approvals-and-sandbox":
-            # Exactly CM's existing launch policy, applied to the backend.
-            backend.extend(
-                [
-                    "-c",
-                    'approval_policy="never"',
-                    "-c",
-                    'sandbox_mode="danger-full-access"',
-                ]
-            )
-            frontend.append(arg)
+            # Fresh sessions retain CM's launch policy. A remote resume must
+            # inherit its stored permissions: Codex 0.154 rejects this flag.
+            # Older viewers/daemons still send it, so normalize at the shared
+            # launcher too, without injecting a backend permission override.
+            if resume is None and permissions is None:
+                backend.extend(
+                    [
+                        "-c",
+                        'approval_policy="never"',
+                        "-c",
+                        'sandbox_mode="danger-full-access"',
+                    ]
+                )
+                frontend.append(arg)
             index += 1
         elif arg == "--no-alt-screen":
             frontend.append(arg)
@@ -406,6 +509,15 @@ def split_args(args):
             raise ValueError(f"unsupported CM Codex launch argument: {arg}")
     if resume:
         frontend.extend(["resume", resume])
+    if permissions is not None:
+        # The remote resume frontend rejects permission flags. Set the backend
+        # defaults and explicit thread RPC instead. Tool-level direct approval
+        # is configured separately; `never` alone rejects prompted MCP calls.
+        backend.extend([
+            "-c", "approval_policy=" + json.dumps(permissions["approvalPolicy"]),
+            "-c", "approvals_reviewer=" + json.dumps(permissions["approvalsReviewer"]),
+            "-c", 'sandbox_mode="danger-full-access"',
+        ])
     return backend, frontend
 
 
@@ -445,7 +557,8 @@ async def launch(args):
     ):
         os.environ.pop(key, None)
     queue = Queue.own()
-    backend_args, frontend_args = split_args(args.codex_args)
+    permissions = launch_permissions()
+    backend_args, frontend_args = split_args(args.codex_args, permissions)
     binary = os.environ.get("CM_CODEX_BIN", "codex")
     backend = frontend = relay = consumer = None
     stop = asyncio.Event()
@@ -484,7 +597,7 @@ async def launch(args):
                 raise RuntimeError(
                     f"Codex app-server startup timed out; see {log_path}"
                 )
-            relay = Relay(backend_socket, queue)
+            relay = Relay(backend_socket, queue, permissions)
             await relay.connect()
             async with unix_serve(
                 relay.serve_frontend,
@@ -493,44 +606,76 @@ async def launch(args):
                 max_size=None,
             ):
                 consumer = asyncio.create_task(consume_supervised(queue, relay))
-                frontend = await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    str(Path(__file__).with_name("native_process.py")),
-                    "--exec-child",
-                    str(os.getpid()),
-                    binary,
-                    "--remote",
-                    "unix://" + frontend_socket,
-                    *frontend_args,
-                )
-                waiters = [
-                    asyncio.create_task(frontend.wait()),
-                    asyncio.create_task(backend.wait()),
-                    asyncio.create_task(stop.wait()),
-                    relay.reader,
-                    consumer,
-                ]
-                done, _ = await asyncio.wait(
-                    waiters, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in waiters[:3]:
-                    task.cancel()
-                await asyncio.gather(*waiters[:3], return_exceptions=True)
-                if relay.reader in done and backend.returncode is None:
-                    # Do not attach a second app-server to a live conversation.
-                    # A broken ownership connection is explicit and recoverable
-                    # with normal CM restart/resume; queued wakes stay durable.
-                    raise RuntimeError("Codex native ownership connection closed")
-                if consumer in done:
-                    await consumer
-                    raise RuntimeError("Codex native notification consumer stopped")
-                if (
-                    backend.returncode is not None
-                    and frontend.returncode is None
-                    and not stop.is_set()
-                ):
-                    raise RuntimeError(f"Codex app-server exited; see {log_path}")
-                return frontend.returncode or 0
+
+                async def spawn_frontend():
+                    return await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        str(Path(__file__).with_name("native_process.py")),
+                        "--exec-child",
+                        str(os.getpid()),
+                        binary,
+                        "--remote",
+                        "unix://" + frontend_socket,
+                        *frontend_args,
+                    )
+
+                respawns = 0
+                frontend = await spawn_frontend()
+                while True:
+                    detach = asyncio.create_task(
+                        relay.detached_for(FRONTEND_DETACH_GRACE_SECS)
+                    )
+                    waiters = [
+                        asyncio.create_task(frontend.wait()),
+                        asyncio.create_task(backend.wait()),
+                        asyncio.create_task(stop.wait()),
+                        detach,
+                        relay.reader,
+                        consumer,
+                    ]
+                    done, _ = await asyncio.wait(
+                        waiters, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in waiters[:4]:
+                        task.cancel()
+                    await asyncio.gather(*waiters[:4], return_exceptions=True)
+                    if relay.reader in done and backend.returncode is None:
+                        # Do not attach a second app-server to a live conversation.
+                        # A broken ownership connection is explicit and recoverable
+                        # with normal CM restart/resume; queued wakes stay durable.
+                        raise RuntimeError("Codex native ownership connection closed")
+                    if consumer in done:
+                        await consumer
+                        raise RuntimeError("Codex native notification consumer stopped")
+                    if (
+                        backend.returncode is not None
+                        and frontend.returncode is None
+                        and not stop.is_set()
+                    ):
+                        raise RuntimeError(f"Codex app-server exited; see {log_path}")
+                    if stop.is_set() or backend.returncode is not None:
+                        return frontend.returncode or 0
+                    stranded = (
+                        detach in done
+                        or (frontend.returncode is not None and relay.attachment.exit_followed_detach())
+                    )
+                    if not stranded:
+                        # The operator quit the terminal while it was attached.
+                        return frontend.returncode or 0
+                    respawns += 1
+                    if respawns > FRONTEND_RESPAWN_LIMIT:
+                        raise RuntimeError(
+                            "Codex terminal frontend kept detaching from its CM relay; see "
+                            f"{log_path}"
+                        )
+                    print(
+                        f"CM native Codex launcher: terminal frontend detached "
+                        f"(relaunch {respawns}/{FRONTEND_RESPAWN_LIMIT}); app-server thread kept",
+                        file=sys.stderr,
+                    )
+                    await terminate(frontend)
+                    relay.attachment.detached()
+                    frontend = await spawn_frontend()
         finally:
             if consumer:
                 consumer.cancel()

@@ -6,6 +6,14 @@ Fresh work uses the configured default host (`sessions`); launch dialogs also
 allow explicit local execution. Existing workspaces retain their owning host.
 Continuous orchestrators remain on `manager`.
 
+Owner's cloud hosts enable `~/.cm/codex-permissions.json` with
+`{"mode":"full-access-no-review"}` for Codex: full filesystem/network access,
+`approval_policy=never`, and direct approval of configured MCP/app tools. This
+policy covers fresh and resumed sessions, including continuous workers. `never`
+alone rejects tools that still need approval; pair it with their explicit
+`default_tools_approval_mode="approve"` settings. See
+[Codex permissions and live repair](doc/messaging/NATIVE_NOTIFICATIONS.md#codex-restart-permissions-cli-0154).
+
 ## Repository workflow
 
 Work on branches and merge tested changes directly into `main`. Owner does not use pull requests in this repository; do not create them.
@@ -19,6 +27,16 @@ sockets, temporary files and networking while keeping the source read-only.
 Use a private `CARGO_TARGET_DIR`; the shared target also serves live binaries.
 See [cloud responsiveness verification](doc/cloud-responsiveness-fixes.md).
 
+## Task worktree cleanup
+
+In the work view, Alt+d offers **Keep worktrees** (default) or immediate cleanup
+of the selected task and tracked descendants. Alt+Shift+w offers workspace
+closure without changing planning task status. Cleanup runs durably on the
+owning hosts, retains branches and useful artifacts, and protects active,
+shared, pinned and continuous work. Raw `git worktree add` is tracked through a
+chained hook; bypassed hooks and unknown historical ancestry require explicit
+registration. See [task cleanup and recovery](doc/task-worktree-cleanup.md).
+
 ## Global TUI settings
 
 **F9** opens Global Settings in any view. Section tint strength defaults to 2×;
@@ -30,13 +48,15 @@ See [sidebar appearance settings](doc/sidebar-sections.md#layout).
 
 Use the `claude-manager` MCP tools to inspect your context (`ping`), look up work (`list_tasks`, `get_task`), file draft tasks (`propose_task`), delegate authorized work (`start_session`, `create_subtask`), and communicate with other sessions (`chat_open`, `chat_read`, `chat_send`). Start workers in separate worktrees when appropriate, and use background monitors to follow their progress.
 
-Messaging is primarily for agent-to-agent coordination. Owner mostly observes the board and may use it to address groups. Owner's primary way of communicating with agents is still prompting them directly in their sessions. Keep routine updates and questions to Owner in your normal session chat.
+Messaging is primarily for agent-to-agent coordination. Owner mostly observes the board and may use it to address groups. Owner's primary way of communicating with agents is still prompting them directly in their sessions. Every continuous task has its own channel (`ct/<slug>`, daemon-created; the orchestrator and its workers are joined automatically and `chat_open().continuous` names the current orchestrator). Workers post routine review/progress/handoffs there mentioning the orchestrator, the orchestrator answers on the wake by mentioning the worker, and the operator posts landing dispositions in the same channel; only the orchestrator escalates a reviewed decision requiring Owner. Keep scheduled scans/reconciliation as fallback. Show the durable task stage separately from agent activity and preserve live visible sessions for unfinished work. See [continuous reviews and stages](doc/continuous-review-routing.md). Ordinary interactive sessions use `notify_user(message="...")` when Owner action is needed. Local, cloud, and continuous sessions use the same self-scoped alert; the daemon retains it for the updated laptop TUI. See [Owner notifications](doc/OWNER_NOTIFICATIONS.md).
 
 Use `#cm-general` for Claude Manager usage, coordination, upcoming changes, and release notes. When working on CM changes that affect agents or Owner, post a concise advance notice once the plan is concrete, then a follow-up when the change is available, with relevant usage-guide links and any required action. Owner has requested these channel announcements; no additional confirmation is needed. Channels span projects in a space; paired hosts share that space through opt-in sync. Check `chat_open.sync` for actual enrollment/connection status. See `doc/messaging/CROSS_MACHINE.md` for usage and the explicit rollout procedure; building the code alone does not enable sharing.
 
 The short [agent guide](mcp_server/AGENT_GUIDE.md) is also supplied automatically in the MCP initialization response, so agents in other repositories receive the same introduction. It covers session identity, tool discovery, first-message names, shared norms, group DMs, and Owner's quiet-inbox convention. Quick messages are welcome; usual posts are at most 1–3 short paragraphs, with a 3,000-character hard limit and file references for longer material. A standalone space stays local until explicit pairing/handoff enables cross-machine sync.
 
 New MCP connections receive the current guide and tool schemas. Reconnect MCP in existing agents after an upgrade; no session restart is required just to reconnect tools.
+
+The scheduler names each continuous-task orchestrator `<task_id>-orchestrator` (for example `health-alert-triage-orchestrator`) when it binds the session to the task channel, releasing the name from the previous instance; names ending in `-orchestrator` are reserved and any other claim is refused, so workers pick a short codename (ideally their subtask id). Agents can rename themselves with `chat_rename(name=..., expected_name_revision=<chat_open().name.revision>, request_id=...)`. Messages, DMs/groups, memberships, mentions and watches stay attached to the stable participant UID, and old names remain aliases. `chat_send(name=...)` only claims the initial name. Shared policy: [continuous reviews and stages](doc/continuous-review-routing.md), deployed at `~/.cm/policies/continuous-review-routing.md` for orchestrators in every project.
 
 Join existing channels before posting with `chat_channels(action="join", path="...", request_id="...")`. Creators join automatically; `#general` and `#cm-general` are joined by default. Incoming DMs, direct mentions and channel `mention_here=True` use native notifications without monitor rearming. Body text and topic tags alone never notify. See [membership and mentions](doc/messaging/MEMBERSHIP_AND_MENTIONS.md).
 
@@ -143,6 +163,7 @@ A workflow is a TOML-defined state machine of agent roles running as sibling ses
 
 Global:
 - `A-t` — toggle Sessions / Planning
+- `A-?` — show/hide shortcut hints in Sessions and Planning; saved in `~/.cm/tui-sessions.json` and restored on viewer restart
 - `A-q` — quit
 - `A-j/k` — navigate
 - `A-d` — mark task done
@@ -157,7 +178,7 @@ Sessions view:
 - `A-H` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden). Moved from `A-h`; the old `A-H` active-host switcher is retired (new work uses the configured default host).
 - `A-h` / `A-l` — move the sidebar cursor LEFT / RIGHT between the main column and the **continuous column** (when the continuous column is shown; see `A-c`). `A-j`/`A-k` stay vertical within the focused column. See `DESIGN_CONTINUOUS_PANEL.md`.
 - `A-c` — toggle the dedicated **continuous column** (orchestrators with their spawned subtasks nested) on/off. This is the single continuous control: ON = a third pane splits off the right (terminal | main | continuous) showing the continuous tree; OFF = continuous tasks are hidden entirely. Continuous tasks (an orchestrator + its subtasks, matched by `managed_by_uid` **or** task-tree `parent_task_id` **or** — for same-task workers like momentum-detective's ephemeral `detective-*` spawns, which carry the orchestrator's own `task_id` and no subtask — `managed_by_uid.is_some() && task_id == orchestrator.task_id`, so they group correctly across orchestrator respawns; pre-fix a prior instance's worker fell into the main sidebar the moment the scheduler respawned its parent) render **only** in this column — never in the main sidebar. Persisted. (The old `A-C` column toggle + the separate `A-c` master-hide were merged into this one key.)
-- `A-N` — **new sidebar section** (doc/sidebar-sections.md). Sections are Owner-created, collapsible groups of workspaces in the Task sub-view, stored in the local manifest (`sections` + `workspace_sections` sidecars) — pure display, orthogonal to subtasks, never visible to agents or the planning API. Sections render first (in display order), loose workspaces after. On a section header: `Space`/`Enter` fold/unfold, `A-e` rename/recolor, `A-x` delete (members become loose), `A-J`/`A-K` reorder, `A-i` peek members, and `A-n` creates the new workspace INSIDE the section. Membership: the **Section** field on the workspace / task `A-e` forms (`auto` = inherit, `none` = explicitly loose, or a section); a workspace with no explicit choice inherits its parent task's section through `parent_task_id` (so an agent's `create_subtask` lands under its parent's project) or, for `propose_task` rows, through `metadata.filer.task_id`. `A-n` while focused on any row inside a section also joins it. Status sub-view is unchanged (flat).
+- `A-N` — **new sidebar section** (doc/sidebar-sections.md). Sections are Owner-created, collapsible groups of workspaces in the Task sub-view, stored in the local manifest (`sections` + `workspace_sections` sidecars) — pure display, orthogonal to subtasks and planning initiatives. Agents can discover sections with `list_sidebar_sections` and queue workspace moves with `set_session_section`; see the guide for scope and delivery receipts. Sections render first (in display order), loose workspaces after. On a section header: `Space`/`Enter` fold/unfold, `A-e` rename/recolor, `A-x` delete (members become loose), `A-J`/`A-K` reorder, `A-i` peek members, and `A-n` creates the new workspace INSIDE the section. Membership: the **Section** field on the workspace / task `A-e` forms (`auto` = inherit, `none` = explicitly loose, or a section); a workspace with no explicit choice inherits its parent task's section through `parent_task_id` (so an agent's `create_subtask` lands under its parent's project) or, for `propose_task` rows, through `metadata.filer.task_id`. `A-n` while focused on any row inside a section also joins it. Status sub-view is unchanged (flat).
 - `A-e` — settings for the focused row (Tab cycles fields; Space toggles checkboxes; Space/←/→ cycles color pickers). On a **session**: label, idle/burst timers, hidden, notify-on-idle, **global perms**, accent color, and **Transcript** (Enter opens the same picker as A-s's Resume field and rebinds the row — repair a mis-detected binding, or point a dead row at the right conversation before `A-R` revives it; the pick applies immediately and closes the form, so save other edits first). On a live session a rebind is metadata only: the pane keeps its conversation until you run `/resume <id>` in it, after which the binding follows on its own (below). On a **workspace**: name, accent color (cascades to its sessions), **pinned** (pinned workspaces sort to the top of the sidebar with a 📌 marker), **section** (see `A-N`). On a **task** subheader: name, accent color (stored TUI-side in the manifest's `task_colors` sidecar — tasks live in the planning API), **section** (applies to the task's workspace). On a **section header**: name, accent color. Colors come from the named `USER_COLORS` palette and tint the row in the sidebar; selection highlight still overrides.
 - `A-v` — toggle Status / Task sub-view
 - `A-g` — jump to the next session needing attention (pending `notify_user` alerts first, then idle sessions; wraps, crosses into the continuous column)
@@ -166,7 +187,9 @@ Sessions view:
 - `A-i` — detail peek: read-only overlay with the focused row's bound task (name, status, full prompt — "what was this agent asked to do"), or workspace/session info when unbound. j/k / PgUp/PgDn scroll.
 - `A-'` — yank the focused session's last assistant message to the clipboard (OSC 52, works over SSH; ~100KB cap with truncation notice)
 - `A-r` — refresh
-- `A-R` — **revive / restart** the focused session in place: same uid, label, and task binding, with the conversation resumed (claude `--resume` / codex `resume`; bash respawns fresh). On a **dead** session it's a revive; on a **live** session it's a forced restart — the TUI kills the daemon child, waits (bounded ~2s) for the reaper to clear the uid, then runs the same revive flow (use case: pick up an updated agent binary/model without losing the conversation). Local sessions re-run the startup-restore primitive for one slot (re-attach if the daemon still holds the uid live, else respawn-resumed); remote sessions go through the daemon's `session.revive` RPC (argv/env composed daemon-side) and then auto-reattach via the deferred-reattach flow. Workflow participants are refused (the workflow engine owns their lifecycle — `A-u` resumes the run), as are continuous sessions (scheduler-owned).
+- `A-R` — **revive / restart** the focused session in place: same uid, label, and task binding, with the conversation resumed (claude `--resume` / codex `resume`; bash respawns fresh). On a **dead** session it's a revive; on a **live** session it's a forced restart — the TUI kills the daemon child, waits (bounded ~2s) for the reaper to clear the uid, then runs the same revive flow (use case: pick up an updated agent binary/model without losing the conversation). Local sessions re-run the startup-restore primitive for one slot (re-attach if the daemon still holds the uid live, else respawn-resumed); remote sessions go through the daemon's `session.revive` RPC (argv/env composed daemon-side) and then auto-reattach via the deferred-reattach flow. Workflow participants are refused (the workflow engine owns their lifecycle — `A-u` resumes the run), as are continuous sessions (scheduler-owned). Codex resumes omit CM permission overrides for compatibility with the remote frontend; fresh sessions retain YOLO. See [restart permissions](doc/messaging/NATIVE_NOTIFICATIONS.md#codex-restart-permissions-cli-0154).
+
+**Alt+s Resume preserves identity.** Local and cloud Resume reuse the original inactive CM UID and saved task, parent, workspace, permissions and session preferences. Running conversations are refused; attach to them instead. Keeping the UID on the same daemon preserves chat identity. Snapshot seeds still create a new identity. See [session resume and recovery](doc/session-resume-identity.md).
 
 **Transcript binding follows the daemon.** The daemon is the only party that learns about an in-pane `/resume` or `/clear` (the Stop hook reports the live transcript path every turn → `session.turn_ended` re-stamps the resume key) and about codex rollout rotations (the `/proc` watcher → `session.set_transcript_path`). Both now BROADCAST a manifest `Updated` carrying `transcript_path` + `transcript_id`, the TUI mirrors it onto the row (`apply_transcript_from_diff`, via `rebind_transcript`), and every `manifest.watch` (re)connect converges rows on the snapshot's ids. So `A-R`, a user-owned row's startup restore, tombstones, and `read_session_output` all resume the conversation the pane is actually in. Pre-fix the TUI's detector bound once at spawn and never looked again, so after an in-pane `/resume` every TUI-driven respawn resumed the throwaway spawn-time conversation and the operator had to `/resume` again (and the ESmisc codex row was revived into an unrelated test thread its spawn-time guess had picked). Needs the daemon rebuilt for the broadcast half; the TUI half is harmless against an old daemon (no diffs carry the field).
 
@@ -234,6 +257,8 @@ gcloud compute ssh cm-manager --zone=us-east4-a --project=claude-manager-prod \
 ```
 
 Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + restart. The MCP server is installed both on user machines (for local sessions) and at `/opt/cm-daemon/mcp_server/` on cm-manager and cm-sessions (for sessions running against those daemons). Local edits take effect on next local MCP spawn; remote edits need the complete MCP payload copied and a brain-only `daemon.restart` through `scripts/cm-op --ssh <host>` (see Multi-host and HOWTO_HOLDER_BRAIN_SPLIT.md).
+
+The task list reaches the TUI through the incremental feed `GET /tasks/changes` (trigger-fed `task_changes` log, long poll, gzip; see [doc/task-change-feed.md](doc/task-change-feed.md)) — never reintroduce a periodic full `GET /tasks` poll in a viewer: one always-on 5 s poller was ~80 GiB/day (≈$278/month) before 2026-09-10.
 
 The TUI runs on the laptop. For cloud-built viewer updates, follow [doc/TUI_RELEASES.md](doc/TUI_RELEASES.md): build in a private cache, stage a checksum-verified SSH installer, then install on the laptop and reopen only the TUI. A cloud build does not update the laptop, and a TUI-only change needs no daemon restart. The `cm-tui-release` skill points to this runbook.
 

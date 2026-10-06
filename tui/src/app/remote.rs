@@ -166,7 +166,7 @@ impl App {
     /// `try_reattach_remote_session` so the OFF-THREAD attach worker can do the
     /// (blocking, tunnel-bound) attach while the MAIN thread does only this
     /// (cheap) slot build when the result comes back.
-    fn build_remote_terminal_session(
+    pub(super) fn build_remote_terminal_session(
         entry: &ManifestEntry,
         session: crate::session::Session,
     ) -> TerminalSession {
@@ -899,15 +899,22 @@ impl App {
     /// a given-up entry stayed "preserved in skipped" forever, so every
     /// killed momentum-detective worker left an EMPTY `agent: detective-*`
     /// header on the sidebar after a TUI restart (the daemon had long
-    /// dropped it; nothing could ever reattach). User-owned and workflow
-    /// entries keep the preserve behavior (offline-host data-loss guard).
+    /// dropped it; nothing could ever reattach). Also settle scheduler-owned
+    /// incarnations and saved exits of Done tasks: these can lack managed_by.
+    /// Other user-owned and workflow entries keep the preserve behavior.
     /// Returns true when the entry was settled.
     fn settle_gone_agent_entry(
         &mut self,
         ws_id: &str,
         entry: &cm_daemon::manifest::ManifestEntry,
     ) -> bool {
-        if entry.managed_by_uid.is_none() || entry.workflow_run_id.is_some() {
+        let completed_exit = entry.last_exit.is_some()
+            && entry.task_id.as_ref().is_some_and(|id| self.sidebar_done_task_ids.contains(id));
+        if entry.workflow_run_id.is_some()
+            || (entry.managed_by_uid.is_none()
+                && entry.continuous_task_id.is_none()
+                && !completed_exit)
+        {
             return false;
         }
         let Some(ws_idx) = self.workspaces.iter().position(|w| w.id == ws_id) else {
@@ -930,6 +937,7 @@ impl App {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
             ws.tombstones.push(cm_daemon::manifest::SessionTombstone {
+                entry: Some(entry.clone()),
                 uid: uid.clone(),
                 managed_by_uid: entry.managed_by_uid.clone(),
                 label: entry.label.clone(),
@@ -938,13 +946,13 @@ impl App {
                 last_transcript_id: entry.transcript_id.clone(),
                 worktree_path: ws.worktree_path.clone(),
                 generation: entry.generation,
-                exited_at: now,
+                exited_at: entry.last_exit.as_ref().map_or(now, |exit| exit.exited_at),
             });
         }
         self.remove_skipped_entry(ws_id, &uid);
         self.reconnecting_sessions.remove(&uid);
         eprintln!(
-            "cm-tui: agent-spawned session {} ({}) on host {} is gone on the \
+            "cm-tui: session {} ({}) on host {} is gone on the \
              daemon — tombstoned",
             uid,
             entry.label,
@@ -954,6 +962,12 @@ impl App {
         // thing pinning it; the caller drops the pending item, and this
         // entry is already out of `skipped_manifest_entries`).
         self.close_agent_marker_if_empty(ws_idx);
+        // The incremental task feed may now be quiet for hours. Once a full
+        // planning snapshot has arrived, settling the final deferred entry
+        // must release spent workspaces without waiting for another task edit.
+        if !self.sidebar_task_parents.is_empty() {
+            self.reap_spent_workspaces();
+        }
         true
     }
 
@@ -1366,6 +1380,22 @@ mod remote_reconnect_tests {
         (ts, tx, teof)
     }
 
+    #[test]
+    fn resumed_entry_hydrates_all_durable_session_metadata_on_each_host() {
+        for host in [cm_daemon::host_id::HostId::local(), cm_daemon::host_id::HostId::new("sessions")] {
+            let (old, _, _) = session_with_injected_exit("ts-abc-0", host.clone(), false);
+            let mut entry = old.to_manifest_entry();
+            entry.label = "Winners".into(); entry.transcript_id = Some("conversation".into());
+            entry.task_id = Some("original-task".into()); entry.managed_by_uid = Some("ts-parent-0".into());
+            entry.hidden = true; entry.notify_on_idle = true; entry.global_perms = true;
+            entry.color = Some("green".into()); entry.idle_timeout_secs = 17;
+            entry.burst_threshold = 19; entry.generation = 42;
+            entry.seeded_from_snapshot = Some("seed".into());
+            let restored = App::build_remote_terminal_session(&entry, old.session);
+            assert_eq!(serde_json::to_value(restored.to_manifest_entry()).unwrap(), serde_json::to_value(&entry).unwrap());
+        }
+    }
+
     /// Wrap an already-built `Session` in a `TerminalSession` slot with
     /// neutral metadata. Shared by `session_with_injected_exit` (injected
     /// event channel) and the phase-5 e2e (a REAL daemon-attached
@@ -1700,7 +1730,7 @@ mod remote_reconnect_tests {
             .iter()
             .map(|r| {
                 (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
                     r.depth,
                 )
             })
@@ -1782,7 +1812,7 @@ mod remote_reconnect_tests {
             .iter()
             .map(|r| {
                 (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
                     r.depth,
                 )
             })
@@ -1803,6 +1833,76 @@ mod remote_reconnect_tests {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    #[test]
+    fn visual_items_continuous_keeps_sessionless_descendants_reachable() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_manager_host(&tmp.path().join("daemon.sock"));
+        app.workspaces.clear();
+        let (mut orch, _, _) = session_with_injected_exit("orch-new", manager_host(), false);
+        orch.continuous_task_id = Some("ct".into());
+        // Missing task_id is the restored/adopted-row incident shape.
+        orch.task_id = None;
+        let mut parent = workspace_with(orch);
+        parent.id = "orch-ws".into(); parent.host_id = manager_host();
+        app.workspaces.push(parent);
+        let task = |id: &str, ws: Option<&str>, parent: Option<&str>, continuous: bool| TaskEntry {
+            task_id: Some(id.into()), name: id.into(), api_status: TaskStatus::Running,
+            repo_url: None, prompt: None, wip_branch: None, session_id: None, blocked_at: None,
+            is_cloud: true, is_continuous: continuous, workspace_id: ws.map(String::from), project: None,
+            parent_task_id: parent.map(String::from), worktree_mode: WorktreeMode::Inherit, metadata: None,
+        };
+        app.tasks.push(task("orch-task", Some("orch-ws"), None, true));
+        app.tasks.push(task("middle", None, Some("orch-task"), false));
+        app.tasks.push(task("unfinished", Some("empty-ws"), Some("middle"), false));
+        let (dummy, _, _) = session_with_injected_exit("dummy", manager_host(), false);
+        let mut empty = workspace_with(dummy);
+        empty.host_id = manager_host();
+        empty.id = "empty-ws".into(); empty.name = "unfinished scraper".into(); empty.sessions.clear();
+        app.workspaces.push(empty);
+        let rows = app.visual_items_continuous();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].sess_idx, None);
+        assert_eq!(rows[1].cursor(), Cursor::Workspace(1));
+        assert!(!app.visual_items_status().iter().any(|v| matches!(v, VisualItem::WorkspaceHeader(1))));
+        assert!(!app.task_view_visible_workspaces(&app.continuous_members()).contains(&1));
+        app.continuous_column_on = true;
+        app.cursor_column = SidebarColumn::Continuous;
+        app.cursor = Cursor::Session(0, 0);
+        app.navigate(1); assert_eq!(app.cursor, Cursor::Workspace(1));
+        app.navigate(-1); assert_eq!(app.cursor, Cursor::Session(0, 0));
+        app.sidebar_filter = Some("unfinished".into());
+        assert!(app.visual_items_continuous().iter().any(|r| r.sess_idx.is_none()));
+        app.sidebar_filter = None;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("(no session)"), "sessionless row must actually render");
+        let summary = crate::client_session::DaemonSessionSummary {
+            session_uid: "orch-new".into(), label: "orchestrator".into(), session_type: "codex".into(),
+            managed_by_uid: None, workspace_id: Some("orch-ws".into()), task_id: Some("orch-task".into()),
+            workflow_run_id: None, workflow_role: None, worktree_path: None,
+            continuous_task_id: Some("ct".into()), cols: None, rows: None, global_perms: false,
+        };
+        app.remote_session_lists.insert(cm_daemon::host_id::HostId::local(), vec![summary.clone()]);
+        app.converge_session_ownership();
+        assert!(app.workspaces[0].sessions[0].task_id.is_none(), "host scope applies to cached ownership");
+        app.remote_session_lists.insert(manager_host(), vec![summary]);
+        app.converge_session_ownership();
+        assert_eq!(app.workspaces[0].sessions[0].task_id.as_deref(), Some("orch-task"));
+        assert_eq!(app.workspaces[0].sessions[0].uid, "orch-new", "repair must retain identity");
+        // Shared/unrelated work must not disappear from main.
+        app.tasks.push(task("unrelated", Some("empty-ws"), None, false));
+        assert!(app.continuous_empty_workspace_owners().is_empty());
+        assert!(app.task_view_visible_workspaces(&app.continuous_members()).contains(&1));
+        app.tasks.pop();
+        app.workspaces[1].host_id = cm_daemon::host_id::HostId::local();
+        assert!(app.continuous_empty_workspace_owners().is_empty(), "different hosts don't inherit ownership");
+        app.workspaces[1].host_id = manager_host();
+        app.workspaces[1].is_closed = true;
+        assert_eq!(app.visual_items_continuous().len(), 1);
     }
 
     /// Same-task workers (the momentum-detective shape): agent-spawned
@@ -1868,12 +1968,15 @@ mod remote_reconnect_tests {
             metadata: None,
         });
 
+        let owner_ws = app.workspaces[0].id.clone();
+        app.workspaces[0].sessions[0].task_id = None;
+        app.tasks.iter_mut().find(|t| t.is_continuous).unwrap().workspace_id = Some(owner_ws);
         let rows = app.visual_items_continuous();
         let resolved: Vec<(&str, u8)> = rows
             .iter()
             .map(|r| {
                 (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
                     r.depth,
                 )
             })
@@ -1890,6 +1993,77 @@ mod remote_reconnect_tests {
             !members.contains(&(0, 3)),
             "a user-created session on the orchestrator's task stays in the main sidebar",
         );
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// A replaced orchestrator (bridge-cooldown recovery, A-R, supervisor
+    /// respawn) leaves an exit record that still carries `continuous_task_id`.
+    /// It must not become a second depth-0 group: the live session anchors,
+    /// the retired row nests under it, and a worker that matches BOTH (managed
+    /// by the old uid, planning child of the same parent) renders once.
+    #[test]
+    fn visual_items_continuous_folds_replaced_orchestrator_into_one_group() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+        let mk = |uid: &str, cont: Option<&str>, mgr: Option<&str>, task: Option<&str>, label: &str, exited: bool| {
+            let (mut ts, _tx, _teof) = session_with_injected_exit(uid, manager_host(), false);
+            ts.session.exited = exited;
+            ts.continuous_task_id = cont.map(String::from);
+            ts.managed_by_uid = mgr.map(String::from);
+            ts.task_id = task.map(String::from);
+            ts.label = label.into();
+            ts
+        };
+        // Old (exited) orchestrator first in the manifest, then the live one.
+        let mut ws = workspace_with(mk("ts-old-orch", Some("health-alert-triage"), None, Some("parent"), "health-alert-triage-orchestrator", true));
+        ws.sessions.push(mk("ts-new-orch", Some("health-alert-triage"), None, Some("parent"), "health-alert-triage-orchestrator", false));
+        // Worker spawned by the OLD instance on a planning child of the parent.
+        ws.sessions.push(mk("ts-fire", None, Some("ts-old-orch"), Some("child-fire"), "fire-909741f0", false));
+        app.workspaces.push(ws);
+        for (id, parent) in [("parent", None), ("child-fire", Some("parent"))] {
+            app.tasks.push(TaskEntry {
+                task_id: Some(id.into()),
+                name: id.into(),
+                api_status: TaskStatus::Running,
+                repo_url: None,
+                prompt: None,
+                wip_branch: None,
+                session_id: None,
+                blocked_at: None,
+                is_cloud: false,
+                is_continuous: parent.is_none(),
+                workspace_id: None,
+                project: None,
+                parent_task_id: parent.map(String::from),
+                worktree_mode: WorktreeMode::Inherit,
+                metadata: None,
+            });
+        }
+        let rows = app.visual_items_continuous();
+        let resolved: Vec<(&str, u8)> = rows
+            .iter()
+            .map(|r| (app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(), r.depth))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![("ts-new-orch", 0), ("ts-fire", 1), ("ts-old-orch", 1)],
+            "one anchor per continuous task; the worker renders once; the retired orchestrator nests last",
+        );
+        let uids: std::collections::HashSet<&str> = resolved.iter().map(|(u, _)| *u).collect();
+        assert_eq!(uids.len(), resolved.len(), "no session may appear on two rows");
 
         match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
@@ -2058,7 +2232,7 @@ mod remote_reconnect_tests {
             .iter()
             .map(|r| {
                 (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
                     r.depth,
                 )
             })
@@ -3513,6 +3687,45 @@ mod remote_reconnect_tests {
             !app.workspaces[1].is_closed,
             "the user-owned marker stays attach-pending-exempt (unchanged)",
         );
+
+        // September 12 stragglers: scheduler roots and manually resumed
+        // workers have no managed_by. A saved exit of a Done task may be
+        // settled, but neither an unfinished nor an unknown user row may.
+        app.sidebar_task_parents.insert("done-task".into(), None);
+        app.sidebar_done_task_ids.insert("done-task".into());
+        for (id, continuous, done, workflow, should_settle) in [
+            ("old-orchestrator", true, false, false, true),
+            ("completed-worker", false, true, false, true),
+            ("unfinished-worker", false, false, false, false),
+            ("workflow-worker", false, true, true, false),
+        ] {
+            let name = if continuous { format!("agent: {id}") } else { id.into() };
+            app.workspaces.push(mk_ws(id, &name));
+            let wi = app.workspaces.len() - 1;
+            let (seed, _, _) = session_with_injected_exit(id, ghost.clone(), false);
+            let mut entry = seed.to_manifest_entry();
+            entry.task_id = Some(if done { "done-task" } else { "unfinished-task" }.into());
+            entry.continuous_task_id = continuous.then(|| "momentum-detective".into());
+            entry.workflow_run_id = workflow.then(|| "active-workflow".into());
+            entry.transcript_id = Some("preserved-conversation".into());
+            entry.last_exit = Some(serde_json::from_value(serde_json::json!({
+                "code": 0, "memory_cap_kill": false, "exited_at": 1789099687.5
+            })).unwrap());
+            app.skipped_manifest_entries.insert(id.into(), vec![entry.clone()]);
+            let mut pending = PendingRemoteReattach::new(id.into(), entry);
+            pending.attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
+            app.pending_remote_reattach.push(pending);
+            app.drain_deferred_remote_reattach();
+            assert!(app.pending_remote_reattach.is_empty());
+            assert_eq!(app.workspaces[wi].is_closed, should_settle, "{id}");
+            assert_eq!(!app.skipped_manifest_entries.contains_key(id), should_settle, "{id}");
+            if should_settle {
+                let tomb = &app.workspaces[wi].tombstones[0];
+                assert_eq!(tomb.last_transcript_id.as_deref(), Some("preserved-conversation"));
+                assert_eq!(tomb.exited_at, 1789099687.5);
+                assert_eq!(tomb.entry.as_ref().unwrap().uid, id);
+            }
+        }
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = dhandle.join();

@@ -27,7 +27,10 @@ pub fn request(selection: ClipboardType, formatter: Formatter, target: EventLoop
             .name("cm-clipboard".into())
             .spawn(move || {
                 for request in rx {
-                    let text = read_clipboard(request.selection).unwrap_or_default();
+                    let text = read_clipboard(request.selection)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
                     let response = (request.formatter)(&text);
                     let _ = request
                         .target
@@ -50,7 +53,7 @@ fn readers(selection: ClipboardType, wayland: bool) -> Vec<Vec<&'static str>> {
     let primary = matches!(selection, ClipboardType::Selection);
     let mut result = Vec::new();
     if wayland {
-        let mut args = vec!["wl-paste", "--no-newline"];
+        let mut args = vec!["wl-paste", "--no-newline", "--type", "text"];
         if primary {
             args.push("--primary");
         }
@@ -72,13 +75,43 @@ fn readers(selection: ClipboardType, wayland: bool) -> Vec<Vec<&'static str>> {
     result
 }
 
-fn read_clipboard(selection: ClipboardType) -> Option<String> {
-    for args in readers(selection, std::env::var_os("WAYLAND_DISPLAY").is_some()) {
-        if let Ok(text) = read_command(&args, Duration::from_millis(700)) {
-            return Some(text);
+fn read_clipboard(selection: ClipboardType) -> io::Result<Option<String>> {
+    read_text_with(
+        readers(selection, std::env::var_os("WAYLAND_DISPLAY").is_some()),
+        |args| read_command(args, Duration::from_millis(700)),
+    )
+}
+
+fn file_limit_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+    )
+}
+
+fn read_text_with(
+    providers: Vec<Vec<&str>>,
+    mut read: impl FnMut(&[&str]) -> io::Result<String>,
+) -> io::Result<Option<String>> {
+    let mut failures = Vec::new();
+    let mut read_empty = false;
+    for args in providers {
+        match read(&args) {
+            Ok(text) if !text.is_empty() => return Ok(Some(text)),
+            Ok(_) => read_empty = true,
+            // Trying another executable cannot cure a process-wide file limit.
+            Err(e) if file_limit_error(&e) => return Err(e),
+            Err(e) => failures.push(format!("{}: {e}", args[0])),
         }
     }
-    None
+    if read_empty {
+        Ok(None)
+    } else {
+        Err(io::Error::other(format!(
+            "Cannot read the laptop clipboard ({}). Check the clipboard helper and desktop display connection.",
+            failures.join("; "),
+        )))
+    }
 }
 
 fn read_command(args: &[&str], budget: Duration) -> io::Result<String> {
@@ -165,7 +198,9 @@ fn run_command(
             if eof {
                 if let Some(status) = child.try_wait()? {
                     if !status.success() {
-                        return Err(io::Error::other("clipboard command failed"));
+                        return Err(io::Error::other(format!(
+                            "clipboard command exited with {status}"
+                        )));
                     }
                     return Ok(bytes);
                 }
@@ -216,13 +251,13 @@ pub(crate) fn prepare_paste(
                     })
                 });
             }
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData || file_limit_error(&e) => {
+                return Err(e)
+            }
             _ => {}
         }
     }
-    Ok(read_clipboard(ClipboardType::Clipboard)
-        .filter(|s| !s.is_empty())
-        .map(|text| PasteResult { text, image: false }))
+    Ok(read_clipboard(ClipboardType::Clipboard)?.map(|text| PasteResult { text, image: false }))
 }
 
 // All executable text is constant. Clipboard bytes travel only over stdin;
@@ -315,10 +350,13 @@ mod tests {
     fn wayland_clipboard_and_primary_use_the_matching_selection() {
         assert_eq!(
             readers(ClipboardType::Clipboard, true)[0],
-            ["wl-paste", "--no-newline"]
+            ["wl-paste", "--no-newline", "--type", "text"]
         );
         let primary = readers(ClipboardType::Selection, true);
-        assert_eq!(primary[0], ["wl-paste", "--no-newline", "--primary"]);
+        assert_eq!(
+            primary[0],
+            ["wl-paste", "--no-newline", "--type", "text", "--primary"]
+        );
         assert_eq!(primary[1], ["xclip", "-selection", "primary", "-o"]);
         assert_eq!(readers(ClipboardType::Clipboard, false)[0][0], "xclip");
     }
@@ -333,6 +371,51 @@ mod tests {
             .unwrap(),
             "héllo\n\n"
         );
+    }
+
+    #[test]
+    fn exhausted_file_limit_is_reported_instead_of_empty_clipboard() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let mut attempts = 0;
+            let error = read_text_with(vec![vec!["xclip"], vec!["xsel"]], |_| {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(errno))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
+    fn missing_or_failed_clipboard_helpers_are_not_an_empty_clipboard() {
+        let error = read_text_with(vec![vec!["xclip"]], |_| {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("xclip"));
+        assert!(read_text_with(vec![vec!["xclip"]], |_| {
+            Err(io::Error::other("display unavailable"))
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("display unavailable"));
+    }
+
+    #[test]
+    fn text_falls_back_to_working_provider_and_preserves_real_empty_result() {
+        let text = read_text_with(vec![vec!["wl-paste"], vec!["xclip"]], |args| {
+            if args[0] == "wl-paste" {
+                Err(io::ErrorKind::NotFound.into())
+            } else {
+                Ok("hello\n".into())
+            }
+        })
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("hello\n"));
+        assert!(read_text_with(vec![vec!["xclip"]], |_| Ok(String::new()))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

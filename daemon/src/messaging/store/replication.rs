@@ -1,8 +1,129 @@
 //! Durable replication state. Transport is only a carrier: publication, receipt
 //! and coverage records are retained so replay never depends on a socket's RAM.
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+/// Replaceable coverage checkpoint (one small file, outside the journal).
+const COVERAGE_FILE: &str = "_replication/coverage.json";
+/// Written once per compaction: which journal positions at or below
+/// `compacted_through` still matter, and the hub checkpoints legacy coverage
+/// records established at local positions (`owner_execution_position`).
+const JOURNAL_INDEX_FILE: &str = "_replication/journal-index.json";
+/// Recent transport checkpoints kept for local-position translation.
+const RETAINED_MARKS: usize = 256;
+
+/// Journal records for one replica ingest page. Event bodies are written
+/// (and fsynced) immediately; their directories and these records are made
+/// durable together when the page is flushed, bodies first.
+#[derive(Default)]
+pub(super) struct IngestBatch {
+    pub dirs: BTreeSet<PathBuf>,
+    pub journal: Vec<(PathBuf, Vec<u8>)>,
+    /// Monitors were advanced before the page's first publication.
+    pub advanced: bool,
+}
+
+/// Deletes superseded legacy coverage records in the background. The journal
+/// index already tells `rebuild` to skip them, so deletion order and crashes
+/// do not matter; dropping the store stops it promptly.
+pub(super) struct Compactor {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+impl Compactor {
+    fn spawn(dir: PathBuf, positions: Vec<u64>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("cm-msg-compact".into())
+            .spawn(move || {
+                for chunk in positions.chunks(1024) {
+                    if flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    for pos in chunk {
+                        let _ = fs::remove_file(dir.join(format!("{pos:020}.json")));
+                    }
+                }
+                let _ = File::open(&dir).and_then(|d| d.sync_all());
+            })
+            .ok();
+        Self { stop, handle }
+    }
+    pub fn wait(mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+impl Drop for Compactor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Parsed `JOURNAL_INDEX_FILE`.
+#[derive(Default)]
+pub(super) struct JournalIndex {
+    compacted_through: u64,
+    floor: u64,
+    kept: BTreeSet<u64>,
+    marks: BTreeMap<u64, Value>,
+}
+impl JournalIndex {
+    /// Position of a journal file `rebuild` may skip unread.
+    pub fn superseded(&self, path: &Path) -> Option<u64> {
+        let pos = journal_file_position(path)?;
+        (pos <= self.compacted_through && pos != self.floor && !self.kept.contains(&pos))
+            .then_some(pos)
+    }
+}
+fn journal_file_position(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let digits = name.strip_suffix(".json")?;
+    (digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// What `rebuild` learned about the journal's shape, for compaction.
+#[derive(Default)]
+pub(super) struct JournalScan {
+    pub superseded: Vec<u64>,
+    coverage: Vec<u64>,
+    kept: Vec<u64>,
+    legacy_scope_pos: BTreeMap<String, u64>,
+    marks: BTreeMap<u64, Value>,
+    run_mark: Option<(u64, Value)>,
+}
+impl JournalScan {
+    pub fn observe(&mut self, pos: u64, j: &Value) {
+        if j["kind"] == "coverage" {
+            self.coverage.push(pos);
+            let scope = strv(&j["data"], "scope");
+            self.legacy_scope_pos.insert(scope.to_owned(), pos);
+            if scope == "transport" {
+                self.run_mark = Some((pos, transport_mark(&j["data"])));
+            }
+        } else {
+            self.kept.push(pos);
+            self.end_run();
+        }
+    }
+    fn end_run(&mut self) {
+        if let Some((pos, mark)) = self.run_mark.take() {
+            self.marks.insert(pos, mark);
+        }
+    }
+}
+fn transport_mark(data: &Value) -> Value {
+    json!({"generation":data["generation"],"cursor":data["cursor"].as_u64().unwrap_or(0)})
+}
 
 #[derive(Default)]
 pub struct ChangeSignal {
@@ -24,6 +145,10 @@ impl ChangeSignal {
     }
 }
 
+/// Legacy page bounds `(records, bytes)`. Scoped-backfill subscriptions pass
+/// larger bounds from the transport (`sync::transport::BULK_PAGE`).
+const LEGACY_PAGE: (usize, usize) = (64, 256 * 1024);
+
 pub(super) struct Replication {
     pub coordinator_id: String,
     pub coordinator_lineage: BTreeSet<String>,
@@ -35,6 +160,9 @@ pub(super) struct Replication {
     pub hosts: BTreeMap<String, Value>,
     pub people: BTreeMap<String, Person>,
     pub owner_snapshot: Option<Value>,
+    /// Hub transport checkpoints keyed by the first local position at which
+    /// they were known (legacy: their journal position; new: position + 1).
+    pub marks: BTreeMap<u64, Value>,
     pub connected: bool,
     pub last_reconciled: Option<String>,
     pub error: Option<String>,
@@ -64,6 +192,7 @@ impl Replication {
             hosts: BTreeMap::new(),
             people: BTreeMap::new(),
             owner_snapshot: None,
+            marks: BTreeMap::new(),
             connected: false,
             last_reconciled: None,
             error: None,
@@ -188,9 +317,7 @@ impl Store {
                 let id = required(journal, "event_id")?;
                 let decision = &journal["data"];
                 let event = self
-                    .events
-                    .iter()
-                    .find(|e| e.event["id"] == id)
+                    .published(&id)
                     .ok_or_else(|| err("invalid_receipt", "Decision precedes its local event"))?;
                 if journal["event_sha256"] != hash(&fs::read(self.event_path(&event.event)?)?) {
                     return Err(err(
@@ -210,7 +337,7 @@ impl Store {
                         &id,
                         &required(journal, "event_sha256")?,
                     )?;
-                    if !self.events.iter().any(|e| e.event["id"] == id) {
+                    if !self.has_event(&id) {
                         return Err(err("invalid_receipt", "Receipt precedes its local event"));
                     }
                     self.replication
@@ -229,20 +356,12 @@ impl Store {
                 }
             }
             "coverage" => {
+                // Legacy: coverage used to be journaled per scope per page.
+                // New checkpoints live in COVERAGE_FILE; these still load.
                 let scope = required(&journal["data"], "scope")?;
-                let data = &journal["data"];
-                Uuid::parse_str(&required(data, "generation")?)
+                Uuid::parse_str(&required(&journal["data"], "generation")?)
                     .map_err(|_| err("invalid_cursor", "Invalid coverage generation"))?;
-                if data["coordinator_id"] != self.coordinator_id()
-                    || if scope == "transport" {
-                        data["cursor"].as_u64().is_none()
-                            || data["revision"].as_u64().is_none()
-                            || serde_json::from_value::<BTreeSet<String>>(data["scopes"].clone())
-                                .is_err()
-                    } else {
-                        data["through"].as_u64().is_none() || data["complete"] != true
-                    }
-                {
+                if !self.coverage_valid(&scope, &journal["data"]) {
                     return Err(err("invalid_cursor", "Invalid coverage checkpoint"));
                 }
                 self.replication
@@ -254,6 +373,20 @@ impl Store {
         }
         Ok(())
     }
+    fn coverage_valid(&self, scope: &str, data: &Value) -> bool {
+        data["scope"] == scope
+            && data["generation"]
+                .as_str()
+                .is_some_and(|g| Uuid::parse_str(g).is_ok())
+            && data["coordinator_id"] == self.coordinator_id()
+            && if scope == "transport" {
+                data["cursor"].as_u64().is_some()
+                    && data["revision"].as_u64().is_some()
+                    && serde_json::from_value::<BTreeSet<String>>(data["scopes"].clone()).is_ok()
+            } else {
+                data["through"].as_u64().is_some() && data["complete"] == true
+            }
+    }
     fn journal_status(
         &mut self,
         kind: &str,
@@ -261,6 +394,9 @@ impl Store {
         digest: Option<&str>,
         data: Value,
     ) -> Result<()> {
+        // A status record must never become durable ahead of the queued
+        // publication records it may refer to.
+        self.flush_ingest_batch()?;
         if let Some(reason) = &self.degraded {
             return Err(err("store_read_only", reason.clone()));
         }
@@ -333,13 +469,13 @@ impl Store {
         required(receipt, "position")?
             .parse::<u64>()
             .map_err(|_| err("invalid_receipt", "Bad receipt position"))?;
-        if !self.events.iter().any(|e| e.event["id"] == id) {
+        if !self.has_event(&id) {
             return Err(err(
                 "invalid_receipt",
                 "Receipt has no retained local event",
             ));
         }
-        if let Some(event) = self.events.iter().find(|e| e.event["id"] == id) {
+        if let Some(event) = self.published(&id) {
             if hash(&fs::read(self.event_path(&event.event)?)?) != digest {
                 return Err(err(
                     "receipt_conflict",
@@ -375,9 +511,7 @@ impl Store {
             ));
         }
         let e = self
-            .events
-            .iter()
-            .find(|e| e.event["id"] == id)
+            .published(id)
             .ok_or_else(|| err("not_found", "Local event not found"))?;
         let digest = hash(&fs::read(self.event_path(&e.event)?)?);
         self.journal_status("replication.status",Some(id),Some(&digest),json!({"status":"replication_rejected","reason":reason,"coordinator_id":self.coordinator_id()}))?;
@@ -397,9 +531,7 @@ impl Store {
     }
     pub fn wire_event(&self, id: &str) -> Result<Value> {
         let e = self
-            .events
-            .iter()
-            .find(|e| e.event["id"] == id)
+            .published(id)
             .ok_or_else(|| err("not_found", "Event not found"))?;
         let bytes = fs::read(self.event_path(&e.event)?)?;
         let body =
@@ -424,10 +556,85 @@ impl Store {
     /// Caller must be an authenticated coordinator transport. Preserve the exact
     /// original UTF-8 bytes, including unknown fields and JSON formatting.
     pub fn ingest_replica(&mut self, wire: &Value) -> Result<bool> {
+        Ok(self.ingest_replica_page(std::slice::from_ref(wire))?[0])
+    }
+    /// Ingest one hub page (live or bulk) under a single durability barrier:
+    /// each event body is fsynced as it is written, then every touched event
+    /// directory, then the page's journal records and one journal-directory
+    /// fsync. Monitors and projections advance once, after the page is
+    /// durable. The caller holds the store lock throughout, so no reader sees
+    /// a record before it is durable. On an error the records ingested before
+    /// it are still made durable, then the error is returned. Returns, per
+    /// wire, whether it was new.
+    pub fn ingest_replica_page(&mut self, wires: &[Value]) -> Result<Vec<bool>> {
+        if self.ingest_batch.is_some() {
+            return Err(err("invalid_state", "Nested replica ingest page"));
+        }
+        self.ingest_batch = Some(IngestBatch::default());
+        let mut fresh = Vec::with_capacity(wires.len());
+        let mut failure = None;
+        for wire in wires {
+            match self.ingest_one(wire) {
+                Ok(new) => fresh.push(new),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        let flushed = self.flush_ingest_batch();
+        self.ingest_batch = None;
+        flushed?;
+        if fresh.iter().any(|new| *new) {
+            // A durable message stays successful if a derived checkpoint fails;
+            // restart replays from the prior saved monitor scan position.
+            if let Err(e) = self.advance_monitors_at(Utc::now()) {
+                self.degraded = Some(format!("Monitor checkpoint requires reconciliation: {e}"));
+            }
+            self.replication.signal.signal();
+            self.project()?;
+        }
+        failure.map_or(Ok(fresh), Err)
+    }
+    /// Make the open ingest page's queued records durable (no-op otherwise).
+    pub(super) fn flush_ingest_batch(&mut self) -> Result<()> {
+        let Some(batch) = self.ingest_batch.as_mut() else {
+            return Ok(());
+        };
+        if batch.journal.is_empty() && batch.dirs.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::replace(
+            batch,
+            IngestBatch {
+                advanced: batch.advanced,
+                ..IngestBatch::default()
+            },
+        );
+        let journal_dir = self.journal_dir();
+        let result = (|| -> io::Result<()> {
+            for dir in &batch.dirs {
+                File::open(dir)?.sync_all()?;
+            }
+            for (path, bytes) in &batch.journal {
+                write_file_synced(path, bytes, false, false)?;
+            }
+            if !batch.journal.is_empty() {
+                File::open(&journal_dir)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.degraded = Some(format!("Publication outcome requires reconciliation: {e}"));
+            return Err(err("outcome_unknown", self.degraded.clone().unwrap()));
+        }
+        Ok(())
+    }
+    fn ingest_one(&mut self, wire: &Value) -> Result<bool> {
         let raw = required(wire, "event")?;
         let event = self.validate_replication_envelope(raw.as_bytes())?;
         let id = required(&event, "id")?;
-        if self.events.iter().any(|e| e.event["id"] == id) {
+        if self.has_event(&id) {
             if fs::read(self.event_path(&event)?)? != raw.as_bytes() {
                 return Err(err("event_conflict", "Same event ID has different bytes"));
             }
@@ -459,7 +666,6 @@ impl Store {
         self.validate_event_dependencies(&event)?;
         self.preflight_projection(&event)?;
         self.commit_bytes(event, raw.into_bytes(), "replica", Some(receipt.clone()))?;
-        self.project()?;
         Ok(true)
     }
     pub(super) fn validate_replication_envelope(&self, raw: &[u8]) -> Result<Value> {
@@ -502,9 +708,7 @@ impl Store {
         }
         if let Some(parent) = e["data"]["reply_to"].as_str() {
             let p = self
-                .events
-                .iter()
-                .find(|p| p.event["id"] == parent)
+                .published(parent)
                 .ok_or_else(|| err("dependency_missing", "Reply parent is not available yet"))?;
             if p.event["type"] != "message.create"
                 || p.event["conversation_id"] != e["conversation_id"]
@@ -891,7 +1095,7 @@ impl Store {
             return Err(err("unauthorized", "Upload has a foreign origin"));
         }
         // Preserve an already accepted result even if metadata has since moved.
-        if self.events.iter().any(|p| p.event["id"] == id) {
+        if self.has_event(&id) {
             if fs::read(self.event_path(&e)?)? != raw.as_bytes() {
                 return Err(err("event_conflict", "Same event ID has different bytes"));
             }
@@ -1243,9 +1447,7 @@ impl Store {
                 return Err(err("invalid_reply", "Cyclic reply dependency"));
             }
             let p = self
-                .events
-                .iter()
-                .find(|p| p.event["id"] == id)
+                .published(id)
                 .ok_or_else(|| err("dependency_missing", "Missing retained parent"))?;
             if p.event["conversation_id"] != e["conversation_id"] {
                 return Err(err("invalid_reply", "Cross-conversation dependency"));
@@ -1355,16 +1557,98 @@ impl Store {
         }
         Ok(json!({"items":items,"scanned":through}))
     }
-    /// At most 64 records / 256 KiB. `dependency_offset` resumes a long parent
-    /// chain without claiming coverage for an incompletely delivered message.
-    /// On reconnect it is safe to replay from offset zero: IDs are immutable.
+    /// At most [`LEGACY_PAGE`]. `dependency_offset`
+    /// resumes a long parent chain without claiming coverage for an incompletely
+    /// delivered message. On reconnect it is safe to replay from offset zero:
+    /// IDs are immutable.
     pub fn export_slice(
         &self,
         host: &str,
         interests: &BTreeSet<String>,
         after: u64,
         through: u64,
+        dependency_offset: usize,
+    ) -> Result<Value> {
+        self.export_slice_by(host, after, through, dependency_offset, LEGACY_PAGE, |p| {
+            self.eligible_for_host(host, interests, &p.event)
+        })
+    }
+    /// Main-stream page for a scoped-backfill subscription. `covered` scopes
+    /// stream in full; a scope in `joined` streams only after the position its
+    /// separate backfill reaches, so the two lanes never depend on each other's
+    /// page boundaries. Eligibility is a pure function of position, which keeps
+    /// `dependency_offset` stable while scopes are added.
+    pub fn export_scoped_slice(
+        &self,
+        host: &str,
+        covered: &BTreeSet<String>,
+        joined: &BTreeMap<String, u64>,
+        after: u64,
+        through: u64,
+        dependency_offset: usize,
+        limit: (usize, usize),
+    ) -> Result<Value> {
+        let singles = joined
+            .iter()
+            .map(|(scope, from)| (scope.as_str(), (*from, BTreeSet::from([scope.clone()]))))
+            .collect::<BTreeMap<_, _>>();
+        self.export_slice_by(host, after, through, dependency_offset, limit, |p| {
+            self.eligible_for_host(host, covered, &p.event)
+                || singles
+                    .get(strv(&p.event, "conversation_id"))
+                    .is_some_and(|(from, single)| {
+                        p.position > *from && self.eligible_for_host(host, single, &p.event)
+                    })
+        })
+    }
+    /// One page of a single scope's history backfill: only that conversation's
+    /// messages (with their reply chains). Metadata reaches the replica through
+    /// the main stream, which the caller bounds `through` by.
+    pub fn export_backfill(
+        &self,
+        host: &str,
+        scope: &str,
+        after: u64,
+        through: u64,
+        dependency_offset: usize,
+        limit: (usize, usize),
+    ) -> Result<Value> {
+        let single = BTreeSet::from([scope.to_owned()]);
+        self.export_slice_by(host, after, through, dependency_offset, limit, |p| {
+            Self::backfill_member(scope, &p.event)
+                && self.eligible_for_host(host, &single, &p.event)
+        })
+    }
+    fn backfill_member(scope: &str, e: &Value) -> bool {
+        e["type"] == "message.create" && strv(e, "conversation_id") == scope
+    }
+    /// Messages of `scope` in `(after, through]`, for backfill progress.
+    pub fn scope_message_count(&self, scope: &str, after: u64, through: u64) -> u64 {
+        self.events
+            .iter()
+            .filter(|p| p.position > after && p.position <= through)
+            .filter(|p| Self::backfill_member(scope, &p.event))
+            .count() as u64
+    }
+    /// Per-scope coverage this replica holds in `generation`; a hub uses it to
+    /// start a re-added scope's backfill where the earlier coverage ended.
+    pub fn transport_coverage_hints(&self, generation: &str) -> BTreeMap<String, u64> {
+        self.replication
+            .coverage
+            .iter()
+            .filter(|(scope, _)| !matches!(scope.as_str(), "transport" | "metadata" | "*"))
+            .filter(|(_, v)| v["generation"] == generation && v["complete"] == true)
+            .filter_map(|(scope, v)| Some((scope.clone(), v["through"].as_u64()?)))
+            .collect()
+    }
+    fn export_slice_by(
+        &self,
+        host: &str,
+        after: u64,
+        through: u64,
         mut dependency_offset: usize,
+        (max_items, max_bytes): (usize, usize),
+        eligible: impl Fn(&Published) -> bool,
     ) -> Result<Value> {
         if !self.host_authorized(host, None) {
             return Err(err("host_revoked", "Messaging host is not enrolled"));
@@ -1381,7 +1665,7 @@ impl Store {
             .iter()
             .filter(|p| p.position > after && p.position <= through)
         {
-            if self.eligible_for_host(host, interests, &p.event) {
+            if eligible(p) {
                 let mut ids = self.dependency_ids(&p.event)?;
                 ids.push(required(&p.event, "id")?);
                 if dependency_offset >= ids.len() {
@@ -1396,7 +1680,9 @@ impl Store {
                     }
                     let wire = self.wire_event(id)?;
                     let size = serde_json::to_vec(&wire)?.len();
-                    if !items.is_empty() && (items.len() >= 64 || bytes + size > 256 * 1024) {
+                    if !items.is_empty()
+                        && (items.len() >= max_items || bytes + size > max_bytes)
+                    {
                         return Ok(
                             json!({"items":items,"cursor":cursor,"dependency_offset":offset,"through":through,"complete":false,"generation":self.generation,"space_id":self.space_id}),
                         );
@@ -1414,17 +1700,7 @@ impl Store {
         )
     }
     pub fn record_coverage(&mut self, scope: &str, generation: &str, through: u64) -> Result<()> {
-        Uuid::parse_str(generation).map_err(|_| err("invalid_cursor", "Invalid hub generation"))?;
-        if self.replication.coverage.get(scope).is_some_and(|old| {
-            old["generation"] == generation && old["through"].as_u64().is_some_and(|p| p >= through)
-        }) {
-            return Ok(());
-        }
-        let data = json!({"scope":scope,"coordinator_id":self.coordinator_id(),"generation":generation,"through":through,"complete":true});
-        if self.replication.coverage.get(scope) == Some(&data) {
-            return Ok(());
-        }
-        self.journal_status("coverage", None, None, data)
+        self.record_coverage_batch(&[scope], generation, through, None)
     }
     pub fn cached_coverage(&self, scope: &str) -> Value {
         if self.is_coordinator() {
@@ -1439,6 +1715,10 @@ impl Store {
     }
 }
 
+#[cfg(test)]
+mod bench;
+#[cfg(test)]
+mod checkpoint_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1494,6 +1774,47 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn self_rename_preserves_identity_history_and_routing_across_replication_and_restart() {
+        let mut p = pair();
+        let actor = p.people[0].id.clone();
+        let peer = p.people[1].id.clone();
+        let host = p.replica.daemon_id.clone();
+        let dm = p.hub.coordinate(&host, &peer, "messaging.send", &json!({"dm":actor,"body":"Review ready","request_id":"before-dm"})).unwrap();
+        let mention = p.hub.coordinate(&host, &peer, "messaging.send", &json!({"channel":"general","body":"For Scout-a","mentions":[actor],"request_id":"before-mention"})).unwrap();
+        catch_up(&mut p);
+        let conversation = dm["event"]["conversation_id"].clone();
+        let history = p.replica.read(&actor, &json!({"conversation":conversation}), &p.people).unwrap();
+        p.replica.read(&actor, &json!({"conversation":conversation,"ack_receipt":history["receipt"]}), &p.people).unwrap();
+        let memberships = p.replica.memberships.clone();
+        let watch = p.replica.register_monitor(&actor, &json!({"scope":{"dm":peer},"request_id":"watch","mode":"continuous"}), &p.people).unwrap();
+        let rename = json!({"name":"health-triage-parent","expected_name_revision":p.replica.names[&actor].revision,"request_id":"rename"});
+        let result = p.hub.coordinate(&host, &actor, "session.set_name", &rename).unwrap();
+        assert_eq!(p.hub.coordinate(&host, &actor, "session.set_name", &rename).unwrap()["event_id"], result["event_id"]);
+        assert_eq!(p.hub.coordinate(&host, &actor, "session.set_name", &json!({"name":"stale","expected_name_revision":1,"request_id":"stale"})).unwrap_err().code, "name_revision_conflict");
+        let after = p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":peer,"name":"Scout-a","body":"Approved","request_id":"after-dm"})).unwrap();
+        assert_eq!(after["event"]["conversation_id"], conversation);
+        assert_eq!(after["event"]["actor"]["id"], actor);
+        assert_eq!(after["event"]["actor"]["name"], "health-triage-parent");
+        catch_up(&mut p);
+        let root = p._tmp.path().join("replica");
+        drop(p.replica);
+        p.replica = Store::open(&root).unwrap();
+        assert!(p.replica.degraded.is_none(), "{:?}", p.replica.degraded);
+        assert_eq!(p.replica.names[&actor].name, "health-triage-parent");
+        assert!(p.replica.names[&actor].aliases.contains(&"Scout-a".to_string()));
+        assert_eq!(p.replica.memberships, memberships);
+        let history = p.replica.read(&actor, &json!({"conversation":conversation}), &p.people).unwrap();
+        assert_eq!(history["items"].as_array().unwrap().len(), 2);
+        let before = history["items"].as_array().unwrap().iter().find(|e| e["id"] == dm["event_id"]).unwrap();
+        assert_eq!(before["read"], true);
+        let inbox = p.replica.read(&actor, &json!({"inbox":true,"unread_only":true}), &p.people).unwrap();
+        let historical_mention = inbox["items"].as_array().unwrap().iter().find(|e| e["id"] == mention["event_id"]).unwrap();
+        assert_eq!(historical_mention["data"]["mentions"], json!([actor]));
+        let watches = p.replica.monitors(&actor, &json!({"action":"list"})).unwrap();
+        assert!(watches["items"].as_array().unwrap().iter().any(|w| w["id"] == watch["id"] && w["state"] == "active"));
+    }
+
     #[test]
     fn messaging_channel_norms_coordinate_permissions_and_sync_without_global_corruption() {
         let mut p = pair();
@@ -2127,8 +2448,7 @@ impl Store {
         revision: u64,
         scopes: &BTreeSet<String>,
     ) -> Result<()> {
-        Uuid::parse_str(generation).map_err(|_| err("invalid_cursor", "Invalid hub generation"))?;
-        self.journal_status("coverage",None,None,json!({"scope":"transport","coordinator_id":self.coordinator_id(),"generation":generation,"cursor":cursor,"revision":revision,"scopes":scopes,"complete":false}))
+        self.record_coverage_batch(&[], generation, cursor, Some((cursor, revision, scopes)))
     }
     pub fn download_checkpoint(&self) -> Value {
         self.replication
@@ -2181,9 +2501,7 @@ impl Store {
     pub fn query_interest(&self, p: &Value) -> Option<String> {
         if let Some(id) = p["thread"].as_str() {
             return self
-                .events
-                .iter()
-                .find(|e| e.event["id"] == id)
+                .published(id)
                 .and_then(|e| e.event["conversation_id"].as_str().map(str::to_owned))
                 .or_else(|| Some(format!("thread:{id}")));
         }
@@ -2232,7 +2550,7 @@ impl Store {
         if let Some(items) = result["items"].as_array_mut() {
             for item in items {
                 if let Some(id) = item["id"].as_str().map(str::to_owned) {
-                    if self.events.iter().any(|e| e.event["id"] == id) {
+                    if self.has_event(&id) {
                         item["replication"] = self.event_replication(&id);
                     }
                 }
@@ -2255,4 +2573,200 @@ impl Store {
             .ok_or_else(|| err("not_found", "Host revocation record is missing"))?;
         self.wire_event(strv(&event.event, "id"))
     }
+}
+
+/// Coverage checkpoints. A checkpoint claims "this replica holds everything
+/// through hub position N" for a scope, so it is written only after the
+/// records it covers are durable, and losing it (or falling back to an older
+/// copy after a crash) only costs a re-download.
+impl Store {
+    /// Record one page's coverage with a single replaceable-file write:
+    /// `through` for every scope in `scopes` (same monotonic rule as
+    /// `record_coverage`), plus, when `transport` is `Some((cursor, revision,
+    /// subscribed_scopes))`, the download checkpoint `record_download_checkpoint`
+    /// used to journal. Any open ingest page is flushed first.
+    pub fn record_coverage_batch(
+        &mut self,
+        scopes: &[&str],
+        generation: &str,
+        through: u64,
+        transport: Option<(u64, u64, &BTreeSet<String>)>,
+    ) -> Result<()> {
+        Uuid::parse_str(generation).map_err(|_| err("invalid_cursor", "Invalid hub generation"))?;
+        let mut coverage = None::<BTreeMap<String, Value>>;
+        for scope in scopes {
+            let current = coverage.as_ref().unwrap_or(&self.replication.coverage);
+            if current.get(*scope).is_some_and(|old| {
+                old["generation"] == generation
+                    && old["through"].as_u64().is_some_and(|p| p >= through)
+            }) {
+                continue;
+            }
+            let data = json!({"scope":scope,"coordinator_id":self.coordinator_id(),"generation":generation,"through":through,"complete":true});
+            coverage
+                .get_or_insert_with(|| self.replication.coverage.clone())
+                .insert((*scope).to_owned(), data);
+        }
+        let mut marks = None;
+        if let Some((cursor, revision, subscribed)) = transport {
+            let data = json!({"scope":"transport","coordinator_id":self.coordinator_id(),"generation":generation,"cursor":cursor,"revision":revision,"scopes":subscribed,"complete":false});
+            coverage
+                .get_or_insert_with(|| self.replication.coverage.clone())
+                .insert("transport".into(), data.clone());
+            // Known to position tokens minted after the next local arrival
+            // (a token at the current position may predate this checkpoint).
+            let mut m = self.replication.marks.clone();
+            m.insert(self.position.saturating_add(1), transport_mark(&data));
+            marks = Some(m);
+        }
+        let Some(coverage) = coverage else {
+            return Ok(());
+        };
+        let marks = marks.unwrap_or_else(|| self.replication.marks.clone());
+        let recorded_at = now();
+        self.save_coverage(&coverage, &marks, &recorded_at)?;
+        self.replication.coverage = coverage;
+        self.replication.marks = marks;
+        self.replication.last_reconciled = Some(recorded_at);
+        self.replication.signal.signal();
+        Ok(())
+    }
+    fn save_coverage(
+        &mut self,
+        coverage: &BTreeMap<String, Value>,
+        marks: &BTreeMap<u64, Value>,
+        recorded_at: &str,
+    ) -> Result<()> {
+        // Claims are persisted only once everything ingested is durable.
+        self.flush_ingest_batch()?;
+        if let Some(reason) = &self.degraded {
+            return Err(err("store_read_only", reason.clone()));
+        }
+        let recent: Vec<_> = marks
+            .iter()
+            .rev()
+            .take(RETAINED_MARKS)
+            .map(|(k, v)| json!([k, v]))
+            .collect();
+        atomic_replace(
+            &self.root.join(COVERAGE_FILE),
+            &json!({"version":1,"replica_id":self.daemon_id,"generation":self.generation,
+                "journal_position":self.position,"recorded_at":recorded_at,
+                "coverage":coverage,"marks":recent}),
+        )?;
+        Ok(())
+    }
+    /// Hub checkpoint known at a local position (most recent at or before it).
+    pub(super) fn transport_mark_at(&self, local: u64) -> Option<&Value> {
+        self.replication.marks.range(..=local).next_back().map(|(_, v)| v)
+    }
+    pub(super) fn load_journal_index(&self) -> Option<JournalIndex> {
+        let v = load(&self.root.join(JOURNAL_INDEX_FILE)).ok()?;
+        if v["version"] != 1 || v["generation"] != self.generation || v["replica_id"] != self.daemon_id
+        {
+            return None;
+        }
+        Some(JournalIndex {
+            compacted_through: v["compacted_through"].as_u64()?,
+            floor: v["floor"].as_u64()?,
+            kept: serde_json::from_value(v["kept"].clone()).ok()?,
+            marks: parse_marks(&v["marks"])?,
+        })
+    }
+    /// End of `rebuild`: merge the coverage checkpoint file with any legacy
+    /// coverage records, then compact superseded legacy records.
+    pub(super) fn finish_journal_scan(
+        &mut self,
+        index: Option<JournalIndex>,
+        mut scan: JournalScan,
+    ) -> Result<()> {
+        scan.end_run();
+        let mut marks = index.as_ref().map(|i| i.marks.clone()).unwrap_or_default();
+        marks.extend(std::mem::take(&mut scan.marks));
+        let file = load(&self.root.join(COVERAGE_FILE)).ok().filter(|v| {
+            v["version"] == 1 && v["generation"] == self.generation && v["replica_id"] == self.daemon_id
+        });
+        if let Some(file) = &file {
+            let written_at = file["journal_position"].as_u64().unwrap_or(0);
+            for (scope, data) in file["coverage"].as_object().into_iter().flatten() {
+                // A legacy record journaled after this file (e.g. by an older
+                // binary after a downgrade) is newer for its scope. Entries
+                // for a previous coordinator are stale claims: dropped.
+                if scan.legacy_scope_pos.get(scope).is_some_and(|p| *p > written_at)
+                    || !self.coverage_valid(scope, data)
+                {
+                    continue;
+                }
+                self.replication.coverage.insert(scope.clone(), data.clone());
+            }
+            if !scan.legacy_scope_pos.values().any(|p| *p > written_at) {
+                if let Some(at) = file["recorded_at"].as_str() {
+                    self.replication.last_reconciled = Some(at.to_owned());
+                }
+            }
+            if let Some(m) = parse_marks(&file["marks"]) {
+                marks.extend(m);
+            }
+        }
+        self.replication.marks = marks;
+        self.compact_coverage_journal(index, scan);
+        Ok(())
+    }
+    /// Fold legacy coverage records into the checkpoint and index, then delete
+    /// them in the background. Order: checkpoint file, index, deletions — a
+    /// crash at any point leaves either the records or their replacement.
+    /// Positions are never reused: the newest journal file (the `floor`) is
+    /// always retained, so position tokens handed to readers stay valid.
+    /// Best effort: on failure the legacy records simply stay readable.
+    fn compact_coverage_journal(&mut self, index: Option<JournalIndex>, scan: JournalScan) {
+        let floor = self.position;
+        let fresh: Vec<u64> = scan.coverage.iter().copied().filter(|p| *p != floor).collect();
+        let mut doomed = scan.superseded;
+        if !fresh.is_empty() {
+            let recorded_at = self
+                .replication
+                .last_reconciled
+                .clone()
+                .unwrap_or_else(now);
+            let coverage = self.replication.coverage.clone();
+            let marks = self.replication.marks.clone();
+            let mut kept: BTreeSet<u64> = index.map(|i| i.kept).unwrap_or_default();
+            kept.extend(scan.kept);
+            // Legacy marks are immutable history; recent new-style marks
+            // (keyed above the floor) stay in the checkpoint file.
+            let legacy_marks: Vec<_> = self
+                .replication
+                .marks
+                .range(..=floor)
+                .map(|(k, v)| json!([k, v]))
+                .collect();
+            let written = self.save_coverage(&coverage, &marks, &recorded_at).and_then(|_| {
+                atomic_replace(
+                    &self.root.join(JOURNAL_INDEX_FILE),
+                    &json!({"version":1,"replica_id":self.daemon_id,"generation":self.generation,
+                        "compacted_through":floor,"floor":floor,"kept":kept,"marks":legacy_marks}),
+                )
+                .map_err(ChatError::from)
+            });
+            if written.is_err() {
+                return;
+            }
+            doomed.extend(fresh);
+        }
+        if !doomed.is_empty() {
+            self.compactor = Some(Compactor::spawn(self.journal_dir(), doomed));
+        }
+    }
+    /// Test/ops hook: block until background compaction has finished.
+    pub fn wait_for_compaction(&mut self) {
+        if let Some(c) = self.compactor.take() {
+            c.wait();
+        }
+    }
+}
+fn parse_marks(v: &Value) -> Option<BTreeMap<u64, Value>> {
+    v.as_array()?
+        .iter()
+        .map(|pair| Some((pair[0].as_u64()?, pair[1].clone())))
+        .collect()
 }

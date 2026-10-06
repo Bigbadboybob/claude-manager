@@ -35,11 +35,17 @@ impl App {
             f.write_all(bytes)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() { std::fs::File::open(parent)?.sync_all()?; }
+        Ok(())
     }
 
     /// Save session manifest to disk.
     pub(crate) fn save_session_manifest(&self) {
+        self.try_save_session_manifest();
+    }
+
+    pub(crate) fn try_save_session_manifest(&self) -> bool {
         // Refuse to persist before the on-disk manifest has been hydrated
         // into `self.workspaces` by `restore_sessions`. This writer does a
         // FULL REPLACE of `~/.cm/tui-sessions.json` from `self.workspaces`
@@ -53,11 +59,11 @@ impl App {
         // `sessions_restored` to true before `restore_sessions` runs its own
         // internal save, so the hydrated write still goes through.
         if !self.sessions_restored {
-            return;
+            return false;
         }
         if self.defer_manifest_save.get() {
             self.manifest_save_pending.set(true);
-            return;
+            return false;
         }
         let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
         for ws in &self.workspaces {
@@ -118,23 +124,26 @@ impl App {
             view: Some(view.to_string()),
             hide_continuous: self.hide_continuous,
             continuous_column_on: self.continuous_column_on,
+            hide_keybinding_helper: !self.keybinding_helper_visible,
             task_colors: self.task_colors.clone(),
             sections: self.sections.clone(),
             workspace_sections: self.workspace_sections.clone(),
+            sidebar_receipts: self.sidebar_receipts.clone(),
+            auto_close_workspaces: self.auto_close_workspaces.iter()
+                .filter(|id| self.workspaces.iter().any(|ws| &ws.id == *id))
+                .cloned().collect(),
         };
 
         let path = Self::manifest_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-            if let Err(e) = Self::atomic_write_manifest(&path, json.as_bytes()) {
-                eprintln!(
-                    "failed to write session manifest at {}: {}",
-                    path.display(),
-                    e
-                );
-            }
+        let saved = serde_json::to_vec_pretty(&manifest)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| Self::atomic_write_manifest(&path, &bytes));
+        if let Err(e) = saved {
+            eprintln!("failed to write session manifest at {}: {}", path.display(), e);
+            return false;
         }
 
         // 10d-1: every session-list mutation site is required by
@@ -151,6 +160,8 @@ impl App {
         // `eprintln!` (round-11 invariant: don't silently
         // swallow under opt-in).
         self.push_tui_sessions_to_daemon();
+        self.push_sidebar_to_daemon();
+        true
     }
 
     /// Load session manifest from disk. On parse failure, the corrupt file is
@@ -641,6 +652,14 @@ impl App {
     /// main tick. Bounds the `list_sessions` RPC to once per
     /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
     pub fn maybe_adopt_daemon_sessions(&mut self) {
+        if let InputMode::WorktreeCleanup(menu) = &mut self.input_mode {
+            self.needs_redraw |= menu.poll();
+            if menu.close_ready() {
+                let InputMode::WorktreeCleanup(menu) = std::mem::replace(&mut self.input_mode, InputMode::Normal) else { unreachable!() };
+                self.complete_with_cleanup(menu);
+                self.needs_redraw = true;
+            }
+        }
         if let InputMode::ContinuousControl(menu) = &mut self.input_mode {
             self.needs_redraw |= menu.poll();
         }
@@ -699,7 +718,29 @@ impl App {
             }
         }
         self.last_adopt_scan = Some(now);
+        self.converge_session_ownership();
         self.adopt_untracked_daemon_sessions();
+    }
+
+    /// A restored row may predate the daemon's ownership binding. Fill
+    /// absent tags from the current host's existing poll cache, preserving
+    /// its PTY, UID and any explicit local binding.
+    pub(super) fn converge_session_ownership(&mut self) {
+        let mut changed = false;
+        for ws in &mut self.workspaces {
+            for ts in &mut ws.sessions {
+                let Some(summary) = self.remote_session_lists.get(&ts.host_id)
+                    .and_then(|rows| rows.iter().find(|s| s.session_uid == ts.uid)) else { continue; };
+                for (current, observed) in [
+                    (&mut ts.task_id, &summary.task_id),
+                    (&mut ts.continuous_task_id, &summary.continuous_task_id),
+                    (&mut ts.managed_by_uid, &summary.managed_by_uid),
+                ] {
+                    if current.is_none() && observed.is_some() { *current = observed.clone(); changed = true; }
+                }
+            }
+        }
+        if changed { self.save_session_manifest(); self.needs_redraw = true; }
     }
 
     /// Surface agent-spawned ("phantom") daemon sessions in the sidebar.
@@ -977,10 +1018,18 @@ impl App {
                         sessions: Vec::new(),
                         tombstones: Vec::new(),
                     });
+                    if s.managed_by_uid.is_some() || s.continuous_task_id.is_some() {
+                        self.auto_close_workspaces.insert(new_id.clone());
+                    }
                     new_id
                 }
             }
         };
+        // A later follow-up session can reuse a soft-closed wrapper. Its
+        // stable daemon workspace id must become visible again on adoption.
+        if let Some(ws) = self.workspaces.iter_mut().find(|ws| ws.id == target_ws_id) {
+            ws.is_closed = false;
+        }
         (target_ws_id, worktree)
     }
 
@@ -1529,6 +1578,44 @@ mod adopt_daemon_session_tests {
         assert_eq!(app.resolve_adopt_workspace(&second, &host).0, "remote-ws");
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.workspaces[0].host_id, host);
+        assert!(!app.auto_close_workspaces.contains("remote-ws"), "operator launch is user-owned");
+    }
+
+    #[test]
+    fn auto_close_adopted_workspace_persists_and_reopens_for_followup() {
+        let _guard = crate::test_support::home_lock();
+        let cfg = || crate::config::Config {
+            api_url: String::new(), api_token: String::new(), gcp_project: String::new(),
+            gcp_zone: String::new(), repos: std::collections::HashMap::new(),
+        };
+        let mut app = App::new(cfg());
+        let host = cm_daemon::host_id::HostId::new("manager");
+        let mut worker = summary("worker", Some("triage-parent"));
+        worker.label = "scraper-cohort-914e0fc2".into();
+        worker.workspace_id = Some("auto-close-test-ws".into());
+        worker.worktree_path = Some("/remote/preserved-worktree".into());
+        let wid = app.resolve_adopt_workspace(&worker, &host).0;
+        let wi = app.workspaces.iter().position(|w| w.id == wid).unwrap();
+        assert!(app.auto_close_workspaces.contains(&wid));
+        assert_eq!(app.workspaces[wi].name, worker.label);
+        app.sessions_restored = true;
+        assert!(app.close_agent_marker_if_empty(wi));
+        let disk = App::load_manifest();
+        assert!(disk.auto_close_workspaces.contains(&wid));
+        assert!(disk.workspaces[&wid].is_closed);
+        assert_eq!(disk.workspaces[&wid].worktree_path.as_deref(), Some(std::path::Path::new("/remote/preserved-worktree")));
+        let restored = App::new(cfg());
+        assert!(restored.auto_close_workspaces.contains(&wid), "provenance survives viewer restart");
+        worker.session_uid = "followup-worker".into();
+        assert_eq!(app.resolve_adopt_workspace(&worker, &host).0, wid);
+        assert!(!app.workspaces[wi].is_closed, "follow-up adoption reopens the same workspace");
+        app.apply_submit_action(crate::app::input::SubmitAction::SaveWorkspaceSettings {
+            workspace_id: wid.clone(), name: "keep this investigation".into(),
+            color: None, pinned: false, section: None,
+        });
+        assert!(!app.auto_close_workspaces.contains(&wid), "rename claims the wrapper");
+        assert!(!app.close_agent_marker_if_empty(wi));
+        assert!(!App::load_manifest().auto_close_workspaces.contains(&wid));
     }
 
     #[test]

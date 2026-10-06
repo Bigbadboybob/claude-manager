@@ -423,12 +423,14 @@ impl App {
     /// Process all pending terminal events (non-blocking).
     pub fn drain_terminal_events(&mut self) {
         let visible_uid = self.active_session().map(|(_, ts)| ts.uid.clone());
-        for ts in self.workspaces.iter_mut().flat_map(|ws| &mut ws.sessions) {
-            if let Some(control) = &mut ts.session.output_control {
-                control.set_visible(visible_uid.as_deref() == Some(&ts.uid));
-            }
-        }
         let now = Instant::now();
+        for ts in self.workspaces.iter_mut().flat_map(|ws| &mut ws.sessions) {
+            let visible = visible_uid.as_deref() == Some(&ts.uid);
+            if let Some(control) = &mut ts.session.output_control {
+                control.set_visible(visible);
+            }
+            ts.session.poll_repaint(visible, now);
+        }
         let should_check_session_ids =
             now.duration_since(self.last_session_id_check) >= SESSION_ID_CHECK_INTERVAL;
 
@@ -1824,6 +1826,12 @@ impl App {
         // applied may post-date the daemon's capture, and an A-R
         // force-restart's own kill is skipped like the diff path does.
         self.prune_rows_absent_from_snapshot(&snapshot);
+        if let Some(assignments) = &snapshot.sidebar_assignments {
+            self.receive_sidebar_snapshot(&snapshot.host, assignments);
+        }
+        if let Some(alerts) = &snapshot.owner_attention {
+            self.apply_owner_attention_snapshot(&snapshot.host, alerts);
+        }
         // 10e-d: collect uids we adopted with memory_cap_kill=true
         // so we can fire toasts AFTER the workspaces-iteration
         // is done — avoids the &mut self contention from calling
@@ -2162,6 +2170,18 @@ impl App {
                 // re-assert that healed a drifted row). Entries that
                 // don't carry the field (workflow-binding `Updated`s,
                 // `Added`s) are left alone.
+                if let Some(value) = entry.get("sidebar_assignment") {
+                    if let Ok(assignment) = serde_json::from_value(value.clone()) {
+                        self.receive_sidebar_assignment(&host, assignment);
+                    }
+                }
+                if let Some(value) = entry.get("owner_attention") {
+                    if value.is_null() {
+                        self.apply_owner_attention(&host, &uid, None);
+                    } else if let Ok(alert) = serde_json::from_value(value.clone()) {
+                        self.apply_owner_attention(&host, &uid, Some(alert));
+                    }
+                }
                 self.apply_messaging_name(&host, &uid, &entry);
                 self.apply_global_perms_from_diff(&uid, &entry);
                 self.apply_transcript_from_diff(&host, &uid, &entry);
@@ -2468,6 +2488,13 @@ impl App {
     /// therefore modelled as sidebar `backtest_rows` (one collapsible
     /// group) instead of workspaces — see `app/backtests.rs`.
     fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
+        // The work list below intentionally omits Done tasks. Keep their
+        // ancestry separately: a retained session must not fall out of its
+        // continuous tree merely because its planning task completed.
+        self.sidebar_task_parents = tasks.iter()
+            .map(|t| (t.id.clone(), t.parent_task_id.clone())).collect();
+        self.sidebar_done_task_ids = tasks.iter()
+            .filter(|t| t.status == "done").map(|t| t.id.clone()).collect();
         // Feed the backtests group from the FULL fetch (all statuses):
         // queued (backlog) rows and grace-lingering terminal rows are part
         // of the group, while the workspace loop below only looks at
@@ -2508,7 +2535,17 @@ impl App {
             // stay in the planning view.
             match task.status.as_str() {
                 "running" | "blocked" => {}
-                _ => continue,
+                _ => {
+                    // Update existing bindings before pruning. Otherwise a
+                    // task that just completed retains its old Running status
+                    // and pins an empty workspace until the next TUI restart.
+                    if let Some(entry) = self.tasks.iter_mut()
+                        .find(|entry| entry.task_id.as_deref() == Some(task.id.as_str()))
+                    {
+                        entry.api_status = TaskStatus::from_api(&task.status);
+                    }
+                    continue;
+                }
             }
             seen_ids.insert(task.id.clone());
 
@@ -2934,6 +2971,69 @@ mod apply_manifest_diff_tests {
         app
     }
 
+    fn owner_test_alert(id: &str, uid: &str) -> cm_daemon::owner_attention::Alert {
+        cm_daemon::owner_attention::Alert {
+            id: id.into(), session_uid: uid.into(), label: "Task".into(),
+            message: "Ready for review".into(), task_id: None, continuous_task_id: None,
+        }
+    }
+
+    #[test]
+    fn owner_attention_local_and_cloud_stream_indicators_clear_on_focus() {
+        for host in [crate::hosts::HostId::local(), crate::hosts::HostId::new("sessions")] {
+            let mut app = build_app_with_session("self");
+            app.push_worker.shutdown(); // no real desktop/socket side effects in view tests
+            app.workspaces[0].sessions[0].host_id = host.clone();
+            let alert = owner_test_alert("a", "self");
+            app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+                uid: "self".into(), entry: serde_json::json!({"owner_attention": alert}),
+            });
+            assert!(app.session_has_alert("self"));
+            app.needs_redraw = false;
+            app.sync_owner_alert_indicators();
+            assert!(!app.needs_redraw, "pending alerts must not busy-redraw");
+            app.acknowledge_owner_alerts_for_row("self");
+            app.alerts.remove("self");
+            assert!(app.owner_alerts.is_empty());
+            app.apply_owner_attention(&host, "self", Some(alert));
+            assert!(!app.session_has_alert("self"), "old snapshot cannot resurrect a focused alert");
+            app.apply_owner_attention(&host, "self", Some(owner_test_alert("new", "self")));
+            assert!(app.session_has_alert("self"));
+        }
+    }
+
+    #[test]
+    fn owner_attention_snapshot_clears_only_its_host_and_survives_delayed_adoption() {
+        let mut app = build_app_with_session("other");
+        app.push_worker.shutdown();
+        let host = crate::hosts::HostId::new("sessions");
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.apply_owner_attention(&host, "self", Some(owner_test_alert("a", "self")));
+        assert!(!app.session_has_alert("self"));
+        app.workspaces[0].sessions[0].uid = "self".into();
+        app.sync_owner_alert_indicators();
+        assert!(app.session_has_alert("self"));
+        app.apply_owner_attention_snapshot(&crate::hosts::HostId::local(), &Default::default());
+        assert!(app.session_has_alert("self"));
+        app.apply_owner_attention_snapshot(&host, &Default::default());
+        assert!(!app.session_has_alert("self"));
+    }
+
+    #[test]
+    fn owner_attention_continuous_tick_replacement_keeps_attention_and_focus_ack() {
+        let mut app = build_app_with_session("new-tick");
+        app.push_worker.shutdown();
+        let host = crate::hosts::HostId::new("manager");
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.workspaces[0].sessions[0].continuous_task_id = Some("continuous".into());
+        let mut alert = owner_test_alert("a", "previous-tick");
+        alert.continuous_task_id = Some("continuous".into());
+        app.apply_owner_attention(&host, "previous-tick", Some(alert));
+        assert!(app.session_has_alert("new-tick"));
+        app.acknowledge_owner_alerts_for_row("new-tick");
+        assert!(app.owner_alerts.is_empty());
+    }
+
     #[test]
     fn reconcile_binds_remote_session_without_branch_metadata() {
         let mut app = build_app_with_session("lost-launch");
@@ -3303,6 +3403,8 @@ mod apply_manifest_diff_tests {
         crate::manifest_watch::ManifestSnapshotPayload {
             host,
             session_transcripts: Vec::new(),
+            owner_attention: None,
+            sidebar_assignments: None,
             listed_uids: listed.iter().map(|u| u.to_string()).collect(),
             session_last_exits: listed
                 .iter()
@@ -3461,6 +3563,32 @@ mod apply_manifest_diff_tests {
              running oneshot task",
         );
         assert_eq!(app.workspaces[0].tombstones.len(), 1, "history kept");
+    }
+
+    #[test]
+    fn auto_close_plain_label_on_exit_preserves_task_and_history() {
+        let mut app = build_app_with_session("ts-auto-close");
+        app.workspaces[0].name = "scraper-health-4835143c".into();
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.workspaces[0].sessions[0].task_id = Some("triage-child".into());
+        let wid = app.workspaces[0].id.clone();
+        let worktree = app.workspaces[0].worktree_path.clone();
+        app.auto_close_workspaces.insert(wid.clone());
+        app.tasks.push(TaskEntry {
+            task_id: Some("triage-child".into()), name: "triage-child".into(),
+            api_status: TaskStatus::Blocked, repo_url: None, prompt: None,
+            wip_branch: None, session_id: None, blocked_at: None,
+            is_cloud: false, is_continuous: false, workspace_id: Some(wid.clone()),
+            project: None, parent_task_id: Some("triage-parent".into()),
+            worktree_mode: WorktreeMode::Inherit, metadata: None,
+        });
+        app.apply_manifest_diff(exit_diff("ts-auto-close"));
+        assert!(app.workspaces[0].is_closed);
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert_eq!(app.workspaces[0].worktree_path, worktree);
+        assert_eq!(app.workspaces[0].tombstones[0].uid, "ts-auto-close");
+        assert_eq!(app.tasks[0].api_status, TaskStatus::Blocked);
+        assert_eq!(app.tasks[0].workspace_id.as_ref(), Some(&wid));
     }
 
     /// User-created workspaces are NOT closed by the kill-time path —
@@ -3862,6 +3990,8 @@ mod apply_manifest_diff_tests {
             listed_uids: vec!["ts-snap-resume".into()],
             session_last_exits: Vec::new(),
             session_transcripts: vec![("ts-snap-resume".into(), "current".into())],
+            owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
         };
         app.apply_manifest_snapshot(payload);
@@ -3891,6 +4021,8 @@ mod apply_manifest_diff_tests {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
+            owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t22".into(),
@@ -3933,6 +4065,8 @@ mod apply_manifest_diff_tests {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
+            owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t23".into(),
@@ -4092,6 +4226,8 @@ mod apply_manifest_diff_tests {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
+            owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t27".into(),
@@ -4132,6 +4268,8 @@ mod apply_manifest_diff_tests {
             host: cm_daemon::host_id::HostId::local(),
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
+            owner_attention: None,
+            sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t28".into(),
@@ -5867,8 +6005,11 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6078,8 +6219,11 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6286,8 +6430,11 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6436,8 +6583,11 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -6576,8 +6726,11 @@ pub(super) mod pending_workflow_events_tests {
             view: None,
             hide_continuous: false,
             continuous_column_on: false,
+            hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -7614,6 +7767,47 @@ mod backtest_group_tests {
         restore("HOME", orig);
         restore("CM_DAEMON_SOCKET", orig_dsock);
         restore("CM_TUI_SOCKET", orig_tsock);
+    }
+
+    #[test]
+    fn reconcile_keeps_done_worker_sessions_in_continuous_tree() {
+        with_temp_home(|home| {
+            let mut app = test_app(home);
+            app.workspaces.clear();
+            let mut orch = empty_cloud_ws("orch-ws", "orchestrator", None);
+            orch.is_cloud = false;
+            let mut session = real_session("orchestrator");
+            session.uid = "orch-new".into();
+            session.task_id = Some("orch".into());
+            session.continuous_task_id = Some("structured-scraper-creation".into());
+            orch.sessions.push(session);
+            let mut worker = empty_cloud_ws("worker-ws", "SP-30 federal register", None);
+            worker.is_cloud = false;
+            let mut session = real_session("SP-30");
+            session.task_id = Some("worker".into());
+            session.managed_by_uid = Some("orch-old".into());
+            worker.sessions.push(session);
+            app.workspaces.extend([orch, worker]);
+            let orch_task = api_task("orch", "running", "continuous", false, "orch", None);
+            let mut worker_task = api_task("worker", "running", "oneshot", false, "SP-30", None);
+            worker_task.parent_task_id = Some("orch".into());
+            app.reconcile_tasks(vec![orch_task.clone(), worker_task.clone()]);
+            let uid = app.workspaces.iter().find(|w| w.id == "worker-ws").unwrap().sessions[0].uid.clone();
+            for cold_start in [false, true] {
+                if cold_start { app.tasks.clear(); }
+                worker_task.status = "done".into();
+                app.reconcile_tasks(vec![orch_task.clone(), worker_task.clone()]);
+                let wi = app.workspaces.iter().position(|w| w.id == "worker-ws").unwrap();
+                assert!(app.continuous_members().contains(&(wi, 0)));
+                assert!(app.visual_items_continuous().iter().any(|r|
+                    r.ws_idx == wi && r.sess_idx == Some(0) && r.depth == 1));
+                assert!(!app.task_view_visible_workspaces(&app.continuous_members()).contains(&wi));
+                assert_eq!(app.workspaces[wi].sessions[0].uid, uid);
+                assert!(!app.tasks.iter().any(|t| t.task_id.as_deref() == Some("worker")),
+                    "Done tasks must not become active work or mint new workspaces");
+                assert_eq!(app.workspaces.len(), 2);
+            }
+        });
     }
 
     /// The core owner report: a running cloud backtest must NOT become a

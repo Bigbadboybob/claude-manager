@@ -149,6 +149,27 @@ class FleetTests(unittest.TestCase):
         for change in [{'paused':True}, {'in_flight':True}, {'last_run':{'seq':1,'status':'running'}}]:
             self.assertEqual(watch.fleet_alerts(self.health,[self.task|change],{},NOW), {})
 
+    def test_old_queue_waits_for_scheduled_fire_and_overdue_grace(self):
+        # Reproduce the Sep 10 alert after a compact-only Done run. The
+        # remaining queue items are hours old, but the scheduler is waiting.
+        queue = {'q': {'pending':4,'oldest_pending_at':NOW-7*3600}}
+        scheduled = NOW + 420
+        task = self.task | {'next_fire_at':scheduled,'last_run':{'seq':400,'status':'done'}}
+        for now in (NOW, scheduled, scheduled+600):
+            with self.subTest(now=now):
+                self.assertEqual(watch.fleet_alerts(self.health,[task],queue,now), {})
+        self.assertIn('task:consumer', watch.fleet_alerts(self.health,[task],queue,scheduled+601))
+
+    def test_depth_eligibility_does_not_bypass_scheduler_delay(self):
+        queue = {'q': {'pending':6,'oldest_pending_at':NOW-5000}}
+        task = self.task | {'next_fire_at':NOW+60,'schedule':self.task['schedule']|{'depth_threshold':5}}
+        self.assertEqual(watch.fleet_alerts(self.health,[task],queue,NOW), {})
+        self.assertIn('task:consumer', watch.fleet_alerts(self.health,[task],queue,NOW+661))
+
+    def test_consumer_without_scheduled_timestamp_still_detects_overdue_work(self):
+        queue = {'q': {'pending':4,'oldest_pending_at':NOW-5000}}
+        self.assertIn('task:consumer', watch.fleet_alerts(self.health,[self.task|{'next_fire_at':None}],queue,NOW))
+
     def test_daemon_registry_mismatch_and_task_hold_are_distinct(self):
         alerts = watch.fleet_alerts(self.health|{'holder_sessions':3},[self.task|{'recovery_hold':{'run_seq':1}}],{},NOW)
         self.assertEqual(set(alerts), {'daemon','task:consumer'})

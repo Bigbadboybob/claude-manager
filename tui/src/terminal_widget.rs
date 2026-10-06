@@ -6,6 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::session::EventProxy;
@@ -14,12 +15,47 @@ use crate::session::EventProxy;
 pub struct TerminalWidget<'a> {
     term: &'a Arc<FairMutex<Term<EventProxy>>>,
     focused: bool,
+    /// Pane image id → outer image id, when the pane has kitty graphics
+    /// passthrough. Placeholder cells are rewritten through it.
+    images: Option<&'a HashMap<u32, u32>>,
 }
 
 impl<'a> TerminalWidget<'a> {
     pub fn new(term: &'a Arc<FairMutex<Term<EventProxy>>>, focused: bool) -> Self {
-        Self { term, focused }
+        Self { term, focused, images: None }
     }
+
+    pub fn images(mut self, images: Option<&'a HashMap<u32, u32>>) -> Self {
+        self.images = images;
+        self
+    }
+}
+
+/// Render a kitty Unicode-placeholder cell for the outer terminal: keep the
+/// row/column diacritics, re-encode the pane's image id as the outer id, and
+/// keep the underline colour (the placement id). A placeholder naming an
+/// image this pane never sent renders blank, so it cannot show another
+/// pane's image.
+fn render_placeholder(
+    cell: &alacritty_terminal::term::cell::Cell,
+    images: &HashMap<u32, u32>,
+    out: &mut ratatui::buffer::Cell,
+) {
+    use crate::graphics::placeholder;
+    let zerowidth = cell.zerowidth().unwrap_or(&[]);
+    let outer = placeholder::image_id(cell.fg, zerowidth).and_then(|id| images.get(&id));
+    let Some(&outer) = outer else {
+        out.set_char(' ').set_bg(convert_color(cell.bg));
+        return;
+    };
+    let mut symbol = String::from(placeholder::PLACEHOLDER);
+    symbol.extend(zerowidth.iter().take(2));
+    let (r, g, b) = placeholder::id_color(outer);
+    let mut style = Style::default().fg(Color::Rgb(r, g, b)).bg(convert_color(cell.bg));
+    if let Some(underline) = cell.underline_color() {
+        style = style.underline_color(convert_color(underline));
+    }
+    out.set_symbol(&symbol).set_style(style);
 }
 
 /// Current scrollback offset of `term`, in lines scrolled up from the live
@@ -34,6 +70,12 @@ pub fn scrollback_offset(term: &Arc<FairMutex<Term<EventProxy>>>) -> usize {
 
 impl Widget for TerminalWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // With passthrough on, a pane that has no image map of its own (a
+        // local PTY, the planning editor) must still never send raw ids: an
+        // empty map blanks its placeholder cells.
+        static NO_IMAGES: std::sync::OnceLock<HashMap<u32, u32>> = std::sync::OnceLock::new();
+        let passthrough_without_images = crate::graphics::outer::enabled()
+            .then(|| NO_IMAGES.get_or_init(HashMap::new));
         let term = self.term.lock();
         let content = term.renderable_content();
         let cursor = content.cursor;
@@ -61,6 +103,15 @@ impl Widget for TerminalWidget<'_> {
                 || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
             {
                 continue;
+            }
+
+            if let Some(images) = self.images.or(passthrough_without_images) {
+                if cell.c == crate::graphics::placeholder::PLACEHOLDER {
+                    if let Some(out) = buf.cell_mut((x, y)) {
+                        render_placeholder(cell, images, out);
+                    }
+                    continue;
+                }
             }
 
             let fg = convert_color(cell.fg);
@@ -92,7 +143,12 @@ impl Widget for TerminalWidget<'_> {
             }
 
             if let Some(ratatui_cell) = buf.cell_mut((x, y)) {
-                ratatui_cell.set_char(cell.c);
+                // Alacritty stores tabs in the grid for text extraction, but
+                // their cursor movement has already been applied by the parser.
+                // Emitting one here moves the OUTER terminal cursor again and
+                // lets subsequent diff cells overwrite the neighboring sidebar.
+                // Grid control characters are blank display cells, not commands.
+                ratatui_cell.set_char(if cell.c.is_control() { ' ' } else { cell.c });
                 ratatui_cell.set_fg(fg);
                 ratatui_cell.set_bg(bg);
                 ratatui_cell.set_style(Style::default().add_modifier(modifier));
@@ -190,4 +246,181 @@ fn convert_flags(flags: Flags) -> Modifier {
         modifier |= Modifier::CROSSED_OUT;
     }
     modifier
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::vte::ansi::Processor;
+    use ratatui::backend::{Backend, CrosstermBackend};
+
+    use crate::session::{terminal_config, TermSize};
+
+    fn terminal(columns: usize, screen_lines: usize) -> Arc<FairMutex<Term<EventProxy>>> {
+        let (tx, _) = std::sync::mpsc::channel();
+        Arc::new(FairMutex::new(Term::new(
+            terminal_config(),
+            &TermSize {
+                columns,
+                screen_lines,
+            },
+            EventProxy::new(tx),
+        )))
+    }
+
+    fn feed(term: &Arc<FairMutex<Term<EventProxy>>>, bytes: &[u8]) {
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut *term.lock(), bytes);
+    }
+
+    fn frame(term: &Arc<FairMutex<Term<EventProxy>>>, pane: Rect, screen: Rect) -> Buffer {
+        let mut buf = Buffer::empty(screen);
+        for y in 0..screen.height {
+            for x in pane.right()..screen.width {
+                buf[(x, y)]
+                    .set_char(if x == pane.right() { '│' } else { '#' })
+                    .set_fg(Color::White)
+                    .set_bg(Color::Indexed(53));
+            }
+        }
+        TerminalWidget::new(term, false).render(pane, &mut buf);
+        buf
+    }
+
+    // Buffer-only assertions miss cursor-moving bytes. Exercise the production
+    // diff/backend and interpret its ANSI output in a second terminal, just as
+    // the laptop does. The sidebar is unchanged between frames, so it cannot
+    // repair a pane update that accidentally writes beyond its boundary.
+    fn draw_into_terminal(
+        previous: &Buffer,
+        next: &Buffer,
+        outer: &Arc<FairMutex<Term<EventProxy>>>,
+    ) {
+        let mut bytes = Vec::new();
+        let mut backend = CrosstermBackend::new(&mut bytes);
+        backend.draw(previous.diff(next).into_iter()).unwrap();
+        backend.flush().unwrap();
+        feed(outer, &bytes);
+    }
+
+    #[test]
+    fn tabbed_output_does_not_overwrite_sidebar_on_incremental_redraw() {
+        // The test runner may set NO_COLOR; exercise the laptop's colored output.
+        crossterm::style::force_color_output(true);
+        for left in [0, 1, 3, 7] {
+            let screen = Rect::new(0, 0, 48, 5);
+            let pane = Rect::new(left, 1, 23, 3);
+            let inner = terminal(pane.width as usize, pane.height as usize);
+            let outer = terminal(screen.width as usize, screen.height as usize);
+            feed(&inner, b"xxxxxxxxxxxxxxxxxxxxxxx");
+            let mut previous = frame(&inner, pane, screen);
+            draw_into_terminal(&Buffer::empty(screen), &previous, &outer);
+
+            for input in [
+                b"\r\x1b[2K\tstatus".as_slice(),
+                b"\r\x1b[2Kone\tmore\toutput",
+                b"\r\x1b[2Kxxxxxxxxxxxxxxxxxxxxxxx",
+                b"\r\x1b[2K\t\tend",
+            ] {
+                feed(&inner, input);
+                let next = frame(&inner, pane, screen);
+                draw_into_terminal(&previous, &next, &outer);
+                let term = outer.lock();
+                for y in 0..screen.height {
+                    for x in pane.right()..screen.width {
+                        let actual = &term.grid()[Line(y as i32)][Column(x as usize)];
+                        assert_eq!(
+                            actual.c.to_string(),
+                            next[(x, y)].symbol(),
+                            "sidebar overwritten at ({x}, {y}), pane left={left}"
+                        );
+                        assert_eq!(
+                            actual.bg,
+                            AnsiColor::Indexed(53),
+                            "sidebar background overwritten at ({x}, {y}), pane left={left}"
+                        );
+                    }
+                }
+                for x in pane.left()..pane.right() {
+                    assert_eq!(
+                        term.grid()[Line(pane.y as i32)][Column(x as usize)]
+                            .c
+                            .to_string(),
+                        next[(x, pane.y)].symbol(),
+                        "pane content misplaced at column {x}, pane left={left}"
+                    );
+                }
+                drop(term);
+                previous = next;
+            }
+        }
+    }
+
+    #[test]
+    fn kitty_placeholder_cells_are_rewritten_to_outer_image_ids() {
+        crossterm::style::force_color_output(true);
+        let inner = terminal(8, 2);
+        // Image 7 (truecolor id, placement 9 in the underline colour): two
+        // cells, row 0 / columns 0 and 1. Then an id this pane never sent.
+        feed(
+            &inner,
+            "\x1b[38;2;0;0;7m\x1b[58;2;0;0;9m\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}\
+             \x1b[59m\x1b[38;5;99m\u{10EEEE}\u{0305}\u{0305}\x1b[0mx"
+                .as_bytes(),
+        );
+        let images = HashMap::from([(7, 0x12_3456)]);
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buf = Buffer::empty(area);
+        TerminalWidget::new(&inner, false).images(Some(&images)).render(area, &mut buf);
+
+        assert_eq!(buf[(0, 0)].symbol(), "\u{10EEEE}\u{0305}\u{0305}");
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(buf[(0, 0)].underline_color, Color::Rgb(0, 0, 9));
+        assert_eq!(buf[(1, 0)].symbol(), "\u{10EEEE}\u{0305}\u{030D}");
+        assert_eq!(buf[(2, 0)].symbol(), " ", "unknown ids must never reach the outer terminal");
+        assert_eq!(buf[(3, 0)].symbol(), "x");
+
+        // The bytes the outer terminal receives carry the rewritten id and
+        // the diacritics unchanged.
+        let mut bytes = Vec::new();
+        let mut backend = CrosstermBackend::new(&mut bytes);
+        backend.draw(Buffer::empty(area).diff(&buf).into_iter()).unwrap();
+        backend.flush().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("38;2;18;52;86"), "{text:?}");
+        assert!(text.contains("58;2;0;0;9m"), "{text:?}");
+        assert!(text.contains("\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}"), "{text:?}");
+        assert!(!text.contains("38;5;99"), "{text:?}");
+
+        // A pane without its own map never sends raw ids: unchanged when
+        // passthrough is off (another test in this process may turn it on),
+        // blank when it is on.
+        let mut plain = Buffer::empty(area);
+        TerminalWidget::new(&inner, false).render(area, &mut plain);
+        let expected = if crate::graphics::outer::enabled() { " " } else { "\u{10EEEE}" };
+        assert_eq!(plain[(0, 0)].symbol(), expected);
+    }
+
+    #[test]
+    fn tabs_keep_their_style_and_grid_text_in_scrollback() {
+        let inner = terminal(12, 3);
+        feed(&inner, b"\x1b[44m\x1b[2J\ta\r\n\tb\r\n\tc\r\n\td");
+        inner
+            .lock()
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(1));
+        assert_eq!(scrollback_offset(&inner), 1);
+        let pane = Rect::new(1, 1, 12, 3);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        TerminalWidget::new(&inner, false).render(pane, &mut buf);
+
+        for (row, letter) in ['a', 'b', 'c'].into_iter().enumerate() {
+            let y = pane.y + row as u16;
+            assert_eq!(buf[(pane.x, y)].symbol(), " ");
+            assert_eq!(buf[(pane.x, y)].bg, Color::Blue);
+            assert_eq!(buf[(pane.x + 8, y)].symbol(), letter.to_string());
+            // Copy/selection still sees the original tab; only display changes.
+            assert_eq!(inner.lock().grid()[Line(row as i32 - 1)][Column(0)].c, '\t');
+        }
+    }
 }

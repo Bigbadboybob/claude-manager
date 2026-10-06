@@ -251,6 +251,7 @@ impl App {
             let mut peek_max: Option<u16> = None;
             match &self.input_mode {
                 InputMode::ContinuousControl(menu) => menu.draw(frame, area),
+                InputMode::WorktreeCleanup(menu) => menu.draw(frame, area),
                 InputMode::NewSession {
                     engine,
                     label_text,
@@ -1204,7 +1205,8 @@ impl App {
         frame.render_widget(block, area);
 
         if let Some((_, ts)) = self.active_session() {
-            let widget = TerminalWidget::new(&ts.session.term, true);
+            let widget = TerminalWidget::new(&ts.session.term, true)
+                .images(ts.session.graphics.as_ref().map(|g| g.ids()));
             frame.render_widget(widget, inner);
         } else if let Some(wi) = self.active_workspace_index() {
             let ws = &self.workspaces[wi];
@@ -1263,26 +1265,26 @@ impl App {
     /// `visual_items_continuous()`. Reuses `draw_session_list`'s indicator
     /// glyphs (reconnecting `⟳` / hidden / Running spinner / Idle `●` / alert).
     /// The cursor highlight + the `├`/`└` corner polish land in S4/S5.
-    /// A continuous-column row "needs the operator" when its planning task is
-    /// raw-`blocked`. The orchestrators set `blocked` ONLY for a fix-ready
-    /// subtask awaiting review or an explicit human decision
-    /// (needs_human_decision / long_review / source_down); everything they
-    /// advance themselves stays `running`. We read the RAW `api_status` here
-    /// (not `task_status()`, which derives `Blocked` from any idle session and
-    /// would flag every idle row as needing a human).
+    /// A continuous-column row needs the operator when its durable stage is
+    /// OwnerReview, including the legacy raw-`blocked` compatibility mapping.
+    /// Never derive review ownership from session activity or idle time.
     fn session_needs_human(&self, ts: &TerminalSession) -> bool {
         let Some(tid) = ts.task_id.as_deref() else {
             return false;
         };
-        self.tasks
-            .iter()
-            .any(|t| t.task_id.as_deref() == Some(tid) && matches!(t.api_status, TaskStatus::Blocked))
+        self.tasks.iter().find(|t| t.task_id.as_deref() == Some(tid)).is_some_and(|t| {
+            crate::continuous_stage::ContinuousStage::resolve(
+                t.metadata.as_ref(), matches!(t.api_status, TaskStatus::Done),
+                matches!(t.api_status, TaskStatus::Blocked),
+            ) == crate::continuous_stage::ContinuousStage::OwnerReview
+        })
     }
 
     /// P3 (Feature 1): the operator-facing question an orchestrator has parked on
     /// its planning task's metadata (`metadata.operator_question`), if any. A
-    /// headless orchestrator can't call the TUI-only `notify_user`, so it sets
-    /// this via `update_task(metadata=…)` (daemon-routed, works headless) and it
+    /// headless orchestrator can also call daemon-owned `notify_user` for an
+    /// immediate attention alert. This durable question is set through
+    /// `update_task(metadata=…)` (daemon-routed, works headless) and it
     /// rides the existing task-metadata sync (`reconcile_tasks`) to here —
     /// rendered as a distinct `◉` glyph + an inline text line in the continuous
     /// column so a pending decision (e.g. a `needs_human_decision`) is visible
@@ -1371,13 +1373,28 @@ impl App {
             return;
         }
 
+        let legend = crate::continuous_stage::legend();
+        let legend_height = (legend.len() as u16).min(inner.height.saturating_sub(2));
+        let rows_area = Rect { height: inner.height - legend_height, ..inner };
+        let legend_area = Rect { y: inner.y + rows_area.height, height: legend_height, ..inner };
+        frame.render_widget(Paragraph::new(legend).style(Style::default().fg(theme::DIM)), legend_area);
+
         let spinner = self.spinner_frame();
         // One clock sample for every row's idle-age bucket this frame.
         let now = Instant::now();
         let rows = self.visual_items_continuous();
         let mut items: Vec<ListItem> = Vec::new();
         for (i, r) in rows.iter().enumerate() {
-            let ts = &self.workspaces[r.ws_idx].sessions[r.sess_idx];
+            let Some(si) = r.sess_idx else {
+                let ws = &self.workspaces[r.ws_idx];
+                let selected = self.cursor_column == SidebarColumn::Continuous && self.cursor == r.cursor();
+                let last = rows[i + 1..].iter().find(|next| next.depth <= r.depth).is_none_or(|next| next.depth < r.depth);
+                let name = crate::planning::truncate_with_ellipsis(&ws.name, (inner.width as usize).saturating_sub(19));
+                let style = if selected { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::DIM) };
+                items.push(ListItem::new(Line::from(Span::styled(format!("   {} {} (no session)", if last { "└" } else { "├" }, name), style))));
+                continue;
+            };
+            let ts = &self.workspaces[r.ws_idx].sessions[si];
             // P3 (Feature 1): a parked operator-question wins the idle glyph and
             // adds a dim inline text line below the row (see the second Line push).
             let question = self.session_question(ts);
@@ -1389,8 +1406,8 @@ impl App {
             } else {
                 Vec::new()
             };
-            // Idle-age bucket — mirrors the main sidebar: tints the
-            // needs-human ● and, when stale, dims the row's label.
+            // Idle age tints the needs-human ● and stale orchestrator labels.
+            // Subtask labels retain their durable lifecycle color.
             let idle_bucket = (ts.status == SessionStatus::Idle
                 && !ts.session.exited)
                 .then(|| idle_age_bucket_at(ts.idle_since, now));
@@ -1436,6 +1453,14 @@ impl App {
             // depth 0 → 4 cells, depth 1 → 6, depth 2 (session nested under a
             // subtask) → 8 — each level indents 2 more before the label.
             let prefix_cells = 4 + (r.depth as usize) * 2;
+            let stage = (r.depth >= 1).then(|| {
+                let task = ts.task_id.as_deref().and_then(|tid| self.tasks.iter().find(|t| t.task_id.as_deref() == Some(tid)));
+                crate::continuous_stage::ContinuousStage::resolve(
+                    task.and_then(|t| t.metadata.as_ref()),
+                    task.is_some_and(|t| matches!(t.api_status, TaskStatus::Done)),
+                    task.is_some_and(|t| matches!(t.api_status, TaskStatus::Blocked)),
+                )
+            });
             let max_name = (inner.width as usize).saturating_sub(prefix_cells);
             let label = crate::planning::truncate_with_ellipsis(&ts.label, max_name);
 
@@ -1468,15 +1493,16 @@ impl App {
                     Style::default().fg(theme::DIM),
                 ));
             }
-            // Focus highlight: only when the cursor is actually IN this column
-            // (S4). Bold-white, matching the main sidebar's selected style.
+            // Focus takes precedence over lifecycle color, matching the main sidebar.
             let is_selected = self.cursor_column == SidebarColumn::Continuous
                 && matches!(
                     &self.cursor,
-                    Cursor::Session(cwi, csi) if *cwi == r.ws_idx && *csi == r.sess_idx
+                    Cursor::Session(cwi, csi) if *cwi == r.ws_idx && Some(*csi) == r.sess_idx
                 );
             let label_style = if is_selected {
                 Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+            } else if let Some(stage) = stage {
+                Style::default().fg(stage.color())
             } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
                 && !self.session_has_alert(&ts.uid)
                 && !self.reconnecting_sessions.contains(&ts.uid)
@@ -1545,7 +1571,7 @@ impl App {
         let mut state = std::mem::take(&mut self.continuous_list_state);
         if self.cursor_column == SidebarColumn::Continuous {
             let selected = match &self.cursor {
-                Cursor::Session(wi, si) => rows.iter().position(|r| r.ws_idx == *wi && r.sess_idx == *si),
+                Cursor::Session(_, _) | Cursor::Workspace(_) => rows.iter().position(|r| r.cursor() == self.cursor),
                 Cursor::Backtest(_) => self
                     .sidebar_cursor_index(&backtests)
                     .map(|index| rows.len() + index),
@@ -1553,7 +1579,7 @@ impl App {
             };
             state.select(selected);
         }
-        frame.render_stateful_widget(List::new(items).highlight_style(Style::default()), inner, &mut state);
+        frame.render_stateful_widget(List::new(items).highlight_style(Style::default()), rows_area, &mut state);
         self.continuous_list_state = state;
     }
 
@@ -2770,7 +2796,7 @@ impl App {
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
                     .unwrap_or("");
-                let name_style = if !cand.worktree_exists {
+                let name_style = if cand.worktree_exists == Some(false) {
                     Style::default()
                         .fg(theme::DIM)
                         .add_modifier(Modifier::CROSSED_OUT)
@@ -2781,7 +2807,7 @@ impl App {
                 } else {
                     Style::default().fg(theme::HEADER)
                 };
-                let path_style = if !cand.worktree_exists {
+                let path_style = if cand.worktree_exists == Some(false) {
                     Style::default()
                         .fg(theme::ERROR)
                         .add_modifier(Modifier::CROSSED_OUT)
@@ -2790,7 +2816,7 @@ impl App {
                 } else {
                     Style::default().fg(theme::DIM)
                 };
-                let suffix = if cand.worktree_exists {
+                let suffix = if cand.worktree_exists != Some(false) {
                     String::new()
                 } else {
                     "  (worktree gone)".to_string()

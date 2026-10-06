@@ -510,6 +510,10 @@ pub struct ManifestWorkspace {
 /// still exists at the path captured at exit time.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionTombstone {
+    /// Full viewer metadata at close, so an immediate close cannot outrun the
+    /// background preferences push. Legacy tombstones have no full entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<ManifestEntry>,
     pub uid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_by_uid: Option<String>,
@@ -577,6 +581,9 @@ pub struct Manifest {
     /// load as "column off" (today's single-sidebar layout).
     #[serde(default)]
     pub continuous_column_on: bool,
+    /// Viewer shortcut hints (Alt+?): old manifests keep hints visible.
+    #[serde(default)]
+    pub hide_keybinding_helper: bool,
     /// User-assigned accent colors for planning tasks, keyed by task id.
     /// Tasks live in the planning API rather than this manifest, so their
     /// display color rides here as a TUI-side sidecar (same palette names
@@ -595,6 +602,13 @@ pub struct Manifest {
     /// renders under its parent's section) or renders loose.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub workspace_sections: HashMap<String, String>,
+    /// Viewer receipts prevent replayed remote moves from undoing Owner edits.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sidebar_receipts: HashMap<String, crate::sidebar::Receipt>,
+    /// Viewer-created wrappers for adopted agent sessions. Closing an empty
+    /// wrapper preserves its tasks, checkout and transcript tombstones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_close_workspaces: Vec<String>,
 }
 
 /// One sidebar section (see `Manifest::sections`).
@@ -661,6 +675,7 @@ mod tests {
         let m: Manifest = serde_json::from_str(legacy).unwrap();
         assert!(m.sections.is_empty());
         assert!(m.workspace_sections.is_empty());
+        assert!(m.auto_close_workspaces.is_empty());
         // Empty sections serialize to nothing — legacy files stay byte-stable.
         let s = serde_json::to_string(&m).unwrap();
         assert!(!s.contains("sections"));
@@ -673,10 +688,12 @@ mod tests {
             folded: true,
         });
         m2.workspace_sections.insert("ws-a".into(), "sec-1".into());
+        m2.auto_close_workspaces.push("ws-a".into());
         let s = serde_json::to_string(&m2).unwrap();
         let back: Manifest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.sections, m2.sections);
         assert_eq!(back.workspace_sections.get("ws-a").map(String::as_str), Some("sec-1"));
+        assert_eq!(back.auto_close_workspaces, vec!["ws-a"]);
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub(super) enum InputMode {
     /// Normal operation — keys go to terminal or app navigation.
     Normal,
     ContinuousControl(super::continuous_control::Menu),
+    WorktreeCleanup(super::worktree_cleanup::Menu),
     /// Configuring a new workspace and its initial agent session.
     NewSession {
         engine: LaunchEngine,
@@ -270,15 +271,15 @@ pub(super) enum InputMode {
     },
 }
 
-/// Snapshot of a past workspace surfaced in the A-O picker. `worktree_exists`
-/// is checked at modal-open time so the row can be greyed/disabled when the
-/// directory has been removed since close.
+/// Snapshot of a past workspace surfaced in the A-O picker. Local paths
+/// are checked at modal-open time; remote existence remains unknown so
+/// cloud workspaces are not labelled gone based on the laptop filesystem.
 #[derive(Clone, Debug)]
 pub struct PastCandidate {
     pub ws_id: String,
     pub display: String,
     pub worktree_path: Option<std::path::PathBuf>,
-    pub worktree_exists: bool,
+    pub worktree_exists: Option<bool>,
     /// Latest tombstone `exited_at` if any — used to sort most-recent first.
     pub last_exited_at: f64,
 }
@@ -566,6 +567,7 @@ pub(crate) enum SubmitAction {
         cursor_task_id: Option<String>,
     },
     MarkActiveDone,
+    CompleteWithCleanup,
     DeleteActive,
     StopWorkflow {
         run_id: String,
@@ -2640,10 +2642,7 @@ impl App {
                     .iter()
                     .map(|t| t.exited_at)
                     .fold(0.0f64, f64::max);
-                let worktree_exists = ws
-                    .worktree_path
-                    .as_ref()
-                    .map_or(false, |p| p.exists());
+                let worktree_exists = ws.local_worktree_exists();
                 PastCandidate {
                     ws_id: ws.id.clone(),
                     display: ws.name.clone(),
@@ -2678,6 +2677,7 @@ impl App {
         if self.mouse_capture_enabled {
             let _ = execute!(stdout, DisableMouseCapture);
             self.mouse_capture_enabled = false;
+            self.terminal_selection = None;
             self.set_status_msg("Mouse capture OFF — use terminal's native selection (Alt+M to re-enable)");
         } else {
             let _ = execute!(stdout, EnableMouseCapture);
@@ -2763,6 +2763,7 @@ impl App {
             {
                 self.keybinding_helper_visible = !self.keybinding_helper_visible;
                 self.planning.keybinding_helper_visible = self.keybinding_helper_visible;
+                self.save_session_manifest();
                 self.set_status_msg(if self.keybinding_helper_visible {
                     "Keybinding helper shown"
                 } else {
@@ -3083,13 +3084,13 @@ impl App {
                     // differ on whether Shift is baked into the char case or
                     // reported as a modifier — accept both forms.
                     KeyCode::Char('W') => {
-                        self.close_active_workspace();
+                        self.open_worktree_completion(false);
                         return true;
                     }
                     KeyCode::Char('w')
                         if key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
-                        self.close_active_workspace();
+                        self.open_worktree_completion(false);
                         return true;
                     }
                     KeyCode::Char('w') => {
@@ -3105,10 +3106,7 @@ impl App {
                             self.set_status_msg("A section is not a task — nothing to mark done");
                             return true;
                         }
-                        self.input_mode = InputMode::Confirm {
-                            prompt: "Mark task done? Sessions for this task will close.".to_string(),
-                            action: ConfirmAction::MarkDone,
-                        };
+                        self.open_worktree_completion(true);
                         return true;
                     }
                     KeyCode::Char('x') => {
@@ -3147,6 +3145,13 @@ impl App {
                     }
                     KeyCode::Char('r') => {
                         self.backend.refresh();
+                        // Outer-buffer clearing cannot reconstruct a Codex
+                        // screen missing from the daemon's bounded replay tail.
+                        if let Some(ts) = self.active_session_mut() {
+                            if ts.session_type == "codex" {
+                                ts.session.request_repaint();
+                            }
+                        }
                         // A-r doubles as "reconnect now": accelerate in-flight
                         // remote reconnects and revive any that gave up (the
                         // daemon may have restored them since). Addresses the
@@ -3462,31 +3467,56 @@ impl App {
     /// Returns true if the event was consumed.
     fn handle_terminal_mouse(&mut self, me: &crossterm::event::MouseEvent) -> bool {
         if !matches!(self.view_mode, ViewMode::Sessions) {
+            self.terminal_selection = None;
             return false;
         }
+        let Some((_, ts)) = self.active_session() else {
+            self.terminal_selection = None;
+            return false;
+        };
+        let uid = ts.uid.clone();
+        let term_mode = *ts.session.term.lock().mode();
+        let app_tracks_mouse = !ts.session.exited && term_mode.intersects(TermMode::MOUSE_MODE);
+        if self.terminal_selection.as_ref() != Some(&uid) {
+            self.terminal_selection = None;
+        }
+        let continuing_selection = self.terminal_selection.is_some()
+            && matches!(me.kind, MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left));
         // Terminal inner rect (after border) sits at (1,1) with last_term_size dims.
         let (term_cols, term_rows) = self.last_term_size;
-        if me.column < 1 || me.row < 1
-            || me.column > term_cols
-            || me.row > term_rows
-        {
+        if term_cols == 0 || term_rows == 0 {
+            self.terminal_selection = None;
             return false;
         }
-        let grid_col = (me.column - 1) as usize;
-        let viewport_row = (me.row - 1) as usize;
+        let outside = me.column < 1 || me.row < 1
+            || me.column > term_cols
+            || me.row > term_rows;
+        if outside && !continuing_selection {
+            return false;
+        }
+        // Complete a drag released over the border/sidebar without selecting
+        // chrome or leaving a stuck gesture behind.
+        let grid_col = (me.column.clamp(1, term_cols) - 1) as usize;
+        let viewport_row = (me.row.clamp(1, term_rows) - 1) as usize;
+        let starting_selection = matches!(me.kind, MouseEventKind::Down(MouseButton::Left))
+            && (!app_tracks_mouse || me.modifiers.contains(KeyModifiers::SHIFT));
+        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.terminal_selection = starting_selection.then_some(uid);
+        } else if matches!(me.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.terminal_selection = None;
+        }
 
         let Some(ts) = self.active_session_mut() else { return false; };
 
-        // If the inner app has enabled mouse tracking (e.g. Claude Code's
-        // fullscreen renderer, or vim/less in the alternate screen), the mouse
-        // belongs to the app: consume the event and forward it to the PTY instead
-        // of driving our own scrollback/selection. The app manages its own scroll
-        // region; in the alternate screen there is no scrollback for
-        // `scroll_display` to move anyway, so handling the wheel locally just
-        // makes it appear dead. Exited sessions always fall through to local
-        // scrollback so leftover transcripts stay scrollable.
-        let term_mode = *ts.session.term.lock().mode();
-        if !ts.session.exited && term_mode.intersects(TermMode::MOUSE_MODE) {
+        // Fullscreen clients (including Codex) own ordinary clicks and wheel
+        // events. Shift+left-drag explicitly selects in CM, so copy still works
+        // when the client captures the mouse. Latch that choice until release;
+        // releasing Shift first must not leak the end of the gesture to the PTY.
+        if app_tracks_mouse && !starting_selection && !continuing_selection {
+            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                ts.session.term.lock().selection = None;
+            }
             if let Some(bytes) =
                 encode_mouse_for_pty(me, term_mode, grid_col, viewport_row)
             {
@@ -3525,7 +3555,7 @@ impl App {
                 term.selection = Some(Selection::new(ty, point, Side::Left));
                 true
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
+            MouseEventKind::Drag(MouseButton::Left) if continuing_selection => {
                 let mut term = ts.session.term.lock();
                 let display_offset = term.grid().display_offset();
                 let point = viewport_to_point(
@@ -3537,12 +3567,12 @@ impl App {
                 }
                 true
             }
-            MouseEventKind::Up(MouseButton::Left) => {
+            MouseEventKind::Up(MouseButton::Left) if continuing_selection => {
                 let text = ts.session.term.lock().selection_to_string();
                 if let Some(text) = text {
                     if !text.is_empty() {
                         copy_to_clipboard(&text);
-                        self.set_status_msg(&format!("Copied {} chars", text.len()));
+                        self.set_status_msg(&format!("Copied {} chars", text.chars().count()));
                     }
                 }
                 true
@@ -3598,6 +3628,10 @@ impl App {
         // Section ids for the workspace / task settings pickers.
         let section_ids: Vec<String> = self.section_ids();
         let outcome = match &mut self.input_mode {
+            InputMode::WorktreeCleanup(menu) => match event {
+                CrosstermEvent::Key(key) => menu.key(*key),
+                _ => InputOutcome::Consumed,
+            },
             InputMode::ContinuousControl(menu) => match event {
                 CrosstermEvent::Key(key) => menu.key(*key),
                 _ => InputOutcome::Consumed,
@@ -3869,6 +3903,10 @@ impl App {
                 // chosen name. Other submits (and a no-target catalog)
                 // go through the normal path.
                 let old = std::mem::replace(&mut self.input_mode, InputMode::Normal);
+                if let InputMode::WorktreeCleanup(menu) = old {
+                    if matches!(action, SubmitAction::CompleteWithCleanup) { self.complete_with_cleanup(menu); }
+                    return true;
+                }
                 if let InputMode::SnapshotCatalog {
                     picker_target: Some(target),
                     ..
@@ -4117,7 +4155,9 @@ impl App {
                 if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
                     // An emptied name keeps the old one (matches the old
                     // rename-only behavior); color/pinned always apply.
-                    if !name.is_empty() {
+                    if !name.is_empty() && name != ws.name {
+                        // Renaming claims an adopted wrapper as a user workspace.
+                        self.auto_close_workspaces.remove(&workspace_id);
                         ws.name = name;
                     }
                     ws.color = color;
@@ -4239,6 +4279,7 @@ impl App {
                     cursor_task_id,
                 );
             }
+            SubmitAction::CompleteWithCleanup => {}, // handled with the captured completion menu
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
             SubmitAction::SaveSection { section_id, name, color } => match section_id {
@@ -4452,6 +4493,201 @@ mod yank_clipboard_tests {
             last_assistant_message_text(&ts, Path::new("/tmp/yankrepo"))
         });
         assert!(got.is_err());
+    }
+
+    fn mouse_app(mouse_tracking: bool) -> App {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(), api_token: String::new(),
+            gcp_project: String::new(), gcp_zone: String::new(), repos: HashMap::new(),
+        });
+        let mut ts = yank_test_session(None);
+        ts.session_type = "codex".into();
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        let mut term = ts.session.term.lock();
+        if mouse_tracking {
+            // Modes observed from the running remote Codex frontend.
+            parser.advance(&mut *term, b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1003h");
+        }
+        parser.advance(&mut *term, "héllo world".as_bytes());
+        drop(term);
+        app.workspaces = vec![Workspace {
+            id: "mouse-ws".into(), name: "mouse".into(), is_closed: false, is_cloud: false,
+            repo_url: None, worktree_path: None, main_repo_path: None,
+            worker_vm: None, worker_zone: None, host_id: crate::hosts::HostId::local(),
+            color: None, pinned: false, sessions: vec![ts], tombstones: vec![],
+        }];
+        app.cursor = Cursor::Session(0, 0);
+        app.view_mode = ViewMode::Sessions;
+        app.last_term_size = (80, 24);
+        app
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, modifiers: KeyModifiers) {
+        assert!(app.handle_event(&CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind, column, row: 1, modifiers,
+        })));
+    }
+
+    #[test]
+    fn mouse_selection_copies_from_fullscreen_codex_after_shift_released() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(true);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::SHIFT);
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 5, KeyModifiers::empty());
+            assert_eq!(app.workspaces[0].sessions[0].session.term.lock().selection_to_string().as_deref(), Some("héllo"));
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5, KeyModifiers::empty());
+            assert_eq!(app.status_msg.as_ref().map(|s| s.0.as_str()), Some("Copied 5 chars"));
+            assert!(app.terminal_selection.is_none());
+            assert!(app.workspaces[0].sessions[0].last_write_at.is_none(), "local drag must not reach Codex");
+        });
+    }
+
+    #[test]
+    fn mouse_selection_keeps_plain_drag_and_wheel_with_fullscreen_client() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(true);
+            for (kind, column) in [
+                (MouseEventKind::Down(MouseButton::Left), 1),
+                (MouseEventKind::Drag(MouseButton::Left), 5),
+                (MouseEventKind::Up(MouseButton::Left), 5),
+                (MouseEventKind::ScrollUp, 5),
+                (MouseEventKind::ScrollDown, 5),
+            ] {
+                app.workspaces[0].sessions[0].last_write_at = None;
+                mouse(&mut app, kind, column, KeyModifiers::empty());
+                assert!(app.workspaces[0].sessions[0].last_write_at.is_some(), "{kind:?} must still reach the app");
+                assert!(app.workspaces[0].sessions[0].session.term.lock().selection.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn mouse_selection_finishes_outside_pane_and_does_not_recopy_on_stray_release() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(true);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::SHIFT);
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 90, KeyModifiers::SHIFT);
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 90, KeyModifiers::empty());
+            assert_eq!(app.workspaces[0].sessions[0].session.term.lock().selection_to_string().as_deref(), Some("héllo world"));
+            assert!(app.status_msg.as_ref().is_some_and(|s| s.0 == "Copied 11 chars"));
+            assert!(app.terminal_selection.is_none());
+            app.status_msg = None;
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5, KeyModifiers::empty());
+            assert!(app.status_msg.is_none());
+        });
+    }
+
+    #[test]
+    fn mouse_selection_plain_drag_still_copies_without_app_tracking() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(false);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::empty());
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 5, KeyModifiers::empty());
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5, KeyModifiers::empty());
+            assert_eq!(app.status_msg.as_ref().map(|s| s.0.as_str()), Some("Copied 5 chars"));
+            assert!(app.workspaces[0].sessions[0].last_write_at.is_none());
+        });
+    }
+}
+
+#[cfg(test)]
+mod past_workspace_reopen_tests {
+    use super::*;
+
+    fn closed_workspace(host: &str, path: Option<PathBuf>) -> App {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.workspaces.clear();
+        app.tasks.clear();
+        app.workspaces.push(Workspace {
+            id: "ws-past-worker".into(),
+            name: "past-worker".into(),
+            is_closed: true,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: path,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::new(host),
+            color: None,
+            pinned: false,
+            sessions: vec![],
+            tombstones: vec![],
+        });
+        app
+    }
+
+    fn assert_picker_evidence(app: &mut App, expected: Option<bool>) {
+        app.open_past_workspace_picker();
+        let InputMode::PastWorkspacePicker { candidates, .. } = &app.input_mode else {
+            panic!("expected past-workspace picker");
+        };
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].worktree_exists, expected);
+    }
+
+    #[test]
+    fn remote_missing_on_viewer_can_reopen_without_restoring_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("only-on-sessions-host");
+        assert!(!path.exists());
+        let mut app = closed_workspace("sessions", Some(path));
+        app.auto_close_workspaces.insert("ws-past-worker".into());
+        app.workspaces[0].tombstones.push(SessionTombstone {
+            entry: None,
+            uid: "ts-closed-worker".into(),
+            managed_by_uid: Some("ts-parent".into()),
+            label: "worker".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            last_transcript_id: None,
+            worktree_path: None,
+            generation: 0,
+            exited_at: 1.0,
+        });
+        assert_picker_evidence(&mut app, None);
+        assert!(app.reopen_workspace_by_id("ws-past-worker"));
+        assert!(!app.workspaces[0].is_closed);
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+        assert!(matches!(app.input_mode, InputMode::Confirm {
+            action: ConfirmAction::RestoreTombstones { .. }, ..
+        }));
+        app.reap_spent_workspaces();
+        assert!(!app.workspaces[0].is_closed, "reopened focus survives auto-closure");
+    }
+
+    #[test]
+    fn local_missing_is_marked_gone_and_refuses_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = closed_workspace("local", Some(dir.path().join("removed")));
+        assert_picker_evidence(&mut app, Some(false));
+        assert!(!app.reopen_workspace_by_id("ws-past-worker"));
+        assert!(app.workspaces[0].is_closed);
+    }
+
+    #[test]
+    fn local_existing_can_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = closed_workspace("local", Some(dir.path().to_path_buf()));
+        assert_picker_evidence(&mut app, Some(true));
+        assert!(app.reopen_workspace_by_id("ws-past-worker"));
+        assert!(!app.workspaces[0].is_closed);
+    }
+
+    #[test]
+    fn remote_without_recorded_path_still_refuses_reopen() {
+        let mut app = closed_workspace("sessions", None);
+        assert_picker_evidence(&mut app, Some(false));
+        assert!(!app.reopen_workspace_by_id("ws-past-worker"));
+        assert!(app.workspaces[0].is_closed);
     }
 }
 

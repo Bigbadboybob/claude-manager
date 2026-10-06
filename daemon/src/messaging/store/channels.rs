@@ -6,39 +6,70 @@ mod tests;
 
 impl Store {
     pub(super) fn channel_at(&self, path: &str, id: &str, high: u64) -> Value {
-        let mut channel = json!({"path":path,"id":id,"name":path,"revision":id,
-            "kind":"channel","description":"","created_by":"owner","admins":[],"allow_agent_edits":false,"default_join":false,"archived":false});
+        let mut states = vec![(id, Self::channel_base(path, id))];
+        self.apply_channel_events(&mut states, high);
+        states.pop().unwrap().1
+    }
+    /// Every channel's settings, in `self.channels` order, from one pass over
+    /// the history. Replaying it once per channel made listings take seconds.
+    pub(super) fn channels_at(&self, high: u64) -> Vec<Value> {
+        let mut states: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(path, id)| (id.as_str(), Self::channel_base(path, id)))
+            .collect();
+        self.apply_channel_events(&mut states, high);
+        states.into_iter().map(|(_, channel)| channel).collect()
+    }
+    fn channel_base(path: &str, id: &str) -> Value {
+        json!({"path":path,"id":id,"name":path,"revision":id,
+            "kind":"channel","description":"","created_by":"owner","admins":[],"allow_agent_edits":false,"default_join":false,"archived":false})
+    }
+    fn apply_channel_events(&self, states: &mut [(&str, Value)], high: u64) {
+        let mut by_id: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (index, (id, _)) in states.iter().enumerate() {
+            by_id.entry(*id).or_default().push(index);
+        }
+        let targets = |id: &Value| id.as_str().and_then(|id| by_id.get(id)).cloned().unwrap_or_default();
         for published in self.events.iter().filter(|e| e.position <= high) {
             let e = &published.event;
-            if let Some(created) = e["data"]["channels"]
-                .as_array()
-                .and_then(|a| a.iter().find(|c| c["id"] == id))
-            {
+            let mut seen = BTreeSet::new();
+            for created in e["data"]["channels"].as_array().into_iter().flatten() {
+                // As before, only a record's first entry for a channel applies.
+                if !created["id"].as_str().is_some_and(|id| seen.insert(id)) {
+                    continue;
+                }
                 let creator = if e["actor"]["id"] == "system" {
                     "owner"
                 } else {
                     strv(&e["actor"], "id")
                 };
-                channel["created_by"] = json!(creator);
-                channel["admins"] = if creator == "owner" {
-                    json!([])
-                } else {
-                    json!([creator])
-                };
-                for key in ["name", "description", "admins", "allow_agent_edits", "default_join", "archived"] {
-                    if let Some(value) = created.get(key) {
-                        channel[key] = value.clone();
+                for index in targets(&created["id"]) {
+                    let channel = &mut states[index].1;
+                    channel["created_by"] = json!(creator);
+                    channel["admins"] = if creator == "owner" {
+                        json!([])
+                    } else {
+                        json!([creator])
+                    };
+                    for key in ["name", "description", "admins", "allow_agent_edits", "default_join", "archived"] {
+                        if let Some(value) = created.get(key) {
+                            channel[key] = value.clone();
+                        }
                     }
                 }
             }
-            if e["type"] == "channel.update" && e["data"]["channel"]["id"] == id {
-                channel = e["data"]["channel"].clone();
+            if e["type"] == "channel.update" {
+                for index in targets(&e["data"]["channel"]["id"]) {
+                    states[index].1 = e["data"]["channel"].clone();
+                }
             }
-            if e["type"] == "channel.membership.initialize" && e["data"]["channel_id"] == id {
-                channel["default_join"] = e["data"]["default_join"].clone();
+            if e["type"] == "channel.membership.initialize" {
+                for index in targets(&e["data"]["channel_id"]) {
+                    states[index].1["default_join"] = e["data"]["default_join"].clone();
+                }
             }
         }
-        channel
     }
     fn channel_admin(&self, actor: &str, c: &Value) -> bool {
         actor == "owner"

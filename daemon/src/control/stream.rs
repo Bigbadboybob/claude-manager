@@ -715,9 +715,18 @@ fn run_inbound(
                     );
                     continue;
                 };
+                // Optional viewer cell size in pixels (kitty graphics
+                // passthrough). Older viewers omit it.
+                let cell_pixels = match (
+                    frame.payload.get("cell_width").and_then(|v| v.as_u64()),
+                    frame.payload.get("cell_height").and_then(|v| v.as_u64()),
+                ) {
+                    (Some(w), Some(h)) => Some((w.min(u16::MAX as u64) as u16, h.min(u16::MAX as u64) as u16)),
+                    _ => None,
+                };
                 let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(session) = s.sessions.get_mut(session_uid) {
-                    if let Err(e) = session.resize(c, r) {
+                    if let Err(e) = session.resize_with_cell_pixels(c, r, cell_pixels) {
                         eprintln!(
                             "cm-daemon: attach stream {} resize {}x{} failed: {}",
                             session_uid, c, r, e

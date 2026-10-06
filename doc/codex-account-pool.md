@@ -59,6 +59,8 @@ curl --fail http://127.0.0.1:2455/health/ready
 ~/.local/bin/cm-codex-pool
 ```
 
+**HTTP responses session bridge is disabled on both hosts** (`CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ENABLED=false`, drop-in `cm-codex-lb.service.d/*disable-http-bridge.conf`; cm-sessions since 2026-09-08, cm-manager since 2026-09-17). Reason: upstream issue #2272 / PR #1962 (unmerged as of 1.25.0-beta.9): after a retry-circuit cooldown elapses, a reload can re-arm a 600 s half-open lease and the thread answers `503 upstream_request_timeout: HTTP responses session bridge is cooling down` for minutes; the CM daemon then raised a `recovery_hold` on the orchestrator. With the bridge off, requests use the native stream/WebSocket path (cm-sessions: zero such 503s in nine days). The 2026-09-12 stale-anchor patch (`runtime/1.24.0-cm-stale-anchor-20260912`, still the pinned runtime) only affects bridge code and is inert while the bridge is off. Re-enable by deleting the drop-in in an idle window and restarting only the pool. Receipts: `~/.cm/handoffs/codex-lb-disable-bridge-20260917/` (cm-manager) with a pre-change store backup.
+
 Service restarts interrupt requests routed through this proxy: finish/drain those requests before intentional maintenance. The data directory contains credentials and conversation data; keep it private. A recoverable backup needs both its database and encryption key. Updates are manual and pinned pending the migration pilot.
 
 ## Verified at installation

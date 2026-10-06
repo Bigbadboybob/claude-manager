@@ -148,6 +148,26 @@ class TaskResponse(BaseModel):
         from_attributes = True
 
 
+class TaskChange(BaseModel):
+    """One entry of the incremental task feed: apply ``task`` on ``upsert``,
+    drop the cached task on ``remove`` (deleted, archived, or filtered out)."""
+
+    seq: int
+    task_id: str
+    op: str  # "upsert" | "remove"
+    task: TaskResponse | None = None
+
+
+class TaskChangesResponse(BaseModel):
+    epoch: str
+    cursor: int
+    reset: bool
+    # Full consistent snapshot; present only when ``reset`` is true.
+    tasks: list[TaskResponse] | None = None
+    changes: list[TaskChange] = []
+    more: bool = False
+
+
 class InitiativeCreate(BaseModel):
     """Create a draft initiative around an existing coordinator task."""
 

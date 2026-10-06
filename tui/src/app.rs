@@ -31,10 +31,12 @@ use cm_daemon::worktree;
 mod backtests;
 use backtests::*;
 mod sections;
+mod sidebar_remote;
 use sections::*;
 mod model;
 use model::*;
 mod nav;
+mod attention;
 use nav::*;
 mod workflow_ui;
 use workflow_ui::*;
@@ -45,10 +47,12 @@ mod events;
 use events::*;
 mod lifecycle;
 mod plan_launch;
+mod remote_create;
 mod image_paste;
 use lifecycle::*;
 mod input;
 mod continuous_control;
+mod worktree_cleanup;
 use input::*;
 mod transcripts;
 use transcripts::*;
@@ -134,19 +138,26 @@ fn notify_session_idle(label: &str) {
 /// we fall back to a generic line so the notification still says something
 /// useful.
 pub(crate) fn notify_user_alert(label: &str, message: &str) {
-    let label = label.to_string();
+    let (label, message) = (label.to_string(), message.to_string());
+    std::thread::spawn(move || {
+        if let Err(e) = show_user_alert(&label, &message) {
+            eprintln!("cm-tui: Owner notification failed: {e}");
+        }
+    });
+}
+
+/// Blocking desktop submission; call only on a background thread. Success
+/// means the desktop service accepted the notification, not that Owner read it.
+pub(crate) fn show_user_alert(label: &str, message: &str) -> Result<(), String> {
     let body = if message.trim().is_empty() {
         format!("{} needs your attention", label)
     } else {
         format!("{}: {}", label, message)
     };
-    std::thread::spawn(move || {
-        let _ = notify_rust::Notification::new()
-            .summary("Claude Manager")
-            .body(&body)
-            .show();
-        play_notification_sound();
-    });
+    notify_rust::Notification::new().summary("Claude Manager").body(&body)
+        .show().map_err(|e| e.to_string())?;
+    play_notification_sound();
+    Ok(())
 }
 
 /// Best-effort: play a short notification sound. Called from the detached
@@ -195,6 +206,10 @@ fn play_notification_sound() {
 pub struct App {
     pub messages: messages::Messages,
     pub tasks: Vec<TaskEntry>,
+    /// Full planning ancestry, including terminal rows excluded from `tasks`.
+    /// Retained sessions still need these edges after a worker finishes.
+    sidebar_task_parents: HashMap<String, Option<String>>,
+    sidebar_done_task_ids: HashSet<String>,
     /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
     pub workspaces: Vec<Workspace>,
     pub cursor: Cursor,
@@ -291,6 +306,8 @@ pub struct App {
     /// the user can use the terminal's native selection (including block-select
     /// chords). Toggle with Alt+M.
     pub mouse_capture_enabled: bool,
+    /// Session owning an in-progress local drag, even if Shift is released first.
+    terminal_selection: Option<String>,
     /// Pending requests from the control socket. Drained each tick by the
     /// main loop and dispatched to method handlers. The server thread
     /// pushes; the main loop pops + replies. See `tui/src/control/`.
@@ -350,6 +367,11 @@ pub struct App {
     /// out to loose). Absent = inherit through the task tree. Persisted as
     /// `Manifest::workspace_sections`.
     pub(crate) workspace_sections: HashMap<String, String>,
+    pub(crate) sidebar_receipts: HashMap<String, cm_daemon::sidebar::Receipt>,
+    pub(crate) sidebar_retry_at: Instant,
+    pub(crate) sidebar_pending: HashMap<(cm_daemon::host_id::HostId, String), cm_daemon::sidebar::Assignment>,
+    /// Adopted agent workspace ids, persisted independently of display names.
+    pub(crate) auto_close_workspaces: HashSet<String>,
     /// Cloud backtest runs, rendered in the continuous panel's `backtests`
     /// group instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
@@ -475,6 +497,7 @@ pub struct App {
     /// re-dispatching an attach that's already running.
     pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
     plan_launches: Vec<plan_launch::PlanLaunchFlight>,
+    remote_creates: Vec<remote_create::RemoteCreateFlight>,
     image_pastes: Vec<image_paste::ImagePasteFlight>,
     /// 10e-d: per-process de-dup set for cap-kill toasts. A given
     /// session's cap-kill event can reach the TUI through two
@@ -568,6 +591,9 @@ pub struct App {
     /// blinking sidebar indicator, and it's cleared the moment the user
     /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
     alerts: HashMap<String, String>,
+    owner_alerts: HashMap<(crate::hosts::HostId, String), cm_daemon::owner_attention::Alert>,
+    owner_alert_rows: HashSet<String>,
+    dismissed_owner_alerts: HashSet<String>,
     /// Fingerprint of every open-workspace idle session's `(uid, age
     /// bucket)` set at the last `tick_idle_ages` evaluation. Idle ages only
     /// matter at bucket granularity (afterglow → settled → stale), and an
@@ -652,12 +678,18 @@ impl App {
         };
         let hide_continuous = manifest.hide_continuous;
         let continuous_column_on = manifest.continuous_column_on;
+        let keybinding_helper_visible = !manifest.hide_keybinding_helper;
+        let mut planning = PlanningView::new();
+        planning.keybinding_helper_visible = keybinding_helper_visible;
         let task_colors = manifest.task_colors.clone();
         let sections = manifest.sections.clone();
         // Only keep bindings whose target workspace still exists in the
         // manifest — otherwise we'd set workspace_id to a dangling id that
         // nothing resolves to.
         let known_ws_ids: HashSet<&String> = manifest.workspaces.keys().collect();
+        let auto_close_workspaces = manifest.auto_close_workspaces.iter()
+            .filter(|id| known_ws_ids.contains(id))
+            .cloned().collect();
         let manifest_bindings: HashMap<String, String> = manifest
             .bindings
             .iter()
@@ -861,6 +893,8 @@ impl App {
 
         App {
             messages: messages::Messages::load(),            tasks: Vec::new(),
+            sidebar_task_parents: HashMap::new(),
+            sidebar_done_task_ids: HashSet::new(),
             workspaces: Vec::new(),
             cursor: Cursor::Workspace(0),
             cursor_column: SidebarColumn::Main,
@@ -870,11 +904,11 @@ impl App {
             saved_continuous_uid: None,
             sidebar_view,
             sidebar_filter: None,
-            keybinding_helper_visible: true,
+            keybinding_helper_visible,
             sidebar_list_state: ListState::default(),
             continuous_list_state: ListState::default(),
             view_mode: ViewMode::Sessions,
-            planning: PlanningView::new(),
+            planning,
             should_quit: false,
             last_term_size: (80, 24),
             last_adopt_scan: None,
@@ -899,6 +933,7 @@ impl App {
             history_watcher: workflow::history::HistoryWatcher::new(),
             pending_rotations: Vec::new(),
             mouse_capture_enabled: true,
+            terminal_selection: None,
             control_queue,
             subtask_flight: None,
             defer_manifest_save: std::cell::Cell::new(false),
@@ -914,6 +949,10 @@ impl App {
             task_colors,
             sections,
             workspace_sections,
+            sidebar_receipts: manifest.sidebar_receipts.clone(),
+            sidebar_pending: HashMap::new(),
+            sidebar_retry_at: Instant::now(),
+            auto_close_workspaces,
             backtest_rows: Vec::new(),
             backtests_folded: false,
             backtest_unfolded_fleets: HashSet::new(),
@@ -939,11 +978,15 @@ impl App {
             attach_worker,
             attaching: HashMap::new(),
             plan_launches: Vec::new(),
+            remote_creates: Vec::new(),
             image_pastes: Vec::new(),
             push_worker,
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
+            owner_alerts: HashMap::new(),
+            owner_alert_rows: HashSet::new(),
+            dismissed_owner_alerts: HashSet::new(),
             last_alert_frame: 0,
             idle_bucket_fingerprint: 0,
             last_idle_bucket_check: None,
@@ -1206,8 +1249,42 @@ impl App {
     // (Retired: `cycle_active_host` / `A-H` — the global active_host is gone;
     // host is a per-workspace attribute. See DESIGN_REMOVE_GLOBAL_HOST.md.)
 
+    /// Kitty graphics passthrough: handle each pane's image commands and
+    /// queries, queueing outer-terminal bytes (flushed by the main loop
+    /// between frames) and writing replies into the panes.
+    pub fn pump_graphics(&mut self) {
+        let Some(caps) = crate::graphics::outer::caps() else {
+            return;
+        };
+        let cell = crate::graphics::outer::cell_pixels();
+        for ws in &mut self.workspaces {
+            for ts in &mut ws.sessions {
+                let session = &mut ts.session;
+                let Some(graphics) = session.graphics.as_mut() else {
+                    continue;
+                };
+                let term = &session.term;
+                let out = graphics.pump(|| {
+                    use alacritty_terminal::grid::Dimensions;
+                    let term = term.lock();
+                    crate::graphics::PaneCtx {
+                        cols: term.columns() as u16,
+                        rows: term.screen_lines() as u16,
+                        cell,
+                        version: &caps.version,
+                    }
+                });
+                crate::graphics::outer::queue(&out.outer);
+                if !out.pane.is_empty() && !session.exited {
+                    let _ = session.write(&out.pane);
+                }
+            }
+        }
+    }
+
     /// Handle terminal resize.
     pub fn resize_terminals(&mut self, cols: u16, rows: u16) {
+        crate::graphics::outer::refresh_cell_size();
         self.last_term_size = (cols, rows);
         for ws in &mut self.workspaces {
             for ts in &mut ws.sessions {

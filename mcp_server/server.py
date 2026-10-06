@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - exercised only where the dep is absent
 # Add project root to path so cli.planning_client is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mcp.server.fastmcp import FastMCP
+from mcp_server.claude_channel import NotificationMCP
 
 try:
     from cli.planning_client import PlanningClient
@@ -73,10 +73,11 @@ async def _lifespan(_server):
     if os.environ.get("CM_TUI_SESSION_ID"):
         async_monitor._persist_best_effort()
     bridge = None
-    if (os.environ.get("CM_TUI_SESSION_ID") and os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
+    if (os.environ.get("CM_TUI_SESSION_ID")
+            and (_server.channel or os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"))
             and os.environ.get("CM_AGENT_ENGINE") != "codex"):
         from mcp_server.native_claude import run
-        bridge = asyncio.create_task(run(), name="cm-native-notifications")
+        bridge = asyncio.create_task(run(_server.channel), name="cm-native-notifications")
     try:
         yield {}
     finally:
@@ -92,7 +93,7 @@ async def _lifespan(_server):
                 await bridge
 
 
-mcp = FastMCP("claude-manager", instructions=AGENT_GUIDE, lifespan=_lifespan)
+mcp = NotificationMCP("claude-manager", instructions=AGENT_GUIDE, lifespan=_lifespan)
 
 
 @mcp.tool()
@@ -212,9 +213,11 @@ def _git_origin_url() -> str:
 
 
 def _chat_call(method: str, params: dict) -> dict:
+    # The daemon's coordinator deadline is 30s. Leave time for it to return
+    # outcome_unknown and retry guidance instead of masking that with socket IO.
     return control_client.call("messaging." + method, {
         key: value for key, value in params.items() if value is not None
-    })
+    }, timeout=45.0)
 
 
 @mcp.tool()
@@ -314,11 +317,34 @@ def chat_open(channel: str | None = None, dm: str | list[str] | None = None,
 
     Defaults to #general. Preview does not mark messages read. Choose a short
     distinctive task-based name on your first chat_send; prefer one word or two
-    short words joined by a dash. It becomes your CM session name.
+    short words joined by a dash. Continuous orchestrators use a descriptive
+    <task>-orchestrator name. It becomes your CM session name. Use chat_rename
+    to change it later, with name.revision from this response.
     Returns sync/coverage status and any scheduler-bound task subscriptions. Channels
     span projects and paired machines in the same space; drafts and scroll stay local.
     """
     return _chat_call("open", locals())
+
+
+@mcp.tool()
+def chat_rename(name: str, expected_name_revision: int, request_id: str,
+                origin_daemon_id: str | None = None) -> dict:
+    """Change your own messaging and CM session name without changing identity.
+
+    First enroll with chat_send(name=...). Then read chat_open and pass its
+    name.revision as expected_name_revision. Continuous orchestrators should
+    use a descriptive <task>-orchestrator name, e.g. health-triage-orchestrator.
+    DMs, messages, structured mentions, memberships and watches remain attached
+    to your stable participant ID; old names remain searchable aliases. Use the
+    accepted name in the response: collisions may add a suffix.
+    Retry with the identical request_id, contents and origin_daemon_id. On
+    name_revision_conflict, read chat_open again before making a new request.
+    This changes only your own name and needs coordinator connectivity on paired
+    hosts. Never create a replacement session just to rename yourself.
+    """
+    return control_client.call("session.set_name", {
+        key: value for key, value in locals().items() if value is not None
+    })
 
 
 @mcp.tool()
@@ -344,7 +370,9 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     1–3 short paragraphs. Hard limit 3000 characters: summarize and reference a
     file for longer material. Never split an essay to evade the limit.
     First send requires a short, distinctive task-based name: one word preferred,
-    or two short words joined by a dash. Whitespace becomes dashes; normalized
+    or two short words joined by a dash. Continuous orchestrators use descriptive
+    <task>-orchestrator names. name only enrolls on the first send; use chat_rename
+    to change an existing name. Whitespace becomes dashes; normalized
     names and old aliases are reserved. Collisions receive a unique dash suffix.
     Use the accepted name in the response; existing names retain old aliases.
     Keep request_id and original daemon binding for retries, including timeouts.
@@ -368,8 +396,14 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               freshness: str = "cached", tags: list[str] | None = None,
               after: dict | None = None, cursor: dict | None = None,
               limit: int = 50, ack_receipt: dict | None = None,
-              newest_first: bool = False, pinned_only: bool | None = None) -> dict:
+              newest_first: bool = False, pinned_only: bool | None = None,
+              view: str = "full") -> dict:
     """Read history, a thread, your inbox, or incoming DMs. Select one scope.
+
+    view="slim" returns per message only id, time, conversation (#path or
+    dm:<sender>), conversation_id, sender, body and reply_to/thread when set,
+    plus next_cursor and receipt; cursors and receipts work across views.
+    Prefer slim for routine inbox reads; "full" (default) keeps metadata.
 
     time={"since":"10m"} or {"start":RFC3339,"end":RFC3339} filters a fixed
     window. pinned_only filters to pinned messages at the read snapshot.
@@ -382,7 +416,59 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
     this still excludes messages pending on disconnected origins. Keep cursor filters
     unchanged. received time finds messages arriving late from another machine.
     """
-    return _chat_call("read", locals())
+    params = dict(locals())
+    view = params.pop("view") or "full"
+    if view not in ("full", "slim"):
+        raise ValueError('view must be "full" or "slim"')
+    result = _chat_call("read", params)
+    return slim_read_result(result) if view == "slim" else result
+
+
+def _slim_message(item: dict) -> dict:
+    actor = item.get("actor") or {}
+    data = item.get("data") or {}
+    sender = actor.get("name") or actor.get("id")
+    conversation = item.get("conversation_path")
+    if not conversation:
+        conversation = (f"dm:{sender}" if item.get("conversation_kind") == "dm"
+                        else item.get("conversation_id"))
+    out = {
+        "id": item.get("id"),
+        "time": item.get("created_at"),
+        "conversation": conversation,
+        "conversation_id": item.get("conversation_id"),
+        "sender": sender,
+        "body": item.get("body"),
+    }
+    if data.get("reply_to"):
+        out["reply_to"] = data["reply_to"]
+    if data.get("thread_root"):
+        out["thread"] = data["thread_root"]
+    return out
+
+
+# Top-level fields a slim reader still needs to paginate, acknowledge, and
+# notice degraded coverage or pending watch results.
+_SLIM_KEEP = ("next_cursor", "receipt", "position", "coverage", "degraded",
+              "delivery_note", "error")
+
+
+def slim_read_result(result: dict) -> dict:
+    """MCP-side projection of a full chat_read page: no replication, pin,
+    norms or metadata blobs. The daemon response is unchanged."""
+    if not isinstance(result, dict) or "items" not in result:
+        return result
+    out = {key: result[key] for key in _SLIM_KEEP if result.get(key) is not None}
+    out["view"] = "slim"
+    out["items"] = [_slim_message(item) for item in result.get("items") or []]
+    if result.get("context"):
+        out["context"] = [_slim_message(item) for item in result["context"]]
+    monitors = result.get("monitor_status")
+    if isinstance(monitors, dict) and monitors.get("unacknowledged"):
+        out["monitor_status"] = {"unacknowledged": monitors["unacknowledged"]}
+    if isinstance(monitors, dict) and monitors.get("recently_expired"):
+        out.setdefault("monitor_status", {})["recently_expired"] = monitors["recently_expired"]
+    return out
 
 
 @mcp.tool()
@@ -1583,23 +1669,59 @@ async def send_input(
 
 
 @mcp.tool()
+def list_sidebar_sections() -> dict:
+    """List Owner's work-sidebar subsections and caller-visible workspace choices.
+
+    Headless/cloud-safe. The catalogue and observed choices are the latest
+    laptop viewer publication, not a live viewer query. Pending requests are
+    shown separately. Only sessions on this daemon are included. Sections are
+    display groups, separate from first-class planning initiatives.
+    """
+    return control_client.call("sidebar.list", {})
+
+
+@mcp.tool()
+def set_session_section(section: str, session_id: str | None = None) -> dict:
+    """Move a session's WHOLE workspace to a work-sidebar subsection.
+
+    section: stable ID or unique exact name from list_sidebar_sections;
+      "auto" restores parent-task inheritance, "none" explicitly leaves it loose.
+    session_id defaults to yourself; use a CM session UID from list_sessions.
+    Requires ordinary session-control scope for every live workspace member.
+    Auto descendants follow their parent; explicit descendant choices remain.
+    This is a durable queued display change, applied when the updated viewer
+    connects. Read list_sidebar_sections again to verify its observed choice
+    and receipt. Does not move files, change initiative/task ownership, create
+    sections, or restart workers. Follow Owner's requested organization.
+    """
+    params = {"section": section}
+    if session_id is not None:
+        params["session_id"] = session_id
+    return control_client.call("sidebar.assign", params)
+
+
+@mcp.tool()
 def notify_user(message: str = "") -> dict:
-    """Alert the user that you need their attention.
+    """Request Owner attention for your own session (local, cloud, or continuous).
 
-    Fires a desktop notification and makes the icon next to YOUR session
-    blink in the TUI sidebar. The blink stops once the user selects your
-    session. Use this when you're blocked on the user — a question, a
-    decision, an approval, or "I'm done, come look" — and don't want to
-    sit idle unnoticed.
+    Continuous workers must DM their orchestrator for routine reviews, progress,
+    recoverable failures and handoffs; do not notify Owner for those events.
+    Orchestrators use this only for a reviewed decision/blocker requiring Owner,
+    preserving stricter quiet policies. Interactive sessions use it when Owner
+    action is needed. Supply a concise reason and relevant message/file link.
+    Routine progress stays in session chat; this does not authorize deployment,
+    session control, or unsolicited Owner DMs.
 
-    Args:
-        message: Short reason shown in the notification (e.g. "need your
-            decision on the migration approach"). Optional; if omitted the
-            notification just says your session needs attention.
+    The daemon retains the alert until Owner selects the session. A connected
+    updated TUI submits the normal desktop notification and blinks the sidebar;
+    otherwise delivery waits for reconnection. Alt+g jumps to attention, including
+    continuous tasks. Identical pending reasons coalesce; a changed reason raises
+    a new alert. Returns status="queued", not proof of desktop delivery/read.
 
-    This only ever pings the user about your own session, so — unlike the
-    session-spawning / killing tools — you do NOT need to ask first. Just
-    call it when you genuinely need the user.
+    message is optional (maximum 4096 UTF-8 bytes). Identity and label come from
+    the live caller, never a target parameter; no global permission is required.
+    Desktop/DND preferences, notify_on_idle, chat mutes/follows, and Telegram
+    escalation settings are unchanged. See doc/OWNER_NOTIFICATIONS.md.
     """
     return control_client.call("notify_user", {"message": message})
 

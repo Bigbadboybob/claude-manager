@@ -205,6 +205,8 @@ pub fn create_worktree(
         };
     }
 
+    crate::worktree_cleanup::prepare_repo(main_repo);
+
     // Disk guard — only a NEW worktree counts against the ceiling (the
     // reuse fast-path above already returned).
     enforce_worktree_capacity()?;
@@ -635,6 +637,8 @@ pub fn create_subtask_worktree(
     if worktree_path.exists() {
         return Ok(worktree_path);
     }
+
+    crate::worktree_cleanup::prepare_repo(main_repo);
 
     // Disk guard — only a NEW worktree counts against the ceiling (the
     // reuse fast-path above already returned).

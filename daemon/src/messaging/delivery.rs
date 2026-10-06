@@ -1,6 +1,7 @@
 //! A wake is a durable, coalesced hint to read the inbox. Submission is never
 //! confused with a read receipt. A current inbound transcript marker confirms
 //! delivery. Native adapters never resend an ambiguous submission.
+pub mod alarm;
 mod marker;
 use super::atomic_replace;
 use super::{Store, WakeIntent};
@@ -17,6 +18,72 @@ use std::{
     thread,
     time::Duration,
 };
+/// Who wrote the newest unread message, where, and its first line. Lets a
+/// wake say what arrived instead of only "new chat activity".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preview {
+    pub place: String,
+    pub sender: String,
+    pub excerpt: String,
+}
+type PreviewFn<'a> = &'a dyn Fn(&str) -> Option<Preview>;
+fn no_preview(_: &str) -> Option<Preview> {
+    None
+}
+const EXCERPT_CHARS: usize = 120;
+const WAKE_TEXT_BUDGET: usize = 400;
+
+fn clip(text: &str, max: usize) -> String {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if line.chars().count() <= max {
+        return line.to_owned();
+    }
+    let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Store lookup for one event. Reads only that event's record.
+pub fn preview(store: &Store, event_id: &str) -> Option<Preview> {
+    let wire = store.wire_event(event_id).ok()?;
+    let event: Value = serde_json::from_str(wire["event"].as_str()?).ok()?;
+    let actor = &event["actor"];
+    let sender = actor["id"]
+        .as_str()
+        .and_then(|id| store.names.get(id))
+        .map(|n| n.name.clone())
+        .or_else(|| actor["name"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "someone".into());
+    let place = conversation_label(store, event["conversation_id"].as_str().unwrap_or(""));
+    Some(Preview {
+        place,
+        sender: clip(&sender, 40),
+        excerpt: clip(event["body"].as_str().unwrap_or(""), EXCERPT_CHARS),
+    })
+}
+
+fn conversation_label(store: &Store, conversation_id: &str) -> String {
+    store
+        .channel_path_of(conversation_id)
+        .map(|p| clip(&format!("#{p}"), 48))
+        .unwrap_or_else(|| "DM".into())
+}
+
+/// Readable conversation names for `messaging.read` pages (slim view uses
+/// them). Channels get `#path`; DMs are left to the reader's sender label.
+pub fn annotate_conversations(store: &Store, value: &mut Value) {
+    for key in ["items", "context"] {
+        for item in value[key].as_array_mut().into_iter().flatten() {
+            if let Some(path) = item["conversation_id"]
+                .as_str()
+                .and_then(|id| store.channel_path_of(id))
+            {
+                item["conversation_path"] = json!(format!("#{path}"));
+            }
+        }
+    }
+}
+
 fn digest(s: &str) -> String {
     format!("{:x}", Sha256::digest(s.as_bytes()))
 }
@@ -44,6 +111,48 @@ struct Batch {
     // receipts as history rather than blocking new wakes behind old unread IDs.
     released: bool,
     coalesced: BTreeSet<String>,
+    // When the wake first reached the agent (confirmed / submitted / uncertain).
+    // A delivered batch the agent never read stops absorbing new arrivals after
+    // `LATCH_HORIZON_SECS`, so a session that ignored one wake still gets the
+    // next one (2026-09-14: an orchestrator's 11:01 wake swallowed a 16:17
+    // mention for good).
+    #[serde(default)]
+    delivered_at: u64,
+}
+/// How long a delivered-but-unread wake batch keeps coalescing new arrivals.
+const LATCH_HORIZON_SECS: u64 = 120;
+fn delivered(status: &str) -> bool {
+    matches!(status, "confirmed" | "submitted_unverified" | "uncertain")
+}
+/// Stamp delivery times and release latches past the horizon. Released
+/// batches keep their ids as history; read receipts are separate anyway.
+fn expire_latches(q: &mut Queue, now: u64) -> bool {
+    let mut changed = false;
+    for batch in &mut q.batches {
+        if batch.released || !delivered(&batch.status) {
+            continue;
+        }
+        if batch.delivered_at == 0 {
+            batch.delivered_at = now;
+            changed = true;
+        } else if now.saturating_sub(batch.delivered_at) >= LATCH_HORIZON_SECS {
+            // Arrivals absorbed after delivery never had a wake of their own;
+            // hand the unfetched ones to a successor so `collect` re-batches
+            // them instead of treating them as covered history.
+            let orphaned: BTreeSet<String> = batch
+                .coalesced
+                .iter()
+                .filter(|id| !batch.checked.contains(*id))
+                .cloned()
+                .collect();
+            batch.ids.retain(|id| !orphaned.contains(id));
+            batch.coalesced.retain(|id| !orphaned.contains(id));
+            batch.released = true;
+            batch.sealed = true;
+            changed = true;
+        }
+    }
+    changed
 }
 fn queue_path(root: &Path, uid: &str) -> PathBuf {
     root.join("_delivery").join(format!("{}.json", digest(uid)))
@@ -164,57 +273,28 @@ impl Recipient {
     }
 }
 pub fn tick(state: &Arc<Mutex<DaemonState>>) {
-    let (handle, root, draining) = {
+    let (handle, root, gate, recipients) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        (s.messaging.clone(), s.messaging_root.clone(), s.draining)
+        if s.draining { return; }
+        (s.messaging.clone(), s.messaging_root.clone(), s.messaging_delivery.clone(),
+         s.sessions.keys().cloned().collect::<Vec<_>>())
     };
-    if draining {
-        return;
-    }
-    let gate = state
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .messaging_delivery
-        .clone();
-    let (groups, store_root) = {
+    {
         let _guard = gate.lock().unwrap_or_else(|p| p.into_inner());
-        let Ok(mut slot) = handle.try_lock() else {
-            return;
-        };
-        let Some(store) = slot.as_mut() else {
-            return;
-        };
+        let Ok(mut slot) = handle.try_lock() else { return; };
+        let Some(store) = slot.as_mut() else { return; };
         if store.degraded.is_some() || store.advance_monitors_at(chrono::Utc::now()).is_err() {
             return;
         }
-        if let Err(e) = reconcile(&root, store) {
-            eprintln!("cm messaging: wake reconciliation: {e}");
-            return;
-        }
-        (store.wake_intents(), store.root.clone())
-    };
-    for (uid, _) in groups {
-        // Give cancellations a boundary between recipients, and re-evaluate
-        // eligibility after acquiring it. Never keep the store locked on PTY I/O.
+    }
+    for uid in recipients {
+        // Keep the existing cancellation/publication boundary, but evaluate
+        // only this live recipient. A drain ends the tick between recipients.
         let _guard = gate.lock().unwrap_or_else(|p| p.into_inner());
-        let ids = {
-            let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(store) = slot.as_mut() else {
-                return;
-            };
-            if store.degraded.is_some() {
-                return;
-            }
-            if let Err(e) = reconcile(&root, store) {
-                eprintln!("cm messaging: wake reconciliation: {e}");
-                return;
-            }
-            store.wake_intents().remove(&uid).unwrap_or_default()
-        };
         let recipient = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
-            s.sessions
-                .get(&uid)
+            if s.draining { return; }
+            s.sessions.get(&uid)
                 .filter(|s| !s.fanout.snapshot_since(None).closed)
                 .map(|s| Recipient {
                     engine: s.session_type.clone(),
@@ -223,14 +303,66 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
                     live: Some((Arc::downgrade(state), uid.clone())),
                 })
         };
-        let Some(recipient) = recipient else {
-            continue;
+        let Some(recipient) = recipient else { continue; };
+        let (ids, store_root) = {
+            let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(store) = slot.as_mut() else { return; };
+            if store.degraded.is_some() { return; }
+            let ids = store.wake_intents_for_session(&uid);
+            if let Err(e) = reconcile_intents(&root, store, &uid, &ids) {
+                eprintln!("cm messaging: wake reconciliation for {uid}: {e}");
+                return;
+            }
+            (ids, store.root.clone())
         };
-        if let Err(e) = deliver_intents(&root, &store_root, &uid, ids, &recipient) {
+        // Lock order matches the RPC path: delivery gate, then store.
+        let lookup = |id: &str| {
+            let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+            slot.as_ref().and_then(|store| preview(store, id))
+        };
+        if let Err(e) = deliver_intents_previewed(
+            &root,
+            &store_root,
+            &uid,
+            ids,
+            &recipient,
+            crate::continuous::task::now_unix(),
+            &lookup,
+        ) {
             eprintln!("cm messaging: wake for {uid} pending: {e}");
         }
     }
+    alarm_tick(state, &root);
 }
+
+/// Throttled stall alarm over live native-capable sessions.
+fn alarm_tick(state: &Arc<Mutex<DaemonState>>, root: &Path) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::continuous::task::now_unix();
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < alarm::ALARM_INTERVAL_SECS
+        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let uids: Vec<String> = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.draining {
+            return;
+        }
+        s.sessions
+            .iter()
+            .filter(|(_, x)| ["claude-code", "codex"].contains(&x.session_type.as_str()))
+            .filter(|(_, x)| !x.fanout.snapshot_since(None).closed)
+            .map(|(uid, _)| uid.clone())
+            .collect()
+    };
+    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    alarm::pass(state, root, &uids, now, alarm::threshold_secs());
+}
+
+#[cfg(test)]
 fn deliver_intents(
     cm_root: &Path,
     store_root: &Path,
@@ -238,9 +370,39 @@ fn deliver_intents(
     intents: Vec<WakeIntent>,
     r: &Recipient,
 ) -> io::Result<()> {
+    deliver_intents_at(
+        cm_root,
+        store_root,
+        uid,
+        intents,
+        r,
+        crate::continuous::task::now_unix(),
+    )
+}
+#[cfg(test)]
+fn deliver_intents_at(
+    cm_root: &Path,
+    store_root: &Path,
+    uid: &str,
+    intents: Vec<WakeIntent>,
+    r: &Recipient,
+    now: u64,
+) -> io::Result<()> {
+    deliver_intents_previewed(cm_root, store_root, uid, intents, r, now, &no_preview)
+}
+fn deliver_intents_previewed(
+    cm_root: &Path,
+    store_root: &Path,
+    uid: &str,
+    intents: Vec<WakeIntent>,
+    r: &Recipient,
+    now: u64,
+    preview: PreviewFn,
+) -> io::Result<()> {
     let path = queue_path(store_root, uid);
     let mut q = load(&path)?;
-    if collect(&mut q, &intents) {
+    let expired = expire_latches(&mut q, now);
+    if collect(&mut q, &intents) || expired {
         save(&path, &q)?;
     }
     let first = q
@@ -251,6 +413,9 @@ fn deliver_intents(
         let id = format!("chat:{}", batch.wake_id);
         if let Some(event) = crate::notifications::get(cm_root, uid, &id)? {
             batch.status = native_status(&event).into();
+            if delivered(&batch.status) && batch.delivered_at == 0 {
+                batch.delivered_at = now;
+            }
             continue;
         }
         // Old Stop/PTY attempts must never be replayed through the new adapter.
@@ -305,7 +470,7 @@ fn deliver_intents(
             uid,
             &id,
             "chat",
-            &wake_text(batch, &intents),
+            &wake_text(batch, &intents, preview),
             &format!("[cm-chat {}]", batch.wake_id),
         )?;
         batch.status = native_status(&event).into();
@@ -379,7 +544,7 @@ pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()>
     if ids.is_empty() {
         return Ok(());
     }
-    let intents = store.wake_intents().remove(uid).unwrap_or_default();
+    let intents = store.wake_intents_for_session(uid);
     let path = queue_path(&store.root, uid);
     let mut q = load(&path)?;
     // Include arrivals not yet visited by the delivery worker before sealing.
@@ -411,18 +576,51 @@ fn native_status(event: &Value) -> &str {
     }
 }
 
-fn wake_text(batch: &Batch, intents: &[WakeIntent]) -> String {
+/// Short (<= ~400 chars) wake: count, newest sender/place/excerpt, how to
+/// read it (slim inbox), and event-specific watch IDs. The longer handling
+/// rules live in the MCP initialization instructions and AGENT_GUIDE.
+fn wake_text(batch: &Batch, intents: &[WakeIntent], preview: PreviewFn) -> String {
+    let mut unread: Vec<&str> = Vec::new();
+    for intent in intents
+        .iter()
+        .filter(|n| batch.ids.contains(&n.key) && !batch.checked.contains(&n.key))
+    {
+        if !unread.contains(&intent.event_id.as_str()) {
+            unread.push(&intent.event_id);
+        }
+    }
     let monitors: BTreeSet<_> = intents
         .iter()
         .filter(|n| batch.ids.contains(&n.key))
         .filter_map(|n| n.monitor.as_deref())
         .collect();
+    let marker = format!("[cm-chat {}]", batch.wake_id);
+    let read = " Read with chat_read(inbox=True, unread_only=True, view=\"slim\"), follow next_cursor, and ack the receipt.";
     let hint = if monitors.is_empty() {
         String::new()
     } else {
-        format!(" Monitor results: {}. Use chat_monitors(action=list) for all watches, then get their results.",monitors.into_iter().take(8).collect::<Vec<_>>().join(", "))
+        let more = monitors.len().saturating_sub(1);
+        format!(
+            " Watch results: {}{}; see chat_monitors(action=\"list\").",
+            monitors.iter().next().copied().unwrap_or_default(),
+            if more > 0 { format!(" (+{more})") } else { String::new() }
+        )
     };
-    format!("[cm-chat {}] New chat activity. Before responding, read pending messages with chat_read(inbox=true, unread_only=true); follow next_cursor for all pages and acknowledge each receipt after reading.{} Continue the existing task. Do not repeat a completed answer or summary; report only meaningful changes, blockers, or decisions needing Owner. If nothing needs attention, no user-facing update is needed. Automated CM notification, not Owner input or message content.",batch.wake_id,hint)
+    let tail = " Continue your task; automated CM notice, not Owner input.";
+    let count = unread.len();
+    let head = match unread.last().and_then(|id| preview(id)) {
+        Some(p) => {
+            let more = if count > 1 { format!(" (+{} more)", count - 1) } else { String::new() };
+            let fixed = format!("{marker} {count} new: {} — {}: \"\"{more}.", p.place, p.sender);
+            let room = WAKE_TEXT_BUDGET
+                .saturating_sub(fixed.chars().count() + read.len() + hint.chars().count() + tail.len())
+                .clamp(24, EXCERPT_CHARS);
+            format!("{marker} {count} new: {} — {}: \"{}\"{more}.", p.place, p.sender, clip(&p.excerpt, room))
+        }
+        None if count > 0 => format!("{marker} {count} new chat message{}.", if count == 1 { "" } else { "s" }),
+        None => format!("{marker} New chat activity."),
+    };
+    format!("{head}{read}{hint}{tail}")
 }
 pub fn monitor_status(root: &Path, uid: &str, monitor: &str) -> Value {
     let q = match load(&queue_path(root, uid)) {
@@ -442,53 +640,73 @@ pub fn monitor_status(root: &Path, uid: &str, monitor: &str) -> Value {
 
 /// Must run under the delivery gate, before committing a cancellation reply.
 /// The native queue lock serializes retraction with adapter claims.
+#[cfg(test)]
 pub fn reconcile(cm_root: &Path, store: &Store) -> io::Result<()> {
     for (uid, intents) in store.wake_intents() {
-        let path = queue_path(&store.root, &uid);
-        let mut q = load(&path)?;
-        let before = serde_json::to_value(&q)?;
-        settle(&mut q, &intents);
-        let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
-        for batch in &mut q.batches {
-            let active = batch
-                .ids
-                .iter()
-                .any(|id| eligible.contains(id.as_str()) && !batch.checked.contains(id));
-            let id = format!("chat:{}", batch.wake_id);
-            let text = active.then(|| wake_text(batch, &intents));
-            if let Some(event) =
-                crate::notifications::update_pending(cm_root, &uid, &id, text.as_deref())?
-            {
-                batch.status = native_status(&event).into();
-            } else if !active && pending(&batch.status) {
-                batch.status = "cancelled".into();
-            } else if !active
-                && matches!(
-                    batch.status.as_str(),
-                    "hook_pending" | "hook_attempt_pending"
-                )
-            {
-                let inbox = cm_root
-                    .join("inbox")
-                    .join(&uid)
-                    .join(format!("chat-{}.json", batch.wake_id));
-                let claim = inbox.with_extension("json.retired");
-                match fs::rename(&inbox, &claim) {
-                    Ok(()) => {
-                        fs::remove_file(&claim)?;
-                        fs::File::open(inbox.parent().unwrap())?.sync_all()?;
-                        batch.status = "cancelled".into();
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        batch.status = "submitted_no_retry".into()
-                    }
-                    Err(e) => return Err(e),
+        reconcile_intents(cm_root, store, &uid, &intents)?;
+    }
+    Ok(())
+}
+
+/// Agent read receipts, follows and monitor changes affect only that actor.
+/// Keep offline actors' durable queues until they resume or explicitly cancel.
+pub fn reconcile_session(cm_root: &Path, store: &Store, uid: &str) -> io::Result<()> {
+    reconcile_intents(cm_root, store, uid, &store.wake_intents_for_session(uid))
+}
+
+fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIntent]) -> io::Result<()> {
+    let path = queue_path(&store.root, uid);
+    let mut q = load(&path)?;
+    let before = serde_json::to_value(&q)?;
+    settle(&mut q, intents);
+    let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
+    for batch in &mut q.batches {
+        let active = batch
+            .ids
+            .iter()
+            .any(|id| eligible.contains(id.as_str()) && !batch.checked.contains(id));
+        let id = format!("chat:{}", batch.wake_id);
+        // Only a still-pending native event can be rewritten; skip the store
+        // lookup for delivered batches an agent has not read yet.
+        let text = active.then(|| {
+            if matches!(batch.status.as_str(), "native_pending" | "pending" | "deferred" | "deferred_unsupported") {
+                wake_text(batch, intents, &|id: &str| preview(store, id))
+            } else {
+                wake_text(batch, intents, &no_preview)
+            }
+        });
+        if let Some(event) =
+            crate::notifications::update_pending(cm_root, uid, &id, text.as_deref())?
+        {
+            batch.status = native_status(&event).into();
+        } else if !active && pending(&batch.status) {
+            batch.status = "cancelled".into();
+        } else if !active
+            && matches!(
+                batch.status.as_str(),
+                "hook_pending" | "hook_attempt_pending"
+            )
+        {
+            let inbox = cm_root
+                .join("inbox")
+                .join(uid)
+                .join(format!("chat-{}.json", batch.wake_id));
+            let claim = inbox.with_extension("json.retired");
+            match fs::rename(&inbox, &claim) {
+                Ok(()) => {
+                    fs::remove_file(&claim)?;
+                    fs::File::open(inbox.parent().unwrap())?.sync_all()?;
+                    batch.status = "cancelled".into();
                 }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    batch.status = "submitted_no_retry".into()
+                }
+                Err(e) => return Err(e),
             }
         }
-        if serde_json::to_value(&q)? != before {
-            save(&path, &q)?;
-        }
+    }
+    if serde_json::to_value(&q)? != before {
+        save(&path, &q)?;
     }
     Ok(())
 }
@@ -610,6 +828,37 @@ mod tests {
             native_event(t.path(), &q.batches[1]).unwrap()["status"],
             "pending"
         );
+    }
+    #[test]
+    fn messaging_delivered_but_unread_wake_stops_latching_after_horizon() {
+        for state in ["observed", "submitted", "uncertain"] {
+            let (t, mut store, actor, people) = fixture();
+            let one = dm(&mut store, &actor, &people, "one");
+            let first = deliver(&store, t.path(), "codex");
+            set_native_status(t.path(), &first.batches[0], state);
+            let t0 = 1_000_000u64;
+            // Status is picked up and the delivery time stamped.
+            deliver_intents_at(t.path(), &store.root, "b", store.wake_intents().remove("b").unwrap_or_default(), &recipient("codex"), t0).unwrap();
+            let q = load(&queue_path(&store.root, "b")).unwrap();
+            assert_eq!(q.batches[0].delivered_at, t0, "{state}");
+            // Inside the horizon a new arrival still shares the outstanding wake.
+            let two = dm(&mut store, &actor, &people, "two");
+            deliver_intents_at(t.path(), &store.root, "b", store.wake_intents().remove("b").unwrap_or_default(), &recipient("codex"), t0 + 30).unwrap();
+            let q = load(&queue_path(&store.root, "b")).unwrap();
+            assert_eq!(q.batches.len(), 1, "{state}");
+            assert!(q.batches[0].ids.contains(&two));
+            // Past the horizon the unread batch releases and the next arrival
+            // publishes a fresh native wake.
+            let three = dm(&mut store, &actor, &people, "three");
+            deliver_intents_at(t.path(), &store.root, "b", store.wake_intents().remove("b").unwrap_or_default(), &recipient("codex"), t0 + LATCH_HORIZON_SECS + 1).unwrap();
+            let q = load(&queue_path(&store.root, "b")).unwrap();
+            assert_eq!(q.batches.len(), 2, "{state}");
+            assert!(q.batches[0].released && q.batches[0].sealed);
+            // The arrival absorbed after delivery moves to the successor.
+            assert_eq!(q.batches[0].ids, vec![one.clone()]);
+            assert_eq!(q.batches[1].ids, vec![two.clone(), three]);
+            assert_eq!(native_event(t.path(), &q.batches[1]).unwrap()["status"], "pending");
+        }
     }
     fn read_page(store: &mut Store, actor: &str, params: &Value) -> Value {
         let result = store.read(actor, params, &[]).unwrap();
@@ -929,6 +1178,46 @@ mod tests {
         );
     }
     #[test]
+    fn messaging_scoped_reconciliation_ignores_unrelated_history_and_preserves_cancellation() {
+        let (tmp, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "scoped-active");
+        let q = deliver(&store, tmp.path(), "codex");
+        let id = format!("chat:{}", q.batches[0].wake_id);
+        let other = store.participant_id("offline");
+        let offline = super::super::Person {
+            id: other.clone(), name: "Offline".into(), session_uid: "offline".into(),
+            kind: "agent".into(), present: false, task: None,
+        };
+        store.enroll_participants(&[offline.clone()]).unwrap();
+        dm(&mut store, &other, &[offline], "offline-pending");
+        let path = queue_path(&store.root, "offline");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"unrelated corrupt historical ledger").unwrap();
+        store.follow(&actor, &json!({"action":"set","dnd":true,"request_id":"scoped-mute"}), &people).unwrap();
+        reconcile_session(tmp.path(), &store, "b").unwrap();
+        assert_eq!(crate::notifications::get(tmp.path(), "b", &id).unwrap().unwrap()["status"], "cancelled");
+        assert_eq!(fs::read(&path).unwrap(), b"unrelated corrupt historical ledger");
+        assert_eq!(store.wake_intents_for_session("offline").len(), 1, "offline messages stay available on resume");
+    }
+
+    #[test]
+    fn messaging_delivery_tick_does_not_reconcile_sessionless_history() {
+        let (tmp, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "offline-tick");
+        let q = deliver(&store, tmp.path(), "codex");
+        let path = queue_path(&store.root, "b");
+        store.follow(&actor, &json!({"action":"set","dnd":true,"request_id":"offline-mute"}), &people).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut daemon = DaemonState::default();
+        daemon.messaging_root = store.root.clone();
+        *daemon.messaging.lock().unwrap() = Some(store);
+        let state = Arc::new(Mutex::new(daemon));
+        tick(&state);
+        assert_eq!(fs::read(&path).unwrap(), before, "background delivery visits only live sessions");
+        assert_eq!(native_event(tmp.path(), &q.batches[0]).unwrap()["status"], "pending");
+    }
+
+    #[test]
     fn messaging_legacy_ambiguous_submission_is_never_replayed() {
         let t = tempfile::tempdir().unwrap();
         let path = queue_path(t.path(), "a");
@@ -950,5 +1239,51 @@ mod tests {
         assert!(crate::notifications::get(t.path(), "a", "chat:test")
             .unwrap()
             .is_none());
+    }
+    #[test]
+    fn messaging_wake_text_names_sender_place_excerpt_and_count_within_budget() {
+        let (t, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "first message");
+        let long = format!("rlso: A5 readmit FAILED {}\nsecond line must not appear", "x".repeat(300));
+        store
+            .send("owner", "", "owner",
+                &json!({"channel":"general","mentions":[actor],"body":long,"request_id":"long"}), &people)
+            .unwrap();
+        let intents = store.wake_intents().remove("b").unwrap();
+        let lookup = |id: &str| preview(&store, id);
+        deliver_intents_previewed(t.path(), &store.root, "b", intents, &recipient("claude-code"), 1, &lookup).unwrap();
+        let q = load(&queue_path(&store.root, "b")).unwrap();
+        let text = native_event(t.path(), &q.batches[0]).unwrap()["text"].as_str().unwrap().to_owned();
+        assert!(text.starts_with(&format!("[cm-chat {}] 2 new: #general — Owner: \"rlso: A5 readmit FAILED", q.batches[0].wake_id)), "{text}");
+        assert!(text.contains("(+1 more)") && text.contains("view=\"slim\""), "{text}");
+        assert!(text.contains('…') && !text.contains("second line"), "{text}");
+        assert!(text.chars().count() <= WAKE_TEXT_BUDGET, "{} chars: {text}", text.chars().count());
+    }
+    #[test]
+    fn messaging_wake_text_falls_back_without_preview_and_keeps_watch_ids() {
+        let (_t, mut store, actor, people) = fixture();
+        let m = store
+            .register_monitor(&actor, &json!({"scope":{"channel":"general"},"request_id":"watch"}), &people)
+            .unwrap();
+        dm(&mut store, &actor, &people, "one");
+        store
+            .send("owner", "", "owner", &json!({"channel":"general","body":"watched","request_id":"w"}), &people)
+            .unwrap();
+        let intents = store.wake_intents().remove("b").unwrap();
+        let batch = Batch {
+            wake_id: "w1".into(),
+            ids: intents.iter().map(|i| i.key.clone()).collect(),
+            ..Batch::default()
+        };
+        let text = wake_text(&batch, &intents, &no_preview);
+        assert!(text.starts_with("[cm-chat w1] 2 new chat messages."), "{text}");
+        assert!(text.contains(m["id"].as_str().unwrap()), "{text}");
+        let with = wake_text(&batch, &intents, &|id: &str| preview(&store, id));
+        assert!(with.contains("#general — Owner: \"watched\""), "{with}");
+        assert!(with.contains(m["id"].as_str().unwrap()), "{with}");
+        // A fully fetched batch keeps the marker but claims nothing new.
+        let mut read = batch;
+        read.checked = read.ids.iter().cloned().collect();
+        assert!(wake_text(&read, &intents, &no_preview).starts_with("[cm-chat w1] New chat activity."));
     }
 }

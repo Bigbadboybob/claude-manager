@@ -9,7 +9,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex, Weak,
     },
     time::{Duration, Instant},
@@ -80,7 +80,31 @@ struct Pending {
     response: Option<Value>,
     barrier: u64,
     revision: u64,
+    /// Scoped peers only: also wait (until `soft_until`) for these scopes'
+    /// history backfills, plus any the hub reports this call started. The
+    /// reply never waits for history beyond that.
+    scopes: Vec<String>,
+    wait_history: bool,
+    soft_until: Instant,
 }
+/// Replica-side view of one hub backfill (scoped-backfill peers only).
+#[derive(Clone, Debug, Default)]
+pub struct BackfillProgress {
+    pub id: u64,
+    pub done: u64,
+    pub total: u64,
+    pub complete: bool,
+    /// Acknowledged backfill cursor: all of the scope's messages at or below it
+    /// are durable here, so a reconnect can resume the backfill from it.
+    pub cursor: u64,
+}
+/// Most "currently viewed" selectors kept as transport interests. Views no
+/// longer expire (each expiry used to restart the whole replica stream); the
+/// oldest is released past this bound, which never triggers a replay.
+const MAX_VIEWS: usize = 256;
+/// How long a `freshness="hub"` barrier waits for a newly added scope's
+/// history before replying with backfill progress instead.
+pub const BARRIER_HISTORY_WAIT: Duration = Duration::from_secs(5);
 
 pub struct Runtime {
     state: Weak<Mutex<DaemonState>>,
@@ -95,6 +119,11 @@ pub struct Runtime {
     commands: Mutex<mpsc::Receiver<Command>>,
     pending: Mutex<BTreeMap<String, Pending>>,
     views: Mutex<BTreeMap<String, Instant>>,
+    /// Negotiated `scoped_backfill` on the current hub connection.
+    pub(super) scoped: AtomicBool,
+    pub(super) stream_cursor: AtomicU64,
+    pub(super) stream_revision: AtomicU64,
+    pub(super) backfills: Mutex<BTreeMap<String, BackfillProgress>>,
     upload_retry: Mutex<BTreeMap<String, Instant>>,
     peers: Mutex<BTreeMap<String, transport::PeerConnection>>,
 }
@@ -141,6 +170,10 @@ impl Runtime {
             commands: Mutex::new(commands),
             pending: Mutex::new(BTreeMap::new()),
             views: Mutex::new(BTreeMap::new()),
+            scoped: AtomicBool::new(false),
+            stream_cursor: AtomicU64::new(0),
+            stream_revision: AtomicU64::new(1),
+            backfills: Mutex::new(BTreeMap::new()),
             upload_retry: Mutex::new(BTreeMap::new()),
             peers: Mutex::new(BTreeMap::new()),
         });
@@ -188,6 +221,22 @@ impl Runtime {
         self.signal.signal();
     }
     pub fn request(&self, actor: &str, method: &str, params: &Value) -> Result<Value> {
+        self.request_scoped(actor, method, params, None)
+    }
+    /// True when the hub connection negotiated per-scope backfill.
+    pub fn scoped(&self) -> bool {
+        self.scoped.load(Ordering::Acquire)
+    }
+    /// Like [`Self::request`]; with a scoped hub, `history` additionally waits
+    /// up to its duration for those scopes' history backfills, and for any
+    /// backfill the call itself started, to finish.
+    pub fn request_scoped(
+        &self,
+        actor: &str,
+        method: &str,
+        params: &Value,
+        history: Option<(Vec<String>, Duration)>,
+    ) -> Result<Value> {
         if !self.connected.load(Ordering::Acquire) {
             return Err(error(
                 "coordinator_unavailable",
@@ -206,6 +255,10 @@ impl Runtime {
                     response: None,
                     barrier: u64::MAX,
                     revision: 0,
+                    soft_until: Instant::now()
+                        + history.as_ref().map_or(Duration::ZERO, |(_, d)| *d),
+                    wait_history: history.is_some(),
+                    scopes: history.map(|(scopes, _)| scopes).unwrap_or_default(),
                 },
             );
         if self
@@ -228,30 +281,88 @@ impl Runtime {
             ));
         }
         self.signal.signal();
-        let result = rx
-            .recv_timeout(Duration::from_secs(30))
-            .unwrap_or_else(|_| {
-                Err(error(
-                    "outcome_unknown",
-                    "Coordinator response timed out; retry the same request ID",
-                ))
-            });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let result = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left.min(Duration::from_millis(200))) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => {
+                    // A history wait ends on time, not only on a stream frame.
+                    self.poll_pending();
+                }
+                Err(_) => {
+                    break Err(error(
+                        "outcome_unknown",
+                        "Coordinator response timed out; retry the same request ID",
+                    ))
+                }
+            }
+        };
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&id);
         result
     }
+    /// Keep a viewed conversation streaming live. Views persist for this
+    /// daemon's lifetime (bounded by [`MAX_VIEWS`]): they used to expire after
+    /// 60s, and every expiry or re-view restarted the replica's whole stream.
     pub fn view(&self, selector: &str) {
-        self.views
+        let mut views = self.views.lock().unwrap_or_else(|p| p.into_inner());
+        let added = views.insert(selector.into(), Instant::now()).is_none();
+        while views.len() > MAX_VIEWS {
+            let oldest = views
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            views.remove(&oldest);
+        }
+        drop(views);
+        if added {
+            self.signal.signal();
+        }
+    }
+    /// Backfill progress for `scope` (a conversation ID) while its history is
+    /// still arriving from the hub.
+    pub fn backfill_status(&self, scope: &str) -> Option<BackfillProgress> {
+        self.backfills
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(selector.into(), Instant::now());
-        self.signal.signal();
+            .get(scope)
+            .filter(|b| !b.complete)
+            .cloned()
+    }
+    /// Merge hub-reported backfill states; never regress a newer or completed one.
+    pub(super) fn merge_backfills(&self, items: &Value) {
+        let Some(items) = items.as_object() else {
+            return;
+        };
+        let mut map = self.backfills.lock().unwrap_or_else(|p| p.into_inner());
+        for (scope, v) in items {
+            let id = v["id"].as_u64().unwrap_or(0);
+            let incoming = BackfillProgress {
+                id,
+                done: v["done"].as_u64().unwrap_or(0),
+                total: v["total"].as_u64().unwrap_or(0),
+                complete: v["complete"] == true,
+                cursor: v["cursor"].as_u64().unwrap_or(0),
+            };
+            match map.get_mut(scope) {
+                Some(old) if old.id == id => {
+                    old.done = old.done.max(incoming.done);
+                    old.cursor = old.cursor.max(incoming.cursor);
+                    old.complete |= incoming.complete;
+                }
+                Some(old) if old.id > id => {}
+                _ => {
+                    map.insert(scope.clone(), incoming);
+                }
+            }
+        }
     }
     fn interests(&self) -> BTreeSet<String> {
-        let mut views = self.views.lock().unwrap_or_else(|p| p.into_inner());
-        views.retain(|_, time| time.elapsed() < Duration::from_secs(60));
+        let views = self.views.lock().unwrap_or_else(|p| p.into_inner());
         let mut out = views.keys().cloned().collect::<BTreeSet<_>>();
         drop(views);
         if let Some(store) = self
@@ -303,11 +414,23 @@ impl Runtime {
             )));
         }
     }
+    fn poll_pending(&self) {
+        self.finish_pending(
+            self.stream_cursor.load(Ordering::Acquire),
+            self.stream_revision.load(Ordering::Acquire),
+        );
+    }
     fn finish_pending(&self, cursor: u64, revision: u64) {
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
         let ready = pending
             .iter()
             .filter(|(_, p)| p.response.is_some() && p.barrier <= cursor && p.revision <= revision)
+            .filter(|(_, p)| {
+                now >= p.soft_until
+                    || !p.wait_history
+                    || p.scopes.iter().all(|scope| self.backfill_status(scope).is_none())
+            })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in ready {

@@ -2,8 +2,9 @@
 //! groups of workspaces in the Sessions view's Task sub-view.
 //!
 //! A section is pure display state — it lives in the manifest sidecar
-//! (`Manifest::sections` + `Manifest::workspace_sections`), never on the
-//! planning API, the daemon, or the MCP surface. Membership is explicit per
+//! (`Manifest::sections` + `Manifest::workspace_sections`), separate from the
+//! planning API. `sidebar_remote` publishes discovery and accepts scoped,
+//! durable agent assignment requests from the daemon. Membership is explicit per
 //! workspace; a workspace with no explicit assignment INHERITS its section
 //! through the task tree (a subtask renders under its parent task's
 //! section, a `propose_task` row under its proposer's), and otherwise
@@ -297,11 +298,12 @@ impl App {
         &self,
         members: &HashSet<(usize, usize)>,
     ) -> Vec<usize> {
+        let empty_owners = self.continuous_empty_workspace_owners();
         self.workspaces
             .iter()
             .enumerate()
             .filter(|(wi, ws)| {
-                if ws.is_closed || self.is_past_workspace(*wi) {
+                if ws.is_closed || self.is_past_workspace(*wi) || empty_owners.contains_key(wi) {
                     return false;
                 }
                 // A workspace whose ONLY sessions are continuous members

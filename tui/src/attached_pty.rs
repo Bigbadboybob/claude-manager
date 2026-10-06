@@ -163,6 +163,9 @@ pub struct ReaderHalf {
     /// `memory_cap_kill`) when the observed `ChildEvent` was
     /// synthesized from a bare stream EOF with no `End` frame.
     transport_eof: Arc<AtomicBool>,
+    /// Kitty graphics passthrough: strips graphics commands out of the
+    /// stream before Alacritty parses it. `None` when passthrough is off.
+    graphics: Option<crate::graphics::Tap>,
 }
 
 impl ReaderHalf {
@@ -176,6 +179,19 @@ impl ReaderHalf {
 
 impl Read for ReaderHalf {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.graphics.take() {
+            Some(mut tap) => {
+                let result = tap.read(buf, |scratch| self.read_stream(scratch));
+                self.graphics = Some(tap);
+                result
+            }
+            None => self.read_stream(buf),
+        }
+    }
+}
+
+impl ReaderHalf {
+    fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let result = self.inner.read(buf);
         // After every read, drain any cached child event. The
         // signal is one-shot per stream: once we've written to
@@ -277,6 +293,7 @@ impl AttachedPty {
             pending_exit_stash: None,
             memory_cap_kill: memory_cap_kill.clone(),
             transport_eof: transport_eof.clone(),
+            graphics: None,
         };
         let writer = AttachWriter::new(writer_socket, stream_id)?;
 
@@ -303,6 +320,12 @@ impl AttachedPty {
     pub fn took_memory_cap_kill(&self) -> bool {
         // swap-with-false: atomic read-and-clear.
         self.memory_cap_kill.swap(false, Ordering::SeqCst)
+    }
+
+    /// Route this pane's stream through kitty graphics passthrough. Call
+    /// before the EventLoop takes ownership.
+    pub fn set_graphics_tap(&mut self, tap: crate::graphics::Tap) {
+        self.reader.graphics = Some(tap);
     }
 
     pub fn output_control(&self) -> crate::attach_writer::OutputControl {
@@ -446,9 +469,13 @@ impl EventedReadWrite for AttachedPty {
 /// the next legitimate resize event.
 impl OnResize for AttachedPty {
     fn on_resize(&mut self, window_size: WindowSize) {
+        // Real cell sizes arrive only with graphics passthrough; the
+        // placeholder 1×1 means "unknown" and is not sent.
+        let cell_pixels = (window_size.cell_width > 1 && window_size.cell_height > 1)
+            .then_some((window_size.cell_width, window_size.cell_height));
         if let Err(e) = self
             .writer
-            .send_resize(window_size.num_cols, window_size.num_lines)
+            .send_resize(window_size.num_cols, window_size.num_lines, cell_pixels)
         {
             eprintln!(
                 "cm-tui: AttachedPty resize {}x{} failed: {} (daemon will see the next resize event)",

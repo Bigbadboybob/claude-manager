@@ -75,6 +75,22 @@ pub struct RecoveryHold {
     pub fire_token: String,
     pub detected_at: u64,
     pub detail: String,
+    /// Raised from an upstream CAPACITY refusal (`server_overloaded`) after
+    /// the transient re-drives were spent. The thread is intact, so the
+    /// scheduler releases the hold itself — resuming the SAME run on the
+    /// same thread — once a post-hold pool probe is healthy and a backoff has
+    /// elapsed (`scheduler::try_release_capacity_hold`). Every other hold
+    /// still needs `continuous.reconcile`. Absent on holds written before
+    /// 2026-09-29; those are recognised by their `server_overloaded` detail.
+    #[serde(default)]
+    pub capacity: bool,
+}
+
+impl RecoveryHold {
+    /// Whether the scheduler may release this hold without reconciliation.
+    pub fn auto_releasable(&self) -> bool {
+        self.capacity || self.detail.contains("(server_overloaded)")
+    }
 }
 
 /// When a task fires.
@@ -205,6 +221,17 @@ pub struct ModePreset {
     pub args: Option<serde_json::Value>,
 }
 
+/// Channel-creation policy for a continuous task (see
+/// DESIGN_TASK_CHANNELS.md). Serialized lowercase; absent = `auto`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskChannelPolicy {
+    #[default]
+    Auto,
+    Manual,
+    Off,
+}
+
 /// The durable record of a continuous task. Persisted at
 /// `~/.cm/continuous-tasks/<task_id>/state.json`.
 ///
@@ -228,6 +255,18 @@ pub struct ContinuousTask {
     pub planning_task_id: Option<String>,
     #[serde(default)]
     pub messaging: Option<crate::messaging::tasks::TaskChannel>,
+    /// How the task's chat channel comes to exist. `auto` (default): the
+    /// daemon creates `ct/<slug>` and binds it (DESIGN_TASK_CHANNELS.md);
+    /// `manual`: the operator supplies `messaging.channel_id`; `off`: no
+    /// channel, no subscription.
+    #[serde(default)]
+    pub task_channel: TaskChannelPolicy,
+    /// Durable orchestrator instructions (lane, gate, lifecycle, procedure),
+    /// materialized before every fire as the engine's project-instruction file
+    /// in the worktree (`continuous::instructions`). When set, `default_prompt`
+    /// is only the short per-fire dispatch.
+    #[serde(default)]
+    pub standing_instructions: Option<String>,
     pub label: String,
     #[serde(default)]
     pub project: Option<String>,
@@ -309,6 +348,12 @@ pub struct ContinuousTask {
     /// session exit, and an operator `continuous.force_done`.
     #[serde(default)]
     pub consecutive_wedge_closes: u32,
+    /// Capacity holds the scheduler has auto-released since the last run
+    /// that reached `Done`. Drives the release backoff (30 min doubling to a
+    /// 4 h cap) so a persisting upstream refusal cannot churn the thread.
+    /// Reset by `report_done` and operator `continuous.force_done`.
+    #[serde(default)]
+    pub capacity_hold_releases: u32,
     /// A transcript-proven Claude auth/usage blocker on the active run. While
     /// this record matches `last_run`, supervision and scheduled fires stay
     /// blocked. The scheduler clears it only after the host usage probe proves
@@ -386,6 +431,8 @@ impl ContinuousTask {
             task_id,
             planning_task_id: None,
             messaging: None,
+            task_channel: TaskChannelPolicy::Auto,
+            standing_instructions: None,
             label,
             project: None,
             host_id: "local".into(),
@@ -419,6 +466,7 @@ impl ContinuousTask {
             consecutive_failures: 0,
             investigation_count: 0,
             consecutive_wedge_closes: 0,
+            capacity_hold_releases: 0,
             account_blocked: None,
             recovery_hold: None,
             recovery: None,

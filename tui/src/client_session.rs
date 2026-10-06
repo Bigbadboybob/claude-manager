@@ -299,6 +299,8 @@ pub struct ClientSession {
     /// state without touching alacritty's fd. `None` if the dup failed.
     pub hup_fd: Option<std::os::fd::OwnedFd>,
     pub output_control: Option<crate::attach_writer::OutputControl>,
+    /// Kitty graphics passthrough state; `None` when it is off.
+    pub graphics: Option<crate::graphics::PaneGraphics>,
 }
 
 // Post-review #15 (deferred): a `Drop` impl that calls
@@ -416,11 +418,20 @@ impl ClientSession {
 
         // Step 5: morph the socket into an AttachedPty. From here
         // the connection is a one-way StreamFrame channel.
-        let pty = AttachedPty::from_socket(
+        let mut pty = AttachedPty::from_socket(
             attach_socket,
             format!("attach-{}", session_uid),
         )
         .context("wrap attach socket as AttachedPty")?;
+        let graphics = crate::graphics::for_attached_pane(
+            open_resp.replay_bytes,
+            config.daemon_socket.to_path_buf(),
+            config.operator_token_id.to_string(),
+        )
+        .map(|(tap, graphics)| {
+            pty.set_graphics_tap(tap);
+            graphics
+        });
 
         // Grab a handle to the `memory_cap_kill` flag BEFORE the
         // EventLoop takes ownership of `pty` (slice
@@ -486,6 +497,7 @@ impl ClientSession {
             transport_eof,
             hup_fd,
             output_control,
+            graphics,
         })
     }
 
@@ -518,11 +530,12 @@ impl ClientSession {
     /// `{"resize": {cols, rows}}` data frame the daemon
     /// recognises and applies to the PTY).
     pub fn resize(&self, cols: u16, rows: u16) {
+        let (cell_width, cell_height) = crate::graphics::outer::cell_pixels().unwrap_or((1, 1));
         let window_size = WindowSize {
             num_lines: rows,
             num_cols: cols,
-            cell_width: 1,
-            cell_height: 1,
+            cell_width,
+            cell_height,
         };
         let _ = self.sender.send(Msg::Resize(window_size));
         self.term.lock().resize(TermSize {
@@ -635,6 +648,11 @@ pub(crate) fn rpc_continuous_control(daemon_socket: &Path, token: &str, method: 
     response.result.ok_or_else(|| anyhow::anyhow!("daemon returned no result"))
 }
 
+pub(crate) fn rpc_worktree_cleanup(socket: &Path, token: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let request = Request { id: next_request_id(), caller: Caller::operator(token), method: "worktree.cleanup".into(), params };
+    rpc_round_trip_with_read_timeout(socket, &request, Duration::from_secs(10))?.result.context("cleanup response missing result")
+}
+
 /// Catalog requests use the host's operator channel, independent of continuous tasks.
 pub(crate) fn rpc_catalog_control(
     socket: &Path, token: &str, method: &str, params: serde_json::Value,
@@ -642,6 +660,61 @@ pub(crate) fn rpc_catalog_control(
     anyhow::ensure!(matches!(method, "session.list_transcripts" | "snapshot.control"), "unsupported catalog method");
     let request = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
     rpc_round_trip(socket, &request)?.result.context("catalog response missing result")
+}
+
+/// `graphics.read_file`: pull the file behind a pane's kitty graphics
+/// command from the session's host (doc/kitty-graphics-passthrough.md).
+/// Returns the kitty-style error text (`ENOENT:…`) on failure.
+pub(crate) fn rpc_graphics_read_file(
+    socket: &Path,
+    token: &str,
+    request: &crate::graphics::pane::FetchRequest,
+) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    // The daemon replies in pages (control frames are capped at 4 MiB).
+    const MAX_BYTES: usize = 32 << 20;
+    let mut bytes = Vec::new();
+    loop {
+        let size = match request.size {
+            0 => 0,
+            size => size.saturating_sub(bytes.len() as u64),
+        };
+        let req = Request {
+            id: next_request_id(),
+            caller: Caller::operator(token),
+            method: "graphics.read_file".into(),
+            params: serde_json::json!({
+                "medium": request.medium.to_string(),
+                "path": request.path,
+                "offset": request.offset + bytes.len() as u64,
+                "size": size,
+            }),
+        };
+        let response = rpc_round_trip_with_read_timeout(socket, &req, Duration::from_secs(30)).map_err(|e| {
+            match e.downcast_ref::<DaemonRpcError>() {
+                Some(rpc) if rpc.message.contains(':') && rpc.message.starts_with('E') => rpc.message.clone(),
+                _ => format!("EIO:{e:#}"),
+            }
+        })?;
+        let result = response
+            .result
+            .ok_or_else(|| "EIO:graphics.read_file returned no result".to_string())?;
+        let data = result["data"]
+            .as_str()
+            .ok_or_else(|| "EIO:graphics.read_file returned no data".to_string())?;
+        let page = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| format!("EIO:{e}"))?;
+        let empty = page.is_empty();
+        bytes.extend(page);
+        if bytes.len() > MAX_BYTES {
+            return Err("EFBIG:image exceeds the 32 MiB limit".into());
+        }
+        // Older replies have no `eof`: they were always the whole range.
+        if result["eof"].as_bool().unwrap_or(true) || empty {
+            return Ok(bytes);
+        }
+    }
 }
 
 fn rpc_round_trip_with_read_timeout(
@@ -941,6 +1014,8 @@ pub(crate) fn rpc_create_session_with_timeout(
 
 /// `add_session` response (remote-session-execution Phase 1/3).
 pub(crate) struct AddSessionResult {
+    pub entry: Option<cm_daemon::manifest::ManifestEntry>,
+    pub workspace_id: Option<String>,
     pub resume_id: Option<String>,
     pub session_uid: String,
     pub worktree_path: String,
@@ -1011,12 +1086,24 @@ pub fn rpc_add_session_with_resume(
     let req = Request {
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
-        method: "add_session".into(),
+        method: if resume_id.is_some() { "session.resume" } else { "add_session" }.into(),
         params,
     };
     let resp = rpc_round_trip(daemon_socket, &req)?;
     let result = resp.result.context("add_session response missing result")?;
+    let entry: Option<cm_daemon::manifest::ManifestEntry> = result.get("entry")
+        .filter(|e| !e.is_null())
+        .map(|e| serde_json::from_value(e.clone()))
+        .transpose()?;
+    if resume_id.is_some() {
+        let saved = entry.as_ref().context("Resume response lacks identity metadata; update the daemon")?;
+        anyhow::ensure!(Some(saved.uid.as_str()) == result["session_uid"].as_str(),
+            "Resume response contains inconsistent session identities");
+        anyhow::ensure!(result["workspace_id"].is_string(), "Resume response lacks original workspace");
+    }
     Ok(AddSessionResult {
+        entry,
+        workspace_id: result["workspace_id"].as_str().map(str::to_owned),
         resume_id: result["resume_id"].as_str().map(str::to_owned),
         session_uid: result["session_uid"]
             .as_str()
@@ -1102,6 +1189,7 @@ fn open_attach_socket(
         }
         AttachOpenResp {
             output_flow: result["output_flow"].as_bool().unwrap_or(false),
+            replay_bytes: result["replay_bytes"].as_u64(),
             session_uid: result["session_uid"].as_str()
                 .context("attach.direct result missing session_uid")?.to_string(),
         }
@@ -1141,6 +1229,8 @@ fn open_attach_socket(
 struct AttachOpenResp {
     session_uid: String,
     output_flow: bool,
+    /// Replayed ring bytes ahead of live output; absent on older daemons.
+    replay_bytes: Option<u64>,
 }
 
 /// `attach.open` over an *already-dialed* `UnixStream`. The same
@@ -1187,6 +1277,7 @@ fn rpc_attach_open(
     let result = resp.result.context("attach.open response missing result")?;
     Ok(AttachOpenResp {
         output_flow: result["output_flow"].as_bool().unwrap_or(false),
+        replay_bytes: result["replay_bytes"].as_u64(),
         session_uid: result["session_uid"]
             .as_str()
             .context("attach.open result missing session_uid")?
@@ -1739,6 +1830,15 @@ pub fn rpc_tui_update_sessions_snapshot(
     operator_token_id: &str,
     sessions: &[TuiSessionSnapshotPush<'_>],
 ) -> anyhow::Result<()> {
+    rpc_tui_update_sessions_with_preferences(daemon_socket, operator_token_id, sessions, &[])
+}
+
+pub fn rpc_tui_update_sessions_with_preferences(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    sessions: &[TuiSessionSnapshotPush<'_>],
+    preferences: &[cm_daemon::resume_identity::Preferences],
+) -> anyhow::Result<()> {
     let sessions_json: Vec<serde_json::Value> = sessions
         .iter()
         .map(|s| {
@@ -1760,7 +1860,7 @@ pub fn rpc_tui_update_sessions_snapshot(
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
         method: "tui.update_sessions_snapshot".into(),
-        params: serde_json::json!({ "sessions": sessions_json }),
+        params: serde_json::json!({ "sessions": sessions_json, "preferences": preferences }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
@@ -2374,6 +2474,158 @@ mod tests {
         }
     }
 
+    /// Kitty graphics passthrough end to end through a real daemon session:
+    /// a program in the pane probes the terminal, reads its pixel size, and
+    /// sends a file-based image with placeholder cells. See
+    /// doc/kitty-graphics-passthrough.md.
+    #[test]
+    fn kitty_graphics_end_to_end_through_a_real_daemon_session() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        crate::graphics::outer::enable_for_tests("kitty(0.39.1)", (10, 20));
+        let (socket, working_dir, _state, _stop, _handle) = start_test_daemon("ws-graphics-e2e");
+        let png = working_dir.join("image.png");
+        std::fs::write(&png, b"\x89PNG not really").unwrap();
+        let result = working_dir.join("pane-saw.txt");
+        let script = format!(
+            r#"
+import base64, fcntl, os, select, struct, termios, time, tty
+tty.setraw(0)
+def ask(q, end):
+    os.write(1, q)
+    buf, deadline = b"", time.time() + 10
+    while not buf.endswith(end) and time.time() < deadline:
+        if select.select([0], [], [], 0.2)[0]:
+            buf += os.read(0, 256)
+    return buf
+seen = {{}}
+seen["xtversion"] = ask(b"\x1b[>q", b"\x1b\\")
+seen["cell"] = ask(b"\x1b[16t", b"t")
+seen["probe"] = ask(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", b"\x1b\\")
+deadline = time.time() + 10
+while time.time() < deadline:
+    ws = struct.unpack("HHHH", fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))
+    if ws[2]:
+        break
+    time.sleep(0.05)
+seen["winsize"] = ws
+open({result:?}, "w").write(repr(seen))
+path = base64.b64encode({png:?}.encode()).decode()
+os.write(1, ("\x1b_Ga=T,U=1,t=f,i=5,f=100,c=2,r=1;" + path + "\x1b\\").encode())
+os.write(1, "\x1b[38;2;0;0;5m\U0010EEEE̅̅\U0010EEEE̅̍\x1b[39m".encode())
+time.sleep(60)
+"#
+        );
+        let argv = vec!["/usr/bin/python3".to_string(), "-c".to_string(), script];
+        let uid = test_uid();
+        let config = ClientSessionConfig {
+            daemon_socket: &socket,
+            operator_token_id: "op-graphics",
+            uid: &uid,
+            workspace_id: "ws-graphics-e2e",
+            label: "graphics-e2e",
+            session_type: "bash",
+            argv: &argv,
+            working_dir: &working_dir,
+            env: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            cgroup_path: None,
+            worktree_path: None,
+            task_id: None,
+            transcript_path: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            global_perms: false,
+        };
+        let mut session = ClientSession::new(config).expect("spawn graphics session");
+        // The TUI resizes every newly attached pane; this carries the cell size.
+        session.resize(80, 24);
+        let mut graphics = session.graphics.take().expect("passthrough is on");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut outer = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let out = graphics.pump(|| crate::graphics::PaneCtx {
+                cols: 80,
+                rows: 24,
+                cell: Some((10, 20)),
+                version: "kitty(0.39.1)",
+            });
+            outer.extend(out.outer);
+            if !out.pane.is_empty() {
+                session.write(&out.pane).unwrap();
+            }
+            if graphics.ids().contains_key(&5) && !outer.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let seen = std::fs::read_to_string(&result).expect("pane recorded its replies");
+        assert!(seen.contains(r"'xtversion': b'\x1bP>|kitty(0.39.1)\x1b\\'"), "{seen}");
+        assert!(seen.contains(r"'cell': b'\x1b[6;20;10t'"), "{seen}");
+        assert!(seen.contains(r"'probe': b'\x1b_Gi=31;OK\x1b\\'"), "{seen}");
+        assert!(seen.contains("'winsize': (24, 80, 800, 480)"), "{seen}");
+
+        let outer_id = graphics.ids()[&5];
+        let text = String::from_utf8(outer.clone()).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "\x1b_Ga=T,U=1,i={outer_id},f=100,c=2,r=1,q=2;{}\x1b\\",
+                b64.encode(b"\x89PNG not really")
+            ),
+            "t=f is fetched from the session's host and sent in-band"
+        );
+
+        // The placeholder cells in the grid reach the outer terminal with
+        // the outer id.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(
+            crate::terminal_widget::TerminalWidget::new(&session.term, false)
+                .images(Some(graphics.ids())),
+            area,
+            &mut buf,
+        );
+        let (r, g, b) = crate::graphics::placeholder::id_color(outer_id);
+        let row = (0..24)
+            .find(|&y| buf[(0, y)].symbol().starts_with('\u{10EEEE}'))
+            .expect("placeholder row rendered");
+        assert_eq!(buf[(0, row)].fg, ratatui::style::Color::Rgb(r, g, b));
+        assert_eq!(buf[(1, row)].symbol(), "\u{10EEEE}\u{0305}\u{030D}");
+
+        // Closing the pane frees its images in the outer terminal.
+        drop(graphics);
+        let mut flushed = Vec::new();
+        crate::graphics::outer::flush(&mut flushed).unwrap();
+        assert!(
+            String::from_utf8(flushed).unwrap().contains(&format!("\x1b_Ga=d,d=I,i={outer_id},q=2\x1b\\")),
+        );
+        // Images larger than one control frame arrive in pages.
+        let big = working_dir.join("big.png");
+        let content: Vec<u8> = (0..5 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&big, &content).unwrap();
+        let fetched = rpc_graphics_read_file(
+            &socket,
+            "op-graphics",
+            &crate::graphics::pane::FetchRequest {
+                medium: 'f',
+                path: big.to_string_lossy().into_owned(),
+                offset: 0,
+                size: 0,
+            },
+        )
+        .expect("paged fetch");
+        assert!(fetched == content, "paged fetch returned {} bytes", fetched.len());
+        let _ = rpc_kill_session(&socket, "op-graphics", &uid);
+    }
+
     /// Fresh TUI-format uid for tests (slice 10c-e-3b-fix).
     fn test_uid() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2583,6 +2835,118 @@ mod tests {
                 "round-trip session.resize must move the daemon PTY size",
             );
         }
+        let _ = rpc_kill_session(&socket, "op-test", &uid);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    #[test]
+    fn codex_repaint_recovers_evicted_screen_without_input_or_restart() {
+        use alacritty_terminal::index::{Column, Line};
+        use std::time::{Duration, Instant};
+
+        fn wait_until(mut condition: impl FnMut() -> bool) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(Instant::now() < until, "timed out waiting for PTY");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let (socket, working_dir, state, stop, handle) = start_test_daemon("ws-repaint");
+        // A deterministic repaintable PTY application. Its initial header is
+        // evicted by >1 MiB of updates to the bottom row; only SIGWINCH redraws
+        // it. No network/model calls and no production session are involved.
+        let program = r#"
+import os, signal
+def repaint(*_):
+    os.write(1, b'\x1b[2J\x1b[HCONVERSATION-START\x1b[22;1HREADY')
+signal.signal(signal.SIGWINCH, repaint)
+repaint()
+data = b'\x1b[22;1H\x1b[2Kworking' * 70000
+while data:
+    data = data[os.write(1, data):]
+os.write(1, b'\x1b[22;1HREADY')
+while True:
+    signal.pause()
+"#;
+        let argv = vec!["python3".into(), "-c".into(), program.into()];
+        let uid = test_uid();
+        let config = bash_config(&socket, &working_dir, "op-test", &uid,
+            "ws-repaint", "repaint-fixture", &argv, 80, 24);
+        rpc_start_session(&config).unwrap();
+        let (fanout, pid) = {
+            let st = state.lock().unwrap();
+            let s = st.sessions.get(&uid).unwrap();
+            (s.fanout.clone(), s.pid)
+        };
+        wait_until(|| {
+            let snap = fanout.snapshot_since(None);
+            snap.start_offset > 0 && snap.bytes.ends_with(b"READY")
+        });
+        let dimensions = || {
+            let st = state.lock().unwrap();
+            let s = st.sessions.get(&uid).unwrap();
+            (s.last_cols, s.last_rows)
+        };
+        let mut config = bash_config(&socket, &working_dir, "op-test", &uid,
+            "ws-repaint", "repaint-fixture", &argv, 80, 24);
+        // Model this repaintable fixture as an existing Codex pane in the TUI.
+        config.session_type = "codex";
+        let mut viewer = crate::session::Session::new_attached_existing(config).unwrap();
+        wait_until(|| viewer.term.lock().grid()[Line(21)][Column(0)].c == 'R');
+        assert_ne!(viewer.term.lock().grid()[Line(0)][Column(0)].c, 'C',
+            "the raw replay tail reproduces the missing upper conversation");
+
+        let now = Instant::now();
+        viewer.poll_repaint(false, now);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dimensions(), (80, 24), "hidden panes must not repaint the fleet");
+
+        viewer.poll_repaint(true, now);
+        wait_until(|| dimensions() == (79, 24));
+        wait_until(|| viewer.term.lock().grid()[Line(0)][Column(0)].c == 'C');
+        // Finish even when focus moved away in the meantime.
+        let before_restore = fanout.snapshot_since(None).cursor;
+        viewer.poll_repaint(false, now + Duration::from_millis(500));
+        wait_until(|| dimensions() == (80, 24));
+        wait_until(|| {
+            let snap = fanout.snapshot_since(None);
+            snap.cursor > before_restore && snap.bytes.ends_with(b"READY")
+        });
+
+        // Repeated focus changes do not repeat the automatic pulse.
+        let cursor = fanout.snapshot_since(None).cursor;
+        viewer.poll_repaint(true, now + Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dimensions(), (80, 24));
+        assert_eq!(fanout.snapshot_since(None).cursor, cursor);
+
+        // A-r can request another repaint; a simultaneous user resize wins.
+        viewer.request_repaint();
+        viewer.poll_repaint(true, now + Duration::from_secs(2));
+        wait_until(|| dimensions() == (79, 24));
+        viewer.resize(100, 30);
+        wait_until(|| dimensions() == (100, 30));
+        viewer.poll_repaint(false, now + Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dimensions(), (100, 30));
+        {
+            let st = state.lock().unwrap();
+            let s = st.sessions.get(&uid).unwrap();
+            assert_eq!(s.pid, pid, "repaint must keep the same process");
+            assert!(s.last_input_at.lock().unwrap().is_none(),
+                "repaint must never send input or submit a prompt");
+        }
+        drop(viewer);
+
+        // A shell attach uses the same transport but is never auto-repainted.
+        let config = bash_config(&socket, &working_dir, "op-test", &uid,
+            "ws-repaint", "shell-fixture", &argv, 100, 30);
+        let mut shell_viewer = crate::session::Session::new_attached_existing(config).unwrap();
+        shell_viewer.poll_repaint(true, Instant::now());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dimensions(), (100, 30));
+        drop(shell_viewer);
         let _ = rpc_kill_session(&socket, "op-test", &uid);
         stop_test_daemon(&socket, stop, handle);
     }
@@ -3982,8 +4346,11 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let req = wire::read_request(&mut stream).unwrap().unwrap();
                 wire::write_response(&mut stream, &Response::ok(req.id.clone(), serde_json::json!({
-                    "session_uid": "ts-abcd-0", "workspace_id":"ws-test", "worktree_path":"/remote/worktree",
-                    "resume_id":"conversation-id", "main_repo_path":"/remote/repo", "branch":"main"
+                    "session_uid": "ts-aaaa-0", "workspace_id":"ws-test", "worktree_path":"/remote/worktree",
+                    "resume_id":"conversation-id", "main_repo_path":"/remote/repo", "branch":"main",
+                    "entry": { "uid":"ts-aaaa-0", "label":"Winners", "session_type":"claude-code",
+                        "transcript_id":"conversation-id", "task_id":"original-task", "global_perms":true,
+                        "color":"green", "notify_on_idle":true }
                 }))).unwrap();
                 requests.push(req);
             }
@@ -3996,11 +4363,17 @@ mod tests {
         let added = rpc_add_session_with_resume(&socket, "op-test", "ts-abcd-0", "ws-test", "agent",
             "claude-code", None, 100, 30, Some("conversation-id"), None).unwrap();
         assert_eq!(added.resume_id.as_deref(), Some("conversation-id"));
+        assert_eq!(added.session_uid, "ts-aaaa-0");
+        let entry = added.entry.unwrap();
+        assert_eq!(entry.label, "Winners");
+        assert_eq!(entry.task_id.as_deref(), Some("original-task"));
+        assert!(entry.global_perms && entry.notify_on_idle);
+        assert_eq!(entry.color.as_deref(), Some("green"));
         let requests = server.join().unwrap();
         assert_eq!(requests[0].method, "create_session");
         assert_eq!(requests[0].params["in_place"], true);
         assert_eq!(requests[0].params["seed_from"], "reviewer");
-        assert_eq!(requests[1].method, "add_session");
+        assert_eq!(requests[1].method, "session.resume");
         assert_eq!(requests[1].params["resume_id"], "conversation-id");
         assert!(requests.iter().all(|r| r.params.get("argv").is_none() && r.params.get("env").is_none()));
     }
@@ -4686,4 +5059,22 @@ mod tests {
 pub fn rpc_messaging(socket: &Path, token: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
     let req = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
     Ok(rpc_round_trip(socket, &req)?.result.unwrap_or(serde_json::Value::Null))
+}
+
+/// Read timeout for the message board's worker thread. A replica forwards
+/// joins, channel edits, pins and hub refreshes to the coordinator and holds
+/// the reply until its own copy catches up, for up to 30s
+/// (`daemon/src/messaging/sync/mod.rs`, `Sync::request`). With a hub that
+/// negotiates `scoped_backfill`, joins reply once the membership change is
+/// local and history follows (reported as `cache.backfill`); a hub refresh
+/// waits at most 5s for history. Older hubs still hold the reply. The 5s default gave
+/// up first: the hub committed the change, the board kept it as an unconfirmed
+/// saved operation, and every later channel action was refused behind it.
+pub const MESSAGING_BOARD_RPC_READ_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// [`rpc_messaging`] for the message board's worker thread, which may wait on
+/// the coordinator. Never call this from the UI thread.
+pub fn rpc_messaging_board(socket: &Path, token: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
+    Ok(rpc_round_trip_with_read_timeout(socket, &req, MESSAGING_BOARD_RPC_READ_TIMEOUT)?.result.unwrap_or(serde_json::Value::Null))
 }

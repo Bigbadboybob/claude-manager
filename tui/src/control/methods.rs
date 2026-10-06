@@ -2795,6 +2795,7 @@ mod tests {
 
     fn make_tombstone(uid: &str) -> SessionTombstone {
         SessionTombstone {
+            entry: None,
             uid: uid.into(),
             managed_by_uid: None,
             label: "test".into(),

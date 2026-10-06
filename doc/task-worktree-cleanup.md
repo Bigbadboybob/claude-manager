@@ -1,0 +1,134 @@
+# Closing tasks and reclaiming worktrees
+
+In the work view, **Alt+d** opens the completion dialog for the selected task.
+**Keep worktrees** is the default. Use Tab or the arrow keys to select
+**Reap this task + descendants**, inspect the paths and retention reasons, and
+press Enter. Use j/k to scroll the preview or result. Escape cancels before
+submission, or closes the report afterward.
+
+**Alt+Shift+w** opens the same choice for closing a workspace. Closing a
+workspace does not mark its associated planning tasks done: any nonterminal
+task still protects its checkout. For task completion and cleanup, use Alt+d
+on that task's header. Plain Alt+w retains its existing close-session behavior.
+A workspace containing several tasks requires selecting a specific task before
+Alt+d; cleanup never guesses which one to complete.
+For an exited worker whose viewer binding is missing, Alt+d resolves a single
+associated task from the host's checkout inventory before completion. A
+workspace-close preview includes the workspace's own task owners; an open
+associated task is reported as needing completion, not as unrelated sharing.
+New ownership discovered after the preview still blocks removal.
+
+An already-reaped workspace can still be closed with either choice. The host reports “Workspace checkout already absent” and checks any surviving descendants using retained ownership records. A checkout removed between preview and cleanup is reported as already absent. A new checkout at the same path is never covered by the old checkout's approval. If the dialog was opened before the host update and still shows a missing-path error, cancel and reopen it for a fresh preview.
+
+Workspaces the viewer creates for adopted agent sessions close automatically when their last session is removed, including workers whose tasks still await review or monitoring. The viewer saves this policy independently of workspace names, so plain labels such as `scraper-cohort-914e0fc2` work. Closure only hides the empty workspace: planning tasks, task bindings, Git worktrees, branches and transcript tombstones remain. A later worker on the same daemon workspace makes it visible again. User-created workspaces, pinned workspaces, live session rows and pending/offline attachments are protected. Renaming an adopted workspace claims it as a user workspace and turns off this automatic closure; pinning also keeps it visible.
+
+The policy applies to newly adopted workspaces after the viewer update. Older empty headers without the saved policy can be closed with **Alt+Shift+w → Keep worktrees**; there is no need to delete the task or its checkout. Existing legacy `agent:` workspace markers retain automatic cleanup. The viewer also reconciles marked empty workspaces after task updates, protecting the currently focused workspace during that sweep.
+
+**Batch reaping.** `scripts/reap_tasks.py --host <host> <task-id>...` runs the preview/apply dance for a list of tasks in one call, which is how `/triage-review` closes out a sweep (reaping is its default per the 2026-09-18 Owner ruling; a checkout deliberately kept is named in its report). `--dry-run` previews only. The whole batch is one pipeline: previews run a few at a time on the host (`--concurrency`, default 2 — 6 timed out the daemon's task-state lookups on cm-manager, 2026-10-05), each apply is queued as soon as its preview lands, and every round of submits and status reads is one `cm-op --batch` round trip with a per-call timeout, so a hung host fails a round with a clear error instead of stalling the batch. Each task prints exactly one outcome (reaped / RETAINED + reason / still settling + status id / ERROR) as soon as it is known, unbuffered. `--wait` is one bound for the whole batch — how long to keep watching applied jobs after the last preview settles — not a per-task wait; anything still settling then is reported with its status id, and the daemon-side job is detached and finishes without the helper. (Pre-2026-10-04 the helper ran one task at a time and waited the full `--wait` on each, so a 33-task close-out needed ~30 min and, block-buffered, printed nothing before the caller's timeout killed it.)
+
+**Choosing reap is a decision made once (2026-09-18).** The apply worker closes the sessions belonging to the approved task family itself, then waits out refusals that are that closing finishing: a `live_process_reference` always, and a `live_session` when this job just closed one. It waits up to `SETTLE_TIMEOUT_SECS` (5 min) shared across the job's checkouts, polling every 5 s, and the job is detached and durable, so the operator walks away rather than re-deciding. Refusals that waiting cannot fix — pinned, continuous, shared with another task, a non-terminal task outside the family, or a live session this job did not close — are reported at once with their real reason. Pre-fix apply took exactly one verdict per checkout, so a checkout whose only blocker was a process seconds from exiting was retained permanently and "reap now" silently became "keep"; closing a session is asynchronous and the agent's stdio MCP child exits a moment later, which under memory pressure took minutes (30 children killed at once were each blocked in a swap-in fault before they noticed stdin had closed).
+
+**A finished task closes its own workers (2026-09-18).** When a task reaches `done` or `archived` by ANY route — the planning API, the TUI, an MCP call, a cloud status flip — the daemon's terminal-task sweep closes the idle worker sessions still bound to it, within five minutes. Before this, only the `mark_subtask_done` MCP tool swept; every other route left workers alive at their prompt, and because the reaper refuses a checkout holding a live session BEFORE it computes age, the retention clock never started and no such checkout was ever reapable (65 live sessions on cm-manager the morning it shipped, 47 of them past `report_done`, some since August). Closing a session deletes nothing: the checkout, branch, files and transcript remain and `A-R` still revives the conversation. It only lets the clock start. The sweep never touches a continuous orchestrator or a workflow participant, and skips a session that is mid-turn, picking it up once it settles. A worker whose task is still open — including one that has called `report_done` and is awaiting review — stays live by design.
+
+Automatic closure never submits a reap request. The scheduled reaper still applies its usual seven-day retention and task/activity protections; an unfinished triage task keeps its checkout. For immediate cleanup later, **Alt+Shift+O** opens past workspaces. Reopen the workspace, then use **Alt+d → Reap this task + descendants** once that task is finished. Reopening returns bound Done tasks to Running and can resume designated designer sessions; restoring other closed sessions is optional. Cloud paths are not checked on the laptop or falsely labelled gone: the owning host validates them when launching sessions or previewing cleanup. A missing local worktree still blocks reopening.
+
+Task completion previews the owning host and other configured remote hosts,
+so CM children created on a different worker host can be included. A remote
+task does not include the laptop's retained migration copies. A workspace-only
+close stays on its owning host. Unavailable hosts are reported and must return
+a preview before recursive cleanup can be selected; Keep remains available.
+
+## What cleanup includes
+
+The preview fixes the set of checkout identities approved for this operation:
+
+- The selected task's checkout and checkouts of its CM descendant tasks.
+- Raw Git worktrees with recorded creation links, including nested descendants.
+- Claude-native worktrees with exact parent metadata.
+
+New checkouts created after the preview are not silently added. Each checkout
+has a UUID stored in its Git administration directory, so deleting a checkout
+and reusing its pathname does not transfer an old cleanup approval.
+
+This choice skips the usual seven-day retention delay for these checkouts.
+It preserves the existing reaper's other protections: active sessions and
+processes, pinned and continuous work, nonterminal tasks, shared ownership,
+unsafe files, conflicts, and uncertain Git state. A retained nested checkout
+also protects the enclosing checkout. Children inherit task ownership and
+pin/continuous protection through their creation ancestry. Cleanup rechecks
+ownership, task status and activity before and after preservation and at the
+final removal boundary. It does not terminate descendant agents to free space.
+
+Branches are retained. Ordinary uncommitted files are saved in a WIP commit;
+meaningful ignored outputs are archived under `~/.cm/worktree-artifacts/`.
+If preservation fails, the checkout remains. Generated caches may be discarded
+according to the existing reaper policy. A task can finish with some checkouts
+retained; the report explains each outcome. This command does not delete
+branches or trigger artifact-vault garbage collection.
+
+## Raw Git tracking and limits
+
+The daemon installs a chained `post-checkout` hook for known repositories and
+before creating worktrees in new repositories. The wrapper records ordinary
+`git worktree add` creation, then runs the previous hook with its original
+arguments and exit status. Existing hooks, including predictionTrading's
+bootstrap, are preserved as `post-checkout.before-cm-lineage`.
+
+Creation evidence includes the creating Git process's checkout and the inherited
+CM session/task identity when available. Branch switches do not reparent a
+checkout. Records live under `~/.cm/worktree-lineage/`; ownership evidence
+survives removal of an ancestor. The host inventories exact CM bindings,
+branch-and-repository task bindings, and Claude metadata to reconcile existing
+checkouts. Branch ancestry or a similar name is never enough to assign a raw
+checkout to a task.
+
+Git can bypass post-checkout with `--no-checkout`, disabled/replaced hooks, or
+creation on an unconfigured host. Unattributed historical worktrees are left
+out of recursive cleanup. Hook conflicts are reported; CM does not overwrite
+an externally replaced or symlinked hook. Checkout-relative or checkout-local
+`core.hooksPath` hooks are also left unchanged; wrapping those would modify
+source files and would not reliably track new checkouts. Absolute shared custom
+hook directories can be chained. After inspecting a missed checkout,
+an operator/agent can explicitly register its creation parent on that host:
+
+```bash
+python3 ~/.cm/worktree-tools/worktree_lineage.py register /absolute/child /absolute/parent
+```
+
+Register only a parent supported by creation evidence. To install the chained
+hook in another repository:
+
+```bash
+python3 ~/.cm/worktree-tools/worktree_lineage.py install /absolute/repository
+```
+
+## Durable jobs and recovery
+
+The operator-only daemon RPC is `worktree.cleanup` with actions `preview`,
+`apply`, and `status`. Preview uses a caller-generated UUID `id`, optional
+`task_id`, and optional absolute host-local `worktree_path`. Apply and status
+use that same `id`; retries are idempotent. Preview pins `root_task_ids` and
+returns `root_tasks` with their current status, including ownership resolved
+from a workspace path. Agent session callers cannot invoke
+this destructive RPC through MCP. Normal task/session permissions are unchanged.
+
+The TUI waits for every host to acknowledge its persisted cleanup request
+before completing the task. If the viewer exits before acknowledgment, it
+leaves the task open. Once queued, a detached host worker continues without the
+viewer and waits briefly for closure; a failed status update retains a
+nonterminal task's checkout. Requests and per-path results are saved after every
+step under `~/.cm/worktree-cleanup/<id>.json`, with a sibling `.log`. The daemon
+resumes unfinished jobs at startup; a worker lock prevents duplicate execution.
+Cleanup shares the scheduled reaper's host lock.
+
+To inspect an existing job from the CM checkout:
+
+```bash
+scripts/cm-op --ssh cm-sessions worktree.cleanup '{"action":"status","id":"<job-uuid>"}'
+```
+
+The JSON lists removed and retained paths and any artifact recovery location.
+The shared removal ledger is `~/.cm/worktree-reaper.jsonl`. A retained checkout
+can be reconsidered with a fresh preview after its blocking condition is
+resolved. An error does not justify bypassing preservation or deleting an
+unknown checkout manually.

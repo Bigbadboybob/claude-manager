@@ -76,6 +76,7 @@ controls and runaway-child watcher remain available; no new caps were enabled.
 - The Codex pool is cloud-owned on port 2455. The laptop's `cm-codex-lb.service`
   is only a persistent SSH forward to it. Never reseed the live pool using the
   old laptop database. Keep its HTTP response session bridge disabled as configured.
+  Browser account enrollment also needs the separate loopback callback forward on port 1455; see [Codex LB callback tunnel](codex-oauth-callback.md). Forwarding the dashboard alone leaves the browser at `localhost:1455/auth/callback` with connection refused.
 - The original absolute `node_repl` runtime path is provided by
   `/usr/lib/chatgpt/resources/cua_node` pointing to `~/.local/share/cm-node-repl`.
   All nine migrated Codex app servers reloaded MCP configuration successfully,
@@ -252,3 +253,12 @@ directory must not be committed. Runtime verification also writes
 `~/.cm/setup-verification.json` on `cm-sessions`. A copy of the tested runtime
 archive, startup script and service unit is retained in
 `~/.cm/provisioning/` on its data disk, which is covered by the snapshot schedule.
+
+## Explicit task cleanup
+
+The work-view completion dialog (Alt+d) can request immediate cleanup of the
+selected task and tracked descendants on their hosts. Keep is the default;
+active/shared/pinned/continuous work remains protected. Jobs and results persist
+under `~/.cm/worktree-cleanup/`, independently of the laptop. The daemon embeds
+its Python runtime under `~/.cm/worktree-tools/` and installs chained Git hooks
+for raw worktree lineage. See [usage, limits and recovery](task-worktree-cleanup.md).

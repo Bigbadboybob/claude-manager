@@ -191,6 +191,11 @@ def fleet_alerts(health, tasks, queues, now, overdue=600):
                 due = None
                 if queue['pending'] and oldest:
                     due = epoch(oldest) + (0 if threshold and queue['pending'] >= threshold else schedule['window_secs'])
+                    # Queue eligibility does not override the scheduler's
+                    # not-before time (notably the post-compaction delay).
+                    scheduled = task.get('next_fire_at')
+                    if scheduled is not None:
+                        due = max(due, scheduled)
             if due is not None and now > due + overdue:
                 alerts[key] = f"Continuous task '{name}' appears overdue for eligible work. Check scheduling and queue evidence. No run was forced."
     return alerts

@@ -137,6 +137,19 @@ impl Store {
             json!({"subscription_id":next.id,"task_id":next.task_id,"channel_id":next.channel_id,"binding_revision":next.revision,"monitor_id":monitor_id,"actor_id":next.actor}),
         )
     }
+    /// Is `actor` the session currently bound as some continuous task's
+    /// parent? Gates the reserved `-orchestrator` name suffix.
+    pub fn is_task_subscription_actor(&self, actor: &str) -> bool {
+        self.task_bindings
+            .values()
+            .any(|b| b.active && b.actor == actor)
+    }
+    /// The channel a task subscription points at, for orientation blocks.
+    pub fn task_binding_for(&self, task_id: &str) -> Option<&TaskBinding> {
+        self.task_bindings
+            .values()
+            .find(|b| b.active && b.task_id == task_id)
+    }
     pub fn configured_task_ids(&self) -> Vec<String> {
         self.task_bindings
             .values()
@@ -203,6 +216,131 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn person(uid: &str, id: String) -> Person {
+        Person {
+            id,
+            name: uid.into(),
+            session_uid: uid.into(),
+            task: None,
+            present: true,
+            kind: "agent".into(),
+        }
+    }
+
+    /// The `<task>-orchestrator` name follows the scheduler binding: the dead
+    /// predecessor's record is released (no `-1d8` suffix for the replacement),
+    /// mentions by name resolve to the live holder, and a worker that is not
+    /// the bound parent cannot claim any `-orchestrator` name.
+    #[test]
+    fn orchestrator_name_hands_over_without_suffix_and_suffix_is_reserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Store::open(tmp.path()).unwrap();
+        let old = s.participant_id("old");
+        let new = s.participant_id("new");
+        let worker = s.participant_id("worker");
+        let people = [
+            person("old", old.clone()),
+            person("new", new.clone()),
+            person("worker", worker.clone()),
+        ];
+        s.enroll_participants(&people).unwrap();
+        let channel = s.channels["general"].clone();
+        let sub = uuid();
+        let mut bind = TaskBinding {
+            id: sub.clone(),
+            task_id: "bug-triage".into(),
+            channel_id: channel.clone(),
+            actor: old.clone(),
+            revision: 1,
+            active: true,
+            acknowledged: BTreeSet::new(),
+        };
+        s.bind_task_subscription(bind.clone()).unwrap();
+        let first = s
+            .assign_task_name(&old, "old", "bug-triage-orchestrator", &[], "k1")
+            .unwrap();
+        assert!(first.is_some());
+        assert_eq!(s.names[&old].name, "bug-triage-orchestrator");
+        // Same actor, same name: no-op.
+        assert!(s
+            .assign_task_name(&old, "old", "bug-triage-orchestrator", &[], "k1b")
+            .unwrap()
+            .is_none());
+        // A worker cannot take an -orchestrator name at all.
+        let e = s
+            .send(
+                &worker,
+                "worker",
+                "agent",
+                &json!({"channel":"general","name":"bug-triage-orchestrator","body":"hi","request_id":"w1"}),
+                &people,
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "reserved_name");
+        let e = s
+            .send(
+                &worker,
+                "worker",
+                "agent",
+                &json!({"channel":"general","name":"perf-triage-orchestrator","body":"hi","request_id":"w2"}),
+                &people,
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "reserved_name");
+        s.send(
+            &worker,
+            "worker",
+            "agent",
+            &json!({"channel":"general","name":"Scout","body":"hi","request_id":"w3"}),
+            &people,
+        )
+        .unwrap();
+        // Replacement session takes over the binding and the name, unsuffixed.
+        bind.actor = new.clone();
+        bind.revision = 2;
+        s.bind_task_subscription(bind).unwrap();
+        let release = vec![old.clone(), worker.clone()];
+        s.assign_task_name(&new, "new", "bug-triage-orchestrator", &release, "k2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.names[&new].name, "bug-triage-orchestrator");
+        assert!(s.names[&old].released);
+        assert_eq!(s.names[&old].name, "bug-triage-orchestrator", "history keeps the old record");
+        assert!(!s.names[&worker].released, "unrelated names are untouched");
+        // A DM addressed by name reaches the live holder, not the released one.
+        let dm = s
+            .send(
+                &worker,
+                "worker",
+                "agent",
+                &json!({"dm":"bug-triage-orchestrator","body":"handoff","request_id":"dm1"}),
+                &people,
+            )
+            .unwrap();
+        let conv = dm["event"]["conversation_id"].as_str().unwrap();
+        assert!(s.visible(&new, conv));
+        assert!(!s.visible(&old, conv));
+        // Survives reopen (the release travelled as an identity event).
+        drop(s);
+        let s = Store::open(tmp.path()).unwrap();
+        assert!(s.names[&old].released);
+        assert_eq!(s.names[&new].name, "bug-triage-orchestrator");
+    }
+
+    #[test]
+    fn system_notice_posts_without_membership_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Store::open(tmp.path()).unwrap();
+        let channel = s.channels["general"].clone();
+        let a = s.post_system_notice(&channel, "Run seq 7 held", "held:7").unwrap();
+        let b = s.post_system_notice(&channel, "Run seq 7 held", "held:7").unwrap();
+        assert_eq!(a["event_id"], b["event_id"]);
+        assert_eq!(a["event"]["actor"]["kind"], "system");
+        assert_eq!(a["event"]["conversation_id"], channel);
+        assert!(s.post_system_notice("missing", "x", "k").is_err());
+    }
+
     #[test]
     fn messaging_task_replacement_keeps_checkpoint_but_not_private_watches_or_dms() {
         let tmp = tempfile::tempdir().unwrap();

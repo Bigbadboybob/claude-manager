@@ -226,6 +226,11 @@ impl PtyModeTracker {
         *self.term.mode()
     }
 
+    /// Current visible grid only; excludes scrollback and erased dialogs.
+    pub fn visible_text(&self) -> String {
+        self.term.grid().display_iter().map(|cell| cell.c).collect()
+    }
+
     /// Enter encoding for the current mode (see [`enter_bytes_for_mode`]).
     pub fn enter_bytes(&self) -> &'static [u8] {
         enter_bytes_for_mode(self.term_mode())

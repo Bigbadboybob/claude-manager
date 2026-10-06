@@ -65,6 +65,9 @@ pub struct ExitedTombstone {
     pub workspace_id: String,
     pub task_id: Option<String>,
     pub managed_by_uid: Option<String>,
+    /// Retain scheduler ownership on exits and across brain restarts.
+    #[serde(default)]
+    pub continuous_task_id: Option<String>,
     pub label: String,
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
@@ -429,6 +432,8 @@ pub struct DaemonState {
     /// [`RECENTLY_EXITED_CAP`]. Front = oldest. Recorded via
     /// [`DaemonState::record_exited`].
     pub recently_exited: VecDeque<ExitedTombstone>,
+    pub resume_history: Mutex<crate::resume_identity::History>,
+    pub resume_claims: std::collections::HashSet<(String, String)>,
     /// Pending kill attributions, keyed by target session uid. Written
     /// by the `kill_session` handler under the state lock BEFORE the
     /// SIGKILL's exit can be observed; consumed by `handle_session_exit`
@@ -790,6 +795,8 @@ impl Default for DaemonState {
         Self {
             sessions: HashMap::new(),
             recently_exited: VecDeque::new(),
+            resume_history: Mutex::new(Default::default()),
+            resume_claims: Default::default(),
             kill_requests: HashMap::new(),
             workspaces: HashMap::new(),
             bindings: HashMap::new(),
@@ -1123,7 +1130,7 @@ impl DaemonState {
                         ..Default::default()
                     },
                 });
-            ws.sessions.push(sess.to_manifest_entry());
+            ws.sessions.push(crate::resume_identity::entry(self, sess));
         }
         Manifest {
             messaging_names: self.messaging_names.clone(),
@@ -1137,9 +1144,12 @@ impl DaemonState {
             hide_continuous: false,
             // TUI-only view state; the daemon-owned registry doesn't track it.
             continuous_column_on: false,
+            hide_keybinding_helper: false,
             task_colors: HashMap::new(),
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            sidebar_receipts: HashMap::new(),
+            auto_close_workspaces: Vec::new(),
         }
     }
 
@@ -1180,6 +1190,9 @@ impl DaemonState {
     /// the live registry, serializes it, and rename-swaps it into
     /// place so a reader (or a crash) never sees a half-written file.
     pub fn save_daemon_sessions(&self, path: &Path) -> std::io::Result<()> {
+        if let Err(e) = crate::resume_identity::persist(self) {
+            eprintln!("cm-daemon: resume archive persist failed: {e}");
+        }
         let manifest = self.build_daemon_manifest();
         write_manifest_atomic(path, &manifest)
     }
@@ -1195,6 +1208,7 @@ impl DaemonState {
     /// aborts); the best-effort lifecycle variant keeps its
     /// log-and-swallow behavior for normal operation.
     pub fn save_daemon_sessions_checked(&self, path: &Path) -> std::io::Result<()> {
+        crate::resume_identity::persist(self)?;
         let manifest = self.build_daemon_manifest();
         write_manifest_atomic_impl(path, &manifest, true)
     }
@@ -1406,7 +1420,7 @@ fn write_manifest_atomic_impl(
 /// `durable`, the temp file is `fsync`ed before the rename and the
 /// containing directory after it (the rename-swap idiom needs the dir
 /// fsync for durability — phase 4c).
-fn write_json_atomic(path: &Path, json: &str, durable: bool) -> std::io::Result<()> {
+pub(crate) fn write_json_atomic(path: &Path, json: &str, durable: bool) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1454,6 +1468,7 @@ mod tests {
             workspace_id: "ws".to_string(),
             task_id: None,
             managed_by_uid: None,
+            continuous_task_id: None,
             label: uid.to_string(),
             workflow_run_id: None,
             workflow_role: None,

@@ -944,6 +944,9 @@ pub fn compose_full_env(params: &SpawnParams) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
+    for (k, v) in crate::session::PTY_ENV_DEFAULTS {
+        env.insert(k.into(), v.into());
+    }
     for (k, v) in &params.env {
         env.insert(k.clone(), v.clone());
     }
@@ -1993,6 +1996,7 @@ pub fn adopt_at_boot(
                 workspace_id: ws_id.clone(),
                 task_id: e.task_id.clone(),
                 managed_by_uid: e.managed_by_uid.clone(),
+                continuous_task_id: e.continuous_task_id.clone(),
                 label: e.label.clone(),
                 workflow_run_id: None,
                 workflow_role: None,

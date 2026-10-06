@@ -10,7 +10,9 @@ mod client_session;
 mod clipboard;
 mod config;
 mod control;
+mod continuous_stage;
 mod daemon_launch;
+mod graphics;
 mod host_pool;
 mod network_watch;
 mod hosts;
@@ -21,6 +23,8 @@ mod memory_cap;
 mod planning;
 mod preflight;
 mod push_worker;
+mod resource_limits;
+mod owner_notification;
 mod session;
 mod session_watch;
 mod term_shim;
@@ -56,6 +60,9 @@ use app::{App, SIDEBAR_WIDTH};
 use config::Config;
 
 fn main() -> anyhow::Result<()> {
+    if let Err(e) = resource_limits::raise_open_file_limit() {
+        eprintln!("cm-tui: unable to raise open-file limit: {e}");
+    }
     let config = Config::load();
 
     // 10f default-flip: daemon mode is now mandatory. The TUI cannot
@@ -149,6 +156,9 @@ fn main() -> anyhow::Result<()> {
 
     // Setup terminal.
     enable_raw_mode()?;
+    // Kitty graphics passthrough probes the terminal and reads its replies,
+    // so it must run in raw mode before crossterm starts reading stdin.
+    graphics::outer::detect_at_startup();
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -190,6 +200,8 @@ fn main() -> anyhow::Result<()> {
     let saved_stderr = redirect_stderr_to_log();
 
     let result = run(&mut terminal, config);
+    // Dropping the app queued deletes for every pane's images.
+    let _ = graphics::outer::flush(terminal.backend_mut());
 
     // Restore terminal.
     disable_raw_mode()?;
@@ -370,6 +382,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // empty.
         let t = Instant::now();
         app.drain_plan_launches();
+        app.drain_remote_creates();
         app.drain_image_pastes();
         app.drain_attach_results();
         log_slow_phase("drain_attach_results", t.elapsed());
@@ -402,6 +415,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // only on an actual bucket change.
         app.tick_idle_ages();
         app.messaging_tick();
+
+        // Kitty graphics passthrough: answer pane queries and send image
+        // bytes. Runs every tick (replies must not wait for a redraw), and
+        // always between frames, never inside a draw.
+        app.pump_graphics();
+        let _ = graphics::outer::flush(terminal.backend_mut());
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();

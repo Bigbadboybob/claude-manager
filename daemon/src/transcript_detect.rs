@@ -501,6 +501,30 @@ pub fn is_codex_rollout_shaped(path: &Path) -> bool {
         && file.ends_with(".jsonl")
 }
 
+/// The creation instant a codex rollout carries in its OWN NAME
+/// (`rollout-2026-09-17T16-35-02-<uuid>.jsonl`). Zero-padded and
+/// fixed-width, so the substring sorts chronologically without any
+/// parsing or timezone math, and two files from one host are always
+/// compared in the same frame.
+///
+/// This is the right key for "which of these is this session's
+/// conversation", and MODIFIED time is the wrong one: a foreign
+/// thread that something is actively appending to looks newest by
+/// mtime while being older than the session itself. That is not
+/// hypothetical — on 2026-09-17 a momentum-detective worker spawned
+/// at 16:35 bound a rollout created on SEPTEMBER 7, because the
+/// app-server in its tree was writing that older conversation. The
+/// orchestrator read its own prior run history instead of the
+/// detective prompt, correctly called it a session-routing integrity
+/// failure, and refused to admit another worker for two days.
+fn rollout_created_key(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("rollout-")?;
+    // `YYYY-MM-DDTHH-MM-SS` — 19 chars, then `-<uuid>`.
+    let stamp = rest.get(..19)?;
+    stamp.chars().all(|c| c.is_ascii_digit() || c == '-' || c == 'T').then(|| stamp.to_string())
+}
+
 /// Resolve the rollout file the codex session rooted at `root_pid`
 /// holds open RIGHT NOW, by walking `/proc/<pid>/fd` symlinks over
 /// the (bounded) descendant tree. Multiple distinct matches — a
@@ -579,18 +603,30 @@ fn scan_live_codex_rollout_preferred(root_pid: u32, native: Option<&serde_json::
         0 => None,
         1 => candidates.pop(),
         n => {
+            // Newest by CREATION (the name's own stamp), falling back to
+            // modified time only to break a tie between two rollouts created
+            // in the same second. A genuine rotation overlap still resolves to
+            // the post-rotation file, because that one is created last; a
+            // stale conversation the tree happens to hold open loses even
+            // while it is the one being written.
             let newest = candidates
                 .iter()
-                .max_by_key(|p| {
-                    std::fs::metadata(p)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(UNIX_EPOCH)
+                .max_by(|a, b| {
+                    let key = |p: &PathBuf| {
+                        (
+                            rollout_created_key(p),
+                            std::fs::metadata(p)
+                                .and_then(|m| m.modified())
+                                .unwrap_or(UNIX_EPOCH),
+                        )
+                    };
+                    key(a).cmp(&key(b))
                 })
                 .cloned();
             eprintln!(
                 "cm-daemon: codex rollout scan under pid {} found {} open \
-                 rollout files (rotation overlap?) — picking most recently \
-                 modified: {}",
+                 rollout files (rotation overlap?) — picking the most recently \
+                 CREATED: {}",
                 root_pid,
                 n,
                 newest
@@ -1182,6 +1218,51 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+    }
+
+    #[test]
+    fn an_ambiguous_rollout_scan_prefers_the_newest_CREATED_not_the_newest_written() {
+        // The 2026-09-17 momentum-detective failure, as a unit: a worker's
+        // process tree held TWO rollouts open — its own, created that
+        // afternoon, and a ten-day-old conversation the app-server was
+        // actively appending to. Picking by modified time bound the old one,
+        // so the worker read the orchestrator's prior run history instead of
+        // its detective prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("rollout-2026-09-07T05-31-15-01a07a59-6b97-0000-0000-000000000000.jsonl");
+        let mine = dir.path().join("rollout-2026-09-17T16-35-02-01a0b111-2222-0000-0000-000000000000.jsonl");
+        std::fs::write(&mine, b"{}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The stale one is written LAST, exactly as it was on the day.
+        std::fs::write(&old, b"{}\n").unwrap();
+
+        assert!(
+            rollout_created_key(&old).unwrap() < rollout_created_key(&mine).unwrap(),
+            "the name's own stamp must order the two, regardless of mtime"
+        );
+        let newest_written = [old.clone(), mine.clone()]
+            .into_iter()
+            .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).unwrap())
+            .unwrap();
+        assert_eq!(newest_written, old, "precondition: mtime really does pick the wrong file");
+    }
+
+    #[test]
+    fn rollout_created_key_reads_real_names_and_refuses_anything_else() {
+        let key = |n: &str| rollout_created_key(Path::new(n));
+        assert_eq!(
+            key("rollout-2026-09-17T16-35-02-01a0b111-2222-7d52-b7a1-b9a176cf1ded.jsonl").as_deref(),
+            Some("2026-09-17T16-35-02")
+        );
+        // A rotation overlap within one second still orders by mtime, so the
+        // key must be equal rather than absent for same-second siblings.
+        assert_eq!(
+            key("rollout-2026-09-17T16-35-02-aaaa.jsonl"),
+            key("rollout-2026-09-17T16-35-02-bbbb.jsonl")
+        );
+        assert_eq!(key("notes.jsonl"), None);
+        assert_eq!(key("rollout-short.jsonl"), None);
+        assert_eq!(key("rollout-XXXX-XX-XXTXX-XX-XX-uuid.jsonl"), None);
     }
 
     #[test]
