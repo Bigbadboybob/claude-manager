@@ -188,11 +188,11 @@ reviews, merges to main and deploys (hub first).
 
 | Slice | Lane | Status | Merged | Deployed |
 |---|---|---|---|---|
-| W0a Codex empty last turn | msgfix | in progress | | |
+| W0a Codex empty last turn | msgfix | reviewed PASS | 8ff296e | batched with wave 0 (MCP payload) |
 | W0b viewer input vs idle | state-core | reviewed PASS | c2fdd91 | batched with wave 0 |
 | W0c-items contract | items | reviewed PASS | 92a5a28 | doc only |
 | W0c-state contract | state-core | reviewed PASS | bc76c50 | doc only |
-| W0d orchestration docs | msgfix | queued | | |
+| W0d orchestration docs | msgfix | in progress | | |
 | W1a items API | items | in progress | | |
 | W1b agent_state core | state-core | in progress | | |
 | W1c messaging send side | msgfix | queued | | |
