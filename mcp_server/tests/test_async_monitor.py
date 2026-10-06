@@ -156,6 +156,41 @@ class RegisterAndFireTests(_MonitorEnv):
         self.assertEqual(len(self.sent), 1)
         self.assertIn("WORKER DONE: 42", self.sent[0]["text"])
 
+    def test_unconfirmed_launch_wakes_with_uncertainty_not_completion(self):
+        from mcp_server.server import start_session
+
+        def call(method, params=None, **kw):
+            if method == "mcp_start_session":
+                return {"session_uid": self.WORKER, "prompt_source": "caller",
+                        "prompt_delivery": {"id": "launch", "status": "pending", "submitted": False}}
+            result = self._fake_call(method, params, **kw)
+            if method == "resolve_authorized_session":
+                result["prompt_delivery"] = {"id": "launch", "status": "unconfirmed",
+                                             "submitted": False, "reason": "no_engine_turn"}
+            return result
+
+        async def scenario():
+            result = await start_session("claude-code", "worker", prompt="go")
+            self.assertNotIn("submitted", result)
+            rec = async_monitor._MONITORS[result["monitor"]["monitor_id"]]
+            await asyncio.wait_for(rec["task"], 5)
+            return rec
+
+        with mock.patch.object(control_client, "call", side_effect=call), mock.patch.object(
+            control_client, "resolve_socket_route",
+            return_value=control_client.SocketRoute(path=None, chose_daemon=True),
+        ), mock.patch.object(async_monitor, "_monitor_sessions") as completion:
+            rec = asyncio.run(scenario())
+        completion.assert_not_called()
+        self.assertEqual(rec["state"], "delivered")
+        self.assertFalse(rec["result"]["submitted"])
+        self.assertEqual(rec["result"]["completed"], [])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("submission unconfirmed", self.sent[0]["text"])
+        self.assertIn("before re-sending", self.sent[0]["text"])
+        self.assertNotIn("finished its initial prompt", self.sent[0]["text"])
+        self.assertNotIn("WORKER DONE", self.sent[0]["text"])
+
     def test_fire_delivers_marker_and_reply_to_caller(self):
         async def scenario():
             # edge=False: the scaffold's worker is ALREADY finished, and

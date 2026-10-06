@@ -20,6 +20,22 @@ def receipt(status="pending", **fields):
 
 
 class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    def test_read_tools_expose_pending_receipt_without_claiming_submission(self):
+        with patch.object(
+            control_client,
+            "call",
+            return_value={
+                "state": "pending",
+                "prompt_delivery": receipt(),
+                "generation": 0,
+                "idle": True,
+            },
+        ):
+            for read in [server.read_last_turn, server.read_session_output]:
+                result = read("worker")
+                self.assertEqual(result["prompt_delivery"], receipt())
+                self.assertNotIn("submitted", result)
+
     async def test_pending_then_confirmed_keeps_pinned_socket(self):
         path = Path("/original/daemon.sock")
         with patch.object(
@@ -45,7 +61,7 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args.kwargs["socket_path"], path)
             self.assertLessEqual(args.kwargs["timeout"], 5)
 
-    async def test_missing_replaced_exited_and_transport_failure_never_confirm(self):
+    async def test_missing_replaced_and_exited_never_confirm(self):
         cases = [
             ({"state": "ready"}, "confirmation_lost_or_session_replaced"),
             (
@@ -59,7 +75,6 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 {"state": "exited", "prompt_delivery": receipt("confirmed")},
                 "session_gone",
             ),
-            (control_client.TransportError("restarting"), "confirmation_unavailable"),
         ]
         for resolved, reason in cases:
             with (
@@ -71,6 +86,86 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertFalse(result["submitted"])
                 self.assertEqual(result["reason"], reason)
+
+    async def test_transient_poll_failures_retry_until_confirmation_or_deadline(self):
+        for transient in [
+            control_client.TransportError("timeout"),
+            control_client.ControlError("conflict", "restarting"),
+        ]:
+            with patch.object(
+                control_client,
+                "call",
+                side_effect=[
+                    transient,
+                    {"state": "ready", "prompt_delivery": receipt("confirmed")},
+                ],
+            ) as call:
+                result = await server._await_launch_confirmation(
+                    "worker", receipt(), socket_path=None, interval=0
+                )
+                self.assertTrue(result["submitted"])
+                self.assertEqual(call.call_count, 2)
+        with patch.object(
+            control_client, "call", side_effect=control_client.TransportError("timeout")
+        ) as call:
+            result = await server._await_launch_confirmation(
+                "worker", receipt(), socket_path=None, timeout_s=0.03, interval=0.001
+            )
+            self.assertFalse(result["submitted"])
+            self.assertEqual(result["reason"], "confirmation_timeout")
+            self.assertGreater(call.call_count, 1)
+
+    async def test_wait_false_returns_pending_without_polling_or_false_submission(self):
+        with (
+            patch.object(
+                server, "_await_launch_confirmation", new_callable=AsyncMock
+            ) as confirm,
+            patch.object(
+                server.async_monitor,
+                "register_monitor",
+                return_value={"monitor_id": "watch"},
+            ) as monitor,
+        ):
+            result = await self.launch(
+                {
+                    "session_uid": "worker",
+                    "prompt_source": "caller",
+                    "prompt_delivery": receipt(),
+                },
+                prompt="go",
+            )
+        confirm.assert_not_awaited()
+        self.assertNotIn("submitted", result)
+        self.assertEqual(result["prompt_delivery"]["status"], "pending")
+        self.assertEqual(monitor.call_args.kwargs["launch_receipt"], receipt())
+        self.assertEqual(
+            monitor.call_args.kwargs["launch_socket_path"], Path("/spawn/daemon.sock")
+        )
+
+    async def test_slash_command_delivery_keeps_monitor_without_a_turn(self):
+        with patch.object(
+            server.async_monitor,
+            "register_monitor",
+            return_value={"monitor_id": "watch"},
+        ) as monitor:
+            result = await self.launch(
+                {
+                    "session_uid": "worker",
+                    "prompt_source": "caller",
+                    "prompt_delivery": receipt(
+                        "delivered", submitted=True, confirmed_by="write"
+                    ),
+                },
+                prompt="/triage-review X",
+            )
+        self.assertTrue(result["submitted"])
+        monitor.assert_called_once()
+        with patch.object(control_client, "call") as call:
+            delivered = await server._await_launch_confirmation(
+                "worker", result["prompt_delivery"], socket_path=None
+            )
+        call.assert_not_called()
+        self.assertTrue(delivered["submitted"])
 
     async def test_timeout_and_malformed_receipt_do_not_claim_success(self):
         for initial, timeout, reason in [
@@ -103,7 +198,7 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
             return await server.start_session("claude-code", "worker", **kwargs)
 
     async def test_failed_prompt_skips_wait_and_monitor_retaining_metadata(self):
-        for wait in [False, True]:
+        for wait in [True]:
             with (
                 self.subTest(wait=wait),
                 patch.object(server, "_await_reply", new_callable=AsyncMock) as reply,

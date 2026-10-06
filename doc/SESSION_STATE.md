@@ -96,34 +96,53 @@ The board's holder-idle clock counts only `state=idle`.
 ## Initial prompt confirmation
 
 For an initial Claude or Codex prompt, `mcp_start_session` returns a per-launch
-`prompt_delivery` receipt and `submitted` boolean. The same receipt is available
-through `resolve_authorized_session`:
+`prompt_delivery` receipt. It does **not** add a top-level `submitted` field:
+old MCP callers retain their existing response behavior after a brain upgrade.
+The same receipt is available through `resolve_authorized_session`:
 
 ```text
-{id: UUID, status: pending | confirmed | unconfirmed, submitted: bool,
- attempts: 0 | 1 | 2, confirmed_by: relay | hooks | presence | transcript | null,
+{id: UUID, status: pending | confirmed | delivered | unconfirmed, submitted: bool,
+ attempts: 0 | 1 | 2, confirmed_by: relay | hooks | presence | transcript | write | null,
  reason: string | null}
 ```
 
-The MCP `start_session` tool polls this receipt on the original daemon, with a
-120-second cap, for both `wait` values. Only a fresh engine turn edge or a new
-exact prompt record confirms submission. CM's own `turn_seq` increment and PTY
-repaint alone do not. Delivery allows one alternate-encoding Enter retry after
-ten seconds, with a 25-second confirmation window and a 90-second total delivery
-guard. It never re-pastes the body. Operator input, process replacement/exit,
-restart pause, unrelated transcript activity or unreadable evidence cancels
-recovery. The first transcript binding is allowed; later rotations are not.
+The MCP tool's default `wait=false` returns promptly after the daemon accepts
+the launch, usually with a pending receipt and no top-level `submitted`. Its
+auto-monitor checks that receipt on the original daemon before watching for
+completion. Failed confirmation produces an uncertainty notification, not a
+completion report. With `notify_on_done=false`, `read_last_turn` and
+`read_session_output` expose the current receipt for inspection.
+`wait=true` checks confirmation before waiting for the worker's reply. Only a
+terminal receipt adds top-level `submitted`; pending does not mean failure.
+Transient socket timeouts and restart conflicts retry within a 360-second poll
+budget covering startup, the existing operator-quiet wait and confirmation.
+
+A fresh engine turn edge or a new prompt record confirms submission. Claude's
+new main-thread user text counts even if the engine expanded or normalized it;
+sidechain, metadata and tool-result rows do not. Codex retains exact matching.
+CM's own `turn_seq` increment and PTY repaint alone do not confirm. Slash commands
+are `delivered` after body plus Enter (`confirmed_by=write`), without requiring a
+model turn; their monitor remains armed.
+
+Delivery restores the existing typing-quiet wait. Recognized terminal query
+replies, mouse/focus and navigation do not count as typing; drafts and submits
+still do. Confirmation gets 90 seconds **from the body write**, independently of
+startup delays, with one Enter retry after ten seconds using the original
+encoding. It never re-pastes the body. A human draft after the paste suppresses
+the retry but does not prevent later evidence from confirming. Unrelated or
+unreadable transcript activity and restart pause defer recovery while observation
+continues; process replacement/exit ends it. The first transcript binding is
+allowed; later rotations are not.
 
 `submitted=false` means confirmation failed, not proof the engine received
-nothing. The session and worktree remain available for inspection; the tool
-skips its reply wait and auto-monitor. Successful launches arm a completion
-watch that also catches a first turn or done report that finished during the
-confirmation wait. Receipts are ephemeral: a daemon restart loses a pending
-receipt and the caller reports unconfirmed. Old daemons omit these fields and
-retain their previous behavior. `prompt_source` identifies the selected text,
-not proof of its submission. Promptless and bash launches keep their existing
-behavior. Deployment needs the daemon brain and complete MCP payload; callers
-reconnect MCP to load the tool's confirmation wait.
+nothing. Inspect state/transcript before re-sending. The session and worktree
+remain available; no reply wait or completed-work claim follows failure.
+Successful launches use a level completion watch, retaining a first turn or done
+report that finished during confirmation. Receipts are ephemeral: a daemon
+restart can lose the receipt, producing an unconfirmed result. Old daemons omit
+these fields. Promptless and bash launches retain existing behavior. Deployment
+needs the brain and complete MCP payload; callers reconnect MCP for the new
+background confirmation handling.
 
 ## Producer RPC (S1)
 

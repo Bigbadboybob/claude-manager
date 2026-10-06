@@ -4,8 +4,7 @@ use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub(crate) const START_MAX: Duration = Duration::from_secs(90);
-pub(crate) const CONFIRM_MAX: Duration = Duration::from_secs(25);
+pub(crate) const CONFIRM_MAX: Duration = Duration::from_secs(90);
 pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Serialize)]
@@ -42,9 +41,15 @@ pub(crate) fn finish(ticket: &Ticket, result: Result<&'static str, &'static str>
     receipt.reason = result.err();
 }
 
+pub(crate) fn delivered_command(ticket: &Ticket) {
+    finish(ticket, Ok("write"));
+    ticket.lock().unwrap_or_else(|p| p.into_inner()).status = "delivered";
+}
+
 pub(super) enum Check {
     Confirmed(&'static str),
     Pending,
+    Deferred,
     Stop(&'static str),
 }
 pub(super) fn confirm(
@@ -67,7 +72,7 @@ pub(super) fn confirm(
                 finish(ticket, Err(reason));
                 return;
             }
-            Check::Pending => {}
+            Check::Pending | Check::Deferred => {}
         }
         if started.elapsed() >= max {
             finish(ticket, Err("no_engine_turn"));
@@ -76,7 +81,11 @@ pub(super) fn confirm(
         if !retried && started.elapsed() >= retry_after {
             // The callback rechecks identity/operator activity at the write.
             match retry() {
-                Check::Pending => {}
+                Check::Pending => {
+                    ticket.lock().unwrap_or_else(|p| p.into_inner()).attempts = 2;
+                    retried = true;
+                }
+                Check::Deferred => {}
                 Check::Confirmed(source) => {
                     finish(ticket, Ok(source));
                     return;
@@ -86,25 +95,14 @@ pub(super) fn confirm(
                     return;
                 }
             }
-            ticket.lock().unwrap_or_else(|p| p.into_inner()).attempts = 2;
-            retried = true;
         }
         std::thread::sleep(interval);
     }
 }
 
 pub(super) struct LaunchWrite {
-    pub created: Instant,
+    pub written_at: Option<Instant>,
     pub enter: Vec<u8>,
-}
-impl LaunchWrite {
-    pub fn allowed(&self, handle: &crate::session::InputHandle) -> bool {
-        self.created.elapsed() < START_MAX
-            && !handle
-                .operator_quiet_for()
-                .is_some_and(|quiet| quiet <= self.created.elapsed())
-            && !crate::writer_gate::pause_requested()
-    }
 }
 
 pub(super) struct Baseline {
@@ -200,6 +198,32 @@ mod tests {
         let receipt = ticket.lock().unwrap();
         assert!(!receipt.submitted);
         assert_eq!(receipt.status, "unconfirmed");
+    }
+
+    #[test]
+    fn deferred_retry_does_not_end_confirmation_or_consume_an_attempt() {
+        use std::cell::Cell;
+        let ticket = Receipt::pending();
+        ticket.lock().unwrap().attempts = 1;
+        let polls = Cell::new(0);
+        confirm(
+            &ticket,
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() >= 4 {
+                    Check::Confirmed("hooks")
+                } else {
+                    Check::Pending
+                }
+            },
+            || Check::Deferred,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        let receipt = ticket.lock().unwrap();
+        assert!(receipt.submitted);
+        assert_eq!(receipt.attempts, 1);
     }
 
     #[test]

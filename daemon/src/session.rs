@@ -2745,8 +2745,8 @@ fn stamp_now(cell: &SharedLastActivity) {
 }
 
 /// The viewer sends either a raw Enter or a kitty keyboard Enter (CSI 13 u,
-/// optionally with numeric modifier/event parameters). Other terminal input
-/// is activity for delivery timing, but does not start an agent turn.
+/// optionally with numeric modifier/event parameters). Draft input affects
+/// delivery timing but does not start an agent turn.
 fn contains_operator_submit(bytes: &[u8]) -> bool {
     bytes.contains(&b'\r')
         || bytes.windows(4).enumerate().any(|(i, prefix)| {
@@ -2766,6 +2766,63 @@ fn contains_operator_submit(bytes: &[u8]) -> bool {
                 .count();
             end > 0 && params.get(end) == Some(&b'u')
         })
+}
+
+/// Automatic terminal replies and viewer navigation cannot edit the composer.
+/// Recognize complete frames only; mixed text/unknown bytes remain typing.
+fn passive_viewer_input(mut bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    while !bytes.is_empty() {
+        if let Some(csi) = bytes.strip_prefix(b"\x1b[") {
+            let Some(end) = csi.iter().position(|b| (0x40..=0x7e).contains(b)) else {
+                return false;
+            };
+            let params = &csi[..end];
+            let final_byte = csi[end];
+            let passive = matches!(
+                final_byte,
+                b'A' | b'B'
+                    | b'C'
+                    | b'D'
+                    | b'H'
+                    | b'F'
+                    | b'I'
+                    | b'O'
+                    | b'R'
+                    | b'c'
+                    | b'n'
+                    | b't'
+                    | b'y'
+            ) || (final_byte == b'u' && params.starts_with(b"?"))
+                || (matches!(final_byte, b'M' | b'm') && params.starts_with(b"<"));
+            if !passive {
+                return false;
+            }
+            bytes = &csi[end + 1..];
+        } else if bytes.starts_with(b"\x1bP>|") || bytes.starts_with(b"\x1b_G") {
+            let Some(end) = bytes.windows(2).position(|p| p == b"\x1b\\") else {
+                return false;
+            };
+            bytes = &bytes[end + 2..];
+        } else if let Some(osc) = bytes.strip_prefix(b"\x1b]") {
+            // Color-query replies from the terminal emulator.
+            if !osc.starts_with(b"10;") && !osc.starts_with(b"11;") {
+                return false;
+            }
+            if let Some(end) = osc.iter().position(|b| *b == 7) {
+                bytes = &osc[end + 1..];
+            } else if let Some(end) = osc.windows(2).position(|p| p == b"\x1b\\") {
+                bytes = &osc[end + 2..];
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 impl InputHandle {
@@ -2803,8 +2860,7 @@ impl InputHandle {
         Ok(())
     }
 
-    /// A recovery Enter (or initial launch paste) must not touch a draft
-    /// typed since automation began.
+    /// A recovery Enter must not touch a draft typed since the agent paste.
     /// Check under the same writer lock used to stamp human input, closing
     /// the race between checking operator activity and writing the retry.
     pub(crate) fn write_recovery_enter(&self, bytes: &[u8], since: Instant) -> std::io::Result<bool> {
@@ -2870,8 +2926,8 @@ impl InputHandle {
 
     /// [`write_and_stamp`](Self::write_and_stamp) for OPERATOR input
     /// (the attach stream — a human typing). Additionally stamps
-    /// `last_operator_input_at` so the agent-prompt delivery threads
-    /// can defer injection while the operator is actively typing. Only
+    /// `last_operator_input_at` for typing (excluding recognized terminal
+    /// replies/navigation) so delivery can defer while the operator types. Only
     /// a submit key stamps `last_input_at`: drafts and navigation must
     /// preserve semantic idle and the agent's done report.
     pub fn write_and_stamp_operator(&self, bytes: &[u8]) -> std::io::Result<()> {
@@ -2879,7 +2935,7 @@ impl InputHandle {
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         // Stamp while holding the same writer lock as explicit prompt delivery.
         // Even a partial/failed human write means the composer may contain text.
-        stamp_now(&self.last_operator_input_at);
+        if !passive_viewer_input(bytes) { stamp_now(&self.last_operator_input_at); }
         writer.write_all(bytes)?;
         writer.flush()?;
         stamp_now(&self.last_activity_at);

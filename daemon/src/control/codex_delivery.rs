@@ -232,7 +232,10 @@ impl DeliveryEvidence {
                                     .collect::<String>()
                             })
                         });
-                        if text.as_deref().is_some_and(|s| same_body(s, body)) {
+                        // Claude may expand skills/slash commands or normalize
+                        // the prompt before its user row lands. A new main
+                        // user text row is a turn receipt even if text differs.
+                        if text.as_deref().is_some_and(|s| !s.trim().is_empty()) {
                             return Some(Observation::Accepted);
                         }
                         active = true;
