@@ -57,7 +57,12 @@ also writes an event, so the version covers flags.
 1. **Defaults and shorthands.** No holder given → the caller. `holder="none"`
    (empty holders) on a non-closed item sets `open` unless a status is given.
    Adding a holder to an `open` item sets `active` unless a status is given.
-   Setting `blocked_by` without a status sets `blocked`.
+   Without an explicit status, a non-empty `blocked_by` or `blocked_on` sets
+   `blocked`, an `eta` sets `waiting`, and clearing the last blocker of a
+   `blocked` item with no `blocked_on` sets `active` (`open` if unheld).
+   Only a `blocked` item carries `blocked_by` / `blocked_on` / `check_back`:
+   leaving `blocked` clears them, and passing them with another explicit
+   status is `422 invalid_field`. `blocked` with neither returns a warning.
 2. **Touch.** Any change to status, note or holders sets `touched_at`.
 3. **`blocked_by`.** Every blocker must exist on the same board and be neither
    `done` nor `dropped` → else `422 invalid_blocker`. An item cannot block
@@ -65,16 +70,21 @@ also writes an event, so the version covers flags.
    `cycle: 14→15→14`. Passing `blocked_by=[]` removes all edges.
 4. **`waiting`** requires `eta` → else `422 eta_required`. `eta` is a duration
    (`40m`, `2h`, `1h30m`) or an RFC 3339 time; stores `eta_at` and
-   `waiting_set_at=now`. `check_back` takes the same forms.
+   `waiting_set_at=now`; leaving `waiting` clears both, and `eta` with another
+   explicit status is refused. `check_back` takes the same forms.
 5. **Done.** Remove edges where the item is a blocker. Each dependent left with
    no blockers, status `blocked` and no `blocked_on` returns to `active` with
    `clock_reset_at=now` and an `unblocked` push to its holders. Set
-   `closed_at`; resolve the item's open flags with resolution `closed`.
+   `closed_at`; resolve the item's open flags with resolution `closed`. A
+   dependent still waiting on another blocker or on `blocked_on` stays
+   `blocked`.
 6. **Dropped.** Set `closed_at`; resolve its open flags (`closed`). Each
    dependent gets a `blocker_dropped` flag; the edge stays until someone acts.
    A `reason` is recommended and stored on the event.
 7. **Reopen.** Any non-closed status on a closed item clears `closed_at` and
    `archived_at`. Blockers named in a reopen are re-validated by rule 3.
+   Reopening a dropped blocker clears its dependents' `blocker_dropped`, as
+   does re-pointing a dependent's `blocked_by` away from dropped items.
 8. **Assigned.** A holder added by an actor other than that holder queues an
    `assigned` push to the new holder.
 9. **Editing rights** (enforced by the daemon, §5): any session whose task
@@ -169,18 +179,20 @@ rows exited more than 7 days ago are pruned.
 ## 6. Planning API (`api/items.py`)
 
 Bearer token as for every endpoint. Errors are `{"detail": {"code", "message", …}}`
-with codes `not_found` (404), `cycle` (409), `invalid_blocker`,
-`eta_required`, `invalid_status`, `invalid_field` (422).
+with codes `not_found` (404), `cycle` (409, plus `cycle: [n…]`),
+`invalid_blocker`, `eta_required`, `invalid_status`, `invalid_field`,
+`no_holders`, `item_closed`, `check_back_required` (422). Malformed bodies get
+FastAPI's standard 422.
 
 | Method + path | Body / query | Returns |
 |---|---|---|
 | `POST /boards/resolve` | `{task_id}` or `{ref}` | `board` header (creates if needed) |
 | `GET /boards` | `?open_only=true` | `[board header]` |
-| `GET /boards/{ref}` | `?since_version=&archived=false&q=&history=0` | `{board, items, flags, recently_closed, free_capacity}` or `{unchanged: true, version}` |
+| `GET /boards/{ref}` | `?since_version=&archived=false&q=&history=0` | `{board, items, flags, recently_closed, free_capacity}` (+ `archived` when `archived=true`) or `{unchanged: true, version}` |
 | `PATCH /boards/{ref}` | `{actor, settings…, orchestrator_pid?}` | `board` header |
-| `POST /boards/{ref}/items` | `{actor, items: [{title, holders?, status?, note?, group?, blocked_by?, blocked_on?, eta?, check_back?, links?}]}` (≤ 50, all-or-nothing) | `{board, items}` |
+| `POST /boards/{ref}/items` | `{actor, items: [{title, holders?, status?, note?, group?, blocked_by?, blocked_on?, eta?, check_back?, links?}]}` (≤ 50, all-or-nothing) | `{board, items, unblocked, warnings}` |
 | `PATCH /boards/{ref}/items` | `{actor, ns: [n], set: {…}, add_holders?, remove_holders?, reason?}` | `{items, unblocked: [n], warnings: [str]}` |
-| `POST /boards/{ref}/items/{n}/resolve` | `{actor, action, kind?, holders?, blocked_by?, blocked_on?, check_back?, reason?}` | `{item, flags_resolved: [kind]}` |
+| `POST /boards/{ref}/items/{n}/resolve` | `{actor, action, kind?, holders?, blocked_by?, blocked_on?, check_back?, reason?, message?}` | `{board, item, flags_resolved: [kind], unblocked, warnings}` |
 | `GET /items` | `?holder_pid=&open=true` | `[{board, n, title, status}]` |
 | `POST /hosts/{daemon_id}/heartbeat` | `{host_label, sessions: [state row], exited: [pid], acked_push_ids: [id]}` | `{pushes: [push]}` |
 
@@ -199,9 +211,11 @@ oldest_s}}`.
 state_age_s, idle_for_s, reported_done, killed_by, agent_state?}`; the snapshot
 is complete for that daemon.
 
-`item_resolve` actions: `nudge` (push + snooze), `reassign` (replace holders),
-`block` (`blocked_by` or `blocked_on` + `check_back`), `drop` (reason). `launch`
-is completed by the daemon: it spawns the session, then calls `reassign`.
+`item_resolve` actions: `nudge` (push + snooze; needs a holder), `reassign`
+(replace holders), `block` (`blocked_by`, or `blocked_on` + `check_back`),
+`drop` (reason). Without `kind` an action resolves all the item's open flags.
+Actions other than `drop` are refused on a closed item. `launch` is completed
+by the daemon: it spawns the session, then calls `reassign`.
 
 ## 7. Daemon RPCs and MCP tools
 
@@ -231,7 +245,7 @@ board(board=None, view="slim", mine=False, group=None, include_closed=True,
 
 item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop",
              holder=None, blocked_by=None, blocked_on=None, check_back=None,
-             reason=None, engine="codex", message=None)
+             reason=None, engine=None, message=None)
   -> {item, flag_resolved}
 ```
 
@@ -240,8 +254,9 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop",
   `#14 active "fuse SEJD" @rl-scale-out[idle 24m] ⚑holder_idle · waiting on JP`.
   `view="full"` returns the item dicts with the last 5 events each.
 - `item_resolve(launch)` spawns through the normal `start_session` path under
-  the caller's permissions with prompt `item #<n> (<board>): <title>` plus
-  `message`, then makes the new session the sole holder.
+  the caller's permissions (`engine` defaults to the caller's own engine), with
+  prompt `item #<n> (<board>): <title>` plus `message`, then makes the new
+  session the sole holder.
 - `report_done` additionally returns `held_items: [{n, board, title, status}]`
   for the caller's open items with the hint "close (item_set n done) or hand
   back (item_set n holder=none)". An API failure appears as `held_items_error`
