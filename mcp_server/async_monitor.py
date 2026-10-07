@@ -527,6 +527,8 @@ def _entry_lines(entry: dict) -> list[str]:
     else:
         lines.append(f"- {uid} ({status})")
 
+    if entry.get("completion_kind") == "no_turn":
+        lines.append("  no_turn: input was submitted, but no engine turn was observed; no new reply")
     reported = bool(entry.get("reported_done"))
     if reported:
         when = _fmt_exit_ts(entry.get("reported_done_at"))

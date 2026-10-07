@@ -98,7 +98,7 @@ class StateReadTests(unittest.TestCase):
             for initial, expected, at_prompt in [(working, 6, False), (idle, 7, True)]:
                 with patch.object(control_client, "call", return_value=initial):
                     baseline, ready, _ = async_monitor._capture_baseline("ts-test")
-                self.assertEqual(baseline, {"kind": "agent", "value": expected, "ended_at": 20.0, "legacy": {"kind": "turn", "value": "old-fingerprint"}})
+                self.assertEqual(baseline, {"kind": "agent", "value": expected, "ended_at": 20.0, "no_turn_at": None, "legacy": {"kind": "turn", "value": "old-fingerprint"}})
                 self.assertEqual(ready, at_prompt)
             self.assertFalse(
                 monitor._edge_passed(
@@ -369,7 +369,7 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
                 ["ts-test"], baselines=baselines, timeout_s=2, poll_interval_s=0.5
             )
         legacy.assert_called_once()
-        self.assertEqual(baselines["ts-test"], {"kind": "agent", "value": 3, "ended_at": 20.0, "legacy": {"kind": "turn", "value": "old-fingerprint"}})
+        self.assertEqual(baselines["ts-test"], {"kind": "agent", "value": 3, "ended_at": 20.0, "no_turn_at": None, "legacy": {"kind": "turn", "value": "old-fingerprint"}})
         self.assertEqual(result["completed"][0]["status"], "awaiting_input")
 
     async def test_first_engine_stop_keeps_the_completion_that_passed_legacy_edge(self):
@@ -380,6 +380,32 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
         legacy.assert_called_once()
         self.assertEqual(result["completed"][0]["status"], "awaiting_input")
         self.assertEqual(baselines["ts-test"]["kind"], "agent")
+
+    async def test_no_turn_escape_returns_label_and_never_old_reply_or_schema_retry(self):
+        initial = observed("idle", seq=5, ended=20.0)
+        initial["agent_state"]["detail"] = {"input_pending": True}
+        baseline = monitor.baseline_for("claude-code", None, initial)
+        self.assertFalse(monitor.engine_turn_complete(initial))
+        completed = observed("idle", seq=5, ended=20.0)
+        completed["agent_state"]["latest_start_at"] = 25.0
+        completed["agent_state"]["detail"] = {"no_turn_at": 45.0}
+        completed["transcript_path"] = "/old/transcript.jsonl"
+        with patch.object(control_client, "call", return_value=completed),                 patch.object(monitor, "_read_all_messages", side_effect=AssertionError("stale reply read")):
+            result = await monitor._monitor_sessions(["ts-test"], baselines={"ts-test":baseline},
+                                                    timeout_s=1)
+        entry = result["completed"][0]
+        self.assertEqual(entry["completion_kind"], "no_turn")
+        self.assertIsNone(entry["last_message"])
+        self.assertIn("no_turn", "\n".join(async_monitor._entry_lines(entry)))
+        self.assertFalse(monitor._edge_passed(monitor.baseline_for("claude-code", None, completed),
+                                            "claude-code", None, completed), "same no_turn cannot fire twice")
+        out = server._with_outcome({"completed":True, "last_message":{"content":"stale"}}, completed)
+        self.assertIsNone(out["last_message"])
+        self.assertEqual(out["completion_kind"], "no_turn")
+        with patch.object(server, "_send_and_await", side_effect=AssertionError("unexpected schema retry")):
+            checked = await server._settle_schema("ts-test", out, {"type":"object"}, retries=2,
+                deadline=time.monotonic()+1, interval=.05, grace=0)
+        self.assertIsNone(checked["result"])
 
     async def test_escaped_idle_cannot_complete_new_sequence_or_quote_old_reply(self):
         escaped = observed("idle", seq=5, ended=20.0, source="relay")

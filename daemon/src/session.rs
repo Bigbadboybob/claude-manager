@@ -2730,7 +2730,9 @@ impl Drop for PendingSession {
 /// PTY would freeze every other daemon RPC. The handle pattern
 /// keeps the lock-then-clone-then-drop-then-write shape
 /// load-bearing.
+#[derive(Clone)]
 pub struct InputHandle {
+    delivery_token: Option<f64>,
     session_uid: Option<String>,
     agent_state: crate::agent_state::AgentStateCell,
     writer: SessionWriter,
@@ -2919,6 +2921,38 @@ impl InputHandle {
         self.note_turn_start();
     }
 
+    /// Each asynchronous delivery carries its own token so an older writer
+    /// cannot mark a newer queued prompt submitted. Commands do not start turns.
+    pub(crate) fn prepare_agent_input(mut self, body: &str) -> Self {
+        if self.delivery_token.is_some() { return self; }
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = match gate.as_ref().map(|g| g.try_read()) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(_)) => return self,
+            None => None,
+        };
+        if self.session_uid.as_deref().is_some_and(|uid|
+            crate::continuous::retirement::ensure_open(uid).is_err()) { return self; }
+        let now = crate::agent_state::unix_now();
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        {
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            if body.trim().is_empty() || body.trim_start().starts_with('/') {
+                cell.note_command(now);
+            } else { cell.note_input(now); }
+        }
+        self.delivery_token = Some(now);
+        self
+    }
+
+    pub(crate) fn note_agent_submitted(&self) {
+        if let Some(token) = self.delivery_token {
+            self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+                .note_submitted(token, crate::agent_state::unix_now());
+        }
+    }
+
     pub(crate) fn note_turn_start(&self) {
         self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
             .note_input(crate::agent_state::unix_now());
@@ -2941,7 +2975,10 @@ impl InputHandle {
         stamp_now(&self.last_activity_at);
         if contains_operator_submit(bytes) {
             stamp_now(&self.last_input_at);
-            self.note_turn_start();
+            let now = crate::agent_state::unix_now();
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            cell.note_input(now);
+            cell.note_submitted(now, now);
         }
         Ok(())
     }
@@ -2973,6 +3010,7 @@ impl InputHandle {
     #[cfg(test)]
     pub(crate) fn test_handle() -> Self {
         InputHandle {
+            delivery_token: None,
             session_uid: None,
             agent_state: Arc::new(Mutex::new(crate::agent_state::StateCell::new(
                 crate::agent_state::unix_now(), None,
@@ -3007,6 +3045,7 @@ impl InputHandle {
         let captured: Arc<Mutex<Vec<(Instant, Vec<u8>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let handle = InputHandle {
+            delivery_token: None,
             session_uid: None,
             agent_state: Arc::new(Mutex::new(crate::agent_state::StateCell::new(
                 crate::agent_state::unix_now(), None,
@@ -3040,6 +3079,7 @@ impl DaemonSession {
     /// PTY writes don't stall other daemon RPCs.
     pub fn input_handle(&self) -> InputHandle {
         InputHandle {
+            delivery_token: None,
             session_uid: Some(self.uid.clone()),
             agent_state: Arc::clone(&self.agent_state),
             writer: Arc::clone(&self.writer),

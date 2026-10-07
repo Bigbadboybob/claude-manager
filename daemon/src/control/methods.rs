@@ -1891,7 +1891,7 @@ pub fn send_input(
     if is_agent {
         // Input was delivered NOW — flip idle false synchronously even though
         // the PTY write is deferred to the delivery thread (which stamps too).
-        handle.stamp_activity();
+        let handle = handle.prepare_agent_input(&p.text);
         spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false, Some(Arc::clone(state_arc)));
         Ok(json!({ "ok": true, "delivery": "agent-kitty-async" }))
     } else {
@@ -7591,6 +7591,7 @@ fn spawn_agent_prompt_delivery(
     fresh_spawn: bool,
     confirm_state: Option<Arc<Mutex<DaemonState>>>,
 ) {
+    let handle = handle.prepare_agent_input(&prompt);
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
@@ -8032,6 +8033,7 @@ fn deliver_agent_body_inner(
     if fanout.snapshot_since(None).closed { return false; }
     let _unit = crate::writer_gate::unit_permit();
     if let Some(before_write) = before_write { before_write(); }
+    let handle = handle.clone().prepare_agent_input(body);
     if let Some(launch) = launch.as_mut() { launch.written_at = Some(Instant::now()); }
     if let Err(e) = handle.write_and_stamp(&payload) {
         eprintln!(
@@ -8040,7 +8042,6 @@ fn deliver_agent_body_inner(
         );
         return false;
     }
-    if launch.is_some() { handle.note_turn_start(); }
     // Step boundary: body landed. Under a restart pause, complete the
     // Enter promptly rather than park mid-prompt: the gap is drained in
     // short slices so a pause landing MID-gap is observed within one
@@ -8079,6 +8080,7 @@ fn deliver_agent_body_inner(
         );
         return false;
     }
+    handle.note_agent_submitted();
     // Initial launches use engine evidence and exactly one guarded retry.
     // PTY output can be a startup redraw, so it cannot acknowledge this prompt.
     if launch.is_some() { return true; }
@@ -8140,6 +8142,7 @@ fn deliver_agent_body_inner(
             );
             return false;
         }
+        handle.note_agent_submitted();
     }
     // Positive delivery log (the failure mode this path exists for is
     // "writes succeed but the agent never submits" — invisible without
@@ -8215,6 +8218,7 @@ fn spawn_persistent_prompt_delivery(
     compact: bool,
     state: Arc<Mutex<DaemonState>>,
 ) {
+    let handle = handle.prepare_agent_input(if compact { "/compact" } else { &prompt });
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-persistent-prompt-{}", session_uid))
         .spawn(move || {
@@ -14006,7 +14010,9 @@ pub(crate) fn capture_drain_sessions(
                         crate::continuous::completion::codex_drain_relay_finished_after(
                             &s.agent_state.lock().unwrap_or_else(|p| p.into_inner()), after, now_unix_f64())
                     } else if s.session_type == "claude-code" && agent.source.engine_reported() {
-                        crate::continuous::completion::claude_drain_state_finished_after(&agent, after, now_unix_f64())
+                        crate::continuous::completion::claude_drain_state_finished_after(&agent, after, now_unix_f64(),
+                            s.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.delivery
+                                .as_ref().is_some_and(|d| d.local_command))
                     } else { Some(end.is_some_and(|e| e >= report.at_instant)) };
                     transcript_checks.push((uid.clone(), s.session_type.clone(), s.transcript_path.clone(), after, finished));
                 }
@@ -20957,6 +20963,10 @@ while True:
             let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
             assert_eq!(resolved["prompt_delivery"]["id"], receipt.id);
             assert_eq!(resolved["prompt_delivery"]["submitted"], accept || command);
+            if command {
+                assert_eq!(resolved["agent_state"]["turn_seq"], 0);
+                assert!(resolved["agent_state"].get("latest_start_at").is_none());
+            }
             kill_all_sessions(&state);
         }
     }
@@ -31562,6 +31572,49 @@ while True:
             assert_eq!(continuous_pause(&state, &json!({"task_id": t.task_id, "paused": false, "expected_admission_revision": revision})).unwrap_err().0, ErrorCode::Conflict);
             assert_eq!(continuous_pause(&state, &json!({"task_id": t.task_id, "paused": false, "expected_drain_request_id": request})).unwrap_err().0, ErrorCode::Conflict);
             assert!(task::load_one(&t.task_id).unwrap().paused);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_local_commands_complete_without_advancing_the_turn_or_sticking_drain() {
+        with_temp_home(|| {
+            use crate::agent_state::{HookEdges, InputDelivery};
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            insert_session(&state, &uid, "ws-command");
+            for body in ["/clear", "/compact", ""] {
+                let handle = state.lock().unwrap().sessions[&uid].input_handle();
+                let (before_seq, before_start) = {
+                    let mut st = state.lock().unwrap();
+                    let session = st.sessions.get_mut(&uid).unwrap();
+                    session.session_type = "claude-code".into();
+                    let mut cell = session.agent_state.lock().unwrap();
+                    cell.inputs.hooks = HookEdges { stop_at: Some(now_unix_f64() - 100.0), ..Default::default() };
+                    (cell.inputs.turn_seq, cell.inputs.latest_start)
+                };
+                let handle = handle.prepare_agent_input(body);
+                handle.note_agent_submitted();
+                {
+                    let st = state.lock().unwrap();
+                    let session = &st.sessions[&uid];
+                    let mut cell = session.agent_state.lock().unwrap();
+                    assert_eq!(cell.inputs.turn_seq, before_seq, "{body}");
+                    assert_eq!(cell.inputs.latest_start, before_start, "{body}");
+                    let now = now_unix_f64();
+                    cell.inputs.delivery = Some(InputDelivery { requested_at: now - 20.0,
+                        submitted_at: Some(now - 18.0), local_command: true, engine_started: false });
+                    *session.last_activity_at.lock().unwrap() = None;
+                    *session.last_input_at.lock().unwrap() =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(18));
+                }
+                assert!(crate::control::continuous_drain::notice_ready(&state, &uid), "{body}");
+                // An ordinary swallowed prompt remains protected from a stop
+                // notice even when its monitor can return labelled no_turn.
+                state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap()
+                    .inputs.delivery.as_mut().unwrap().local_command = false;
+                assert!(!crate::control::continuous_drain::notice_ready(&state, &uid));
+            }
             kill_all_sessions(&state);
         });
     }

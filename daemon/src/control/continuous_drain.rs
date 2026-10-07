@@ -68,7 +68,9 @@ pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
                 now,
             )
         } else if session.session_type == "claude-code" && agent.source.engine_reported() {
-            completion::claude_drain_state_finished_after(&agent, after, now)
+            completion::claude_drain_state_finished_after(&agent, after, now,
+                session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.delivery
+                    .as_ref().is_some_and(|d| d.local_command))
         } else {
             None
         };

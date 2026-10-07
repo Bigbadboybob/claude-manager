@@ -18,7 +18,8 @@ agent_state = {
   state: working | working-background | waiting-on-human | errored |
          idle | starting | exited | unknown,
   since: unix_s,
-  detail: {waiting_for?, error_kind?, resumes_at?, retrying?, open_tool?},
+  detail: {waiting_for?, error_kind?, resumes_at?, retrying?, open_tool?,
+           input_pending?, no_turn_at?},
   source: presence | hooks | relay | transcript | pty,
   observed_at: unix_s,
   engine_version?: string,
@@ -52,7 +53,18 @@ or accepted agent `send_input`); viewer navigation and drafts are not turns.
 `latest_start_at` is the newest accepted input or engine start. It remains set
 when a delivery hold expires: idle then describes the engine, while
 `last_turn.ended_at < latest_start_at` (or no end) means that accepted input has
-not completed. Old brains omit the field.
+not completed. Old brains omit the field. A newly observed relay turn can
+reconcile a fractional accepted-input timestamp to Codex's whole-second start;
+an unchanged older completion never gets that allowance.
+
+Local slash commands and empty sends record a delivery without advancing
+`latest_start_at` or `turn_seq`. The delivery token records actual Enter,
+separately from queued input. After 15 seconds, PTY quiet and engine idle with
+no observed start permit `detail.no_turn_at` (Unix seconds); it means no engine
+turn was observed, not that the submitted prompt succeeded. Before this escape,
+`detail.input_pending=true` holds turn consumers. Deferred/unwritten input
+cannot take the escape. A real engine start cancels it. Delivery tokens survive
+brain restart; input writes alone do not synthesize a foreground turn end.
 `last_turn` describes the most recent ended turn, including interruption or
 failure, independently of the current state. A done report remains the separate
 `reported_done` signal: an idle session has not necessarily finished its work.
@@ -276,6 +288,9 @@ A turn wait returns on engine idle, error, human wait, or background work after
 a recorded foreground turn end. Idle/background states with `latest_start_at`
 require an end at least as new as that start; an escaped delivery hold cannot
 complete a watch or return an old reply just because `turn_seq` advanced.
+The bounded no-turn escape returns `completion_kind="no_turn"` and no
+`last_message`; it does not trigger schema retries or satisfy `until=final`.
+Monitors anchor `no_turn_at` to avoid returning the same escape twice.
 Working, starting and unknown keep waiting
 even when the compatibility `idle` bit is true. The single-session
 `wait_for_session_idle` has a narrow exception: unknown with explicit
@@ -308,7 +323,9 @@ changes. The continuation follow-up also needs the updated daemon brain.
 Continuous drain notices require engine idle or errored; final drain completion
 also requires a turn end at or after `report_done`. Notice delivery requires
 a turn end after the latest accepted input/start, including after an idle hold
-expires, to avoid pasting onto a prompt parked in the composer. Foreground/background
+expires, to avoid pasting onto a prompt parked in the composer. Delivered local
+commands may instead use the bounded no-turn escape; ordinary unconfirmed
+prompts remain protected from a second paste. Foreground/background
 work, human waits and unknown initially hold the drain. Legacy sessions retain
 their old checks. Both Codex relay loss and Claude unknown state permit a bounded transcript
 fallback after 90 seconds. Claude requires a timestamped turn-duration or
@@ -411,3 +428,8 @@ legacy `idle` boolean; `agent_state` continues to report the engine state.
 The MCP workflow stuck check uses explicit `agent_state.state == "idle"` when
 available, so background work, waiting and unknown are never declared stuck on
 the strength of the compatibility boolean alone.
+
+Claude 2.1.292's installed implementation registers `/compact` as a local
+command, invokes PreCompact/PostCompact, and returns `shouldQuery:false` from
+its compact-result dispatcher. It does not run the normal assistant-turn Stop
+path; drain must not require a Stop after this local command.

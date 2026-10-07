@@ -306,18 +306,19 @@ pub fn claude_drain_state_finished_after(
     agent: &crate::agent_state::AgentState,
     after: f64,
     now: f64,
+    local_command: bool,
 ) -> Option<bool> {
     use crate::agent_state::State;
     if agent.state == State::Unknown && now - agent.since > 90.0 {
         return None;
     }
-    Some(
-        after.is_finite()
-            && matches!(agent.state, State::Idle | State::Errored)
-            && agent.last_turn.ended_at.is_some_and(|end| {
+    if agent.detail.input_pending == Some(true) { return Some(false); }
+    Some(after.is_finite() && matches!(agent.state, State::Idle | State::Errored)
+        && ((local_command && agent.detail.no_turn_at.is_some_and(|at| at >= after))
+            || agent.last_turn.ended_at.is_some_and(|end| {
                 end >= after && agent.latest_start_at.is_none_or(|start| start <= end)
-            }),
-    )
+            })))
+
 }
 
 /// Drain keeps the short uncertainty hold, then resumes its existing bounded
@@ -338,8 +339,13 @@ pub fn codex_drain_relay_finished_after(cell: &crate::agent_state::StateCell, af
         }
     }
     let state = crate::agent_state::derive(&cell.inputs, now);
+    if state.detail.input_pending == Some(true) { return Some(false); }
+    if state.state == State::Idle && cell.inputs.delivery.as_ref().is_some_and(|d| d.local_command)
+        && state.detail.no_turn_at.is_some_and(|at| at >= after) {
+        return Some(true);
+    }
     Some(after.is_finite() && matches!(state.state, State::Idle | State::Errored)
-        && state.last_turn.ended_at.is_some_and(|end| end >= after
+        && state.last_turn.ended_at.is_some_and(|end| end.floor() >= after.floor()
             && cell.inputs.latest_start.is_none_or(|start| start <= end)
             && relay.turn_started_at.is_none_or(|start| start <= end)))
 }
@@ -364,13 +370,13 @@ mod tests {
         });
         let initial = cell.recompute(100.0);
         assert_eq!(
-            claude_drain_state_finished_after(&initial, 0.0, 190.0),
+            claude_drain_state_finished_after(&initial, 0.0, 190.0, false),
             Some(false)
         );
         cell.inputs.presence.as_mut().unwrap().observed_at = 190.0;
         let again = cell.recompute(190.0);
         assert_eq!(
-            claude_drain_state_finished_after(&again, 0.0, 191.0),
+            claude_drain_state_finished_after(&again, 0.0, 191.0, false),
             None,
             "invalid observation heartbeats must not reset the outage clock"
         );
@@ -452,6 +458,7 @@ mod tests {
         cell.note_input(103.0);
         assert_eq!(codex_relay_finished_after(&cell, 101.0, 103.0), Some(false));
         cell.inputs.latest_start = None;
+        cell.inputs.delivery = None;
         let base = cell.inputs.relay.clone().unwrap();
         for variant in 0..7 {
             let mut relay = base.clone();

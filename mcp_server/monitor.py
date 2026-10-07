@@ -46,6 +46,11 @@ def engine_turn_complete(resolved: dict) -> bool | None:
         return True
     if state not in ("idle", "working-background"):
         return False
+    detail = agent.get("detail") or {}
+    if detail.get("input_pending") is True:
+        return False
+    if no_turn_at(agent) is not None:
+        return True
     ended = _engine_end(agent)
     start = agent.get("latest_start_at")
     if start is not None:
@@ -56,6 +61,12 @@ def engine_turn_complete(resolved: dict) -> bool | None:
         if ended is None or ended < start:
             return False
     return state == "idle" or ended is not None
+
+
+def no_turn_at(agent: dict | None) -> float | None:
+    detail = (agent or {}).get("detail")
+    at = detail.get("no_turn_at") if isinstance(detail, dict) else None
+    return at if type(at) in (int, float) and math.isfinite(at) and at >= 0 else None
 
 
 def _engine_end(agent: dict) -> float | None:
@@ -294,6 +305,7 @@ def _agent_baseline(agent: dict, legacy: dict | None) -> dict:
         "kind": "agent",
         "value": seq - (agent.get("state") == "working"),
         "ended_at": _engine_end(agent),
+        "no_turn_at": no_turn_at(agent),
         "legacy": legacy,
     }
 
@@ -339,6 +351,10 @@ def _edge_passed(baseline: dict, engine: str, tpath: str | None,
             legacy = baseline.get("legacy")
             # No transcript at arm time had level behavior before engine state.
             return _edge_passed(legacy, engine, tpath) if isinstance(legacy, dict) else True
+        no_turn = no_turn_at(agent)
+        if no_turn is not None and "no_turn_at" in baseline:
+            previous = baseline["no_turn_at"]
+            return previous is None or no_turn > previous
         seq = agent.get("turn_seq") if agent is not None else None
         anchor = baseline.get("value")
         if type(seq) is not int or type(anchor) is not int:
@@ -435,8 +451,10 @@ def _monitor_completed_entry(
     `killed` / `killed_by` / `exited_at` — are carried onto the entry when
     present so the fire message can label a killed session as killed
     instead of presenting its last transcript line as a final report."""
+    no_turn = bool(exit_meta and no_turn_at(engine_state(exit_meta)) is not None
+                   and exit_meta.get("state") != "exited")
     last_message = None
-    if include_message and transcript_path is not None:
+    if include_message and transcript_path is not None and not no_turn:
         try:
             msgs, _ = _read_all_messages(engine, transcript_path, generation)
             last_message = _last_assistant(msgs)
@@ -449,6 +467,8 @@ def _monitor_completed_entry(
         "idle": idle,
         "last_message": last_message,
     }
+    if no_turn:
+        entry["completion_kind"] = "no_turn"
     for key in _EXIT_PROVENANCE_KEYS:
         if exit_meta and exit_meta.get(key) is not None:
             entry[key] = exit_meta[key]

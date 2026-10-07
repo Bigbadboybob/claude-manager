@@ -63,6 +63,7 @@ from mcp_server.monitor import (
     _session_status,
     engine_state,
     engine_turn_complete,
+    no_turn_at,
     _edge_passed,
     SEMANTIC_IDLE_GRACE_S,
     transcript_turn_complete,
@@ -1910,7 +1911,7 @@ async def start_session(
         agent_baseline=({"kind": "agent", "value": (
             launch_receipt.get("turn_seq_before", 0)
             if isinstance(launch_receipt, dict) else 0
-        )} if delivered_a_prompt else None),
+        ), "no_turn_at": None} if delivered_a_prompt else None),
     )
     res["session_uid"] = session_uid
     if schema is not None:
@@ -2127,6 +2128,9 @@ def _with_outcome(out: dict, resolved: dict) -> dict:
     for key in _OUTCOME_FIELDS:
         if resolved.get(key) is not None:
             out[key] = resolved[key]
+    if (out.get("completed") or out.get("timed_out") is False) and resolved.get("state") != "exited" and no_turn_at(engine_state(resolved)) is not None:
+        out["completion_kind"] = "no_turn"
+        out["last_message"] = None
     return out
 
 
@@ -3126,7 +3130,8 @@ async def _send_and_await(
         engine=engine, transcript_path=transcript_path,
         anchor_cursor=anchor_cursor, generation=generation,
         deadline=deadline, interval=interval, grace=grace,
-        agent_baseline=({"kind": "agent", "value": engine_state(pre).get("turn_seq")}
+        agent_baseline=({"kind": "agent", "value": engine_state(pre).get("turn_seq"),
+                         "no_turn_at": no_turn_at(engine_state(pre))}
                         if engine_state(pre) is not None else None),
     )
     res["delivered"] = True
@@ -3163,6 +3168,7 @@ async def _settle_schema(
             attempts_left <= 0
             or res.get("state") == "exited"
             or res.get("timed_out")
+            or res.get("completion_kind") == "no_turn"
             or res.get("status") in ("needs_human", "errored", "unknown")
             or time.monotonic() >= deadline
         )

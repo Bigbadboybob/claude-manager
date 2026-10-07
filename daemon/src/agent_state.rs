@@ -53,6 +53,10 @@ impl Source {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Detail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_pending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_turn_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
@@ -303,6 +307,14 @@ pub struct LegacyObs {
     pub turn_ended_at: Option<f64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InputDelivery {
+    pub requested_at: f64,
+    pub submitted_at: Option<f64>,
+    pub local_command: bool,
+    pub engine_started: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Inputs {
     pub spawned_at: f64,
     pub exited: bool,
@@ -312,6 +324,8 @@ pub struct Inputs {
     pub relay: Option<RelaySnapshot>,
     pub turn_seq: u64,
     pub latest_start: Option<f64>,
+    #[serde(default)]
+    pub delivery: Option<InputDelivery>,
     pub background: Background,
     pub last_progress_at: Option<f64>,
     pub previous: Option<AgentState>,
@@ -383,6 +397,11 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         newer(start, max_time(r.turn_started_at, r.last_turn.ended_at))
             && start.is_some_and(|at| now - at < 15.0)
     });
+    let delivery_pending = input.delivery.as_ref().is_some_and(|d| !d.engine_started
+        && !last_turn.ended_at.is_some_and(|end| end >= d.requested_at)
+        && now - d.submitted_at.unwrap_or(d.requested_at) < 15.0);
+    let no_turn_candidate = input.legacy.pty_idle && input.delivery.as_ref().is_some_and(|d|
+        !d.engine_started && d.submitted_at.is_some_and(|at| now - at >= 15.0));
     let state = if input.exited {
         entered = now;
         State::Exited
@@ -399,7 +418,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             .filter(|r| r.backend_connected)
             .map_or(observed_at, |r| r.observed_at + 90.0);
         State::Unknown
-    } else if presence_input_pending || relay_input_pending {
+    } else if presence_input_pending || relay_input_pending || (source.engine_reported() && delivery_pending) {
         entered = start.unwrap_or(observed_at);
         State::Working
     } else if source.engine_reported() {
@@ -472,11 +491,11 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                     .and_then(|p| p.main_turn_open)
                     .unwrap_or(input.legacy.semantic_idle != Some(true))
             };
-            let pending_input = relay.is_none() && newer(start, Some(observed_at));
+            let pending_input = relay.is_none() && !no_turn_candidate && newer(start, Some(observed_at));
             if pending_input
                 || relay.is_some_and(|r| r.foreground == RelayStatus::Active)
                 || presence.is_some_and(|p| p.status == PresenceStatus::Busy && open)
-                || (source == Source::Hooks && newer(start, last_turn.ended_at))
+                || (source == Source::Hooks && !no_turn_candidate && newer(start, last_turn.ended_at))
             {
                 if relay.is_some_and(|r| r.retrying) {
                     detail.retrying = Some(true);
@@ -526,6 +545,17 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         } else {
             None
         };
+    if source.engine_reported() {
+        if let Some(delivery) = input.delivery.as_ref().filter(|d| !d.engine_started) {
+            let completed = last_turn.ended_at.is_some_and(|end| end >= delivery.requested_at);
+            if !completed {
+                let no_turn = delivery.submitted_at.filter(|at| now - at >= 15.0)
+                    .filter(|_| input.legacy.pty_idle && state == State::Idle);
+                if let Some(at) = no_turn { detail.no_turn_at = Some(at + 15.0); }
+                else { detail.input_pending = Some(true); }
+            }
+        }
+    }
     AgentState {
         state,
         since: entered.min(now),
@@ -618,6 +648,7 @@ impl StateCell {
                 relay: None,
                 turn_seq: 0,
                 latest_start: None,
+                delivery: None,
                 background: Background::default(),
                 last_progress_at: None,
                 previous: None,
@@ -640,8 +671,22 @@ impl StateCell {
         self.inputs.turn_seq = self.inputs.turn_seq.saturating_add(1);
         self.pending_starts = self.pending_starts.saturating_add(1);
         self.inputs.latest_start = Some(now);
+        self.inputs.delivery = Some(InputDelivery { requested_at: now, submitted_at: None,
+            local_command: false, engine_started: false });
+    }
+    pub fn note_command(&mut self, now: f64) {
+        self.inputs.delivery = Some(InputDelivery { requested_at: now, submitted_at: None,
+            local_command: true, engine_started: false });
+    }
+    pub fn note_submitted(&mut self, token: f64, now: f64) {
+        if let Some(delivery) = self.inputs.delivery.as_mut().filter(|d| d.requested_at == token) {
+            delivery.submitted_at = Some(now);
+        }
     }
     fn engine_starts(&mut self, count: u64, at: f64) {
+        if let Some(delivery) = self.inputs.delivery.as_mut().filter(|d| at >= d.requested_at) {
+            delivery.engine_started = true;
+        }
         let covered = self.pending_starts.min(count);
         self.pending_starts -= covered;
         self.inputs.turn_seq = self.inputs.turn_seq.saturating_add(count - covered);
@@ -706,6 +751,17 @@ impl StateCell {
                     }
                 });
                 if starts > 0 {
+                    // Relay event time is often whole seconds. A newly observed
+                    // start covers an accepted input in that second; an unchanged
+                    // old completion must never receive this rounding allowance.
+                    if self.pending_starts > 0 && starts >= self.pending_starts
+                        && self.inputs.latest_start.is_some_and(|input| input > at && input.floor() == at.floor()) {
+                        self.inputs.latest_start = Some(at);
+                    }
+                    if let Some(delivery) = self.inputs.delivery.as_mut()
+                        .filter(|d| at.floor() >= d.requested_at.floor()) {
+                        delivery.engine_started = true;
+                    }
                     self.engine_starts(starts, at);
                 }
                 if !same_epoch {
@@ -1078,6 +1134,8 @@ struct RestartRecord {
     stalled_since: Option<f64>,
     turn_seq: u64,
     latest_start: Option<f64>,
+    #[serde(default)]
+    delivery: Option<InputDelivery>,
     hooks: HookEdges,
     background: Background,
     presence: Option<PresenceObs>,
@@ -1109,6 +1167,7 @@ impl RestartRecord {
             stalled_since: state.stalled_since,
             turn_seq: c.inputs.turn_seq,
             latest_start: c.inputs.latest_start,
+            delivery: c.inputs.delivery.clone(),
             hooks: c.inputs.hooks.clone(),
             background: c.inputs.background.clone(),
             presence: c.inputs.presence.clone(),
@@ -1130,6 +1189,7 @@ impl RestartRecord {
             relay: self.relay,
             turn_seq: self.turn_seq,
             latest_start: self.latest_start,
+            delivery: self.delivery,
             background: self.background,
             last_progress_at: Some(self.stalled_since.map_or(now, |at| at - 900.0)),
             previous: None,
@@ -1889,6 +1949,73 @@ mod tests {
         .unwrap();
         assert_eq!(c.recompute(948.0).state, State::Working);
         assert_eq!(c.inputs.turn_seq, 3);
+    }
+
+    #[test]
+    fn no_turn_requires_submitted_quiet_input_and_never_covers_a_real_start() {
+        let mut c = StateCell::new(0.0, None);
+        c.inputs = relay(RelayStatus::Idle);
+        c.inputs.legacy.pty_idle = true;
+        c.inputs.relay.as_mut().unwrap().observed_at = 100.0;
+        c.inputs.relay.as_mut().unwrap().last_turn.ended_at = Some(90.0);
+        c.note_input(100.0);
+        let pending = c.recompute(116.0);
+        assert_eq!(pending.state, State::Idle);
+        assert_eq!(pending.detail.input_pending, Some(true));
+        assert_eq!(pending.detail.no_turn_at, None, "queued input has no delivery proof");
+        c.note_submitted(100.0, 116.0);
+        assert_eq!(c.recompute(130.0).detail.no_turn_at, None);
+        c.inputs.legacy.pty_idle = false;
+        assert_eq!(c.recompute(132.0).detail.no_turn_at, None, "busy terminal cannot escape");
+        c.inputs.legacy.pty_idle = true;
+        assert_eq!(c.recompute(132.0).detail.no_turn_at, Some(131.0));
+        c.engine_starts(1, 133.0);
+        assert_eq!(c.recompute(150.0).detail.no_turn_at, None, "a real start revokes no_turn");
+        // Hooks-only old Claude sessions can also consume empty Enter without Stop.
+        let mut hooks = StateCell::new(0.0, None);
+        hooks.inputs.hooks.stop_at = Some(90.0);
+        hooks.inputs.legacy.pty_idle = true;
+        hooks.note_input(100.0);
+        hooks.note_submitted(100.0, 100.0);
+        assert_eq!(hooks.recompute(116.0).detail.no_turn_at, Some(115.0));
+        // A stale delivery token cannot acknowledge newer queued input.
+        c.note_input(160.0);
+        c.note_submitted(100.0, 170.0);
+        assert_eq!(c.inputs.delivery.as_ref().unwrap().submitted_at, None);
+        let seq = c.inputs.turn_seq;
+        let start = c.inputs.latest_start;
+        c.note_command(180.0);
+        c.note_submitted(180.0, 181.0);
+        c.inputs.relay.as_mut().unwrap().observed_at = 196.0;
+        assert_eq!(c.inputs.turn_seq, seq);
+        assert_eq!(c.inputs.latest_start, start, "local commands don't manufacture a turn start");
+        assert_eq!(c.recompute(197.0).detail.no_turn_at, Some(196.0));
+    }
+
+    #[test]
+    fn same_second_relay_start_reconciles_fractional_input_without_reusing_old_end() {
+        let mut c = StateCell::new(0.0, None);
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let mut snapshot = RelaySnapshot {
+            backend_connected: true, foreground: RelayStatus::Idle,
+            turn_seq: 1, turn_started_at: Some(99.0),
+            last_turn: LastTurn { ended_at: Some(100.0), status: Some(TurnStatus::Completed) },
+            ..Default::default()
+        };
+        c.apply(report(&epoch, 1, snapshot.clone()), 100.1).unwrap();
+        c.note_input(100.8);
+        // Rounding alone would incorrectly reuse turn 1 here.
+        c.apply(report(&epoch, 2, snapshot.clone()), 101.0).unwrap();
+        assert_eq!(c.inputs.latest_start, Some(100.8));
+        assert_eq!(crate::continuous::completion::codex_drain_relay_finished_after(&c, 100.8, 116.0), Some(false));
+        snapshot.turn_seq = 2;
+        snapshot.turn_started_at = Some(100.0);
+        c.apply(report(&epoch, 3, snapshot), 102.0).unwrap();
+        let state = c.recompute(103.0);
+        assert_eq!(state.state, State::Idle);
+        assert_eq!(state.latest_start_at, Some(100.0));
+        assert_eq!(state.last_turn.ended_at, Some(100.0));
+        assert_eq!(crate::continuous::completion::codex_drain_relay_finished_after(&c, 100.8, 103.0), Some(true));
     }
 
     #[test]
