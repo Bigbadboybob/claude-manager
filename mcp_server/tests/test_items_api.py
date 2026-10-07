@@ -498,6 +498,45 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
             await conn.execute("DELETE FROM session_states WHERE engine IS NULL")
         self.assertIsNone((await self.read())["board"]["orchestrator"])
 
+    async def test_blocked_on_owner_pushes_orchestrator_and_is_listed(self):
+        orch = {"pid": "agent:d1:orch-uid", "name": "orch", "session_uid": "orch-uid",
+                "daemon_id": "d1"}
+        await self.beat([{**self.row("orch"), "engine": "codex"}])
+        await self.create({"title": "gpu", "holders": [LANE]}, {"title": "other", "holders": [LANE]})
+        r = await self.patch(1, actor=LANE, status="blocked_on_owner", blocked_on="approve 8xH100?")
+        self.assertEqual(r.json()["items"][0]["status"], "blocked_on_owner")
+        pushes = await self.fetch("SELECT kind, session_uid, text FROM item_pushes WHERE kind = 'owner_blocked'")
+        self.assertEqual([(p["session_uid"]) for p in pushes], ["orch-uid"])
+        self.assertIn('#1 "gpu" is blocked on Owner: approve 8xH100?', pushes[0]["text"])
+        board = await self.read()
+        self.assertEqual(board["board"]["health"]["blocked_on_owner"], 1)
+        self.assertEqual(board["board"]["health"]["owner_items"], [1])
+        listed = (await self.http.get("/items/owner-blocked")).json()
+        self.assertEqual([(i["board"], i["n"], i["decision"]) for i in listed],
+                         [(self.ref, 1, "approve 8xH100?")])
+        self.assertEqual(listed[0]["holders"][0]["session_uid"], "lane-uid")
+        # Only Owner clears it; the holder gets 403.
+        r = await self.patch(1, actor=LANE, status="active", ok=False)
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (403, "owner_only"))
+        await self.patch(1, actor={"pid": "owner", "name": "Owner"}, status="active")
+        pushes = await self.fetch("SELECT text FROM item_pushes WHERE kind = 'owner_blocked' ORDER BY id")
+        self.assertIn("no longer blocked on Owner (Owner; now active)", pushes[-1]["text"])
+        self.assertEqual((await self.http.get("/items/owner-blocked")).json(), [])
+        # The orchestrator's own change is not pushed back to it.
+        await self.patch(2, actor={"pid": "owner"}, status="blocked_on_owner")
+        n = len(await self.fetch("SELECT 1 FROM item_pushes WHERE kind = 'owner_blocked'"))
+        await self.patch(2, actor=orch, note="noted", ok=True)
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM item_pushes WHERE kind = 'owner_blocked'")), n)
+
+    async def test_answer_resolves_blocked_on_owner(self):
+        await self.create({"title": "gpu", "holders": [LANE]})
+        await self.patch(1, actor=LANE, status="blocked_on_owner", blocked_on="approve?")
+        r = await self.post(f"/boards/{self.ref}/items/1/resolve",
+                            {"actor": LANE, "action": "answer", "message": "yes, 4 GPUs"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual((r.json()["item"]["status"], r.json()["item"]["note"]),
+                         ("active", "Owner: yes, 4 GPUs"))
+
     async def test_archived_items_leave_the_board_but_stay_searchable(self):
         await self.create({"title": "fuse SEJD", "note": "PR-ready"}, "other")
         await self.patch(1, status="done")

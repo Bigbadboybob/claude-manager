@@ -11,9 +11,14 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-STATUSES = ("open", "active", "waiting", "blocked", "done", "dropped")
+STATUSES = ("open", "active", "waiting", "blocked", "blocked_on_owner", "done", "dropped")
+OWNER_PID = "owner"
+# Waiting on a decision only Owner can make: set by Owner, or by a holder who
+# names the decision in `blocked_on`; cleared by Owner, or by recording
+# Owner's answer with item_resolve(n, "answer", message=...).
+OWNER_BLOCKED = "blocked_on_owner"
 CLOSED = frozenset({"done", "dropped"})
-RESOLVE_ACTIONS = ("nudge", "reassign", "launch", "block", "drop")
+RESOLVE_ACTIONS = ("nudge", "reassign", "launch", "block", "drop", "answer")
 
 MAX_TITLE = 200
 MAX_NOTE = 500
@@ -213,6 +218,8 @@ class BoardTx:
         self.unblocked: list[int] = []
         self.warnings: list[str] = []
         self.board_changed = False
+        # (n, entered) for every move into or out of blocked_on_owner.
+        self.owner_transitions: list[tuple[int, bool]] = []
 
     # ---- lookups -------------------------------------------------------
     def item(self, n: int) -> Item:
@@ -357,7 +364,7 @@ class BoardTx:
         return out
 
     def apply(self, n: int, fields: dict, *, holders=None, add=(), remove=(),
-              reason=None, creating=False):
+              reason=None, creating=False, answered=False):
         """Apply one item's field changes and every rule that follows from them."""
         it = self.item(n)
         unknown = set(fields) - {
@@ -446,7 +453,7 @@ class BoardTx:
             if status not in CLOSED:
                 if blockers_given and it.blocked_by:
                     status = "blocked"
-                elif "blocked_on" in fields and it.blocked_on:
+                elif "blocked_on" in fields and it.blocked_on and status != OWNER_BLOCKED:
                     status = "blocked"
                 elif eta_given:
                     status = "waiting"
@@ -454,18 +461,39 @@ class BoardTx:
                       and not it.blocked_on):
                     status = "active" if new_holders else "open"
 
-        # Only a blocked item carries blockers.
+        # Blocked on Owner: who may enter and leave it.
+        actor_pid = self.actor["pid"]
+        is_owner = actor_pid == OWNER_PID
+        if status == OWNER_BLOCKED and prev_status != OWNER_BLOCKED:
+            if not is_owner:
+                if actor_pid not in prev_pids and actor_pid not in [h["pid"] for h in it.holders]:
+                    raise ItemsError(403, "owner_only",
+                                     "only Owner or the item's holder can mark it blocked on Owner")
+                if not it.blocked_on:
+                    raise invalid("decision_required",
+                                  "name the decision Owner must make in blocked_on "
+                                  "(e.g. blocked_on=\"approve 8xH100 for SEJD?\")",
+                                  field="blocked_on")
+        if prev_status == OWNER_BLOCKED and status != OWNER_BLOCKED and not (is_owner or answered):
+            raise ItemsError(403, "owner_only",
+                             f"#{n} is blocked on Owner: only Owner clears it, or record Owner's "
+                             f"answer with item_resolve({n}, \"answer\", message=...)")
+
+        # Only a blocked item carries blockers (blocked_on also names the
+        # decision of an item blocked on Owner).
         if status != "blocked":
             if blockers_given and it.blocked_by:
                 raise invalid("invalid_field", "blocked_by requires status blocked",
                               field="blocked_by")
-            if "blocked_on" in fields and it.blocked_on:
+            keeps_text = status == OWNER_BLOCKED
+            if "blocked_on" in fields and it.blocked_on and not keeps_text:
                 raise invalid("invalid_field", "blocked_on requires status blocked",
                               field="blocked_on")
             if it.blocked_by:
                 it.blocked_by = set()
                 self.deps_changed.add(n)
-            it.blocked_on = None
+            if not keeps_text:
+                it.blocked_on = None
             it.check_back_at = None
         elif not it.blocked_by and not it.blocked_on:
             self.warnings.append(
@@ -485,6 +513,10 @@ class BoardTx:
             it.waiting_set_at = None
 
         it.status = status
+        if (status == OWNER_BLOCKED) != (prev_status == OWNER_BLOCKED) and not creating:
+            self.owner_transitions.append((n, status == OWNER_BLOCKED))
+        elif creating and status == OWNER_BLOCKED:
+            self.owner_transitions.append((n, True))
         if n in self.deps_changed:
             self._check_cycles(it)
             self._clear_blocker_dropped(it)
@@ -569,6 +601,16 @@ class BoardTx:
                           field="action")
         if it.status in CLOSED and action != "drop":
             raise invalid("item_closed", f"#{n} is {it.status}")
+        if action == "answer":
+            if it.status != OWNER_BLOCKED:
+                raise invalid("invalid_field", f"#{n} is not blocked on Owner", field="action")
+            answer = _text(message, MAX_NOTE, "message", required=True)
+            resolved = [k for k in sorted(it.open_flags) if self.resolve_flag(it, k, "answer")]
+            self.apply(n, {"status": "active" if it.holders else "open", "note": f"Owner: {answer}"},
+                       reason=f"answer: {answer}", answered=True)
+            self._event(it, "resolved", new={"action": action, "flags": resolved},
+                        reason=f"answer: {answer}")
+            return resolved
         kinds = [kind] if kind else sorted(it.open_flags)
         resolved: list[str] = []
 

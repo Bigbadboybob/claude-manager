@@ -262,7 +262,7 @@ def item(
     (not planning tasks) on a shared board: your initiative's, else your
     top-level task's. The holder defaults to you; name others by chat name,
     session uid or participant id, or holder="none" to leave it unassigned.
-    status: open/active/waiting/blocked/done/dropped (default active).
+    status: open/active/waiting/blocked/blocked_on_owner/done/dropped (default active).
     eta ("40m", "2h" or a time) marks a long job as waiting, which keeps it
     from being flagged idle. blocked_by takes open item numbers on the same
     board (no cycles); blocked_on is free text ("EP GO") and gets no idle or
@@ -300,6 +300,12 @@ def item_set(
     """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
     note="needs EP GO"), item_set(15, blocked_by=[14]),
     item_set(14, "waiting", eta="40m", note="full C2 run").
+
+    Waiting on a decision only Owner can make: item_set(14, "blocked_on_owner",
+    blocked_on="approve 8xH100 for SEJD?") (you must hold the item and name the
+    decision). It is shown loudly to Owner and never flagged idle or stale.
+    Only Owner clears it; when Owner answers you elsewhere, record it with
+    item_resolve(14, "answer", message="<Owner's answer>").
 
     holder replaces the holders ("none" hands the item back); add_holder /
     remove_holder adjust them. An empty string clears note, group or
@@ -361,7 +367,9 @@ def item_resolve(
       joins your task and checkout unless `task_id` names a task, whose own
       worktree it then gets (minted if needed), as with start_session;
     - block: blocked_by items, or blocked_on text with a check_back time;
-    - drop: cancel it with a reason.
+    - drop: cancel it with a reason;
+    - answer: record Owner's answer (`message`) to an item blocked on Owner,
+      which returns it to active.
 
     kind limits the action to one flag kind; by default it resolves all of
     the item's open flags. A launch retried with the same request_id reassigns

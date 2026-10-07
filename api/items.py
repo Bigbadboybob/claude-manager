@@ -99,6 +99,11 @@ async def resolve_item(ref: str, body: ItemResolveBody, request: Request,
         check_back=body.check_back, reason=body.reason, message=body.message))
 
 
+@router.get("/items/owner-blocked")
+async def owner_blocked(request: Request):
+    return await _call(items_db.owner_blocked(_pool(request)))
+
+
 @router.get("/items")
 async def held_items(request: Request, holder_pid: str = Query(..., min_length=1, max_length=200),
                      open: bool = Query(True)):

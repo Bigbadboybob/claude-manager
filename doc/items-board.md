@@ -29,7 +29,7 @@ holder state is shown verbatim and never treated as idle or closed.
 |---|---|---|
 | `n` | int | per-board number |
 | `title` | str ≤ 200 | required |
-| `status` | `open` `active` `waiting` `blocked` `done` `dropped` | default `active` |
+| `status` | `open` `active` `waiting` `blocked` `blocked_on_owner` `done` `dropped` | default `active` |
 | `holders` | `[{pid, name, session_uid, daemon_id}]` | default: the caller |
 | `note` | str ≤ 500 | one line, latest wins |
 | `group` | str ≤ 80 | free-text heading |
@@ -91,7 +91,17 @@ re-read fully every ~30 s.
    does re-pointing a dependent's `blocked_by` away from dropped items.
 8. **Assigned.** A holder added by an actor other than that holder queues an
    `assigned` push to the new holder.
-9. **Editing rights** (enforced by the daemon, §5): any session whose task
+9. **Blocked on Owner** (`blocked_on_owner`, sql/019): waiting on a decision
+   only Owner can make. Owner may set it; a holder may set it only while
+   naming the decision in `blocked_on` (else `422 decision_required`); anyone
+   else gets `403 owner_only`. Only Owner moves it to any other status
+   (including done/dropped, `403 owner_only` otherwise), except
+   `item_resolve(n, "answer", message=…)`, which records Owner's answer (note
+   `Owner: …`, event reason `answer: …`) and returns it to `active` (`open` if
+   unheld). `blocked_by` is not allowed with it; `blocked_on` keeps the
+   decision text. Every move in or out pushes the orchestrator at once (kind
+   `owner_blocked`) unless the orchestrator made the change.
+10. **Editing rights** (enforced by the daemon, §5): any session whose task
    resolves to the board, any current holder on it, a `global_perms` session,
    and Owner. Reading is open to every session.
 
@@ -144,7 +154,8 @@ also raised by the write path. Thresholds are per board:
 `open` item that keeps holders gets the same holder and staleness flags as
 `active`, so nothing blocked behind it can hide.
 
-**Exemptions.** An item blocked only by open items (`blocked_by` non-empty,
+**Exemptions.** An item blocked on Owner never gets `holder_idle` or `stale`
+(`holder_gone` still applies). An item blocked only by open items (`blocked_by` non-empty,
 `blocked_on` empty) is exempt from `holder_idle` and `stale`. Free-text
 `blocked_on` earns no exemption. `waiting` before its overdue point is exempt
 from `holder_idle`. Nothing exempts `holder_gone`. Since `blocked_by` cannot
@@ -181,6 +192,7 @@ ids are acked on the next beat; unacked rows are re-sent.
 |---|---|---|
 | `assigned` | new holder | added by someone else |
 | `unblocked` | holders | last blocker done |
+| `owner_blocked` | orchestrator | an item enters or leaves `blocked_on_owner` (immediately, not batched) |
 | `nudge` | holders | `item_resolve(nudge)` |
 | `overdue` | holder when raised; orchestrator once the flag is `repush_s` old | flag |
 | `board` | orchestrator | new flags immediately; unresolved flags every `repush_s` — whenever any flag is new or due, the push carries every open flag and their re-push clocks align, so k flags are one wake per window; done/dropped/blocked events by others than the orchestrator, batched over a `digest_s` window. One row per orchestrator per tick; no push without a live orchestrator |
@@ -214,6 +226,7 @@ FastAPI's standard 422.
 | `PATCH /boards/{ref}/items` | `{actor, ns: [n], set: {…}, add_holders?, remove_holders?, reason?}` | `{items, unblocked: [n], warnings: [str]}` |
 | `POST /boards/{ref}/items/{n}/resolve` | `{actor, action, kind?, holders?, blocked_by?, blocked_on?, check_back?, reason?, message?}` | `{board, item, flags_resolved: [kind], unblocked, warnings}` |
 | `GET /items` | `?holder_pid=&open=true` | `[{board, n, title, status}]` |
+| `GET /items/owner-blocked` | (none) | `[{board, board_name, n, title, decision, since, holders: [{pid, session_uid, daemon_id, name}]}]`, oldest first, across boards |
 | `POST /hosts/{daemon_id}/heartbeat` | `{host_label, sessions: [state row], exited: [pid], acked_push_ids: [id]}` | `{pushes: [{id, session_uid, pid, kind, text, owner_alert, board_id, board}], server_time}` (≤ 100 per beat) |
 
 `holders` on the wire are resolved objects `{pid, name, session_uid,
@@ -225,8 +238,8 @@ Bounds: item numbers 1…2³¹−1, ≤ 50 numbers/holders per list, `reason` �
 1 s…30 days. Out of range is a 422.
 
 **Board header:** `{id, slug, name, initiative_id, root_task_id, version,
-orchestrator: {pid, name, state} | null, settings, health: {unresolved,
-oldest_s}}`.
+orchestrator: {pid, name, state} | null, settings, health: {blocked_on_owner,
+owner_items: [n], unresolved, oldest_s}}`.
 
 **Item (read):** §1 fields plus `holders[].state = {state, for_s, reported_done}`,
 `flags: [kind]`, `blocks: [n]`, and with `history=N` the last N events.
@@ -258,10 +271,18 @@ by the daemon: it spawns the session, then calls `reassign`.
 ## 7. Daemon RPCs and MCP tools
 
 Daemon methods (daemon-only; no TUI handler, no CLI fallback): `item.create`,
-`item.set`, `item.resolve`, `board.read` (`board.read` is restart-barrier
-read-only). The daemon resolves the caller's pid, task and board, resolves
-holder names, enforces §2 rule 9, stamps `actor`, and forwards. The Operator
-(TUI) acts as `owner`.
+`item.set`, `item.resolve`, `board.read`, `board.owner_blocked` (both reads
+are restart-barrier read-only). The daemon resolves the caller's pid, task and
+board, resolves holder names, enforces §2 rule 10, stamps `actor`, and
+forwards. The Operator (TUI) acts as `owner`.
+
+**TUI.** Every 20 s the viewer reads `board.owner_blocked` (one small filtered
+query, first reachable daemon) and marks each holder's sidebar row and its
+workspace header with an amber ◇/◆ alternating about once a second plus a bold
+`OWNER` tag, ranked just below a pending ⚑ alert; the status bar adds `◆N
+OWNER`. In the board overlay the item's badge is `OWNER` with the diamond in the
+flag cell, the banner leads with "N blocked on Owner", and `s` → `O` lets Owner
+set the status (any other status clears it).
 
 Holder arguments accept a chat name, a session uid, a participant id, `me`, or
 `none`. An unknown or ambiguous name is refused with the candidates.

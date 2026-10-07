@@ -1455,6 +1455,8 @@ impl App {
             };
             let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
                 self.alert_indicator()
+            } else if self.owner_blocked_session(&ts.uid) {
+                self.owner_indicator()
             } else {
                 (indicator, indicator_style)
             };
@@ -1514,6 +1516,7 @@ impl App {
                 Style::default().fg(stage.color())
             } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
                 && !self.session_has_alert(&ts.uid)
+                && !self.owner_blocked_session(&ts.uid)
                 && !self.reconnecting_sessions.contains(&ts.uid)
             {
                 // Stale-idle rows fade like the main sidebar's — see the
@@ -1883,10 +1886,16 @@ impl App {
 
                     // Reserve room for the tags so the name truncates before
                     // them (the pin glyph 📌 is double-width + a space).
+                    // A member session blocked on Owner marks the header too.
+                    let ws_owner_blocked = ws
+                        .sessions
+                        .iter()
+                        .any(|s| self.owner_blocked_session(&s.uid));
                     let max_name = (inner.width as usize)
                         .saturating_sub(2)
                         .saturating_sub(host_tag.chars().count())
-                        .saturating_sub(if ws.pinned { 3 } else { 0 });
+                        .saturating_sub(if ws.pinned { 3 } else { 0 })
+                        .saturating_sub(if ws_owner_blocked { 8 } else { 0 });
                     // Char-boundary-safe truncation — a raw `&ws.name[..n]` byte
                     // slice panics when the cut lands inside a multibyte char
                     // (e.g. '≤' in a workspace name). Matches the session/task
@@ -1894,10 +1903,17 @@ impl App {
                     let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
                     let mut header_spans = vec![Span::raw(" "), Span::raw(indent(*wi))];
+                    if ws_owner_blocked {
+                        let (glyph, style) = self.owner_indicator();
+                        header_spans.push(Span::styled(format!("{glyph} "), style));
+                    }
                     if ws.pinned {
                         header_spans.push(Span::raw("\u{1f4cc} "));
                     }
                     header_spans.push(Span::raw(name));
+                    if ws_owner_blocked {
+                        header_spans.push(super::owner_blocked::owner_tag());
+                    }
                     if !host_tag.is_empty() {
                         header_spans.push(Span::styled(host_tag, Style::default().fg(theme::DIM)));
                     }
@@ -1978,8 +1994,12 @@ impl App {
                     // pending, the rainbow-heartbeat bead takes over the icon
                     // cell entirely (overriding even a hidden session's blank)
                     // — the whole point is to grab the eye regardless of status.
+                    // Below a pending alert: work blocked on an Owner decision.
+                    let owner_blocked = self.owner_blocked_session(&ts.uid);
                     let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
                         self.alert_indicator()
+                    } else if owner_blocked {
+                        self.owner_indicator()
                     } else {
                         (indicator, indicator_style)
                     };
@@ -2053,6 +2073,9 @@ impl App {
                         spans.push(Span::styled(badge, style));
                     }
                     spans.push(Span::raw(display));
+                    if owner_blocked {
+                        spans.push(super::owner_blocked::owner_tag());
+                    }
                     if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
                         spans.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
                     }
@@ -2072,6 +2095,7 @@ impl App {
                             .add_modifier(Modifier::BOLD)
                     } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
                         && !self.session_has_alert(&ts.uid)
+                        && !owner_blocked
                         && !self.reconnecting_sessions.contains(&ts.uid)
                     {
                         // Stale-idle rows (idle > 30 min) fade out label and
@@ -2480,6 +2504,14 @@ impl App {
             rollup.push(Span::styled(
                 format!("\u{2691}{} ", n_alert),
                 Style::default().fg(theme::ATTN),
+            ));
+        }
+        // Items blocked on an Owner decision, across every board.
+        let n_owner = self.owner_blocked.count();
+        if n_owner > 0 {
+            rollup.push(Span::styled(
+                format!("\u{25c6}{} OWNER ", n_owner),
+                super::owner_blocked::owner_style(),
             ));
         }
 

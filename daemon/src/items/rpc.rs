@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
 
-pub const METHODS: &[&str] = &["item.create", "item.set", "item.resolve", "board.read"];
+pub const METHODS: &[&str] = &["item.create", "item.set", "item.resolve", "board.read", "board.owner_blocked"];
 
 type RpcResult<T = Value> = Result<T, (ErrorCode, String)>;
 
@@ -26,6 +26,8 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         "item.set" => item_set(&ctx, &req.params),
         "item.resolve" => item_resolve(state, &ctx, &req.params),
         "board.read" => board_read(&ctx, &req.params),
+        // Every item blocked on Owner, across boards (the TUI's sidebar marker).
+        "board.owner_blocked" => ctx.api.get("/items/owner-blocked", &[]),
         other => Err((ErrorCode::UnknownMethod, format!("unknown items method {other}"))),
     });
     match result {

@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from dispatch import items_db
-from dispatch.items_rules import CLOSED, BoardTx, Item, iso
+from dispatch.items_rules import CLOSED, OWNER_BLOCKED, BoardTx, Item, iso
 
 logger = logging.getLogger("cm.board_engine")
 
@@ -86,7 +86,7 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
     # holder and staleness flags as `active`, so nothing blocked behind it
     # can hide.
     held_open = item.status == "open" and bool(item.holders)
-    working = item.status in ("active", "waiting", "blocked") or held_open
+    working = item.status in ("active", "waiting", "blocked", OWNER_BLOCKED) or held_open
     touched = max(t for t in (item.touched_at, item.clock_reset_at) if t is not None)
 
     if item.status == "open" and not item.holders:
@@ -111,6 +111,9 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
     # Waiting only on open items is legitimate waiting: no idle/stale clock.
     exempt = (item.status == "blocked" and bool(item.blocked_by) and not item.blocked_on
               and all(b is not None and b.status not in CLOSED for b in blockers))
+    # Waiting on Owner is never the holder's stall: no idle or stale clock
+    # (holder_gone still applies).
+    exempt = exempt or item.status == OWNER_BLOCKED
 
     if (board.get("holder_idle_enabled") and (item.status == "active" or held_open) and item.holders
             and all(status[h["pid"]] == "idle" for h in item.holders)):

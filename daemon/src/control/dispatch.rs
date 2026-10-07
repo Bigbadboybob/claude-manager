@@ -319,6 +319,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "get_initiative",
     "backtest.result",
     "board.read",
+    "board.owner_blocked",
     "continuous.list",
     "continuous.context",
     "continuous.dispatch_pending",
@@ -815,7 +816,7 @@ pub fn dispatch_request(
         // callable proxies to the planning API. The daemon stamps the
         // caller's participant id as the actor and resolves holder names;
         // editing rights are checked in `items::rpc`.
-        "item.create" | "item.set" | "item.resolve" | "board.read" => {
+        "item.create" | "item.set" | "item.resolve" | "board.read" | "board.owner_blocked" => {
             DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
         }
 

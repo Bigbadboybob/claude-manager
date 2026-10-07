@@ -327,6 +327,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "item.set",
     "item.resolve",
     "board.read",
+    "board.owner_blocked",
 })
 
 

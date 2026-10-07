@@ -156,6 +156,13 @@ class ComputeFlags(unittest.TestCase):
         self.assertEqual(flags(waiter, items=both), {})
         self.assertEqual(flags(held, items=both), {"stale": None})
 
+    def test_blocked_on_owner_is_never_idle_or_stale_but_gone_still_counts(self):
+        idle = {LANE["pid"]: state("idle", ago(hours=3))}
+        owner = item(status="blocked_on_owner", blocked_on="approve?", touched=ago(hours=5))
+        self.assertEqual(flags(owner, idle), {})
+        gone = {LANE["pid"]: state(exited=True)}
+        self.assertEqual(flags(owner, gone), {"holder_gone": {"holders": ["lane"]}})
+
     def test_closed_items_have_no_flags(self):
         self.assertEqual(flags(item(status="done", touched=ago(days=2))), {})
 

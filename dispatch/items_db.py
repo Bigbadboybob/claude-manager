@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import asyncpg
 
-from dispatch.items_rules import CLOSED, BoardTx, Item, ItemsError, iso
+from dispatch.items_rules import CLOSED, OWNER_BLOCKED, BoardTx, Item, ItemsError, iso
 
 STATE_FRESH_S = 90
 BOARD_SETTINGS = (
@@ -289,7 +289,57 @@ async def _write(pool: asyncpg.Pool, ref: str, actor: dict, extra_ns, run):
             tx = BoardTx(board, items, actor, now)
             result = run(tx)
             await _apply(conn, tx)
+            if tx.owner_transitions:
+                await _push_owner_transitions(conn, board, tx, now)
             return tx, result
+
+
+async def _orchestrator_row(conn, board: dict, now: datetime) -> dict | None:
+    """The orchestrator's state row (explicit pid, else the best candidate)."""
+    if board.get("orchestrator_pid"):
+        row = await conn.fetchrow("SELECT * FROM session_states WHERE pid = $1",
+                                  board["orchestrator_pid"])
+        return dict(row) if row else None
+    anchor = await _anchor_task(conn, board)
+    if anchor is None:
+        return None
+    row = await conn.fetchrow(ORCHESTRATOR_CANDIDATES_SQL, anchor,
+                              now - timedelta(seconds=STATE_FRESH_S))
+    return dict(row) if row else None
+
+
+async def _anchor_task(conn, board: dict):
+    if board.get("initiative_id"):
+        return await conn.fetchval("SELECT coordinator_task_id FROM initiatives WHERE id = $1",
+                                   uuid.UUID(board["initiative_id"]))
+    if board.get("root_task_id"):
+        return uuid.UUID(board["root_task_id"])
+    return None
+
+
+async def _push_owner_transitions(conn, board: dict, tx: BoardTx, now: datetime) -> None:
+    """Tell the orchestrator at once when an item enters or leaves
+    blocked_on_owner (unless the orchestrator made the change itself)."""
+    orch = await _orchestrator_row(conn, board, now)
+    if not orch or not orch.get("daemon_id") or not orch.get("session_uid") \
+            or orch["pid"] == tx.actor["pid"]:
+        return
+    who = tx.actor.get("name") or tx.actor["pid"]
+    parts = []
+    for n, entered in tx.owner_transitions:
+        it = tx.items[n]
+        if entered:
+            parts.append(f"#{n} \"{it.title}\" is blocked on Owner: {it.blocked_on or 'decision pending'}")
+        else:
+            parts.append(f"#{n} \"{it.title}\" is no longer blocked on Owner ({who}; now {it.status})")
+    text = f"[cm-board {board['slug']}] " + "; ".join(parts) + f". board(board=\"{board['slug']}\")"
+    await conn.execute(
+        """INSERT INTO item_pushes (board_id, daemon_id, session_uid, pid, kind, text, dedupe,
+                                    created_at)
+           VALUES ($1, $2, $3, $4, 'owner_blocked', $5, $6, $7) ON CONFLICT (dedupe) DO NOTHING""",
+        uuid.UUID(board["id"]), orch["daemon_id"], orch["session_uid"], orch["pid"],
+        text[:1000], f"owner_blocked:{board['id']}:{now.isoformat()}:{tx.owner_transitions}", now,
+    )
 
 
 def _write_reply(tx: BoardTx, ns) -> dict:
@@ -502,7 +552,13 @@ async def _health(conn, board_id: str, now: datetime) -> dict:
         uuid.UUID(board_id),
     )
     oldest = row["oldest"]
-    return {"unresolved": int(row["n"]),
+    owner = await conn.fetch(
+        """SELECT number FROM items WHERE board_id = $1 AND status = $2 AND archived_at IS NULL
+            ORDER BY number""",
+        uuid.UUID(board_id), OWNER_BLOCKED,
+    )
+    return {"blocked_on_owner": len(owner), "owner_items": [r["number"] for r in owner],
+            "unresolved": int(row["n"]),
             "oldest_s": int((now - oldest).total_seconds()) if oldest else None}
 
 
@@ -648,6 +704,33 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
         if archived:
             out["archived"] = old
         return out
+
+
+async def owner_blocked(pool) -> list[dict]:
+    """Every item blocked on Owner, across boards, with its holders (for the
+    TUI's sidebar marker and status-bar count)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT b.slug, b.name AS board_name, i.id, i.number, i.title, i.blocked_on,
+                      i.touched_at
+                 FROM items i JOIN boards b ON b.id = i.board_id
+                WHERE i.status = $1 AND i.archived_at IS NULL
+                ORDER BY i.touched_at, b.slug, i.number""",
+            OWNER_BLOCKED,
+        )
+        holders = await conn.fetch(
+            """SELECT item_id, pid, session_uid, daemon_id, name FROM item_holders
+                WHERE item_id = ANY($1::bigint[]) ORDER BY added_at, pid""",
+            [r["id"] for r in rows],
+        )
+    by_item: dict[int, list] = {}
+    for h in holders:
+        by_item.setdefault(h["item_id"], []).append(
+            {"pid": h["pid"], "session_uid": h["session_uid"], "daemon_id": h["daemon_id"],
+             "name": h["name"]})
+    return [{"board": r["slug"], "board_name": r["board_name"], "n": r["number"],
+             "title": r["title"], "decision": r["blocked_on"], "since": iso(r["touched_at"]),
+             "holders": by_item.get(r["id"], [])} for r in rows]
 
 
 async def held_items(pool, holder_pid: str, *, open_only: bool = True) -> list[dict]:

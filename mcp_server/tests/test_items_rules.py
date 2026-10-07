@@ -378,6 +378,66 @@ class TouchEventsAndPushes(unittest.TestCase):
         self.assertEqual({b[1].status, b[2].status}, {"done"})
 
 
+class BlockedOnOwner(unittest.TestCase):
+    def setUp(self):
+        self.b = Board()
+        self.b.create({"title": "gpu budget", "holders": [LANE]})
+
+    def test_holder_sets_it_naming_the_decision(self):
+        tx = self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="approve 8xH100?")
+        it = self.b[1]
+        self.assertEqual((it.status, it.blocked_on), ("blocked_on_owner", "approve 8xH100?"))
+        self.assertEqual(tx.owner_transitions, [(1, True)])
+
+    def test_holder_must_name_the_decision(self):
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, actor=LANE, status="blocked_on_owner")
+        self.assertEqual(cm.exception.code, "decision_required")
+
+    def test_others_cannot_set_it_but_owner_can_without_text(self):
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, actor=OTHER, status="blocked_on_owner", blocked_on="x")
+        self.assertEqual((cm.exception.status, cm.exception.code), (403, "owner_only"))
+        self.b.set(1, actor=OWNER, status="blocked_on_owner")
+        self.assertEqual(self.b[1].status, "blocked_on_owner")
+
+    def test_only_owner_clears_it(self):
+        self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="approve?")
+        attempts = [(LANE, {"status": "active"}), (ORCH, {"status": "done"}),
+                    (LANE, {"status": "dropped"}), (ORCH, {"status": "blocked", "blocked_on": "y"})]
+        for actor, fields in attempts:
+            with self.assertRaises(ItemsError) as cm:
+                self.b.set(1, actor=actor, **fields)
+            self.assertEqual(cm.exception.code, "owner_only", fields)
+        # Notes and holders stay editable without clearing it.
+        self.b.set(1, actor=LANE, note="still waiting")
+        self.assertEqual(self.b[1].status, "blocked_on_owner")
+        tx = self.b.set(1, actor=OWNER, status="active")
+        self.assertEqual(self.b[1].status, "active")
+        self.assertIsNone(self.b[1].blocked_on)
+        self.assertEqual(tx.owner_transitions, [(1, False)])
+
+    def test_answer_records_owners_answer_and_resumes(self):
+        self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="approve?")
+        tx = self.b.tx(LANE)
+        tx.resolve(1, "answer", message="approved, use 4 not 8")
+        it = self.b[1]
+        self.assertEqual(it.status, "active")
+        self.assertEqual(it.note, "Owner: approved, use 4 not 8")
+        self.assertIn("answer: approved, use 4 not 8", [e["reason"] for e in tx.events])
+        self.assertEqual(tx.owner_transitions, [(1, False)])
+        with self.assertRaises(ItemsError):
+            self.b.tx(LANE).resolve(1, "answer", message="again")
+        with self.assertRaises(ItemsError):
+            self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="next?")
+            self.b.tx(LANE).resolve(1, "answer", message="")
+
+    def test_blocked_by_is_not_allowed_with_it(self):
+        self.b.create("other")
+        with self.assertRaises(ItemsError):
+            self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="x", blocked_by=[2])
+
+
 class Resolve(unittest.TestCase):
     def setUp(self):
         self.b = Board()

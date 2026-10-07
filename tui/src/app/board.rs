@@ -378,6 +378,8 @@ impl App {
                         'a' => Some("active"),
                         'w' => None,
                         'b' => Some("blocked"),
+                        // Owner marks an item as waiting on their own decision.
+                        'O' => Some("blocked_on_owner"),
                         'd' => Some("done"),
                         _ => None,
                     };
@@ -603,6 +605,13 @@ impl App {
         let sep = || Span::styled(" \u{00b7} ", Style::default().fg(theme::DIM));
         let health = &header["health"];
         let unresolved = health["unresolved"].as_i64().unwrap_or(0);
+        // Decisions waiting on Owner come first in the banner.
+        let owner = health["blocked_on_owner"].as_i64().unwrap_or(0);
+        if owner > 0 {
+            spans.push(sep());
+            let (glyph, style) = self.owner_indicator();
+            spans.push(Span::styled(format!("{glyph} {owner} blocked on Owner"), style));
+        }
         spans.push(sep());
         if unresolved > 0 {
             let oldest = health["oldest_s"].as_i64().map(|s| format!(" oldest {}", age(s))).unwrap_or_default();
@@ -636,10 +645,15 @@ impl App {
             Span::styled(if selected { "\u{25b6} " } else { "  " }, Style::default().fg(theme::TEXT)),
             Span::styled(format!("{:>4} ", format!("#{}", item["n"])), fade(Style::default().fg(theme::MUTED))),
             Span::styled(pad(&badge, cols.badge), fade(badge_style)),
-            Span::styled(
-                if flagged { "\u{2691} " } else { "  " },
-                Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
-            ),
+            if flagged {
+                Span::styled("\u{2691} ", Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD))
+            } else if item["status"] == "blocked_on_owner" && !closed {
+                // Just below a flag: the alternating Owner diamond.
+                let (glyph, style) = self.owner_indicator();
+                Span::styled(format!("{glyph} "), style)
+            } else {
+                Span::raw("  ")
+            },
             Span::styled(
                 pad(&truncate(item["title"].as_str().unwrap_or(""), cols.title), cols.title + 1),
                 fade(Style::default().fg(theme::TEXT)),
@@ -716,7 +730,11 @@ impl App {
             meta.push(format!("blocked by {}", bb.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ")));
         }
         if let Some(on) = item["blocked_on"].as_str().filter(|s| !s.is_empty()) {
-            meta.push(format!("blocked on: {on}"));
+            if item["status"] == "blocked_on_owner" {
+                meta.push(format!("Owner decision: {on}"));
+            } else {
+                meta.push(format!("blocked on: {on}"));
+            }
         }
         if let Some(eta) = item["eta_at"].as_str() {
             meta.push(format!("eta {}", eta.get(11..16).unwrap_or(eta)));
@@ -764,7 +782,7 @@ impl App {
         if let Some(menu) = b.menu {
             return Line::styled(
                 match menu {
-                    Menu::Status => "Status: o open \u{00b7} a active \u{00b7} w waiting \u{00b7} b blocked \u{00b7} d done",
+                    Menu::Status => "Status: o open \u{00b7} a active \u{00b7} w waiting \u{00b7} b blocked \u{00b7} O on Owner \u{00b7} d done",
                     Menu::Resolve => "Resolve flag: 1 nudge \u{00b7} 2 reassign \u{00b7} 3 block \u{00b7} 4 drop",
                 },
                 bold,
@@ -850,6 +868,7 @@ fn status_badge(item: &Value, now: i64) -> (String, Style) {
             None => ("WAITING".into(), bold(theme::HEADER)),
         },
         "blocked" => ("BLOCKED".into(), bold(theme::ATTN)),
+        "blocked_on_owner" => ("OWNER".into(), super::owner_blocked::owner_style()),
         "open" => ("OPEN".into(), Style::default().fg(theme::MUTED)),
         "done" => ("DONE".into(), Style::default().fg(theme::DIM)),
         "dropped" => ("DROPPED".into(), Style::default().fg(theme::DIM)),
@@ -897,7 +916,7 @@ fn status_counts(items: &[Value]) -> String {
             None => counts.push((s, 1)),
         }
     }
-    let order = ["active", "waiting", "blocked", "open"];
+    let order = ["blocked_on_owner", "active", "waiting", "blocked", "open"];
     counts.sort_by_key(|(k, _)| order.iter().position(|o| o == k).unwrap_or(order.len()));
     if counts.is_empty() {
         return "no open items".into();
@@ -905,7 +924,11 @@ fn status_counts(items: &[Value]) -> String {
     let total: usize = counts.iter().map(|(_, n)| n).sum();
     format!(
         "{total} open: {}",
-        counts.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(" \u{00b7} ")
+        counts
+            .iter()
+            .map(|(k, n)| format!("{n} {}", if k == "blocked_on_owner" { "blocked on Owner" } else { k }))
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ")
     )
 }
 
@@ -1085,6 +1108,28 @@ mod tests {
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn blocked_on_owner_gets_badge_diamond_banner_and_counts_first() {
+        for width in [100u16, 160] {
+            let mut app = test_app();
+            loaded(&mut app);
+            let mut data = app.board.data.clone();
+            data["board"]["health"]["blocked_on_owner"] = json!(1);
+            data["items"][2]["status"] = json!("blocked_on_owner");
+            data["items"][2]["blocked_on"] = json!("approve 8xH100?");
+            app.board.accept(data);
+            let out = screen_at(&mut app, width, 30);
+            assert!(out.contains("1 blocked on Owner"), "banner:\n{out}");
+            let row = out.lines().find(|l| l.contains("needs EP GO")).expect("row");
+            assert!(row.contains("OWNER"), "{row}");
+            assert!(row.contains('\u{25c7}') || row.contains('\u{25c6}'), "diamond cell: {row}");
+            assert!(out.contains("1 blocked on Owner \u{00b7} "), "counts list it first:\n{out}");
+        }
+        let (badge, style) = status_badge(&json!({"status": "blocked_on_owner"}), 0);
+        assert_eq!(badge, "OWNER");
+        assert_eq!(style.fg, Some(theme::OWNER_BLOCKED));
     }
 
     #[test]
