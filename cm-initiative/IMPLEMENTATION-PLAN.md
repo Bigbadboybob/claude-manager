@@ -201,7 +201,7 @@ reviews, merges to main and deploys (hub first).
 | W2b heartbeat + push delivery | items | reviewed PASS (+fixes) | 8411958, baee959 | API+018 cm-manager 23:40Z; brains cm-manager 23:44Z, cm-sessions 23:52Z; heartbeats 200 |
 | W2c flag engine | items | reviewed PASS (+fixes) | 5fb76eb, bf1bf7c | pending big deploy |
 | Prompt confirmation (start_session) | state-core | reviewed PASS (2 review rounds) | 376ff8c, dcf6399, 3025127 (merge 1dc3a2e) | pending big deploy |
-| W3d report_done held items + pokes | items | in progress | | |
+| W3d report_done held items + pokes | items | reviewed PASS | 78d543f | pending big deploy |
 | W3f TUI state glyphs + board overlay; W4c docs | msgfix | in progress | | |
 | W3a/W3b/W3c hooks + consumers | state-core | queued | | |
 | W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | cm-manager + cm-sessions 23:20Z; Claude sessions on source=presence |
