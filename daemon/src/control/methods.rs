@@ -2944,9 +2944,21 @@ pub fn session_turn_ended(
         session.input_handle().stamp_activity();
     } else {
         session.stamp_turn_end();
+        // Legacy Stop remains the fallback during rollout/restart or a
+        // rejected rich payload. Record its boundary in the core too, so an
+        // earlier hook prompt cannot leave a hooks-only session Working.
+        if session.session_type == "claude-code" {
+            let _ = session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).apply(
+                crate::agent_state::Report::Hook {
+                    event: crate::agent_state::HookEvent::Stop,
+                    payload: crate::agent_state::HookPayload::default(),
+                }, crate::agent_state::unix_now(),
+            );
+        }
     }
     let native_codex = session.session_type == "codex";
     rebind_reported_transcript(&mut state, &p.session_uid, p.transcript_path.as_deref());
+    crate::agent_state::recompute_and_publish(&state, &p.session_uid);
     drop(state);
     if native_codex {
         // The native launcher reports the selected thread immediately. The
@@ -7613,7 +7625,9 @@ fn spawn_initial_prompt_delivery(
                     transcript = super::codex_delivery::DeliveryEvidence::capture_launch(
                         &state, &uid, &body,
                     );
-                    ticket.lock().unwrap_or_else(|p| p.into_inner()).attempts = 1;
+                    let mut receipt = ticket.lock().unwrap_or_else(|p| p.into_inner());
+                    receipt.attempts = 1;
+                    receipt.turn_seq_before = captured.as_ref().map(|(_, _, baseline)| baseline.turn_seq);
                 };
                 if !deliver_agent_body_inner(
                     &handle,
@@ -33475,6 +33489,30 @@ while True:
         state.lock().unwrap().restarting = true;
         assert_eq!(session_agent_report(&state, &params, Some(uid)).unwrap_err().0, ErrorCode::Conflict);
         state.lock().unwrap().restarting = false;
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn legacy_stop_closes_core_turn_after_rich_report_rejection() {
+        let state = make_state_arc();
+        let uid = "ts-stop-fallback-core";
+        insert_session(&state, uid, "ws-state");
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
+        let now = now_unix_f64();
+        session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
+            "event":"UserPromptSubmit", "payload":{"observed_at":now - 2.0}}), Some(uid)).unwrap();
+        assert_eq!(session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
+            "event":"Stop", "payload":{"observed_at":now, "background":{"jobs":[{}]}}}), Some(uid))
+            .unwrap_err().0, ErrorCode::InvalidParams);
+        session_turn_ended(&state, &json!({"session_uid":uid}), Some(uid)).unwrap();
+        {
+            let st = state.lock().unwrap();
+            let mut cell = st.sessions[uid].agent_state.lock().unwrap();
+            let current = cell.recompute(now_unix_f64() + 2.0);
+            assert_eq!(current.state, crate::agent_state::State::Idle);
+            assert_eq!(current.last_turn.status, Some(crate::agent_state::TurnStatus::Completed));
+            assert!(current.last_turn.ended_at.unwrap() >= now);
+        }
         kill_all_sessions(&state);
     }
 

@@ -15,6 +15,8 @@ pub struct Receipt {
     pub attempts: u8,
     pub confirmed_by: Option<&'static str>,
     pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_seq_before: Option<u64>,
 }
 pub type Ticket = Arc<Mutex<Receipt>>;
 impl Receipt {
@@ -26,6 +28,7 @@ impl Receipt {
             attempts: 0,
             confirmed_by: None,
             reason: None,
+            turn_seq_before: None,
         }))
     }
 }
@@ -107,7 +110,7 @@ pub(super) struct LaunchWrite {
 
 pub(super) struct Baseline {
     pub at: f64,
-    turn_seq: u64,
+    pub(super) turn_seq: u64,
     relay_seq: Option<u64>,
     relay_start: Option<f64>,
     hook_prompt: Option<f64>,
@@ -198,6 +201,16 @@ mod tests {
         let receipt = ticket.lock().unwrap();
         assert!(!receipt.submitted);
         assert_eq!(receipt.status, "unconfirmed");
+    }
+
+    #[test]
+    fn confirmed_receipt_retains_the_counter_before_the_launch_write() {
+        let ticket = Receipt::pending();
+        ticket.lock().unwrap().turn_seq_before = Some(4);
+        finish(&ticket, Ok("relay"));
+        let receipt = serde_json::to_value(ticket.lock().unwrap().clone()).unwrap();
+        assert_eq!(receipt["turn_seq_before"], 4);
+        assert_eq!(receipt["submitted"], true);
     }
 
     #[test]

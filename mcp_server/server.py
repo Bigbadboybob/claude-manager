@@ -1898,14 +1898,19 @@ async def start_session(
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     interval = max(0.5, min(poll_interval_s, 30.0))
     grace = max(1.0, min(pending_idle_grace_s, 60.0))
-    # Fresh session: no transcript bound yet, so anchor on None — every
-    # assistant message it writes is the reply. `_await_reply` picks up the
-    # transcript path the moment the detector binds it.
+    # The receipt captures the counter before the launch body is written.
+    # Anchor there even after confirmation, retaining a fast completed launch
+    # turn while rejecting startup idle. Old receipts use a fresh counter of 0.
+    # Legacy engines still use their initial transcript cursor.
     res = await _await_reply(
         session_uid,
         engine="claude-code", transcript_path=None,
         anchor_cursor=None, generation=0,
         deadline=deadline, interval=interval, grace=grace,
+        agent_baseline=({"kind": "agent", "value": (
+            launch_receipt.get("turn_seq_before", 0)
+            if isinstance(launch_receipt, dict) else 0
+        )} if delivered_a_prompt else None),
     )
     res["session_uid"] = session_uid
     if schema is not None:
@@ -2621,7 +2626,9 @@ async def wait_for_session_idle(
 
     With agent_state, engine evidence governs the wait: idle, needs_human,
     errored, or working-background after a foreground turn end can return.
-    Working, starting and unknown keep waiting even with idle=True. Results
+    Working and starting keep waiting even with idle=True. Unknown returns
+    only when explicit pty_idle=True, preserving status=unknown and labeling
+    idle_source=pty; reply/edge monitors do not use that exception. Results
     include agent_state and pty_idle; a human wait or error is not finished work.
     Legacy PTY/transcript fallback retains the quietness behavior below.
 
@@ -2679,6 +2686,13 @@ async def wait_for_session_idle(
             }, resolved)
         engine_done = engine_turn_complete(resolved)
         if engine_done is not None:
+            if ((engine_state(resolved) or {}).get("state") == "unknown"
+                    and resolved.get("pty_idle") is True):
+                return _with_outcome({
+                    "idle": True, "timed_out": False, "state": state,
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+                    "idle_source": "pty",
+                }, resolved)
             if engine_done or now >= deadline:
                 return _with_outcome({
                     "idle": engine_done, "timed_out": not engine_done, "state": state,

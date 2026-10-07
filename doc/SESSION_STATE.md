@@ -103,7 +103,7 @@ The same receipt is available through `resolve_authorized_session`:
 ```text
 {id: UUID, status: pending | confirmed | delivered | unconfirmed, submitted: bool,
  attempts: 0 | 1 | 2, confirmed_by: relay | hooks | presence | transcript | write | null,
- reason: string | null}
+ reason: string | null, turn_seq_before?: u64}
 ```
 
 The MCP tool's default `wait=false` returns promptly after the daemon accepts
@@ -122,7 +122,10 @@ new main-thread user text counts even if the engine expanded or normalized it;
 sidechain, metadata and tool-result rows do not. Codex retains exact matching.
 CM's own `turn_seq` increment and PTY repaint alone do not confirm. Slash commands
 are `delivered` after body plus Enter (`confirmed_by=write`), without requiring a
-model turn; their monitor remains armed.
+model turn; their monitor remains armed. `turn_seq_before` captures the counter
+immediately before the launch write. A blocking launch wait anchors there so
+startup idle cannot stand in for the launch turn; older receipts use the fresh
+session's zero counter when engine state is available.
 
 Delivery restores the existing typing-quiet wait. Recognized terminal query
 replies, mouse/focus and navigation do not count as typing; drafts and submits
@@ -177,8 +180,9 @@ Hook payloads use the normalized fields above; hook adapters translate
 engine-specific fields. `observed_at` defaults to receipt time; adapters should
 capture it at the event so delayed hooks retain their order. `prompt_id` suppresses
 duplicate prompt submissions. Notification edges apply only to
-`permission_prompt`, `elicitation_dialog` and `idle_prompt`; unrelated notices
-are ignored. A Stop with `continuing=true` starts another turn instead of
+`permission_prompt` and `elicitation_dialog`; `idle_prompt` is an idle reminder,
+not a human wait, and is ignored (including old persisted idle-reminder edges).
+A Stop with `continuing=true` starts another turn instead of
 advertising semantic idle. Transcript rebinding retains the existing containment
 check against the session's workspace.
 
@@ -226,7 +230,9 @@ text, `stop_hook_active` and `continuing` through `session.agent_report`. A
 method-not-found, conflict (including brain restart), or invalid-params reply
 enables the legacy `session.turn_ended` fallback; transport and authorization
 failures do not. A partial payload missing the shared helper sends the legacy
-report inline. Accepted continuation reports refresh legacy activity even when
+report inline. A legacy Claude Stop also records its boundary in the core,
+so rejected rich metadata cannot leave a hooks-only session working.
+Accepted continuation reports refresh legacy activity even when
 a newer engine start already opened the turn. The report is best
 effort and fails open. New UserPromptSubmit, StopFailure, PermissionRequest and
 Notification hooks run asynchronously and double-fork before daemon IPC. They
@@ -262,7 +268,11 @@ include the engine detail and a notification caveat; `needs_human` is not done.
 
 A turn wait returns on engine idle, error, human wait, or background work after
 a recorded foreground turn end. Working, starting and unknown keep waiting
-even when the compatibility `idle` bit is true. Explicit `source=pty` or
+even when the compatibility `idle` bit is true. The single-session
+`wait_for_session_idle` has a narrow exception: unknown with explicit
+`pty_idle=true` returns idle with `status=unknown`, `idle_source=pty` and the
+unchanged engine observation. Reply/edge monitors do not take that exception.
+Explicit `source=pty` or
 `transcript` observations and old daemons retain the existing transcript/PTY
 path. Transcript content is still read to return messages; it cannot override
 an engine working/unknown state to complete a wait.
@@ -270,8 +280,10 @@ an engine working/unknown state to complete a wait.
 Edge monitors anchor on `turn_seq`. Arming during `working` includes the current
 turn; arming at a boundary requires a later turn. A new engine `last_turn.ended_at`
 also passes an unchanged counter for older Claude sessions that lack a prompt
-hook on machine-injected starts. Receipt/heartbeat timestamps never count. A source upgrade re-anchors
-old transcript baselines to engine counters. Send-and-wait captures the counter
+hook on machine-injected starts. Receipt/heartbeat timestamps never count. On a
+source upgrade the current transcript is checked against the old edge once,
+so the watched turn's first Stop is retained, then counters replace the baseline.
+Send-and-wait captures the counter
 before sending, so an old reply cannot satisfy the new request. Errors or human
 waits can return without assistant text. Schema correction does not send another
 prompt while the engine needs attention. `until=final` still requires an explicit
@@ -293,6 +305,11 @@ native wake delivery and frontend forwarding continue. An old daemon without
 `session.agent_report` receives ordered legacy turn edges; capability retries
 back off from one to ten minutes. Optional `transcript_path` triggers the existing
 ownership scan on path changes; heartbeats alone do not repeat that scan.
+
+Input queued by CM keeps a relay session working until the relay observes a
+turn start or completion at least as new as that input. A later idle heartbeat
+alone cannot close the 2.5–4 second PTY delivery gap, even though CM has already
+incremented the session counter. Disconnected/stale relays remain unknown.
 
 Background terminals are polled after turn completion and every 30 seconds with
 pagination. A method-not-found response disables polling; failures, incomplete

@@ -573,10 +573,15 @@ async def _monitor_sessions(
             done = False
             status_override = None
             engine_done = engine_turn_complete(resolved)
+            legacy_edge_passed = False
             if engine_done is not None and baselines and uid in baselines:
                 if baselines[uid].get("kind") != "agent":
                     # An MCP reconnect/source upgrade cannot compare engine
-                    # counters with an old transcript fingerprint. Re-anchor.
+                    # counters with an old transcript fingerprint. Honor a
+                    # watched turn's own first Stop before adopting counters.
+                    legacy_edge_passed = await asyncio.to_thread(
+                        _edge_passed, baselines[uid], engine, tpath
+                    )
                     baselines[uid] = baseline_for(engine, tpath, resolved)
             if state == "exited":
                 done = True
@@ -618,7 +623,7 @@ async def _monitor_sessions(
             edge_ok = True
             if done and state != "exited" and baselines:
                 b = baselines.get(uid)
-                if b is not None and not await asyncio.to_thread(
+                if b is not None and not legacy_edge_passed and not await asyncio.to_thread(
                     _edge_passed, b, engine, tpath, resolved
                 ):
                     edge_ok = False

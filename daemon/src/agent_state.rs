@@ -373,6 +373,11 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             && p.status != PresenceStatus::Unknown
             && start.is_some_and(|at| at > p.status_updated_at && now - at < 10.0)
     });
+    // A relay heartbeat is a receipt time, not evidence that queued PTY input
+    // reached the engine. Keep the delivery gap open until a real turn edge.
+    let relay_input_pending = relay.is_some_and(|r| {
+        newer(start, max_time(r.turn_started_at, r.last_turn.ended_at))
+    });
     let state = if input.exited {
         entered = now;
         State::Exited
@@ -389,7 +394,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             .filter(|r| r.backend_connected)
             .map_or(observed_at, |r| r.observed_at + 90.0);
         State::Unknown
-    } else if presence_input_pending {
+    } else if presence_input_pending || relay_input_pending {
         entered = start.unwrap_or(observed_at);
         State::Working
     } else if source.engine_reported() {
@@ -406,7 +411,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                 .iter()
                 .find(|f| matches!(f.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
         });
-        let hook_wait = newer(
+        let hook_wait = hooks.waiting_for.as_deref() != Some("idle_prompt") && newer(
             hooks.waiting_at,
             max_time(start, max_time(hooks.stop_at, hooks.failure_at)),
         );
@@ -768,7 +773,7 @@ impl StateCell {
                         if matches!(event, HookEvent::Notification)
                             && !matches!(
                                 payload.notification_type.as_deref(),
-                                Some("permission_prompt" | "elicitation_dialog" | "idle_prompt")
+                                Some("permission_prompt" | "elicitation_dialog")
                             )
                         {
                             return Ok(applied);
@@ -1876,6 +1881,51 @@ mod tests {
         .unwrap();
         assert_eq!(c.recompute(948.0).state, State::Working);
         assert_eq!(c.inputs.turn_seq, 3);
+    }
+
+    #[test]
+    fn relay_idle_heartbeats_cannot_complete_queued_input() {
+        let mut c = StateCell::new(0.0, None);
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let mut snapshot = RelaySnapshot {
+            backend_connected: true, foreground: RelayStatus::Idle,
+            turn_seq: 1, turn_started_at: Some(90.0),
+            last_turn: LastTurn { ended_at: Some(95.0), status: Some(TurnStatus::Completed) },
+            ..Default::default()
+        };
+        c.apply(report(&epoch, 1, snapshot.clone()), 99.0).unwrap();
+        c.note_input(100.0);
+        for (seq, at) in [(2, 101.0), (3, 104.0), (4, 160.0)] {
+            c.apply(report(&epoch, seq, snapshot.clone()), at).unwrap();
+            let state = c.recompute(at);
+            assert_eq!(state.state, State::Working, "heartbeats cannot end a pending input");
+            assert_eq!(state.turn_seq, 2);
+        }
+        snapshot.turn_seq = 2;
+        snapshot.turn_started_at = Some(161.0);
+        snapshot.last_turn = LastTurn { ended_at: Some(162.0), status: Some(TurnStatus::Completed) };
+        c.apply(report(&epoch, 5, snapshot), 164.0).unwrap();
+        let state = c.recompute(164.0);
+        assert_eq!(state.state, State::Idle);
+        assert_eq!(state.turn_seq, 2);
+    }
+
+    #[test]
+    fn idle_prompt_is_not_a_human_wait_including_restored_edges() {
+        let mut c = StateCell::new(0.0, None);
+        c.apply(hook(HookEvent::UserPromptSubmit, 900.0), 900.0).unwrap();
+        c.apply(hook(HookEvent::Stop, 910.0), 910.0).unwrap();
+        let notice = |kind: &str, at: f64| Report::Hook {
+            event: HookEvent::Notification,
+            payload: HookPayload { observed_at: Some(at), notification_type: Some(kind.into()), ..Default::default() },
+        };
+        assert!(!c.apply(notice("idle_prompt", 970.0), 970.0).unwrap().accepted);
+        assert_eq!(c.recompute(970.0).state, State::Idle);
+        c.inputs.hooks.waiting_at = Some(970.0);
+        c.inputs.hooks.waiting_for = Some("idle_prompt".into());
+        assert_eq!(c.recompute(975.0).state, State::Idle, "old sidecar observations must not retain the false wait");
+        c.apply(notice("permission_prompt", 980.0), 980.0).unwrap();
+        assert_eq!(c.recompute(980.0).state, State::WaitingOnHuman);
     }
 
     #[test]

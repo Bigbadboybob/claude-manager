@@ -138,7 +138,7 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
         for state in ("working", "unknown", "starting", "future"):
             with (
                 self.subTest(state=state),
-                patch.object(control_client, "call", return_value=observed(state)),
+                patch.object(control_client, "call", return_value=dict(observed(state), pty_idle=False)),
                 patch.object(
                     monitor,
                     "transcript_turn_complete",
@@ -349,7 +349,7 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(result["result"])
             self.assertTrue(result["schema_error"])
 
-    async def test_source_upgrade_reanchors_legacy_edge_without_transcript_inference(
+    async def test_source_upgrade_checks_legacy_edge_once_then_adopts_engine_counters(
         self,
     ):
         baselines = {"ts-test": {"kind": "turn", "value": "old-fingerprint"}}
@@ -362,14 +362,37 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 monitor,
                 "last_completed_turn_fingerprint",
-                side_effect=AssertionError("legacy inference"),
-            ),
+                return_value="old-fingerprint",
+            ) as legacy,
         ):
             result = await monitor._monitor_sessions(
                 ["ts-test"], baselines=baselines, timeout_s=2, poll_interval_s=0.5
             )
+        legacy.assert_called_once()
         self.assertEqual(baselines["ts-test"], {"kind": "agent", "value": 3, "ended_at": 20.0})
         self.assertEqual(result["completed"][0]["status"], "awaiting_input")
+
+    async def test_first_engine_stop_keeps_the_completion_that_passed_legacy_edge(self):
+        baselines = {"ts-test": {"kind": "turn", "value": "old-turn"}}
+        with patch.object(control_client, "call", return_value=observed("idle", seq=0)), \
+                patch.object(monitor, "last_completed_turn_fingerprint", return_value="new-turn") as legacy:
+            result = await monitor._monitor_sessions(["ts-test"], baselines=baselines, timeout_s=1)
+        legacy.assert_called_once()
+        self.assertEqual(result["completed"][0]["status"], "awaiting_input")
+        self.assertEqual(baselines["ts-test"]["kind"], "agent")
+
+    async def test_unknown_quiet_pty_exception_is_limited_to_single_idle_wait(self):
+        value = observed("unknown", idle=True)
+        with patch.object(control_client, "call", return_value=value):
+            single, many = await asyncio.gather(
+                server.wait_for_session_idle("ts-test", timeout_s=1),
+                monitor._monitor_sessions(["ts-test"], timeout_s=1, poll_interval_s=.5))
+        self.assertTrue(single["idle"])
+        self.assertFalse(single["timed_out"])
+        self.assertEqual(single["status"], "unknown")
+        self.assertEqual(single["idle_source"], "pty")
+        self.assertEqual(single["agent_state"]["state"], "unknown")
+        self.assertTrue(many["timed_out"])
 
 
 if __name__ == "__main__":
