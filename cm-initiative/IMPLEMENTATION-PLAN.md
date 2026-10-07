@@ -281,3 +281,8 @@ viewer input, forced 401 → errored, unknown on missing status / relay expiry +
 confirmation, /clear and /new → no_turn, async monitors, both native forks (post-hotfix).
 Not covered live: brain-restart sidecar restore, 900 s stall threshold, Codex 0.153.4,
 approvals, automatic Codex terminal wake. Board smoke test PASS (items). All lanes on standby.
+Merged-not-deployed (next batch): d6a4c39 (board never auto-picks bash as orchestrator),
+58cb050 (fork starts with no initial prompt; Codex pre-trust now runs for launcher/holder
+spawns, which fixes the folder-trust dialog on Codex forks and fresh worktrees). Board visual
+pass (msgfix) in progress. Live board settings: sejd board orchestrator_pid=EP,
+holder_idle_enabled=true (19:00Z).
