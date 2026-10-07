@@ -763,7 +763,9 @@ def split_args(args, permissions=None):
             # A fork runs in a NEW worktree; without this the frontend stops
             # at a "Working directory · fork" picker whose default is the
             # SOURCE session's directory (verified on codex-cli 0.160.1).
-            frontend.extend(["-c", 'tui.resume_cwd="current"'])
+            # With --remote, "current" must be explicit: the frontend cannot
+            # infer which directory the remote backend should use.
+            frontend.extend(["-c", 'tui.resume_cwd="current"', "--cd", os.getcwd()])
         frontend.extend([subcommand, resume])
     if permissions is not None:
         # The remote resume frontend rejects permission flags. Set the backend

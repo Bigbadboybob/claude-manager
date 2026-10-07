@@ -77,10 +77,12 @@ class CodexResumeArgsTests(unittest.TestCase):
     def test_fork_is_shaped_like_resume(self):
         # CM fork-into-a-task: `fork <id>` reaches the remote frontend as
         # a fork, never a resume, with no permission flag on the frontend.
-        backend, frontend = split_args(["fork", "-c", "x=1", "--no-alt-screen", "src-thread"])
+        with patch("mcp_server.native_codex.os.getcwd", return_value="/work/fork with spaces"):
+            backend, frontend = split_args(["fork", "-c", "x=1", "--no-alt-screen", "src-thread"])
         # The fork runs in its new worktree, never the source's directory.
         self.assertEqual(frontend, [
-            "--no-alt-screen", "-c", 'tui.resume_cwd="current"', "fork", "src-thread",
+            "--no-alt-screen", "-c", 'tui.resume_cwd="current"',
+            "--cd", "/work/fork with spaces", "fork", "src-thread",
         ])
         self.assertEqual(backend, ["-c", "x=1"])
         policy = {"approvalPolicy": "never", "approvalsReviewer": "user",
