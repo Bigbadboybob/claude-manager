@@ -23,6 +23,7 @@ agent_state = {
   observed_at: unix_s,
   engine_version?: string,
   turn_seq: u64,
+  latest_start_at?: unix_s,
   last_turn: {ended_at: unix_s | null,
               status: completed | interrupted | failed | null},
   background: {
@@ -48,6 +49,10 @@ source observation time. Unobserved turn/background times are null, not zero.
 
 `turn_seq` increases on each new turn start (prompt submit, relay `turn/started`,
 or accepted agent `send_input`); viewer navigation and drafts are not turns.
+`latest_start_at` is the newest accepted input or engine start. It remains set
+when a delivery hold expires: idle then describes the engine, while
+`last_turn.ended_at < latest_start_at` (or no end) means that accepted input has
+not completed. Old brains omit the field.
 `last_turn` describes the most recent ended turn, including interruption or
 failure, independently of the current state. A done report remains the separate
 `reported_done` signal: an idle session has not necessarily finished its work.
@@ -268,7 +273,10 @@ Session listings, reads, waits and monitor results expose `agent_state` and
 include the engine detail and a notification caveat; `needs_human` is not done.
 
 A turn wait returns on engine idle, error, human wait, or background work after
-a recorded foreground turn end. Working, starting and unknown keep waiting
+a recorded foreground turn end. Idle/background states with `latest_start_at`
+require an end at least as new as that start; an escaped delivery hold cannot
+complete a watch or return an old reply just because `turn_seq` advanced.
+Working, starting and unknown keep waiting
 even when the compatibility `idle` bit is true. The single-session
 `wait_for_session_idle` has a narrow exception: unknown with explicit
 `pty_idle=true` returns idle with `status=unknown`, `idle_source=pty` and the
@@ -298,9 +306,14 @@ changes. The continuation follow-up also needs the updated daemon brain.
 ## Daemon consumers (S7)
 
 Continuous drain notices require engine idle or errored; final drain completion
-also requires a turn end at or after `report_done`. Foreground/background work,
-human waits and unknown hold the drain. Legacy sessions retain their old checks;
-Codex retains the bounded transcript fallback after 90 seconds of relay loss.
+also requires a turn end at or after `report_done`. Notice delivery requires
+a turn end after the latest accepted input/start, including after an idle hold
+expires, to avoid pasting onto a prompt parked in the composer. Foreground/background
+work, human waits and unknown initially hold the drain. Legacy sessions retain
+their old checks. Both Codex relay loss and Claude unknown state permit a bounded transcript
+fallback after 90 seconds. Claude requires a timestamped turn-duration or
+terminal assistant record after the latest input/report and rejects newer
+substantive, unknown or partial records. Its public state stays unknown.
 `daemon.health.sessions_mid_turn` counts foreground and background engine work,
 falling back to semantic idle only without an engine source.
 

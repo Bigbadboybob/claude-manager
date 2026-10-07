@@ -13961,7 +13961,7 @@ pub(crate) fn capture_drain_sessions(
 ) -> Vec<crate::continuous::drain::SessionObservation> {
     use crate::continuous::drain::SessionObservation;
     let Some(drain) = task.drain.as_ref() else { return Vec::new(); };
-    let mut codex_checks = Vec::new();
+    let mut transcript_checks = Vec::new();
     let mut sessions = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let mut uids = std::collections::HashSet::new();
@@ -13998,24 +13998,18 @@ pub(crate) fn capture_drain_sessions(
             let orchestrator = drain.session_uid.as_deref() == Some(&uid);
             if let Some(s) = state.sessions.get(&uid) {
                 let done = s.reported_done();
-                if s.session_type == "codex" {
-                    if let Some(report) = &done {
-                        let finished = crate::continuous::completion::codex_drain_relay_finished_after(
-                            &s.agent_state.lock().unwrap_or_else(|p| p.into_inner()),
-                            report.at_unix, now_unix_f64());
-                        codex_checks.push((uid.clone(), s.transcript_path.clone(), report.at_unix, finished));
-                    }
-                }
                 let end = *s.last_turn_end_at.lock().unwrap_or_else(|p| p.into_inner());
                 let agent = crate::agent_state::current(s);
-                let final_turn_ended = done.as_ref().is_some_and(|r| {
-                    if agent.source.engine_reported() {
-                        matches!(agent.state, crate::agent_state::State::Idle | crate::agent_state::State::Errored)
-                            && agent.last_turn.ended_at.is_some_and(|at| at >= r.at_unix)
-                    } else {
-                        end.is_some_and(|e| e >= r.at_instant)
-                    }
-                });
+                if let Some(report) = &done {
+                    let after = report.at_unix.max(agent.latest_start_at.unwrap_or(0.0));
+                    let finished = if s.session_type == "codex" {
+                        crate::continuous::completion::codex_drain_relay_finished_after(
+                            &s.agent_state.lock().unwrap_or_else(|p| p.into_inner()), after, now_unix_f64())
+                    } else if s.session_type == "claude-code" && agent.source.engine_reported() {
+                        crate::continuous::completion::claude_drain_state_finished_after(&agent, after, now_unix_f64())
+                    } else { Some(end.is_some_and(|e| e >= report.at_instant)) };
+                    transcript_checks.push((uid.clone(), s.session_type.clone(), s.transcript_path.clone(), after, finished));
+                }
                 observations.push(SessionObservation {
                     session_uid: uid,
                     orchestrator,
@@ -14025,7 +14019,7 @@ pub(crate) fn capture_drain_sessions(
                     last_input_at: s.last_input_at.lock().unwrap_or_else(|p| p.into_inner())
                         .map(|at| now_unix_f64() - at.elapsed().as_secs_f64()),
                     failed: s.last_exit.operator_kill_requested(),
-                    final_turn_ended,
+                    final_turn_ended: false,
                 });
             } else if let Some(tomb) = state.exited_tombstone(&uid) {
                 observations.push(SessionObservation {
@@ -14043,10 +14037,13 @@ pub(crate) fn capture_drain_sessions(
         observations.sort_by(|a, b| a.session_uid.cmp(&b.session_uid));
         observations
     };
-    for (uid, path, after, relay_finished) in codex_checks {
+    for (uid, engine, path, after, finished) in transcript_checks {
         if let Some(session) = sessions.iter_mut().find(|s| s.session_uid == uid) {
-            session.final_turn_ended = relay_finished.unwrap_or_else(|| path.is_some_and(|path|
-                crate::continuous::completion::codex_turn_finished_after(&path, after)));
+            session.final_turn_ended = finished.unwrap_or_else(|| path.is_some_and(|path| {
+                if engine == "claude-code" {
+                    crate::continuous::completion::claude_turn_finished_after(&path, after)
+                } else { crate::continuous::completion::codex_turn_finished_after(&path, after) }
+            }));
         }
     }
     sessions
@@ -31565,6 +31562,156 @@ while True:
             assert_eq!(continuous_pause(&state, &json!({"task_id": t.task_id, "paused": false, "expected_admission_revision": revision})).unwrap_err().0, ErrorCode::Conflict);
             assert_eq!(continuous_pause(&state, &json!({"task_id": t.task_id, "paused": false, "expected_drain_request_id": request})).unwrap_err().0, ErrorCode::Conflict);
             assert!(task::load_one(&t.task_id).unwrap().paused);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_drain_notice_rejects_parked_input_after_idle_escape() {
+        with_temp_home(|| {
+            use crate::agent_state::{
+                LastTurn, PresenceObs, PresenceStatus, RelaySnapshot, RelayStatus, State,
+            };
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            insert_session(&state, &uid, "ws-parked");
+            let now = now_unix_f64();
+            for engine in ["codex", "claude-code"] {
+                {
+                    let mut st = state.lock().unwrap();
+                    let session = st.sessions.get_mut(&uid).unwrap();
+                    session.session_type = engine.into();
+                    *session.last_input_at.lock().unwrap() =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(20));
+                    let mut cell = session.agent_state.lock().unwrap();
+                    cell.inputs.latest_start = Some(now - 20.0);
+                    cell.inputs.previous = None;
+                    cell.inputs.relay = (engine == "codex").then(|| RelaySnapshot {
+                        backend_connected: true,
+                        foreground: RelayStatus::Idle,
+                        observed_at: now,
+                        turn_started_at: Some(now - 40.0),
+                        last_turn: LastTurn {
+                            ended_at: Some(now - 30.0),
+                            status: Some(crate::agent_state::TurnStatus::Completed),
+                        },
+                        ..Default::default()
+                    });
+                    cell.inputs.presence = (engine == "claude-code").then(|| PresenceObs {
+                        valid: true,
+                        status: PresenceStatus::Idle,
+                        observed_at: now,
+                        status_updated_at: now - 30.0,
+                        engine_version: None,
+                        waiting_for: None,
+                        main_turn_open: Some(false),
+                        transcript_error: None,
+                    });
+                    cell.inputs.hooks.stop_at = Some(now - 30.0);
+                }
+                assert_eq!(
+                    crate::agent_state::current(&state.lock().unwrap().sessions[&uid]).state,
+                    State::Idle
+                );
+                assert!(
+                    !crate::control::continuous_drain::notice_ready(&state, &uid),
+                    "{engine}: parked input must not receive a second pasted prompt"
+                );
+                {
+                    let st = state.lock().unwrap();
+                    let mut cell = st.sessions[&uid].agent_state.lock().unwrap();
+                    if let Some(relay) = cell.inputs.relay.as_mut() {
+                        relay.last_turn.ended_at = Some(now - 10.0);
+                    }
+                    cell.inputs.hooks.stop_at = Some(now - 10.0);
+                }
+                assert!(
+                    crate::control::continuous_drain::notice_ready(&state, &uid),
+                    "{engine}: the accepted input's completed turn permits the notice"
+                );
+            }
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_unknown_claude_drain_uses_new_transcript_end_after_ninety_seconds() {
+        with_continuous_home(|home| {
+            use crate::agent_state::{PresenceObs, PresenceStatus, State};
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            let mut task = fresh_task_running("unknown-claude", home, &uid);
+            crate::continuous::drain::request(&mut task, crate::continuous::task::now_unix());
+            insert_continuous_session(&state, &uid, &task.task_id);
+            let path = home.join("unknown-claude.jsonl");
+            std::fs::write(
+                &path,
+                r#"{"timestamp":"2026-10-07T00:00:00.500Z","type":"system","subtype":"turn_duration"}"#,
+            )
+            .unwrap();
+            let ended = crate::workflow::history::iso8601_to_ms("2026-10-07T00:00:00.500Z").unwrap()
+                as f64
+                / 1000.0;
+            let now = now_unix_f64();
+            {
+                let mut st = state.lock().unwrap();
+                let session = st.sessions.get_mut(&uid).unwrap();
+                session.transcript_path = Some(path.to_string_lossy().into_owned());
+                session.stamp_reported_done(None);
+                session
+                    .done_report
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .at_unix = ended - 1.0;
+                *session.last_input_at.lock().unwrap() = None;
+                session.stamp_turn_end();
+                let mut cell = session.agent_state.lock().unwrap();
+                cell.inputs.latest_start = Some(ended - 2.0);
+                cell.inputs.presence = Some(PresenceObs {
+                    valid: false,
+                    status: PresenceStatus::Unknown,
+                    observed_at: now,
+                    status_updated_at: now,
+                    engine_version: None,
+                    waiting_for: None,
+                    main_turn_open: None,
+                    transcript_error: None,
+                });
+            }
+            assert!(!crate::control::continuous_drain::notice_ready(
+                &state, &uid
+            ));
+            assert!(!capture_drain_sessions(&state, &task)[0].final_turn_ended);
+            {
+                let st = state.lock().unwrap();
+                let mut cell = st.sessions[&uid].agent_state.lock().unwrap();
+                cell.inputs.previous.as_mut().unwrap().since = now - 91.0;
+            }
+            assert!(crate::control::continuous_drain::notice_ready(&state, &uid));
+            assert!(capture_drain_sessions(&state, &task)[0].final_turn_ended);
+            assert_eq!(
+                crate::agent_state::current(&state.lock().unwrap().sessions[&uid]).state,
+                State::Unknown
+            );
+            {
+                let st = state.lock().unwrap();
+                st.sessions[&uid]
+                    .agent_state
+                    .lock()
+                    .unwrap()
+                    .inputs
+                    .latest_start = Some(ended + 1.0);
+            }
+            assert!(
+                !crate::control::continuous_drain::notice_ready(&state, &uid),
+                "fallback cannot paste over a newer accepted input"
+            );
+            assert!(
+                !capture_drain_sessions(&state, &task)[0].final_turn_ended,
+                "fallback cannot reuse a transcript end from before the new input"
+            );
             kill_all_sessions(&state);
         });
     }

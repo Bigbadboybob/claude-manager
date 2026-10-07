@@ -381,6 +381,33 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["completed"][0]["status"], "awaiting_input")
         self.assertEqual(baselines["ts-test"]["kind"], "agent")
 
+    async def test_escaped_idle_cannot_complete_new_sequence_or_quote_old_reply(self):
+        escaped = observed("idle", seq=5, ended=20.0, source="relay")
+        escaped["agent_state"]["latest_start_at"] = 25.0
+        baseline = {"kind": "agent", "value": 4, "ended_at": 20.0}
+        with patch.object(control_client, "call", return_value=escaped):
+            result = await monitor._monitor_sessions(["ts-test"], baselines={"ts-test":baseline},
+                                                    timeout_s=.1, poll_interval_s=.05)
+            self.assertTrue(result["timed_out"])
+            self.assertEqual(result["completed"], [])
+            reply = await server._await_reply("ts-test", engine="codex", transcript_path=None,
+                anchor_cursor=None, generation=0, deadline=time.monotonic()+.1,
+                interval=.05, grace=0, agent_baseline=baseline)
+            self.assertTrue(reply["timed_out"])
+            self.assertFalse(reply["completed"])
+        for state in ["idle", "working-background"]:
+            ended = observed(state, seq=5, ended=30.0, source="relay")
+            ended["agent_state"]["latest_start_at"] = 25.0
+            self.assertTrue(monitor.engine_turn_complete(ended))
+            ended["agent_state"]["last_turn"]["ended_at"] = 20.0
+            self.assertFalse(monitor.engine_turn_complete(ended))
+        completed = observed("idle", seq=5, ended=30.0, source="relay")
+        completed["agent_state"]["latest_start_at"] = 25.0
+        with patch.object(control_client, "call", side_effect=[escaped, completed]):
+            result = await monitor._monitor_sessions(["ts-test"], baselines={"ts-test":baseline},
+                                                    timeout_s=2, poll_interval_s=.05)
+        self.assertEqual(result["completed"][0]["agent_state"]["last_turn"]["ended_at"], 30.0)
+
     async def test_brain_rollback_keeps_watch_pinned_to_pre_arm_legacy_turn(self):
         legacy = observed("idle")
         del legacy["agent_state"]

@@ -241,6 +241,85 @@ pub fn codex_turn_finished_after(path: &str, after: f64) -> bool {
     read() == Some(true)
 }
 
+/// Claude's drain fallback uses a bounded, strict tail read. Unlike a probe for
+/// error banners, unknown/malformed records must not reveal an older completion.
+pub fn claude_turn_finished_after(path: &str, after: f64) -> bool {
+    if !after.is_finite() {
+        return false;
+    }
+    let read = || -> Option<bool> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)))
+            .ok()?;
+        let mut bytes = Vec::new();
+        file.take(256 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 256 * 1024 {
+            return None;
+        }
+        let text = std::str::from_utf8(&bytes).ok()?;
+        for line in text
+            .lines()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(200)
+        {
+            let record: serde_json::Value = serde_json::from_str(line).ok()?;
+            if record.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+            let terminal = match record.get("type")?.as_str()? {
+                "system" => match record.get("subtype")?.as_str()? {
+                    "turn_duration" => true,
+                    "stop_hook_summary" => continue,
+                    _ => return Some(false),
+                },
+                "assistant" => matches!(
+                    record
+                        .pointer("/message/stop_reason")
+                        .and_then(|v| v.as_str()),
+                    Some("end_turn" | "stop_sequence")
+                ),
+                "file-history-snapshot" | "last-prompt" | "summary" | "attachment" | "progress" => {
+                    continue
+                }
+                _ => return Some(false),
+            };
+            if !terminal {
+                return Some(false);
+            }
+            let stamp = record.get("timestamp")?.as_str()?;
+            if !stamp.ends_with('Z') {
+                return None;
+            }
+            let ms = crate::workflow::history::iso8601_to_ms(stamp)?;
+            return Some(ms as f64 >= (after * 1000.0).ceil());
+        }
+        None
+    };
+    read() == Some(true)
+}
+
+/// None permits a transcript check only after a continuous 90s source outage.
+/// Engine state stays Unknown on the public surfaces during this drain escape.
+pub fn claude_drain_state_finished_after(
+    agent: &crate::agent_state::AgentState,
+    after: f64,
+    now: f64,
+) -> Option<bool> {
+    use crate::agent_state::State;
+    if agent.state == State::Unknown && now - agent.since > 90.0 {
+        return None;
+    }
+    Some(
+        after.is_finite()
+            && matches!(agent.state, State::Idle | State::Errored)
+            && agent.last_turn.ended_at.is_some_and(|end| {
+                end >= after && agent.latest_start_at.is_none_or(|start| start <= end)
+            }),
+    )
+}
+
 /// Drain keeps the short uncertainty hold, then resumes its existing bounded
 /// transcript check if the relay cannot provide usable evidence for 90 seconds.
 /// This does not change the UI's unknown state or scheduler recovery policy.
@@ -268,6 +347,70 @@ pub fn codex_drain_relay_finished_after(cell: &crate::agent_state::StateCell, af
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_drain_unknown_has_bounded_escape_and_strict_timestamped_tail() {
+        use crate::agent_state::{PresenceObs, PresenceStatus, StateCell};
+        let mut cell = StateCell::new(0.0, None);
+        cell.inputs.presence = Some(PresenceObs {
+            valid: false,
+            status: PresenceStatus::Unknown,
+            observed_at: 100.0,
+            status_updated_at: 100.0,
+            engine_version: None,
+            waiting_for: None,
+            main_turn_open: None,
+            transcript_error: None,
+        });
+        let initial = cell.recompute(100.0);
+        assert_eq!(
+            claude_drain_state_finished_after(&initial, 0.0, 190.0),
+            Some(false)
+        );
+        cell.inputs.presence.as_mut().unwrap().observed_at = 190.0;
+        let again = cell.recompute(190.0);
+        assert_eq!(
+            claude_drain_state_finished_after(&again, 0.0, 191.0),
+            None,
+            "invalid observation heartbeats must not reset the outage clock"
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let complete =
+            r#"{"timestamp":"2026-10-07T00:00:00.500Z","type":"system","subtype":"turn_duration"}"#;
+        let ended = crate::workflow::history::iso8601_to_ms("2026-10-07T00:00:00.500Z").unwrap() as f64
+            / 1000.0;
+        for (suffix, expected) in [
+            ("", true),
+            (r#"{"type":"system","subtype":"stop_hook_summary"}"#, true),
+            (r#"{"type":"progress"}"#, true),
+            (r#"{"type":"user"}"#, false),
+            (
+                r#"{"type":"assistant","message":{"stop_reason":"tool_use"}}"#,
+                false,
+            ),
+            (r#"{"type":"future-unknown"}"#, false),
+            (r#"{"partial":"#, false),
+        ] {
+            std::fs::write(path, format!("{complete}\n{suffix}")).unwrap();
+            assert_eq!(
+                claude_turn_finished_after(path, ended - 0.001),
+                expected,
+                "{suffix}"
+            );
+            assert!(
+                !claude_turn_finished_after(path, ended + 0.001),
+                "old end cannot follow new input"
+            );
+        }
+        std::fs::write(path, r#"{"timestamp":"2026-10-07T00:00:00.500Z","type":"assistant","message":{"stop_reason":"end_turn"}}"#).unwrap();
+        assert!(claude_turn_finished_after(path, ended));
+        std::fs::write(path, r#"{"type":"system","subtype":"turn_duration"}"#).unwrap();
+        assert!(
+            !claude_turn_finished_after(path, 0.0),
+            "missing timestamps are not completion evidence"
+        );
+    }
 
     #[test]
     fn drain_falls_back_only_after_relay_uncertainty_exceeds_ninety_seconds() {

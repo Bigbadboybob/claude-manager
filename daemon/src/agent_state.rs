@@ -166,6 +166,9 @@ pub struct AgentState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_version: Option<String>,
     pub turn_seq: u64,
+    /// Latest accepted input or engine start; idle alone cannot complete it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_start_at: Option<f64>,
     pub last_turn: LastTurn,
     pub background: Background,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -531,6 +534,9 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         observed_at,
         engine_version: version,
         turn_seq: input.turn_seq,
+        // Publish stable event time, not the wall-clock conversion of a legacy
+        // Instant on each read (which would churn diffs and evidence hashes).
+        latest_start_at: max_time(input.latest_start, relay.and_then(|r| r.turn_started_at)),
         last_turn,
         background: input.background.clone(),
         stalled_since,
@@ -1908,8 +1914,12 @@ mod tests {
             assert_eq!(state.state, State::Working, "heartbeats cannot end a pending input");
             assert_eq!(state.turn_seq, 2);
         }
-        assert_eq!(c.recompute(116.0).state, State::Idle,
+        let escaped = c.recompute(116.0);
+        assert_eq!(escaped.state, State::Idle,
             "an empty submit or command that starts no turn must escape the hold");
+        assert_eq!(escaped.latest_start_at, Some(100.0));
+        assert!(escaped.last_turn.ended_at < escaped.latest_start_at,
+            "idle must carry evidence that the newly accepted turn has not ended");
         snapshot.turn_seq = 2;
         snapshot.turn_started_at = Some(161.0);
         snapshot.last_turn = LastTurn { ended_at: Some(162.0), status: Some(TurnStatus::Completed) };

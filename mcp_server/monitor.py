@@ -42,14 +42,20 @@ def engine_turn_complete(resolved: dict) -> bool | None:
     if agent is None:
         return None
     state = agent.get("state")
-    if state in ("idle", "errored", "waiting-on-human", "exited"):
+    if state in ("errored", "waiting-on-human", "exited"):
         return True
-    last_turn = agent.get("last_turn")
-    return bool(
-        state == "working-background"
-        and isinstance(last_turn, dict)
-        and last_turn.get("ended_at") is not None
-    )
+    if state not in ("idle", "working-background"):
+        return False
+    ended = _engine_end(agent)
+    start = agent.get("latest_start_at")
+    if start is not None:
+        # An expired delivery hold is idle, but the queued turn has not ended.
+        # turn_seq already advanced when input was accepted, before PTY delivery.
+        if type(start) not in (int, float) or not math.isfinite(start) or start < 0:
+            return False
+        if ended is None or ended < start:
+            return False
+    return state == "idle" or ended is not None
 
 
 def _engine_end(agent: dict) -> float | None:
