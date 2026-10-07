@@ -7,6 +7,8 @@ pub(super) enum InputMode {
     /// Normal operation — keys go to terminal or app navigation.
     Normal,
     ContinuousControl(super::continuous_control::Menu),
+    /// A-F: fork the focused session's conversation into a new task.
+    ForkSession(super::fork::ForkForm),
     WorktreeCleanup(super::worktree_cleanup::Menu),
     /// Configuring a new workspace and its initial agent session.
     NewSession {
@@ -467,6 +469,8 @@ pub(crate) enum InputOutcome {
 /// themselves never see `&mut App`.
 #[derive(Debug, Clone)]
 pub(crate) enum SubmitAction {
+    /// A-F form submitted; the form itself rides in the replaced input mode.
+    ForkSession,
     /// Submit attempted but the inputs produced no work to do (e.g.
     /// empty workspace name, no workflow selected). Modal still closes.
     None,
@@ -3357,6 +3361,19 @@ impl App {
                         self.reorder_section_key(-1);
                         return true;
                     }
+                    // A-F (Alt+Shift+f): fork the focused session into a new
+                    // task. Shift folded into the char or reported as a
+                    // modifier — accept both, ahead of A-f (workflow launch).
+                    KeyCode::Char('F') => {
+                        self.open_fork_session();
+                        return true;
+                    }
+                    KeyCode::Char('f')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.open_fork_session();
+                        return true;
+                    }
                     KeyCode::Char('f') => {
                         self.open_workflow_launch();
                         return true;
@@ -3746,6 +3763,10 @@ impl App {
                 CrosstermEvent::Key(key) => menu.key(*key),
                 _ => InputOutcome::Consumed,
             },
+            InputMode::ForkSession(form) => match event {
+                CrosstermEvent::Key(key) => form.key(*key),
+                _ => InputOutcome::Consumed,
+            },
             InputMode::ContinuousControl(menu) => match event {
                 CrosstermEvent::Key(key) => menu.key(*key),
                 _ => InputOutcome::Consumed,
@@ -4018,6 +4039,12 @@ impl App {
                 // chosen name. Other submits (and a no-target catalog)
                 // go through the normal path.
                 let old = std::mem::replace(&mut self.input_mode, InputMode::Normal);
+                if let InputMode::ForkSession(form) = old {
+                    if matches!(action, SubmitAction::ForkSession) {
+                        self.submit_fork(form);
+                    }
+                    return true;
+                }
                 if let InputMode::WorktreeCleanup(menu) = old {
                     if matches!(action, SubmitAction::CompleteWithCleanup) { self.complete_with_cleanup(menu); }
                     return true;
@@ -4395,6 +4422,7 @@ impl App {
                 );
             }
             SubmitAction::CompleteWithCleanup => {}, // handled with the captured completion menu
+            SubmitAction::ForkSession => {}, // handled with the captured fork form
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
             SubmitAction::SaveSection { section_id, name, color } => match section_id {

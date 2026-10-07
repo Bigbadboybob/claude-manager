@@ -165,6 +165,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "session.set_workflow_context",
     "propose_task",
     "mcp_start_session",
+    # Fork into new task (`fork_session` tool + the TUI's A-F action):
+    # mints a subtask + worktree and spawns the engine-native fork. Daemon-
+    # owned on every host (there is no TUI handler), like mcp_start_session.
+    "session.fork",
     # Headless-capable subtask status PATCH. Unlike its create_subtask /
     # list_subtasks / mark_subtask_done siblings (TUI-served on a laptop —
     # see DAEMON_DISPATCHED_BUT_TUI_ROUTED), there is NO TUI handler, so it

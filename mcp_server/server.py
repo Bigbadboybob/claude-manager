@@ -1923,6 +1923,81 @@ async def start_session(
 
 
 @mcp.tool()
+async def fork_session(
+    session_uid: str,
+    task_name: str,
+    base: str = "source",
+    prompt: str | None = None,
+    parent_task: str | None = None,
+    label: str | None = None,
+    notify_on_done: bool = True,
+    notify_until: str = "turn_end",
+) -> dict:
+    """Fork a Claude or Codex session's conversation into a NEW task.
+
+    Creates a subtask (default parent: the source session's task) with its
+    own `cm-sub/...` worktree, then starts a session there that continues
+    from a copy of the source's conversation using the engine's native
+    fork (`claude --resume <id> --fork-session` / `codex fork <id>`). The
+    source session keeps running unchanged; CM stores no history copy.
+
+    Args:
+        session_uid: The session to fork (one you can see in
+            `list_sessions`; must have completed at least one turn).
+        task_name: Name of the new task.
+        base: "source" (default) cuts the new branch at the source
+            worktree's committed HEAD (uncommitted edits stay behind);
+            "trunk" cuts it at the project's main branch.
+        prompt: Optional first message for the fork.
+        parent_task: Parent task id override (within your own task tree).
+        label: Sidebar label for the new session (default: task_name).
+        notify_on_done / notify_until: As for `start_session` — with a
+            prompt, a self-waking monitor is registered on the fork.
+
+    Returns `{task_id, session_uid, worktree_path, base_sha, forked_from,
+    engine, ...}` (`forked_from` names the source session + conversation;
+    `transcript_id` is the fork's own conversation id for Claude).
+
+    State your intent in plain language and ask the user to confirm
+    before calling this tool.
+    """
+    params: dict = {"source_uid": session_uid, "task_name": task_name, "base": base}
+    if prompt and prompt.strip():
+        params["prompt"] = prompt
+    if parent_task:
+        params["parent_task_id"] = parent_task
+    if label:
+        params["label"] = label
+    socket_path = control_client.resolve_socket_for_method("session.fork")
+    res = await asyncio.to_thread(
+        control_client.call, "session.fork", params, socket_path=socket_path
+    )
+    if not isinstance(res, dict):
+        return res
+    receipt = res.get("prompt_delivery")
+    if isinstance(receipt, dict) and receipt.get("status") != "pending":
+        res["submitted"] = receipt.get("submitted") is True
+    fork_uid = res.get("session_uid")
+    if notify_on_done and fork_uid and res.get("prompt_source") == "caller":
+        try:
+            res["monitor"] = async_monitor.register_monitor(
+                [fork_uid], mode="any", until=notify_until,
+                note=(
+                    f"fork '{task_name}' reported done"
+                    if notify_until in ("final", "task_done")
+                    else f"fork '{task_name}' finished its first prompt"
+                ),
+                source="auto",
+                edge=not isinstance(receipt, dict),
+                **({"launch_receipt": receipt, "launch_socket_path": socket_path}
+                   if isinstance(receipt, dict) else {}),
+            )
+        except async_monitor.RegistrationError as e:
+            res["monitor"] = {"error": e.code, "message": str(e)}
+    return res
+
+
+@mcp.tool()
 async def send_input(
     session_uid: str,
     text: str,

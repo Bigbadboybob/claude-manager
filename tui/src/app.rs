@@ -48,6 +48,7 @@ use events::*;
 mod lifecycle;
 mod plan_launch;
 mod remote_create;
+mod fork;
 mod image_paste;
 use lifecycle::*;
 mod input;
@@ -503,6 +504,8 @@ pub struct App {
     pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
     plan_launches: Vec<plan_launch::PlanLaunchFlight>,
     remote_creates: Vec<remote_create::RemoteCreateFlight>,
+    /// A-F forks in flight (the host provisions a worktree before replying).
+    fork_flights: Vec<fork::ForkFlight>,
     image_pastes: Vec<image_paste::ImagePasteFlight>,
     /// 10e-d: per-process de-dup set for cap-kill toasts. A given
     /// session's cap-kill event can reach the TUI through two
@@ -988,6 +991,7 @@ impl App {
             attaching: HashMap::new(),
             plan_launches: Vec::new(),
             remote_creates: Vec::new(),
+            fork_flights: Vec::new(),
             image_pastes: Vec::new(),
             push_worker,
             last_drawn_view_mode: None,

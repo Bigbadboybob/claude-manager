@@ -15675,6 +15675,41 @@ pub fn create_subtask(
 ) -> MethodResult {
     let p: CreateSubtaskParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("create_subtask params: {}", e)))?;
+    let (base, leaf_slug) = validate_create_subtask(&p)?;
+    // The caller's OWN task is the PARENT, its workspace the repo context.
+    let parent = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "create_subtask is callable only by Session callers (the daemon \
+             resolves the parent task from the caller's session)"
+                .into(),
+        ))?;
+        let caller = state.sessions.get(cuid).ok_or((
+            ErrorCode::Unauthorized,
+            format!("caller session '{}' not in daemon registry", cuid),
+        ))?;
+        // Taskless callers should use propose_task for top-level tasks.
+        let parent_task_id = caller.task_id.clone().ok_or((
+            ErrorCode::Unauthorized,
+            "create_subtask requires a tasked caller; use propose_task for top-level tasks"
+                .into(),
+        ))?;
+        SubtaskParent {
+            task_id: Some(parent_task_id),
+            workspace_id: caller.workspace_id.clone(),
+            worktree_path: None,
+        }
+    };
+    create_subtask_core(state_arc, &p, base, leaf_slug, parent, caller_uid, "mcp.create_subtask")
+}
+
+/// Shape checks shared by `create_subtask` and `session.fork`, run before
+/// any caller resolution or API/git work. Returns the trimmed `base` and
+/// the leaf slug.
+fn validate_create_subtask(
+    p: &CreateSubtaskParams,
+) -> Result<(Option<String>, String), (ErrorCode, String)> {
     // Validate mode BEFORE resolving the caller (mirror TUI ordering).
     if !matches!(p.worktree_mode.as_str(), "inherit" | "branch" | "in-place") {
         return Err((
@@ -15711,13 +15746,33 @@ pub fn create_subtask(
             format!("name '{}' produces an empty slug after normalization", p.name),
         ));
     }
+    Ok((base, leaf_slug))
+}
 
-    // Resolve the caller + snapshot everything the unlocked HTTP/git
-    // phase needs, then DROP the lock.
+/// Where a subtask hangs: the planning-row parent (`None` = top-level row)
+/// and the workspace whose repo/checkout supplies the main repo, repo URL
+/// and (inherit mode) the shared worktree. `create_subtask` passes the
+/// caller's own task + workspace; `session.fork` passes the SOURCE
+/// session's. `worktree_path` overrides the workspace's recorded path
+/// (a source known only from its exit tombstone).
+struct SubtaskParent {
+    task_id: Option<String>,
+    workspace_id: String,
+    worktree_path: Option<PathBuf>,
+}
+
+fn create_subtask_core(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    p: &CreateSubtaskParams,
+    base: Option<String>,
+    leaf_slug: String,
+    parent: SubtaskParent,
+    caller_uid: Option<&str>,
+    submitted_via: &str,
+) -> MethodResult {
     let machine = local_machine_hostname();
+    let parent_workspace_id = parent.workspace_id.clone();
     let (
-        parent_task_id,
-        parent_workspace_id,
         parent_worktree_path,
         parent_main_repo_path,
         parent_ws_repo_url,
@@ -15727,51 +15782,22 @@ pub fn create_subtask(
         filer,
         api_url_cfg,
         api_token_cfg,
-    ): (
-        String,
-        String,
-        Option<PathBuf>,
-        Option<PathBuf>,
-        Option<String>,
-        PathBuf,
-        bool,
-        Vec<(String, String)>,
-        Value,
-        String,
-        String,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let cuid = caller_uid.ok_or((
-            ErrorCode::Unauthorized,
-            "create_subtask is callable only by Session callers (the daemon \
-             resolves the parent task from the caller's session)"
-                .into(),
-        ))?;
-        let caller = state.sessions.get(cuid).ok_or((
-            ErrorCode::Unauthorized,
-            format!("caller session '{}' not in daemon registry", cuid),
-        ))?;
-        // The caller's OWN task is the PARENT. Taskless callers should
-        // use propose_task for top-level tasks.
-        let parent_task_id = caller.task_id.clone().ok_or((
-            ErrorCode::Unauthorized,
-            "create_subtask requires a tasked caller; use propose_task for top-level tasks"
-                .into(),
-        ))?;
-        let parent_workspace_id = caller.workspace_id.clone();
-        let ws = state.workspaces.get(&parent_workspace_id).ok_or((
-            ErrorCode::Conflict,
-            format!(
-                "caller's workspace '{}' not in daemon manifest snapshot",
-                parent_workspace_id
-            ),
-        ))?;
+        let ws = state.workspaces.get(&parent_workspace_id);
+        if ws.is_none() && parent.worktree_path.is_none() {
+            return Err((
+                ErrorCode::Conflict,
+                format!(
+                    "parent workspace '{}' not in daemon manifest snapshot",
+                    parent_workspace_id
+                ),
+            ));
+        }
         (
-            parent_task_id,
-            parent_workspace_id,
-            ws.worktree_path.clone(),
-            ws.main_repo_path.clone(),
-            ws.repo_url.clone(),
+            parent.worktree_path.clone().or_else(|| ws.and_then(|w| w.worktree_path.clone())),
+            ws.and_then(|w| w.main_repo_path.clone()),
+            ws.and_then(|w| w.repo_url.clone()),
             state.config.repos_dir_or_default(),
             state.config.allow_clone,
             state
@@ -15779,13 +15805,8 @@ pub fn create_subtask(
                 .repos
                 .iter()
                 .map(|e| (e.name.clone(), e.url.clone()))
-                .collect(),
-            filer_metadata(
-                &state,
-                caller_uid,
-                machine.as_deref(),
-                "mcp.create_subtask",
-            ),
+                .collect::<Vec<(String, String)>>(),
+            filer_metadata(&state, caller_uid, machine.as_deref(), submitted_via),
             state.config.api_url.clone(),
             state.config.api_token.clone(),
         )
@@ -15806,9 +15827,12 @@ pub fn create_subtask(
     // that a dangling id would violate anyway. ONLY a clean 404 falls back —
     // a transport/auth/5xx error still propagates (we can't tell if the
     // parent really exists, so retrying is safer than silently orphaning).
-    let parent_row: Value = match api_get_task(&creds, &parent_task_id) {
-        Ok(row) => row,
-        Err(PlanningClientError::ApiError { status: 404, .. }) => {
+    // `None` parent (a fork of a taskless session) → top-level row.
+    let parent_task_id: String = parent.task_id.clone().unwrap_or_default();
+    let parent_row: Value = match parent.task_id.as_deref().map(|id| api_get_task(&creds, id)) {
+        None => Value::Null,
+        Some(Ok(row)) => row,
+        Some(Err(PlanningClientError::ApiError { status: 404, .. })) => {
             eprintln!(
                 "cm-daemon: create_subtask parent task {} not found on the \
                  planning API (deleted?); creating '{}' as a TOP-LEVEL task \
@@ -15817,7 +15841,7 @@ pub fn create_subtask(
             );
             Value::Null
         }
-        Err(e) => return Err(e.to_method_err()),
+        Some(Err(e)) => return Err(e.to_method_err()),
     };
     let parent_exists = !parent_row.is_null();
     // The FK we actually write into the new row: Some(parent) only when the
@@ -16077,7 +16101,9 @@ pub fn create_subtask(
         // overlay entry also survives the TUI's replace-not-merge
         // `task.update_tree` pushes, which race this mint window (the
         // TUI's planning snapshot doesn't know the subtask yet).
-        state.record_agent_task_edge(&new_task_id, &parent_task_id);
+        if let Some(parent_task_id) = parent.task_id.as_deref() {
+            state.record_agent_task_edge(&new_task_id, parent_task_id);
+        }
         state
             .task_workspaces
             .insert(new_task_id.clone(), workspace_id_for_new.clone());
@@ -16105,6 +16131,497 @@ pub fn create_subtask(
         // already running on it — nothing runs until start_session.
         "launched": false,
     }))
+}
+
+// ===================================================================
+// Fork into new task (`session.fork`). One daemon RPC behind both the
+// TUI's A-F action (Operator caller) and the MCP `fork_session` tool
+// (Session caller): mint a subtask of the source's task with its own
+// branch worktree, then spawn a session there whose argv is the engine's
+// NATIVE fork of the source conversation (`claude --resume <src>
+// --fork-session --session-id <pin>` / `codex fork <src>`). The source
+// session is untouched and CM writes no copy of the history — unlike the
+// agent-memory snapshots, which keep a transcript copy under
+// `~/.cm/agent-memories/` until deleted by hand.
+// ===================================================================
+
+#[derive(Deserialize)]
+struct ForkSessionParams {
+    /// The session whose conversation is forked (live, or a recent exit
+    /// tombstone that still names its transcript).
+    source_uid: String,
+    /// Name of the new planning task.
+    task_name: String,
+    /// `"source"` (default): cut the new branch at the source worktree's
+    /// current HEAD. `"trunk"`: cut it at the project's main branch.
+    #[serde(default)]
+    base: Option<String>,
+    /// Optional first prompt, delivered once the fork is up.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Override the parent task (must be within the caller's scope).
+    /// Default: the source's task.
+    #[serde(default)]
+    parent_task_id: Option<String>,
+    /// Sidebar label for the new session (default: the task name).
+    #[serde(default)]
+    label: Option<String>,
+    /// Operator callers (the TUI) pre-mint the uid they will attach to.
+    #[serde(default)]
+    uid: Option<String>,
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+}
+
+/// The source conversation a fork starts from.
+#[derive(Debug, Clone, PartialEq)]
+struct ForkSource {
+    engine: String,
+    transcript_id: String,
+    workspace_id: String,
+    worktree_path: PathBuf,
+    task_id: Option<String>,
+    label: String,
+}
+
+/// `"source"` / `"trunk"` (case-insensitive, default source).
+fn fork_base_choice(raw: Option<&str>) -> Result<bool, (ErrorCode, String)> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("source") => Ok(false),
+        Some("trunk") => Ok(true),
+        Some(other) => Err((
+            ErrorCode::InvalidParams,
+            format!("base must be \"source\" or \"trunk\", got '{}'", other),
+        )),
+    }
+}
+
+/// Resolve `uid` to a forkable source: a live registry session first, then
+/// the newest exit tombstone. Fails for bash, for a session with no bound
+/// transcript yet, and for ids that could escape the transcript dirs.
+fn resolve_fork_source(state: &DaemonState, uid: &str) -> Result<ForkSource, (ErrorCode, String)> {
+    let (engine, transcript_path, workspace_id, task_id, label, tomb_worktree) =
+        if let Some(s) = state.sessions.get(uid) {
+            (
+                s.session_type.clone(),
+                s.transcript_path.clone(),
+                s.workspace_id.clone(),
+                s.task_id.clone(),
+                s.title.clone(),
+                None,
+            )
+        } else if let Some(t) = state.recently_exited.iter().rev().find(|t| t.session_uid == uid) {
+            (
+                t.session_type.clone(),
+                t.transcript_path.clone(),
+                t.workspace_id.clone(),
+                t.task_id.clone(),
+                t.label.clone(),
+                t.worktree_path.clone().map(PathBuf::from),
+            )
+        } else {
+            return Err((
+                ErrorCode::NotFound,
+                format!("session '{}' is not known to this daemon", uid),
+            ));
+        };
+    if !matches!(engine.as_str(), "claude-code" | "codex") {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("only claude / codex sessions can be forked (session '{}' is {})", uid, engine),
+        ));
+    }
+    let transcript_id = transcript_path
+        .as_deref()
+        .and_then(crate::session::transcript_id_from_path)
+        .ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "session '{}' has no bound transcript yet — nothing to fork until it has \
+                 completed a turn",
+                uid
+            ),
+        ))?;
+    crate::agent_memory::validate_transcript_id(&transcript_id)
+        .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?;
+    let worktree_path = tomb_worktree
+        .or_else(|| state.workspaces.get(&workspace_id).and_then(|w| w.worktree_path.clone()))
+        .ok_or((
+            ErrorCode::NotFound,
+            format!("session '{}' has no worktree on this host", uid),
+        ))?;
+    Ok(ForkSource { engine, transcript_id, workspace_id, worktree_path, task_id, label })
+}
+
+pub fn session_fork(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: ForkSessionParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("session.fork params: {}", e)))?;
+    refuse_if_draining(state_arc, "session.fork")?;
+    let use_trunk = fork_base_choice(p.base.as_deref())?;
+    let task_name = p.task_name.trim().to_string();
+    if task_name.is_empty() {
+        return Err((ErrorCode::InvalidParams, "task_name must be non-empty".into()));
+    }
+    let prompt = p.prompt.as_deref().filter(|s| !s.trim().is_empty()).map(str::to_string);
+    if prompt.as_ref().is_some_and(|s| s.len() > MAX_SEND_INPUT_BYTES) {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("prompt exceeds cap of {} bytes", MAX_SEND_INPUT_BYTES),
+        ));
+    }
+    let session_uid = match p.uid.as_deref() {
+        Some(uid) if caller_uid.is_none() => {
+            if !is_valid_session_uid(uid) {
+                return Err((
+                    ErrorCode::InvalidParams,
+                    format!("invalid session uid '{}' (expected ts-<hex>-<hex>)", uid),
+                ));
+            }
+            uid.to_string()
+        }
+        _ => new_daemon_minted_session_uid(),
+    };
+
+    // ---- resolve source, scope and parent under the lock ----
+    let (source, parent_task_id, cap_inherit, cols, rows, server_path) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if state.sessions.contains_key(&session_uid) {
+            return Err((ErrorCode::Conflict, format!("session '{}' already exists", session_uid)));
+        }
+        let source = resolve_fork_source(&state, &p.source_uid)?;
+        let mut caller_global = caller_uid.is_none();
+        let mut caller_task: Option<String> = None;
+        let mut cap_inherit = None;
+        let mut size = (p.cols.unwrap_or(0), p.rows.unwrap_or(0));
+        if let Some(cuid) = caller_uid {
+            let decision = if state.sessions.contains_key(&p.source_uid) {
+                crate::control::auth::check_session_caller(&state, cuid, &p.source_uid)
+            } else {
+                crate::control::auth::check_session_caller_for_exited(
+                    &state,
+                    cuid,
+                    &p.source_uid,
+                    source.task_id.as_deref(),
+                    &source.workspace_id,
+                )
+            };
+            return_auth_error_if_denied_with_state(decision, cuid, &p.source_uid, Some(&state))?;
+            let caller = state.sessions.get(cuid).ok_or((
+                ErrorCode::Unauthorized,
+                format!("caller session '{}' not in daemon registry", cuid),
+            ))?;
+            caller_global = caller.global_perms;
+            caller_task = caller.task_id.clone();
+            if let (Some(soft), Some(hard), Some(prefix)) = (
+                caller.memory_cap_soft_bytes,
+                caller.memory_cap_hard_bytes,
+                caller.cgroup_prefix.clone(),
+            ) {
+                cap_inherit = Some(InheritedCap { soft_bytes: soft, hard_bytes: hard, cgroup_prefix: prefix });
+            }
+            if size.0 == 0 || size.1 == 0 {
+                size = (caller.last_cols, caller.last_rows);
+            }
+        }
+        let parent = match p.parent_task_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(explicit) => {
+                let in_scope = caller_global
+                    || caller_task.as_deref().is_some_and(|own| {
+                        crate::control::auth::task_is_self_or_descendant_of(
+                            &state.task_tree,
+                            explicit,
+                            own,
+                        )
+                    });
+                if !in_scope {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!("task '{}' is not the caller's task or a descendant", explicit),
+                    ));
+                }
+                Some(explicit.to_string())
+            }
+            None => source.task_id.clone().or(caller_task),
+        };
+        let server_path = Some(state.config.mcp_server_path.clone()).filter(|s| !s.trim().is_empty());
+        let (cols, rows) = if size.0 == 0 || size.1 == 0 { (120, 40) } else { size };
+        (source, parent, cap_inherit, cols, rows, server_path)
+    };
+
+    // The conversation must still exist where the engine will look for it.
+    let source_file = match source.engine.as_str() {
+        "claude-code" => crate::transcript_detect::claude_transcript_path(
+            &source.worktree_path,
+            &source.transcript_id,
+        ),
+        _ => crate::transcript_detect::codex_transcript_path(&source.transcript_id),
+    };
+    if !source_file.is_some_and(|f| f.is_file()) {
+        return Err((
+            ErrorCode::NotFound,
+            format!(
+                "source transcript {} is not on this host (nothing has been written to it yet?)",
+                source.transcript_id
+            ),
+        ));
+    }
+
+    // ---- base commit ----
+    let base_sha = if use_trunk {
+        crate::worktree::resolve_project_main(&source.worktree_path)
+            .map(|(_, sha)| sha)
+            .map_err(|e| (ErrorCode::Conflict, e.to_string()))?
+    } else {
+        crate::worktree::worktree_head_sha(&source.worktree_path).ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "cannot read HEAD of the source worktree {}",
+                source.worktree_path.display()
+            ),
+        ))?
+    };
+
+    // ---- task + worktree (same mint as create_subtask branch mode) ----
+    let subtask = CreateSubtaskParams {
+        name: task_name.clone(),
+        prompt: prompt.clone(),
+        worktree_mode: "branch".into(),
+        project: None,
+        base: Some(base_sha.clone()),
+    };
+    let (base, leaf_slug) = validate_create_subtask(&subtask)?;
+    let created = create_subtask_core(
+        state_arc,
+        &subtask,
+        base,
+        leaf_slug,
+        SubtaskParent {
+            task_id: parent_task_id.clone(),
+            workspace_id: source.workspace_id.clone(),
+            worktree_path: Some(source.worktree_path.clone()),
+        },
+        caller_uid,
+        if caller_uid.is_some() { "mcp.fork_session" } else { "tui.fork" },
+    )?;
+    let task_id = created["task_id"].as_str().unwrap_or_default().to_string();
+    let worktree_path = PathBuf::from(created["worktree_path"].as_str().unwrap_or_default());
+    let workspace_id = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.task_workspaces.get(&task_id).cloned()
+    }
+    .ok_or((ErrorCode::Internal, "forked task has no workspace binding".into()))?;
+    // Undo the mint if the spawn fails, so a failed fork leaves no task row
+    // or checkout behind.
+    let rollback = |state_arc: &Arc<Mutex<DaemonState>>| {
+        let (api_url, api_token, main_repo) = {
+            let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state.task_workspaces.remove(&task_id);
+            state.bindings.remove(&task_id);
+            let main = state.workspaces.remove(&workspace_id).and_then(|w| w.main_repo_path);
+            (state.config.api_url.clone(), state.config.api_token.clone(), main)
+        };
+        if let Some(main) = main_repo {
+            let _ = crate::worktree::remove_worktree(&main, &worktree_path);
+        }
+        if let Ok(creds) = PlanningApiCreds::from_config(&api_url, &api_token) {
+            let _ = api_delete_task(&creds, &task_id);
+        }
+    };
+
+    // ---- spawn the native fork ----
+    let label = p
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| task_name.clone());
+    let full = match compose_fork_spawn_params(
+        &session_uid,
+        &workspace_id,
+        &label,
+        &source,
+        &worktree_path,
+        &task_id,
+        cols,
+        rows,
+        server_path.as_deref(),
+        caller_uid,
+        cap_inherit.as_ref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rollback(state_arc);
+            return Err(e);
+        }
+    };
+    let forked_transcript_id = full
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .and_then(crate::session::transcript_id_from_path);
+    let detector_snapshot = if source.engine == "codex" {
+        crate::transcript_detect::snapshot_codex_transcript_ids(&worktree_path)
+    } else {
+        Vec::new()
+    };
+    let start_result = match start_session(state_arc, &full) {
+        Ok(v) => v,
+        Err(e) => {
+            rollback(state_arc);
+            return Err(e);
+        }
+    };
+    // Codex mints the forked thread's rollout after start; bind it the same
+    // way an MCP spawn is bound (claude's pin is already exact).
+    if source.engine == "codex" {
+        if let Err(e) = crate::transcript_detect::spawn_queued_detector(
+            state_arc.clone(),
+            session_uid.clone(),
+            crate::transcript_detect::DetectorEngine::Codex,
+            worktree_path.clone(),
+            detector_snapshot,
+            None,
+            crate::transcript_detect::default_detector_spawn_fn(),
+        ) {
+            eprintln!(
+                "cm-daemon: session.fork {}: transcript detector failed to start ({}); \
+                 the /proc watcher binds the rollout instead",
+                session_uid, e
+            );
+        }
+    }
+    let mut prompt_receipt = None;
+    if let Some(prompt) = prompt.as_deref() {
+        let handle = {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state.sessions.get(&session_uid).map(|s| (s.input_handle(), s.fanout.clone()))
+        };
+        if let Some((handle, fanout)) = handle {
+            let ticket = super::prompt_delivery::Receipt::pending();
+            {
+                let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(session) = state.sessions.get_mut(&session_uid) {
+                    session.prompt_delivery = Some(Arc::clone(&ticket));
+                }
+            }
+            spawn_initial_prompt_delivery(
+                Arc::clone(state_arc),
+                handle,
+                fanout,
+                session_uid.clone(),
+                prompt.to_string(),
+                Arc::clone(&ticket),
+            );
+            prompt_receipt = Some(ticket.lock().unwrap_or_else(|p| p.into_inner()).clone());
+        }
+    }
+    let mut out = json!({
+        "session_uid": start_result.get("session_uid").and_then(Value::as_str).unwrap_or(&session_uid),
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "workspace_id": workspace_id,
+        "worktree_path": worktree_path.to_string_lossy(),
+        "branch": crate::worktree::worktree_current_branch(&worktree_path),
+        "base": if use_trunk { "trunk" } else { "source" },
+        "base_sha": created.get("base_sha").cloned().unwrap_or(Value::Null),
+        "engine": source.engine,
+        "label": label,
+        "transcript_id": forked_transcript_id,
+        "forked_from": {
+            "session_uid": p.source_uid,
+            "transcript_id": source.transcript_id,
+            "label": source.label,
+            "worktree_path": source.worktree_path.to_string_lossy(),
+        },
+        "prompt_source": if prompt.is_some() { "caller" } else { "none" },
+    });
+    if let Some(receipt) = prompt_receipt {
+        out["prompt_delivery"] = json!(receipt);
+    }
+    if let Some(cgroup) = start_result.get("cgroup_path") {
+        out["cgroup_path"] = cgroup.clone();
+    }
+    Ok(out)
+}
+
+/// Full-shape `start_session` params for a fork: the engine-native fork
+/// argv (MCP config, hooks and env exactly as a fresh spawn of `uid`),
+/// bound to the NEW task, with claude's pinned fork id stamped as the
+/// transcript path from birth.
+#[allow(clippy::too_many_arguments)]
+fn compose_fork_spawn_params(
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    source: &ForkSource,
+    working_dir: &std::path::Path,
+    task_id: &str,
+    cols: u16,
+    rows: u16,
+    server_path: Option<&str>,
+    managed_by: Option<&str>,
+    cap: Option<&InheritedCap>,
+) -> MethodResult {
+    let (program, tail, pin) = crate::mcp_config::build_launch_args(
+        &source.engine,
+        uid,
+        None,
+        server_path,
+        crate::mcp_config::Launch::Fork(&source.transcript_id),
+    )
+    .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
+    let (program, tail) = match cap {
+        Some(cap) => {
+            let spec = crate::mcp_config::CapSpec {
+                soft_bytes: cap.soft_bytes,
+                hard_bytes: cap.hard_bytes,
+                session_uid: uid,
+                cgroup_prefix: &cap.cgroup_prefix,
+            };
+            let (p, a, _) = crate::mcp_config::wrap_with_systemd_run(&program, &tail, Some(&spec));
+            (p, a)
+        }
+        None => (program, tail),
+    };
+    let mut argv = vec![program];
+    argv.extend(tail);
+    let env: serde_json::Map<String, Value> = crate::mcp_config::build_env(uid, None)
+        .into_iter()
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+    let mut full = json!({
+        "uid": uid,
+        "workspace_id": workspace_id,
+        "label": label,
+        "argv": argv,
+        "working_dir": working_dir.to_string_lossy(),
+        "env": env,
+        "session_type": source.engine,
+        "cols": cols,
+        "rows": rows,
+        "task_id": task_id,
+    });
+    if let Some(path) = pin
+        .as_deref()
+        .and_then(|pin| crate::transcript_detect::claude_transcript_path(working_dir, pin))
+    {
+        full["transcript_path"] = json!(path.to_string_lossy());
+    }
+    if let Some(m) = managed_by {
+        full["managed_by_uid"] = json!(m);
+    }
+    if let Some(cap) = cap {
+        full["memory_cap_bytes"] = json!(cap.soft_bytes);
+        full["memory_cap_hard_bytes"] = json!(cap.hard_bytes);
+        full["cgroup_prefix"] = json!(cap.cgroup_prefix.to_string_lossy());
+    }
+    Ok(full)
 }
 
 #[derive(Deserialize, Default)]
@@ -32291,6 +32808,238 @@ while True:
                 wip
             );
             drop(reqs);
+
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    // ============================================================
+    // session.fork — fork into new task
+    // ============================================================
+
+    const FORK_SRC_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Seed `ts-src` as a live claude session in `ws-src` (task
+    /// `task-src`) whose bound transcript exists on disk.
+    fn seed_fork_source(state: &Arc<Mutex<DaemonState>>, repo: &std::path::Path, name: &str) {
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = ManifestWorkspace::default();
+            ws.id = "ws-src".to_string();
+            ws.worktree_path = Some(repo.to_path_buf());
+            ws.main_repo_path = Some(repo.to_path_buf());
+            ws.repo_url = Some(name.to_string());
+            s.workspaces.insert("ws-src".to_string(), ws);
+        }
+        seed_tasked_caller(state, "ts-src", "ws-src", "task-src");
+        let path = crate::transcript_detect::claude_transcript_path(repo, FORK_SRC_ID).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
+        let mut s = state.lock().unwrap();
+        let src = s.sessions.get_mut("ts-src").unwrap();
+        src.session_type = "claude-code".to_string();
+        src.transcript_path = Some(path.to_string_lossy().into_owned());
+    }
+
+    #[test]
+    fn fork_base_choice_accepts_source_and_trunk_only() {
+        assert_eq!(fork_base_choice(None), Ok(false));
+        assert_eq!(fork_base_choice(Some("")), Ok(false));
+        assert_eq!(fork_base_choice(Some("Source")), Ok(false));
+        assert_eq!(fork_base_choice(Some("trunk")), Ok(true));
+        assert_eq!(fork_base_choice(Some("main")).unwrap_err().0, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn resolve_fork_source_requires_an_agent_with_a_transcript() {
+        with_home_and_repo("forksrc", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            {
+                let s = state.lock().unwrap();
+                let src = resolve_fork_source(&s, "ts-src").expect("forkable");
+                assert_eq!(src.engine, "claude-code");
+                assert_eq!(src.transcript_id, FORK_SRC_ID);
+                assert_eq!(src.worktree_path, repo);
+                assert_eq!(src.task_id.as_deref(), Some("task-src"));
+                assert_eq!(resolve_fork_source(&s, "ts-nope").unwrap_err().0, ErrorCode::NotFound);
+            }
+            {
+                let mut s = state.lock().unwrap();
+                s.sessions.get_mut("ts-src").unwrap().transcript_path = None;
+                assert_eq!(resolve_fork_source(&s, "ts-src").unwrap_err().0, ErrorCode::Conflict);
+                s.sessions.get_mut("ts-src").unwrap().session_type = "bash".into();
+                assert_eq!(resolve_fork_source(&s, "ts-src").unwrap_err().0, ErrorCode::InvalidParams);
+            }
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// A Session caller can fork only a source it could drive, and
+    /// cannot hang the fork under a task outside its own tree.
+    #[test]
+    fn session_fork_session_caller_is_scoped() {
+        with_home_and_repo("forkscope", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-other".to_string();
+                ws.worktree_path = Some(repo.clone());
+                s.workspaces.insert("ws-other".to_string(), ws);
+                s.task_tree.insert("task-src".into(), None);
+                s.task_tree.insert("task-other".into(), None);
+                s.task_tree_pushed = true;
+            }
+            seed_tasked_caller(&state, "ts-other", "ws-other", "task-other");
+            let err = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "x"}),
+                Some("ts-other"),
+            )
+            .expect_err("an unrelated session cannot fork ts-src");
+            assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+            // The source itself may fork, but not under someone else's task.
+            let err = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "x", "parent_task_id": "task-other"}),
+                Some("ts-src"),
+            )
+            .expect_err("explicit parent outside the caller's tree");
+            assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// End to end (with a stand-in `claude` on PATH): the fork mints a
+    /// subtask of the source's task on a branch cut at the source HEAD,
+    /// spawns `claude --resume <src> --fork-session --session-id <new>`
+    /// there bound to the NEW task and the NEW transcript id, and leaves
+    /// the source session untouched.
+    #[test]
+    fn session_fork_claude_spawns_native_fork_in_new_subtask() {
+        with_home_and_repo("forkrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            std::fs::write(repo.join("wip.txt"), "source work").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "source wip"]);
+            let source_head = git_sha(&repo, "HEAD");
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let source_path_before =
+                state.lock().unwrap().sessions["ts-src"].transcript_path.clone();
+
+            let bin = home.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let argv_file = home.join("claude-argv.txt");
+            let fake = bin.join("claude");
+            std::fs::write(
+                &fake,
+                format!("#!/bin/sh\necho \"$@\" > {}\nexec sleep 60\n", argv_file.display()),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            unsafe {
+                std::env::set_var(
+                    "PATH",
+                    format!("{}:{}", bin.display(), old_path.to_string_lossy()),
+                )
+            };
+
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks/task-src" {
+                    (
+                        200,
+                        format!(
+                            r#"{{"id":"task-src","name":"Source Task","repo_url":"{}","project":"proj","status":"running","parent_task_id":null}}"#,
+                            name_owned
+                        ),
+                    )
+                } else if method == "POST" && path == "/tasks" {
+                    (200, r#"{"id":"task-fork","name":"other idea","status":"running"}"#.to_string())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            let result = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "other idea"}),
+                None,
+            );
+            unsafe { std::env::set_var("PATH", &old_path) };
+            let result = result.expect("session.fork ok");
+
+            assert_eq!(result["task_id"], "task-fork");
+            assert_eq!(result["parent_task_id"], "task-src");
+            assert_eq!(result["engine"], "claude-code");
+            assert_eq!(result["base"], "source");
+            assert_eq!(result["base_sha"], json!(source_head));
+            assert_eq!(result["forked_from"]["session_uid"], "ts-src");
+            assert_eq!(result["forked_from"]["transcript_id"], FORK_SRC_ID);
+            let new_id = result["transcript_id"].as_str().expect("claude fork id is pinned");
+            assert_ne!(new_id, FORK_SRC_ID);
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert!(wt.join("wip.txt").exists(), "branch cut at the source HEAD");
+            assert_ne!(wt, repo);
+            assert!(result["branch"].as_str().unwrap().starts_with("cm-sub/source-task-other-idea-"));
+
+            let uid = result["session_uid"].as_str().unwrap().to_string();
+            {
+                let s = state.lock().unwrap();
+                let forked = &s.sessions[&uid];
+                assert_eq!(forked.task_id.as_deref(), Some("task-fork"));
+                assert_eq!(forked.session_type, "claude-code");
+                assert_eq!(forked.workspace_id, result["workspace_id"].as_str().unwrap());
+                assert_eq!(
+                    forked.transcript_path,
+                    crate::transcript_detect::claude_transcript_path(&wt, new_id)
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    "the fork is bound to its OWN conversation in its OWN worktree",
+                );
+                let src = &s.sessions["ts-src"];
+                assert_eq!(src.transcript_path, source_path_before, "source untouched");
+                assert_eq!(src.task_id.as_deref(), Some("task-src"));
+                assert_eq!(s.task_tree.get("task-fork"), Some(&Some("task-src".to_string())));
+            }
+
+            let reqs = stub.requests.lock().unwrap();
+            let post = reqs.iter().find(|r| r.method == "POST").expect("POST /tasks");
+            let body: Value = serde_json::from_str(&post.body).unwrap();
+            assert_eq!(body["parent_task_id"], "task-src");
+            assert_eq!(body["worktree_mode"], "branch");
+            assert_eq!(body["metadata"]["filer"]["submitted_via"], "tui.fork");
+            drop(reqs);
+
+            let mut argv = String::new();
+            for _ in 0..100 {
+                argv = std::fs::read_to_string(&argv_file).unwrap_or_default();
+                if !argv.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(
+                argv.contains(&format!(
+                    "--resume {} --fork-session --session-id {}",
+                    FORK_SRC_ID, new_id
+                )),
+                "engine-native fork argv: {}",
+                argv
+            );
+            assert!(argv.contains("--mcp-config"), "MCP injected: {}", argv);
+            assert!(
+                !home.join(".cm/agent-memories").exists(),
+                "no snapshot copy is written",
+            );
 
             kill_all_sessions(&state);
             clear_api_env();

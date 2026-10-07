@@ -742,6 +742,45 @@ pub fn build_args(
     server_path_override: Option<&str>,
     resume_session_id: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>, Option<String>)> {
+    let launch = match resume_session_id {
+        Some(id) => Launch::Resume(id),
+        None => Launch::Fresh,
+    };
+    build_launch_args(session_type, session_uid, workflow, server_path_override, launch)
+}
+
+/// How an agent conversation starts: fresh, continuing a transcript in
+/// place, or as an engine-native FORK of one (a new conversation whose
+/// history is copied from the source by the engine itself — the source
+/// is never touched and CM keeps no copy of its own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch<'a> {
+    Fresh,
+    Resume(&'a str),
+    Fork(&'a str),
+}
+
+/// [`build_args`] with an explicit [`Launch`]. Forks:
+///
+/// - claude: `--resume <src> --fork-session --session-id <pin>`. The CLI
+///   accepts `--session-id` alongside `--resume` only with
+///   `--fork-session`, so the fork's transcript id is a daemon-minted pin
+///   (returned like a fresh spawn's) and the binding is exact from birth.
+///   Works across directories: the fork lands in the new cwd's project dir.
+/// - codex: the `fork` subcommand, shaped exactly like `resume` (SESSION_ID
+///   last, no permission flag); codex mints a new thread + rollout, which
+///   the detector / native relay bind.
+pub fn build_launch_args(
+    session_type: &str,
+    session_uid: &str,
+    workflow: Option<&WorkflowMeta>,
+    server_path_override: Option<&str>,
+    launch: Launch<'_>,
+) -> std::io::Result<(String, Vec<String>, Option<String>)> {
+    let resume_session_id = match launch {
+        Launch::Resume(id) => Some(id),
+        _ => None,
+    };
     match session_type {
         "claude-code" => {
             let cfg = write_claude_mcp_config(session_uid, workflow, server_path_override)?;
@@ -767,13 +806,22 @@ pub fn build_args(
             // Fresh spawns instead get a daemon-minted `--session-id` pin
             // (hyphenated: the CLI requires "a valid UUID"); never both
             // flags — a resume's identity IS the resumed id.
-            let pinned = match resume_session_id {
-                Some(sid) => {
+            let pinned = match launch {
+                Launch::Resume(sid) => {
                     args.push("--resume".to_string());
                     args.push(sid.to_string());
                     None
                 }
-                None => {
+                Launch::Fork(src) => {
+                    let pin = uuid::Uuid::new_v4().to_string();
+                    args.push("--resume".to_string());
+                    args.push(src.to_string());
+                    args.push("--fork-session".to_string());
+                    args.push("--session-id".to_string());
+                    args.push(pin.clone());
+                    Some(pin)
+                }
+                Launch::Fresh => {
                     let pin = uuid::Uuid::new_v4().to_string();
                     args.push("--session-id".to_string());
                     args.push(pin.clone());
@@ -792,6 +840,10 @@ pub fn build_args(
             // to rebind `transcript_path`.
             if resume_session_id.is_some() {
                 args.push("resume".into());
+            } else if matches!(launch, Launch::Fork(_)) {
+                // Same frontend shape as `resume`: a remote fork inherits
+                // the source thread's policy (or the host policy file).
+                args.push("fork".into());
             } else {
                 // The native launcher always uses Codex's remote frontend,
                 // including on a local CM host. Remote resumes reject CLI
@@ -809,7 +861,7 @@ pub fn build_args(
             args.push("-c".into());
             args.push("project_doc_max_bytes=262144".into());
             args.extend(codex_overrides(session_uid, workflow, server_path_override));
-            if let Some(sid) = resume_session_id {
+            if let Launch::Resume(sid) | Launch::Fork(sid) = launch {
                 args.push(sid.to_string());
             }
             // No pin for codex: `--session-id` is a claude flag; codex
@@ -1804,6 +1856,63 @@ mod tests {
             args,
         );
         assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    // ---- fork-into-new-task: engine-native fork argv ------------------
+
+    #[test]
+    fn build_launch_args_claude_fork_resumes_source_with_fork_and_new_pin() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args, pin) = build_launch_args(
+            "claude-code", "ts-fork-1", None, None, Launch::Fork("src-sid"),
+        )
+        .expect("ok");
+        assert_eq!(prog, "claude");
+        let pin = pin.expect("a claude fork pins its NEW conversation id");
+        assert_ne!(pin, "src-sid", "the fork's identity must not be the source's");
+        assert_eq!(pin.len(), 36, "hyphenated uuid, got {:?}", pin);
+        let at = args.iter().position(|a| a == "--resume").expect("--resume present");
+        assert_eq!(
+            &args[at..at + 5],
+            &["--resume", "src-sid", "--fork-session", "--session-id", pin.as_str()],
+            "claude fork argv: {:?}",
+            args,
+        );
+        // MCP injection + hooks ride along exactly like a fresh spawn.
+        assert!(args.iter().any(|a| a == "--mcp-config"));
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn build_launch_args_codex_fork_uses_fork_subcommand_and_trailing_source() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args, pin) = build_launch_args(
+            "codex", "ts-fork-2", None, None, Launch::Fork("src-thread"),
+        )
+        .expect("ok");
+        assert!(prog.ends_with("launcher.sh"));
+        assert!(pin.is_none(), "codex fork identity is bound post-spawn");
+        let dash = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dash + 1], "fork", "fork is the first engine argument: {:?}", args);
+        assert_eq!(args.last().map(String::as_str), Some("src-thread"));
+        assert!(!args.iter().any(|a| a == "resume"));
+        assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(args.iter().any(|a| a.contains("ts-fork-2")), "MCP env carries the NEW uid");
+    }
+
+    #[test]
+    fn build_args_matches_launch_variants() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (_, resumed, _) = build_args("codex", "ts-v-1", None, None, Some("x")).unwrap();
+        let (_, launched, _) =
+            build_launch_args("codex", "ts-v-1", None, None, Launch::Resume("x")).unwrap();
+        assert_eq!(resumed, launched);
     }
 
     #[test]

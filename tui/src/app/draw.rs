@@ -259,6 +259,7 @@ impl App {
             match &self.input_mode {
                 InputMode::ContinuousControl(menu) => menu.draw(frame, area),
                 InputMode::WorktreeCleanup(menu) => menu.draw(frame, area),
+                InputMode::ForkSession(form) => form.draw(frame, area),
                 InputMode::NewSession {
                     engine,
                     label_text,
@@ -1823,7 +1824,7 @@ impl App {
             ("A-o    stop wf", "A-c  cont-col"),
             ("A-C    cont-stop", "A-,  activity"),
             ("A-b    snapshot", "A-g  attention"),
-            ("A-O    reopen ws", ""),
+            ("A-O    reopen ws", "A-F  fork task"),
             ("A-N    +section", "A-J/K sect order"),
             ("PgUp/Dn scroll", ""),
             ("A-Ent  newline", "A-;  recent"),

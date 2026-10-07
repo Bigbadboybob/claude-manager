@@ -653,6 +653,26 @@ pub(crate) fn rpc_worktree_cleanup(socket: &Path, token: &str, params: serde_jso
     rpc_round_trip_with_read_timeout(socket, &request, Duration::from_secs(10))?.result.context("cleanup response missing result")
 }
 
+/// `session.fork` (fork into new task). The host mints a task, cuts and
+/// provisions a worktree and spawns the engine-native fork before it
+/// replies, so the read budget is the remote-create one.
+pub(crate) fn rpc_session_fork(
+    socket: &Path,
+    token: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    let request = Request {
+        id: next_request_id(),
+        caller: Caller::operator(token),
+        method: "session.fork".into(),
+        params,
+    };
+    rpc_round_trip_with_read_timeout(socket, &request, timeout)?
+        .result
+        .context("session.fork response missing result")
+}
+
 /// Catalog requests use the host's operator channel, independent of continuous tasks.
 pub(crate) fn rpc_catalog_control(
     socket: &Path, token: &str, method: &str, params: serde_json::Value,

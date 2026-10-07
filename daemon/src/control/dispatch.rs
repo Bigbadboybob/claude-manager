@@ -862,6 +862,9 @@ pub fn dispatch_request(
         "add_session" | "session.resume" => {
             DispatchOutcome::Done(dispatch_add_session(state, req))
         }
+        // Fork into new task: Operator (TUI A-F) or Session (MCP
+        // `fork_session`, scoped to sources the caller can reach).
+        "session.fork" => DispatchOutcome::Done(dispatch_session_fork(state, req)),
 
         // Continuous Tasks Phase 2 (DESIGN_CONTINUOUS_TASKS.md §8) — the
         // trigger funnel + continuous-task CRUD. `trigger` is bimodal
@@ -1048,6 +1051,25 @@ fn dispatch_mcp_start_session(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::mcp_start_session(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.fork` — Operator frames must carry a valid operator token;
+/// Session callers are scoped in the method body (source reachable,
+/// explicit parent within the caller's task tree).
+fn dispatch_session_fork(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => {
+            if let Err(resp) = require_operator(req, "session.fork requires an authenticated Operator") {
+                return resp;
+            }
+            None
+        }
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::session_fork(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
