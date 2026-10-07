@@ -203,7 +203,8 @@ reviews, merges to main and deploys (hub first).
 | Prompt confirmation (start_session) | state-core | reviewed PASS (2 review rounds) | 376ff8c, dcf6399, 3025127 (merge 1dc3a2e) | pending big deploy |
 | W3d report_done held items + pokes | items | reviewed PASS | 78d543f | pending big deploy |
 | W3f TUI state glyphs + board overlay; W4c docs | msgfix | reviewed PASS (2 rounds) | b056a75..8867ce1 | next TUI release + MCP payload |
-| Fork into new task (TUI + MCP, Owner request) | coordinator subagent | in progress | | |
+| Fork session into new/existing task (TUI A-F + MCP fork_session) | coordinator subagent | reviewed PASS (+fixes, scope ext.) | f9f5c26, 6d48aa9 | pending big deploy |
+| Codex scrollback (inline mode, alt-screen wheel, yank msgs) — Owner blocker | coordinator subagent | merged | a931d1a (merge 772a6f5) | pending big deploy; existing Codex need A-R |
 | W3a Claude hooks | state-core | reviewed PASS (real 2.1.291 verified) | 39261ec | pending big deploy; new events need A-R |
 | W3b MCP consumers (+W3a follow-ups) | state-core | reviewed PASS (2 rounds) | 281fbd9, fac421b | pending big deploy |
 | A-O past-workspaces search (Owner request, subagent) | coordinator | merged | 530b64d | next TUI release |
@@ -257,3 +258,7 @@ Follow-up (messaging, small): a bundled wake ("N new") previews only the newest 
 another sender's handoff can hide behind it. 2026-10-07 00:42Z: msgfix's mentioned W3f handoff
 was missed by the coordinator this way. Wake text should list all senders/conversations in
 the bundle.
+
+**Consolidated merge ready: origin/main 772a6f5 (2026-10-07).** Everything pending deploy:
+API (board engine), brains + MCP payload on cm-manager and cm-sessions, laptop TUI release
+(+ laptop daemon), then Codex A-R round.
