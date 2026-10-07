@@ -1,0 +1,53 @@
+{
+  "kind": "hook",
+  "event": "Stop",
+  "payload": {
+    "observed_at": 1000.0,
+    "transcript_path": "/fixture/project/engine-session.jsonl",
+    "prompt_id": "prompt-1",
+    "last_assistant_message": "Turn finished.",
+    "continuing": false,
+    "stop_hook_active": false,
+    "background": {
+      "complete": true,
+      "observed_at": 1000.0,
+      "jobs": [
+        {
+          "id": "shell-1",
+          "kind": "shell",
+          "label": "test runner",
+          "first_seen_at": 1000.0,
+          "wakes_agent": true
+        },
+        {
+          "id": "agent-1",
+          "kind": "subagent",
+          "label": "review lane",
+          "first_seen_at": 1000.0,
+          "wakes_agent": true
+        },
+        {
+          "id": "monitor-1",
+          "kind": "monitor",
+          "label": "job watcher",
+          "first_seen_at": 1000.0,
+          "wakes_agent": true
+        },
+        {
+          "id": "workflow-1",
+          "kind": "workflow",
+          "label": "build workflow",
+          "first_seen_at": 1000.0,
+          "wakes_agent": true
+        }
+      ],
+      "crons": [
+        {
+          "id": "cron-1",
+          "schedule": "*/5 * * * *",
+          "recurring": true
+        }
+      ]
+    }
+  }
+}

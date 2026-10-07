@@ -7,9 +7,9 @@ mirrored by the TUI's `claude_args`). Runs at every turn boundary and:
      Pending messages produce `{"decision": "block", "reason": <messages>}`
      so Claude continues with those messages, without PTY typing.
 
-  2. Reports `session.turn_ended` with `continuing=true` when the inbox
-     resumes the turn. Otherwise it stamps the final turn-end. A continuing
-     hook must invalidate the old completion report and idle signal.
+  2. Reports normalized Stop state/background through session.agent_report,
+     falling back to session.turn_ended on older daemons. continuing=true
+     when the inbox resumes the turn preserves the existing idle contract.
 
 Design constraints:
   - FAIL OPEN. A broken daemon socket, malformed stdin, or any other
@@ -28,48 +28,42 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 # Make `mcp_server` importable when invoked as a bare script — same
 # bootstrap as wait.py (this file lives at mcp_server/hooks/).
-sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 INBOX_ROOT = os.path.expanduser("~/.cm/inbox")
-
-# Turn-end report timeout. The hook runs on every turn boundary — a
-# hung daemon must not stall the agent, so keep this tight.
-TURN_ENDED_TIMEOUT_S = 3.0
 
 
 def _session_uid() -> str:
     return os.environ.get("CM_TUI_SESSION_ID", "").strip()
 
 
-def _report_turn_ended(uid: str, transcript_path: str | None = None, *, continuing: bool = False) -> None:
-    """Best-effort `session.turn_ended` self-report.
-
-    `transcript_path` is the file Claude Code names in this hook's stdin
-    payload — the only exact, live answer to "which conversation is this
-    session in". The daemon re-stamps it as the session's resume key, so a
-    restart resumes the CURRENT conversation instead of whatever id was
-    recorded at spawn (which goes stale on /clear, /compact, or a fork, and
-    then silently resumes the wrong history). The daemon bounds the claim to
-    this session's own transcript directory; sending it is safe and
-    best-effort like everything else here.
-    """
+def _report_turn_ended(
+    uid: str,
+    transcript_path: str | None = None,
+    *,
+    continuing: bool = False,
+    payload: dict | None = None,
+    observed_at: float | None = None,
+) -> None:
+    """Forward Stop state with legacy method-not-found fallback, fail open."""
     try:
-        from mcp_server import control_client
+        from mcp_server.hooks.cm_state_hook import report
 
-        params = {"session_uid": uid, "continuing": continuing}
+        data = dict(payload or {})
+        data["hook_event_name"] = "Stop"
         if transcript_path:
-            params["transcript_path"] = transcript_path
-        control_client.call(
-            "session.turn_ended",
-            params,
-            timeout=TURN_ENDED_TIMEOUT_S,
+            data["transcript_path"] = transcript_path
+        report(
+            uid,
+            data,
+            observed_at=observed_at if observed_at is not None else time.time(),
+            continuing=continuing,
         )
-    except Exception:  # noqa: BLE001 — fail open, always
+    except Exception:
         pass
 
 
@@ -80,9 +74,7 @@ def _drain_inbox(uid: str) -> list[str]:
     dropped (their content is retained monitor-side either way)."""
     inbox = os.path.join(INBOX_ROOT, uid)
     try:
-        names = sorted(
-            n for n in os.listdir(inbox) if n.endswith(".json")
-        )
+        names = sorted(n for n in os.listdir(inbox) if n.endswith(".json"))
     except OSError:
         return []
     messages: list[str] = []
@@ -111,6 +103,8 @@ def _drain_inbox(uid: str) -> list[str]:
 
 def main() -> int:
     try:
+        observed_at = time.time()
+        payload = {}
         # Consume stdin fully (an unread pipe can raise BrokenPipeError on
         # the writer). The uid still comes from the env, which is
         # authoritative, but the payload carries `transcript_path` — the
@@ -130,6 +124,11 @@ def main() -> int:
         except ValueError:
             pass
 
+        if not isinstance(payload, dict):
+            payload = {}
+        # Stop should be a main-thread event; reject subagent-shaped inputs.
+        if payload.get("agent_id"):
+            return 0
         uid = _session_uid()
         if not uid:
             return 0  # not a cm session — nothing to do
@@ -137,7 +136,13 @@ def main() -> int:
         messages = _drain_inbox(uid)
         # A blocked Stop continues the turn. Do not advertise an idle composer
         # while Claude is processing inbox work.
-        _report_turn_ended(uid, transcript_path, continuing=bool(messages))
+        _report_turn_ended(
+            uid,
+            transcript_path,
+            continuing=bool(messages),
+            payload=payload,
+            observed_at=observed_at,
+        )
         if messages:
             reason = "\n\n".join(messages)
             print(json.dumps({"decision": "block", "reason": reason}))

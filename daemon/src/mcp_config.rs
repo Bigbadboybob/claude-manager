@@ -352,9 +352,9 @@ pub fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf
 }
 
 /// Build the inline-JSON value for a claude-code spawn's `--settings`
-/// flag, injecting the cm Stop hook (`mcp_server/hooks/cm_stop_hook.py`
+/// flag, injecting cm state hooks plus the synchronous Stop hook (`mcp_server/hooks/cm_stop_hook.py`
 /// beside the resolved server.py). The hook (a) reports turn-ends to
-/// the daemon (`session.turn_ended` → `semantic_idle`) and (b) drains
+/// the daemon (`session.agent_report`, legacy `session.turn_ended`) and (b) drains
 /// the session's monitor inbox at turn boundaries via Stop-hook
 /// block+reason. Returns `None` (spawn proceeds hook-less) when the
 /// script isn't present at the resolved location — e.g. a deployment
@@ -372,29 +372,43 @@ pub fn claude_settings_hook_arg(server_path_override: Option<&str>) -> Option<St
     // config: the `--settings` argv is frozen for the life of the
     // claude process, so a baked interpreter path here goes stale the
     // same way — route through the launcher, direct pair as fallback.
-    let command = match ensure_launcher(&server) {
-        Ok(launcher) => format!(
-            "'{}' 'hooks/cm_stop_hook.py'",
-            launcher.to_string_lossy()
+    let launcher = ensure_launcher(&server).ok();
+    let hook_command = |filename: &str| match &launcher {
+        Some(launcher) => format!(
+            "'{}' 'hooks/{}'",
+            sh_squote(&launcher.to_string_lossy()),
+            filename
         ),
-        Err(_) => format!(
+        None => format!(
             "'{}' '{}'",
-            resolve_python_interpreter(&server),
-            hook.to_string_lossy()
+            sh_squote(&resolve_python_interpreter(&server)),
+            sh_squote(
+                &server
+                    .parent()
+                    .unwrap()
+                    .join("hooks")
+                    .join(filename)
+                    .to_string_lossy()
+            )
         ),
     };
-    Some(
-        serde_json::json!({
-            "hooks": {
-                "Stop": [
-                    {"hooks": [
-                        {"type": "command", "command": command, "timeout": 15}
-                    ]}
-                ]
-            }
-        })
-        .to_string(),
-    )
+    let mut hooks = serde_json::json!({
+        "Stop": [{"hooks": [{"type": "command", "command": hook_command("cm_stop_hook.py"), "timeout": 15}]}]
+    });
+    if server.parent()?.join("hooks/cm_state_hook.py").is_file() {
+        // async is supported in Claude 2.1.291's command-hook settings.
+        // The script also double-forks so older runners cannot block on IPC.
+        for event in [
+            "UserPromptSubmit",
+            "StopFailure",
+            "PermissionRequest",
+            "Notification",
+        ] {
+            hooks[event] = serde_json::json!([{"hooks": [{"type": "command",
+                "command": hook_command("cm_state_hook.py"), "timeout": 5, "async": true}]}]);
+        }
+    }
+    Some(serde_json::json!({"hooks": hooks}).to_string())
 }
 
 /// Resolve the Python interpreter that runs `server.py`, in priority order:
@@ -1136,6 +1150,18 @@ mod tests {
             entry["timeout"].as_u64().is_some(),
             "hook must carry an explicit timeout"
         );
+        assert!(parsed["hooks"].get("UserPromptSubmit").is_none(), "partial old payload keeps Stop only");
+        std::fs::write(srv_dir.join("hooks/cm_state_hook.py"), "").unwrap();
+        let new_arg = claude_settings_hook_arg(Some(server.to_str().unwrap())).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&new_arg).unwrap();
+        assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["timeout"], 15);
+        assert!(settings["hooks"]["Stop"][0]["hooks"][0].get("async").is_none());
+        for event in ["UserPromptSubmit", "StopFailure", "PermissionRequest", "Notification"] {
+            let hook = &settings["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["async"], true);
+            assert_eq!(hook["timeout"], 5);
+            assert!(hook["command"].as_str().unwrap().contains("hooks/cm_state_hook.py"));
+        }
     }
 
     #[test]

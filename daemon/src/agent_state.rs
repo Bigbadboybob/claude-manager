@@ -143,6 +143,13 @@ impl Background {
         let drop_count = self.ended.len().saturating_sub(10);
         self.ended.drain(..drop_count);
         next.ended = std::mem::take(&mut self.ended);
+        // Claude Stop has stable IDs but no start timestamp. Adapters stamp
+        // observations; retain the daemon's first sighting across reports.
+        for job in &mut next.jobs {
+            if let Some(old) = self.jobs.iter().find(|old| old.id == job.id && old.kind == job.kind) {
+                job.first_seen_at = old.first_seen_at.min(job.first_seen_at);
+            }
+        }
         next.jobs.sort_by(|a, b| a.id.cmp(&b.id));
         next.crons.sort_by(|a, b| a.id.cmp(&b.id));
         next.observed_at = Some(now);
@@ -536,6 +543,11 @@ pub enum HookEvent {
 pub struct HookPayload {
     pub observed_at: Option<f64>,
     pub prompt_id: Option<String>,
+    // Accepted adapter metadata; not published as session state.
+    pub source: Option<String>,
+    pub stop_hook_active: Option<bool>,
+    pub last_assistant_message: Option<String>,
+    pub error_details: Option<String>,
     pub continuing: bool,
     pub transcript_path: Option<String>,
     pub waiting_for: Option<String>,
@@ -824,12 +836,15 @@ fn validate_report_bounds(report: &Report) -> Result<(), String> {
     match report {
         Report::Hook { payload, .. } => {
             bounded(payload.prompt_id.as_deref(), MAX_ID_BYTES, "prompt_id")?;
+            bounded(payload.source.as_deref(), MAX_ID_BYTES, "source")?;
             for (field, text) in [
                 ("transcript_path", &payload.transcript_path),
                 ("waiting_for", &payload.waiting_for),
                 ("error_kind", &payload.error_kind),
                 ("tool_name", &payload.tool_name),
                 ("notification_type", &payload.notification_type),
+                ("last_assistant_message", &payload.last_assistant_message),
+                ("error_details", &payload.error_details),
             ] {
                 bounded(text.as_deref(), MAX_TEXT_BYTES, field)?;
             }
@@ -1861,6 +1876,90 @@ mod tests {
         .unwrap();
         assert_eq!(c.recompute(948.0).state, State::Working);
         assert_eq!(c.inputs.turn_seq, 3);
+    }
+
+    #[test]
+    fn normalized_claude_stop_preserves_background_age_and_completion_history() {
+        // Shared with the Python adapter test: a normalized 2.1.291-schema Stop.
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../mcp_server/tests/fixtures/claude-hooks/Stop.normalized.json"
+        ))
+        .unwrap();
+        let mut c = StateCell::new(0.0, Some(42));
+        c.apply(hook(HookEvent::UserPromptSubmit, 990.0), 990.0)
+            .unwrap();
+        let applied = c
+            .apply(serde_json::from_value(fixture.clone()).unwrap(), 1000.0)
+            .unwrap();
+        assert!(applied.accepted && applied.ended && !applied.started);
+        assert_eq!(
+            applied.transcript_path.as_deref(),
+            Some("/fixture/project/engine-session.jsonl")
+        );
+        let state = c.recompute(1000.0);
+        assert_eq!(state.state, State::WorkingBackground);
+        assert_eq!(state.last_turn.status, Some(TurnStatus::Completed));
+        assert_eq!(state.background.jobs.len(), 4);
+        assert_eq!(state.background.crons.len(), 1);
+        assert!(state.background.jobs.iter().all(|j| j.wakes_agent));
+
+        fixture["payload"]["observed_at"] = serde_json::json!(1010.0);
+        for job in fixture["payload"]["background"]["jobs"]
+            .as_array_mut()
+            .unwrap()
+        {
+            job["first_seen_at"] = serde_json::json!(1010.0);
+        }
+        c.apply(serde_json::from_value(fixture.clone()).unwrap(), 1010.0)
+            .unwrap();
+        assert!(c
+            .inputs
+            .background
+            .jobs
+            .iter()
+            .all(|job| job.first_seen_at == 1000.0));
+        fixture["payload"]["observed_at"] = serde_json::json!(1020.0);
+        fixture["payload"]["background"]["jobs"] = serde_json::json!([]);
+        c.apply(serde_json::from_value(fixture).unwrap(), 1020.0)
+            .unwrap();
+        let state = c.recompute(1020.0);
+        assert_eq!(
+            state.state,
+            State::Idle,
+            "scheduled crons alone do not imply live work"
+        );
+        assert_eq!(state.background.ended.len(), 4);
+        assert!(state
+            .background
+            .ended
+            .iter()
+            .all(|job| job.ended_at == 1020.0));
+    }
+
+    #[test]
+    fn hook_adapter_metadata_is_bounded_and_not_published() {
+        for (field, limit) in [
+            ("source", 256),
+            ("last_assistant_message", 4096),
+            ("error_details", 4096),
+        ] {
+            let mut c = StateCell::new(0.0, Some(42));
+            let mut value = serde_json::json!({"kind":"hook", "event":"StopFailure",
+                "payload":{"observed_at":1000.0, "error_kind":"rate_limit", "stop_hook_active":false}});
+            value["payload"][field] = serde_json::json!("x".repeat(limit));
+            c.apply(serde_json::from_value(value.clone()).unwrap(), 1000.0)
+                .unwrap();
+            let state = serde_json::to_value(c.recompute(1000.0)).unwrap();
+            assert_eq!(state["state"], "errored");
+            assert_eq!(state["detail"]["error_kind"], "rate_limit");
+            assert!(!state.to_string().contains(&"x".repeat(limit)));
+            value["payload"][field] = serde_json::json!("x".repeat(limit + 1));
+            assert!(
+                c.apply(serde_json::from_value(value).unwrap(), 1001.0)
+                    .is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]

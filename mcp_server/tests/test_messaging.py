@@ -128,7 +128,8 @@ class MessagingToolsTests(unittest.TestCase):
         import io
         with patch.object(hook, "_session_uid", return_value="a"), patch.object(hook, "_drain_inbox", return_value=["Wake"]), patch.object(hook, "_report_turn_ended") as report, patch("sys.stdin", io.StringIO("{}")), patch("sys.stdout", io.StringIO()):
             self.assertEqual(hook.main(), 0)
-        report.assert_called_once_with("a", None, continuing=True)
+        from unittest.mock import ANY
+        report.assert_called_once_with("a", None, continuing=True, payload={}, observed_at=ANY)
 
     def test_milestone_b_tools_keep_daemon_routing_and_explicit_acknowledgements(self):
         calls = [

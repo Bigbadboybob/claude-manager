@@ -160,6 +160,7 @@ During a brain restart the RPC returns conflict; retry the latest report.
                                   PermissionRequest | Notification,
  payload: {observed_at?, prompt_id?, continuing?, transcript_path?,
            waiting_for?, error_kind?, resumes_at?, tool_name?, notification_type?,
+           source?, stop_hook_active?, last_assistant_message?, error_details?,
            background?}}
 
 {session_uid, kind: "snapshot", epoch: UUID, seq: u64,
@@ -172,7 +173,7 @@ During a brain restart the RPC returns conflict; retry the latest report.
             retrying?: bool, error_kind?, background?}}
 ```
 
-Hook payloads use the normalized fields above; future hook adapters translate
+Hook payloads use the normalized fields above; hook adapters translate
 engine-specific fields. `observed_at` defaults to receipt time; adapters should
 capture it at the event so delayed hooks retain their order. `prompt_id` suppresses
 duplicate prompt submissions. Notification edges apply only to
@@ -216,6 +217,36 @@ flags and ten ended jobs. Oversized reports are rejected without applying them.
 Retired epoch replay protection is never evicted: after 64 epoch retirements,
 a further fresh epoch is refused until the session restarts; reports from the
 current epoch continue to work.
+
+## Claude hooks (S3)
+
+The synchronous Stop hook retains its inbox drain and block/reason behavior.
+It reports normalized background tasks and session crons, bounded assistant
+text, `stop_hook_active` and `continuing` through `session.agent_report`. Only a
+method-not-found reply enables the legacy `session.turn_ended` fallback; a
+transport, authorization or validation failure does not. The report is best
+effort and fails open. New UserPromptSubmit, StopFailure, PermissionRequest and
+Notification hooks run asynchronously and double-fork before daemon IPC. They
+print nothing and make no permission decisions. Events carrying a subagent
+`agent_id` are ignored because those hooks inherit the main session's CM identity.
+
+The adapter captures observation time before reading input and translates
+StopFailure `error` to `error_kind`. `source`, `stop_hook_active`, assistant text
+and error details are accepted metadata; they are not retained or published in
+`agent_state`. Text is bounded to 4,096 UTF-8 bytes (source/prompt ID: 256).
+Prompts, tool arguments, cron prompts and notification bodies are omitted.
+Background tasks become shell/subagent/monitor/workflow jobs with
+`wakes_agent=true`; their stable IDs preserve `first_seen_at` across consecutive
+reports. Crons carry only ID, schedule and recurrence. Missing lists, unknown
+job kinds, malformed entries or truncation mark enumeration incomplete.
+Lists are capped at 256 entries and reduced further if necessary to fit the
+RPC size limit. Cron schedules alone do not imply running background work.
+
+Deployment needs the brain and complete MCP payload on each session host.
+The launcher loads the updated Stop script for existing sessions. The other
+events are frozen in Claude's launch settings and require a new session or
+A-R; reconnecting MCP alone does not install them. Presence and transcript
+observation continue to support sessions with the older launch settings.
 
 ## Codex relay (S4/S5)
 
