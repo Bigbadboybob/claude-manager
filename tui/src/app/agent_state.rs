@@ -216,8 +216,9 @@ impl App {
         // A live diff into idle/waiting notifies, including the first state
         // seen for a session (snapshots seed silently).
         let entered_quiet = quiet(next.activity) && old.is_none_or(|o| !quiet(o.activity));
+        // Moving between idle and waiting keeps the earlier notification.
         next.notified_quiet = entered_quiet
-            || (quiet(next.activity) && old.is_some_and(|o| o.activity == next.activity && o.notified_quiet));
+            || (quiet(next.activity) && old.is_some_and(|o| quiet(o.activity) && o.notified_quiet));
         // A working engine that just stalled while the terminal sits quiet
         // gets the notification its stuck state would otherwise suppress.
         let newly_stalled = next.stalled && old.is_some_and(|o| !o.stalled);
@@ -228,7 +229,10 @@ impl App {
                 .flat_map(|w| &w.sessions)
                 .find(|s| s.uid == uid && &s.host_id == host)
             {
-                if ts.notify_on_idle && (entered_quiet || ts.status == SessionStatus::Idle) {
+                // First engine state seen while the terminal is already
+                // idle: the PTY path has notified for this spell.
+                let pty_already = entered_quiet && old.is_none() && ts.status == SessionStatus::Idle;
+                if ts.notify_on_idle && !pty_already && (entered_quiet || ts.status == SessionStatus::Idle) {
                     notify_session_idle(&ts.label);
                 }
             }

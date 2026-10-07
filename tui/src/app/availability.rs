@@ -143,6 +143,11 @@ impl App {
     /// laptop daemon that predates a method falls through to one that has
     /// it. `(host name, socket, operator token)`; resolved non-blocking.
     pub(super) fn owner_rpc_targets(&self) -> Vec<(String, PathBuf, String)> {
+        // Tests never reach a real daemon, inside or outside the sandbox: a
+        // board/F7 write from a test must not touch live items or levels.
+        if cfg!(test) {
+            return Vec::new();
+        }
         let local = cm_daemon::host_id::HostId::local();
         let mut hosts = vec![local.clone()];
         hosts.extend(self.host_pool.host_ids().into_iter().filter(|h| *h != local));

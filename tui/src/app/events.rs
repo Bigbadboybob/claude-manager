@@ -3025,6 +3025,11 @@ mod apply_manifest_diff_tests {
         assert!(!app.needs_redraw, "re-applying the same state does not repaint");
         assert_eq!(app.agent_indicator(&app.workspaces[0].sessions[1]).unwrap().0, "\u{2717}");
         assert_eq!(app.agent_state_wire(&app.workspaces[0].sessions[1])["detail"]["error_kind"], "rate_limit");
+        // waiting -> idle keeps the earlier notification (no second notify).
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"waiting-on-human","since":3.5,"source":"hooks"}));
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"idle","since":3.6,"source":"hooks"}));
+        assert!(app.agent_view(&app.workspaces[0].sessions[1]).unwrap().notified_quiet);
+        assert!(app.engine_covers_idle_notify(&host, "other"));
         // Working by the engine beats a quiet PTY: renders as running.
         app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated { uid: "self".into(),
             entry: serde_json::json!({"agent_state":{"state":"working","since":4.0}}) });

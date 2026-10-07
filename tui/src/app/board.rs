@@ -659,9 +659,9 @@ mod tests {
         app.board.visible = true;
         app.board.listed = true;
         app.board.last_poll = Some(Instant::now());
-        app.board.boards = vec![json!({"slug":"sfd","name":"Swarm Focused Design"}), json!({"slug":"other","name":"Other"})];
+        app.board.boards = vec![json!({"slug":"test-fake-board","name":"Swarm Focused Design"}), json!({"slug":"other","name":"Other"})];
         app.board.accept(json!({
-            "board":{"slug":"sfd","version":3,"orchestrator":"Swarm-Coord [working]","health":{"unresolved":1,"oldest_s":1500}},
+            "board":{"slug":"test-fake-board","version":3,"orchestrator":"Swarm-Coord [working]","health":{"unresolved":1,"oldest_s":1500}},
             "flags":[{"n":3,"kind":"holder_idle","age_s":1500,"detail":null}],
             "items":[
                 {"n":3,"status":"active","title":"fuse SEJD","group":"perf","flags":[{"kind":"holder_idle"}],
@@ -765,9 +765,9 @@ mod tests {
         app.board_write("item.set", json!({"n": 3, "note": "a"}));
         app.board_write("item.set", json!({"n": 1, "note": "b"}));
         assert_eq!(app.board.queued.len(), 2, "nothing dropped while busy");
-        assert_eq!(app.board.queued[0].1["board"], "sfd");
+        assert_eq!(app.board.queued[0].1["board"], "test-fake-board");
         app.handle_event(&key(KeyCode::Tab));
-        tx.send(("read".into(), Some("sfd".into()), Ok(json!({"board":{"version":9},"items":[{"n":42}]})))).unwrap();
+        tx.send(("read".into(), Some("test-fake-board".into()), Ok(json!({"board":{"version":9},"items":[{"n":42}]})))).unwrap();
         app.board.rx.as_ref().unwrap();
         let reply = app.board.rx.as_ref().unwrap().try_recv().unwrap();
         let (tx2, rx2) = mpsc::channel();
@@ -786,7 +786,7 @@ mod tests {
         assert_eq!(app.board.prompt, Some((PromptKind::WaitingEta, String::new())));
         for c in "40m".chars() { app.handle_event(&key(KeyCode::Char(c))); }
         app.handle_event(&key(KeyCode::Enter));
-        assert_eq!(app.board.queued.back().unwrap().1, json!({"n":3,"status":"waiting","eta":"40m","board":"sfd"}));
+        assert_eq!(app.board.queued.back().unwrap().1, json!({"n":3,"status":"waiting","eta":"40m","board":"test-fake-board"}));
         app.handle_event(&key(KeyCode::Char('x')));
         app.handle_event(&key(KeyCode::Char('3')));
         for c in "EP GO".chars() { app.handle_event(&key(KeyCode::Char(c))); }
@@ -795,12 +795,12 @@ mod tests {
         for c in "2h".chars() { app.handle_event(&key(KeyCode::Char(c))); }
         app.handle_event(&key(KeyCode::Enter));
         assert_eq!(app.board.queued.back().unwrap().1,
-            json!({"n":3,"action":"block","blocked_on":"EP GO","check_back":"2h","board":"sfd"}));
+            json!({"n":3,"action":"block","blocked_on":"EP GO","check_back":"2h","board":"test-fake-board"}));
         // 6. The closed strip is selectable, so `o` can reopen it.
         for _ in 0..5 { app.handle_event(&key(KeyCode::Char('j'))); }
         assert_eq!(app.board.selected_n(), Some(9));
         app.handle_event(&key(KeyCode::Char('o')));
-        assert_eq!(app.board.queued.back().unwrap().1, json!({"n":9,"status":"active","board":"sfd"}));
+        assert_eq!(app.board.queued.back().unwrap().1, json!({"n":9,"status":"active","board":"test-fake-board"}));
     }
 
     /// Run one tick, then hold the slot again so the drained write is not sent.
