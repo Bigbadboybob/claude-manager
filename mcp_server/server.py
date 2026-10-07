@@ -46,6 +46,7 @@ except ModuleNotFoundError:
                 "(headless/remote host). Workflow and session tools are unaffected."
             )
 
+from mcp_server.launch_confirmation import await_launch_confirmation as _await_launch_confirmation
 from mcp_server import control_client
 from mcp_server.transcripts.types import Role
 # Session status + transcript-tail helpers and the multi-session monitor
@@ -1542,9 +1543,10 @@ async def start_session(
     spawns, waits for the initial `prompt`'s reply, and returns the
     worker's final message inline, so you don't have to hand-write the
     spawn → `wait_for_session_idle` → `read_last_turn` sequence (and its
-    post-send race). Leave `wait=false` (default) for fire-and-forget
-    spawns you'll drive yourself. `isolated=true` additionally gives the
-    worker its own git worktree in one call — the analogue of
+    post-send race). `wait=false` returns promptly once the daemon accepts
+    the launch; its background monitor checks initial delivery before waiting
+    for completion. `wait=true` checks delivery before waiting for the reply.
+    `isolated=true` additionally gives the worker its own git worktree — the analogue of
     `Agent(isolation="worktree")`.
 
     Args:
@@ -1558,9 +1560,11 @@ async def start_session(
             returns after it goes quiet with `last_message=null`.
         label: Sidebar label for the new session.
         prompt: Optional initial prompt to deliver once the session is
-            ready (queued via the same PendingWrite drainer the workflow
-            activation flow uses). For a bash session this is just a
-            command line. Required in practice when `wait=true` — there's
+            ready. CM confirms a new engine turn or an exact transcript
+            receipt (a new main user turn suffices for Claude), with one
+            guarded Enter retry if needed. Slash commands count as delivered
+            after body plus Enter, without requiring a model turn. For a bash session
+            this is just a command line. Required in practice when `wait=true` — there's
             nothing to wait for otherwise.
             **Omit it to launch a planning task as written**: when
             `prompt` is empty/absent AND you named a task EXPLICITLY
@@ -1664,6 +1668,17 @@ async def start_session(
           - `prompt_source` — "caller" (your `prompt`), "task" (the
             bound task's stored prompt, auto-delivered because you
             passed none), or "none" (spawned promptless).
+          - `prompt_delivery` — on updated daemons, a receipt with status
+            pending/confirmed/delivered/unconfirmed, attempt count, source and
+            reason. `wait=false` usually returns pending; the auto-monitor
+            checks it in the background and reports either completion or
+            uncertain submission. With notify_on_done=false, inspect the receipt
+            using read_last_turn. `submitted` is present only when
+            the tool has a terminal receipt, never false merely for pending.
+            False means unconfirmed; inspect before re-sending to avoid duplicates.
+            The session remains available and no completion is claimed.
+            Older daemons omit these fields. `prompt_source` identifies text,
+            not proof it was submitted.
           - `shared_workspace` / `warning` / `workspace_shared_with` —
             present ONLY when `allow_shared_workspace=true` actually put
             the worker in your own checkout. `workspace_shared_with` is
@@ -1764,6 +1779,18 @@ async def start_session(
         control_client.call, method, params, socket_path=route.path
     )
 
+    # wait=false remains a fast spawn/acceptance call. Its monitor consumes
+    # the receipt in the background; pending never means submitted=false.
+    launch_receipt = spawn.get("prompt_delivery") if isinstance(spawn, dict) else None
+    if isinstance(launch_receipt, dict) and spawn.get("session_uid"):
+        if wait:
+            launch_receipt = await _await_launch_confirmation(
+                spawn["session_uid"], launch_receipt, socket_path=route.path,
+            )
+            spawn["prompt_delivery"] = launch_receipt
+        if launch_receipt.get("status") != "pending":
+            spawn["submitted"] = launch_receipt.get("submitted") is True
+
     # ux-5c: the server tells us which prompt (if any) the child was
     # actually handed — "caller" (the `prompt` arg), "task" (the task's
     # own stored prompt, auto-delivered because we passed none while
@@ -1808,6 +1835,8 @@ async def start_session(
                 "worktree_path",
                 "task_id",
                 "prompt_source",
+                "submitted",
+                "prompt_delivery",
                 "shared_workspace",
                 "warning",
                 "workspace_shared_with",
@@ -1817,6 +1846,10 @@ async def start_session(
                 if spawn.get(key) is not None and d.get(key) is None:
                     d[key] = spawn[key]
         return d
+
+    if wait and isinstance(launch_receipt, dict) and not launch_receipt["submitted"]:
+        spawn.update(completed=False, timed_out=False, last_message=None)
+        return _with_isolation(spawn)
 
     if not wait:
         spawn_uid = spawn.get("session_uid") if isinstance(spawn, dict) else None
@@ -1838,6 +1871,11 @@ async def start_session(
                         else f"worker '{label}' finished its initial prompt"
                     ),
                     source="auto",
+                    # Confirmation gates the level watch so startup cannot
+                    # fire it, while a fast first turn/report_done is retained.
+                    edge=not isinstance(launch_receipt, dict),
+                    **({"launch_receipt": launch_receipt, "launch_socket_path": route.path}
+                       if isinstance(launch_receipt, dict) else {}),
                 )
             except async_monitor.RegistrationError as e:
                 spawn["monitor"] = {"error": e.code, "message": str(e)}
@@ -2064,6 +2102,7 @@ _OUTCOME_FIELDS = (
     "reported_done",
     "reported_done_at",
     "report_reason",
+    "prompt_delivery",
 )
 
 
@@ -2115,6 +2154,7 @@ def read_session_output(
         - note: present only when no transcript is bound (messages empty).
           Explains the bash-session read dead-end and what to do instead.
         - Outcome fields, present when the daemon knows them:
+          prompt_delivery (the initial launch receipt),
           reported_done / reported_done_at / report_reason (the agent's
           own "I'm finished" signal) and, for a session that has ended,
           killed / killed_by / exited_at. Read them before trusting the

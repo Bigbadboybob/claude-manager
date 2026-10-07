@@ -37,6 +37,7 @@ import sys
 import time
 
 from mcp_server import control_client, monitor_state
+from mcp_server.launch_confirmation import await_launch_confirmation
 from mcp_server.monitor import (
     _monitor_sessions,
     baseline_for,
@@ -162,6 +163,8 @@ def register_monitor(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     source: str = "explicit",
     edge: bool = True,
+    launch_receipt: dict | None = None,
+    launch_socket_path=None,
 ) -> dict:
     """Start a background watch on `session_uids`; returns immediately.
 
@@ -299,6 +302,8 @@ def register_monitor(
         "delivered": None,
         "baselines": baselines,
         "report_anchors": report_anchors,
+        "launch_receipt": launch_receipt,
+        "launch_socket_path": launch_socket_path,
         "task": None,
     }
     _MONITORS[monitor_id] = record
@@ -379,7 +384,18 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     try:
         result = None
-        while True:
+        launch = record.get("launch_receipt")
+        if launch is not None:
+            launch = await await_launch_confirmation(
+                record["watching"][0], launch, socket_path=record.get("launch_socket_path"),
+                timeout_s=min(360.0, max(0.0, deadline - time.monotonic())),
+            )
+            record["launch_receipt"] = launch
+            if not launch["submitted"]:
+                result = {"completed": [], "still_running": record["watching"],
+                          "timed_out": False, "submitted": False,
+                          "prompt_delivery": launch}
+        while result is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 result = {
@@ -402,6 +418,9 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
                 # survive it (daemon-side persistence); retry.
                 _log(f"{monitor_id}: daemon unreachable ({e}); retrying")
                 await asyncio.sleep(5.0)
+        if launch is not None:
+            result["prompt_delivery"] = launch
+            result["submitted"] = launch["submitted"]
         record["result"] = result
         record["state"] = "fired"
         persist_state()
@@ -539,6 +558,18 @@ def _format_fire_message(record: dict, result: dict) -> str:
     marker (also used for delivery verification)."""
     lines: list[str] = []
     head = f"[cm-monitor {record['monitor_id']} fired]"
+    if result.get("submitted") is False and result.get("prompt_delivery"):
+        receipt = result["prompt_delivery"]
+        uncertainty = (
+            " The daemon lost the confirmation receipt after a restart or session change; "
+            "delivery is unknown, not failed."
+            if receipt.get("reason") == "confirmation_lost_or_session_replaced" else ""
+        )
+        return (f"{head} Initial prompt submission unconfirmed for "
+                f"{', '.join(record['watching'])}: {receipt.get('reason')}. "
+                f"{uncertainty} submitted=false means no confirmation, not proof of no delivery. "
+                "Inspect its state/transcript before "
+                "re-sending to avoid a duplicate prompt. No completion is claimed.")
     if record["note"]:
         head += f" {record['note']}"
     lines.append(head)
@@ -746,7 +777,7 @@ def list_monitors() -> dict:
     out = []
     for m in _MONITORS.values():
         _refresh_delivery(m)
-        out.append({k: v for k, v in m.items() if k != "task"})
+        out.append({k: v for k, v in m.items() if k not in {"task", "launch_socket_path"}})
     try:
         persist_state()
         durable = monitor_state.read()

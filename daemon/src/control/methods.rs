@@ -2770,6 +2770,8 @@ pub fn resolve_authorized_session(
             "idle": idle,
             "pty_idle": pty_idle,
             "agent_state": agent_state,
+            "prompt_delivery": session.prompt_delivery.as_ref().map(|ticket|
+                ticket.lock().unwrap_or_else(|p| p.into_inner()).clone()),
             // Hook-derived turn-boundary signal (S3): null = no hook
             // data, true = last turn-end postdates last input (at the
             // prompt regardless of PTY spinner noise), false = a turn
@@ -7220,6 +7222,31 @@ mod operator_quiet_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn launch_ignores_terminal_replies_but_defers_for_typing() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (handle, writes) = InputHandle::test_handle_capturing();
+        for reply in [b"\x1b[6;20;10t".as_slice(), b"\x1b[4;480;800t",
+            b"\x1bP>|kitty(0.39.1)\x1b\\", b"\x1b[A", b"\x1b[13;20R",
+            b"\x1b[?1;2c", b"\x1b[?1u", b"\x1b[<64;10;20M"] {
+            handle.write_and_stamp_operator(reply).unwrap();
+            assert!(handle.operator_quiet_for().is_none(), "{reply:?}");
+        }
+        handle.write_and_stamp_operator(b"typed draft").unwrap();
+        assert!(handle.operator_quiet_for().is_some());
+        let typed = Instant::now();
+        writes.lock().unwrap().clear();
+        let mut launch = crate::control::prompt_delivery::LaunchWrite { written_at: None, enter: Vec::new() };
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        assert!(super::deliver_agent_body_inner(&handle, &fanout, "launch", "prompt", false,
+            "test launch", None, None, Some(&mut launch)));
+        let written = launch.written_at.unwrap();
+        assert!(written.duration_since(typed) >= super::OPERATOR_QUIET_WINDOW);
+        let captured = writes.lock().unwrap();
+        assert_eq!(captured.len(), 2, "defer then write body/Enter instead of cancelling");
+        assert!(captured[0].1.windows(6).any(|w| w == b"prompt"));
+    }
+
+    #[test]
     fn codex_delivery_recovery_enter_preserves_new_operator_draft() {
         let (h, writes) = InputHandle::test_handle_capturing();
         let start = Instant::now();
@@ -7548,6 +7575,141 @@ fn spawn_agent_prompt_delivery(
         });
 }
 
+fn spawn_initial_prompt_delivery(
+    state: Arc<Mutex<DaemonState>>,
+    handle: crate::session::InputHandle,
+    fanout: Arc<crate::session::PtyByteFanout>,
+    uid: String,
+    body: String,
+    ticket: super::prompt_delivery::Ticket,
+) {
+    use super::prompt_delivery::{self as delivery, Baseline, Check, LaunchWrite};
+    let result_ticket = Arc::clone(&ticket);
+    let spawned = std::thread::Builder::new()
+        .name(format!("cm-launch-confirm-{uid}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut launch = LaunchWrite {
+                    written_at: None,
+                    enter: Vec::new(),
+                };
+                let mut captured = None;
+                let mut transcript = None;
+                let mut before_write = || {
+                    captured = {
+                        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                        state.sessions.get(&uid).map(|s| {
+                            let cell = s.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+                            (
+                                s.pid,
+                                s.generation,
+                                Baseline::capture(&cell.inputs, now_unix_f64()),
+                            )
+                        })
+                    };
+                    transcript = super::codex_delivery::DeliveryEvidence::capture_launch(
+                        &state, &uid, &body,
+                    );
+                    ticket.lock().unwrap_or_else(|p| p.into_inner()).attempts = 1;
+                };
+                if !deliver_agent_body_inner(
+                    &handle,
+                    &fanout,
+                    &uid,
+                    &body,
+                    true,
+                    "initial prompt",
+                    None,
+                    Some(&mut before_write),
+                    Some(&mut launch),
+                ) {
+                    delivery::finish(&ticket, Err("write_failed_or_cancelled"));
+                    return;
+                }
+                let Some((pid, generation, baseline)) = captured else {
+                    delivery::finish(&ticket, Err("session_gone"));
+                    return;
+                };
+                if body.trim_start().starts_with('/') {
+                    delivery::delivered_command(&ticket);
+                    return;
+                }
+                let transcript = std::cell::RefCell::new(transcript);
+                let generation = std::cell::Cell::new(generation);
+                let check = || {
+                    {
+                        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                        let Some(s) = state.sessions.get(&uid) else {
+                            return Check::Stop("session_gone");
+                        };
+                        if s.pid != pid
+                            || s.last_exit.kernel_set()
+                            || !s
+                                .prompt_delivery
+                                .as_ref()
+                                .is_some_and(|t| Arc::ptr_eq(t, &ticket))
+                        {
+                            return Check::Stop("session_replaced_or_exited");
+                        }
+                        if s.generation != generation.get() {
+                            generation.set(s.generation);
+                            return Check::Deferred;
+                        }
+                        let cell = s.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(source) = baseline.confirmed_by(&cell.inputs) {
+                            return Check::Confirmed(source);
+                        }
+                    }
+                    if let Some(evidence) = transcript.borrow_mut().as_mut() {
+                        use super::codex_delivery::Observation;
+                        match evidence.observe(&state, &uid, &body) {
+                            Observation::Accepted => return Check::Confirmed("transcript"),
+                            // Evidence may be coalesced or the hook may lag
+                            // the transcript. Stop retrying, but keep watching.
+                            Observation::Active => return Check::Deferred,
+                            Observation::Gone => return Check::Stop("session_gone"),
+                            Observation::Unknown => return Check::Deferred,
+                            Observation::Pending => {}
+                        }
+                    }
+                    if crate::writer_gate::pause_requested() { Check::Deferred } else { Check::Pending }
+                };
+                delivery::confirm(
+                    &ticket,
+                    &check,
+                    || {
+                        match check() {
+                            Check::Pending => {}
+                            other => return other,
+                        }
+                        // Keep the observed encoding. Never type a new
+                        // escape sequence into a composer using raw Enter.
+                        let since = launch.written_at.expect("body was written");
+                        match handle.write_recovery_enter(&launch.enter, since) {
+                            Ok(true) => Check::Pending,
+                            Ok(false) => Check::Deferred,
+                            Err(_) => Check::Stop("retry_write_failed"),
+                        }
+                    },
+                    delivery::RETRY_AFTER,
+                    delivery::CONFIRM_MAX.saturating_sub(launch.written_at.unwrap().elapsed()),
+                    std::time::Duration::from_millis(200),
+                );
+            }));
+            if result.is_err() {
+                delivery::finish(&ticket, Err("confirmation_worker_failed"));
+            }
+            let receipt = ticket.lock().unwrap_or_else(|p| p.into_inner());
+            eprintln!(
+                "cm-daemon: initial prompt {uid}: submitted={} attempts={} source={:?} reason={:?}",
+                receipt.submitted, receipt.attempts, receipt.confirmed_by, receipt.reason
+            );
+        });
+    if spawned.is_err() {
+        delivery::finish(&result_ticket, Err("confirmation_worker_unavailable"));
+    }
+}
+
 /// Confirmation runs for fresh/resumed launches, persistent fires and
 /// send_input. Never clear/re-paste based on missing transcript evidence:
 /// a delayed writer could otherwise make us interrupt or duplicate real work.
@@ -7700,6 +7862,17 @@ fn deliver_agent_body_guarded(
     notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
     before_write: Option<&mut dyn FnMut()>,
 ) -> bool {
+    deliver_agent_body_inner(handle, fanout, session_uid, body_text, fresh_spawn, what, notice, before_write, None)
+}
+
+fn deliver_agent_body_inner(
+    handle: &crate::session::InputHandle,
+    fanout: &Arc<crate::session::PtyByteFanout>,
+    session_uid: &str, body_text: &str, fresh_spawn: bool, what: &str,
+    notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
+    before_write: Option<&mut dyn FnMut()>,
+    mut launch: Option<&mut super::prompt_delivery::LaunchWrite>,
+) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
     // Own the fanout subscription for the life of THIS delivery rather
@@ -7830,6 +8003,7 @@ fn deliver_agent_body_guarded(
     if fanout.snapshot_since(None).closed { return false; }
     let _unit = crate::writer_gate::unit_permit();
     if let Some(before_write) = before_write { before_write(); }
+    if let Some(launch) = launch.as_mut() { launch.written_at = Some(Instant::now()); }
     if let Err(e) = handle.write_and_stamp(&payload) {
         eprintln!(
             "cm-daemon: agent {} body write failed for {}: {}",
@@ -7837,6 +8011,7 @@ fn deliver_agent_body_guarded(
         );
         return false;
     }
+    if launch.is_some() { handle.note_turn_start(); }
     // Step boundary: body landed. Under a restart pause, complete the
     // Enter promptly rather than park mid-prompt: the gap is drained in
     // short slices so a pause landing MID-gap is observed within one
@@ -7867,6 +8042,7 @@ fn deliver_agent_body_guarded(
     } else {
         AGENT_KITTY_ENTER
     };
+    if let Some(launch) = launch.as_mut() { launch.enter = enter.to_vec(); }
     if let Err(e) = handle.write_and_stamp(enter) {
         eprintln!(
             "cm-daemon: agent {} Enter write failed for {}: {}",
@@ -7874,6 +8050,9 @@ fn deliver_agent_body_guarded(
         );
         return false;
     }
+    // Initial launches use engine evidence and exactly one guarded retry.
+    // PTY output can be a startup redraw, so it cannot acknowledge this prompt.
+    if launch.is_some() { return true; }
     // Verify: a PTY still quiet a full window after the Enter means the
     // submit didn't take (mode flipped inside the gap, byte swallowed
     // mid-redraw, ...). Re-send Enter once with a freshly-read mode.
@@ -9226,33 +9405,9 @@ pub fn mcp_start_session(
 
     let start_result = start_session(state_arc, &Value::Object(full_params))?;
 
-    // Sub-2b-3 review-fix #2: deliver `prompt` if supplied.
-    // Pre-fix this was logged-and-dropped — silent contract
-    // break with the Python MCP tool which advertises prompt
-    // delivery. Look up the new session's InputHandle and
-    // write the prompt through the shared `write_and_stamp`
-    // helper (same path the attach-stream Input frame handler
-    // uses).
-    //
-    // Engine-specific submission:
-    //   - claude-code / bash: body + `\n`, synchronous, with
-    //     kill-on-failure (no half-initialized session).
-    //   - codex: a bare `\n` does NOT submit codex's
-    //     kitty-keyboard TUI, and a multi-line body without
-    //     bracketed paste submits at the first newline. The
-    //     daemon has no `Term` to read codex's live mode, so it
-    //     delivers asynchronously assuming codex's always-on
-    //     modes (bracketed paste + kitty Enter) with a settle/
-    //     gap delay — see `spawn_agent_prompt_delivery`. This
-    //     is the daemon-side stand-in for the TUI's mode-aware
-    //     `PendingWrite::wait_for_quiet` drainer, which isn't
-    //     relocated daemon-side.
-    //
-    // ux-5c: `effective_prompt` is either the caller's own prompt or
-    // the bound task's stored prompt (see the resolution block above).
-    // Both go through this identical delivery path — an auto-delivered
-    // task prompt is indistinguishable, from the child's side, from one
-    // the caller typed.
+    // Delivery stays asynchronous so the control RPC remains short. The MCP
+    // tool polls the per-launch receipt before claiming the prompt started.
+    let mut prompt_ticket = None;
     if let Some(prompt) = effective_prompt.as_deref() {
         if !prompt.is_empty() {
             let handle_opt = {
@@ -9291,24 +9446,17 @@ pub fn mcp_start_session(
                 ));
             };
             if is_tui_agent {
-                // codex and claude-code both run kitty-keyboard TUIs: a bare
-                // newline in the composer does NOT submit, and a multi-line
-                // body delivered without bracketed-paste markers splits into
-                // premature submissions. The TUI handles this via its
-                // mode-aware drainer; the daemon has no `Term` to read the
-                // live terminal mode, so we deliver asynchronously assuming
-                // the modes these agents always enable (BRACKETED_PASTE +
-                // kitty), with a timing gap so they're active before the
-                // bytes land. See `spawn_agent_prompt_delivery`. Returns
-                // immediately; the transcript detector binds once the agent
-                // runs the turn.
-                spawn_agent_prompt_delivery(
-                    handle,
-                    fanout,
-                    session_uid.clone(),
-                    prompt.to_string(),
-                    true,
-                    Some(Arc::clone(state_arc)),
+                let ticket = super::prompt_delivery::Receipt::pending();
+                {
+                    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(session) = state.sessions.get_mut(&session_uid) {
+                        session.prompt_delivery = Some(Arc::clone(&ticket));
+                    }
+                }
+                prompt_ticket = Some(Arc::clone(&ticket));
+                spawn_initial_prompt_delivery(
+                    Arc::clone(state_arc), handle, fanout, session_uid.clone(),
+                    prompt.to_string(), ticket,
                 );
             } else {
                 // claude-code / bash: body + newline, synchronous, with
@@ -9419,6 +9567,10 @@ pub fn mcp_start_session(
             obj.insert("task_id".into(), Value::String(tid.to_string()));
         }
         obj.insert("prompt_source".into(), Value::String(prompt_source.to_string()));
+        if let Some(ticket) = &prompt_ticket {
+            let receipt = ticket.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            obj.insert("prompt_delivery".into(), json!(receipt));
+        }
         // Reaped-worktree heal: say what was re-created and relay any
         // zero-commit-decoy / wip_branch-mismatch warnings. Nothing is
         // written on the healthy path.
@@ -20674,6 +20826,100 @@ mod tests {
     /// startup repaints swallow the first Enter, and the 40KB batch remains in
     /// the composer. All three production entry points must retry only Enter.
     #[test]
+    fn initial_prompt_confirmation_retries_once_and_ignores_repaint() {
+        // Real PTYs swallow the first submit while repainting; only the
+        // identical Enter is accepted. One case never starts a turn; slash
+        // commands are delivered without requiring a model turn.
+        for (engine, accept, command) in [("claude-code", true, false), ("codex", true, false),
+            ("codex", false, false), ("claude-code", false, true)] {
+            let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = TempDir::new().unwrap();
+            let state = state_with_workspace("ws-confirm", &dir);
+            let uid = fresh_test_uid();
+            let rollout = dir.path().join("rollout.jsonl");
+            let writes = dir.path().join("writes.json");
+            let script = dir.path().join("composer.py");
+            let body = if command { "/triage-review X" } else { "one initial prompt\nsecond line" };
+            std::fs::write(&script, r#"
+import datetime,json,os,pathlib,select,sys,time,tty
+rollout,writes=map(pathlib.Path,sys.argv[1:3]);engine=sys.argv[3];accept=sys.argv[4]=='true'
+tty.setraw(0)
+os.write(1,b'\x1b[?2004h\x1b[>1uStarting\r\n')
+time.sleep(.3);os.write(1,b'.'*1024+b'\r\n')
+buf=b'';enters=0;encodings=[]
+while True:
+    ready,_,_=select.select([0],[],[],.1)
+    if enters:os.write(1,b'\rStartup redraw')
+    if not ready:continue
+    data=os.read(0,65536)
+    if not data:break
+    buf+=data
+    for marker in [b'\x1b[13u',b'\r']:
+        while marker in buf:
+            enters+=1;encodings.append(marker.hex());buf=buf.replace(marker,b'',1)
+    text=buf.replace(b'\x1b[200~',b'').replace(b'\x1b[201~',b'').decode()
+    writes.write_text(json.dumps({'enters':enters,'text':text,'encodings':encodings}))
+    if accept and enters==2 and not rollout.exists():
+        stamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z')
+        row={'timestamp':stamp,'type':'user','message':{'content':'expanded '+text}} if engine=='claude-code' else {'timestamp':stamp,'type':'event_msg','payload':{'type':'user_message','message':text}}
+        rollout.write_text(json.dumps(row)+'\n')
+"#).unwrap();
+            let mut sp = crate::session::SpawnParams::new(&uid, "confirm", "/usr/bin/python3");
+            sp.args = vec!["-u".into(), script.display().to_string(), rollout.display().to_string(),
+                writes.display().to_string(), engine.into(), accept.to_string()];
+            sp.workspace_id = "ws-confirm".into();
+            sp.session_type = engine.into();
+            let mut session = crate::session::DaemonSession::spawn(sp).unwrap();
+            let ticket = crate::control::prompt_delivery::Receipt::pending();
+            session.prompt_delivery = Some(ticket.clone());
+            let handle = session.input_handle();
+            let fanout = session.fanout.clone();
+            state.lock().unwrap().sessions.insert(uid.clone(), session);
+            spawn_initial_prompt_delivery(state.clone(), handle, fanout, uid.clone(), body.into(), ticket.clone());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(110);
+            loop {
+                // Detector bind followed by a hook/path correction before
+                // evidence is observed. Two bumps still belong to this process.
+                if rollout.exists() {
+                    let mut state = state.lock().unwrap();
+                    let session = state.sessions.get_mut(&uid).unwrap();
+                    if session.transcript_path.is_none() {
+                        session.transcript_path = Some(dir.path().join("detector-guess.jsonl").display().to_string());
+                        session.generation += 1;
+                        session.transcript_path = Some(rollout.display().to_string());
+                        session.generation += 1;
+                    }
+                }
+                if ticket.lock().unwrap().status != "pending" { break; }
+                assert!(std::time::Instant::now() < deadline, "{engine}: confirmation hung");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let receipt = ticket.lock().unwrap().clone();
+            assert_eq!(receipt.submitted, accept || command, "{engine}: {receipt:?}");
+            assert_eq!(receipt.attempts, if command {1} else {2});
+            assert_eq!(receipt.confirmed_by, if command {Some("write")} else if accept {Some("transcript")} else {None});
+            assert_eq!(receipt.reason, if accept || command {None} else {Some("no_engine_turn")});
+            if command { assert_eq!(receipt.status, "delivered"); }
+            let input: Value = loop {
+                if let Ok(text) = std::fs::read_to_string(&writes) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        if v["enters"] == if command {1} else {2} { break v; }
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            assert_eq!(input["text"], body, "body must never be re-pasted");
+            if !command { assert_eq!(input["encodings"][0], input["encodings"][1]); }
+            assert_eq!(input["enters"], if command {1} else {2}, "only the allowed Enter attempts");
+            let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
+            assert_eq!(resolved["prompt_delivery"]["id"], receipt.id);
+            assert_eq!(resolved["prompt_delivery"]["submitted"], accept || command);
+            kill_all_sessions(&state);
+        }
+    }
+
+    #[test]
     fn codex_delivery_recovers_parked_prompt_on_all_agent_entry_points() {
         for route in ["fresh", "persistent", "send_input"] {
             let dir = TempDir::new().unwrap();
@@ -24947,6 +25193,11 @@ while True:
             set_spawn_program_override_for_test(None);
 
             assert_eq!(resp["prompt_source"], json!("task"));
+            assert!(resp.get("submitted").is_none(), "old MCP must not see pending as failure");
+            assert_eq!(resp["prompt_delivery"]["status"], "pending");
+            let resolved = resolve_authorized_session(&state,
+                &json!({"session_uid":resp["session_uid"]}), Some("ts-caller")).unwrap();
+            assert_eq!(resolved["prompt_delivery"]["id"], resp["prompt_delivery"]["id"]);
             assert_eq!(resp["task_id"].as_str(), Some("task-1"));
             let reqs = stub.requests.lock().unwrap();
             assert!(
@@ -33332,7 +33583,6 @@ while True:
                 let session = &s.sessions[uid];
                 assert_eq!(*session.last_input_at.lock().unwrap(), baseline, "{bytes:?}");
                 assert!(session.last_activity_at.lock().unwrap().unwrap() >= before);
-                assert!(session.last_operator_input_at.lock().unwrap().unwrap() >= before);
             }
             let resolved = resolve_authorized_session(
                 &state, &json!({"session_uid": uid}), None,
