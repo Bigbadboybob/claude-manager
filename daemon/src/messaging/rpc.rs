@@ -15,10 +15,12 @@ pub fn default_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".cm")
 }
+/// Project an already-open store. Startup owns opening/retrying in the
+/// background; no RPC or maintenance caller may rebuild the store here.
 pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
-    let (handle, root) = {
+    let handle = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        (s.messaging.clone(), s.messaging_root.clone())
+        s.messaging.clone()
     };
     let delivery_gate = state
         .lock()
@@ -26,11 +28,9 @@ pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
         .messaging_delivery
         .clone();
     let _delivery_guard = delivery_gate.lock().unwrap_or_else(|p| p.into_inner());
-    let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_none() {
-        *slot = Some(Store::open(&root)?);
-    }
-    project_names(state, slot.as_ref().unwrap(), false);
+    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let store = slot.as_ref().ok_or_else(super::startup::starting)?;
+    project_names(state, store, false);
     Ok(())
 }
 pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bool) {
@@ -67,7 +67,7 @@ pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bo
             s.manifest_watcher.broadcast(crate::manifest::ManifestDiff::Updated{uid:n.session_uid.clone(),entry:json!({"uid":n.session_uid,"label":n.name,"name_revision":n.revision,"messaging_daemon_id":store.daemon_id})});
         }
     }
-    if any_changed && persist {
+    if any_changed && (persist || s.messaging_registry_restored) {
         s.persist_sessions_best_effort();
     }
 }
@@ -171,6 +171,12 @@ fn repair_legacy_binding(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Result<(
 }
 
 fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, ChatError> {
+    // A readiness check must not take the delivery gate: plain sends are
+    // deliberately allowed while another thread is publishing a wake.
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    if handle.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+        return Err(super::startup::starting());
+    }
     if req.method == "messaging.sync" {
         return execute_sync_admin(state, req);
     }
@@ -366,10 +372,7 @@ fn execute_with_freshness(
     let _delivery_guard =
         coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_none() {
-        *slot = Some(Store::open(&root)?);
-    }
-    let store = slot.as_mut().unwrap();
+    let store = slot.as_mut().ok_or_else(super::startup::starting)?;
     let actor = if kind == "owner" {
         "owner".into()
     } else {
@@ -786,6 +789,11 @@ mod tests {
         assert!(stalled["delay_note"].as_str().unwrap().contains("authoritative"));
     }
     fn setup(root: &std::path::Path) -> Arc<Mutex<DaemonState>> {
+        let state = uninitialized(root);
+        super::super::startup::open_for_test(&state).unwrap();
+        state
+    }
+    fn uninitialized(root: &std::path::Path) -> Arc<Mutex<DaemonState>> {
         let mut state = DaemonState::default();
         state.messaging_root = root.into();
         for uid in ["a", "b", "outsider"] {
@@ -1240,12 +1248,12 @@ mod tests {
         )
         .unwrap();
         drop(state);
-        let state = setup(tmp.path());
+        let state = uninitialized(tmp.path());
         let manifest = tmp.path().join("daemon-sessions.json");
         let original = b"headless registry must survive initialization";
         std::fs::write(&manifest, original).unwrap();
         state.lock().unwrap().daemon_sessions_path = Some(manifest.clone());
-        initialize(&state).unwrap();
+        super::super::startup::open_for_test(&state).unwrap();
         assert_eq!(std::fs::read(&manifest).unwrap(), original);
         assert_eq!(state.lock().unwrap().messaging_names["a"].name, "Scout");
         let stale = tmp.path().join("stale-tui.json");
@@ -1260,5 +1268,27 @@ mod tests {
         assert_eq!(entry.label, "Scout");
         assert_eq!(entry.workflow_role.as_deref(), Some("worker"));
         assert_eq!(entry.task_id.as_deref(), Some("task-a"));
+    }
+
+    #[test]
+    fn messaging_late_name_recovery_persists_after_registry_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        call(&state, "a", "send", json!({
+            "channel":"general", "name":"Restored-Scout", "body":"Ready", "request_id":"name",
+        })).unwrap();
+        drop(state);
+        let state = uninitialized(tmp.path());
+        let manifest = tmp.path().join("daemon-sessions.json");
+        {
+            let mut s = state.lock().unwrap();
+            s.daemon_sessions_path = Some(manifest.clone());
+            s.messaging_registry_restored = true;
+        }
+        super::super::startup::open_for_test(&state).unwrap();
+        assert!(manifest.exists(), "late name recovery must persist the restored registry");
+        assert_eq!(state.lock().unwrap().messaging_names["a"].name, "Restored-Scout");
+        let saved: Value = serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+        assert_eq!(saved["messaging_names"]["a"]["name"], "Restored-Scout");
     }
 }

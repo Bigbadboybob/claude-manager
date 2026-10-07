@@ -31840,7 +31840,7 @@ while True:
 
             // A channel subscription is scheduler-owned and repeated config
             // updates preserve its identity/checkpoint; null explicitly clears it.
-            crate::messaging::rpc::initialize(&state).unwrap();
+            crate::messaging::startup::open_for_test(&state).unwrap();
             let channel = {
                 let handle = state.lock().unwrap().messaging.clone();
                 let slot = handle.lock().unwrap();

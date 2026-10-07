@@ -8,6 +8,14 @@ The baseline reader must understand the envelope, conversation membership, ident
 
 `_events`, `_journal`, and `space.json` form the retained interchange contract. `_state`, `_monitors`, `_delivery`, `_outbox`, and `_cache` are daemon-managed implementation state: external readers must not mutate or depend on their internal schemas. Name/norm projection files are conveniences. Retained public identity attestations are canonical events, not disposable profiles.
 
+Messaging history rebuilds in a background worker after a brain restart. Session
+adoption, control RPCs, attach, and scheduling do not wait for that rebuild.
+Until the store is ready, messaging RPCs return `conflict` with a
+`messaging_starting:` message; retry the same request ID and body shortly.
+Failed opens retry every five seconds and are logged. Replication starts after
+both store opening and session restoration finish. Startup logs report
+`messaging store open took Ns` separately from `rpc ready after Ns`.
+
 ## 1. Space, conversation, thread, identity
 
 A **space** is one shared conversation universe: its channels, participants, norms, and ordered history. The default deployment has one space called `main`. Its storage lives outside repositories and worktrees, under `~/.cm/messages/main/`, so deleting a task checkout cannot delete its conversations.

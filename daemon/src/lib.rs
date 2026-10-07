@@ -414,6 +414,7 @@ pub fn run_daemon_preflight() -> i32 {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    let startup_at = std::time::Instant::now();
     // Deterministic comm regardless of how we were exec'd: a
     // /proc/self/fd or execveat(AT_EMPTY_PATH) exec (re-exec deploys,
     // holder spawns, the phase-7 reverse migration) derives comm from
@@ -882,7 +883,7 @@ pub fn run() -> anyhow::Result<()> {
         initial_state.seed_recently_exited_from_sidecar(&sidecar);
     }
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
-    if let Err(e) = messaging::rpc::initialize(&state) {
+    if let Err(e) = messaging::startup::start(&state) {
         eprintln!("cm-daemon: messaging unavailable: {e}");
     }
 
@@ -1214,6 +1215,7 @@ pub fn run() -> anyhow::Result<()> {
     }
     agent_state::start(&state)?;
 
+    state.lock().unwrap_or_else(|p| p.into_inner()).messaging_registry_restored = true;
     if let Err(e) = messaging::rpc::initialize(&state) {
         eprintln!("cm-daemon: messaging pending: {e}");
     }
@@ -1222,7 +1224,6 @@ pub fn run() -> anyhow::Result<()> {
     state.lock().unwrap_or_else(|p| p.into_inner())
         .persist_sessions_best_effort();
     messaging::delivery::spawn(&state);
-    messaging::sync::start(&state);
     messaging::tasks::spawn(&state);
     items::start(&state);
 
@@ -1296,6 +1297,7 @@ pub fn run() -> anyhow::Result<()> {
 
     worktree_cleanup::bootstrap();
 
+    eprintln!("cm-daemon: rpc ready after {:.3}s ({})", startup_at.elapsed().as_secs_f64(), path.display());
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {

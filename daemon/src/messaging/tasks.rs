@@ -458,11 +458,10 @@ fn reconcile_task(
 /// The background loop also runs this so a replacement doesn't need to
 /// discover chat first. Per-task failures are logged, not fatal.
 pub fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<(String, Value)>, ChatError> {
-    let (handle, root, graph) = {
+    let (handle, graph) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         (
             s.messaging.clone(),
-            s.messaging_root.clone(),
             SessionGraph::capture(&s),
         )
     };
@@ -483,10 +482,7 @@ pub fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<(String, Value)>, 
         }
     }
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_none() {
-        *slot = Some(Store::open(&root)?);
-    }
-    let store = slot.as_mut().unwrap();
+    let Some(store) = slot.as_mut() else { return Ok(Vec::new()); };
     if store.messaging_frozen() {
         return Ok(Vec::new());
     }

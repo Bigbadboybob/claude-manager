@@ -93,7 +93,7 @@ mod tests {
         st.config.api_url = url;
         st.config.api_token = "tok".into();
         let state = Arc::new(Mutex::new(st));
-        crate::messaging::rpc::initialize(&state).unwrap();
+        crate::messaging::startup::open_for_test(&state).unwrap();
         let started = std::time::Instant::now();
         let mut reply = json!({"ok": true});
         attach(&state, "me-uid", &mut reply);

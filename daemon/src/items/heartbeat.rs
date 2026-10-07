@@ -436,7 +436,7 @@ mod tests {
             serde_json::from_value(json!({"uid":"me-uid","type":"codex"})).unwrap(),
         );
         let state = Arc::new(Mutex::new(st));
-        crate::messaging::rpc::initialize(&state).unwrap();
+        crate::messaging::startup::open_for_test(&state).unwrap();
         let mut beat = Beat::default();
         beat.run(&state);
         assert_eq!(beat.acks, BTreeSet::from([41, 42]));

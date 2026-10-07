@@ -986,7 +986,7 @@ mod tests {
             );
         }
         let state = Arc::new(Mutex::new(state));
-        crate::messaging::rpc::initialize(&state).unwrap();
+        crate::messaging::startup::open_for_test(&state).unwrap();
         state
     }
 

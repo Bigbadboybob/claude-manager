@@ -386,6 +386,10 @@ pub type WorktreeSpawnQueues = Arc<Mutex<HashMap<PathBuf, Arc<WorktreeSpawnQueue
 /// `list_sessions` need a consistent snapshot.
 pub struct DaemonState {
     pub messaging: Arc<Mutex<Option<crate::messaging::Store>>>,
+    /// One background opener per brain; rebuilding never holds daemon/store locks.
+    pub messaging_startup: Arc<std::sync::atomic::AtomicBool>,
+    /// Name recovery must not persist the session registry before adoption finishes.
+    pub messaging_registry_restored: bool,
     /// Serializes chat cancellation/preferences with the final delivery boundary.
     pub messaging_delivery: Arc<Mutex<()>>,
     pub messaging_wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
@@ -817,6 +821,8 @@ impl Default for DaemonState {
             workflow_definitions: HashMap::new(),
             base_workflow_definitions: HashMap::new(),
             messaging: Arc::new(Mutex::new(None)),
+            messaging_startup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            messaging_registry_restored: false,
             messaging_delivery: Arc::new(Mutex::new(())),
             messaging_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             messaging_root: crate::messaging::rpc::default_root(),
