@@ -153,8 +153,10 @@ Milestone A.
 1. **Light staffing**, no time pressure: three lanes — **state-core** (Codex),
    **items** (Claude; takes the items-daemon slices too), **messaging**
    (Claude; also W0d). Other slices are picked up by these lanes in wave order.
-2. **Swarm-Coord merges and deploys** each reviewed slice itself, hub first,
-   brain-only restarts.
+2. **Swarm-Coord merges** each reviewed slice to main. **Deploys are consolidated**
+   (Owner, 2026-10-07): chat/messaging fixes were the exception; everything
+   else now accumulates on main and ships in one deploy when the remaining
+   work is done, hub first, brain-only restarts.
 3. **Existing Codex lanes are restarted** at Milestone A; Swarm-Coord gives
    Owner the list and Owner does the restarts.
 
