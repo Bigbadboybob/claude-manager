@@ -40,11 +40,35 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
+
+/// Whether CM launches Codex in inline mode (`--no-alt-screen`). Codex's
+/// default alternate screen has no scrollback, so CM's mouse wheel and
+/// Shift+PageUp (which move CM's own terminal scrollback) had nothing to
+/// scroll. Inline mode inserts history above the viewport, where it reaches
+/// the scrollback. Process-wide: the daemon sets it from `daemon.toml`'s
+/// `codex_inline_scrollback` (startup + reload_config), the TUI from
+/// `~/.cm/tui-settings.toml`. Applies to the next spawn/resume only.
+static CODEX_INLINE_SCROLLBACK: AtomicBool = AtomicBool::new(true);
+
+pub fn set_codex_inline_scrollback(on: bool) {
+    CODEX_INLINE_SCROLLBACK.store(on, Ordering::Relaxed);
+}
+
+pub fn codex_inline_scrollback() -> bool {
+    CODEX_INLINE_SCROLLBACK.load(Ordering::Relaxed)
+}
+
+/// Screen-mode flags for a CM Codex argv. Both argv composers (this
+/// module's `build_args` and the TUI's `codex_args`) call this, fresh and
+/// resume alike; `native_codex.py::split_args` forwards it to the frontend.
+pub fn codex_screen_args(inline: bool) -> Vec<String> {
+    if inline { vec!["--no-alt-screen".into()] } else { Vec::new() }
+}
 
 /// Per-session MCP config dir. `~/.cm/mcp/<session_uid>/`.
 fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
@@ -850,6 +874,7 @@ pub fn build_launch_args(
                 // permission overrides and inherit the saved task's policy.
                 args.push("--dangerously-bypass-approvals-and-sandbox".into());
             }
+            args.extend(codex_screen_args(codex_inline_scrollback()));
             // Same update-check disable the TUI applies — prevents
             // codex's popup from tearing down the PTY.
             args.push("-c".into());
@@ -1913,6 +1938,26 @@ mod tests {
         let (_, launched, _) =
             build_launch_args("codex", "ts-v-1", None, None, Launch::Resume("x")).unwrap();
         assert_eq!(resumed, launched);
+    }
+
+    #[test]
+    fn build_args_codex_launches_inline_for_scrollback_fresh_and_resume() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        for resume in [None, Some("sid-inline")] {
+            let (_p, args, _pin) = build_args("codex", "ts-inl-1", None, None, resume).expect("ok");
+            let engine = &args[args.iter().position(|a| a == "--").unwrap() + 1..];
+            let flag = engine.iter().position(|a| a == "--no-alt-screen");
+            assert!(flag.is_some(), "codex must launch inline (scrollback): {:?}", engine);
+            if let Some(sid) = resume {
+                assert_eq!(engine.last().map(String::as_str), Some(sid));
+                assert!(flag.unwrap() < engine.len() - 1, "flag precedes the resume id");
+            }
+        }
+        // The off switch (daemon.toml codex_inline_scrollback = false).
+        assert!(codex_screen_args(false).is_empty());
+        assert_eq!(codex_screen_args(true), vec!["--no-alt-screen".to_string()]);
     }
 
     #[test]

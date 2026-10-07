@@ -3990,6 +3990,7 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             let mut applied = new_cfg.clone();
             applied.auth = st.config.auth.clone();
             applied.tls = st.config.tls.clone();
+            crate::mcp_config::set_codex_inline_scrollback(applied.codex_inline_scrollback);
             st.config = applied;
         }
         (changed, requires_restart)
@@ -20450,6 +20451,7 @@ mod tests {
                 repos: Vec::new(),
                 scheduler: Default::default(),
                 notify_command: None,
+                codex_inline_scrollback: true,
             };
             Arc::new(Mutex::new(s))
         };

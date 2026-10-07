@@ -2393,7 +2393,7 @@ fn last_assistant_message_text(
     messages
         .into_iter()
         .rev()
-        .find(|m| m.role == crate::agent::Role::Assistant)
+        .find(|m| m.role == crate::agent::Role::Assistant && !m.content.trim().is_empty())
         .map(|m| m.content)
         .ok_or_else(|| "Yank: no assistant messages in transcript yet".to_string())
 }
@@ -2813,6 +2813,20 @@ impl App {
             Some((_, ts)) if ts.session_type == "bash" => {
                 Err("Yank: bash sessions have no transcript".to_string())
             }
+            // The reader only sees THIS machine's ~/.claude / ~/.codex, so a
+            // session on another host (cm-sessions, manager) used to fall
+            // through to an empty read and a misleading "no assistant
+            // messages yet". Say what is actually wrong.
+            Some((_, ts)) if ts.host_id != crate::hosts::HostId::local() => Err(format!(
+                "Yank: '{}' runs on host '{}'; its transcript is not on this machine \
+                 (use read_last_turn, or Shift+drag to copy from the pane)",
+                ts.label,
+                ts.host_id.as_str(),
+            )),
+            Some((_, ts)) if ts.transcript_id.is_none() => Err(format!(
+                "Yank: '{}' has no transcript bound yet (A-e -> Transcript binds one)",
+                ts.label,
+            )),
             Some((ws, ts)) => match ws.worktree_path.as_deref() {
                 None => Err(
                     "Yank: workspace has no worktree — transcript path unknown"
@@ -3655,6 +3669,19 @@ impl App {
                 ts.last_write_at = Some(Instant::now());
             }
             return true;
+        }
+
+        // Alternate-screen apps that don't track the mouse (Codex launched
+        // before inline mode, less, vim): CM has no scrollback to move there,
+        // so turn the wheel into the app's own scroll keys.
+        if !ts.session.exited {
+            if let Some(bytes) =
+                alt_screen_wheel_bytes(me.kind, term_mode, ts.session_type == "codex")
+            {
+                let _ = ts.session.write(&bytes);
+                ts.last_write_at = Some(Instant::now());
+                return true;
+            }
         }
 
         use alacritty_terminal::grid::Scroll;
@@ -4664,6 +4691,43 @@ mod yank_clipboard_tests {
         app.view_mode = ViewMode::Sessions;
         app.last_term_size = (80, 24);
         app
+    }
+
+    #[test]
+    fn yank_names_remote_and_unbound_sessions_instead_of_empty_transcript() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(false);
+            app.workspaces[0].worktree_path = Some(PathBuf::from("/tmp/yankrepo"));
+            app.yank_last_assistant_message();
+            let msg = app.status_msg.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+            assert!(msg.contains("no transcript bound"), "{msg}");
+
+            let ts = &mut app.workspaces[0].sessions[0];
+            ts.transcript_id = Some("01a114a8-0000".into());
+            ts.host_id = crate::hosts::HostId::new("sessions");
+            app.yank_last_assistant_message();
+            let msg = app.status_msg.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+            assert!(msg.contains("runs on host 'sessions'"), "{msg}");
+        });
+    }
+
+    #[test]
+    fn wheel_over_alt_screen_codex_without_mouse_tracking_pages_its_transcript() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(false);
+            {
+                let ts = &mut app.workspaces[0].sessions[0];
+                let mut parser: alacritty_terminal::vte::ansi::Processor =
+                    alacritty_terminal::vte::ansi::Processor::new();
+                // Codex 0.160.1 alternate screen: ?1049h + ?1007h, no mouse modes.
+                parser.advance(&mut *ts.session.term.lock(), b"\x1b[?1049h\x1b[?1007h");
+            }
+            mouse(&mut app, MouseEventKind::ScrollUp, 5, KeyModifiers::empty());
+            assert!(
+                app.workspaces[0].sessions[0].last_write_at.is_some(),
+                "the wheel must reach an alt-screen Codex as PageUp, not scroll empty scrollback",
+            );
+        });
     }
 
     fn mouse(app: &mut App, kind: MouseEventKind, column: u16, modifiers: KeyModifiers) {

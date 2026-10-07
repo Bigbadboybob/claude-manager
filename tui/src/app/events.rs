@@ -265,6 +265,48 @@ pub(super) fn encode_mouse_for_pty(
     crate::input::event_to_bytes(&CrosstermEvent::Mouse(translated), &term_mode)
 }
 
+/// Bytes for a mouse-wheel notch over an ALTERNATE-screen app that did not
+/// enable mouse reporting (CM forwards real reports itself when it did).
+/// The alternate screen has no scrollback, so moving CM's own viewport is a
+/// silent no-op; translate the wheel into keys the app scrolls with instead.
+///
+/// - Codex: one PageUp/PageDown. In Codex's alternate screen (0.160.1)
+///   PageUp/PageDown scroll the transcript while Up/Down recall composer
+///   history, so the usual arrow translation would rewrite the draft.
+/// - Anything else (less, vim, …): xterm/alacritty "alternate scroll"
+///   (`?1007`, on by default): three cursor-key presses per notch, in
+///   application-cursor form (`ESC O A`) when DECCKM is set.
+///
+/// `None` = not applicable (primary screen, mouse reporting, not a wheel
+/// event, or the app turned alternate scroll off).
+pub(super) fn alt_screen_wheel_bytes(
+    kind: MouseEventKind,
+    term_mode: TermMode,
+    codex: bool,
+) -> Option<Vec<u8>> {
+    let up = match kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+    if !term_mode.contains(TermMode::ALT_SCREEN) || term_mode.intersects(TermMode::MOUSE_MODE) {
+        return None;
+    }
+    if codex {
+        return Some(if up { b"\x1b[5~".to_vec() } else { b"\x1b[6~".to_vec() });
+    }
+    if !term_mode.contains(TermMode::ALTERNATE_SCROLL) {
+        return None;
+    }
+    let key: &[u8] = match (term_mode.contains(TermMode::APP_CURSOR), up) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1bOB",
+        (false, true) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+    };
+    Some(key.repeat(3))
+}
+
 /// Decide the actual byte sequence to write for a workflow delivery body,
 /// given the inner program's current terminal mode.
 ///
@@ -4712,6 +4754,38 @@ mod mouse_forwarding_tests {
                 .is_some(),
             "bare motion forwards under any-motion tracking"
         );
+    }
+
+    #[test]
+    fn alt_screen_wheel_translates_for_non_mouse_apps() {
+        let alt = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        // Codex (alt screen, no mouse reporting): PageUp/PageDown, which
+        // scroll its transcript; arrows would recall composer history.
+        assert_eq!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt, true).unwrap(), b"\x1b[5~");
+        assert_eq!(alt_screen_wheel_bytes(MouseEventKind::ScrollDown, alt, true).unwrap(), b"\x1b[6~");
+        // Other apps: alternate-scroll arrows, three per notch, DECCKM-aware.
+        assert_eq!(
+            alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt, false).unwrap(),
+            b"\x1b[A\x1b[A\x1b[A"
+        );
+        assert_eq!(
+            alt_screen_wheel_bytes(MouseEventKind::ScrollDown, alt | TermMode::APP_CURSOR, false)
+                .unwrap(),
+            b"\x1bOB\x1bOB\x1bOB"
+        );
+        // ?1007l turns the arrow translation off for non-Codex apps.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, TermMode::ALT_SCREEN, false).is_none());
+    }
+
+    #[test]
+    fn alt_screen_wheel_leaves_primary_screen_and_mouse_apps_alone() {
+        let alt = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        // Primary screen (inline Codex, shells): CM scrolls its own scrollback.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, TermMode::ALTERNATE_SCROLL, true).is_none());
+        // Mouse-reporting apps get real SGR reports via encode_mouse_for_pty.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt | TermMode::MOUSE_REPORT_CLICK, true).is_none());
+        // Non-wheel events are never translated.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::Moved, alt, true).is_none());
     }
 }
 

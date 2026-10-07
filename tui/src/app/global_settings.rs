@@ -11,6 +11,10 @@ const MAX_TINT: f64 = 5.0;
 #[serde(default)]
 struct Preferences {
     sidebar_tint_strength: f64,
+    /// File-only (no F9 row): launch Codex with `--no-alt-screen` so its
+    /// history reaches CM's scrollback. Applies to the next TUI-composed
+    /// Codex spawn/A-R; restart the TUI after editing.
+    codex_inline_scrollback: bool,
 }
 
 #[cfg(test)]
@@ -116,6 +120,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             sidebar_tint_strength: DEFAULT_TINT,
+            codex_inline_scrollback: true,
         }
     }
 }
@@ -142,11 +147,17 @@ fn read_document(path: &Path) -> anyhow::Result<toml::Table> {
 
 impl GlobalSettings {
     pub(super) fn load() -> Self {
-        Self::load_from(
+        let settings = Self::load_from(
             dirs::home_dir()
                 .unwrap_or_default()
                 .join(".cm/tui-settings.toml"),
-        )
+        );
+        // Process-wide, so only the production load sets it (tests use
+        // `load_from` and must not flip other tests' argv).
+        cm_daemon::mcp_config::set_codex_inline_scrollback(
+            settings.saved.codex_inline_scrollback,
+        );
+        settings
     }
 
     fn load_from(path: PathBuf) -> Self {
