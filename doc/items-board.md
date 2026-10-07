@@ -308,8 +308,11 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop",
   caller cannot launch (it is not in the daemon's spawn registry). The MCP
   timeouts (90 s, 180 s for launch) exceed the worst-case call chain.
 - `report_done` additionally returns `held_items: [{n, board, title, status}]`
-  for the caller's open items with the hint "close (item_set n done) or hand
-  back (item_set n holder=none)". An API failure appears as `held_items_error`
-  and never fails `report_done`.
+  for the caller's open items (an empty list when none), plus
+  `held_items_hint` ("close each … or hand it back …") when any are open. The
+  lookup is bounded to 2 s; any failure appears as `held_items_error` and
+  never fails `report_done`. `report_done` and every session exit (a recorded
+  exit tombstone) also poke the heartbeat, so the board sees them within
+  seconds.
 - If the planning API is unreachable, item tools fail fast with
   `planning_api_unavailable`; there is no local queue.

@@ -14,6 +14,7 @@ pub type ApiResult = Result<Value, (ErrorCode, String)>;
 pub struct Api {
     base_url: String,
     token: String,
+    timeout: Duration,
 }
 
 impl Api {
@@ -24,13 +25,19 @@ impl Api {
             .map_err(|e| e.to_method_err())?;
         let token = crate::planning_client::resolve_api_token(Some(api_token))
             .map_err(|e| e.to_method_err())?;
-        Ok(Api { base_url, token })
+        Ok(Api { base_url, token, timeout: TIMEOUT })
     }
 
-    fn agent() -> ureq::Agent {
+    /// The same API with a shorter overall timeout, for best-effort calls.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    fn agent(&self) -> ureq::Agent {
         ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(TIMEOUT))
+                .timeout_global(Some(self.timeout))
                 .http_status_as_error(false)
                 .build(),
         )
@@ -45,7 +52,7 @@ impl Api {
     }
 
     pub fn get(&self, path: &str, query: &[(&str, String)]) -> ApiResult {
-        let mut request = Self::agent().get(&self.url(path)).header("Authorization", &self.auth());
+        let mut request = self.agent().get(&self.url(path)).header("Authorization", &self.auth());
         for (key, value) in query {
             request = request.query(*key, value);
         }
@@ -54,7 +61,7 @@ impl Api {
 
     pub fn post(&self, path: &str, body: &Value) -> ApiResult {
         finish(
-            Self::agent()
+            self.agent()
                 .post(&self.url(path))
                 .header("Authorization", &self.auth())
                 .send_json(body),
@@ -64,7 +71,7 @@ impl Api {
 
     pub fn patch(&self, path: &str, body: &Value) -> ApiResult {
         finish(
-            Self::agent()
+            self.agent()
                 .patch(&self.url(path))
                 .header("Authorization", &self.auth())
                 .send_json(body),

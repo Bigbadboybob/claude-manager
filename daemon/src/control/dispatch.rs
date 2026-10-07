@@ -1437,7 +1437,13 @@ fn dispatch_report_done(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return resp;
     }
     match methods::report_done(state, &req.caller, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(mut value) => {
+            // Items the caller still holds (best effort, bounded; never fails).
+            if let Some(uid) = req.caller.session_uid() {
+                crate::items::held::attach(state, uid, &mut value);
+            }
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }

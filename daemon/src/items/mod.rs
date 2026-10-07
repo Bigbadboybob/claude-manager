@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod heartbeat;
+pub mod held;
 pub mod rpc;
 
 /// Start the items background work (the holder-state heartbeat).

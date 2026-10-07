@@ -854,6 +854,8 @@ impl DaemonState {
         while self.recently_exited.len() > RECENTLY_EXITED_CAP {
             self.recently_exited.pop_front();
         }
+        // Let the items board see the exit within seconds, not a full beat.
+        crate::items::heartbeat::poke();
     }
 
     /// Stamp who requested a session's kill, so the tombstone built later
