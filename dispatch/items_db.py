@@ -405,6 +405,25 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
             return await _board_header(conn, board, now)
 
 
+async def delete_board(pool, ref: str) -> dict:
+    """Delete a board and everything on it, refusing while any item is open
+    (for scratch boards; closed items, history and flags go with it)."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            board = await _board_by_ref(conn, ref, lock=True)
+            open_ns = [r["number"] for r in await conn.fetch(
+                """SELECT number FROM items WHERE board_id = $1 AND closed_at IS NULL
+                    ORDER BY number""", uuid.UUID(board["id"]))]
+            if open_ns:
+                raise ItemsError(409, "board_not_empty",
+                                 f"board {board['slug']} still has open items; close or drop them first",
+                                 open_items=open_ns)
+            count = await conn.fetchval("SELECT count(*) FROM items WHERE board_id = $1",
+                                        uuid.UUID(board["id"]))
+            await conn.execute("DELETE FROM boards WHERE id = $1", uuid.UUID(board["id"]))
+    return {"deleted": board["slug"], "id": board["id"], "items": int(count)}
+
+
 # ---- reads ---------------------------------------------------------------
 
 def holder_state(row, now: datetime) -> dict:

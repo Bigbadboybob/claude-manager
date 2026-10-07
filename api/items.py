@@ -67,6 +67,11 @@ async def patch_board(ref: str, body: BoardPatchBody, request: Request):
     return await _call(items_db.patch_board(_pool(request), ref, actor, changes))
 
 
+@router.delete("/boards/{ref}")
+async def delete_board(ref: str, request: Request):
+    return await _call(items_db.delete_board(_pool(request), ref))
+
+
 @router.post("/boards/{ref}/items")
 async def create_items(ref: str, body: ItemsCreateBody, request: Request):
     specs = [spec.model_dump(exclude_unset=True) for spec in body.items]

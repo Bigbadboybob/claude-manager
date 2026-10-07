@@ -1089,7 +1089,7 @@ mod tests {
         let resp = call(&state, "me-uid", "item.set", json!({"n":1,"blocked_by":[2]}));
         let err = resp.error.unwrap();
         assert!(matches!(err.code, ErrorCode::Conflict));
-        assert_eq!(err.message, "cycle: cycle: 1→2→1");
+        assert_eq!(err.message, "cycle: 1→2→1");
     }
 
     #[test]

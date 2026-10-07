@@ -115,8 +115,9 @@ pub fn map_error(status: u16, body: &str) -> (ErrorCode, String) {
     let detail = &parsed["detail"];
     let message = if let Some(message) = detail["message"].as_str() {
         match detail["code"].as_str() {
-            Some(c) => format!("{c}: {message}"),
-            None => message.to_string(),
+            // `cycle: 1→2→1` already starts with its code: no double prefix.
+            Some(c) if !message.starts_with(&format!("{c}:")) => format!("{c}: {message}"),
+            _ => message.to_string(),
         }
     } else if let Some(errors) = detail.as_array() {
         let parts: Vec<String> = errors
@@ -148,7 +149,7 @@ mod tests {
     fn item_errors_keep_code_and_message() {
         let (code, msg) = map_error(409, r#"{"detail":{"code":"cycle","message":"cycle: 1→2→1","cycle":[1,2,1]}}"#);
         assert!(matches!(code, ErrorCode::Conflict));
-        assert_eq!(msg, "cycle: cycle: 1→2→1");
+        assert_eq!(msg, "cycle: 1→2→1");
         let (code, msg) = map_error(422, r#"{"detail":{"code":"eta_required","message":"waiting requires eta"}}"#);
         assert!(matches!(code, ErrorCode::InvalidParams));
         assert_eq!(msg, "eta_required: waiting requires eta");

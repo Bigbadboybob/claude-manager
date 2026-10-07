@@ -174,6 +174,20 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         events = await self.fetch("SELECT type, new FROM item_events")
         self.assertEqual(events[0]["type"], "board_updated")
 
+    async def test_delete_board_refuses_open_items_then_cascades(self):
+        await self.create("a", "b")
+        r = await self.http.delete(f"/boards/{self.ref}")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["code"], "board_not_empty")
+        self.assertEqual(r.json()["detail"]["open_items"], [1, 2])
+        await self.patch([1, 2], status="done")
+        r = await self.http.delete(f"/boards/{self.ref}")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["items"], 2)
+        for table in ("boards", "items", "item_events", "item_holders", "item_pushes"):
+            self.assertEqual(await self.fetch(f"SELECT 1 FROM {table}"), [], table)
+        self.assertEqual((await self.http.delete(f"/boards/{self.ref}")).status_code, 404)
+
     # ---- writes ---------------------------------------------------------
     async def test_numbering_persists_and_concurrent_creates_never_collide(self):
         await self.create("a", "b")

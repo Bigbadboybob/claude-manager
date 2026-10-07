@@ -161,6 +161,11 @@ class ComputeFlags(unittest.TestCase):
 
 
 class Compose(unittest.TestCase):
+    def test_unassigned_reports_item_age_not_flag_age(self):
+        it = item(status="open", holders=(), touched=ago(minutes=7))
+        flag = {"kind": "unassigned", "n": 1, "detail": None, "raised_at": NOW}
+        self.assertEqual(board_engine.describe(flag, it, {}, NOW), "#1 unassigned (no holder 7m)")
+
     def test_shape_and_limit(self):
         text = compose("sfd", ["#14 holder_idle (rl idle 24m)"], {"done": [9, 11]})
         self.assertEqual(text, '[cm-board sfd] 1 flag: #14 holder_idle (rl idle 24m) · 2 done '

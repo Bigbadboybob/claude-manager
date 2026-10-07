@@ -174,8 +174,11 @@ def describe(flag: dict, item: Item | None, states: dict, now: datetime) -> str:
         why = f"untouched {_short(_seconds(now - touched))}"
     elif kind == "overdue" and item is not None and item.eta_at:
         why = f"eta passed {_short(_seconds(now - item.eta_at))} ago"
-    elif kind == "unassigned":
-        why = f"no holder {_short(_seconds(now - flag['raised_at']))}"
+    elif kind == "unassigned" and item is not None:
+        # Measured like the flag: since the item was last touched (made open
+        # or handed back), not since the flag was raised.
+        touched = max(t for t in (item.touched_at, item.clock_reset_at) if t is not None)
+        why = f"no holder {_short(_seconds(now - touched))}"
     elif kind == "check_back" and item is not None:
         why = f"check back on \"{item.blocked_on}\""
     elif kind == "blocker_dropped":

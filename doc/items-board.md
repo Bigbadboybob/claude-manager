@@ -194,7 +194,8 @@ searchable with `archived=true`). Delivered pushes, state rows exited and
 ## 6. Planning API (`api/items.py`)
 
 Bearer token as for every endpoint. Errors are `{"detail": {"code", "message", …}}`
-with codes `not_found` (404), `cycle` (409, plus `cycle: [n…]`),
+with codes `not_found` (404), `cycle` and `board_not_empty` (409, plus `cycle: [n…]` /
+`open_items`),
 `invalid_blocker`, `eta_required`, `invalid_status`, `invalid_field`,
 `no_holders`, `item_closed`, `check_back_required` (422). Malformed bodies get
 FastAPI's standard 422.
@@ -204,6 +205,7 @@ FastAPI's standard 422.
 | `POST /boards/resolve` | `{task_id}` or `{ref}` | `board` header (creates if needed) |
 | `GET /boards` | `?open_only=true` | `[board header]` |
 | `GET /boards/{ref}` | `?since_version=&archived=false&q=&history=0` | `{board, items, flags, recently_closed, free_capacity}` (+ `archived` when `archived=true`) or `{unchanged: true, version}` |
+| `DELETE /boards/{ref}` | (none) | `{deleted, id, items}`; `409 board_not_empty` with `open_items` while any item is open. Deletes the board's items, history, flags and pushes. For scratch boards |
 | `PATCH /boards/{ref}` | `{actor, settings…, orchestrator_pid?}` | `board` header |
 | `POST /boards/{ref}/items` | `{actor, items: [{title, holders?, status?, note?, group?, blocked_by?, blocked_on?, eta?, check_back?, links?}], request_id?}` (≤ 50, all-or-nothing) | `{board, items, unblocked, warnings}`; a repeated `request_id` on the board returns the first call's items with `replayed: true` |
 | `PATCH /boards/{ref}/items` | `{actor, ns: [n], set: {…}, add_holders?, remove_holders?, reason?}` | `{items, unblocked: [n], warnings: [str]}` |
