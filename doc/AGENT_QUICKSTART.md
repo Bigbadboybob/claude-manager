@@ -209,16 +209,19 @@ send_input(session_uid="ts-…", text="Next: make the cache key include the regi
 chat_send(channel="<channel>", mentions=["<participant id from chat_people>"],
           body="Review ready on branch X at abc1234.", request_id="review-x-1")
 
-# Declare a long job instead of going silent.
-chat_send(channel="<channel>", body="waiting: full daemon suite, ETA 19:40Z, then rebase and hand off",
-          request_id="wait-suite-1")
+# Track work in flight as board items; declare a long job instead of going silent.
+item("fuse SEJD hot operators", holder="rl-scale-out", group="RL")   # assigns and wakes the holder
+item_set(14, "waiting", eta="40m", note="full daemon suite")         # never flagged idle before its ETA
+item_set(15, blocked_by=[14])                                        # back to active when #14 is done
+board()                                                              # flags first, then items by group
+item_resolve(14, "nudge", message="still on it?")                    # resolve each flag you are woken for
 
 # An Owner question: options, recommendation, who is blocked.
 notify_user(message="Decision needed: keep or drop the v1 endpoint? Options: keep (cost …) / drop (risk …). "
                     "Recommend drop. Blocks the api lane. Details: <message link>")
 ```
 
-After dispatching, end your turn; the monitor or mention wakes you. After compaction, read your own last posts, then replies and inbox, then your work list and `list_sessions`.
+After dispatching, end your turn; the monitor, mention or board push wakes you. After compaction, read your own last posts, then replies and inbox, then `board()` and `list_sessions`.
 
 ## CM beyond messaging
 

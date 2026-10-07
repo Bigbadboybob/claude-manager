@@ -37,24 +37,66 @@ replies). `send_input` auto-registers a completion monitor exactly like
 
 ## 3. Every piece of work in flight has a holder
 
-Each unit of work in flight has exactly one named holder (a session), a one-line
-statement of what "done" means, and a next action. "I'll start X" is not a
-state: either X has a holder now, or it is not in flight. Keep the list in one
-place that Owner can read without asking you (until board tools ship: a pinned
-message or a file in the initiative's shared directory, updated when something
-changes, not on a timer). Check that list, `list_sessions` and the workers'
-transcripts before you message a lane for status.
+Each unit of work in flight is an **item** on your board with exactly one named
+holder, a title that says what "done" means, and, when useful, a one-line note
+with the next action. "I'll start X" is not a state: either X is an item with a
+holder now, or it is not in flight. The board is the list Owner reads without
+asking you; check it (and `read_last_turn` on a worker whose state is unclear)
+before you message a lane for status.
 
-Work-item board tools (`item`, `board`) are being added by the same initiative;
-this section will describe them when they ship.
+**Making and assigning work**
+
+- `item("title", holder="lane-name", group="RL training")` creates and assigns
+  in one call; the holder is woken (`assigned`). `item([...])` creates several.
+- `item_set(n, holder=...)` reassigns, `add_holder` / `remove_holder` adjust.
+  Workers set their own status: `done`, `waiting` with `eta`, `blocked`.
+- Dependencies: `item_set(15, blocked_by=[14])`. Only real open items on the
+  same board, no cycles. An item blocked only by open items is exempt from the
+  idle and stale flags, but every chain ends at an item that is not, so a
+  stopped chain always surfaces at its end. Waiting on anything outside the
+  board uses free-text `blocked_on`, which is not exempt.
+
+**What the board tells you**
+
+`board()` (slim by default) shows each holder's live state, for example
+`#14 active "fuse SEJD" [RL] @rl-scale-out[idle 24m] ⚑holder_idle`. The engine
+raises these flags and pushes you once per window with every open flag:
+
+| Flag | Meaning |
+|---|---|
+| `unassigned` | open with no holder for a few minutes |
+| `holder_gone` | a holder's session exited |
+| `holder_idle` | every holder sat at its prompt for 20 min (on per board) |
+| `holder_waiting_on_human` / `holder_errored` | a holder needs a person, or failed |
+| `stale` | nobody touched it for 2 h (longer for a long declared job) |
+| `overdue` | waiting past its ETA plus a grace; the holder is asked first |
+| `check_back` | a free-text block reached its check-back time |
+| `blocker_dropped` | something it waited on was dropped; decide what it needs now |
+
+Done, dropped and blocked items arrive batched (one wake per few minutes).
+
+**Resolving flags (each one call)**
+
+| `item_resolve(n, action, ...)` | Effect |
+|---|---|
+| `"nudge"`, `message=` | asks the holder to update, close or hand it back; snoozes the flag |
+| `"reassign"`, `holder=` | gives it to another session |
+| `"launch"`, `engine=`, `task_id=` | starts a new session with the item as its prompt and makes it the holder (your engine by default; `task_id` gives it that task's worktree, otherwise it joins your checkout) |
+| `"block"`, `blocked_by=` or `blocked_on=` + `check_back=` | marks it legitimately waiting |
+| `"drop"`, `reason=` | cancels it |
+
+Every flag must be resolved. An unresolved flag re-wakes you every 30 minutes,
+and if flags sit for an hour while you are idle, errored or gone, Owner is
+alerted. The board header's `health` (unresolved count, oldest age) is the
+number Owner watches.
 
 ## 4. Long jobs are declared, not inferred
 
 A job you expect to run longer than 20 minutes (a build, a benchmark, a backtest,
-a long test suite) is declared as waiting, with an ETA and a one-line note:
-post it in the coordination channel or thread ("waiting: full daemon suite,
-ETA 19:40Z, then rebase and hand off"), and for continuous subtasks also set
-`metadata.continuous_stage="waiting"` with `next_action`. An orchestrator does
+a long test suite) is declared as waiting, with an ETA and a one-line note: set its item to
+waiting, `item_set(n, "waiting", eta="40m", note="full daemon suite")`; for
+continuous subtasks also set `metadata.continuous_stage="waiting"` with
+`next_action`. A channel post is optional. An orchestrator does
 not guess activity from a spinner, a shell or a stale monitor; it trusts the
 declaration and follows up when the ETA passes.
 
@@ -67,6 +109,8 @@ declaration and follows up when the ETA passes.
 | `chat_send(mention_here=True)` | current channel members |
 | `start_session` / `send_input` (auto monitor) | you, when the worker's turn ends (`notify_until="final"`: when it calls `report_done` or exits) |
 | `monitor_sessions(...)` | you, on the condition you set |
+| `item(..., holder=X)` / `item_set(n, holder=X)` | X, when assigned |
+| board flags and closures | the board's orchestrator, batched (one wake per few minutes; unresolved flags re-wake every 30 min) |
 | `notify_user(message=..., urgency=...)` | Owner, through the TUI alert, if the urgency meets Owner's availability; otherwise held until it does (emergency also pushes to Owner's phone) |
 | `@Name` in a message body | that participant, **only** if it names exactly one current member of the conversation; otherwise nobody, and the send returns a warning |
 | Tags, channel membership, a pinned message | nobody |
@@ -116,7 +160,7 @@ Rebuild state in this order before acting:
 
 1. Your own last posts in the coordination channel(s) (what you promised).
 2. The replies to them and your unread inbox (what changed).
-3. The work list (section 3), `list_sessions` for your workers, and
+3. The board (`board()`, section 3), `list_sessions` for your workers, and
    `read_last_turn` on any worker whose state is unclear.
 
 Then continue; do not repeat finished summaries or re-dispatch work that has a

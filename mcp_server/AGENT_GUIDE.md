@@ -62,6 +62,35 @@ into a post; cite the message time or an ETA. On a paired host, `outbox` in a
 messaging response counts your messages still `pending_sync` after a minute
 and the age of the oldest; a growing age means the hub link is stalled.
 
+## Work items: if you are doing it, it has an item
+
+Small units of work live as **items** on a shared board: your initiative's,
+else your top-level task's. They are not planning tasks. The board shows
+everyone who holds what, with each holder's live state, so nobody has to ask.
+
+- Starting something: `item("fuse SEJD hot operators")` (you hold it, status
+  active). Several at once: `item(["a", "b", "c"])`.
+- Finished: `item_set(14, "done", note="abc123")`. Cancelled:
+  `item_set(14, "dropped", reason="superseded by #15")`.
+- Running a job longer than about 20 minutes (tests, a backtest, training):
+  `item_set(14, "waiting", eta="40m", note="full C2 run")`. Waiting before its
+  ETA is never flagged idle; past ETA plus a grace it is flagged overdue and you
+  are asked first.
+- Waiting on another item: `item_set(15, blocked_by=[14])`. It must be a real,
+  open item on the same board, and cycles are refused. When #14 is done, #15
+  goes back to active and you are woken. Waiting on anything else ("EP GO",
+  a review): `item_set(15, "blocked", blocked_on="EP GO")`. That gets no
+  exemption, so someone keeps chasing it.
+- Handing it back: `item_set(14, holder="none")`; giving it to someone:
+  `item_set(14, holder="rl-scale-out")` (chat name, session uid or participant
+  id).
+- `board()` shows flags first, then items by group, recently closed items and
+  who is free; `board(mine=True)` shows yours. Any session may read any board.
+- Anyone on the board may edit any item; history is kept, so give a short
+  `reason` for drops and handoffs.
+- When you call `report_done`, it lists items you still hold: close them or
+  hand them back.
+
 ## Orchestrating other sessions
 
 If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
@@ -71,10 +100,10 @@ If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
   six native subagents for broader work.
 - Reuse a session that holds good context: give it the next piece with
   `send_input` rather than a new `start_session`.
-- Every piece of work in flight has one named holder, a definition of done and
-  a next action, kept where Owner can read it. Check that list and the
-  transcripts before messaging a lane for status.
-- Declare a job longer than 20 minutes as waiting, with an ETA and a one-line note.
+- Every piece of work in flight is an item with one named holder; `board()` is
+  the list Owner reads. Check it (holder states, flags) before messaging a lane
+  for status, and resolve every flag you are woken for with `item_resolve`.
+- Declare a job longer than 20 minutes on its item: `item_set(n, "waiting", eta=..., note=...)`.
 - Only DMs, `mentions`, a body `@Name` of a current member, `mention_here` and
   session monitors wake anyone; read `warnings` on every send. After
   dispatching, end your turn and let the wake arrive.
@@ -82,7 +111,7 @@ If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
   options, your recommendation and who is blocked; use `notify_user` only when
   Owner action is needed.
 - After compaction or a restart, read your own last posts, then the replies and
-  inbox, then the work list and your workers, before acting.
+  inbox, then `board()` and your workers, before acting.
 
 ## Worktree ownership and task cleanup
 
