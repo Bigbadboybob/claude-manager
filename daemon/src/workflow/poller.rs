@@ -140,6 +140,9 @@ pub enum SkipReason {
     /// Gate ran, idle predicate ran, but the agent isn't idle since
     /// baseline. Most common steady-state skip.
     NotIdle,
+    /// The optional engine gate observed foreground/background work or a
+    /// human wait. Transcript completion cannot override that observation.
+    EngineStateBlocked,
     /// Active role has no static `on_idle` transition and is idle, but
     /// the idle-nudge backstop already fired at this exact assistant-turn
     /// count. Debounced so the async history-append lag window can't
@@ -229,6 +232,7 @@ struct TickSnapshot {
     /// poller). Captured here so the apply phase doesn't re-walk the
     /// session maps under the lock.
     active_session_daemon_owned: bool,
+    engine_state_blocked: bool,
     /// Snapshot of the workflow definition, if loaded. Cloned
     /// because the apply phase may run under a fresh state lock
     /// in [`fire_static_transition`] and we don't want to re-lookup
@@ -1031,6 +1035,9 @@ impl WorkflowPoller {
                 reason: SkipReason::NoHistoryEntry,
             };
         };
+        if snap.engine_state_blocked {
+            return Decision::Skip { run_id: snap.run_id.clone(), reason: SkipReason::EngineStateBlocked };
+        }
         let fire = crate::workflow::transcript::assistant_turn_completed_since(
             &engine, worktree, sid, baseline,
         );
@@ -1329,6 +1336,28 @@ impl WorkflowPoller {
     }
 }
 
+fn workflow_engine_blocks(state: &DaemonState, run: &WorkflowRun) -> bool {
+    if !state.config.workflow_state_gate {
+        return false;
+    }
+    let session = run
+        .active_role
+        .as_ref()
+        .and_then(|role| run.role_sessions.get(role))
+        .and_then(|binding| binding.daemon_session_uid.as_ref())
+        .and_then(|uid| state.sessions.get(uid));
+    session.is_some_and(|session| {
+        let agent = crate::agent_state::current(session);
+        agent.source.engine_reported()
+            && matches!(
+                agent.state,
+                crate::agent_state::State::Working
+                    | crate::agent_state::State::WorkingBackground
+                    | crate::agent_state::State::WaitingOnHuman
+            )
+    })
+}
+
 /// 10d-2c-2-2-b reviewer-fix: build per-run snapshots from
 /// **on-disk state.json files**, not from `state.workflow_runs`.
 ///
@@ -1396,6 +1425,7 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
             // `resolve_role_session_context` (tag fallbacks) still serve engine
             // + worktree derivation below; only the FIRE gate is uid-based.
             let active_session_daemon_owned = daemon_owns_run(state, run);
+            let engine_state_blocked = workflow_engine_blocks(state, run);
 
             // Worktree resolution via session tags, NOT
             // `run.task_key`. The session bound to this run +
@@ -1439,6 +1469,7 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
                 worktree_path,
                 role_session_types,
                 active_session_daemon_owned,
+                engine_state_blocked,
                 workflow,
             }
         })
@@ -2276,8 +2307,29 @@ mod tests {
         // binding so the new uid-based gate fires.
         bind_daemon_uid_to_role("r1", "worker", "ts-worker");
 
-        let poller = WorkflowPoller::new(state);
+        let poller = WorkflowPoller::new(Arc::clone(&state));
         poller.set_disable_apply_for_test(true);
+        // A complete transcript cannot override current engine activity.
+        for status in [crate::agent_state::PresenceStatus::Busy,
+            crate::agent_state::PresenceStatus::Shell, crate::agent_state::PresenceStatus::Waiting] {
+            {
+                let mut st = state.lock().unwrap();
+                st.config.workflow_state_gate = true;
+                let session = &st.sessions["ts-worker"];
+                let mut cell = session.agent_state.lock().unwrap();
+                let now = crate::agent_state::unix_now();
+                cell.inputs.presence = Some(crate::agent_state::PresenceObs {
+                    valid: true, status, observed_at: now, status_updated_at: now,
+                    engine_version: None, waiting_for: None, main_turn_open: Some(true),
+                    transcript_error: None,
+                });
+            }
+            let blocked = poller.poll_once();
+            assert!(matches!(blocked.as_slice(), [Decision::Skip {
+                reason: SkipReason::EngineStateBlocked, .. }]), "{blocked:?}");
+        }
+        // Rollout flag off restores the underlying transcript predicate.
+        state.lock().unwrap().config.workflow_state_gate = false;
         let decisions = poller.poll_once();
         assert_eq!(decisions.len(), 1, "expected one decision for r1");
         match &decisions[0] {

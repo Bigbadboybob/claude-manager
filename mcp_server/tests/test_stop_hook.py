@@ -159,7 +159,7 @@ class StopHookTests(unittest.TestCase):
                 ) as call,
             ):
                 cm_stop_hook._report_turn_ended(
-                    "ts-test", "/fixture/t.jsonl", continuing=True
+                    "ts-test", "/fixture/t.jsonl", continuing=True, observed_at=1000.0
                 )
                 self.assertEqual(call.call_count, 2)
                 args = call.call_args
@@ -170,6 +170,7 @@ class StopHookTests(unittest.TestCase):
                         {
                             "session_uid": "ts-test",
                             "continuing": True,
+                            "observed_at": 1000.0,
                             "transcript_path": "/fixture/t.jsonl",
                         },
                     ),
@@ -196,13 +197,14 @@ class StopHookTests(unittest.TestCase):
             patch.object(control_client, "call", return_value={}) as call,
         ):
             cm_stop_hook._report_turn_ended(
-                "ts-test", "/fixture/t.jsonl", continuing=True
+                "ts-test", "/fixture/t.jsonl", continuing=True, observed_at=1000.0
             )
         call.assert_called_once_with(
             "session.turn_ended",
             {
                 "session_uid": "ts-test",
                 "continuing": True,
+                "observed_at": 1000.0,
                 "transcript_path": "/fixture/t.jsonl",
             },
             timeout=3.0,

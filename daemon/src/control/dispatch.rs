@@ -9643,6 +9643,7 @@ mod tests {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
                 presence_idle_enabled: true,
+                workflow_state_gate: false,
                 mcp_server_path: String::new(),
                 api_url: cfg_url.clone(),
                 api_token: "cfg-tok-threaded".into(),
@@ -9703,6 +9704,7 @@ mod tests {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
             presence_idle_enabled: true,
+            workflow_state_gate: false,
             mcp_server_path: String::new(),
             api_url: format!("http://127.0.0.1:{}", port),
             api_token: "bt-test-token".into(),

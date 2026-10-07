@@ -58,6 +58,13 @@ pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
         let relay_finished = completion::codex_drain_relay_finished_after(
             &session.agent_state.lock().unwrap_or_else(|p| p.into_inner()),
             after, super::methods::now_unix_f64());
+        let agent = crate::agent_state::current(session);
+        if agent.source.engine_reported()
+            && !(session.session_type == "codex"
+                && agent.state == crate::agent_state::State::Unknown && relay_finished.is_none())
+        {
+            return matches!(agent.state, crate::agent_state::State::Idle | crate::agent_state::State::Errored);
+        }
         (
             session.session_type.clone(),
             session.semantic_idle(),

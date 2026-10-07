@@ -258,7 +258,11 @@ pub fn codex_drain_relay_finished_after(cell: &crate::agent_state::StateCell, af
             return None;
         }
     }
-    codex_relay_finished_after(cell, after, now)
+    let state = crate::agent_state::derive(&cell.inputs, now);
+    Some(after.is_finite() && matches!(state.state, State::Idle | State::Errored)
+        && state.last_turn.ended_at.is_some_and(|end| end >= after
+            && cell.inputs.latest_start.is_none_or(|start| start <= end)
+            && relay.turn_started_at.is_none_or(|start| start <= end)))
 }
 
 #[cfg(test)]
@@ -323,9 +327,20 @@ mod tests {
                     pid: None, cpu: None, wakes_agent: false,
                 }),
             }
+            cell.inputs.background = relay.background.clone();
             cell.inputs.relay = Some(relay);
             assert_eq!(codex_relay_finished_after(&cell, 101.0, 103.0), Some(false));
+            assert_eq!(codex_drain_relay_finished_after(&cell, 101.0, 103.0), Some(variant == 4),
+                "drain accepts failed final turns but holds work and human waits");
+            assert_eq!(codex_drain_relay_finished_after(&cell, 103.0, 103.0), Some(false),
+                "completion must follow the report");
         }
+        let mut inconsistent = base;
+        inconsistent.turn_started_at = Some(103.0);
+        cell.inputs.background = Default::default();
+        cell.inputs.relay = Some(inconsistent);
+        assert_eq!(codex_drain_relay_finished_after(&cell, 101.0, 104.0), Some(false),
+            "a newer relay start cannot reuse an older end even without a counter edge");
     }
 
     #[test]

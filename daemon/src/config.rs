@@ -410,6 +410,10 @@ pub struct DaemonConfig {
     /// daemon.reload_config to restore PTY-based idle while keeping agent_state.
     #[serde(default = "default_presence_idle_enabled")]
     pub presence_idle_enabled: bool,
+    /// Gate workflow transcript-idle transitions on engine state after rollout
+    /// soak. Hot reloadable; off until deliberately enabled.
+    #[serde(default)]
+    pub workflow_state_gate: bool,
     /// Absolute path to `mcp_server/server.py`. The daemon
     /// injects this into every agent's `CM_MCP_SERVER` env so
     /// the agent's MCP runtime knows where to find the
@@ -507,6 +511,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             presence_idle_enabled: default_presence_idle_enabled(),
+            workflow_state_gate: false,
             mcp_server_path: String::new(),
             api_url: String::new(),
             api_token: String::new(),
@@ -794,6 +799,7 @@ mode = "ssh-trust"
     fn serde_round_trip() {
         let original = DaemonConfig {
             presence_idle_enabled: false,
+            workflow_state_gate: true,
             mcp_server_path: "/opt/x.py".into(),
             api_url: "http://h:8000".into(),
             api_token: "tok".into(),
@@ -817,6 +823,7 @@ mode = "ssh-trust"
             toml::from_str(&toml_text).expect("de");
         assert_eq!(reparsed.mcp_server_path, original.mcp_server_path);
         assert_eq!(reparsed.presence_idle_enabled, original.presence_idle_enabled);
+        assert_eq!(reparsed.workflow_state_gate, original.workflow_state_gate);
         assert_eq!(reparsed.api_url, original.api_url);
         assert_eq!(reparsed.api_token, original.api_token);
         assert_eq!(reparsed.log_path, original.log_path);

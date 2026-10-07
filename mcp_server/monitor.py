@@ -265,13 +265,7 @@ def baseline_for(engine: str, tpath: str | None, resolved: dict | None = None) -
     callers offload via asyncio.to_thread where it matters."""
     agent = engine_state(resolved or {})
     if agent is not None:
-        seq = agent.get("turn_seq")
-        if type(seq) is not int or seq < 0:
-            return {"kind": "agent", "value": None}
-        # A watch armed mid-turn must observe this turn's end. At a boundary,
-        # anchor the current sequence so stale completion cannot fire again.
-        return {"kind": "agent", "value": seq - (agent.get("state") == "working"),
-                "ended_at": _engine_end(agent)}
+        return _agent_baseline(agent, baseline_for(engine, tpath))
     if engine == "claude-code":
         fp = last_completed_turn_fingerprint(engine, tpath)
         return {"kind": "turn", "value": fp} if fp is not None else None
@@ -281,6 +275,21 @@ def baseline_for(engine: str, tpath: str | None, resolved: dict | None = None) -
         return {"kind": "size", "value": os.path.getsize(tpath)}
     except OSError:
         return None
+
+
+def _agent_baseline(agent: dict, legacy: dict | None) -> dict:
+    # Keep the pre-arm legacy edge for a brain rollback. Reading it only at
+    # arm/rearm avoids transcript polling while engine counters are available.
+    seq = agent.get("turn_seq")
+    if type(seq) is not int or seq < 0:
+        return {"kind": "agent", "value": None, "legacy": legacy}
+    # A watch armed mid-turn must observe this turn's end.
+    return {
+        "kind": "agent",
+        "value": seq - (agent.get("state") == "working"),
+        "ended_at": _engine_end(agent),
+        "legacy": legacy,
+    }
 
 
 def report_anchor_for(resolved: dict) -> float | None:
@@ -320,6 +329,10 @@ def _edge_passed(baseline: dict, engine: str, tpath: str | None,
     kind = baseline.get("kind")
     if kind == "agent":
         agent = engine_state(resolved or {})
+        if agent is None:
+            legacy = baseline.get("legacy")
+            # No transcript at arm time had level behavior before engine state.
+            return _edge_passed(legacy, engine, tpath) if isinstance(legacy, dict) else True
         seq = agent.get("turn_seq") if agent is not None else None
         anchor = baseline.get("value")
         if type(seq) is not int or type(anchor) is not int:
@@ -582,7 +595,7 @@ async def _monitor_sessions(
                     legacy_edge_passed = await asyncio.to_thread(
                         _edge_passed, baselines[uid], engine, tpath
                     )
-                    baselines[uid] = baseline_for(engine, tpath, resolved)
+                    baselines[uid] = _agent_baseline(engine_state(resolved), baselines[uid])
             if state == "exited":
                 done = True
             elif engine_done is not None:

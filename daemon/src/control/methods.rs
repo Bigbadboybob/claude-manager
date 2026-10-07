@@ -2887,6 +2887,8 @@ pub fn session_agent_report(
 #[derive(Deserialize)]
 struct SessionTurnEndedParams {
     session_uid: String,
+    #[serde(default)]
+    observed_at: Option<f64>,
     /// Stop-hook inbox messages resume the turn; invalidate old idle/done
     /// signals instead of advertising a boundary while those messages run.
     #[serde(default)]
@@ -2940,21 +2942,28 @@ pub fn session_turn_ended(
             format!("session '{}' not in daemon registry", p.session_uid),
         )
     })?;
-    if p.continuing {
+    if session.session_type == "claude-code" {
+        let applied = session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).apply(
+                crate::agent_state::Report::Hook {
+                    event: crate::agent_state::HookEvent::Stop,
+                    payload: crate::agent_state::HookPayload {
+                        observed_at: p.observed_at,
+                        continuing: p.continuing,
+                        ..Default::default()
+                    },
+                },
+                crate::agent_state::unix_now(),
+            ).map_err(|e| (ErrorCode::InvalidParams, e))?;
+        if applied.accepted && (applied.started || p.continuing) {
+            session.stamp_engine_activity();
+        }
+        if applied.ended {
+            session.stamp_turn_end();
+        }
+    } else if p.continuing {
         session.input_handle().stamp_activity();
     } else {
         session.stamp_turn_end();
-        // Legacy Stop remains the fallback during rollout/restart or a
-        // rejected rich payload. Record its boundary in the core too, so an
-        // earlier hook prompt cannot leave a hooks-only session Working.
-        if session.session_type == "claude-code" {
-            let _ = session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).apply(
-                crate::agent_state::Report::Hook {
-                    event: crate::agent_state::HookEvent::Stop,
-                    payload: crate::agent_state::HookPayload::default(),
-                }, crate::agent_state::unix_now(),
-            );
-        }
     }
     let native_codex = session.session_type == "codex";
     rebind_reported_transcript(&mut state, &p.session_uid, p.transcript_path.as_deref());
@@ -3816,16 +3825,19 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         .values()
         .filter(|s| s.transcript_path.is_some())
         .count();
-    // H3: drain visibility. `sessions_mid_turn` counts sessions whose
-    // semantic-idle signal says a turn is IN FLIGHT (input newer than
-    // the last turn-end self-report). Sessions without the signal
-    // (bash, codex, pre-hook spawns → `semantic_idle() == None`) are
-    // not counted — the drain wait protects hook-reporting claude
-    // sessions, the ones with conversations to lose.
+    // Engine work includes live background work. Legacy sessions retain their
+    // semantic-idle rule; terminal repainting cannot hide engine activity.
     let mid_turn = state
         .sessions
         .values()
-        .filter(|s| s.semantic_idle() == Some(false))
+        .filter(|s| {
+            let agent = crate::agent_state::current(s);
+            if agent.source.engine_reported() {
+                matches!(agent.state, crate::agent_state::State::Working | crate::agent_state::State::WorkingBackground)
+            } else {
+                s.semantic_idle() == Some(false)
+            }
+        })
         .count();
     // DESIGN_HOLDER_BRAIN_SPLIT phase 4: the full split health
     // surface (C14 shipped the `split` bit with the cm-redeploy
@@ -13995,6 +14007,15 @@ pub(crate) fn capture_drain_sessions(
                     }
                 }
                 let end = *s.last_turn_end_at.lock().unwrap_or_else(|p| p.into_inner());
+                let agent = crate::agent_state::current(s);
+                let final_turn_ended = done.as_ref().is_some_and(|r| {
+                    if agent.source.engine_reported() {
+                        matches!(agent.state, crate::agent_state::State::Idle | crate::agent_state::State::Errored)
+                            && agent.last_turn.ended_at.is_some_and(|at| at >= r.at_unix)
+                    } else {
+                        end.is_some_and(|e| e >= r.at_instant)
+                    }
+                });
                 observations.push(SessionObservation {
                     session_uid: uid,
                     orchestrator,
@@ -14004,9 +14025,7 @@ pub(crate) fn capture_drain_sessions(
                     last_input_at: s.last_input_at.lock().unwrap_or_else(|p| p.into_inner())
                         .map(|at| now_unix_f64() - at.elapsed().as_secs_f64()),
                     failed: s.last_exit.operator_kill_requested(),
-                    final_turn_ended: done
-                        .as_ref()
-                        .is_some_and(|r| end.is_some_and(|e| e >= r.at_instant)),
+                    final_turn_ended,
                 });
             } else if let Some(tomb) = state.exited_tombstone(&uid) {
                 observations.push(SessionObservation {
@@ -16962,8 +16981,8 @@ fn wait_for_task_sessions_gone(
 /// some since August.
 ///
 /// Returns the uids it killed. Three deliberate filters:
-/// * IDLE only — a session mid-turn on a terminal task is unusual, so leave it
-///   for a later pass rather than killing an agent mid-write. The explicit
+/// * Engine idle, errored or waiting-on-human, or PTY-quiet legacy/unknown.
+///   Keep foreground and background work alive. The explicit
 ///   operator paths (`mark_subtask_done`, an approved reap) stay unconditional.
 /// * NEVER a continuous orchestrator (`continuous_task_id`): the scheduler owns
 ///   that lifecycle, and its planning row's status says nothing about the run.
@@ -16981,7 +17000,15 @@ pub(crate) fn sweep_terminal_task_sessions(
             s.task_id.as_deref() == Some(task_id)
                 && s.continuous_task_id.is_none()
                 && s.workflow_run_id.is_none()
-                && compute_session_state_and_idle(s).1
+                && {
+                    let agent = crate::agent_state::current(s);
+                    if !agent.source.engine_reported() || agent.state == crate::agent_state::State::Unknown {
+                        compute_session_state_and_idle(s).1
+                    } else {
+                        matches!(agent.state, crate::agent_state::State::Idle
+                            | crate::agent_state::State::Errored | crate::agent_state::State::WaitingOnHuman)
+                    }
+                }
         })
         .map(|(uid, _)| uid.clone())
         .collect();
@@ -19520,6 +19547,7 @@ mod tests {
             );
             s.config = crate::config::DaemonConfig {
                 presence_idle_enabled: true,
+                workflow_state_gate: false,
                 mcp_server_path:
                     "/opt/cm-daemon/mcp_server/server.py".to_string(),
                 api_url: "http://10.150.0.2:8000".to_string(),
@@ -22043,6 +22071,7 @@ while True:
                 &cfg_path,
                 "mcp_server_path = \"/new/server.py\"\n\
                  presence_idle_enabled = false\n\
+                 workflow_state_gate = true\n\
                  api_url = \"http://example:8000\"\n\
                  [auth]\nmode = \"token\"\n",
             )
@@ -22064,6 +22093,7 @@ while True:
             assert!(changed.contains(&"mcp_server_path"), "{:?}", changed);
             assert!(changed.contains(&"api_url"), "{:?}", changed);
             assert!(changed.contains(&"presence_idle_enabled"), "{:?}", changed);
+            assert!(changed.contains(&"workflow_state_gate"), "{:?}", changed);
             let restart: Vec<&str> = out["requires_restart"]
                 .as_array()
                 .unwrap()
@@ -22078,6 +22108,7 @@ while True:
             assert_eq!(st.config.mcp_server_path, "/new/server.py");
             assert_eq!(st.config.api_url, "http://example:8000");
             assert!(!st.config.presence_idle_enabled);
+            assert!(st.config.workflow_state_gate);
             assert_eq!(
                 st.config.auth.mode,
                 crate::config::AuthMode::SshTrust,
@@ -31539,6 +31570,174 @@ while True:
     }
 
     #[test]
+    fn state_core_legacy_stop_timestamp_cannot_close_a_newer_prompt() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            insert_session(&state, &uid, "ws-stop");
+            let now = now_unix_f64();
+            {
+                let mut st = state.lock().unwrap();
+                let session = st.sessions.get_mut(&uid).unwrap();
+                session.session_type = "claude-code".into();
+                session.stamp_turn_end();
+                session.input_handle().stamp_activity();
+                let mut cell = session.agent_state.lock().unwrap();
+                cell.inputs.latest_start = Some(now - 1.0);
+                cell.inputs.hooks.prompt_at = Some(now - 1.0);
+            }
+            let stop = |at| {
+                session_turn_ended(&state, &json!({"session_uid":uid, "observed_at":at}), None).unwrap()
+            };
+            stop(now - 2.0);
+            assert_eq!(
+                state.lock().unwrap().sessions[&uid].semantic_idle(),
+                Some(false)
+            );
+            assert_eq!(
+                crate::agent_state::current(&state.lock().unwrap().sessions[&uid]).state,
+                crate::agent_state::State::Working
+            );
+            stop(now);
+            assert_eq!(
+                state.lock().unwrap().sessions[&uid].semantic_idle(),
+                Some(true)
+            );
+            let ended = *state.lock().unwrap().sessions[&uid]
+                .last_turn_end_at
+                .lock()
+                .unwrap();
+            stop(now - 2.0);
+            assert_eq!(
+                *state.lock().unwrap().sessions[&uid]
+                    .last_turn_end_at
+                    .lock()
+                    .unwrap(),
+                ended
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_daemon_consumers_respect_engine_work_and_final_report_time() {
+        with_continuous_home(|home| {
+            use crate::agent_state::{LastTurn, PresenceObs, PresenceStatus, State, TurnStatus};
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            let mut task = fresh_task_running("state-drain", home, &uid);
+            crate::continuous::drain::request(&mut task, crate::continuous::task::now_unix());
+            insert_continuous_session(&state, &uid, &task.task_id);
+            let report = state.lock().unwrap().sessions[&uid].stamp_reported_done(None);
+            for (status, failed, valid, expected, ready, mid_turn) in [
+                (PresenceStatus::Idle, false, true, State::Idle, true, 0),
+                (PresenceStatus::Idle, true, true, State::Errored, true, 0),
+                (PresenceStatus::Busy, false, true, State::Working, false, 1),
+                (
+                    PresenceStatus::Shell,
+                    false,
+                    true,
+                    State::WorkingBackground,
+                    false,
+                    1,
+                ),
+                (
+                    PresenceStatus::Waiting,
+                    false,
+                    true,
+                    State::WaitingOnHuman,
+                    false,
+                    0,
+                ),
+                (PresenceStatus::Idle, false, false, State::Unknown, false, 0),
+            ] {
+                {
+                    let st = state.lock().unwrap();
+                    let session = &st.sessions[&uid];
+                    // Intentionally disagree with the engine on both legacy clocks.
+                    *session.last_activity_at.lock().unwrap() = if ready {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    *session.last_turn_end_at.lock().unwrap() = Some(std::time::Instant::now());
+                    let mut cell = session.agent_state.lock().unwrap();
+                    cell.inputs.latest_start = None;
+                    cell.inputs.hooks.stop_at = Some(report.at_unix + 0.01);
+                    cell.inputs.presence = Some(PresenceObs {
+                        valid,
+                        status,
+                        observed_at: report.at_unix + 0.01,
+                        status_updated_at: report.at_unix + 0.01,
+                        engine_version: None,
+                        waiting_for: None,
+                        main_turn_open: Some(true),
+                        transcript_error: failed.then(|| "auth".into()),
+                    });
+                    assert_eq!(
+                        crate::agent_state::derive(&cell.inputs, now_unix_f64()).state,
+                        expected
+                    );
+                }
+                assert_eq!(
+                    crate::control::continuous_drain::notice_ready(&state, &uid),
+                    ready,
+                    "{expected:?}"
+                );
+                assert_eq!(
+                    daemon_health(&state).unwrap()["sessions_mid_turn"],
+                    mid_turn,
+                    "{expected:?}"
+                );
+                let observations = capture_drain_sessions(&state, &task);
+                assert_eq!(
+                    observations
+                        .iter()
+                        .find(|s| s.session_uid == uid)
+                        .unwrap()
+                        .final_turn_ended,
+                    ready,
+                    "{expected:?}"
+                );
+            }
+            // Codex errors are final for drain, but their end must follow report_done.
+            {
+                let mut st = state.lock().unwrap();
+                let session = st.sessions.get_mut(&uid).unwrap();
+                session.session_type = "codex".into();
+                let mut cell = session.agent_state.lock().unwrap();
+                cell.inputs.presence = None;
+                cell.inputs.relay = Some(crate::agent_state::RelaySnapshot {
+                    backend_connected: true,
+                    foreground: crate::agent_state::RelayStatus::Idle,
+                    observed_at: now_unix_f64(),
+                    last_turn: LastTurn {
+                        ended_at: Some(report.at_unix - 1.0),
+                        status: Some(TurnStatus::Failed),
+                    },
+                    ..Default::default()
+                });
+            }
+            assert!(!capture_drain_sessions(&state, &task)[0].final_turn_ended);
+            {
+                let st = state.lock().unwrap();
+                st.sessions[&uid]
+                    .agent_state
+                    .lock()
+                    .unwrap()
+                    .inputs
+                    .relay
+                    .as_mut()
+                    .unwrap()
+                    .last_turn
+                    .ended_at = Some(report.at_unix + 0.01);
+            }
+            assert!(capture_drain_sessions(&state, &task)[0].final_turn_ended);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
     fn continuous_drain_stop_hook_continuation_invalidates_idle_and_old_report() {
         with_continuous_home(|home| {
             let state = Arc::new(Mutex::new(DaemonState::new()));
@@ -33797,6 +33996,48 @@ while True:
     /// rendered the victim's truncated transcript tail as if it were the
     /// agent's final report — the same misread the operator/agent kill
     /// paths were already fixed for.
+    #[test]
+    fn state_core_terminal_sweep_spares_quiet_work_but_closes_engine_boundaries() {
+        use crate::agent_state::{PresenceObs, PresenceStatus};
+        let state = make_state_arc();
+        for (uid, status, valid, quiet) in [
+            ("ts-working", PresenceStatus::Busy, true, true),
+            ("ts-background", PresenceStatus::Shell, true, true),
+            ("ts-idle", PresenceStatus::Idle, true, false),
+            ("ts-error", PresenceStatus::Idle, true, false),
+            ("ts-wait", PresenceStatus::Waiting, true, false),
+            ("ts-unknown-quiet", PresenceStatus::Unknown, false, true),
+            ("ts-unknown-busy", PresenceStatus::Unknown, false, false),
+        ] {
+            let mut sp = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
+            sp.args = vec!["60".into()];
+            let mut session = crate::session::DaemonSession::spawn(sp).unwrap();
+            session.task_id = Some("done-task".into());
+            if quiet {
+                *session.last_activity_at.lock().unwrap() = None;
+            }
+            let now = now_unix_f64();
+            session.agent_state.lock().unwrap().inputs.presence = Some(PresenceObs {
+                valid,
+                status,
+                observed_at: now,
+                status_updated_at: now,
+                engine_version: None,
+                waiting_for: None,
+                main_turn_open: Some(true),
+                transcript_error: (uid == "ts-error").then(|| "auth".into()),
+            });
+            state.lock().unwrap().sessions.insert(uid.into(), session);
+        }
+        let mut swept = sweep_terminal_task_sessions(&state, "done-task", "test");
+        swept.sort();
+        assert_eq!(
+            swept,
+            ["ts-error", "ts-idle", "ts-unknown-quiet", "ts-wait"]
+        );
+        kill_all_sessions(&state);
+    }
+
     #[test]
     fn terminal_sweep_closes_plain_workers_and_spares_scheduler_owned_ones() {
         // The general-action sweep: a task going terminal by ANY route closes

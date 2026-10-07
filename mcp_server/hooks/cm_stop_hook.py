@@ -56,7 +56,11 @@ def _report_turn_ended(
         except ImportError:
             from mcp_server import control_client
 
-            legacy = {"session_uid": uid, "continuing": continuing}
+            legacy = {
+                "session_uid": uid,
+                "continuing": continuing,
+                "observed_at": observed_at if observed_at is not None else time.time(),
+            }
             if transcript_path:
                 legacy["transcript_path"] = transcript_path
             control_client.call("session.turn_ended", legacy, timeout=3.0)

@@ -87,18 +87,18 @@ class StateReadTests(unittest.TestCase):
                 self.assertEqual(result["agent_state"], value["agent_state"])
                 self.assertTrue(result["pty_idle"])
 
-    def test_baseline_uses_engine_turns_without_reading_transcripts(self):
+    def test_baseline_uses_engine_turns_and_keeps_rollback_edge(self):
         with patch.object(
             monitor,
             "last_completed_turn_fingerprint",
-            side_effect=AssertionError("legacy read"),
+            return_value="old-fingerprint",
         ):
             working = observed("working", seq=7)
             idle = observed("idle", seq=7)
             for initial, expected, at_prompt in [(working, 6, False), (idle, 7, True)]:
                 with patch.object(control_client, "call", return_value=initial):
                     baseline, ready, _ = async_monitor._capture_baseline("ts-test")
-                self.assertEqual(baseline, {"kind": "agent", "value": expected, "ended_at": 20.0})
+                self.assertEqual(baseline, {"kind": "agent", "value": expected, "ended_at": 20.0, "legacy": {"kind": "turn", "value": "old-fingerprint"}})
                 self.assertEqual(ready, at_prompt)
             self.assertFalse(
                 monitor._edge_passed(
@@ -369,7 +369,7 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
                 ["ts-test"], baselines=baselines, timeout_s=2, poll_interval_s=0.5
             )
         legacy.assert_called_once()
-        self.assertEqual(baselines["ts-test"], {"kind": "agent", "value": 3, "ended_at": 20.0})
+        self.assertEqual(baselines["ts-test"], {"kind": "agent", "value": 3, "ended_at": 20.0, "legacy": {"kind": "turn", "value": "old-fingerprint"}})
         self.assertEqual(result["completed"][0]["status"], "awaiting_input")
 
     async def test_first_engine_stop_keeps_the_completion_that_passed_legacy_edge(self):
@@ -380,6 +380,29 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
         legacy.assert_called_once()
         self.assertEqual(result["completed"][0]["status"], "awaiting_input")
         self.assertEqual(baselines["ts-test"]["kind"], "agent")
+
+    async def test_brain_rollback_keeps_watch_pinned_to_pre_arm_legacy_turn(self):
+        legacy = observed("idle")
+        del legacy["agent_state"]
+        with patch.object(monitor, "last_completed_turn_fingerprint", return_value="old"):
+            baseline = monitor.baseline_for("claude-code", "/fixture/t.jsonl", observed("working"))
+        for fingerprint, fires in [("old", False), ("new", True)]:
+            with self.subTest(fingerprint=fingerprint), \
+                    patch.object(control_client, "call", return_value=legacy), \
+                    patch.object(monitor, "last_completed_turn_fingerprint", return_value=fingerprint):
+                result = await monitor._monitor_sessions(["ts-test"], baselines={"ts-test":baseline},
+                                                        timeout_s=.1, poll_interval_s=.05)
+            self.assertEqual(bool(result["completed"]), fires)
+
+    def test_codex_rollback_uses_size_and_missing_transcript_keeps_level_behavior(self):
+        initial = observed("idle", source="relay")
+        with patch.object(monitor.os.path, "getsize", return_value=10):
+            baseline = monitor.baseline_for("codex", "/fixture/t.jsonl", initial)
+        for size, passed in [(10, False), (11, True)]:
+            with patch.object(monitor.os.path, "getsize", return_value=size):
+                self.assertEqual(monitor._edge_passed(baseline, "codex", "/fixture/t.jsonl", {}), passed)
+        no_path = monitor.baseline_for("codex", None, initial)
+        self.assertTrue(monitor._edge_passed(no_path, "codex", None, {}))
 
     async def test_unknown_quiet_pty_exception_is_limited_to_single_idle_wait(self):
         value = observed("unknown", idle=True)

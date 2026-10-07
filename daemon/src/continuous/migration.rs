@@ -195,7 +195,7 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
     }
     let mut rows = Vec::new();
     for s in &sessions {
-        let (engine, transcript, input, semantic_idle) = {
+        let (engine, transcript, input, semantic_idle, agent_state) = {
             let state = state.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(live) = state.sessions.get(&s.session_uid) {
                 (
@@ -206,6 +206,7 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
                         *live.last_input_at.lock().unwrap_or_else(|p| p.into_inner())
                     ),
                     live.semantic_idle(),
+                    serde_json::to_value(crate::agent_state::current(live)).unwrap_or(Value::Null),
                 )
             } else {
                 (
@@ -215,6 +216,7 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
                         .and_then(|x| x.transcript_path.clone()),
                     String::new(),
                     None,
+                    json!({"state":"exited"}),
                 )
             }
         };
@@ -316,7 +318,7 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
         });
         rows.push(json!({"uid":s.session_uid,"orchestrator":s.orchestrator,"exited":s.exited,"reported_at":s.reported_at,
             "reported":s.reported_done,"final_turn":s.final_turn_ended,"failed":s.failed,"input":input,
-            "semantic_idle":semantic_idle,"transcript":transcript_stamp,"monitor_hash":journal_hash}));
+            "semantic_idle":semantic_idle,"agent_state":agent_state,"transcript":transcript_stamp,"monitor_hash":journal_hash}));
     }
     let items = match batch(t) {
         Ok(items) => json!(items),
@@ -332,11 +334,37 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
     }
     let value = json!({"task":binding,"sessions":rows,"batch":items});
     Evidence {
-        hash: digest(&value),
+        hash: evidence_digest(&value),
         value,
         blockers,
         sessions,
     }
+}
+
+// Report the full observation, but heartbeat receipts and CPU samples do not
+// change the evidence an operator reconciled. State, turn edges and background
+// inventory changes still invalidate it.
+fn evidence_digest(value: &Value) -> String {
+    let mut stable = value.clone();
+    if let Some(rows) = stable["sessions"].as_array_mut() {
+        for row in rows {
+            if let Some(agent) = row["agent_state"].as_object_mut() {
+                agent.remove("observed_at");
+                if let Some(background) = agent.get_mut("background").and_then(Value::as_object_mut)
+                {
+                    background.remove("observed_at");
+                    if let Some(jobs) = background.get_mut("jobs").and_then(Value::as_array_mut) {
+                        for job in jobs {
+                            if let Some(job) = job.as_object_mut() {
+                                job.remove("cpu");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    digest(&stable)
 }
 
 fn reconciled(t: &task::ContinuousTask, e: &Evidence) -> bool {
@@ -968,5 +996,34 @@ pub fn recover_codex(state: &Arc<Mutex<DaemonState>>, task_id: &str, now: u64) -
             "Recovery identity changed before release; receipt retained.",
         )),
         task::TryModifyOutcome::Persist(e) => Err(internal(e)),
+    }
+}
+
+#[cfg(test)]
+mod state_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn agent_state_heartbeats_preserve_reconciliation_but_work_changes_do_not() {
+        let initial = json!({"sessions": [{"agent_state": {
+            "state": "idle", "turn_seq": 4, "observed_at": 100.0,
+            "background": {"observed_at": 100.0, "jobs": [{"id":"j1", "cpu": 1.0}]}
+        }}]});
+        let hash = evidence_digest(&initial);
+        let mut heartbeat = initial.clone();
+        heartbeat["sessions"][0]["agent_state"]["observed_at"] = json!(101.0);
+        heartbeat["sessions"][0]["agent_state"]["background"]["observed_at"] = json!(101.0);
+        heartbeat["sessions"][0]["agent_state"]["background"]["jobs"][0]["cpu"] = json!(7.0);
+        assert_eq!(evidence_digest(&heartbeat), hash);
+        for (key, changed) in [
+            ("state", json!("working-background")),
+            ("turn_seq", json!(5)),
+            ("background", json!({"jobs":[]})),
+        ] {
+            let mut next = heartbeat.clone();
+            next["sessions"][0]["agent_state"][key] = changed;
+            assert_ne!(evidence_digest(&next), hash, "{key}");
+        }
+        assert_eq!(initial["sessions"][0]["agent_state"]["observed_at"], 100.0);
     }
 }

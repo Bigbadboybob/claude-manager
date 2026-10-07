@@ -374,9 +374,11 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             && start.is_some_and(|at| at > p.status_updated_at && now - at < 10.0)
     });
     // A relay heartbeat is a receipt time, not evidence that queued PTY input
-    // reached the engine. Keep the delivery gap open until a real turn edge.
+    // reached the engine. Hold until a real turn edge, with a bounded escape
+    // for empty Enter, menu input, or a swallowed prompt.
     let relay_input_pending = relay.is_some_and(|r| {
         newer(start, max_time(r.turn_started_at, r.last_turn.ended_at))
+            && start.is_some_and(|at| now - at < 15.0)
     });
     let state = if input.exited {
         entered = now;
@@ -467,7 +469,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                     .and_then(|p| p.main_turn_open)
                     .unwrap_or(input.legacy.semantic_idle != Some(true))
             };
-            let pending_input = newer(start, Some(observed_at));
+            let pending_input = relay.is_none() && newer(start, Some(observed_at));
             if pending_input
                 || relay.is_some_and(|r| r.foreground == RelayStatus::Active)
                 || presence.is_some_and(|p| p.status == PresenceStatus::Busy && open)
@@ -1895,12 +1897,19 @@ mod tests {
         };
         c.apply(report(&epoch, 1, snapshot.clone()), 99.0).unwrap();
         c.note_input(100.0);
-        for (seq, at) in [(2, 101.0), (3, 104.0), (4, 160.0)] {
+        assert_eq!(derive(&c.inputs, 114.0).state, State::Working);
+        assert_eq!(derive(&c.inputs, 116.0).state, State::Idle,
+            "the hold expires even without another heartbeat");
+        assert_eq!(derive(&c.inputs, 190.0).state, State::Unknown,
+            "an expired delivery hold cannot turn stale relay data into idle");
+        for (seq, at) in [(2, 101.0), (3, 104.0), (4, 114.0)] {
             c.apply(report(&epoch, seq, snapshot.clone()), at).unwrap();
             let state = c.recompute(at);
             assert_eq!(state.state, State::Working, "heartbeats cannot end a pending input");
             assert_eq!(state.turn_seq, 2);
         }
+        assert_eq!(c.recompute(116.0).state, State::Idle,
+            "an empty submit or command that starts no turn must escape the hold");
         snapshot.turn_seq = 2;
         snapshot.turn_started_at = Some(161.0);
         snapshot.last_turn = LastTurn { ended_at: Some(162.0), status: Some(TurnStatus::Completed) };

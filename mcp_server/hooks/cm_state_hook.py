@@ -156,7 +156,11 @@ def report(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            legacy = {"session_uid": uid, "continuing": continuing}
+            legacy = {
+                "session_uid": uid,
+                "continuing": continuing,
+                "observed_at": observed_at,
+            }
             if params["payload"].get("transcript_path"):
                 legacy["transcript_path"] = params["payload"]["transcript_path"]
             control_client.call("session.turn_ended", legacy, timeout=remaining)

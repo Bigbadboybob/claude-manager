@@ -230,7 +230,8 @@ text, `stop_hook_active` and `continuing` through `session.agent_report`. A
 method-not-found, conflict (including brain restart), or invalid-params reply
 enables the legacy `session.turn_ended` fallback; transport and authorization
 failures do not. A partial payload missing the shared helper sends the legacy
-report inline. A legacy Claude Stop also records its boundary in the core,
+report inline. Both paths forward the original `observed_at`; a delayed legacy
+Stop cannot stamp idle over a newer prompt. A legacy Claude Stop also records its boundary in the core,
 so rejected rich metadata cannot leave a hooks-only session working.
 Accepted continuation reports refresh legacy activity even when
 a newer engine start already opened the turn. The report is best
@@ -283,6 +284,8 @@ also passes an unchanged counter for older Claude sessions that lack a prompt
 hook on machine-injected starts. Receipt/heartbeat timestamps never count. On a
 source upgrade the current transcript is checked against the old edge once,
 so the watched turn's first Stop is retained, then counters replace the baseline.
+The baseline also retains its original transcript fingerprint/size for rollback
+to a daemon without engine state; an unchanged old turn cannot fire the watch.
 Send-and-wait captures the counter
 before sending, so an old reply cannot satisfy the new request. Errors or human
 waits can return without assistant text. Schema correction does not send another
@@ -291,6 +294,31 @@ new `report_done` or exit, re-arming past interim turn boundaries.
 
 Deploy the MCP payload and reconnect existing MCP callers for these consumer
 changes. The continuation follow-up also needs the updated daemon brain.
+
+## Daemon consumers (S7)
+
+Continuous drain notices require engine idle or errored; final drain completion
+also requires a turn end at or after `report_done`. Foreground/background work,
+human waits and unknown hold the drain. Legacy sessions retain their old checks;
+Codex retains the bounded transcript fallback after 90 seconds of relay loss.
+`daemon.health.sessions_mid_turn` counts foreground and background engine work,
+falling back to semantic idle only without an engine source.
+
+The terminal-task sweep closes engine idle, errored or waiting-on-human sessions.
+Legacy and unknown sessions must be PTY-quiet. Foreground/background work survives,
+and continuous orchestrators/workflow participants retain their lifecycle exclusions.
+Migration reports include full `agent_state`. Reconciliation hashes omit heartbeat
+observation times and per-job CPU samples; state, turn and inventory changes
+still invalidate the reviewed evidence. Reconciliations recorded before this
+schema addition need to be recorded again once after upgrade.
+
+Workflow `on_idle` continues to use transcript completion. The optional
+`workflow_state_gate = true` in `~/.cm/daemon.toml` additionally holds transitions
+while the engine is working, working-background or waiting-on-human. It defaults
+**off for the initial rollout**; enable after the state soak using
+`daemon.reload_config` or SIGHUP to the brain. Turning it off restores the prior
+workflow behavior immediately. Prompt-delivery quietness remains independent.
+These consumers require the updated brain on every session host, with no A-R.
 
 ## Codex relay (S4/S5)
 
@@ -307,7 +335,8 @@ back off from one to ten minutes. Optional `transcript_path` triggers the existi
 ownership scan on path changes; heartbeats alone do not repeat that scan.
 
 Input queued by CM keeps a relay session working until the relay observes a
-turn start or completion at least as new as that input. A later idle heartbeat
+turn start or completion at least as new as that input, for at most 15 seconds.
+The bounded escape handles empty Enter, menu commands and swallowed input. A later idle heartbeat
 alone cannot close the 2.5–4 second PTY delivery gap, even though CM has already
 incremented the session counter. Disconnected/stale relays remain unknown.
 
