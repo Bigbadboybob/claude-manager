@@ -199,8 +199,11 @@ reviews, merges to main and deploys (hub first).
 | W1b agent_state core | state-core | reviewed PASS (+fixes) | 8223700 | cm-manager + cm-sessions 23:20Z (c61f920) |
 | W2a items daemon proxy + MCP tools | items | reviewed PASS (follow-ups in W2b) | 5e24d12 | cm-manager + cm-sessions 23:20Z |
 | W2b heartbeat + push delivery | items | reviewed PASS (+fixes) | 8411958, baee959 | API+018 cm-manager 23:40Z; brains cm-manager 23:44Z, cm-sessions 23:52Z; heartbeats 200 |
-| W2c flag engine | items | in progress | | |
-| Prompt confirmation (start_session) | state-core | re-review | | |
+| W2c flag engine | items | reviewed PASS (+fixes) | 5fb76eb, bf1bf7c | pending big deploy |
+| Prompt confirmation (start_session) | state-core | final fix in progress | | |
+| W3d report_done held items + pokes | items | queued (after prompt confirmation merges) | | |
+| W3f TUI state glyphs + board overlay; W4c docs | msgfix | in progress | | |
+| W3a/W3b/W3c hooks + consumers | state-core | queued | | |
 | W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | cm-manager + cm-sessions 23:20Z; Claude sessions on source=presence |
 | W2e Codex relay state + 0.160 parsers | state-core | reviewed PASS (+6 fixes) | cef633b, c61f920 | cm-manager + cm-sessions 23:20Z; existing Codex sessions need A-R |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
@@ -236,3 +239,7 @@ new pinned brain fd, then the holder saw the outgoing brain's socket reset as a 
 ("brain declared dead ... respawning current pin") and exec'd the OLD binary. Epoch bumped,
 build_id unchanged. A second daemon.restart worked. Always verify build_id / /proc exe sha
 after a deploy. Needs a holder fix (follow-up task).
+
+**Pending big deploy** (merged to main, not deployed): W2c flag engine (API only), then
+everything after. API: api/board_engine.py + api/main.py. Brains + MCP: per later slices.
+TUI: rebuild release at the end (tui-9ef0e15 superseded unless Owner installs it first).
