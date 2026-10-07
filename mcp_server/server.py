@@ -1957,16 +1957,22 @@ async def fork_session(
         base: "source" (default) cuts new branches at the source worktree's
             committed HEAD; "trunk" at the project's main branch. Uncommitted
             source edits never come along (`uncommitted_left_behind`).
-        prompt: First message for the fork. When blank the fork gets a
-            short note on where it came from and where it now works.
+        prompt: Optional first message for the fork. When blank NOTHING is
+            typed: the fork waits at its composer (a Claude fork writes its
+            transcript only on its first message, so an unprompted fork
+            cannot be resumed after a daemon restart). Where it came from is
+            in the result instead (`forked_from`, `commits_not_carried`).
         request_id: Idempotency key; generated per call when omitted. A
             retry with the same key returns the first fork.
         label: Sidebar label for the new session (default: the task name).
         notify_on_done / notify_until: As for `start_session` — with a
             prompt, a self-waking monitor is registered on the fork.
 
-    Returns `{task_id, session_uid, worktree_path, base_sha, forked_from,
-    engine, target, uncommitted_left_behind, ...}`.
+    Returns `{task_id, session_uid, worktree_path, branch, base_sha,
+    forked_from: {session_uid, label, branch, ...}, commits_not_carried
+    (`git log --oneline` lines on the source the fork's checkout lacks,
+    capped at 10; `commits_not_carried_truncated`), engine, target,
+    prompt_source ("caller" | "none"), uncommitted_left_behind, ...}`.
 
     State your intent in plain language and ask the user to confirm
     before calling this tool.

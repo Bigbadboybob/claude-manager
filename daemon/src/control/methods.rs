@@ -16723,28 +16723,22 @@ fn session_fork_once(
         }
     }
 
-    // Always hand the fork a first turn (see `fork_default_prompt`).
-    let first_prompt = match prompt.clone() {
-        Some(text) => text,
-        None => {
-            let source_branch = crate::worktree::worktree_current_branch(&source.worktree_path);
-            let missing = match (source_head.as_deref(), crate::worktree::worktree_head_sha(&worktree_path)) {
-                (Some(a), Some(b)) => commits_not_carried(&worktree_path, &b, a),
-                _ => Vec::new(),
-            };
-            fork_default_prompt(&ForkMove {
-                source_label: &source.label,
-                source_branch: source_branch.as_deref(),
-                task_name: &task_name,
-                task_id: &task_id,
-                branch: fork_branch.as_deref(),
-                worktree: &worktree_path,
-                missing_commits: &missing,
-            })
-        }
+    // What the move did NOT carry, reported in the result (and the TUI's
+    // status line) — never typed into the session. A fork starts at its
+    // composer with no first prompt unless the caller passed one: Owner
+    // prompts it right away, and an auto-typed turn could land in a startup
+    // dialog instead of the composer (2026-10-07). Accepted cost: a claude
+    // fork writes its transcript only on its first message, so a fork that
+    // was never prompted cannot be resumed after a daemon restart.
+    let source_branch = crate::worktree::worktree_current_branch(&source.worktree_path);
+    let missing = match (source_head.as_deref(), crate::worktree::worktree_head_sha(&worktree_path)) {
+        (Some(a), Some(b)) => commits_not_carried(&worktree_path, &b, a),
+        _ => Vec::new(),
     };
+    let missing_truncated = missing.len() > FORK_MISSING_COMMITS_CAP;
+    let missing: Vec<String> = missing.into_iter().take(FORK_MISSING_COMMITS_CAP).collect();
     let mut prompt_receipt = None;
-    {
+    if let Some(first_prompt) = prompt.clone() {
         let handle = {
             let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
             state.sessions.get(&session_uid).map(|s| (s.input_handle(), s.fanout.clone()))
@@ -16788,8 +16782,11 @@ fn session_fork_once(
             "transcript_id": source.transcript_id,
             "label": source.label,
             "worktree_path": source.worktree_path.to_string_lossy(),
+            "branch": source_branch,
         },
-        "prompt_source": if prompt.is_some() { "caller" } else { "default" },
+        "commits_not_carried": missing,
+        "commits_not_carried_truncated": missing_truncated,
+        "prompt_source": if prompt.is_some() { "caller" } else { "none" },
         "uncommitted_left_behind": uncommitted_files > 0,
         "uncommitted_files": uncommitted_files,
     });
@@ -16872,53 +16869,6 @@ fn commits_not_carried(worktree: &std::path::Path, target_sha: &str, source_sha:
 }
 
 const FORK_MISSING_COMMITS_CAP: usize = 10;
-
-/// The facts the default first prompt states about the move.
-struct ForkMove<'a> {
-    source_label: &'a str,
-    source_branch: Option<&'a str>,
-    task_name: &'a str,
-    task_id: &'a str,
-    branch: Option<&'a str>,
-    worktree: &'a std::path::Path,
-    /// `commits_not_carried` output (up to cap + 1 lines).
-    missing_commits: &'a [String],
-}
-
-/// The text a fork receives when the caller gave no first prompt. A fork
-/// must take a turn at once: claude writes the forked transcript only on
-/// its first message, and an unwritten fork cannot be resumed after a
-/// daemon restart. It states where the conversation came from and where
-/// it now works, and which source commits did NOT come along.
-fn fork_default_prompt(m: &ForkMove<'_>) -> String {
-    let source_branch = m.source_branch.unwrap_or("a detached HEAD");
-    let branch = m.branch.unwrap_or("a detached HEAD");
-    let mut text = format!(
-        "You were forked from {} (branch {}). You now work on task \"{}\" ({}) on branch {} \
-         in the worktree {}.",
-        m.source_label.trim(),
-        source_branch,
-        m.task_name,
-        m.task_id,
-        branch,
-        m.worktree.display()
-    );
-    if !m.missing_commits.is_empty() {
-        text.push_str(&format!(
-            " These commits on {} are NOT on {} and were not carried over:",
-            source_branch, branch
-        ));
-        for line in m.missing_commits.iter().take(FORK_MISSING_COMMITS_CAP) {
-            text.push_str(&format!(" [{}]", line));
-        }
-        if m.missing_commits.len() > FORK_MISSING_COMMITS_CAP {
-            text.push_str(" [and more]");
-        }
-        text.push('.');
-    }
-    text.push_str(" Wait for instructions.");
-    text
-}
 
 /// Full-shape `start_session` params for a fork: the engine-native fork
 /// argv (MCP config, hooks and env exactly as a fresh spawn of `uid`),
@@ -33288,43 +33238,6 @@ while True:
 
 
     #[test]
-    fn fork_default_prompt_states_the_move_and_commits_left_behind() {
-        let wt = std::path::Path::new("/wt/x");
-        let plain = fork_default_prompt(&ForkMove {
-            source_label: " planner ",
-            source_branch: Some("cm/feature"),
-            task_name: "try B",
-            task_id: "task-b",
-            branch: Some("cm-sub/try-b-1234567"),
-            worktree: wt,
-            missing_commits: &[],
-        });
-        assert_eq!(
-            plain,
-            "You were forked from planner (branch cm/feature). You now work on task \"try B\" \
-             (task-b) on branch cm-sub/try-b-1234567 in the worktree /wt/x. Wait for instructions."
-        );
-        let missing: Vec<String> = (0..12).map(|i| format!("abc{i:04} commit {i}")).collect();
-        let text = fork_default_prompt(&ForkMove {
-            source_label: "planner",
-            source_branch: Some("cm/feature"),
-            task_name: "try B",
-            task_id: "task-b",
-            branch: None,
-            worktree: wt,
-            missing_commits: &missing,
-        });
-        assert!(text.contains(
-            "These commits on cm/feature are NOT on a detached HEAD and were not carried over:"
-        ));
-        assert!(text.contains("[abc0000 commit 0]") && text.contains("[abc0009 commit 9]"));
-        assert!(!text.contains("abc0010"), "capped at {}", FORK_MISSING_COMMITS_CAP);
-        assert!(text.contains("[and more]"));
-        assert!(text.ends_with("Wait for instructions."));
-        assert!(!text.contains('\n'), "one line: delivered as a single submitted turn");
-    }
-
-    #[test]
     fn fork_target_requires_exactly_one_of_task_name_and_task_id() {
         let parse = |v: Value| fork_target(&serde_json::from_value::<ForkSessionParams>(v).unwrap());
         assert_eq!(
@@ -33370,6 +33283,10 @@ while True:
             seed_fork_source(&state, &repo, name);
             let target_wt = home.join("target-wt");
             run_git(&repo, &["worktree", "add", "-q", "-b", "cm/target", target_wt.to_str().unwrap()]);
+            // A source commit the target branch lacks: reported, not typed.
+            std::fs::write(repo.join("source-only.txt"), "x").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "source only work"]);
             {
                 let mut s = state.lock().unwrap();
                 let mut ws = ManifestWorkspace::default();
@@ -33399,6 +33316,11 @@ while True:
             assert_eq!(result["workspace_id"], "ws-target");
             assert_eq!(result["worktree_path"], json!(target_wt.to_string_lossy()));
             assert_eq!(result["branch"], "cm/target");
+            let missing = result["commits_not_carried"].as_array().expect("list");
+            assert_eq!(missing.len(), 1, "{}", result);
+            assert!(missing[0].as_str().unwrap().ends_with("source only work"));
+            assert_eq!(result["prompt_source"], "none");
+            assert!(result.get("prompt_delivery").is_none());
             let shared = result["workspace_shared_with"].as_array().expect("co-tenant reported");
             assert!(shared.iter().any(|t| t["session_uid"] == "ts-tenant"));
             let uid = result["session_uid"].as_str().unwrap();
@@ -33659,7 +33581,19 @@ while True:
             let again = session_fork(&state, &params, None).expect("dedup replay");
             assert_eq!(again["session_uid"], result["session_uid"]);
             assert_eq!(again["deduplicated"], json!(true));
-            assert_eq!(result["prompt_source"], "default");
+            // No first prompt unless the caller passed one: the fork waits
+            // at its composer and the move's facts ride the result instead.
+            assert_eq!(result["prompt_source"], "none");
+            assert!(result.get("prompt_delivery").is_none(), "nothing typed: {}", result);
+            assert!(
+                state.lock().unwrap().sessions[result["session_uid"].as_str().unwrap()]
+                    .prompt_delivery
+                    .is_none(),
+                "no delivery armed",
+            );
+            assert_eq!(result["commits_not_carried"], json!([]), "cut at the source HEAD");
+            assert_eq!(result["commits_not_carried_truncated"], json!(false));
+            assert!(result["forked_from"].get("branch").is_some(), "{}", result);
             assert_eq!(result["uncommitted_left_behind"], json!(true));
             assert_eq!(result["uncommitted_files"], json!(1));
 

@@ -43,7 +43,7 @@ class ForkSessionToolTests(unittest.IsolatedAsyncioTestCase):
         control_client.call = _call
 
     async def test_new_task_arguments_reach_the_daemon_rpc(self):
-        self._stub({"session_uid": "ts-fork-0", "task_id": "task-f", "prompt_source": "default"})
+        self._stub({"session_uid": "ts-fork-0", "task_id": "task-f", "prompt_source": "none"})
         res = await fork_session(
             "ts-src-0", task_name="try plan B", base="trunk",
             parent_task_id="task-p", label="planB",
@@ -61,11 +61,11 @@ class ForkSessionToolTests(unittest.IsolatedAsyncioTestCase):
             kwargs["socket_path"], control_client.resolve_socket_for_method("session.fork"),
         )
         self.assertEqual(res["task_id"], "task-f")
-        self.assertNotIn("monitor", res, "default prompt → nothing to wake the caller for")
+        self.assertNotIn("monitor", res, "no prompt → nothing to wake the caller for")
         self.assertEqual(self.monitors, [])
 
     async def test_existing_task_and_caller_request_id(self):
-        self._stub({"session_uid": "ts-fork-1", "prompt_source": "default"})
+        self._stub({"session_uid": "ts-fork-1", "prompt_source": "none"})
         await fork_session("ts-src-0", task_id="task-x", request_id="key-1", top_level=False)
         params = self.calls[0][1]
         self.assertEqual(params["task_id"], "task-x")
@@ -92,7 +92,7 @@ class ForkSessionToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("submitted", res, "a pending receipt never claims submitted")
 
     async def test_blank_prompt_is_not_sent_and_opt_out_skips_monitor(self):
-        self._stub({"session_uid": "ts-fork-2", "prompt_source": "default"})
+        self._stub({"session_uid": "ts-fork-2", "prompt_source": "none"})
         await fork_session("ts-src-0", task_name="fork", prompt="   ")
         self.assertNotIn("prompt", self.calls[0][1])
         self.assertEqual(self.monitors, [])

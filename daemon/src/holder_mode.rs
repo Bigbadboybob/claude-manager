@@ -1102,6 +1102,15 @@ pub fn holder_spawn(
         &params.args,
         params.working_dir.as_deref(),
     );
+    // The codex twin. Split mode (every production host) spawns through
+    // here, not `PendingSession::spawn`; without it a Codex child in a
+    // fresh worktree booted into the "Folder access" dialog and the first
+    // delivered keypress answered it.
+    crate::codex_trust::maybe_pretrust_for_spawn(
+        &params.shell,
+        &params.args,
+        params.working_dir.as_deref(),
+    );
     let kills_baseline = params.kills_dir.as_ref().map(|dir| {
         crate::reaper::capture_baseline_for_spawn(dir, &params.uid).unwrap_or(0)
     });

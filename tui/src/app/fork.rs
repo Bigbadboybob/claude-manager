@@ -16,6 +16,11 @@
 //! agent-memory snapshots, which copy the transcript into
 //! `~/.cm/agent-memories/` until deleted by hand).
 //!
+//! The fork starts with NO first prompt — it waits at its composer for
+//! Owner's own first message. Where it came from (source session and
+//! branch, and the source commits its checkout lacks) is shown on the
+//! status line, never typed into the session.
+//!
 //! The RPC may provision a checkout before it replies, so it runs off the
 //! input thread like remote A-n (`remote_create.rs`).
 use super::*;
@@ -35,8 +40,7 @@ const F_TARGET: u8 = 0;
 const F_TASK: u8 = 1;
 const F_PARENT: u8 = 2;
 const F_BASE: u8 = 3;
-const F_PROMPT: u8 = 4;
-const FIELDS: u8 = 5;
+const FIELDS: u8 = 4;
 
 /// A task the user can pick (from the viewer's task list).
 #[derive(Debug, Clone, PartialEq)]
@@ -90,7 +94,6 @@ pub(crate) struct ForkForm {
     /// false = cut new branches at the source's HEAD (default), true = at
     /// the project's trunk.
     pub use_trunk: bool,
-    pub prompt: String,
     pub active_field: u8,
     pub error: Option<String>,
     /// Tasks offered by the pickers, captured at open.
@@ -116,7 +119,6 @@ impl ForkForm {
             existing_task: None,
             parent: ParentChoice::SourceTask,
             use_trunk: false,
-            prompt: String::new(),
             active_field: F_TASK,
             error: None,
             tasks: Vec::new(),
@@ -253,7 +255,6 @@ impl ForkForm {
     fn text_field(&mut self) -> Option<&mut String> {
         match self.active_field {
             F_TASK if !self.existing => Some(&mut self.task_name),
-            F_PROMPT => Some(&mut self.prompt),
             _ => None,
         }
     }
@@ -293,9 +294,6 @@ impl ForkForm {
                 ParentChoice::TopLevel => params["top_level"] = json!(true),
                 ParentChoice::Task(t) => params["parent_task_id"] = json!(t.task_id),
             }
-        }
-        if !self.prompt.trim().is_empty() {
-            params["prompt"] = json!(self.prompt);
         }
         params
     }
@@ -376,22 +374,13 @@ impl ForkForm {
             Span::styled("   ", dim),
             Span::styled(format!("{} trunk", radio(self.use_trunk)), pick(self.use_trunk)),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled(format!("{}Prompt: ", mark(F_PROMPT)), dim),
-            Span::styled(sanitize_for_display(&self.prompt), white),
-            Span::styled(cursor(F_PROMPT), white),
-            Span::styled(
-                if self.prompt.is_empty() && self.active_field != F_PROMPT {
-                    "(blank: a note on where it came from)"
-                } else {
-                    ""
-                },
-                dim,
-            ),
-        ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  Uncommitted changes in the source stay behind; the source is untouched.",
+            dim,
+        )));
+        lines.push(Line::from(Span::styled(
+            "  The fork starts with no prompt: it waits for your first message.",
             dim,
         )));
         if let Some(err) = &self.error {
@@ -472,6 +461,12 @@ pub(crate) struct ForkReply {
     pub uncommitted_files: u64,
     /// Other live sessions in the checkout the fork joined.
     pub shared_with: usize,
+    /// The source's branch (None: detached HEAD, or an older host).
+    pub source_branch: Option<String>,
+    /// `git log --oneline` lines on the source that the fork's checkout
+    /// lacks (capped by the host; `commits_truncated` marks more).
+    pub commits_not_carried: Vec<String>,
+    pub commits_truncated: bool,
 }
 
 pub(crate) fn parse_fork_reply(v: &Value) -> anyhow::Result<ForkReply> {
@@ -496,6 +491,20 @@ pub(crate) fn parse_fork_reply(v: &Value) -> anyhow::Result<ForkReply> {
             .get("workspace_shared_with")
             .and_then(Value::as_array)
             .map_or(0, Vec::len),
+        source_branch: v
+            .get("forked_from")
+            .and_then(|f| f.get("branch"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        commits_not_carried: v
+            .get("commits_not_carried")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default(),
+        commits_truncated: v
+            .get("commits_not_carried_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -736,12 +745,27 @@ impl App {
 /// The result line after a fork lands.
 pub(crate) fn fork_status_line(source_label: &str, task_name: &str, reply: &ForkReply) -> String {
     let mut line = format!(
-        "Forked {} into \"{}\" (task {}, {})",
+        "Forked {}{} into \"{}\" (task {}, {})",
         source_label,
+        reply.source_branch.as_deref().map(|b| format!(" ({b})")).unwrap_or_default(),
         task_name,
         transcripts::short_id(&reply.task_id),
         reply.branch.as_deref().unwrap_or("worktree"),
     );
+    if !reply.commits_not_carried.is_empty() {
+        let shas: Vec<&str> = reply
+            .commits_not_carried
+            .iter()
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        line.push_str(&format!(
+            " — {}{} source commit(s) not carried: {}{}",
+            if reply.commits_truncated { "over " } else { "" },
+            reply.commits_not_carried.len(),
+            shas.join(" "),
+            if reply.commits_truncated { " …" } else { "" },
+        ));
+    }
     if reply.shared_with > 0 {
         line.push_str(&format!(" — shares its checkout with {} live session(s)", reply.shared_with));
     }
@@ -798,7 +822,6 @@ mod tests {
         assert_eq!(f.parent, ParentChoice::SourceTask);
         assert!(!f.use_trunk);
         assert_eq!(f.active_field, F_TASK);
-        assert!(f.prompt.is_empty());
     }
 
     #[test]
@@ -823,12 +846,12 @@ mod tests {
         assert!(f.use_trunk);
         f.key(key(KeyCode::Char(' ')));
         assert!(!f.use_trunk);
+        // No Prompt row: Tab from Base wraps to Into.
         f.key(key(KeyCode::Tab));
-        type_str(&mut f, "go on");
-        assert_eq!(f.prompt, "go on");
-        f.active_field = F_PROMPT;
+        assert_eq!(f.active_field, F_TARGET);
+        f.active_field = F_TASK;
         f.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
-        assert_eq!(f.prompt, "go on", "Alt-chords never type into the form");
+        assert_eq!(f.task_name, "plannerB", "Alt-chords never type into the form");
         assert!(matches!(f.key(key(KeyCode::Enter)), InputOutcome::Submit(SubmitAction::ForkSession)));
         assert!(matches!(f.key(key(KeyCode::Esc)), InputOutcome::Cancel));
     }
@@ -837,7 +860,7 @@ mod tests {
     fn empty_name_is_refused_inline() {
         let mut f = form();
         f.task_name = "   ".into();
-        f.active_field = F_PROMPT;
+        f.active_field = F_BASE;
         assert!(matches!(f.key(key(KeyCode::Enter)), InputOutcome::Consumed));
         assert_eq!(f.error.as_deref(), Some("Task name is required"));
         assert_eq!(f.active_field, F_TASK, "focus returns to the missing field");
@@ -878,7 +901,7 @@ mod tests {
         assert!(matches!(f.key(key(KeyCode::Enter)), InputOutcome::Consumed), "Enter re-opens picker");
         f.key(key(KeyCode::Esc));
         assert!(f.picker.is_none(), "Esc closes only the picker");
-        f.active_field = F_PROMPT;
+        f.active_field = F_BASE;
         assert!(matches!(f.key(key(KeyCode::Enter)), InputOutcome::Submit(SubmitAction::ForkSession)));
     }
 
@@ -912,10 +935,9 @@ mod tests {
         f.parent = ParentChoice::Task(TaskChoice { task_id: "t-beta".into(), name: "Beta".into() });
         assert_eq!(f.rpc_params("u", 1, 1)["parent_task_id"], "t-beta");
         f.use_trunk = true;
-        f.prompt = "continue".into();
         let p = f.rpc_params("u", 1, 1);
         assert_eq!(p["base"], "trunk");
-        assert_eq!(p["prompt"], "continue");
+        assert!(p.get("prompt").is_none(), "the viewer never sends a first prompt");
         f.existing = true;
         f.existing_task = Some(TaskChoice { task_id: "t-alpha".into(), name: "Alpha rollout".into() });
         let p = f.rpc_params("u", 1, 1);
@@ -929,7 +951,9 @@ mod tests {
             "session_uid": "ts-new-1", "task_id": "task-f", "task_name": "try B",
             "workspace_id": "ws-f", "worktree_path": "/wt/cm-sub-x", "label": "try B",
             "branch": "cm-sub/x", "transcript_id": "new-conv", "engine": "claude-code",
-            "forked_from": {"session_uid": "ts-src-1", "transcript_id": "src-conv"},
+            "forked_from": {"session_uid": "ts-src-1", "transcript_id": "src-conv", "branch": "cm/feature"},
+            "commits_not_carried": ["abc1234 later work", "def5678 more"],
+            "commits_not_carried_truncated": false,
             "uncommitted_files": 3,
             "workspace_shared_with": [{"session_uid": "ts-other", "label": "o"}],
         })
@@ -957,9 +981,17 @@ mod tests {
     fn status_line_warns_about_uncommitted_and_shared_checkouts() {
         let r = parse_fork_reply(&reply_json()).unwrap();
         let line = fork_status_line("planner", "try B", &r);
-        assert!(line.starts_with("Forked planner into \"try B\" (task task-f, cm-sub/x)"));
+        assert!(line.starts_with("Forked planner (cm/feature) into \"try B\" (task task-f, cm-sub/x)"));
+        assert!(line.contains("2 source commit(s) not carried: abc1234 def5678"), "{line}");
         assert!(line.contains("shares its checkout with 1 live session(s)"));
         assert!(line.contains("warning: 3 uncommitted file(s) in the source were left behind"));
+        // An older host's reply (no branch / commit fields) still renders.
+        let mut old = reply_json();
+        old.as_object_mut().unwrap().remove("commits_not_carried");
+        old["forked_from"].as_object_mut().unwrap().remove("branch");
+        let line = fork_status_line("planner", "try B", &parse_fork_reply(&old).unwrap());
+        assert!(line.starts_with("Forked planner into \"try B\""), "{line}");
+        assert!(!line.contains("not carried"));
     }
 
     #[test]
