@@ -284,6 +284,15 @@ OWNER`. In the board overlay the item's badge is `OWNER` with the diamond in the
 flag cell, the banner leads with "N blocked on Owner", and `s` → `O` lets Owner
 set the status (any other status clears it).
 
+Blockers are shown on the row itself, in the tail column before the note:
+`⟵ #1 bench run (WAIT 32m)` (first blocker, its badge, `+N` for more), or the
+quoted `blocked_on` reason with `check back 20m` (red `overdue` once past;
+shortened to `back 20m` on narrow terminals, never the reason). Items others
+wait for show `→ blocks #4 #7` (the read's `blocks`, else computed in the
+viewer). Under the summary, `⟵ N blocked: on items · on Owner · external`.
+The detail pane lists **Blocked by** (each blocker's badge, title, holder
+chips and ETA, then the reason and check-back time) and **Blocks**.
+
 Holder arguments accept a chat name, a session uid, a participant id, `me`, or
 `none`. An unknown or ambiguous name is refused with the candidates.
 

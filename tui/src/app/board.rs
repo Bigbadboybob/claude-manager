@@ -499,6 +499,9 @@ impl App {
         }
         if b.data["board"].is_object() {
             lines.push(self.board_summary_line(width));
+            if let Some(line) = blocked_summary(b.items(), width) {
+                lines.push(line);
+            }
             if b.show_free {
                 let free: Vec<&str> = b.data["free_capacity"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
                 lines.push(Line::styled(
@@ -537,6 +540,7 @@ impl App {
         let cols = Columns::for_width(width);
         let now = now_unix();
         let items = b.items();
+        let index = item_index(b);
         let mut group: Option<String> = None;
         let mut cursor_line = 0usize;
         for (i, item) in items.iter().enumerate() {
@@ -549,7 +553,7 @@ impl App {
             if i == b.cursor {
                 cursor_line = lines.len();
             }
-            lines.push(self.item_row(item, &cols, now, i == b.cursor, false));
+            lines.push(self.item_row(item, &index, &cols, now, i == b.cursor, false));
         }
         let closed = b.closed();
         if !closed.is_empty() {
@@ -563,17 +567,20 @@ impl App {
                 if selected {
                     cursor_line = lines.len();
                 }
-                lines.push(self.item_row(item, &cols, now, selected, true));
+                lines.push(self.item_row(item, &index, &cols, now, selected, true));
             }
         }
         // Layout: list, detail pane for the selected row, footer.
         let footer_h = 2u16;
+        // The compact pane grows by the selected row's Blocked by / Blocks
+        // lines, up to half the overlay.
+        let edge_lines = b.selected().map_or(0, |item| detail_edge_lines(item, &index)) as u16;
         let detail_h: u16 = if b.selected().is_none() {
             0
         } else if b.detail {
-            (inner.height / 2).max(6)
+            (inner.height / 2).max(6 + edge_lines)
         } else {
-            6
+            (6 + edge_lines).min((inner.height / 2).max(6))
         }
         .min(inner.height.saturating_sub(footer_h + 3));
         let list_h = inner.height.saturating_sub(footer_h + detail_h);
@@ -582,7 +589,7 @@ impl App {
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list);
         if detail_h > 0 {
             let area = Rect { y: inner.y + list_h, height: detail_h, ..inner };
-            self.draw_board_detail(frame, area, now);
+            self.draw_board_detail(frame, area, &index, now);
         }
         let footer = Rect { y: inner.y + list_h + detail_h, height: footer_h.min(inner.height), ..inner };
         frame.render_widget(Paragraph::new(vec![self.board_status_line(), board_help(width)]), footer);
@@ -635,8 +642,17 @@ impl App {
         clip_spans(spans, width)
     }
 
-    /// One aligned row: marker, #n, status badge, ⚑, title…, holder chips, note…
-    fn item_row(&self, item: &Value, cols: &Columns, now: i64, selected: bool, closed: bool) -> Line<'static> {
+    /// One aligned row: marker, #n, status badge, ⚑, title…, holder chips,
+    /// then the tail: what blocks it, what it blocks, the note.
+    fn item_row(
+        &self,
+        item: &Value,
+        index: &ItemIndex,
+        cols: &Columns,
+        now: i64,
+        selected: bool,
+        closed: bool,
+    ) -> Line<'static> {
         let flagged = item["flags"].as_array().is_some_and(|f| !f.is_empty());
         let (badge, badge_style) = status_badge(item, now);
         let dim = closed;
@@ -688,9 +704,23 @@ impl App {
             spans.push(Span::raw(" ".repeat(cols.chips.saturating_sub(used))));
         }
         if cols.note > 0 {
-            if let Some(note) = item["note"].as_str().filter(|n| !n.is_empty()) {
-                spans.push(Span::styled(truncate(&format!(" {note}"), cols.note), Style::default().fg(theme::DIM)));
+            let mut tail: Vec<Span<'static>> = Vec::new();
+            if !closed {
+                let reason = blocker_spans(item, index, now, cols.note.saturating_sub(1));
+                if !reason.is_empty() {
+                    tail.push(Span::raw(" "));
+                    tail.extend(reason);
+                }
+                let blocks = blocks_of(item, index);
+                if !blocks.is_empty() {
+                    let list: Vec<String> = blocks.iter().map(|n| format!("#{n}")).collect();
+                    tail.push(Span::styled(format!(" \u{2192} blocks {}", list.join(" ")), Style::default().fg(theme::DIM)));
+                }
             }
+            if let Some(note) = item["note"].as_str().filter(|n| !n.is_empty()) {
+                tail.push(Span::styled(format!(" {note}"), Style::default().fg(theme::DIM)));
+            }
+            spans.extend(clip(tail, cols.note));
         }
         let mut line = Line::from(spans);
         if selected {
@@ -699,7 +729,7 @@ impl App {
         line
     }
 
-    fn draw_board_detail(&self, frame: &mut Frame, area: Rect, now: i64) {
+    fn draw_board_detail(&self, frame: &mut Frame, area: Rect, index: &ItemIndex, now: i64) {
         let Some(item) = self.board.selected() else { return };
         let width = area.width as usize;
         let rule = Line::styled("\u{2500}".repeat(width), Style::default().fg(theme::DIM));
@@ -726,20 +756,11 @@ impl App {
         if let Some(g) = item["group"].as_str().filter(|g| !g.is_empty()) {
             meta.push(format!("group: {g}"));
         }
-        if let Some(bb) = item["blocked_by"].as_array().filter(|b| !b.is_empty()) {
-            meta.push(format!("blocked by {}", bb.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ")));
-        }
-        if let Some(on) = item["blocked_on"].as_str().filter(|s| !s.is_empty()) {
-            if item["status"] == "blocked_on_owner" {
-                meta.push(format!("Owner decision: {on}"));
-            } else {
-                meta.push(format!("blocked on: {on}"));
-            }
-        }
         if let Some(eta) = item["eta_at"].as_str() {
             meta.push(format!("eta {}", eta.get(11..16).unwrap_or(eta)));
         }
         lines.push(Line::styled(meta.join(" \u{00b7} "), Style::default().fg(theme::MUTED)));
+        lines.extend(self.detail_edges(item, index, now));
         if let Some(note) = item["note"].as_str().filter(|n| !n.is_empty()) {
             lines.push(Line::styled(format!("note: {note}"), Style::default().fg(theme::TEXT)));
         }
@@ -762,6 +783,75 @@ impl App {
             ));
         }
         frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), area);
+    }
+
+    /// The detail pane's "Blocked by" and "Blocks" sections: each related
+    /// item with its badge, holders and ETA, plus the blocked_on text and
+    /// check-back time.
+    fn detail_edges(&self, item: &Value, index: &ItemIndex, now: i64) -> Vec<Line<'static>> {
+        let heading = |text: &str| Line::styled(text.to_owned(), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD));
+        let mut lines = Vec::new();
+        let blocked_by = numbers(&item["blocked_by"]);
+        let on = item["blocked_on"].as_str().filter(|s| !s.is_empty());
+        if !blocked_by.is_empty() || on.is_some() {
+            lines.push(heading("Blocked by"));
+            for n in &blocked_by {
+                lines.push(self.related_item_line(*n, index, now));
+            }
+            if let Some(on) = on {
+                let owner = item["status"] == "blocked_on_owner";
+                let mut spans = vec![
+                    Span::raw("  "),
+                    if owner {
+                        Span::styled("\u{25c6} Owner decision: ", super::owner_blocked::owner_style())
+                    } else {
+                        Span::styled("\u{27f5} ", Style::default().fg(theme::ATTN))
+                    },
+                    Span::styled(format!("\"{on}\""), Style::default().fg(theme::TEXT)),
+                ];
+                if let Some((text, style)) = check_back(item, now) {
+                    spans.push(Span::styled(" \u{00b7} ", Style::default().fg(theme::DIM)));
+                    spans.push(Span::styled(text, style));
+                    if let Some(at) = item["check_back_at"].as_str() {
+                        spans.push(Span::styled(format!(" ({})", at.get(11..16).unwrap_or(at)), Style::default().fg(theme::DIM)));
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        let blocks = blocks_of(item, index);
+        if !blocks.is_empty() {
+            lines.push(heading("Blocks"));
+            for n in blocks {
+                lines.push(self.related_item_line(n, index, now));
+            }
+        }
+        lines
+    }
+
+    /// `  #3 BLOCKED bench run · ◐ bench · eta 21:40` for an item on this board.
+    fn related_item_line(&self, n: i64, index: &ItemIndex, now: i64) -> Line<'static> {
+        let dim = Style::default().fg(theme::DIM);
+        let mut spans = vec![Span::styled(format!("  #{n} "), Style::default().fg(theme::MUTED))];
+        let Some(other) = index.get(&n) else {
+            spans.push(Span::styled("(not on the board: archived or another board)", dim));
+            return Line::from(spans);
+        };
+        let (badge, style) = status_badge(other, now);
+        spans.push(Span::styled(format!("{badge} "), style));
+        spans.push(Span::styled(other["title"].as_str().unwrap_or("").to_owned(), Style::default().fg(theme::TEXT)));
+        for h in other["holders"].as_array().into_iter().flatten() {
+            let name = h["name"].as_str().or_else(|| h["pid"].as_str()).unwrap_or("?").to_owned();
+            let state = h["state"]["state"].as_str().unwrap_or("unknown");
+            let (glyph, gstyle) = holder_glyph(state, h["state"]["for_s"].as_i64(), self.spinner_frame());
+            spans.push(Span::styled(" \u{00b7} ", dim));
+            spans.push(Span::styled(format!("{glyph} "), gstyle));
+            spans.push(Span::styled(name, Style::default().fg(theme::MUTED)));
+        }
+        if let Some(eta) = other["eta_at"].as_str() {
+            spans.push(Span::styled(format!(" \u{00b7} eta {}", eta.get(11..16).unwrap_or(eta)), dim));
+        }
+        Line::from(spans)
     }
 
     fn board_status_line(&self) -> Line<'static> {
@@ -805,15 +895,150 @@ struct Columns {
 
 impl Columns {
     /// Fixed: marker 2, #n 5, badge, flag 2. The rest splits title / chips /
-    /// note, title first; the note column disappears on narrow terminals.
+    /// tail, the tail a bit wider than the title since it carries the blocker;
+    /// it disappears on very narrow terminals.
     fn for_width(width: usize) -> Self {
         let badge = 13;
         let rest = width.saturating_sub(2 + 5 + badge + 2);
-        let chips = (rest / 4).clamp(12, 30).min(rest.saturating_sub(16));
-        let title = (rest.saturating_sub(chips) * 3 / 5).clamp(16, 60).min(rest.saturating_sub(chips + 1));
+        let chips = (rest / 5).clamp(12, 30).min(rest.saturating_sub(16));
+        let title = (rest.saturating_sub(chips) * 2 / 5).clamp(16, 60).min(rest.saturating_sub(chips + 1));
         let note = rest.saturating_sub(title + 1 + chips);
         Self { badge, title, chips, note: if note >= 10 { note } else { 0 } }
     }
+}
+
+/// Open and recently closed items by number, for blocker lookups.
+type ItemIndex<'a> = HashMap<i64, &'a Value>;
+
+fn item_index(b: &Board) -> ItemIndex<'_> {
+    b.items().iter().chain(b.closed()).filter_map(|i| Some((i["n"].as_i64()?, i))).collect()
+}
+
+fn numbers(v: &Value) -> Vec<i64> {
+    v.as_array().into_iter().flatten().filter_map(Value::as_i64).collect()
+}
+
+/// Open items this one blocks: the API's `blocks`, else computed here.
+fn blocks_of(item: &Value, index: &ItemIndex) -> Vec<i64> {
+    if item["blocks"].is_array() {
+        return numbers(&item["blocks"]);
+    }
+    let Some(n) = item["n"].as_i64() else { return Vec::new() };
+    let mut out: Vec<i64> = index
+        .values()
+        .filter(|o| !matches!(o["status"].as_str(), Some("done" | "dropped")))
+        .filter(|o| numbers(&o["blocked_by"]).contains(&n))
+        .filter_map(|o| o["n"].as_i64())
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// `check back 20m`, or `check back overdue 5m` in red.
+fn check_back(item: &Value, now: i64) -> Option<(String, Style)> {
+    let at = item["check_back_at"].as_str().and_then(parse_rfc3339)?;
+    Some(if at >= now {
+        (format!("check back {}", age(at - now)), Style::default().fg(theme::MUTED))
+    } else {
+        (format!("check back overdue {}", age(now - at)), Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD))
+    })
+}
+
+/// What blocks a row, within `room` cells: `⟵ #3 bench run (WAIT 12m)`
+/// (+N for more blockers), `⟵ "GPU quota" · check back 20m`, or the quoted
+/// Owner question. The related title / text is what gets truncated.
+fn blocker_spans(item: &Value, index: &ItemIndex, now: i64, room: usize) -> Vec<Span<'static>> {
+    let arrow = || Span::styled("\u{27f5} ", Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD));
+    let width = |spans: &[Span]| spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let blocked_by = numbers(&item["blocked_by"]);
+    if let Some(&first) = blocked_by.first() {
+        let mut head = vec![arrow(), Span::styled(format!("#{first}"), Style::default().fg(theme::MUTED))];
+        let mut after = Vec::new();
+        let mut title = String::new();
+        if let Some(other) = index.get(&first) {
+            let (badge, style) = status_badge(other, now);
+            let badge = badge.strip_suffix(" left").unwrap_or(&badge).to_owned();
+            title = other["title"].as_str().unwrap_or("").to_owned();
+            after.push(Span::styled(format!(" ({badge})"), style));
+        }
+        if blocked_by.len() > 1 {
+            after.push(Span::styled(format!(" +{}", blocked_by.len() - 1), Style::default().fg(theme::ATTN)));
+        }
+        let left = room.saturating_sub(width(&head) + width(&after) + 1);
+        if !title.is_empty() && left >= 4 {
+            head.push(Span::styled(format!(" {}", truncate(&title, left)), Style::default().fg(theme::TEXT)));
+        }
+        head.extend(after);
+        return head;
+    }
+    let status = item["status"].as_str().unwrap_or("");
+    let Some(on) = item["blocked_on"].as_str().filter(|s| !s.is_empty()) else { return Vec::new() };
+    if !matches!(status, "blocked" | "blocked_on_owner") {
+        return Vec::new();
+    }
+    let (lead, text_style) = if status == "blocked_on_owner" {
+        (None, super::owner_blocked::owner_style())
+    } else {
+        (Some(arrow()), Style::default().fg(theme::TEXT))
+    };
+    let quoted = format!("\"{on}\"");
+    let lead_w = lead.as_ref().map_or(0, |s| s.content.chars().count());
+    let mut after = Vec::new();
+    if let Some((text, style)) = check_back(item, now) {
+        // Tight: `back 20m` / `overdue 5m` rather than cutting the reason.
+        let full = 3 + text.chars().count();
+        let text = if lead_w + quoted.chars().count() + full <= room {
+            text
+        } else {
+            text.strip_prefix("check back ")
+                .map(|t| if t.starts_with("overdue") { t.to_owned() } else { format!("back {t}") })
+                .unwrap_or(text)
+        };
+        after.push(Span::styled(" \u{00b7} ", Style::default().fg(theme::DIM)));
+        after.push(Span::styled(text, style));
+    }
+    // The reason keeps at least half the room; the check-back is clipped first.
+    let left = room.saturating_sub(lead_w + width(&after)).max(room.saturating_sub(lead_w) / 2);
+    let mut out: Vec<Span<'static>> = lead.into_iter().collect();
+    out.push(Span::styled(truncate(&quoted, left.max(4)), text_style));
+    out.extend(after);
+    clip(out, room)
+}
+
+/// `3 blocked: 2 on items · 1 on Owner · 1 external` under the summary.
+fn blocked_summary(items: &[Value], width: usize) -> Option<Line<'static>> {
+    let (mut on_items, mut owner, mut external) = (0, 0, 0);
+    for item in items {
+        match item["status"].as_str() {
+            Some("blocked_on_owner") => owner += 1,
+            Some("blocked") if !numbers(&item["blocked_by"]).is_empty() => on_items += 1,
+            Some("blocked") => external += 1,
+            _ => {}
+        }
+    }
+    let total = on_items + owner + external;
+    if total == 0 {
+        return None;
+    }
+    let parts: Vec<String> = [(on_items, "on items"), (owner, "on Owner"), (external, "external")]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+    Some(Line::from(clip(
+        vec![
+            Span::styled(format!("\u{27f5} {total} blocked"), Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(": {}", parts.join(" \u{00b7} ")), Style::default().fg(theme::MUTED)),
+        ],
+        width,
+    )))
+}
+
+/// Lines the detail pane needs for its Blocked by / Blocks sections.
+fn detail_edge_lines(item: &Value, index: &ItemIndex) -> usize {
+    let by = numbers(&item["blocked_by"]).len() + usize::from(item["blocked_on"].as_str().is_some_and(|s| !s.is_empty()));
+    let blocks = blocks_of(item, index).len();
+    by + usize::from(by > 0) + blocks + usize::from(blocks > 0)
 }
 
 fn now_unix() -> i64 {
@@ -1011,6 +1236,10 @@ fn pad(s: &str, width: usize) -> String {
 
 /// Keep spans within `width` cells (the summary line on narrow terminals).
 fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    Line::from(clip(spans, width))
+}
+
+fn clip(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut used = 0usize;
     for span in spans {
@@ -1026,7 +1255,7 @@ fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
             break;
         }
     }
-    Line::from(out)
+    out
 }
 
 #[cfg(test)]
@@ -1130,6 +1359,93 @@ mod tests {
         let (badge, style) = status_badge(&json!({"status": "blocked_on_owner"}), 0);
         assert_eq!(badge, "OWNER");
         assert_eq!(style.fg, Some(theme::OWNER_BLOCKED));
+    }
+
+    /// The `loaded` board plus a blocker graph: #4 waits on #1, #5 on an
+    /// external approval, #6 on an Owner decision (check-back overdue), #7 on
+    /// #1 and #3.
+    fn blockers(app: &mut App) {
+        loaded(app);
+        let mut data = app.board.data.clone();
+        let items = data["items"].as_array_mut().unwrap();
+        items[2]["blocked_by"] = json!([1]);
+        items[2]["blocked_on"] = Value::Null;
+        items.push(json!({"n":5,"status":"blocked","title":"scale to 64 GPUs","group":"Docs","blocked_on":"GPU quota approval",
+            "check_back_at": iso(1200),"holders":[]}));
+        items.push(json!({"n":6,"status":"blocked_on_owner","title":"allocator","group":"Docs","blocked_on":"pick allocator variant",
+            "check_back_at": iso(-300),"holders":[]}));
+        items.push(json!({"n":7,"status":"blocked","title":"final eval","group":"Docs","blocked_by":[1,3],"holders":[]}));
+        app.board.accept(data);
+    }
+
+    fn row<'a>(text: &'a str, n: &str) -> &'a str {
+        text.lines().find(|l| l.contains(&format!("   #{n} "))).unwrap_or_else(|| panic!("no row #{n}:\n{text}"))
+    }
+
+    #[test]
+    fn blockers_show_inline_with_reverse_edges_and_detail_sections() {
+        for width in [100u16, 160] {
+            let mut app = test_app();
+            blockers(&mut app);
+            app.board.cursor = 2; // #4
+            let text = screen_at(&mut app, width, 40);
+            if std::env::var_os("CM_BOARD_DUMP").is_some() {
+                println!("--- {width} columns ---\n{text}");
+            }
+            // Inline: the blocking item, its status and ETA.
+            let r4 = row(&text, "4");
+            assert!(r4.contains("\u{27f5} #1 bench run (WAIT 3"), "{r4}");
+            assert!(!r4.contains("left)"), "the countdown is compact: {r4}");
+            // External blocker with its check-back; Owner question quoted.
+            // Narrow terminals shorten the check-back wording, never the reason.
+            let (back, overdue) = if width >= 160 { ("check back 2", "check back overdue 5m") } else { ("back 2", "overdue 5m") };
+            let r5 = row(&text, "5");
+            assert!(r5.contains(&format!("\u{27f5} \"GPU quota approval\" \u{00b7} {back}")), "{r5}");
+            let r6 = row(&text, "6");
+            assert!(r6.contains("OWNER") && r6.contains("\"pick allocator vari"), "{r6}");
+            assert!(r6.contains(overdue), "{r6}");
+            // Several blockers: the first, then +N.
+            assert!(row(&text, "7").contains("\u{27f5} #1") && row(&text, "7").contains("+1"), "{text}");
+            // Reverse edges, computed client-side when the read lacks them.
+            assert!(row(&text, "1").contains("\u{2192} blocks #4 #7"), "{text}");
+            assert!(row(&text, "3").contains("\u{2192} blocks #7"), "{text}");
+            // Summary of what the blocked items wait on.
+            assert!(text.contains("\u{27f5} 4 blocked: 2 on items \u{00b7} 1 on Owner \u{00b7} 1 external"), "{text}");
+            // Detail pane for #4: Blocked by with badge, holders and ETA.
+            let at = text.find("Blocked by").expect("detail section");
+            let detail = &text[at..];
+            assert!(detail.contains("#1 WAIT 3") && detail.contains("bench run \u{00b7} \u{25d0} bench \u{00b7} eta "), "{detail}");
+        }
+        // #6: the Owner decision and its check-back time; #1: what it blocks.
+        let mut app = test_app();
+        blockers(&mut app);
+        app.board.cursor = 5;
+        let text = screen_at(&mut app, 160, 40);
+        let detail = &text[text.find("Blocked by").expect("section")..];
+        assert!(detail.contains("\u{25c6} Owner decision: \"pick allocator variant\" \u{00b7} check back overdue 5m ("), "{detail}");
+        app.board.cursor = 1;
+        let text = screen_at(&mut app, 160, 40);
+        let detail = &text[text.find("Blocks").expect("section")..];
+        assert!(detail.contains("#4 BLOCKED needs EP GO \u{00b7} ? lane-c") && detail.contains("#7 BLOCKED final eval"), "{detail}");
+        // The API's own reverse edges win over the client-side computation.
+        let mut data = app.board.data.clone();
+        data["items"][1]["blocks"] = json!([4]);
+        app.board.accept(data);
+        assert!(row(&screen_at(&mut app, 160, 40), "1").contains("\u{2192} blocks #4 "));
+    }
+
+    #[test]
+    fn blocker_text_truncates_the_title_not_the_status() {
+        let mut app = test_app();
+        blockers(&mut app);
+        let index = item_index(&app.board);
+        let item = json!({"n":8,"status":"blocked","blocked_by":[3,1]});
+        let text: String = blocker_spans(&item, &index, now_unix(), 30).iter().map(|s| s.content.to_string()).collect();
+        assert!(text.starts_with("\u{27f5} #3 fuse") && text.ends_with("\u{2026} (ACTIVE) +1"), "{text}");
+        assert!(text.chars().count() <= 30, "{text}");
+        let gone = json!({"n":8,"status":"blocked","blocked_by":[99]});
+        let text: String = blocker_spans(&gone, &index, now_unix(), 30).iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "\u{27f5} #99", "an archived blocker is still named");
     }
 
     #[test]
