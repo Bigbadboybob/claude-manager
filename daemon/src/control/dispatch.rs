@@ -9656,6 +9656,7 @@ mod tests {
                 repos: Vec::new(),
                 scheduler: Default::default(),
                 notify_command: None,
+                codex_inline_scrollback: true,
             };
         }
         let resp = dispatch_request(
@@ -9717,6 +9718,7 @@ mod tests {
             repos: Vec::new(),
             scheduler: Default::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
         };
     }
 

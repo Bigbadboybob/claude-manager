@@ -488,9 +488,16 @@ pub struct DaemonConfig {
     /// logged and nothing was pushed.
     #[serde(default)]
     pub notify_command: Option<String>,
+    /// Launch Codex sessions with `--no-alt-screen` (inline mode) so their
+    /// history lands in the viewer's scrollback. Default on; set `false` and
+    /// `daemon.reload_config` if inline rendering misbehaves. Takes effect on
+    /// the next Codex spawn or A-R revive, never on a running session.
+    #[serde(default = "default_codex_inline_scrollback")]
+    pub codex_inline_scrollback: bool,
 }
 
 fn default_presence_idle_enabled() -> bool { true }
+fn default_codex_inline_scrollback() -> bool { true }
 
 impl DaemonConfig {
     /// Effective clone directory: the configured `repos_dir`, or the
@@ -524,6 +531,7 @@ impl Default for DaemonConfig {
             repos: Vec::new(),
             scheduler: SchedulerConfig::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
         }
     }
 }
@@ -817,6 +825,7 @@ mode = "ssh-trust"
             }],
             scheduler: SchedulerConfig::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
         };
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =

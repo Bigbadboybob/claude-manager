@@ -5,10 +5,39 @@ cells, and writes incremental buffer differences through the Crossterm backend.
 The grid is already a display model: its cell contents must not be replayed as
 terminal commands.
 
+## Scrolling Codex sessions
+
+Codex 0.160 draws in the alternate screen by default. The alternate screen
+has no scrollback, so CM's mouse wheel and Shift+PageUp, which move CM's own
+scrollback, had nothing to scroll. Codex there also does not enable mouse
+reporting (only `?1049h` + `?1007h`), so the wheel was not forwarded either.
+
+CM now launches Codex with `--no-alt-screen` (inline mode) in both argv
+composers (`daemon/src/mcp_config.rs::build_args`, `tui/src/mcp_config.rs::
+codex_args`), for fresh launches and resumes; `mcp_server/native_codex.py`
+passes the flag to the remote frontend. Inline Codex inserts history above its
+viewport, so it lands in CM's scrollback; on resize it clears and reprints the
+transcript (`CSI 2J` + `CSI 3J`) rather than duplicating it. A resumed session
+replays its history into scrollback. The startup banner can appear two or three
+times while the thread loads.
+
+Running sessions keep the mode they started with. Revive one with **A-R** to
+switch it. Turn inline mode off with `codex_inline_scrollback = false` in
+`~/.cm/daemon.toml` (then `daemon.reload_config`) for daemon-composed spawns and
+revives, and in `~/.cm/tui-settings.toml` for TUI-composed ones (restart the
+TUI).
+
+For any alternate-screen app that does not request mouse reporting, the wheel
+is translated into keys the app scrolls with. Codex gets PageUp/PageDown,
+because Up/Down recall its composer history. Other apps get the standard
+alternate-scroll arrows (three per notch). This makes the wheel work in Codex
+sessions that have not been revived. Plain PageUp/PageDown already reach
+alternate-screen apps.
+
 ## Copying from mouse-enabled clients
 
-Fullscreen Codex enables mouse tracking, so ordinary clicks, drags and scrolling
-belong to Codex. Hold **Shift** while starting a left-button drag to select text
+When a fullscreen client enables mouse tracking, ordinary clicks, drags and scrolling
+belong to the client. Hold **Shift** while starting a left-button drag to select text
 in CM instead. Releasing the mouse copies the selection through OSC 52 to the
 viewing terminal's clipboard. **Shift+Alt+drag** selects a rectangular block.
 The gesture stays with CM if Shift is released first, and dragging outside the

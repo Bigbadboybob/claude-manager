@@ -730,6 +730,7 @@ pub fn run() -> anyhow::Result<()> {
     // 12f: stash the loaded config so `start_session`'s
     // env-injection step can read it (mcp_server_path /
     // api_url / api_token).
+    crate::mcp_config::set_codex_inline_scrollback(daemon_config.codex_inline_scrollback);
     initial_state.config = daemon_config;
     // Phase 3b: the dev flag (read once above) and the listener's
     // raw fd — the latter is MANIFEST INPUT ONLY (see the field doc):
