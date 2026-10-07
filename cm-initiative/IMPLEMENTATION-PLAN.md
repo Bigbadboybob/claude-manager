@@ -272,3 +272,4 @@ steps: laptop TUI install + laptop daemon, Codex A-R round.
 17:55Z: Codex fork launcher fix (0bdb6ed, `--cd` with tui.resume_cwd under --remote) hot-copied
 as mcp_server/native_codex.py on both hosts (launcher is read per spawn; no restart). Live
 Codex fork verified by state-core. Merged-not-deployed: 537af5c (items cosmetics + DELETE /boards).
+Merged-not-deployed: a82450f (send_input_and_wait follows transcript rotation after /clear or /new; MCP payload only).
