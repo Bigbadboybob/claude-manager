@@ -253,3 +253,7 @@ note_input; the delivery token can be overwritten by a Codex continuing turn-end
 Owner Enter; a delivery whose thread dies before Enter keeps input_pending set until the
 monitor times out. Holder pin race on deploy (see above). Hub brain start loads the full
 message store.
+Follow-up (messaging, small): a bundled wake ("N new") previews only the newest message, so
+another sender's handoff can hide behind it. 2026-10-07 00:42Z: msgfix's mentioned W3f handoff
+was missed by the coordinator this way. Wake text should list all senders/conversations in
+the bundle.
