@@ -723,7 +723,7 @@ def split_args(args, permissions=None):
     """CM-generated embedded argv -> backend configuration + remote UI intent."""
     args = list(args)
     resume = None
-    # `fork` (CM's fork-into-new-task) is shaped exactly like `resume`:
+    # `fork` (CM's fork-into-a-task) is shaped exactly like `resume`:
     # subcommand first, SESSION_ID last, and no frontend permission flag.
     subcommand = "resume"
     if args and args[0] in ("resume", "fork"):

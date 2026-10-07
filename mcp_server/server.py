@@ -1925,67 +1925,94 @@ async def start_session(
 @mcp.tool()
 async def fork_session(
     session_uid: str,
-    task_name: str,
+    task_name: str | None = None,
+    task_id: str | None = None,
     base: str = "source",
+    parent_task_id: str | None = None,
     prompt: str | None = None,
-    parent_task: str | None = None,
+    request_id: str | None = None,
+    top_level: bool = False,
     label: str | None = None,
     notify_on_done: bool = True,
     notify_until: str = "turn_end",
 ) -> dict:
-    """Fork a Claude or Codex session's conversation into a NEW task.
+    """Fork a Claude or Codex session's conversation into a task.
 
-    Creates a subtask (default parent: the source session's task) with its
-    own `cm-sub/...` worktree, then starts a session there that continues
-    from a copy of the source's conversation using the engine's native
-    fork (`claude --resume <id> --fork-session` / `codex fork <id>`). The
-    source session keeps running unchanged; CM stores no history copy.
+    Starts a session that continues from a copy of the source's
+    conversation via the engine's native fork (`claude --resume <id>
+    --fork-session` / `codex fork <id>`). The source keeps running
+    unchanged; CM stores no history copy. Pass exactly one of:
+
+    - `task_name`: a NEW task with its own `cm-sub/...` worktree. Parent
+      defaults to the source session's task; `parent_task_id` overrides it
+      (must be within your task tree) and `top_level=true` files it
+      top-level in the same project (global permissions only).
+    - `task_id`: an EXISTING task. The fork joins that task's workspace
+      exactly like `start_session(task_id=…)` — shared checkouts are fine
+      and reported in `workspace_shared_with`; a task that never ran gets
+      a worktree minted at `base`.
 
     Args:
-        session_uid: The session to fork (one you can see in
-            `list_sessions`; must have completed at least one turn).
-        task_name: Name of the new task.
-        base: "source" (default) cuts the new branch at the source
-            worktree's committed HEAD (uncommitted edits stay behind);
-            "trunk" cuts it at the project's main branch.
-        prompt: Optional first message for the fork.
-        parent_task: Parent task id override (within your own task tree).
-        label: Sidebar label for the new session (default: task_name).
+        session_uid: The session to fork (must have completed a turn).
+        base: "source" (default) cuts new branches at the source worktree's
+            committed HEAD; "trunk" at the project's main branch. Uncommitted
+            source edits never come along (`uncommitted_left_behind`).
+        prompt: First message for the fork. When blank the fork gets a
+            short note on where it came from and where it now works.
+        request_id: Idempotency key; generated per call when omitted. A
+            retry with the same key returns the first fork.
+        label: Sidebar label for the new session (default: the task name).
         notify_on_done / notify_until: As for `start_session` — with a
             prompt, a self-waking monitor is registered on the fork.
 
     Returns `{task_id, session_uid, worktree_path, base_sha, forked_from,
-    engine, ...}` (`forked_from` names the source session + conversation;
-    `transcript_id` is the fork's own conversation id for Claude).
+    engine, target, uncommitted_left_behind, ...}`.
 
     State your intent in plain language and ask the user to confirm
     before calling this tool.
     """
-    params: dict = {"source_uid": session_uid, "task_name": task_name, "base": base}
+    params: dict = {
+        "source_uid": session_uid,
+        "base": base,
+        "request_id": request_id or str(uuid.uuid4()),
+    }
+    for key, value in (
+        ("task_name", task_name), ("task_id", task_id),
+        ("parent_task_id", parent_task_id), ("label", label),
+    ):
+        if value:
+            params[key] = value
+    if top_level:
+        params["top_level"] = True
     if prompt and prompt.strip():
         params["prompt"] = prompt
-    if parent_task:
-        params["parent_task_id"] = parent_task
-    if label:
-        params["label"] = label
     socket_path = control_client.resolve_socket_for_method("session.fork")
-    res = await asyncio.to_thread(
-        control_client.call, "session.fork", params, socket_path=socket_path
-    )
+    try:
+        res = await asyncio.to_thread(
+            control_client.call, "session.fork", params,
+            # The host mints a task + worktree and provisions it before it
+            # replies; the request_id makes a post-timeout retry safe.
+            timeout=FORK_SESSION_TIMEOUT_S, socket_path=socket_path,
+        )
+    except control_client.ControlError as e:
+        if e.code == "unknown_method":
+            return {"error": e.code, "message": FORK_UNSUPPORTED_MESSAGE}
+        raise
     if not isinstance(res, dict):
         return res
     receipt = res.get("prompt_delivery")
     if isinstance(receipt, dict) and receipt.get("status") != "pending":
         res["submitted"] = receipt.get("submitted") is True
     fork_uid = res.get("session_uid")
+    name = task_name or res.get("task_name") or task_id
     if notify_on_done and fork_uid and res.get("prompt_source") == "caller":
         try:
             res["monitor"] = async_monitor.register_monitor(
                 [fork_uid], mode="any", until=notify_until,
                 note=(
-                    f"fork '{task_name}' reported done"
+                    f"fork '{name}' reported done"
                     if notify_until in ("final", "task_done")
-                    else f"fork '{task_name}' finished its first prompt"
+                    else f"fork '{name}' finished its first prompt"
                 ),
                 source="auto",
                 edge=not isinstance(receipt, dict),
@@ -1995,6 +2022,13 @@ async def fork_session(
         except async_monitor.RegistrationError as e:
             res["monitor"] = {"error": e.code, "message": str(e)}
     return res
+
+
+FORK_SESSION_TIMEOUT_S = 180.0
+FORK_UNSUPPORTED_MESSAGE = (
+    "The host daemon is too old for fork_session (no session.fork method); "
+    "it needs a brain deploy."
+)
 
 
 @mcp.tool()

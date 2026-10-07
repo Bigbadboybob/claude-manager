@@ -75,7 +75,7 @@ class CodexResumeArgsTests(unittest.TestCase):
                          {"threadId": "saved", **policy})
 
     def test_fork_is_shaped_like_resume(self):
-        # CM fork-into-new-task: `fork <id>` reaches the remote frontend as
+        # CM fork-into-a-task: `fork <id>` reaches the remote frontend as
         # a fork, never a resume, with no permission flag on the frontend.
         backend, frontend = split_args(["fork", "-c", "x=1", "--no-alt-screen", "src-thread"])
         # The fork runs in its new worktree, never the source's directory.

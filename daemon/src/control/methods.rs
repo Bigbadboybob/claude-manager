@@ -8299,6 +8299,9 @@ struct MintContext {
     allow_entries: Vec<(String, String)>,
     api_url: String,
     api_token: String,
+    /// Cut point for a fresh mint (`None` = the project's trunk). Set by
+    /// `session.fork` into a never-run task with `base="source"`.
+    base: Option<String>,
 }
 
 /// Result of minting a workspace for a workspace-less task.
@@ -8490,11 +8493,12 @@ fn mint_task_workspace(
             "Task '{}' retains a workspace binding but its prior local branch could not be verified; reconcile the existing checkout before relaunching.", task_id
         )));
     }
-    let minted = crate::worktree::mint_task_worktree(
+    let minted = crate::worktree::mint_task_worktree_at(
         &main_repo,
         task_id,
         &task_name,
         wip_branch_hint.as_deref(),
+        ctx.base.as_deref(),
     )
         .map_err(|e| {
             (
@@ -9030,6 +9034,7 @@ pub fn mcp_start_session(
                             .collect(),
                         api_url: state.config.api_url.clone(),
                         api_token: state.config.api_token.clone(),
+                        base: None,
                     },
                 }
             }
@@ -16150,8 +16155,18 @@ struct ForkSessionParams {
     /// The session whose conversation is forked (live, or a recent exit
     /// tombstone that still names its transcript).
     source_uid: String,
-    /// Name of the new planning task.
-    task_name: String,
+    /// Fork into a NEW task with this name (exactly one of `task_name` /
+    /// `task_id`).
+    #[serde(default)]
+    task_name: Option<String>,
+    /// Fork into this EXISTING task: join its workspace (minting one if it
+    /// never ran), like `start_session(task_id=…)`.
+    #[serde(default)]
+    task_id: Option<String>,
+    /// New task only: make it top-level (same project as the source's
+    /// task) instead of a subtask.
+    #[serde(default)]
+    top_level: bool,
     /// `"source"` (default): cut the new branch at the source worktree's
     /// current HEAD. `"trunk"`: cut it at the project's main branch.
     #[serde(default)]
@@ -16255,7 +16270,81 @@ fn resolve_fork_source(state: &DaemonState, uid: &str) -> Result<ForkSource, (Er
     Ok(ForkSource { engine, transcript_id, workspace_id, worktree_path, task_id, label })
 }
 
+/// Completed / in-flight forks by `(caller, request_id)`. A client whose
+/// read timed out may retry with the same `request_id`; it must get the
+/// first fork back, not a second one. The per-key mutex is held for the
+/// whole fork, so a concurrent retry waits for the original and then
+/// returns its result. Failures are not cached (a retry runs again).
+/// Brain-process memory only, pruned after `FORK_REQUEST_TTL`.
+type ForkRequestSlot = Arc<Mutex<Option<Value>>>;
+static FORK_REQUESTS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, (std::time::Instant, ForkRequestSlot)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+const FORK_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `session.fork` entry point: idempotent per `(caller, request_id)` when a
+/// `request_id` is supplied, otherwise a plain fork.
 pub fn session_fork(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let Some(request_id) = params
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return session_fork_once(state_arc, params, caller_uid);
+    };
+    let key = format!("{}\u{0}{}", caller_uid.unwrap_or("operator"), request_id);
+    let slot = {
+        let mut map = FORK_REQUESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        map.retain(|_, (at, _)| now.duration_since(*at) < FORK_REQUEST_TTL);
+        Arc::clone(
+            &map.entry(key.clone())
+                .or_insert_with(|| (now, Arc::new(Mutex::new(None))))
+                .1,
+        )
+    };
+    let mut done = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(first) = done.as_ref() {
+        let mut replay = first.clone();
+        replay["deduplicated"] = json!(true);
+        return Ok(replay);
+    }
+    match session_fork_once(state_arc, params, caller_uid) {
+        Ok(v) => {
+            *done = Some(v.clone());
+            Ok(v)
+        }
+        Err(e) => {
+            drop(done);
+            let mut map = FORK_REQUESTS.lock().unwrap_or_else(|p| p.into_inner());
+            if map.get(&key).is_some_and(|(_, s)| Arc::ptr_eq(s, &slot)) {
+                map.remove(&key);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Files with uncommitted changes in `worktree` (`git status --porcelain`
+/// lines), or `None` when git can't say.
+fn uncommitted_file_count(worktree: &std::path::Path) -> Option<usize> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count())
+}
+
+fn session_fork_once(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
     caller_uid: Option<&str>,
@@ -16264,10 +16353,7 @@ pub fn session_fork(
         .map_err(|e| (ErrorCode::InvalidParams, format!("session.fork params: {}", e)))?;
     refuse_if_draining(state_arc, "session.fork")?;
     let use_trunk = fork_base_choice(p.base.as_deref())?;
-    let task_name = p.task_name.trim().to_string();
-    if task_name.is_empty() {
-        return Err((ErrorCode::InvalidParams, "task_name must be non-empty".into()));
-    }
+    let target = fork_target(&p)?;
     let prompt = p.prompt.as_deref().filter(|s| !s.trim().is_empty()).map(str::to_string);
     if prompt.as_ref().is_some_and(|s| s.len() > MAX_SEND_INPUT_BYTES) {
         return Err((
@@ -16288,8 +16374,8 @@ pub fn session_fork(
         _ => new_daemon_minted_session_uid(),
     };
 
-    // ---- resolve source, scope and parent under the lock ----
-    let (source, parent_task_id, cap_inherit, cols, rows, server_path) = {
+    // ---- resolve source, scope and target under the lock ----
+    let (source, source_ws, cap_inherit, cols, rows, server_path, plan) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         if state.sessions.contains_key(&session_uid) {
             return Err((ErrorCode::Conflict, format!("session '{}' already exists", session_uid)));
@@ -16329,29 +16415,70 @@ pub fn session_fork(
                 size = (caller.last_cols, caller.last_rows);
             }
         }
-        let parent = match p.parent_task_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(explicit) => {
-                let in_scope = caller_global
-                    || caller_task.as_deref().is_some_and(|own| {
-                        crate::control::auth::task_is_self_or_descendant_of(
-                            &state.task_tree,
-                            explicit,
-                            own,
-                        )
-                    });
-                if !in_scope {
-                    return Err((
-                        ErrorCode::Unauthorized,
-                        format!("task '{}' is not the caller's task or a descendant", explicit),
-                    ));
-                }
-                Some(explicit.to_string())
+        // The task the fork lands in (an existing task, or the parent of a
+        // new one) must sit inside a Session caller's OWN task tree —
+        // reaching the source (e.g. as a co-tenant of its workspace) is not
+        // enough. Taskless callers have no tree unless they are global.
+        let in_scope = |task: Option<&str>| -> Result<(), (ErrorCode, String)> {
+            if caller_global {
+                return Ok(());
             }
-            None => source.task_id.clone().or(caller_task),
+            let Some(own) = caller_task.as_deref() else {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    "fork_session requires a tasked caller (the fork lands in your own \
+                     task tree)"
+                        .into(),
+                ));
+            };
+            match task {
+                Some(t) if crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, t, own) => Ok(()),
+                Some(t) => Err((
+                    ErrorCode::Unauthorized,
+                    format!("task '{}' is not the caller's task or a descendant", t),
+                )),
+                None => Err((
+                    ErrorCode::Unauthorized,
+                    "a top-level task is outside your task tree; pass a parent within it".into(),
+                )),
+            }
         };
+        let plan = match &target {
+            ForkTarget::New { top_level, parent_task_id, .. } => {
+                let parent = if *top_level {
+                    None
+                } else {
+                    parent_task_id
+                        .clone()
+                        .or_else(|| source.task_id.clone())
+                        .or_else(|| caller_task.clone())
+                };
+                in_scope(parent.as_deref())?;
+                ForkPlan::New { parent }
+            }
+            ForkTarget::Existing(task_id) => {
+                in_scope(Some(task_id))?;
+                let bound = state
+                    .task_workspaces
+                    .get(task_id)
+                    .or_else(|| state.bindings.get(task_id))
+                    .cloned();
+                match bound.as_ref().and_then(|ws_id| state.workspaces.get(ws_id).map(|w| (ws_id, w))) {
+                    Some((ws_id, ws)) => ForkPlan::Join {
+                        workspace_id: ws_id.clone(),
+                        worktree_path: ws.worktree_path.clone().ok_or((
+                            ErrorCode::NotFound,
+                            format!("task '{}' workspace '{}' has no worktree", task_id, ws_id),
+                        ))?,
+                    },
+                    None => ForkPlan::Mint { recover_existing: bound.is_some() },
+                }
+            }
+        };
+        let source_ws = state.workspaces.get(&source.workspace_id).cloned();
         let server_path = Some(state.config.mcp_server_path.clone()).filter(|s| !s.trim().is_empty());
         let (cols, rows) = if size.0 == 0 || size.1 == 0 { (120, 40) } else { size };
-        (source, parent, cap_inherit, cols, rows, server_path)
+        (source, source_ws, cap_inherit, cols, rows, server_path, plan)
     };
 
     // The conversation must still exist where the engine will look for it.
@@ -16372,13 +16499,14 @@ pub fn session_fork(
         ));
     }
 
-    // ---- base commit ----
+    // ---- base commit (used by every path that cuts a branch) ----
+    let source_head = crate::worktree::worktree_head_sha(&source.worktree_path);
     let base_sha = if use_trunk {
         crate::worktree::resolve_project_main(&source.worktree_path)
             .map(|(_, sha)| sha)
             .map_err(|e| (ErrorCode::Conflict, e.to_string()))?
     } else {
-        crate::worktree::worktree_head_sha(&source.worktree_path).ok_or((
+        source_head.clone().ok_or((
             ErrorCode::Conflict,
             format!(
                 "cannot read HEAD of the source worktree {}",
@@ -16386,51 +16514,148 @@ pub fn session_fork(
             ),
         ))?
     };
-
-    // ---- task + worktree (same mint as create_subtask branch mode) ----
-    let subtask = CreateSubtaskParams {
-        name: task_name.clone(),
-        prompt: prompt.clone(),
-        worktree_mode: "branch".into(),
-        project: None,
-        base: Some(base_sha.clone()),
-    };
-    let (base, leaf_slug) = validate_create_subtask(&subtask)?;
-    let created = create_subtask_core(
-        state_arc,
-        &subtask,
-        base,
-        leaf_slug,
-        SubtaskParent {
-            task_id: parent_task_id.clone(),
-            workspace_id: source.workspace_id.clone(),
-            worktree_path: Some(source.worktree_path.clone()),
-        },
-        caller_uid,
-        if caller_uid.is_some() { "mcp.fork_session" } else { "tui.fork" },
-    )?;
-    let task_id = created["task_id"].as_str().unwrap_or_default().to_string();
-    let worktree_path = PathBuf::from(created["worktree_path"].as_str().unwrap_or_default());
-    let workspace_id = {
+    // Uncommitted edits in the source never travel with the fork (the cut
+    // is a commit); say so in the result instead of losing them silently.
+    let uncommitted_files = uncommitted_file_count(&source.worktree_path).unwrap_or(0);
+    let api_creds = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        state.task_workspaces.get(&task_id).cloned()
-    }
-    .ok_or((ErrorCode::Internal, "forked task has no workspace binding".into()))?;
-    // Undo the mint if the spawn fails, so a failed fork leaves no task row
-    // or checkout behind.
+        PlanningApiCreds::from_config(&state.config.api_url, &state.config.api_token)
+    };
+
+    // ---- the target workspace ----
+    let mut worktree_report = WorktreeCheckReport::default();
+    let mut rollback_new: Option<(String, String)> = None; // (task_id, workspace_id)
+    let (task_id, task_name, parent_task_id, workspace_id, worktree_path, created_base_sha) =
+        match (&target, plan) {
+            (ForkTarget::New { task_name, .. }, ForkPlan::New { parent }) => {
+                // "Top-level in the same project": no parent row to inherit
+                // the project from, so carry the source task's.
+                let project = match (&parent, source.task_id.as_deref(), api_creds.as_ref()) {
+                    (None, Some(src_task), Ok(creds)) => api_get_task(creds, src_task)
+                        .ok()
+                        .and_then(|row| row.get("project").and_then(Value::as_str).map(str::to_string)),
+                    _ => None,
+                };
+                let subtask = CreateSubtaskParams {
+                    name: task_name.clone(),
+                    prompt: prompt.clone(),
+                    worktree_mode: "branch".into(),
+                    project,
+                    base: Some(base_sha.clone()),
+                };
+                let (base, leaf_slug) = validate_create_subtask(&subtask)?;
+                let created = create_subtask_core(
+                    state_arc,
+                    &subtask,
+                    base,
+                    leaf_slug,
+                    SubtaskParent {
+                        task_id: parent.clone(),
+                        workspace_id: source.workspace_id.clone(),
+                        worktree_path: Some(source.worktree_path.clone()),
+                    },
+                    caller_uid,
+                    if caller_uid.is_some() { "mcp.fork_session" } else { "tui.fork" },
+                )?;
+                let task_id = created["task_id"].as_str().unwrap_or_default().to_string();
+                let worktree_path = PathBuf::from(created["worktree_path"].as_str().unwrap_or_default());
+                let workspace_id = {
+                    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    state.task_workspaces.get(&task_id).cloned()
+                }
+                .ok_or((ErrorCode::Internal, "forked task has no workspace binding".into()))?;
+                rollback_new = Some((task_id.clone(), workspace_id.clone()));
+                let base = created.get("base_sha").cloned().unwrap_or(Value::Null);
+                (task_id, task_name.clone(), parent, workspace_id, worktree_path, base)
+            }
+            (ForkTarget::Existing(task_id), ForkPlan::Join { workspace_id, worktree_path }) => {
+                // Same as start_session(task_id=X): join the bound checkout,
+                // re-creating it first if it was reaped. Co-tenancy is fine.
+                worktree_report = ensure_ready_worktree(state_arc, &workspace_id, &worktree_path, Some(task_id))?;
+                let name = api_creds
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| api_get_task(c, task_id).ok())
+                    .and_then(|row| row.get("name").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| task_id.clone());
+                (task_id.clone(), name, None, workspace_id, worktree_path, Value::Null)
+            }
+            (ForkTarget::Existing(task_id), ForkPlan::Mint { recover_existing }) => {
+                // A never-run task: mint its checkout via the start_session
+                // path, cut at the requested base.
+                let ctx = MintContext {
+                    recover_existing,
+                    caller_repo_url: source_ws.as_ref().and_then(|w| w.repo_url.clone()),
+                    caller_main_repo: source_ws.as_ref().and_then(|w| w.main_repo_path.clone()),
+                    repos_dir: Default::default(),
+                    allow_clone: false,
+                    allow_entries: Vec::new(),
+                    api_url: String::new(),
+                    api_token: String::new(),
+                    base: Some(base_sha.clone()),
+                };
+                let ctx = {
+                    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    MintContext {
+                        repos_dir: state.config.repos_dir_or_default(),
+                        allow_clone: state.config.allow_clone,
+                        allow_entries: state
+                            .config
+                            .repos
+                            .iter()
+                            .map(|e| (e.name.clone(), e.url.clone()))
+                            .collect(),
+                        api_url: state.config.api_url.clone(),
+                        api_token: state.config.api_token.clone(),
+                        ..ctx
+                    }
+                };
+                let minted = mint_task_workspace(state_arc, task_id, &ctx)?;
+                worktree_report = minted.worktree_report;
+                let name = minted
+                    .task_row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| task_id.clone());
+                (task_id.clone(), name, None, minted.workspace_id, minted.worktree_path, Value::Null)
+            }
+            _ => return Err((ErrorCode::Internal, "fork target/plan mismatch".into())),
+        };
+    let base_sha_out = if created_base_sha.is_null() {
+        json!(crate::worktree::worktree_head_sha(&worktree_path))
+    } else {
+        created_base_sha
+    };
+    let fork_branch = crate::worktree::worktree_current_branch(&worktree_path);
+
+    // Undo a NEW task's mint if the spawn fails, so a failed fork leaves no
+    // task row, auth edge, checkout or zero-commit branch behind. An
+    // existing task's workspace is never torn down.
     let rollback = |state_arc: &Arc<Mutex<DaemonState>>| {
+        let Some((task_id, workspace_id)) = rollback_new.as_ref() else { return };
         let (api_url, api_token, main_repo) = {
             let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-            state.task_workspaces.remove(&task_id);
-            state.bindings.remove(&task_id);
-            let main = state.workspaces.remove(&workspace_id).and_then(|w| w.main_repo_path);
+            state.task_workspaces.remove(task_id);
+            state.bindings.remove(task_id);
+            state.agent_task_edges.remove(task_id);
+            state.task_tree.remove(task_id);
+            let main = state.workspaces.remove(workspace_id).and_then(|w| w.main_repo_path);
+            state.persist_sessions_best_effort();
             (state.config.api_url.clone(), state.config.api_token.clone(), main)
         };
         if let Some(main) = main_repo {
             let _ = crate::worktree::remove_worktree(&main, &worktree_path);
+            if let Some(branch) = fork_branch.as_deref().filter(|b| b.starts_with("cm-sub/")) {
+                let _ = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&main)
+                    .args(["branch", "-D", branch])
+                    .output();
+            }
         }
         if let Ok(creds) = PlanningApiCreds::from_config(&api_url, &api_token) {
-            let _ = api_delete_task(&creds, &task_id);
+            let _ = api_delete_task(&creds, task_id);
         }
     };
 
@@ -16496,8 +16721,29 @@ pub fn session_fork(
             );
         }
     }
+
+    // Always hand the fork a first turn (see `fork_default_prompt`).
+    let first_prompt = match prompt.clone() {
+        Some(text) => text,
+        None => {
+            let source_branch = crate::worktree::worktree_current_branch(&source.worktree_path);
+            let missing = match (source_head.as_deref(), crate::worktree::worktree_head_sha(&worktree_path)) {
+                (Some(a), Some(b)) => commits_not_carried(&worktree_path, &b, a),
+                _ => Vec::new(),
+            };
+            fork_default_prompt(&ForkMove {
+                source_label: &source.label,
+                source_branch: source_branch.as_deref(),
+                task_name: &task_name,
+                task_id: &task_id,
+                branch: fork_branch.as_deref(),
+                worktree: &worktree_path,
+                missing_commits: &missing,
+            })
+        }
+    };
     let mut prompt_receipt = None;
-    if let Some(prompt) = prompt.as_deref() {
+    {
         let handle = {
             let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
             state.sessions.get(&session_uid).map(|s| (s.input_handle(), s.fanout.clone()))
@@ -16515,21 +16761,24 @@ pub fn session_fork(
                 handle,
                 fanout,
                 session_uid.clone(),
-                prompt.to_string(),
+                first_prompt,
                 Arc::clone(&ticket),
             );
             prompt_receipt = Some(ticket.lock().unwrap_or_else(|p| p.into_inner()).clone());
         }
     }
+    let co_tenants = live_workspace_co_tenants(state_arc, &workspace_id, &session_uid);
     let mut out = json!({
         "session_uid": start_result.get("session_uid").and_then(Value::as_str).unwrap_or(&session_uid),
+        "target": if matches!(target, ForkTarget::New { .. }) { "new" } else { "existing" },
         "task_id": task_id,
+        "task_name": task_name,
         "parent_task_id": parent_task_id,
         "workspace_id": workspace_id,
         "worktree_path": worktree_path.to_string_lossy(),
-        "branch": crate::worktree::worktree_current_branch(&worktree_path),
+        "branch": fork_branch,
         "base": if use_trunk { "trunk" } else { "source" },
-        "base_sha": created.get("base_sha").cloned().unwrap_or(Value::Null),
+        "base_sha": base_sha_out,
         "engine": source.engine,
         "label": label,
         "transcript_id": forked_transcript_id,
@@ -16539,8 +16788,16 @@ pub fn session_fork(
             "label": source.label,
             "worktree_path": source.worktree_path.to_string_lossy(),
         },
-        "prompt_source": if prompt.is_some() { "caller" } else { "none" },
+        "prompt_source": if prompt.is_some() { "caller" } else { "default" },
+        "uncommitted_left_behind": uncommitted_files > 0,
+        "uncommitted_files": uncommitted_files,
     });
+    if !co_tenants.is_empty() {
+        out["workspace_shared_with"] = json!(co_tenants);
+    }
+    if let Some(obj) = out.as_object_mut() {
+        worktree_report.decorate(obj);
+    }
     if let Some(receipt) = prompt_receipt {
         out["prompt_delivery"] = json!(receipt);
     }
@@ -16548,6 +16805,118 @@ pub fn session_fork(
         out["cgroup_path"] = cgroup.clone();
     }
     Ok(out)
+}
+
+/// Where the fork lands, from the request.
+#[derive(Debug, Clone, PartialEq)]
+enum ForkTarget {
+    New { task_name: String, parent_task_id: Option<String>, top_level: bool },
+    Existing(String),
+}
+
+/// What the lock-time resolution decided to do for that target.
+enum ForkPlan {
+    New { parent: Option<String> },
+    Join { workspace_id: String, worktree_path: PathBuf },
+    Mint { recover_existing: bool },
+}
+
+/// Exactly one of `task_name` (a new task) / `task_id` (an existing one).
+fn fork_target(p: &ForkSessionParams) -> Result<ForkTarget, (ErrorCode, String)> {
+    let trimmed = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    match (trimmed(&p.task_name), trimmed(&p.task_id)) {
+        (Some(task_name), None) => Ok(ForkTarget::New {
+            task_name,
+            parent_task_id: trimmed(&p.parent_task_id),
+            top_level: p.top_level,
+        }),
+        (None, Some(task_id)) => {
+            if p.top_level || trimmed(&p.parent_task_id).is_some() {
+                return Err((
+                    ErrorCode::InvalidParams,
+                    "parent_task_id / top_level apply only to a new task (task_name)".into(),
+                ));
+            }
+            Ok(ForkTarget::Existing(task_id))
+        }
+        _ => Err((
+            ErrorCode::InvalidParams,
+            "pass exactly one of task_name (fork into a new task) or task_id (fork into an \
+             existing task)"
+                .into(),
+        )),
+    }
+}
+
+/// `git log --oneline <target>..<source>` in `worktree`, capped: the
+/// commits the source sits on that the fork's checkout lacks.
+fn commits_not_carried(worktree: &std::path::Path, target_sha: &str, source_sha: &str) -> Vec<String> {
+    if target_sha == source_sha {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["log", "--oneline", "-n", &(FORK_MISSING_COMMITS_CAP + 1).to_string()])
+        .arg(format!("{}..{}", target_sha, source_sha))
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+const FORK_MISSING_COMMITS_CAP: usize = 10;
+
+/// The facts the default first prompt states about the move.
+struct ForkMove<'a> {
+    source_label: &'a str,
+    source_branch: Option<&'a str>,
+    task_name: &'a str,
+    task_id: &'a str,
+    branch: Option<&'a str>,
+    worktree: &'a std::path::Path,
+    /// `commits_not_carried` output (up to cap + 1 lines).
+    missing_commits: &'a [String],
+}
+
+/// The text a fork receives when the caller gave no first prompt. A fork
+/// must take a turn at once: claude writes the forked transcript only on
+/// its first message, and an unwritten fork cannot be resumed after a
+/// daemon restart. It states where the conversation came from and where
+/// it now works, and which source commits did NOT come along.
+fn fork_default_prompt(m: &ForkMove<'_>) -> String {
+    let source_branch = m.source_branch.unwrap_or("a detached HEAD");
+    let branch = m.branch.unwrap_or("a detached HEAD");
+    let mut text = format!(
+        "You were forked from {} (branch {}). You now work on task \"{}\" ({}) on branch {} \
+         in the worktree {}.",
+        m.source_label.trim(),
+        source_branch,
+        m.task_name,
+        m.task_id,
+        branch,
+        m.worktree.display()
+    );
+    if !m.missing_commits.is_empty() {
+        text.push_str(&format!(
+            " These commits on {} are NOT on {} and were not carried over:",
+            source_branch, branch
+        ));
+        for line in m.missing_commits.iter().take(FORK_MISSING_COMMITS_CAP) {
+            text.push_str(&format!(" [{}]", line));
+        }
+        if m.missing_commits.len() > FORK_MISSING_COMMITS_CAP {
+            text.push_str(" [and more]");
+        }
+        text.push('.');
+    }
+    text.push_str(" Wait for instructions.");
+    text
 }
 
 /// Full-shape `start_session` params for a fork: the engine-native fork
@@ -32915,6 +33284,312 @@ while True:
         });
     }
 
+
+    #[test]
+    fn fork_default_prompt_states_the_move_and_commits_left_behind() {
+        let wt = std::path::Path::new("/wt/x");
+        let plain = fork_default_prompt(&ForkMove {
+            source_label: " planner ",
+            source_branch: Some("cm/feature"),
+            task_name: "try B",
+            task_id: "task-b",
+            branch: Some("cm-sub/try-b-1234567"),
+            worktree: wt,
+            missing_commits: &[],
+        });
+        assert_eq!(
+            plain,
+            "You were forked from planner (branch cm/feature). You now work on task \"try B\" \
+             (task-b) on branch cm-sub/try-b-1234567 in the worktree /wt/x. Wait for instructions."
+        );
+        let missing: Vec<String> = (0..12).map(|i| format!("abc{i:04} commit {i}")).collect();
+        let text = fork_default_prompt(&ForkMove {
+            source_label: "planner",
+            source_branch: Some("cm/feature"),
+            task_name: "try B",
+            task_id: "task-b",
+            branch: None,
+            worktree: wt,
+            missing_commits: &missing,
+        });
+        assert!(text.contains(
+            "These commits on cm/feature are NOT on a detached HEAD and were not carried over:"
+        ));
+        assert!(text.contains("[abc0000 commit 0]") && text.contains("[abc0009 commit 9]"));
+        assert!(!text.contains("abc0010"), "capped at {}", FORK_MISSING_COMMITS_CAP);
+        assert!(text.contains("[and more]"));
+        assert!(text.ends_with("Wait for instructions."));
+        assert!(!text.contains('\n'), "one line: delivered as a single submitted turn");
+    }
+
+    #[test]
+    fn fork_target_requires_exactly_one_of_task_name_and_task_id() {
+        let parse = |v: Value| fork_target(&serde_json::from_value::<ForkSessionParams>(v).unwrap());
+        assert_eq!(
+            parse(json!({"source_uid": "s", "task_name": " x "})).unwrap(),
+            ForkTarget::New { task_name: "x".into(), parent_task_id: None, top_level: false }
+        );
+        assert_eq!(
+            parse(json!({"source_uid": "s", "task_id": "t"})).unwrap(),
+            ForkTarget::Existing("t".into())
+        );
+        for bad in [
+            json!({"source_uid": "s"}),
+            json!({"source_uid": "s", "task_name": "x", "task_id": "t"}),
+            json!({"source_uid": "s", "task_id": "t", "parent_task_id": "p"}),
+            json!({"source_uid": "s", "task_id": "t", "top_level": true}),
+        ] {
+            assert_eq!(parse(bad.clone()).unwrap_err().0, ErrorCode::InvalidParams, "{bad}");
+        }
+    }
+
+    /// Put a stand-in `claude` (records argv, then sleeps) first on PATH.
+    /// Returns the previous PATH to restore.
+    fn fake_claude_on_path(home: &std::path::Path) -> std::ffi::OsString {
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("claude");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::env::var_os("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", bin.display(), old.to_string_lossy())) };
+        old
+    }
+
+    /// Fork into an EXISTING task that already runs somewhere: join its
+    /// workspace exactly like start_session(task_id) — no task row, no new
+    /// worktree — and report the co-tenant instead of refusing.
+    #[test]
+    fn session_fork_into_existing_task_joins_its_workspace_and_reports_co_tenants() {
+        with_home_and_repo("forkjoin", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let target_wt = home.join("target-wt");
+            run_git(&repo, &["worktree", "add", "-q", "-b", "cm/target", target_wt.to_str().unwrap()]);
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-target".to_string();
+                ws.worktree_path = Some(target_wt.clone());
+                ws.main_repo_path = Some(repo.clone());
+                s.workspaces.insert("ws-target".to_string(), ws);
+                s.task_workspaces.insert("task-t".into(), "ws-target".into());
+                s.bindings.insert("task-t".into(), "ws-target".into());
+            }
+            seed_tasked_caller(&state, "ts-tenant", "ws-target", "task-t");
+            let stub = spawn_routed_stub(|method, path, _| {
+                if method == "GET" && path == "/tasks/task-t" {
+                    (200, r#"{"id":"task-t","name":"Target Task","wip_branch":"cm/target"}"#.into())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.into())
+                }
+            });
+            set_api_env(stub.port);
+            let old_path = fake_claude_on_path(home);
+            let result = session_fork(&state, &json!({"source_uid": "ts-src", "task_id": "task-t"}), None);
+            unsafe { std::env::set_var("PATH", &old_path) };
+            let result = result.expect("fork into existing task");
+            assert_eq!(result["target"], "existing");
+            assert_eq!(result["task_id"], "task-t");
+            assert_eq!(result["task_name"], "Target Task");
+            assert_eq!(result["workspace_id"], "ws-target");
+            assert_eq!(result["worktree_path"], json!(target_wt.to_string_lossy()));
+            assert_eq!(result["branch"], "cm/target");
+            let shared = result["workspace_shared_with"].as_array().expect("co-tenant reported");
+            assert!(shared.iter().any(|t| t["session_uid"] == "ts-tenant"));
+            let uid = result["session_uid"].as_str().unwrap();
+            assert_eq!(state.lock().unwrap().sessions[uid].task_id.as_deref(), Some("task-t"));
+            let reqs = stub.requests.lock().unwrap();
+            assert!(!reqs.iter().any(|r| r.method == "POST"), "no task row minted");
+            drop(reqs);
+            assert_eq!(state.lock().unwrap().workspaces.len(), 2, "no workspace minted");
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// Fork into an existing task that never ran: mint its checkout via the
+    /// start_session path, cut at the source HEAD (base="source").
+    #[test]
+    fn session_fork_into_never_run_task_mints_at_the_requested_base() {
+        with_home_and_repo("forkmint", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            std::fs::write(repo.join("wip.txt"), "source work").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "source wip"]);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _| {
+                if method == "GET" && path == "/tasks/task-n" {
+                    (200, format!(r#"{{"id":"task-n","name":"Never Ran","repo_url":"{}"}}"#, name_owned))
+                } else if method == "PATCH" {
+                    (200, "{}".into())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.into())
+                }
+            });
+            set_api_env(stub.port);
+            let old_path = fake_claude_on_path(home);
+            let result = session_fork(&state, &json!({"source_uid": "ts-src", "task_id": "task-n"}), None);
+            unsafe { std::env::set_var("PATH", &old_path) };
+            let result = result.expect("fork into never-run task");
+            assert_eq!(result["target"], "existing");
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert_ne!(wt, repo);
+            assert!(wt.join("wip.txt").exists(), "cut at the source HEAD, not trunk's first commit");
+            assert!(result["branch"].as_str().unwrap().starts_with("cm-sub/never-ran-"));
+            assert_eq!(
+                state.lock().unwrap().task_workspaces.get("task-n"),
+                Some(&result["workspace_id"].as_str().unwrap().to_string())
+            );
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// New-task parent: an explicit parent, or top-level in the source
+    /// task's project.
+    #[test]
+    fn session_fork_new_task_parent_override_and_top_level() {
+        with_home_and_repo("forkparent", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _| {
+                match (method, path) {
+                    ("GET", "/tasks/task-src") | ("GET", "/tasks/task-other") => (
+                        200,
+                        format!(
+                            r#"{{"id":"{}","name":"Some Task","repo_url":"{}","project":"proj"}}"#,
+                            path.trim_start_matches("/tasks/"),
+                            name_owned
+                        ),
+                    ),
+                    ("POST", "/tasks") => (200, r#"{"id":"task-new","name":"n"}"#.into()),
+                    _ => (404, r#"{"detail":"unexpected"}"#.into()),
+                }
+            });
+            set_api_env(stub.port);
+            let old_path = fake_claude_on_path(home);
+            let a = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "a", "parent_task_id": "task-other"}),
+                None,
+            );
+            let b = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "b", "top_level": true}),
+                None,
+            );
+            unsafe { std::env::set_var("PATH", &old_path) };
+            assert_eq!(a.expect("explicit parent")["parent_task_id"], "task-other");
+            assert_eq!(b.expect("top level")["parent_task_id"], Value::Null);
+            let reqs = stub.requests.lock().unwrap();
+            let posts: Vec<Value> = reqs
+                .iter()
+                .filter(|r| r.method == "POST")
+                .map(|r| serde_json::from_str(&r.body).unwrap())
+                .collect();
+            assert_eq!(posts[0]["parent_task_id"], "task-other");
+            assert_eq!(posts[1]["parent_task_id"], Value::Null);
+            assert_eq!(posts[1]["project"], "proj", "top-level stays in the source's project");
+            drop(reqs);
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// A taskless Session caller has no task tree to hang the fork in,
+    /// even when it can reach the source (e.g. a workspace co-tenant).
+    #[test]
+    fn session_fork_refuses_taskless_non_global_callers() {
+        with_home_and_repo("forktaskless", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let mut sp = SpawnParams::new("ts-loose", "loose", "/bin/sleep");
+            sp.args = vec!["120".to_string()];
+            sp.workspace_id = "ws-src".to_string();
+            let sess = crate::session::DaemonSession::spawn(sp).expect("spawn");
+            state.lock().unwrap().sessions.insert("ts-loose".into(), sess);
+            let err = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "x"}),
+                Some("ts-loose"),
+            )
+            .expect_err("taskless caller");
+            assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// A spawn failure after the mint removes everything the fork made:
+    /// the planning row, the workspace, the auth edge, the worktree and
+    /// its zero-commit cm-sub branch.
+    #[test]
+    fn session_fork_rolls_back_task_worktree_and_branch_on_spawn_failure() {
+        with_home_and_repo("forkrollback", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            // No `claude` anywhere on PATH (git stays reachable for the mint):
+            // the spawn fails after the task and worktree exist.
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks/task-src" {
+                    (200, format!(r#"{{"id":"task-src","name":"Src","repo_url":"{}"}}"#, name_owned))
+                } else if method == "POST" && path == "/tasks" {
+                    (200, r#"{"id":"task-doomed","name":"doomed"}"#.to_string())
+                } else if method == "DELETE" {
+                    (200, "{}".to_string())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+            let result = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "doomed"}),
+                None,
+            );
+            unsafe { std::env::set_var("PATH", &old_path) };
+            assert!(result.is_err(), "spawn must fail: {:?}", result);
+            {
+                let s = state.lock().unwrap();
+                assert!(!s.task_workspaces.contains_key("task-doomed"));
+                assert!(!s.bindings.contains_key("task-doomed"));
+                assert!(!s.agent_task_edges.contains_key("task-doomed"));
+                assert!(!s.task_tree.contains_key("task-doomed"));
+                assert_eq!(s.workspaces.len(), 1, "only the source workspace remains");
+            }
+            let branches = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["branch", "--list", "cm-sub/*"])
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+                "zero-commit fork branch deleted: {}",
+                String::from_utf8_lossy(&branches.stdout)
+            );
+            let reqs = stub.requests.lock().unwrap();
+            assert!(
+                reqs.iter().any(|r| r.method == "DELETE" && r.path == "/tasks/task-doomed"),
+                "planning row deleted"
+            );
+            drop(reqs);
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
     /// End to end (with a stand-in `claude` on PATH): the fork mints a
     /// subtask of the source's task on a branch cut at the source HEAD,
     /// spawns `claude --resume <src> --fork-session --session-id <new>`
@@ -32928,6 +33603,7 @@ while True:
             run_git(&repo, &["add", "-A"]);
             run_git(&repo, &["commit", "-q", "-m", "source wip"]);
             let source_head = git_sha(&repo, "HEAD");
+            std::fs::write(repo.join("dirty.txt"), "uncommitted").unwrap();
             let state = make_state_arc();
             seed_fork_source(&state, &repo, name);
             let source_path_before =
@@ -32970,13 +33646,20 @@ while True:
             });
             set_api_env(stub.port);
 
-            let result = session_fork(
-                &state,
-                &json!({"source_uid": "ts-src", "task_name": "other idea"}),
-                None,
-            );
+            let params = json!({
+                "source_uid": "ts-src", "task_name": "other idea", "request_id": "req-1",
+            });
+            let result = session_fork(&state, &params, None);
             unsafe { std::env::set_var("PATH", &old_path) };
             let result = result.expect("session.fork ok");
+            // A retry with the same request id (a client whose read timed
+            // out) gets the first fork back instead of minting a second.
+            let again = session_fork(&state, &params, None).expect("dedup replay");
+            assert_eq!(again["session_uid"], result["session_uid"]);
+            assert_eq!(again["deduplicated"], json!(true));
+            assert_eq!(result["prompt_source"], "default");
+            assert_eq!(result["uncommitted_left_behind"], json!(true));
+            assert_eq!(result["uncommitted_files"], json!(1));
 
             assert_eq!(result["task_id"], "task-fork");
             assert_eq!(result["parent_task_id"], "task-src");
@@ -32989,6 +33672,7 @@ while True:
             assert_ne!(new_id, FORK_SRC_ID);
             let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
             assert!(wt.join("wip.txt").exists(), "branch cut at the source HEAD");
+            assert!(!wt.join("dirty.txt").exists(), "uncommitted edits stay behind");
             assert_ne!(wt, repo);
             assert!(result["branch"].as_str().unwrap().starts_with("cm-sub/source-task-other-idea-"));
 
@@ -33012,6 +33696,7 @@ while True:
             }
 
             let reqs = stub.requests.lock().unwrap();
+            assert_eq!(reqs.iter().filter(|r| r.method == "POST").count(), 1, "one fork only");
             let post = reqs.iter().find(|r| r.method == "POST").expect("POST /tasks");
             let body: Value = serde_json::from_str(&post.body).unwrap();
             assert_eq!(body["parent_task_id"], "task-src");

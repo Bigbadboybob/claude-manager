@@ -1858,7 +1858,7 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
     }
 
-    // ---- fork-into-new-task: engine-native fork argv ------------------
+    // ---- fork-into-a-task: engine-native fork argv ------------------
 
     #[test]
     fn build_launch_args_claude_fork_resumes_source_with_fork_and_new_pin() {
