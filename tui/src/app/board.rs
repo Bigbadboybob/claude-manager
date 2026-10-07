@@ -66,6 +66,11 @@ pub(super) struct Board {
     /// Free-text reason typed for a `block` resolution, kept while the
     /// check-back prompt is open.
     pending_block: Option<String>,
+    /// Free-capacity names expanded under the summary (`f`).
+    show_free: bool,
+    /// Board to select when the list arrives: the focused session's
+    /// `(initiative_id, root_task_id)`.
+    preferred: (Option<String>, Option<String>),
     status: String,
     error: String,
 }
@@ -127,48 +132,6 @@ fn age(secs: i64) -> String {
     } else {
         format!("{}m", s / 60)
     }
-}
-
-/// One item line: `#14 active  title  @rl[idle 24m]  ⚑holder_idle · note`.
-fn item_line(item: &Value) -> String {
-    let holders: Vec<String> = item["holders"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|h| {
-            let name = h["name"].as_str().or_else(|| h["pid"].as_str()).unwrap_or("?");
-            let state = h["state"]["state"].as_str().unwrap_or("unknown");
-            match h["state"]["for_s"].as_i64() {
-                Some(s) => format!("@{name}[{state} {}]", age(s)),
-                None => format!("@{name}[{state}]"),
-            }
-        })
-        .collect();
-    let flags: Vec<String> = item["flags"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|f| f["kind"].as_str().map(|k| format!("\u{2691}{k}")))
-        .collect();
-    let mut line = format!(
-        "#{} {:<8} {}",
-        item["n"],
-        item["status"].as_str().unwrap_or("?"),
-        item["title"].as_str().unwrap_or("")
-    );
-    for part in [holders.join(" "), flags.join(" ")] {
-        if !part.is_empty() {
-            line.push_str("  ");
-            line.push_str(&part);
-        }
-    }
-    if let Some(b) = item["blocked_by"].as_array().filter(|b| !b.is_empty()) {
-        line.push_str(&format!("  \u{2190}{}", b.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(",")));
-    }
-    if let Some(note) = item["note"].as_str().filter(|n| !n.is_empty()) {
-        line.push_str(&format!(" \u{00b7} {note}"));
-    }
-    line
 }
 
 impl App {
@@ -272,9 +235,22 @@ impl App {
                     self.board.list_retry_at = None;
                     let keep = self.board.slug();
                     self.board.boards = v.as_array().cloned().unwrap_or_default();
-                    self.board.board_idx = keep
-                        .and_then(|s| self.board.boards.iter().position(|b| b["slug"] == s.as_str()))
+                    // The focused session's board first (its initiative's,
+                    // else its root task's), then the board already shown.
+                    let (initiative, root) = std::mem::take(&mut self.board.preferred);
+                    let preferred = self.board.boards.iter().position(|b| {
+                        initiative.as_deref().is_some_and(|i| b["initiative_id"] == i)
+                    }).or_else(|| self.board.boards.iter().position(|b| {
+                        root.as_deref().is_some_and(|r| b["root_task_id"] == r)
+                    }));
+                    let previous = self.board.board_idx;
+                    self.board.board_idx = preferred
+                        .or_else(|| keep.and_then(|s| self.board.boards.iter().position(|b| b["slug"] == s.as_str())))
                         .unwrap_or(0);
+                    if self.board.board_idx != previous {
+                        self.board.data = Value::Null;
+                        self.board.cursor = 0;
+                    }
                     self.board.version = None;
                     self.board_read(false);
                 }
@@ -370,6 +346,7 @@ impl App {
                 return false;
             }
             self.board.visible = true;
+            self.board.preferred = self.focused_board_hint();
             self.board.last_poll = None;
             self.board.listed = false;
             self.board_tick();
@@ -459,6 +436,7 @@ impl App {
                 let n = self.board.selected_n().unwrap();
                 self.board_write("item.set", json!({"n": n, "status": "active"}));
             }
+            KeyCode::Char('f') => self.board.show_free = !self.board.show_free,
             KeyCode::Char('g') => {
                 self.board.listed = false;
                 self.board.last_poll = None;
@@ -479,118 +457,299 @@ impl App {
         self.board.last_full = None;
     }
 
+    /// Board for the focused session's task: its initiative's board, else
+    /// its root task's. Matched locally against the board list (resolving
+    /// through the API would create a board on first use).
+    fn focused_board_hint(&self) -> (Option<String>, Option<String>) {
+        let Some(task_id) = self.active_session().and_then(|(_, ts)| ts.task_id.clone()) else {
+            return (None, None);
+        };
+        let initiative = self.planning.task_initiative(&task_id);
+        let mut root = task_id;
+        for _ in 0..64 {
+            match self.tasks.iter().find(|t| t.task_id.as_deref() == Some(root.as_str())).and_then(|t| t.parent_task_id.clone()) {
+                Some(parent) => root = parent,
+                None => break,
+            }
+        }
+        (initiative, Some(root))
+    }
+
     pub(super) fn draw_board(&self, frame: &mut Frame) {
         let area = frame.area();
         frame.render_widget(Clear, area);
         let b = &self.board;
-        let title = match b.boards.get(b.board_idx) {
-            Some(h) => format!(
-                " Board: {} ({}/{}) ",
-                h["name"].as_str().or_else(|| h["slug"].as_str()).unwrap_or("?"),
-                b.board_idx + 1,
-                b.boards.len()
-            ),
-            None => " Board ".into(),
-        };
+        let tint = self.global_settings.tint_strength();
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(title)
+            .title(Line::from(board_title(b)))
             .border_style(Style::default().fg(theme::TEXT));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let mut lines: Vec<Line> = Vec::new();
+        let width = inner.width as usize;
         let dim = Style::default().fg(theme::DIM);
-        let bold = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
-        if b.boards.is_empty() && b.listed {
-            lines.push(Line::styled("No boards with open items.", dim));
+        let mut lines: Vec<Line> = Vec::new();
+        if b.boards.is_empty() {
+            lines.push(Line::styled(
+                if b.listed { "No boards with open items." } else { "Loading boards…" },
+                dim,
+            ));
         }
-        let header = &b.data["board"];
-        if header.is_object() {
-            let health = &header["health"];
-            let flags = health["unresolved"].as_i64().unwrap_or(0);
-            let mut head = format!("orchestrator {}", header["orchestrator"].as_str().unwrap_or("none"));
-            if flags > 0 {
-                head.push_str(&format!(" \u{00b7} \u{2691}{flags}"));
-                if let Some(s) = health["oldest_s"].as_i64() {
-                    head.push_str(&format!(" oldest {}", age(s)));
-                }
-            } else {
-                head.push_str(" \u{00b7} no flags");
-            }
-            let free: Vec<&str> = b.data["free_capacity"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-            if !free.is_empty() {
-                head.push_str(&format!(" \u{00b7} free: {}", free.join(", ")));
-            }
-            lines.push(Line::styled(head, dim));
-            lines.push(Line::from(""));
-        }
-        let flags = b.data["flags"].as_array().cloned().unwrap_or_default();
-        if !flags.is_empty() {
-            lines.push(Line::styled("Flags", bold));
-            for f in &flags {
-                let detail = match &f["detail"] {
-                    Value::Null => String::new(),
-                    Value::String(s) => format!(" {s}"),
-                    other => format!(" {other}"),
-                };
+        if b.data["board"].is_object() {
+            lines.push(self.board_summary_line(width));
+            if b.show_free {
+                let free: Vec<&str> = b.data["free_capacity"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
                 lines.push(Line::styled(
-                    format!("  \u{2691} #{} {} {}{detail}", f["n"], f["kind"].as_str().unwrap_or("?"), age(f["age_s"].as_i64().unwrap_or(0))),
-                    Style::default().fg(theme::ATTN),
+                    truncate(&format!("  free: {}", free.join(", ")), width),
+                    Style::default().fg(theme::MUTED),
                 ));
             }
             lines.push(Line::from(""));
         }
+        // Flags
+        let flags = b.data["flags"].as_array().cloned().unwrap_or_default();
+        if !flags.is_empty() {
+            lines.push(Line::styled(
+                format!("\u{2691} Flags ({})", flags.len()),
+                Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+            ));
+            for f in &flags {
+                let detail = match &f["detail"] {
+                    Value::Null => String::new(),
+                    Value::String(s) => format!("  {s}"),
+                    other => format!("  {other}"),
+                };
+                lines.push(Line::styled(
+                    truncate(&format!(
+                        "  #{:<3} {:<22} {:>4}{detail}",
+                        f["n"],
+                        f["kind"].as_str().unwrap_or("?"),
+                        age(f["age_s"].as_i64().unwrap_or(0))
+                    ), width),
+                    Style::default().fg(theme::ERROR),
+                ));
+            }
+            lines.push(Line::from(""));
+        }
+        // Items: flagged first (already ordered by the daemon), then groups.
+        let cols = Columns::for_width(width);
+        let now = now_unix();
+        let items = b.items();
         let mut group: Option<String> = None;
-        for (i, item) in b.items().iter().enumerate() {
+        let mut cursor_line = 0usize;
+        for (i, item) in items.iter().enumerate() {
             let flagged = item["flags"].as_array().is_some_and(|f| !f.is_empty());
             let g = item["group"].as_str().unwrap_or("").to_owned();
             if !flagged && group.as_deref() != Some(g.as_str()) {
-                lines.push(Line::styled(if g.is_empty() { "(no group)".to_owned() } else { g.clone() }, bold));
+                lines.push(group_header(&g, items, width, tint));
                 group = Some(g);
             }
-            let mut style = Style::default().fg(if flagged { theme::ATTN } else { theme::TEXT });
             if i == b.cursor {
-                style = style.add_modifier(Modifier::REVERSED);
+                cursor_line = lines.len();
             }
-            lines.push(Line::styled(format!("  {}", item_line(item)), style));
-            if b.detail && i == b.cursor {
-                for e in item["history"].as_array().into_iter().flatten() {
-                    lines.push(Line::styled(
-                        format!(
-                            "      {} {} {}{}",
-                            e["at"].as_str().unwrap_or("").get(11..16).unwrap_or(""),
-                            e["actor"].as_str().unwrap_or("?"),
-                            e["type"].as_str().unwrap_or("?"),
-                            e["reason"].as_str().map(|r| format!(" ({r})")).unwrap_or_default()
-                        ),
-                        dim,
-                    ));
-                }
-            }
+            lines.push(self.item_row(item, &cols, now, i == b.cursor, false));
         }
-        let open_rows = b.items().len();
-        if !b.closed().is_empty() {
+        let closed = b.closed();
+        if !closed.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::styled("Recently closed (24 h) \u{00b7} o reopens", bold));
-            for (j, item) in b.closed().iter().take(CLOSED_SHOWN).enumerate() {
-                let mut style = dim;
-                if open_rows + j == b.cursor {
-                    style = style.add_modifier(Modifier::REVERSED);
+            lines.push(Line::styled(
+                format!("Recently closed (24 h) \u{00b7} {} \u{00b7} o reopens", closed.len()),
+                dim.add_modifier(Modifier::BOLD),
+            ));
+            for (j, item) in closed.iter().take(CLOSED_SHOWN).enumerate() {
+                let selected = items.len() + j == b.cursor;
+                if selected {
+                    cursor_line = lines.len();
                 }
-                lines.push(Line::styled(format!("  {}", item_line(item)), style));
+                lines.push(self.item_row(item, &cols, now, selected, true));
             }
         }
+        // Layout: list, detail pane for the selected row, footer.
         let footer_h = 2u16;
-        let body = Rect { height: inner.height.saturating_sub(footer_h), ..inner };
-        // Keep the cursor row in view.
-        let cursor_line = lines
-            .iter()
-            .position(|l| l.style.add_modifier.contains(Modifier::REVERSED))
-            .unwrap_or(0) as u16;
-        let scroll = cursor_line.saturating_sub(body.height.saturating_sub(3));
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
-        let footer = Rect { y: inner.y + body.height, height: footer_h.min(inner.height), ..inner };
-        let first = if let Some((kind, text)) = &b.prompt {
+        let detail_h: u16 = if b.selected().is_none() {
+            0
+        } else if b.detail {
+            (inner.height / 2).max(6)
+        } else {
+            6
+        }
+        .min(inner.height.saturating_sub(footer_h + 3));
+        let list_h = inner.height.saturating_sub(footer_h + detail_h);
+        let list = Rect { height: list_h, ..inner };
+        let scroll = (cursor_line as u16).saturating_sub(list_h.saturating_sub(3));
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list);
+        if detail_h > 0 {
+            let area = Rect { y: inner.y + list_h, height: detail_h, ..inner };
+            self.draw_board_detail(frame, area, now);
+        }
+        let footer = Rect { y: inner.y + list_h + detail_h, height: footer_h.min(inner.height), ..inner };
+        frame.render_widget(Paragraph::new(vec![self.board_status_line(), board_help(width)]), footer);
+    }
+
+    /// `● EP · ⚑ 2 oldest 25m · 7 open: 3 active · 2 waiting · 1 blocked · 1 open · free 3 (f)`
+    fn board_summary_line(&self, width: usize) -> Line<'static> {
+        let b = &self.board;
+        let header = &b.data["board"];
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let (orch_name, orch_state) = parse_orchestrator(header["orchestrator"].as_str().unwrap_or("none"));
+        if orch_name == "none" {
+            spans.push(Span::styled("no orchestrator", Style::default().fg(theme::DIM)));
+        } else {
+            let (glyph, style) = holder_glyph(&orch_state, None, self.spinner_frame());
+            spans.push(Span::styled(format!("{glyph} "), style));
+            spans.push(Span::styled(orch_name, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(format!(" ({orch_state})"), Style::default().fg(theme::DIM)));
+        }
+        let sep = || Span::styled(" \u{00b7} ", Style::default().fg(theme::DIM));
+        let health = &header["health"];
+        let unresolved = health["unresolved"].as_i64().unwrap_or(0);
+        spans.push(sep());
+        if unresolved > 0 {
+            let oldest = health["oldest_s"].as_i64().map(|s| format!(" oldest {}", age(s))).unwrap_or_default();
+            spans.push(Span::styled(
+                format!("\u{2691} {unresolved} flag{}{oldest}", if unresolved == 1 { "" } else { "s" }),
+                Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled("no flags", Style::default().fg(theme::OK)));
+        }
+        let free = b.data["free_capacity"].as_array().map_or(0, Vec::len);
+        if free > 0 {
+            spans.push(sep());
+            spans.push(Span::styled(
+                format!("free {free} ({})", if b.show_free { "f hide" } else { "f show" }),
+                Style::default().fg(theme::MUTED),
+            ));
+        }
+        spans.push(sep());
+        spans.push(Span::styled(status_counts(b.items()), Style::default().fg(theme::MUTED)));
+        clip_spans(spans, width)
+    }
+
+    /// One aligned row: marker, #n, status badge, ⚑, title…, holder chips, note…
+    fn item_row(&self, item: &Value, cols: &Columns, now: i64, selected: bool, closed: bool) -> Line<'static> {
+        let flagged = item["flags"].as_array().is_some_and(|f| !f.is_empty());
+        let (badge, badge_style) = status_badge(item, now);
+        let dim = closed;
+        let fade = |s: Style| if dim { s.fg(theme::DIM) } else { s };
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(if selected { "\u{25b6} " } else { "  " }, Style::default().fg(theme::TEXT)),
+            Span::styled(format!("{:>4} ", format!("#{}", item["n"])), fade(Style::default().fg(theme::MUTED))),
+            Span::styled(pad(&badge, cols.badge), fade(badge_style)),
+            Span::styled(
+                if flagged { "\u{2691} " } else { "  " },
+                Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                pad(&truncate(item["title"].as_str().unwrap_or(""), cols.title), cols.title + 1),
+                fade(Style::default().fg(theme::TEXT)),
+            ),
+        ];
+        // Holder chips: the sidebar's state glyphs, then the name.
+        let mut used = 0usize;
+        let holders = item["holders"].as_array().cloned().unwrap_or_default();
+        if holders.is_empty() {
+            let text = if closed { "" } else { "unassigned" };
+            spans.push(Span::styled(pad(text, cols.chips), fade(Style::default().fg(theme::DIM))));
+        } else {
+            let mut chip_spans = Vec::new();
+            for h in &holders {
+                let name = h["name"].as_str().or_else(|| h["pid"].as_str()).unwrap_or("?");
+                let state = h["state"]["state"].as_str().unwrap_or("unknown");
+                let (glyph, style) = holder_glyph(state, h["state"]["for_s"].as_i64(), self.spinner_frame());
+                let chip = format!("{glyph} {name} ");
+                let w = chip.chars().count();
+                if used + w > cols.chips {
+                    if used < cols.chips {
+                        chip_spans.push(Span::styled("+", Style::default().fg(theme::DIM)));
+                        used += 1;
+                    }
+                    break;
+                }
+                used += w;
+                chip_spans.push(Span::styled(format!("{glyph} "), fade(style)));
+                chip_spans.push(Span::styled(format!("{name} "), fade(Style::default().fg(theme::MUTED))));
+            }
+            spans.extend(chip_spans);
+            spans.push(Span::raw(" ".repeat(cols.chips.saturating_sub(used))));
+        }
+        if cols.note > 0 {
+            if let Some(note) = item["note"].as_str().filter(|n| !n.is_empty()) {
+                spans.push(Span::styled(truncate(&format!(" {note}"), cols.note), Style::default().fg(theme::DIM)));
+            }
+        }
+        let mut line = Line::from(spans);
+        if selected {
+            line = line.style(Style::default().bg(theme::SELECT_BG));
+        }
+        line
+    }
+
+    fn draw_board_detail(&self, frame: &mut Frame, area: Rect, now: i64) {
+        let Some(item) = self.board.selected() else { return };
+        let width = area.width as usize;
+        let rule = Line::styled("\u{2500}".repeat(width), Style::default().fg(theme::DIM));
+        let (badge, badge_style) = status_badge(item, now);
+        let mut lines = vec![
+            rule,
+            Line::from(vec![
+                Span::styled(format!("#{} ", item["n"]), Style::default().fg(theme::MUTED)),
+                Span::styled(item["title"].as_str().unwrap_or("").to_owned(), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(badge.trim_end().to_owned(), badge_style),
+            ]),
+        ];
+        let mut meta: Vec<String> = Vec::new();
+        let holders: Vec<String> = item["holders"].as_array().into_iter().flatten().map(|h| {
+            let name = h["name"].as_str().or_else(|| h["pid"].as_str()).unwrap_or("?");
+            let state = h["state"]["state"].as_str().unwrap_or("unknown");
+            match h["state"]["for_s"].as_i64() {
+                Some(s) => format!("{name} ({state} {})", age(s)),
+                None => format!("{name} ({state})"),
+            }
+        }).collect();
+        meta.push(if holders.is_empty() { "holders: none".into() } else { format!("holders: {}", holders.join(", ")) });
+        if let Some(g) = item["group"].as_str().filter(|g| !g.is_empty()) {
+            meta.push(format!("group: {g}"));
+        }
+        if let Some(bb) = item["blocked_by"].as_array().filter(|b| !b.is_empty()) {
+            meta.push(format!("blocked by {}", bb.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ")));
+        }
+        if let Some(on) = item["blocked_on"].as_str().filter(|s| !s.is_empty()) {
+            meta.push(format!("blocked on: {on}"));
+        }
+        if let Some(eta) = item["eta_at"].as_str() {
+            meta.push(format!("eta {}", eta.get(11..16).unwrap_or(eta)));
+        }
+        lines.push(Line::styled(meta.join(" \u{00b7} "), Style::default().fg(theme::MUTED)));
+        if let Some(note) = item["note"].as_str().filter(|n| !n.is_empty()) {
+            lines.push(Line::styled(format!("note: {note}"), Style::default().fg(theme::TEXT)));
+        }
+        if let Some(links) = item["links"].as_array().filter(|l| !l.is_empty()) {
+            lines.push(Line::styled(
+                format!("links: {}", links.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("  ")),
+                Style::default().fg(theme::HEADER),
+            ));
+        }
+        for e in item["history"].as_array().into_iter().flatten() {
+            lines.push(Line::styled(
+                format!(
+                    "  {} {} {}{}",
+                    e["at"].as_str().unwrap_or("").get(11..16).unwrap_or(""),
+                    e["actor"].as_str().unwrap_or("?"),
+                    e["type"].as_str().unwrap_or("?"),
+                    e["reason"].as_str().map(|r| format!(" ({r})")).unwrap_or_default()
+                ),
+                Style::default().fg(theme::DIM),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), area);
+    }
+
+    fn board_status_line(&self) -> Line<'static> {
+        let b = &self.board;
+        let bold = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
+        if let Some((kind, text)) = &b.prompt {
             let label = match kind {
                 PromptKind::Add => "New item title",
                 PromptKind::Note => "Note",
@@ -600,41 +759,256 @@ impl App {
                 PromptKind::ResolveBlockCheck => "Check back (e.g. 2h; empty for none)",
                 PromptKind::WaitingEta => "ETA (e.g. 40m, 2h)",
             };
-            Line::styled(format!("{label}: {text}\u{2588}"), bold)
-        } else if let Some(menu) = b.menu {
-            Line::styled(
+            return Line::styled(format!("{label}: {text}\u{2588}"), bold);
+        }
+        if let Some(menu) = b.menu {
+            return Line::styled(
                 match menu {
-                    Menu::Status => "Status: o open · a active · w waiting · b blocked · d done",
-                    Menu::Resolve => "Resolve flag: 1 nudge · 2 reassign · 3 block · 4 drop",
+                    Menu::Status => "Status: o open \u{00b7} a active \u{00b7} w waiting \u{00b7} b blocked \u{00b7} d done",
+                    Menu::Resolve => "Resolve flag: 1 nudge \u{00b7} 2 reassign \u{00b7} 3 block \u{00b7} 4 drop",
                 },
                 bold,
-            )
-        } else if !b.error.is_empty() {
-            Line::styled(b.error.clone(), Style::default().fg(theme::ERROR))
-        } else {
-            Line::styled(b.status.clone(), dim)
-        };
-        let help = Line::styled(
-            "j/k move · Enter history · a add · s status · n note · r reassign · x resolve · d drop · o reopen · Tab board · g refresh · Esc close",
-            dim,
-        );
-        frame.render_widget(Paragraph::new(vec![first, help]), footer);
+            );
+        }
+        if !b.error.is_empty() {
+            return Line::styled(b.error.clone(), Style::default().fg(theme::ERROR));
+        }
+        Line::styled(b.status.clone(), Style::default().fg(theme::DIM))
     }
+}
+
+/// Column widths for one item row at `width` cells.
+struct Columns {
+    badge: usize,
+    title: usize,
+    chips: usize,
+    note: usize,
+}
+
+impl Columns {
+    /// Fixed: marker 2, #n 5, badge, flag 2. The rest splits title / chips /
+    /// note, title first; the note column disappears on narrow terminals.
+    fn for_width(width: usize) -> Self {
+        let badge = 13;
+        let rest = width.saturating_sub(2 + 5 + badge + 2);
+        let chips = (rest / 4).clamp(12, 30).min(rest.saturating_sub(16));
+        let title = (rest.saturating_sub(chips) * 3 / 5).clamp(16, 60).min(rest.saturating_sub(chips + 1));
+        let note = rest.saturating_sub(title + 1 + chips);
+        Self { badge, title, chips, note: if note >= 10 { note } else { 0 } }
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// RFC 3339 → Unix seconds (`2026-10-07T19:40:00Z`, fractional seconds and
+/// numeric offsets accepted). The TUI carries no date crate.
+fn parse_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let mut rest = &s[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        rest = frac.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    let offset = match rest {
+        "" | "Z" | "z" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) => {
+            let sign = if o.starts_with('-') { -1 } else { 1 };
+            sign * (o.get(1..3)?.parse::<i64>().ok()? * 3600 + o.get(4..6)?.parse::<i64>().ok()? * 60)
+        }
+        _ => return None,
+    };
+    // Days from civil (Howard Hinnant).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + sec - offset)
+}
+
+/// Colored status badge: ACTIVE green, WAIT cyan with the ETA countdown
+/// (red once overdue), BLOCKED yellow, OPEN grey, DONE/DROPPED dim.
+fn status_badge(item: &Value, now: i64) -> (String, Style) {
+    let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    match item["status"].as_str().unwrap_or("?") {
+        "active" => ("ACTIVE".into(), bold(theme::OK)),
+        "waiting" => match item["eta_at"].as_str().and_then(parse_rfc3339) {
+            Some(eta) if eta >= now => (format!("WAIT {} left", age(eta - now)), bold(theme::HEADER)),
+            Some(eta) => (format!("WAIT +{} over", age(now - eta)), bold(theme::ERROR)),
+            None => ("WAITING".into(), bold(theme::HEADER)),
+        },
+        "blocked" => ("BLOCKED".into(), bold(theme::ATTN)),
+        "open" => ("OPEN".into(), Style::default().fg(theme::MUTED)),
+        "done" => ("DONE".into(), Style::default().fg(theme::DIM)),
+        "dropped" => ("DROPPED".into(), Style::default().fg(theme::DIM)),
+        // Unknown statuses are shown verbatim, never as closed.
+        other => (other.to_uppercase(), Style::default().fg(theme::TEXT)),
+    }
+}
+
+/// The sidebar's state glyphs for a holder (see app/agent_state.rs).
+fn holder_glyph(state: &str, for_s: Option<i64>, spinner: &'static str) -> (&'static str, Style) {
+    match state {
+        "working" => (spinner, Style::default().fg(theme::OK)),
+        "starting" => (spinner, Style::default().fg(theme::DIM)),
+        "working-background" => ("\u{25d0}", Style::default().fg(theme::OK).add_modifier(Modifier::DIM)),
+        "waiting-on-human" => ("?", Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD)),
+        "errored" => ("\u{2717}", Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD)),
+        "idle" => {
+            let color = match for_s {
+                Some(s) if s < 120 => theme::AFTERGLOW,
+                Some(s) if s >= 1800 => theme::DIM,
+                _ => theme::TEXT,
+            };
+            ("\u{25cf}", Style::default().fg(color))
+        }
+        "exited" => ("\u{00d7}", Style::default().fg(theme::DIM)),
+        _ => ("\u{00b7}", Style::default().fg(theme::DIM)),
+    }
+}
+
+/// `"EP [working] (set on the board)"` → ("EP", "working").
+fn parse_orchestrator(s: &str) -> (String, String) {
+    match (s.find(" ["), s.find(']')) {
+        (Some(a), Some(b)) if b > a => (s[..a].to_owned(), s[a + 2..b].to_owned()),
+        _ => (s.to_owned(), "unknown".to_owned()),
+    }
+}
+
+/// `"3 active · 1 waiting · 1 open"` over open items, in a fixed order.
+fn status_counts(items: &[Value]) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for item in items {
+        let s = item["status"].as_str().unwrap_or("?").to_owned();
+        match counts.iter_mut().find(|(k, _)| *k == s) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((s, 1)),
+        }
+    }
+    let order = ["active", "waiting", "blocked", "open"];
+    counts.sort_by_key(|(k, _)| order.iter().position(|o| o == k).unwrap_or(order.len()));
+    if counts.is_empty() {
+        return "no open items".into();
+    }
+    let total: usize = counts.iter().map(|(_, n)| n).sum();
+    format!(
+        "{total} open: {}",
+        counts.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(" \u{00b7} ")
+    )
+}
+
+/// A group heading with its counts, on the section tint.
+fn group_header(group: &str, items: &[Value], width: usize, tint: f64) -> Line<'static> {
+    let members: Vec<Value> = items
+        .iter()
+        .filter(|i| i["group"].as_str().unwrap_or("") == group && i["flags"].as_array().is_none_or(Vec::is_empty))
+        .cloned()
+        .collect();
+    let name = if group.is_empty() { "Ungrouped".to_owned() } else { group.to_owned() };
+    let counts = status_counts(&members);
+    let counts = counts.split_once(": ").map_or(counts.clone(), |(_, c)| c.to_owned());
+    let bg = theme::sidebar_section_bg(Some("blue"), tint);
+    let text = format!(" {name}   ");
+    let used = text.chars().count() + counts.chars().count();
+    Line::from(vec![
+        Span::styled(text, Style::default().fg(theme::HEADER).bg(bg).add_modifier(Modifier::BOLD)),
+        Span::styled(counts, Style::default().fg(theme::MUTED).bg(bg)),
+        Span::styled(" ".repeat(width.saturating_sub(used)), Style::default().bg(bg)),
+    ])
+}
+
+/// ` Board · SEJD (sejd) · initiative board · 1/3 · Tab next `
+fn board_title(b: &Board) -> Vec<Span<'static>> {
+    let Some(h) = b.boards.get(b.board_idx) else {
+        return vec![Span::raw(" Work board ")];
+    };
+    let slug = h["slug"].as_str().unwrap_or("?").to_owned();
+    let name = h["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&slug).to_owned();
+    let kind = if !h["initiative_id"].is_null() {
+        "initiative board"
+    } else if !h["root_task_id"].is_null() {
+        "task board"
+    } else {
+        "board"
+    };
+    let mut spans = vec![
+        Span::raw(" Work board \u{00b7} "),
+        Span::styled(name.clone(), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+    ];
+    if name != slug {
+        spans.push(Span::styled(format!(" ({slug})"), Style::default().fg(theme::MUTED)));
+    }
+    spans.push(Span::styled(format!(" \u{00b7} {kind}"), Style::default().fg(theme::MUTED)));
+    if b.boards.len() > 1 {
+        spans.push(Span::styled(
+            format!(" \u{00b7} board {}/{} \u{00b7} Tab next ", b.board_idx + 1, b.boards.len()),
+            Style::default().fg(theme::HEADER),
+        ));
+    } else {
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+fn board_help(width: usize) -> Line<'static> {
+    let full = "j/k move \u{00b7} Enter more detail \u{00b7} a add \u{00b7} s status \u{00b7} n note \u{00b7} r reassign \u{00b7} x resolve \u{00b7} d drop \u{00b7} o reopen \u{00b7} f free \u{00b7} Tab board \u{00b7} g refresh \u{00b7} Esc close";
+    let short = "j/k \u{00b7} Enter \u{00b7} a s n r x d o \u{00b7} f \u{00b7} Tab \u{00b7} g \u{00b7} Esc";
+    Line::styled(if full.chars().count() <= width { full } else { short }, Style::default().fg(theme::DIM))
+}
+
+/// Cut to `max` cells with a one-cell `…`.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
+fn pad(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n >= width { s.to_owned() } else { format!("{s}{}", " ".repeat(width - n)) }
+}
+
+/// Keep spans within `width` cells (the summary line on narrow terminals).
+fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let n = span.content.chars().count();
+        if used + n <= width {
+            used += n;
+            out.push(span);
+        } else {
+            let room = width.saturating_sub(used);
+            if room > 1 {
+                out.push(Span::styled(truncate(&span.content, room), span.style));
+            }
+            break;
+        }
+    }
+    Line::from(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn item_line_shows_holder_state_flags_blockers_and_note() {
-        let item = json!({"n":14,"status":"active","title":"fuse SEJD",
-            "holders":[{"pid":"p","name":"rl-scale-out","state":{"state":"idle","for_s":1440}}],
-            "flags":[{"kind":"holder_idle"}],"blocked_by":[3],"note":"waiting on JP"});
-        assert_eq!(item_line(&item),
-            "#14 active   fuse SEJD  @rl-scale-out[idle 24m]  \u{2691}holder_idle  \u{2190}#3 \u{00b7} waiting on JP");
-        assert_eq!(item_line(&json!({"n":2,"status":"open","title":"t","holders":[]})), "#2 open     t");
-    }
 
     fn test_app() -> App {
         let tmp = tempfile::tempdir().unwrap();
@@ -655,28 +1029,56 @@ mod tests {
         app
     }
 
+    fn iso(offset_s: i64) -> String {
+        // RFC 3339 UTC for now + offset (civil-from-days, Howard Hinnant).
+        let t = now_unix() + offset_s;
+        let (days, secs) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs % 3600 / 60, secs % 60)
+    }
+
     fn loaded(app: &mut App) {
         app.board.visible = true;
         app.board.listed = true;
         app.board.last_poll = Some(Instant::now());
-        app.board.boards = vec![json!({"slug":"test-fake-board","name":"Swarm Focused Design"}), json!({"slug":"other","name":"Other"})];
+        app.board.last_full = Some(Instant::now());
+        app.board.boards = vec![
+            json!({"slug":"test-fake-board","name":"SEJD","initiative_id":"ini-1","root_task_id":null}),
+            json!({"slug":"other","name":"other","initiative_id":null,"root_task_id":"t-root"}),
+        ];
         app.board.accept(json!({
-            "board":{"slug":"test-fake-board","version":3,"orchestrator":"Swarm-Coord [working]","health":{"unresolved":1,"oldest_s":1500}},
+            "board":{"slug":"test-fake-board","version":3,"orchestrator":"EP [working] (set on the board)","health":{"unresolved":1,"oldest_s":1500}},
             "flags":[{"n":3,"kind":"holder_idle","age_s":1500,"detail":null}],
             "items":[
-                {"n":3,"status":"active","title":"fuse SEJD","group":"perf","flags":[{"kind":"holder_idle"}],
+                {"n":3,"status":"active","title":"fuse SEJD hot operators across the whole training pipeline","group":"RL training","flags":[{"kind":"holder_idle"}],
                  "holders":[{"pid":"p","name":"rl","state":{"state":"idle","for_s":1500}}],
+                 "note":"profiling shows the fused kernel saves 18% but the backward pass still dominates; next try the custom allreduce",
                  "history":[{"at":"2026-10-07T01:02:03Z","actor":"rl","type":"status","reason":null}]},
-                {"n":1,"status":"waiting","title":"bench run","group":"perf","holders":[]},
-                {"n":2,"status":"open","title":"docs","group":"docs","holders":[]}
+                {"n":1,"status":"waiting","title":"bench run","group":"RL training","eta_at": iso(1920),
+                 "holders":[{"pid":"q","name":"bench","state":{"state":"working-background","for_s":300}}]},
+                {"n":4,"status":"blocked","title":"needs EP GO","group":"RL training","blocked_on":"EP GO",
+                 "holders":[{"pid":"r","name":"lane-c","state":{"state":"waiting-on-human","for_s":60}}]},
+                {"n":2,"status":"open","title":"docs","group":"Docs","holders":[]}
             ],
             "recently_closed":[{"n":9,"status":"done","title":"old thing","holders":[]}],
-            "free_capacity":["lane-b"]
+            "free_capacity":["lane-b","lane-d"]
         }));
     }
 
     fn screen(app: &mut App) -> String {
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        screen_at(app, 140, 30)
+    }
+
+    fn screen_at(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height)
@@ -686,21 +1088,100 @@ mod tests {
     }
 
     #[test]
-    fn board_renders_flags_first_then_groups_then_closed_strip() {
+    fn board_renders_title_summary_badges_chips_columns_and_groups() {
+        for width in [100u16, 160] {
+            let mut app = test_app();
+            loaded(&mut app);
+            let text = screen_at(&mut app, width, 34);
+            if std::env::var_os("CM_BOARD_DUMP").is_some() {
+                println!("--- {width} columns ---\n{text}");
+            }
+            let pos = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("missing {needle:?} at {width}:\n{text}"));
+            // Title: name, slug, kind, which board of how many.
+            assert!(text.contains("Work board \u{00b7} SEJD (test-fake-board) \u{00b7} initiative board \u{00b7} board 1/2 \u{00b7} Tab next"));
+            // Summary: orchestrator with state, flags, counts, free collapsed to a count.
+            assert!(text.contains("EP (working)"));
+            assert!(text.contains("\u{2691} 1 flag oldest 25m"));
+            assert!(text.contains("free 2 (f show)"));
+            if width >= 160 {
+                assert!(text.contains("4 open: 1 active \u{00b7} 1 waiting \u{00b7} 1 blocked \u{00b7} 1 open"));
+            }
+            assert!(!text.contains("lane-b"), "free capacity collapsed to a count");
+            // Flags first, then group headers with counts.
+            assert!(pos("\u{2691} Flags (1)") < pos("#3 "));
+            assert!(text.contains(" RL training   1 waiting \u{00b7} 1 blocked"));
+            assert!(pos(" RL training") < pos(" Docs"));
+            // Badges with the ETA countdown, chips with the sidebar glyphs.
+            assert!(text.contains("ACTIVE") && text.contains("BLOCKED") && text.contains("OPEN"));
+            assert!(text.contains("WAIT 3") && text.contains("left"), "ETA countdown");
+            assert!(text.contains("\u{25cf} rl") && text.contains("\u{25d0} bench") && text.contains("? lane-c"));
+            assert!(text.contains("unassigned"));
+            // One line per item; the full note lives in the detail pane.
+            assert!(text.contains("\u{2026}"));
+            assert!(text.contains("note: profiling shows the fused kernel"));
+            // Columns align: the badge starts at the same cell on every item row.
+            let starts: Vec<usize> = text
+                .lines()
+                // Item rows are indented ("▶   #3" / "    #1"); the detail
+                // pane's "#3 title" line and the flags list are not.
+                .filter(|l| ["   #3 ", "   #1 ", "   #4 ", "   #2 "].iter().any(|n| l.contains(n)))
+                .filter_map(|l| {
+                    let chars: Vec<char> = l.chars().collect();
+                    ["ACTIVE", "WAIT", "BLOCKED", "OPEN"].iter().filter_map(|b| {
+                        let b: Vec<char> = b.chars().collect();
+                        chars.windows(b.len()).position(|w| w == b.as_slice())
+                    }).min()
+                })
+                .collect();
+            assert_eq!(starts.len(), 4, "{text}");
+            assert!(starts.windows(2).all(|w| w[0] == w[1]), "badge column misaligned: {starts:?}");
+        }
+    }
+
+    #[test]
+    fn free_capacity_expands_and_the_focused_sessions_board_is_preferred() {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
         let mut app = test_app();
         loaded(&mut app);
-        let text = screen(&mut app);
-        let pos = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("missing {needle:?} in\n{text}"));
-        assert!(text.contains("Board: Swarm Focused Design (1/2)"));
-        assert!(text.contains("orchestrator Swarm-Coord [working] \u{00b7} \u{2691}1 oldest 25m \u{00b7} free: lane-b"));
-        assert!(pos("Flags") < pos("\u{2691} #3 holder_idle 25m"));
-        assert!(pos("\u{2691} #3 holder_idle 25m") < pos("#3 active"));
-        assert!(pos("\u{2502}perf") < pos("#1 waiting"), "group heading before its items");
-        assert!(pos("#1 waiting") < pos("\u{2502}docs") && pos("\u{2502}docs") < pos("#2 open"));
-        assert!(pos("Recently closed (24 h)") < pos("#9 done"));
-        // Enter shows the selected item's history.
-        app.board.detail = true;
-        assert!(screen(&mut app).contains("01:02 rl status"));
+        app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(screen_at(&mut app, 120, 30).contains("free: lane-b, lane-d"));
+        // The list reply selects the board whose root task matches the hint.
+        app.board.preferred = (None, Some("t-root".into()));
+        let tx = busy(&mut app);
+        let boards = json!(app.board.boards.clone());
+        tx.send(("list".into(), None, Ok(boards))).unwrap();
+        app.board_tick();
+        assert_eq!(app.board.slug().as_deref(), Some("other"));
+        // ... and the initiative match wins over the root task.
+        app.board.preferred = (Some("ini-1".into()), Some("t-root".into()));
+        let tx = busy(&mut app);
+        tx.send(("list".into(), None, Ok(json!(app.board.boards.clone())))).unwrap();
+        app.board_tick();
+        assert_eq!(app.board.slug().as_deref(), Some("test-fake-board"));
+    }
+
+    #[test]
+    fn badges_glyphs_columns_and_time_parsing() {
+        assert_eq!(parse_rfc3339("1970-01-02T00:00:00Z"), Some(86_400));
+        assert_eq!(parse_rfc3339("2026-10-07T19:40:00.123+02:00"), parse_rfc3339("2026-10-07T17:40:00Z"));
+        assert_eq!(parse_rfc3339("not a time"), None);
+        let now = parse_rfc3339("2026-10-07T12:00:00Z").unwrap();
+        let badge = |v: Value| status_badge(&v, now).0;
+        assert_eq!(badge(json!({"status":"waiting","eta_at":"2026-10-07T12:40:00Z"})), "WAIT 40m left");
+        assert_eq!(badge(json!({"status":"waiting","eta_at":"2026-10-07T11:00:00Z"})), "WAIT +1h over");
+        assert_eq!(status_badge(&json!({"status":"waiting","eta_at":"2026-10-07T11:00:00Z"}), now).1.fg, Some(theme::ERROR));
+        assert_eq!(status_badge(&json!({"status":"active"}), now).1.fg, Some(theme::OK));
+        assert_eq!(status_badge(&json!({"status":"blocked"}), now).1.fg, Some(theme::ATTN));
+        assert_eq!(badge(json!({"status":"someday"})), "SOMEDAY", "unknown statuses are shown verbatim");
+        assert_eq!(holder_glyph("working-background", None, "x").0, "\u{25d0}");
+        assert_eq!(holder_glyph("bogus", None, "x").0, "\u{00b7}", "an unknown state is never idle");
+        assert_eq!(parse_orchestrator("EP [idle] (set on the board)"), ("EP".into(), "idle".into()));
+        let narrow = Columns::for_width(98);
+        let wide = Columns::for_width(158);
+        assert!(wide.note > narrow.note && wide.title > narrow.title, "wide terminals give the extra room to title and note");
+        assert_eq!(Columns::for_width(60).note, 0, "very narrow terminals drop the note column");
+        assert!(2 + 5 + wide.badge + 2 + wide.title + 1 + wide.chips + wide.note <= 158);
+        assert!(2 + 5 + narrow.badge + 2 + narrow.title + 1 + narrow.chips <= 98);
     }
 
     #[test]
