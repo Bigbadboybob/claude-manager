@@ -269,3 +269,6 @@ binary sha verified on both; policy docs released. Brief messaging sync drop dur
 restart, reconnected with 0 pending. Post-deploy checks assigned (state-core live
 checklist + drain re-record, items board smoke test, msgfix TUI release). Remaining Owner
 steps: laptop TUI install + laptop daemon, Codex A-R round.
+17:55Z: Codex fork launcher fix (0bdb6ed, `--cd` with tui.resume_cwd under --remote) hot-copied
+as mcp_server/native_codex.py on both hosts (launcher is read per spawn; no restart). Live
+Codex fork verified by state-core. Merged-not-deployed: 537af5c (items cosmetics + DELETE /boards).
