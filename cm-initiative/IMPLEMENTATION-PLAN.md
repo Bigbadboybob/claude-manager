@@ -204,7 +204,8 @@ reviews, merges to main and deploys (hub first).
 | W3d report_done held items + pokes | items | reviewed PASS | 78d543f | pending big deploy |
 | W3f TUI state glyphs + board overlay; W4c docs | msgfix | in progress | | |
 | W3a Claude hooks | state-core | reviewed PASS (real 2.1.291 verified) | 39261ec | pending big deploy; new events need A-R |
-| W3b/W3c MCP + daemon consumers | state-core | in progress | | |
+| W3b MCP consumers (+W3a follow-ups) | state-core | reviewed PASS (2 rounds) | 281fbd9, fac421b | pending big deploy |
+| W3c daemon consumers | state-core | in progress | | |
 | W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | cm-manager + cm-sessions 23:20Z; Claude sessions on source=presence |
 | W2e Codex relay state + 0.160 parsers | state-core | reviewed PASS (+6 fixes) | cef633b, c61f920 | cm-manager + cm-sessions 23:20Z; existing Codex sessions need A-R |
 | W1c messaging send side | msgfix | reviewed PASS | a11adcc | cm-manager + cm-sessions 19:37Z (Owner priority); verified body @Name wakes |
