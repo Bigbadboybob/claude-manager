@@ -262,3 +262,10 @@ the bundle.
 **Consolidated merge ready: origin/main 772a6f5 (2026-10-07).** Everything pending deploy:
 API (board engine), brains + MCP payload on cm-manager and cm-sessions, laptop TUI release
 (+ laptop daemon), then Codex A-R round.
+
+**Consolidated deploy done 2026-10-07 17:25Z (772a6f5):** API board engine 17:20Z; cm-manager
+brain epoch 25 (44 sessions) 17:23Z; cm-sessions epoch 11 (48 sessions) 17:25Z; running
+binary sha verified on both; policy docs released. Brief messaging sync drop during each
+restart, reconnected with 0 pending. Post-deploy checks assigned (state-core live
+checklist + drain re-record, items board smoke test, msgfix TUI release). Remaining Owner
+steps: laptop TUI install + laptop daemon, Codex A-R round.
