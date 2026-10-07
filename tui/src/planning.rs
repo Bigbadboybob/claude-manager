@@ -1204,6 +1204,21 @@ pub struct PlanningView {
 }
 
 impl PlanningView {
+    /// The initiative a task belongs to (its own, else its nearest
+    /// ancestor's), from the API rows the planning view already holds.
+    pub fn task_initiative(&self, task_id: &str) -> Option<String> {
+        let find = |id: &str| self.project_data.iter().flat_map(|pd| &pd.tasks).find(|t| t.id == id);
+        let mut current = find(task_id);
+        for _ in 0..64 {
+            let task = current?;
+            if task.initiative_id.is_some() {
+                return task.initiative_id.clone();
+            }
+            current = task.parent_task_id.as_deref().and_then(find);
+        }
+        None
+    }
+
     pub fn new() -> Self {
         PlanningView {
             keybinding_helper_visible: true,

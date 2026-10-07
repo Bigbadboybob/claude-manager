@@ -109,7 +109,7 @@ fn log_draw_section(section: &str, elapsed: std::time::Duration) {
 }
 
 impl App {
-    fn spinner_frame(&self) -> &'static str {
+    pub(super) fn spinner_frame(&self) -> &'static str {
         let elapsed = self.start_time.elapsed().as_millis();
         let idx = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
         SPINNER_FRAMES[idx]
