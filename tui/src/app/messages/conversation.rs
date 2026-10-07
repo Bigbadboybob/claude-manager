@@ -66,14 +66,26 @@ impl Messages {
                 || self.target.get("dm").is_some() || self.target.get("conversation").is_some())
     }
     pub(super) fn accept_messages(&mut self, value: &Value) {
+        self.layout_epoch += 1;
+        let broad = self.target["inbox"] == true
+            || self.target["dms"] == true
+            || self.target["mentions"] == true
+            || self.target["channel"] == "*";
+        let mut stale_layout = false;
         for (key, dst) in [
             ("_dms", &mut self.dms),
             ("_people", &mut self.people),
             ("_channels", &mut self.channels),
         ] {
             if let Some(items) = value[key].as_array() {
+                // Names (and, in mixed lists, conversation labels) are part
+                // of each rendered message.
+                stale_layout |= (key == "_people" || broad) && dst != items;
                 *dst = items.clone();
             }
+        }
+        if stale_layout {
+            self.layout.clear();
         }
         let query = self.query();
         let same = self.loaded_target == query;
@@ -82,17 +94,32 @@ impl Messages {
             .flatten()
             .map(|m| m["id"].clone());
         let at_bottom = same && self.selected + 1 >= self.items.len();
+        let first_before = self.items.first().map(|m| m["id"].clone());
+        if !same {
+            self.layout.clear();
+        }
         let mut incoming = value["items"].as_array().cloned().unwrap_or_default();
         // The service pages newest first. The screen always reads top to bottom.
         incoming.reverse();
         if same && (self.append_older || !self.page_cursor.is_null() || self.live_conversation()) {
             // Keep loaded history and update read flags on overlapping pages.
+            let fresh: HashMap<String, usize> = incoming
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| Some((m["id"].as_str()?.to_owned(), i)))
+                .collect();
+            let mut known: HashSet<String> = HashSet::with_capacity(self.items.len());
             for old in &mut self.items {
-                if let Some(updated) = incoming.iter().find(|m| m["id"] == old["id"]) {
-                    *old = updated.clone();
+                let Some(id) = old["id"].as_str().map(str::to_owned) else { continue };
+                if let Some(&i) = fresh.get(&id) {
+                    if *old != incoming[i] {
+                        *old = incoming[i].clone();
+                        self.layout.remove(&id);
+                    }
                 }
+                known.insert(id);
             }
-            incoming.retain(|m| !self.items.iter().any(|old| old["id"] == m["id"]));
+            incoming.retain(|m| !m["id"].as_str().is_some_and(|id| known.contains(id)));
             if self.append_older {
                 incoming.append(&mut self.items);
             } else {
@@ -119,15 +146,29 @@ impl Messages {
                 .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
         });
         self.items = incoming;
+        if self.target["mentions"] == true {
+            // The mention list reads newest first.
+            self.items.reverse();
+        }
         if let Some(pins) = value["pins"].as_object() {
             for item in &mut self.items {
-                item["pinned"] = json!(pins.contains_key(item["id"].as_str().unwrap_or("")));
-                item["pin"] = pins
-                    .get(item["id"].as_str().unwrap_or(""))
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                let id = item["id"].as_str().unwrap_or("").to_owned();
+                let pinned = json!(pins.contains_key(&id));
+                if item["pinned"] != pinned {
+                    self.layout.remove(&id);
+                }
+                item["pinned"] = pinned;
+                item["pin"] = pins.get(&id).cloned().unwrap_or(Value::Null);
             }
         }
+        // Older history landed above: keep the view on what it showed.
+        self.prepended = if same && self.append_older {
+            first_before
+                .and_then(|id| self.items.iter().position(|m| m["id"] == id))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         self.selected = if at_bottom && !self.append_older {
             self.items.len().saturating_sub(1)
         } else {
@@ -135,8 +176,11 @@ impl Messages {
                 .and_then(|id| self.items.iter().position(|m| m["id"] == *id))
                 .unwrap_or(self.items.len().saturating_sub(1))
         };
+        if self.target["mentions"] == true && !same {
+            self.selected = 0;
+        }
         self.reveal_selection |= !same
-            || self.append_older
+            || self.select_older
             || old != self.items.get(self.selected).map(|m| m["id"].clone());
         if !same {
             self.timeline_scroll = 0;
@@ -152,11 +196,137 @@ impl Messages {
         self.append_older = false;
         if let Some(ids) = self.management.request["ack_receipt"]["ids"].as_array() {
             for item in &mut self.items {
-                if ids.contains(&item["id"]) { item["read"] = json!(true); }
+                if ids.contains(&item["id"]) && item["read"] != true {
+                    item["read"] = json!(true);
+                    self.layout.remove(item["id"].as_str().unwrap_or(""));
+                }
             }
         }
         self.receipt = value["receipt"].clone();
         self.management.last_position = value["position"].clone();
+    }
+    /// One message's rows (without the blank separator).
+    pub(super) fn message_lines(&self, m: &Value, selected: bool, width: usize) -> Vec<Line<'static>> {
+        let muted = Style::default().fg(theme::CHAT_MUTED);
+        let mut lines = Vec::new();
+        let bg = if selected {
+            theme::CHAT_SELECTION
+        } else {
+            theme::CHAT_PANEL
+        };
+        let (marker, marker_style) = self.unread_marker(m);
+        let stamp = m["created_at"].as_str().unwrap_or("");
+        let stamp = stamp.get(..16).unwrap_or(stamp).replace('T', " ");
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    if selected { "▎ " } else { "  " },
+                    Style::default().fg(theme::CHAT_FOCUS),
+                ),
+                Span::styled(
+                    if marker.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{marker} ")
+                    },
+                    marker_style,
+                ),
+                Span::styled(
+                    self.actor_name(m),
+                    chat_actor_style(m).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {stamp}"), muted),
+                Span::styled(
+                    match m["replication"]["status"].as_str() {
+                        Some("pending_sync") => {
+                            if self.sync["connected"] == false {
+                                "  saved · offline"
+                            } else {
+                                "  syncing"
+                            }
+                        }
+                        Some("replication_rejected") => "  sync rejected",
+                        Some("replication_blocked") => "  sync blocked",
+                        _ => "",
+                    },
+                    Style::default().fg(theme::CHAT_TAG),
+                ),
+                Span::styled(
+                    if m["replication"]["receipt"]["accepted_from_stale_revision"] == true {
+                        "  delayed · pre-archive"
+                    } else {
+                        ""
+                    },
+                    muted,
+                ),
+                Span::styled(
+                    if m["pinned"] == true {
+                        "  ◆ pinned"
+                    } else {
+                        ""
+                    },
+                    Style::default().fg(theme::CHAT_TAG),
+                ),
+            ])
+            .style(Style::default().bg(bg)),
+        );
+        if m["replication"]["status"] == "replication_rejected" {
+            lines.push(Line::styled(
+                format!(
+                    "  Retained locally: {}",
+                    m["replication"]["decision"]["reason"]
+                        .as_str()
+                        .unwrap_or("hub rejected this upload")
+                ),
+                Style::default().fg(theme::ERROR).bg(bg),
+            ));
+        }
+        if self.target["inbox"] == true
+            || self.target["dms"] == true
+            || self.target["mentions"] == true
+            || self.target["channel"] == "*"
+        {
+            lines.push(Line::styled(
+                self.conversation_label(&m["conversation_id"]),
+                Style::default().fg(theme::CHAT_FOCUS).bg(bg),
+            ));
+        }
+        if m["data"]["reply_to"].is_string() {
+            lines.push(Line::styled("↳ reply", muted.bg(bg)));
+        }
+        lines.extend(
+            manage::wrap_readable(m["body"].as_str().unwrap_or(""), width)
+                .into_iter()
+                .map(|s| Line::styled(s, Style::default().fg(theme::CHAT_TEXT).bg(bg))),
+        );
+        if let Some(tags) = m["data"]["tags"].as_array().filter(|a| !a.is_empty()) {
+            let text = tags
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|s| format!("#{s}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.extend(
+                manage::wrap_readable(&text, width)
+                    .into_iter()
+                    .map(|s| Line::styled(s, Style::default().fg(theme::CHAT_TAG).bg(bg))),
+            );
+        }
+        if let Some(links) = m["data"]["links"].as_array() {
+            for link in links {
+                let text = format!(
+                    "{}: {}",
+                    link["label"].as_str().unwrap_or("Reference"),
+                    link["uri"].as_str().unwrap_or("")
+                );
+                lines.extend(
+                    manage::wrap_readable(&text, width).into_iter().map(|s| {
+                        Line::styled(s, Style::default().fg(theme::CHAT_FOCUS).bg(bg))
+                    }),
+                );
+            }
+        }
+        lines
     }
     fn unread_marker(&self, m: &Value) -> (&'static str, Style) {
         let muted = Style::default().fg(theme::CHAT_MUTED);
@@ -377,140 +547,65 @@ impl App {
             self.messages.timeline_size = (inner.width, inner.height);
         }
         let muted = Style::default().fg(theme::CHAT_MUTED);
-        let mut lines = Vec::new();
-        let mut selected_range = (0, 0);
-        for (i, m) in self.messages.items.iter().enumerate() {
-            let start = lines.len();
-            let selected = i == self.messages.selected;
-            let bg = if selected {
-                theme::CHAT_SELECTION
-            } else {
-                theme::CHAT_PANEL
-            };
-            let (marker, marker_style) = self.messages.unread_marker(m);
-            let stamp = m["created_at"].as_str().unwrap_or("");
-            let stamp = stamp.get(..16).unwrap_or(stamp).replace('T', " ");
-            lines.push(
-                Line::from(vec![
-                    Span::styled(
-                        if selected { "▎ " } else { "  " },
-                        Style::default().fg(theme::CHAT_FOCUS),
-                    ),
-                    Span::styled(
-                        if marker.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{marker} ")
-                        },
-                        marker_style,
-                    ),
-                    Span::styled(
-                        self.messages.actor_name(m),
-                        chat_actor_style(m).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!("  {stamp}"), muted),
-                    Span::styled(
-                        match m["replication"]["status"].as_str() {
-                            Some("pending_sync") => {
-                                if self.messages.sync["connected"] == false {
-                                    "  saved · offline"
-                                } else {
-                                    "  syncing"
-                                }
-                            }
-                            Some("replication_rejected") => "  sync rejected",
-                            Some("replication_blocked") => "  sync blocked",
-                            _ => "",
-                        },
-                        Style::default().fg(theme::CHAT_TAG),
-                    ),
-                    Span::styled(
-                        if m["replication"]["receipt"]["accepted_from_stale_revision"] == true {
-                            "  delayed · pre-archive"
-                        } else {
-                            ""
-                        },
-                        muted,
-                    ),
-                    Span::styled(
-                        if m["pinned"] == true {
-                            "  ◆ pinned"
-                        } else {
-                            ""
-                        },
-                        Style::default().fg(theme::CHAT_TAG),
-                    ),
-                ])
-                .style(Style::default().bg(bg)),
-            );
-            if m["replication"]["status"] == "replication_rejected" {
-                lines.push(Line::styled(
-                    format!(
-                        "  Retained locally: {}",
-                        m["replication"]["decision"]["reason"]
-                            .as_str()
-                            .unwrap_or("hub rejected this upload")
-                    ),
-                    Style::default().fg(theme::ERROR).bg(bg),
-                ));
+        // Each message's rows are cached per width; only the selected one
+        // and messages still syncing are rebuilt per frame, and only the
+        // visible rows are handed to the widget.
+        let n = self.messages.items.len();
+        let key = (self.messages.layout_epoch, inner.width, n);
+        let cached_heights = {
+            let (epoch, w, len, _) = &self.messages.row_heights;
+            (*epoch, *w, *len) == key
+        };
+        let mut heights = if cached_heights {
+            std::mem::take(&mut self.messages.row_heights.3)
+        } else {
+            Vec::with_capacity(n)
+        };
+        let mut volatile = false;
+        for i in 0..n {
+            if cached_heights {
+                break;
             }
-            if self.messages.target["inbox"] == true
-                || self.messages.target["dms"] == true
-                || self.messages.target["channel"] == "*"
-            {
-                lines.push(Line::styled(
-                    self.messages.conversation_label(&m["conversation_id"]),
-                    Style::default().fg(theme::CHAT_FOCUS).bg(bg),
-                ));
-            }
-            if m["data"]["reply_to"].is_string() {
-                lines.push(Line::styled("↳ reply", muted.bg(bg)));
-            }
-            lines.extend(
-                manage::wrap_readable(m["body"].as_str().unwrap_or(""), width)
-                    .into_iter()
-                    .map(|s| Line::styled(s, Style::default().fg(theme::CHAT_TEXT).bg(bg))),
-            );
-            if let Some(tags) = m["data"]["tags"].as_array().filter(|a| !a.is_empty()) {
-                let text = tags
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|s| format!("#{s}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                lines.extend(
-                    manage::wrap_readable(&text, width)
-                        .into_iter()
-                        .map(|s| Line::styled(s, Style::default().fg(theme::CHAT_TAG).bg(bg))),
-                );
-            }
-            if let Some(links) = m["data"]["links"].as_array() {
-                for link in links {
-                    let text = format!(
-                        "{}: {}",
-                        link["label"].as_str().unwrap_or("Reference"),
-                        link["uri"].as_str().unwrap_or("")
-                    );
-                    lines.extend(
-                        manage::wrap_readable(&text, width).into_iter().map(|s| {
-                            Line::styled(s, Style::default().fg(theme::CHAT_FOCUS).bg(bg))
-                        }),
-                    );
+            let m = &self.messages.items[i];
+            let id = m["id"].as_str().unwrap_or("");
+            let cacheable = !id.is_empty() && m["replication"]["status"] != "pending_sync";
+            volatile |= !cacheable;
+            let cached = cacheable
+                .then(|| self.messages.layout.get(id).filter(|(w, _)| *w == inner.width).map(|(_, l)| l.len()))
+                .flatten();
+            let height = match cached {
+                Some(h) => h,
+                None => {
+                    let lines = self.messages.message_lines(m, false, width);
+                    self.messages.layout_builds += 1;
+                    let h = lines.len();
+                    if cacheable {
+                        let id = id.to_owned();
+                        self.messages.layout.insert(id, (inner.width, lines));
+                    }
+                    h
                 }
-            }
-            if selected {
-                selected_range = (start, lines.len());
-            }
-            lines.push(Line::from(""));
+            };
+            heights.push(height + 1);
         }
-        if lines.is_empty() {
-            lines.push(Line::styled(
-                "No messages yet. c composes · d starts a DM.",
-                muted,
-            ));
+        let mut offsets = Vec::with_capacity(n + 1);
+        offsets.push(0usize);
+        for h in &heights {
+            offsets.push(offsets.last().unwrap() + h);
         }
+        // Messages still syncing change shape; measure them every frame.
+        self.messages.row_heights = if volatile { (0, 0, usize::MAX, Vec::new()) } else { (key.0, key.1, key.2, heights) };
+        let total = *offsets.last().unwrap();
+        let selected_range = if self.messages.selected < n {
+            let i = self.messages.selected;
+            (offsets[i], offsets[i + 1] - 1)
+        } else {
+            (0, 0)
+        };
         let height = inner.height as usize;
+        let prepended = std::mem::take(&mut self.messages.prepended).min(n);
         let scroll = &mut self.messages.timeline_scroll;
+        *scroll += offsets[prepended];
         if self.messages.reveal_selection {
             if selected_range.0 < *scroll
                 || selected_range.1.saturating_sub(selected_range.0) > height
@@ -521,14 +616,43 @@ impl App {
             }
             self.messages.reveal_selection = false;
         }
-        *scroll = (*scroll).min(lines.len().saturating_sub(height));
-        let selected_top = selected_range.0.saturating_sub(*scroll).min(height);
-        let selected_bottom = selected_range.1.saturating_sub(*scroll).min(height);
-        let visible = lines
-            .into_iter()
-            .skip(*scroll)
-            .take(height)
-            .collect::<Vec<_>>();
+        *scroll = (*scroll).min(total.saturating_sub(height));
+        let scroll = *scroll;
+        // Within a screen of the oldest loaded message: fetch more history.
+        self.messages.near_top = n > 0 && scroll < height && !self.messages.next.is_null();
+        let selected_top = selected_range.0.saturating_sub(scroll).min(height);
+        let selected_bottom = selected_range.1.saturating_sub(scroll).min(height);
+        let first = offsets.partition_point(|&o| o <= scroll).saturating_sub(1);
+        let mut visible: Vec<Line<'static>> = Vec::with_capacity(height);
+        let mut skip = scroll.saturating_sub(offsets.get(first).copied().unwrap_or(0));
+        for i in first..n {
+            if visible.len() >= height {
+                break;
+            }
+            let m = &self.messages.items[i];
+            let rows: Vec<Line<'static>> = if i == self.messages.selected {
+                self.messages.layout_builds += 1;
+                self.messages.message_lines(m, true, width)
+            } else {
+                match self.messages.layout.get(m["id"].as_str().unwrap_or("")).filter(|(w, _)| *w == inner.width) {
+                    Some((_, lines)) => lines.clone(),
+                    None => self.messages.message_lines(m, false, width),
+                }
+            };
+            for line in rows.into_iter().chain(std::iter::once(Line::from(""))) {
+                if skip > 0 {
+                    skip -= 1;
+                } else if visible.len() < height {
+                    visible.push(line);
+                }
+            }
+        }
+        if n == 0 {
+            visible.push(Line::styled(
+                "No messages yet. c composes · d starts a DM.",
+                muted,
+            ));
+        }
         let title = format!("{}{} · j/k select · Enter read", self.messages.target_label(),
             if self.messages.filter["pinned_only"] == true { " · Pinned messages" } else { "" });
         frame.render_widget(
@@ -667,11 +791,9 @@ mod tests {
             .any(|(label, _)| label.contains("Alpha")));
         a.messages.dms =
             vec![json!({"id":"pair","peer":"a","peers":["a"],"members":["a","owner"],"unread":1})];
-        assert!(a
-            .messages
-            .menu_items()
-            .iter()
-            .any(|(label, _)| label.contains("●1 Alpha")));
+        let items = a.messages.menu_items();
+        let row = items.iter().position(|(label, _)| label.contains("Alpha")).expect("DM row");
+        assert_eq!(a.messages.count_columns().1[row].1, "●1 ", "the count sits in its own column");
         a.messages.saved.dms_collapsed = true;
         assert!(!a
             .messages

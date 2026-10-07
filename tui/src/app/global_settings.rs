@@ -15,6 +15,9 @@ struct Preferences {
     /// history reaches CM's scrollback. Applies to the next TUI-composed
     /// Codex spawn/A-R; restart the TUI after editing.
     codex_inline_scrollback: bool,
+    /// Messages view conversation sidebar width in cells; 0 fits the
+    /// longest name. Set with `<` / `>` in Messages.
+    messages_sidebar_width: u16,
 }
 
 #[cfg(test)]
@@ -121,6 +124,7 @@ impl Default for Preferences {
         Self {
             sidebar_tint_strength: DEFAULT_TINT,
             codex_inline_scrollback: true,
+            messages_sidebar_width: 0,
         }
     }
 }
@@ -194,13 +198,28 @@ impl GlobalSettings {
         self.dialog.is_some()
     }
 
+    pub(super) fn messages_sidebar_width(&self) -> u16 {
+        self.saved.messages_sidebar_width
+    }
+
+    /// Save the Messages sidebar width (0 = fit names) right away.
+    pub(super) fn set_messages_sidebar_width(&mut self, width: u16) -> anyhow::Result<()> {
+        self.write_key("messages_sidebar_width", toml::Value::Integer(width.into()))?;
+        self.saved.messages_sidebar_width = width;
+        Ok(())
+    }
+
     fn save(&self, draft: Preferences) -> anyhow::Result<()> {
+        self.write_key(
+            "sidebar_tint_strength",
+            toml::Value::Float(draft.sidebar_tint_strength),
+        )
+    }
+
+    fn write_key(&self, key: &str, value: toml::Value) -> anyhow::Result<()> {
         // Read on save to preserve unrelated keys, and refuse malformed files.
         let mut document = read_document(&self.path)?;
-        document.insert(
-            "sidebar_tint_strength".into(),
-            toml::Value::Float(draft.sidebar_tint_strength),
-        );
+        document.insert(key.into(), value);
         let text = toml::to_string_pretty(&document)?;
         let parent = self.path.parent().context("Settings path has no parent")?;
         std::fs::create_dir_all(parent)?;
