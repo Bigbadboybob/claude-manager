@@ -540,6 +540,71 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(result['results'][0]['removed'])
         self.assertIn('task_not_terminal', result['results'][0]['message'])
 
+    def test_apply_during_scan_is_accepted_and_runs_right_after_the_preview(self):
+        job = self.job()
+        job.update(phase='scanning', worktree_path=str(self.worktree))
+        cleanup.write_job(job)
+        with patch.object(cleanup, 'spawn') as spawn:
+            accepted = cleanup.request({'action': 'apply', 'id': job['id']})
+            again = cleanup.request({'action': 'apply', 'id': job['id']})
+        spawn.assert_not_called()  # the scanning worker carries on
+        self.assertEqual((accepted['phase'], accepted['apply_requested']), ('scanning', True))
+        self.assertTrue(again['apply_requested'])
+        with patch.object(cleanup, 'base_context', return_value=self.context), \
+                patch.object(reaper, 'refresh_dynamic_state'), \
+                patch.object(reaper, 'process_references', return_value={}):
+            cleanup.worker(job['id'])
+        done = cleanup.read_job(job['id'])
+        self.assertEqual(done['phase'], 'complete')
+        self.assertTrue(done['results'][0]['removed'])
+
+    def test_preview_keeps_an_apply_request_that_arrived_while_it_scanned(self):
+        job = self.job()
+        job.update(phase='scanning', worktree_path=str(self.worktree))
+        cleanup.write_job(job)
+        in_memory = dict(job)  # the worker's copy, read before the request
+        cleanup.request({'action': 'apply', 'id': job['id']})
+        with patch.object(cleanup, 'base_context', return_value=self.context):
+            cleanup.preview(in_memory)
+        saved = cleanup.read_job(job['id'])
+        self.assertEqual(saved['phase'], 'queued')
+        self.assertTrue(saved['apply_requested'])
+        self.assertTrue(saved['candidates'])
+
+    def test_fast_git_reads_match_git_for_linked_primary_and_detached_checkouts(self):
+        detached = self.root / 'detached'
+        self.git(self.repo, 'worktree', 'add', '--detach', str(detached))
+        for path in (self.repo, self.worktree, detached):
+            self.assertIsNotNone(lineage.git_dirs(path))
+            common = str(Path(self.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve())
+            self.assertEqual(lineage.common_dir(path), common, path)
+            self.assertEqual(lineage.current_branch(path), self.git(path, 'branch', '--show-current'), path)
+        self.assertEqual(lineage.current_branch(detached), '')
+        # Anything unusual falls back to Git.
+        odd = self.base / 'odd'
+        odd.mkdir()
+        (odd / '.git').write_text('not a gitdir line\n')
+        self.assertIsNone(lineage.git_dirs(odd))
+
+    def test_inventory_skips_up_to_date_checkouts_without_running_git(self):
+        with patch.object(cleanup, 'base_context', return_value=self.context):
+            cleanup.inventory(self.context)  # first pass registers what is new
+            calls = []
+            real = lineage.git
+            with patch.object(lineage, 'git', side_effect=lambda *a: calls.append(a[1:]) or real(*a)):
+                records, warnings = cleanup.inventory(self.context)
+        self.assertEqual(warnings, [])
+        self.assertIn(self.parent['id'], records)
+        # Only the once-per-repository calls remain (worktree list, hook
+        # check); no per-checkout identity, branch or remote lookups.
+        per_checkout = [c for c in calls if '--absolute-git-dir' in c or c[:1] == ('branch',)
+                        or c[:2] == ('remote', 'get-url')]
+        self.assertEqual(per_checkout, [], f'per-checkout Git calls: {calls}')
+        # A new owner found for a checkout still re-registers it.
+        ctx = dataclasses.replace(self.context, workspaces={self.worktree: reaper.WorkspaceFacts(task_ids={'task-1', 'task-9'})})
+        records, _ = cleanup.inventory(ctx)
+        self.assertIn('task-9', records[self.parent['id']]['task_ids'])
+
     def test_preview_retry_and_worker_resume_are_idempotent(self):
         job = self.job()
         job.update(phase='scanning', worktree_path=str(self.worktree))

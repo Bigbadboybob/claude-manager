@@ -264,6 +264,8 @@ pub struct App {
     availability: availability::Availability,
     board: board::Board,
     owner_blocked: owner_blocked::OwnerBlocked,
+    /// Reap requests submitted from the cleanup dialog, tracked after it closed.
+    cleanup_jobs: Vec<worktree_cleanup::Menu>,
     pub backend: BackendHandle,
     pub connected: bool,
     pub status_msg: Option<(String, Instant)>,
@@ -929,6 +931,7 @@ impl App {
             availability: availability::Availability::load(),
             board: board::Board::default(),
             owner_blocked: owner_blocked::OwnerBlocked::default(),
+            cleanup_jobs: Vec::new(),
             backend,
             connected: false,
             status_msg: None,

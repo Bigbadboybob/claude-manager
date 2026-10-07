@@ -2506,6 +2506,10 @@ impl App {
                 Style::default().fg(theme::ATTN),
             ));
         }
+        // Background worktree cleanups (Alt+d / Alt+Shift+w reap).
+        if let Some(progress) = self.cleanup_progress() {
+            rollup.push(Span::styled(format!("\u{27f2} {progress} "), Style::default().fg(theme::MUTED)));
+        }
         // Items blocked on an Owner decision, across every board.
         let n_owner = self.owner_blocked.count();
         if n_owner > 0 {

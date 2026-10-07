@@ -2,9 +2,16 @@
 
 In the work view, **Alt+d** opens the completion dialog for the selected task.
 **Keep worktrees** is the default. Use Tab or the arrow keys to select
-**Reap this task + descendants**, inspect the paths and retention reasons, and
-press Enter. Use j/k to scroll the preview or result. Escape cancels before
-submission, or closes the report afterward.
+**Reap this task + descendants** and press Enter. Reap does not wait for the
+preview: Enter marks the task done (or closes the workspace), closes the
+dialog, and the owning hosts resolve the preview and reap in the background
+with the same safety checks. The status bar shows progress (`⟲ cleanup:
+scanning`, `reaping 2/5`), and you are notified only if a checkout was kept or a
+host failed (a host that never accepts the request within 2 minutes counts as
+failed); a clean finish is a status line. Paths and reasons that have arrived
+are shown while the dialog is open; j/k scrolls them. Escape cancels before
+submission. Marking a workspace done without a selected task still waits for
+the preview, which names the task that owns it.
 
 **Alt+Shift+w** opens the same choice for closing a workspace. Closing a
 workspace does not mark its associated planning tasks done: any nonterminal
@@ -36,7 +43,8 @@ Task completion previews the owning host and other configured remote hosts,
 so CM children created on a different worker host can be included. A remote
 task does not include the laptop's retained migration copies. A workspace-only
 close stays on its owning host. Unavailable hosts are reported and must return
-a preview before recursive cleanup can be selected; Keep remains available.
+a preview of their own; the request to them is retried in the background and
+reported as failed if it is never accepted. Keep remains available.
 
 ## What cleanup includes
 
@@ -102,6 +110,18 @@ hook in another repository:
 python3 ~/.cm/worktree-tools/worktree_lineage.py install /absolute/repository
 ```
 
+## Preview speed
+
+A preview scans every checkout the host knows about (manifest, lineage
+records, Git's worktree lists) to register raw worktrees and owners. It used to
+re-register all of them with about seven Git processes each — 40 s for 226
+checkouts on a loaded cm-sessions (2026-10-07). Now a checkout whose stored
+record is current and already lists every owner and parent found is skipped
+without spawning Git; the Git common dir and branch are read from `.git`/`HEAD`
+(falling back to Git for anything unusual), `origin` is read once per
+repository, and Claude's subagent metadata is read only for candidate project
+directories. The same scan takes about 2 s.
+
 ## Durable jobs and recovery
 
 The operator-only daemon RPC is `worktree.cleanup` with actions `preview`,
@@ -112,10 +132,12 @@ returns `root_tasks` with their current status, including ownership resolved
 from a workspace path. Agent session callers cannot invoke
 this destructive RPC through MCP. Normal task/session permissions are unchanged.
 
-The TUI waits for every host to acknowledge its persisted cleanup request
-before completing the task. If the viewer exits before acknowledgment, it
-leaves the task open. Once queued, a detached host worker continues without the
-viewer and waits briefly for closure; a failed status update retains a
+`apply` is accepted at any point after `preview`: during the scan it is
+recorded durably on the job (`apply_requested`), and the scanning worker merges
+it under the request lock when it saves the preview, then continues straight
+into the cleanup. The TUI therefore submits Reap and completes the task at
+once. Once queued, a detached host worker continues without the viewer and
+waits briefly for closure; a failed status update retains a
 nonterminal task's checkout. Requests and per-path results are saved after every
 step under `~/.cm/worktree-cleanup/<id>.json`, with a sibling `.log`. The daemon
 resumes unfinished jobs at startup; a worker lock prevents duplicate execution.

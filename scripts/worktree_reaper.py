@@ -972,7 +972,14 @@ def encode_claude_project_path(path: Path) -> str:
 def load_native_parent_links(
     claude_projects: Path,
     parent_candidates: Iterable[Path],
+    *,
+    candidate_projects_only: bool = False,
 ) -> tuple[dict[Path, NativeParentLink], set[Path], list[str]]:
+    """Links Claude's subagent metadata records from child worktrees to their
+    parent checkouts. `candidate_projects_only` reads only the project
+    directories of `parent_candidates`: the links are identical (a link needs
+    its parent among the candidates), but `native_roots` then covers only
+    those projects, so callers that need every native root must not set it."""
     encoded_candidates: dict[str, list[Path]] = defaultdict(list)
     for candidate in parent_candidates:
         resolved = candidate.resolve(strict=False)
@@ -981,7 +988,14 @@ def load_native_parent_links(
     native_roots: set[Path] = set()
     warnings: list[str] = []
     try:
-        metadata_paths = claude_projects.glob("*/*/subagents/*.meta.json")
+        if candidate_projects_only:
+            metadata_paths = (
+                path
+                for project in sorted(encoded_candidates)
+                for path in (claude_projects / project).glob("*/subagents/*.meta.json")
+            )
+        else:
+            metadata_paths = claude_projects.glob("*/*/subagents/*.meta.json")
         for metadata_path in metadata_paths:
             try:
                 payload = json.loads(metadata_path.read_text())

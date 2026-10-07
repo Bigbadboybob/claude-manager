@@ -654,12 +654,8 @@ impl App {
     pub fn maybe_adopt_daemon_sessions(&mut self) {
         if let InputMode::WorktreeCleanup(menu) = &mut self.input_mode {
             self.needs_redraw |= menu.poll();
-            if menu.close_ready() {
-                let InputMode::WorktreeCleanup(menu) = std::mem::replace(&mut self.input_mode, InputMode::Normal) else { unreachable!() };
-                self.complete_with_cleanup(menu);
-                self.needs_redraw = true;
-            }
         }
+        self.cleanup_tick();
         if let InputMode::ContinuousControl(menu) = &mut self.input_mode {
             self.needs_redraw |= menu.poll();
         }

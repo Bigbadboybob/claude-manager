@@ -92,7 +92,9 @@ def path_absent(path: Path) -> bool:
 
 def inventory(ctx: reaper.ScanContext, root: Path | None = None) -> tuple[dict[str, dict], list[str]]:
     warnings = []
-    known = {Path(row['path']) for row in lineage.records().values()} | set(ctx.workspaces)
+    current = lineage.records()
+    by_path = {Path(row['path']): row for row in current.values()}
+    known = set(by_path) | set(ctx.workspaces)
     known.update(reaper.worktree_paths(home() / 'worktrees'))
     if root:
         known.add(root)
@@ -104,7 +106,7 @@ def inventory(ctx: reaper.ScanContext, root: Path | None = None) -> tuple[dict[s
         try:
             if path_absent(path):
                 continue
-            common = lineage.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+            common = lineage.common_dir(path)
             if common in repos:
                 continue
             repos.add(common)
@@ -114,7 +116,9 @@ def inventory(ctx: reaper.ScanContext, root: Path | None = None) -> tuple[dict[s
             lineage.install_hook(path)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             warnings.append(f'{path}: {exc}')
-    links, _, native_warnings = reaper.load_native_parent_links(Path.home() / '.claude/projects', known)
+    registered = False
+    links, _, native_warnings = reaper.load_native_parent_links(
+        Path.home() / '.claude/projects', known, candidate_projects_only=True)
     warnings.extend(native_warnings)
     for path in sorted(known):
         try:
@@ -122,19 +126,37 @@ def inventory(ctx: reaper.ScanContext, root: Path | None = None) -> tuple[dict[s
                 continue
             facts = ctx.workspaces.get(path, reaper.WorkspaceFacts())
             task_ids = set(facts.task_ids)
-            branch = lineage.git(path, 'branch', '--show-current')
-            try:
-                origin = reaper.canonical_repo_url(lineage.git(path, 'remote', 'get-url', 'origin'))
-            except subprocess.SubprocessError:
-                origin = None
-            task_ids.update(task.task_id for task in ctx.tasks_by_branch.get(branch, [])
-                            if origin and reaper.canonical_repo_url(task.repo_url) == origin)
+            branch = lineage.current_branch(path)
+            if ctx.tasks_by_branch.get(branch):
+                url = lineage.origin_url(path)
+                origin = reaper.canonical_repo_url(url) if url else None
+                task_ids.update(task.task_id for task in ctx.tasks_by_branch.get(branch, [])
+                                if origin and reaper.canonical_repo_url(task.repo_url) == origin)
             link = links.get(path)
+            if up_to_date(by_path.get(path), task_ids, link, by_path):
+                # Already registered with every owner and parent this scan
+                # would add: registering again would only re-run Git to
+                # recompute an identity the stored record already proves.
+                continue
             lineage.register(path, link.parent_worktree if link else None, task_ids=task_ids,
                              source='native-metadata' if link else 'inventory', inherit_session=False)
+            registered = True
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             warnings.append(f'{path}: {exc}')
-    return lineage.records(), warnings
+    return (lineage.records() if registered else current), warnings
+
+
+def up_to_date(record: dict | None, task_ids: set[str], link, by_path: dict[Path, dict]) -> bool:
+    """True when `register` could not change this checkout's record: its
+    identity is current (`lineage.records()` checked the stamp), it already
+    lists every task id found, and any native parent link is already a
+    recorded parent. Unknown parents always re-register."""
+    if record is None or not task_ids <= set(record.get('task_ids', [])):
+        return False
+    if link is None:
+        return True
+    parent = by_path.get(Path(link.parent_worktree).resolve()) if link.parent_worktree else None
+    return parent is not None and parent['id'] in record.get('parents', [])
 
 
 def selected_records(records: dict[str, dict], family: set[str], root: dict | None) -> list[dict]:
@@ -370,7 +392,25 @@ def preview(job: dict) -> None:
     job.update(phase='preview', family=sorted(family), candidates=planned, warnings=warnings,
                missing_root=missing_root,
                message=prefix + f'{len(planned)} tracked checkout(s). Active/shared work is retained; state is checked again after closing.')
-    write_job(job)
+    finish_preview(job)
+
+
+def finish_preview(job: dict) -> None:
+    """Save the preview, honouring an apply that arrived while it scanned.
+
+    The viewer submits Reap without waiting for the preview: `request(apply)`
+    then only records `apply_requested` on the scanning job. Merge that flag
+    under the request lock so this final write cannot drop it."""
+    path = job_path(job['id'])
+    with lineage.locked(path.with_suffix('.request-lock')):
+        try:
+            requested = read_job(job['id']).get('apply_requested')
+        except FileNotFoundError:
+            requested = False
+        if requested:
+            job.update(apply_requested=True, phase='queued',
+                       message='Cleanup queued; waiting for task closure.')
+        write_job(job)
 
 
 def apply(job: dict) -> None:
@@ -473,6 +513,13 @@ def request(params: dict) -> dict:
             job = read_job(ident)
             if job['phase'] in ('queued', 'running', 'complete'):
                 return job
+            if job['phase'] == 'scanning':
+                # Accepted durably now; the scanning worker runs the cleanup
+                # as soon as its preview is saved (finish_preview).
+                job.update(apply_requested=True,
+                           message='Cleanup accepted; it starts when the preview finishes.')
+                write_job(job)
+                return job
             if job['phase'] != 'preview':
                 raise ValueError('preview is not ready')
             job.update(phase='queued', message='Cleanup queued; waiting for task closure.')
@@ -489,7 +536,8 @@ def worker(ident: str) -> None:
         try:
             if job['phase'] == 'scanning':
                 preview(job)
-            elif job['phase'] in ('queued', 'running'):
+            # A preview that found an apply request continues straight on.
+            if job['phase'] in ('queued', 'running'):
                 # Serialize with the daily reaper. UI/RPC returns independently.
                 with lineage.locked(home() / 'worktree-reaper.lock'):
                     job.update(phase='running')
