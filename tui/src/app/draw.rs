@@ -2545,7 +2545,15 @@ impl App {
         } else {
             (rollup, rollup_width)
         };
-        let pad = area.width.saturating_sub(fixed + rollup_width);
+        // Owner's unread DMs / mentions (`✉2 @1 F8`), bottom right. Takes
+        // only spare room: shortens to the glyph, then disappears, rather
+        // than pushing anything else off the bar.
+        let unread = super::unread::indicator_variants(self.unread.dms, self.unread.mentions)
+            .into_iter()
+            .find(|v| fixed + rollup_width + v.chars().count() as u16 <= area.width)
+            .unwrap_or_default();
+        let unread_width = unread.chars().count() as u16;
+        let pad = area.width.saturating_sub(fixed + rollup_width + unread_width);
         let pad_left = pad / 2;
         let pad_right = pad - pad_left;
 
@@ -2569,6 +2577,12 @@ impl App {
         ];
         spans.extend(rollup);
         spans.push(Span::styled(right, Style::default().fg(theme::DIM)));
+        if !unread.is_empty() {
+            spans.push(Span::styled(
+                unread,
+                Style::default().fg(theme::BADGE_FG).bg(theme::ATTN).add_modifier(Modifier::BOLD),
+            ));
+        }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }

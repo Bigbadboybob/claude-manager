@@ -531,6 +531,11 @@ fn execute_with_freshness(
             return execute_with_freshness(state, req, true);
         }
     }
+    // Owner's unread counts only (the viewer's status-bar indicator polls
+    // this): skip every response decoration a full messaging call adds.
+    if req.method == "messaging.attention" {
+        return store.attention(&actor, false).map(|attention| json!({"attention": attention}));
+    }
     let result = match req.method.as_str() {
         "messaging.send" => {
             if kind != "owner" && !store.names.contains_key(&actor) {

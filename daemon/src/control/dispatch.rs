@@ -418,6 +418,7 @@ pub fn dispatch_request(
         "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.availability" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.attention" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "sidebar.list" | "sidebar.assign" => {
             if matches!(req.caller, Caller::Operator(_)) {

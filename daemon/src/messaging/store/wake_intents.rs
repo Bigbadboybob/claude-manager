@@ -156,6 +156,20 @@ impl Store {
             })
             .collect();
         let unread = inbox.len();
+        // Split for the viewer's status-bar indicator (same pass): unread
+        // DMs (incl. group DMs) and unread messages that mention Owner
+        // directly or through @here.
+        let dms = inbox
+            .iter()
+            .filter(|e| self.conversations.contains_key(strv(&e.event, "conversation_id")))
+            .count();
+        let mentions = inbox
+            .iter()
+            .filter(|e| {
+                !self.conversations.contains_key(strv(&e.event, "conversation_id"))
+                    && (mention_recipients(&e.event).contains(&actor) || e.event["data"]["mention_here"] == true)
+            })
+            .count();
         let mut ring = inbox
             .iter()
             .any(|e| e.position > state.bell_position && !self.preference_for_event(actor, e).2);
@@ -186,7 +200,7 @@ impl Store {
             self.save_personal(state)?;
         }
         Ok(
-            json!({"unread":unread,"ring":claim && ring,"monitor_badges":self.monitor_status(actor)["badges"]}),
+            json!({"unread":unread,"dms":dms,"mentions":mentions,"ring":claim && ring,"monitor_badges":self.monitor_status(actor)["badges"]}),
         )
     }
 }

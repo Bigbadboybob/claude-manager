@@ -64,6 +64,7 @@ mod availability;
 mod agent_state;
 mod board;
 mod owner_blocked;
+mod unread;
 
 pub(crate) use lifecycle::try_attach_via_daemon_with_deps;
 
@@ -266,6 +267,7 @@ pub struct App {
     owner_blocked: owner_blocked::OwnerBlocked,
     /// Reap requests submitted from the cleanup dialog, tracked after it closed.
     cleanup_jobs: Vec<worktree_cleanup::Menu>,
+    unread: unread::Unread,
     pub backend: BackendHandle,
     pub connected: bool,
     pub status_msg: Option<(String, Instant)>,
@@ -932,6 +934,7 @@ impl App {
             board: board::Board::default(),
             owner_blocked: owner_blocked::OwnerBlocked::default(),
             cleanup_jobs: Vec::new(),
+            unread: unread::Unread::default(),
             backend,
             connected: false,
             status_msg: None,

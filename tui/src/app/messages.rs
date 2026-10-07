@@ -383,6 +383,10 @@ impl Messages {
             self.status = format!("Matches: {}", matches.join(", "));
         }
     }
+    #[cfg(test)]
+    pub(super) fn target_for_test(&self) -> &Value {
+        &self.target
+    }
     fn sync_label(&self) -> String {
         if self.sync["enabled"] != true {
             return String::new();
@@ -422,6 +426,22 @@ impl Messages {
     }
 }
 impl App {
+    /// F8 / Alt+m opening Messages while something is unread: start on the
+    /// Inbox, newest first, instead of the last channel (status-bar `✉`/`@`).
+    fn open_messages_on_unread(&mut self) {
+        if self.unread.total() == 0 {
+            return;
+        }
+        self.messages.menu = 0;
+        self.messages.target = json!({"inbox": true});
+        self.messages.filter = json!({});
+        self.messages.page_cursor = Value::Null;
+        self.messages.pane = 1;
+        self.messages.selected = 0;
+        self.messages.body_scroll = 0;
+        self.messages.channel_selection_pending = false;
+    }
+
     pub fn messaging_tick(&mut self) {
         // Refreshes run off-thread, but input still belongs to the operator.
         // Replay it in order before starting another refresh. Closing the panel
@@ -752,6 +772,7 @@ impl App {
         {
             self.messages.visible = !self.messages.visible;
             if self.messages.visible {
+                self.open_messages_on_unread();
                 self.messaging_request("bootstrap", json!({}));
             }
             return true;
