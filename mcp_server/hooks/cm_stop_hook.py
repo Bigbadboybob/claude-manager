@@ -49,9 +49,18 @@ def _report_turn_ended(
     payload: dict | None = None,
     observed_at: float | None = None,
 ) -> None:
-    """Forward Stop state with legacy method-not-found fallback, fail open."""
+    """Forward Stop state; a partial payload must still report the turn end."""
     try:
-        from mcp_server.hooks.cm_state_hook import report
+        try:
+            from mcp_server.hooks.cm_state_hook import report
+        except ImportError:
+            from mcp_server import control_client
+
+            legacy = {"session_uid": uid, "continuing": continuing}
+            if transcript_path:
+                legacy["transcript_path"] = transcript_path
+            control_client.call("session.turn_ended", legacy, timeout=3.0)
+            return
 
         data = dict(payload or {})
         data["hook_event_name"] = "Stop"

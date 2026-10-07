@@ -61,6 +61,9 @@ from mcp_server.monitor import (
     _read_all_messages,
     _READ_ALL_LIMIT,
     _session_status,
+    engine_state,
+    engine_turn_complete,
+    _edge_passed,
     SEMANTIC_IDLE_GRACE_S,
     transcript_turn_complete,
 )
@@ -1357,6 +1360,7 @@ def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
             s.get("state", "pending"),
             bool(s.get("idle", False)),
             bool(s.get("reported_done", False)),
+            s.get("agent_state"),
         )
         for k in _SESSION_NOISE_FIELDS:
             s.pop(k, None)
@@ -1408,13 +1412,18 @@ def list_sessions(
             signal — and what it said. Present on live rows AND on exited
             ones, so "finished, then exited" is distinguishable from
             "stopped mid-task".
-        status ∈ {"starting", "working", "awaiting_input", "reported",
-            "exited"} — the legible summary; branch on this instead of
+        status ∈ {"starting", "working", "awaiting_input", "needs_human",
+            "errored", "unknown", "reported", "exited"} — the legible summary; branch on this instead of
             decoding (state, idle) yourself. "reported" means the agent
             declared itself done and has had no new input since — it is
             the one status that means completion. "awaiting_input" means
             only that it stopped talking. See the status legend on
             `wait_for_session_idle`.
+        agent_state / pty_idle: engine-reported state and raw terminal quietness,
+            when available. needs_human means permission/input is needed;
+            errored means an engine failure; unknown never proves idle.
+            working-background keeps awaiting_input for compatibility but its
+            background jobs may still be running. These are not done reports.
         managed_by_uid: the session that spawned this one (None if
             operator-spawned) — the parent link for orchestration.
         task_id / workspace_id: grouping keys (see `list_sessions_grouped`).
@@ -2103,6 +2112,8 @@ _OUTCOME_FIELDS = (
     "reported_done_at",
     "report_reason",
     "prompt_delivery",
+    "agent_state",
+    "pty_idle",
 )
 
 
@@ -2147,8 +2158,8 @@ def read_session_output(
         - messages: list of {role, content, ts}
         - cursor: opaque, pass back on next call
         - state: "ready" | "pending" | "exited"
-        - status: "starting"|"working"|"awaiting_input"|"reported"|
-          "exited" — the legible summary; "reported" means the agent
+        - status: "starting"|"working"|"awaiting_input"|"needs_human"|
+          "errored"|"unknown"|"reported"|"exited" — the legible summary; "reported" means the agent
           called `report_done`.
         - When state="pending", messages is empty and you can poll again.
         - note: present only when no transcript is bound (messages empty).
@@ -2183,7 +2194,7 @@ def read_session_output(
             "generation": generation,
             "state": state,
             "idle": idle,
-            "status": _session_status(state, idle, reported),
+            "status": _session_status(state, idle, reported, resolved.get("agent_state")),
         }
         if transcript_path is None:
             out["note"] = _NO_TRANSCRIPT_NOTE
@@ -2202,7 +2213,7 @@ def read_session_output(
         "generation": generation,
         "state": state,
         "idle": idle,
-        "status": _session_status(state, idle, reported),
+        "status": _session_status(state, idle, reported, resolved.get("agent_state")),
     }, resolved)
 
 
@@ -2230,8 +2241,8 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
           message, or null if the agent hasn't produced one yet.
         - messages: the last `context_messages` rendered messages
           (oldest-first), for context around the final turn.
-        - status: "starting"|"working"|"awaiting_input"|"reported"|
-          "exited". "reported" is the only one that means the agent
+        - status: "starting"|"working"|"awaiting_input"|"needs_human"|
+          "errored"|"unknown"|"reported"|"exited". "reported" is the only one that means the agent
           considers the work DONE; "awaiting_input" just means it
           stopped talking.
         - cursor: end cursor — pass to `read_session_output(since_cursor=)`
@@ -2259,7 +2270,7 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
     generation = int(resolved.get("generation", 0))
     idle = bool(resolved.get("idle", False))
     status = _session_status(
-        state, idle, bool(resolved.get("reported_done", False))
+        state, idle, bool(resolved.get("reported_done", False)), resolved.get("agent_state")
     )
 
     if transcript_path is None:
@@ -2608,6 +2619,12 @@ async def wait_for_session_idle(
         - status="working" (idle=False, timed_out=True): deadline
           reached while still busy.
 
+    With agent_state, engine evidence governs the wait: idle, needs_human,
+    errored, or working-background after a foreground turn end can return.
+    Working, starting and unknown keep waiting even with idle=True. Results
+    include agent_state and pty_idle; a human wait or error is not finished work.
+    Legacy PTY/transcript fallback retains the quietness behavior below.
+
     Note: this returns on the FIRST quiet-at-prompt poll, which can race
     a slow-to-start agent right after `send_input` (the session looks
     quiet for ~2s before the agent's first token). To send a prompt and
@@ -2656,17 +2673,26 @@ async def wait_for_session_idle(
         reported = bool(resolved.get("reported_done", False))
         now = time.monotonic()
         if state == "exited":
-            return {
+            return _with_outcome({
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle, reported),
-            }
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+            }, resolved)
+        engine_done = engine_turn_complete(resolved)
+        if engine_done is not None:
+            if engine_done or now >= deadline:
+                return _with_outcome({
+                    "idle": engine_done, "timed_out": not engine_done, "state": state,
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+                }, resolved)
+            await asyncio.sleep(interval)
+            continue
         # A READY session (transcript bound) that's quiet is unambiguously
         # done with its turn — return immediately.
         if state == "ready" and idle:
-            return {
+            return _with_outcome({
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle, reported),
-            }
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+            }, resolved)
         # READY but PTY-busy: a background task's spinner keeps the PTY
         # noisy while the agent is at the prompt (false-busy). Consult
         # the transcript shape, debounced — see monitor.py. A daemon
@@ -2682,11 +2708,11 @@ async def wait_for_session_idle(
                 if resolved.get("semantic_idle") is True or (
                     now - semantic_idle_since >= SEMANTIC_IDLE_GRACE_S
                 ):
-                    return {
+                    return _with_outcome({
                         "idle": True, "timed_out": False, "state": state,
                         "status": "reported" if reported else "awaiting_input",
                         "idle_source": "transcript",
-                    }
+                    }, resolved)
             else:
                 semantic_idle_since = None
         # A `pending` session reports idle=True as soon as its PTY is
@@ -2705,17 +2731,17 @@ async def wait_for_session_idle(
             if pending_idle_since is None:
                 pending_idle_since = now
             elif now - pending_idle_since >= grace:
-                return {
+                return _with_outcome({
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle, reported),
-            }
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+            }, resolved)
         else:
             pending_idle_since = None
         if now >= deadline:
-            return {
+            return _with_outcome({
                 "idle": False, "timed_out": True, "state": state,
-                "status": _session_status(state, idle, reported),
-            }
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+            }, resolved)
         await asyncio.sleep(interval)
 
 
@@ -2864,11 +2890,16 @@ async def _await_reply(
     deadline: float,
     interval: float,
     grace: float,
+    agent_baseline: dict | None = None,
 ) -> dict:
     """Poll a session until its next reply lands and it goes quiet, or the
     deadline passes. Completion is anchored on transcript progress past
     `anchor_cursor` (a NEW assistant message must appear), so it can't
     return the turn that was already there when polling began.
+
+    When an engine counter was captured before sending, a newer turn_seq plus
+    a boundary/attention state is the completion evidence. Transcript reads only
+    supply message content; errors and human waits can return without a reply.
 
     Shared by `send_input_and_wait` (anchor = the transcript end captured
     just before the send) and `start_session(wait=True)` (anchor = None on
@@ -2927,6 +2958,7 @@ async def _await_reply(
             engine = resolved.get("engine", engine)
             generation = int(resolved.get("generation", generation))
         now = time.monotonic()
+        engine_done = engine_turn_complete(resolved)
 
         if state == "exited":
             last_message = await asyncio.to_thread(_final_read)
@@ -2937,31 +2969,36 @@ async def _await_reply(
             }
             if last_message is None and transcript_path is None:
                 out["note"] = _NO_TRANSCRIPT_NOTE
-            return out
+            return _with_outcome(out, resolved)
 
         if transcript_path is not None:
             # Transcript-anchored: pull new messages since the anchor, latch
             # the reply, complete only when a NEW assistant message exists
             # AND the session is quiet at the prompt.
-            new_msgs, cursor = await asyncio.to_thread(
-                _parser_for(engine).read_messages,
-                transcript_path, generation, cursor, _READ_ALL_LIMIT,
-            )
+            try:
+                new_msgs, cursor = await asyncio.to_thread(
+                    _parser_for(engine).read_messages,
+                    transcript_path, generation, cursor, _READ_ALL_LIMIT,
+                )
+            except OSError:
+                if engine_done is None:
+                    raise
+                new_msgs = []
             for m in new_msgs:
                 if m.role == Role.ASSISTANT:
                     saw_new_assistant = True
                     last_message = m.to_dict()
-            if saw_new_assistant and state == "ready" and idle:
-                return {
+            if engine_done is None and saw_new_assistant and state == "ready" and idle:
+                return _with_outcome({
                     "completed": True, "timed_out": False,
-                    "status": _session_status(state, idle, reported),
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
                     "state": state, "idle": idle, "last_message": last_message,
-                }
+                }, resolved)
             # New assistant reply + PTY still noisy: a background
             # task's spinner can hold `idle` false forever. Fall back
             # to transcript shape (debounced) — see monitor.py. A
             # daemon hook-confirmed `semantic_idle` skips the debounce.
-            if saw_new_assistant and state == "ready":
+            if engine_done is None and saw_new_assistant and state == "ready":
                 if await asyncio.to_thread(
                     transcript_turn_complete, engine, transcript_path
                 ):
@@ -2970,7 +3007,7 @@ async def _await_reply(
                     if resolved.get("semantic_idle") is True or (
                         now - semantic_idle_since >= SEMANTIC_IDLE_GRACE_S
                     ):
-                        return {
+                        return _with_outcome({
                             "completed": True, "timed_out": False,
                             "status": (
                                 "reported" if reported else "awaiting_input"
@@ -2978,37 +3015,57 @@ async def _await_reply(
                             "state": state, "idle": idle,
                             "last_message": last_message,
                             "idle_source": "transcript",
-                        }
+                        }, resolved)
                 else:
                     semantic_idle_since = None
-        else:
+        elif engine_done is None:
             # Transcript-less fallback == `wait_for_session_idle` semantics.
             if state == "ready" and idle:
-                return {
+                return _with_outcome({
                     "completed": True, "timed_out": False,
-                    "status": _session_status(state, idle, reported),
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
                     "state": state, "idle": idle, "last_message": None,
                     "note": _NO_TRANSCRIPT_NOTE,
-                }
+                }, resolved)
             if state == "pending" and idle:
                 if pending_idle_since is None:
                     pending_idle_since = now
                 elif now - pending_idle_since >= grace:
-                    return {
+                    return _with_outcome({
                         "completed": True, "timed_out": False,
-                        "status": _session_status(state, idle, reported),
+                        "status": _session_status(state, idle, reported, resolved.get("agent_state")),
                         "state": state, "idle": idle, "last_message": None,
                         "note": _NO_TRANSCRIPT_NOTE,
-                    }
+                    }, resolved)
             else:
                 pending_idle_since = None
 
+        if engine_done is not None:
+            edge_ok = (
+                _edge_passed(agent_baseline, engine, transcript_path, resolved)
+                if agent_baseline is not None else anchor_cursor is None or saw_new_assistant
+            )
+            if engine_done and edge_ok:
+                out = _with_outcome({
+                    "completed": True, "timed_out": False,
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+                    "state": state, "idle": idle, "last_message": last_message,
+                }, resolved)
+                if transcript_path is None:
+                    out["note"] = _NO_TRANSCRIPT_NOTE
+                return out
+            if now >= deadline:
+                return _with_outcome({
+                    "completed": False, "timed_out": True,
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+                    "state": state, "idle": idle, "last_message": last_message,
+                }, resolved)
         if now >= deadline:
-            return {
+            return _with_outcome({
                 "completed": False, "timed_out": True,
-                "status": _session_status(state, idle, reported),
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
                 "state": state, "idle": idle, "last_message": last_message,
-            }
+            }, resolved)
         await asyncio.sleep(interval)
 
 
@@ -3055,6 +3112,8 @@ async def _send_and_await(
         engine=engine, transcript_path=transcript_path,
         anchor_cursor=anchor_cursor, generation=generation,
         deadline=deadline, interval=interval, grace=grace,
+        agent_baseline=({"kind": "agent", "value": engine_state(pre).get("turn_seq")}
+                        if engine_state(pre) is not None else None),
     )
     res["delivered"] = True
     return res
@@ -3090,6 +3149,7 @@ async def _settle_schema(
             attempts_left <= 0
             or res.get("state") == "exited"
             or res.get("timed_out")
+            or res.get("status") in ("needs_human", "errored", "unknown")
             or time.monotonic() >= deadline
         )
         if stuck:

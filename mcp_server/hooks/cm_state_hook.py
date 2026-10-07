@@ -133,7 +133,7 @@ def normalize(
 def report(
     uid: str, payload: dict, *, observed_at: float, continuing: bool = False
 ) -> None:
-    """Send a bounded self-report; only an unknown method enables Stop fallback."""
+    """Send state, preserving a Stop boundary through older/restarting daemons."""
     try:
         from mcp_server import control_client
 
@@ -149,6 +149,8 @@ def report(
                 "unknown_method",
                 "method_not_found",
                 -32601,
+                "conflict",
+                "invalid_params",
             }:
                 return
             remaining = deadline - time.monotonic()

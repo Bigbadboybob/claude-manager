@@ -222,9 +222,12 @@ current epoch continue to work.
 
 The synchronous Stop hook retains its inbox drain and block/reason behavior.
 It reports normalized background tasks and session crons, bounded assistant
-text, `stop_hook_active` and `continuing` through `session.agent_report`. Only a
-method-not-found reply enables the legacy `session.turn_ended` fallback; a
-transport, authorization or validation failure does not. The report is best
+text, `stop_hook_active` and `continuing` through `session.agent_report`. A
+method-not-found, conflict (including brain restart), or invalid-params reply
+enables the legacy `session.turn_ended` fallback; transport and authorization
+failures do not. A partial payload missing the shared helper sends the legacy
+report inline. Accepted continuation reports refresh legacy activity even when
+a newer engine start already opened the turn. The report is best
 effort and fails open. New UserPromptSubmit, StopFailure, PermissionRequest and
 Notification hooks run asynchronously and double-fork before daemon IPC. They
 print nothing and make no permission decisions. Events carrying a subagent
@@ -247,6 +250,35 @@ The launcher loads the updated Stop script for existing sessions. The other
 events are frozen in Claude's launch settings and require a new session or
 A-R; reconnecting MCP alone does not install them. Presence and transcript
 observation continue to support sessions with the older launch settings.
+
+## MCP consumers (S6)
+
+Session listings, reads, waits and monitor results expose `agent_state` and
+`pty_idle` when supplied by the daemon. Status maps engine `working` to
+`working`, `idle` and `working-background` to `awaiting_input`,
+`waiting-on-human` to `needs_human`, and `errored`/`unknown` to their own words.
+`starting`, `reported` and `exited` retain their meanings. Background results
+include the engine detail and a notification caveat; `needs_human` is not done.
+
+A turn wait returns on engine idle, error, human wait, or background work after
+a recorded foreground turn end. Working, starting and unknown keep waiting
+even when the compatibility `idle` bit is true. Explicit `source=pty` or
+`transcript` observations and old daemons retain the existing transcript/PTY
+path. Transcript content is still read to return messages; it cannot override
+an engine working/unknown state to complete a wait.
+
+Edge monitors anchor on `turn_seq`. Arming during `working` includes the current
+turn; arming at a boundary requires a later turn. A new engine `last_turn.ended_at`
+also passes an unchanged counter for older Claude sessions that lack a prompt
+hook on machine-injected starts. Receipt/heartbeat timestamps never count. A source upgrade re-anchors
+old transcript baselines to engine counters. Send-and-wait captures the counter
+before sending, so an old reply cannot satisfy the new request. Errors or human
+waits can return without assistant text. Schema correction does not send another
+prompt while the engine needs attention. `until=final` still requires an explicit
+new `report_done` or exit, re-arming past interim turn boundaries.
+
+Deploy the MCP payload and reconnect existing MCP callers for these consumer
+changes. The continuation follow-up also needs the updated daemon brain.
 
 ## Codex relay (S4/S5)
 

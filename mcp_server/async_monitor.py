@@ -41,6 +41,8 @@ from mcp_server.launch_confirmation import await_launch_confirmation
 from mcp_server.monitor import (
     _monitor_sessions,
     baseline_for,
+    engine_state,
+    engine_turn_complete,
     report_anchor_for,
     transcript_turn_complete,
 )
@@ -142,6 +144,8 @@ def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
     # in its `until="final"` form: firing on it would wake the caller with
     # news it already had, so it is anchored (and the caller is TOLD).
     anchor = report_anchor_for(resolved)
+    if engine_state(resolved) is not None:
+        return baseline_for(engine, tpath, resolved), bool(engine_turn_complete(resolved)), anchor
     if state != "ready" or not tpath:
         # Starting / transcript-less (bash): nothing to anchor an edge
         # on — level behavior, which is right for a fresh spawn (its
@@ -545,6 +549,14 @@ def _entry_lines(entry: dict) -> list[str]:
             "  turn ended per transcript; PTY still active — background "
             "work may still be running"
         )
+    agent = engine_state(entry)
+    if agent is not None:
+        if agent.get("state") == "working-background":
+            lines.append("  foreground turn ended; background work is still running")
+        elif agent.get("state") == "waiting-on-human":
+            lines.append("  human input or permission needed; this is not a done report")
+        elif agent.get("state") == "errored":
+            lines.append("  the engine reported an error; inspect it before continuing")
     if not killed and not reported and entry.get("state") != "exited":
         lines.append(
             "  (no explicit done-report — this may be an interim turn, "
@@ -633,6 +645,12 @@ def _format_fire_message(record: dict, result: dict) -> str:
             "(Async monitor notification. The watched session(s) have "
             "EXITED — there is no prompt left to send follow-ups to. Read "
             "what they left with read_last_turn, or start a fresh session.)"
+        )
+    elif any(e.get("status") in ("needs_human", "errored") for e in done):
+        lines.append(
+            "(Async monitor notification. A watched session needs attention. "
+            "Inspect its agent_state and read_last_turn; a human wait or error "
+            "does not mean the work is finished.)"
         )
     else:
         lines.append(

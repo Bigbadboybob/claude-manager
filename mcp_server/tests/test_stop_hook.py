@@ -142,8 +142,14 @@ class StopHookTests(unittest.TestCase):
         self.assertEqual(len(body["background"]["crons"]), 1)
         self.assertEqual(body["last_assistant_message"], "Turn finished.")
 
-    def test_only_method_not_found_permits_legacy_fallback(self):
-        for code in ("unknown_method", "method_not_found", -32601):
+    def test_compatibility_and_restart_errors_permit_legacy_fallback(self):
+        for code in (
+            "unknown_method",
+            "method_not_found",
+            -32601,
+            "conflict",
+            "invalid_params",
+        ):
             with (
                 self.subTest(code=code),
                 patch.object(
@@ -174,8 +180,6 @@ class StopHookTests(unittest.TestCase):
                 )
         for error in (
             control_client.ControlError("unauthorized", "no"),
-            control_client.ControlError("conflict", "restart"),
-            control_client.ControlError("invalid_params", "invalid"),
             control_client.TransportError("offline"),
             TimeoutError(),
         ):
@@ -185,6 +189,24 @@ class StopHookTests(unittest.TestCase):
             ):
                 cm_stop_hook._report_turn_ended("ts-test")
                 self.assertEqual(call.call_count, 1)
+
+    def test_partial_payload_without_shared_helper_reports_inline(self):
+        with (
+            patch.dict(sys.modules, {"mcp_server.hooks.cm_state_hook": None}),
+            patch.object(control_client, "call", return_value={}) as call,
+        ):
+            cm_stop_hook._report_turn_ended(
+                "ts-test", "/fixture/t.jsonl", continuing=True
+            )
+        call.assert_called_once_with(
+            "session.turn_ended",
+            {
+                "session_uid": "ts-test",
+                "continuing": True,
+                "transcript_path": "/fixture/t.jsonl",
+            },
+            timeout=3.0,
+        )
 
     def test_subagent_stop_does_not_consume_inbox_or_report(self):
         import io

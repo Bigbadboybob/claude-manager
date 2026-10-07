@@ -2864,11 +2864,14 @@ pub fn session_agent_report(
     }
     // Establish a pre-report baseline even if the periodic tick has not run yet.
     crate::agent_state::recompute_and_publish(&state, &p.session_uid);
+    let continuing = matches!(&p.report, crate::agent_state::Report::Hook {
+        event: crate::agent_state::HookEvent::Stop, payload,
+    } if payload.continuing);
     let applied = session.agent_state.lock().unwrap_or_else(|p| p.into_inner())
         .apply(p.report, crate::agent_state::unix_now())
         .map_err(|e| (ErrorCode::InvalidParams, e))?;
     if applied.accepted {
-        if applied.started { session.stamp_engine_activity(); }
+        if applied.started || continuing { session.stamp_engine_activity(); }
         if applied.ended { session.stamp_turn_end(); }
         rebind_reported_transcript(&mut state, &p.session_uid, applied.transcript_path.as_deref());
         crate::agent_state::recompute_and_publish(&state, &p.session_uid);
@@ -33472,6 +33475,33 @@ while True:
         state.lock().unwrap().restarting = true;
         assert_eq!(session_agent_report(&state, &params, Some(uid)).unwrap_err().0, ErrorCode::Conflict);
         state.lock().unwrap().restarting = false;
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn agent_report_late_continuing_stop_refreshes_legacy_activity_without_extra_turn() {
+        let state = make_state_arc();
+        let uid = "ts-continuing-hook";
+        insert_session(&state, uid, "ws-state");
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
+        let now = now_unix_f64();
+        session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
+            "event":"UserPromptSubmit", "payload":{"observed_at":now}}), Some(uid)).unwrap();
+        {
+            let s = state.lock().unwrap();
+            s.sessions[uid].stamp_turn_end();
+            s.sessions[uid].stamp_reported_done(Some("before inbox continuation".into()));
+            assert_eq!(s.sessions[uid].semantic_idle(), Some(true));
+        }
+        let answer = session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
+            "event":"Stop", "payload":{"observed_at":now - 1.0, "continuing":true}}), Some(uid)).unwrap();
+        assert_eq!(answer["applied"], true);
+        assert_eq!(answer["agent_state"]["turn_seq"], 1, "a newer engine start already opened this turn");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.sessions[uid].semantic_idle(), Some(false));
+            assert!(s.sessions[uid].reported_done().is_none());
+        }
         kill_all_sessions(&state);
     }
 
