@@ -84,6 +84,11 @@ older holder to discard the armed pin. The change takes effect when a brain
 containing it performs the next restart; the first deploy from an older brain
 still uses that older brain's exit path.
 
+The holder also treats `ECONNRESET` as channel EOF, preserving an acknowledged
+arm when an older brain exits with unread frames. That change requires
+`daemon.upgrade_holder`; deploying only the brain does not update the running
+holder. Malformed frames and watchdog failures still take the crash path.
+
 **Check the pin first** (`ps -o cmd -p $(pgrep -f cm-holder)`): when the holder
 runs `--brain /opt/cm-daemon/cm-daemon` — true on cm-sessions since 2026-09-12
 as well as on cm-manager — `cm-redeploy --yes` builds but re-pins the OLD

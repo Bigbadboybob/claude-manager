@@ -661,6 +661,11 @@ impl FrameReader {
             return match err.raw_os_error() {
                 Some(libc::EAGAIN) => Ok(FeedStatus::WouldBlock),
                 Some(libc::EINTR) => Ok(FeedStatus::WouldBlock),
+                // Unix streams report reset when a peer exits with unread
+                // inbound frames. This is peer closure, just like recv == 0,
+                // not evidence of malformed protocol. In particular, a
+                // holder must retain an already-acknowledged deploy arm.
+                Some(libc::ECONNRESET) => Ok(FeedStatus::Eof),
                 _ => Err(ProtocolViolation(format!("recvmsg: {err}"))),
             };
         }
@@ -770,6 +775,21 @@ pub fn recv_frame_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_close_is_eof_even_when_the_peer_left_unread_input() {
+        use std::io::Write;
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+        for unread in [false, true] {
+            let (mut local, peer) = UnixStream::pair().unwrap();
+            if unread {
+                local.write_all(b"queued before peer exit").unwrap();
+            }
+            drop(peer);
+            assert_eq!(FrameReader::new().feed(local.as_fd()).unwrap(), FeedStatus::Eof);
+        }
+    }
 
     #[test]
     fn frame_roundtrips_through_wire_encoding() {

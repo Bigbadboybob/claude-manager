@@ -1244,6 +1244,32 @@ fn deploy_verbs_arm_disarm_and_survive_to_the_supervisor() {
     ));
 }
 
+#[test]
+fn armed_deploy_survives_brain_close_with_unread_holder_reply() {
+    use cm_holder::holder::ArmedDeploy;
+    let (join, mut brain) = start(Holder::new(test_config()));
+    brain.hello();
+    let pin = std::fs::File::open("/bin/true").unwrap();
+    ch::send_frame_blocking(brain.fd.as_fd(), &Frame::new(
+        verbs::RESTART_BRAIN, Some(700), 1, serde_json::json!({}),
+    ), &[pin.as_raw_fd()]).unwrap();
+    assert_eq!(brain.wait_reply(700).0.v, verbs::OK);
+    // Leave a complete reply in the brain's kernel receive queue. Its close
+    // then produces ECONNRESET on the holder, exactly like the old brain's
+    // exit(0) racing an unsolicited ping after a successful deploy arm.
+    brain.send(verbs::STATUS, serde_json::json!({}));
+    let mut pfd = libc::pollfd {
+        fd: brain.fd.as_raw_fd(), events: libc::POLLIN, revents: 0,
+    };
+    assert!(unsafe { libc::poll(&mut pfd, 1, 2000) } > 0);
+    assert_ne!(pfd.revents & libc::POLLIN, 0);
+    drop(brain);
+    let (mut holder, outcome) = join.join().unwrap();
+    assert_eq!(outcome, ServeOutcome::BrainEof, "reset is peer close, not malformed protocol");
+    assert!(matches!(holder.take_armed_deploy(), Some(ArmedDeploy::NewPin(_))));
+    assert!(holder.take_armed_deploy().is_none());
+}
+
 /// Review F1: once `split_rollback` is ARMED, the holder must never
 /// consume an exit status — the standard manifest cannot represent a
 /// consumed `waitid`, so a late exit is LATCHED (zombie parked) and
