@@ -2398,6 +2398,7 @@ impl App {
     pub fn is_input_mode(&self) -> bool {
         self.global_settings.is_open()
             || self.availability.is_open()
+            || self.board.visible
             || !matches!(self.input_mode, InputMode::Normal)
     }
 
@@ -2851,6 +2852,7 @@ impl App {
         self.needs_redraw = true;
         if self.global_settings.handle_event(event) { return true; }
         if self.availability_event(event) { return true; }
+        if self.board_event(event) { return true; }
         // Alt+M toggles mouse capture, including while Messages is open.
         // Terminals may report shifted letters as uppercase or lowercase + Shift.
         if let CrosstermEvent::Key(key) = event {

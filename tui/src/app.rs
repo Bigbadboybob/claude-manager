@@ -61,6 +61,7 @@ mod messages;
 mod global_settings;
 mod availability;
 mod agent_state;
+mod board;
 
 pub(crate) use lifecycle::try_attach_via_daemon_with_deps;
 
@@ -259,6 +260,7 @@ pub struct App {
     pub config: Config,
     global_settings: global_settings::GlobalSettings,
     availability: availability::Availability,
+    board: board::Board,
     pub backend: BackendHandle,
     pub connected: bool,
     pub status_msg: Option<(String, Instant)>,
@@ -920,6 +922,7 @@ impl App {
             config,
             global_settings: global_settings::GlobalSettings::load(),
             availability: availability::Availability::load(),
+            board: board::Board::default(),
             backend,
             connected: false,
             status_msg: None,

@@ -134,6 +134,12 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.board.visible {
+            self.draw_board(frame);
+            self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
+            return;
+        }
         if self.messages.visible {
             self.draw_messages(frame);
             self.global_settings.draw(frame, frame.area());

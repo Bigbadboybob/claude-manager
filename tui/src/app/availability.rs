@@ -138,19 +138,25 @@ impl App {
         }
     }
 
-    fn availability_save(&mut self, cursor: usize) {
-        // Local daemon first (the messages pane's host), then every other
-        // configured host. Sockets/tokens are resolved here, non-blocking.
+    /// Operator RPC targets for Owner-scoped calls: the local daemon first
+    /// (the messages pane's host), then every other configured host, so a
+    /// laptop daemon that predates a method falls through to one that has
+    /// it. `(host name, socket, operator token)`; resolved non-blocking.
+    pub(super) fn owner_rpc_targets(&self) -> Vec<(String, PathBuf, String)> {
         let local = cm_daemon::host_id::HostId::local();
         let mut hosts = vec![local.clone()];
         hosts.extend(self.host_pool.host_ids().into_iter().filter(|h| *h != local));
-        let targets: Vec<(String, PathBuf, String)> = hosts
+        hosts
             .iter()
             .filter_map(|h| {
                 let socket = self.host_pool.live_socket_path(h)?;
                 Some((h.to_string(), socket, self.host_pool.operator_token_for(h)))
             })
-            .collect();
+            .collect()
+    }
+
+    fn availability_save(&mut self, cursor: usize) {
+        let targets = self.owner_rpc_targets();
         if targets.is_empty() {
             if let Some(d) = self.availability.dialog.as_mut() {
                 d.error = Some("No daemon is reachable".into());
