@@ -6,6 +6,7 @@
 //! checks editing rights, stamps the `actor`, and forwards.
 
 pub mod api;
+pub mod chat;
 pub mod heartbeat;
 pub mod held;
 pub mod rpc;

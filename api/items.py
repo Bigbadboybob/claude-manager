@@ -14,6 +14,7 @@ from api.items_models import (
     ItemResolveBody,
     ItemsCreateBody,
     ItemsPatchBody,
+    ItemsTouchBody,
 )
 from dispatch import items_db
 from dispatch.items_rules import ItemsError
@@ -86,6 +87,13 @@ async def update_items(ref: str, body: ItemsPatchBody, request: Request):
         _pool(request), ref, body.actor.model_dump(), body.ns, fields,
         add_holders=[h.model_dump() for h in body.add_holders or []],
         remove_holders=body.remove_holders, reason=body.reason))
+
+
+@router.post("/boards/{ref}/items/touch")
+async def touch_items(ref: str, body: ItemsTouchBody, request: Request):
+    return await _call(items_db.touch_items(
+        _pool(request), ref, body.actor.model_dump(), body.ns, source=body.source,
+        message_id=body.message_id, excerpt=body.excerpt))
 
 
 @router.post("/boards/{ref}/items/{n}/resolve")

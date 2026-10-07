@@ -528,6 +528,22 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         await self.patch(2, actor=orch, note="noted", ok=True)
         self.assertEqual(len(await self.fetch("SELECT 1 FROM item_pushes WHERE kind = 'owner_blocked'")), n)
 
+    async def test_touch_endpoint_records_chat_refs_without_changing_the_item(self):
+        await self.create({"title": "a", "holders": [LANE], "note": "keep"}, {"title": "b"})
+        before = (await self.fetch("SELECT touched_at FROM items WHERE number = 1"))[0]["touched_at"]
+        r = await self.post(f"/boards/{self.ref}/items/touch", {
+            "actor": LANE, "ns": [1, 2, 99], "source": "chat", "message_id": "m-1", "excerpt": "see #1"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["touched"], [1])
+        self.assertEqual({s["n"]: s["reason"] for s in r.json()["skipped"]}, {2: "not_holder", 99: "not_found"})
+        row = (await self.fetch("SELECT touched_at, status, note FROM items WHERE number = 1"))[0]
+        self.assertGreater(row["touched_at"], before)
+        self.assertEqual((row["status"], row["note"]), ("active", "keep"))
+        (event,) = await self.fetch("SELECT type, new FROM item_events WHERE type = 'chat_ref'")
+        self.assertEqual(event["new"], {"message_id": "m-1", "excerpt": "see #1"})
+        bad = await self.post(f"/boards/{self.ref}/items/touch", {"actor": LANE, "ns": [1], "source": "Chat!"})
+        self.assertEqual(bad.status_code, 422)
+
     async def test_answer_resolves_blocked_on_owner(self):
         await self.create({"title": "gpu", "holders": [LANE]})
         await self.patch(1, actor=LANE, status="blocked_on_owner", blocked_on="approve?")

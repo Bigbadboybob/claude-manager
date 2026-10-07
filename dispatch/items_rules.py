@@ -100,6 +100,7 @@ class Item:
     archived_at: datetime | None = None
     created_by: str | None = None
     created_at: datetime | None = None
+    stale_nudged_at: datetime | None = None
     holders: list = field(default_factory=list)       # [{pid, name, session_uid, daemon_id}]
     blocked_by: set = field(default_factory=set)      # item numbers
     open_flags: dict = field(default_factory=dict)    # kind -> {raised_at, detail}
@@ -537,8 +538,9 @@ class BoardTx:
         elif status == "dropped" and prev_status not in CLOSED:
             self._flag_dependents_dropped(it)
 
-        if status != prev_status or "note" in fields or holders_changed:
-            it.touched_at = self.now
+        # Any board member's write is a check-in: it resets the stale clock
+        # (the engine never writes items through apply).
+        it.touched_at = self.now
 
         # Assigned pushes (rule 8).
         for h in it.holders:
@@ -557,6 +559,8 @@ class BoardTx:
             if changed:
                 self._event(it, "updated", prev={k: prev[k] for k in changed},
                             new={k: new[k] for k in changed}, reason=reason)
+            else:
+                self._event(it, "touched", new={"via": "item_set"}, reason=reason)
 
     def _cascade_done(self, it: Item):
         for dep in self._dependents(it.n):
@@ -587,6 +591,30 @@ class BoardTx:
                              if self.items.get(b) and self.items[b].status == "dropped")
             self.raise_flag(dep, "blocker_dropped", {"blockers": dropped})
             self.dirty.add(dep.n)
+
+    def touch(self, ns: list[int], *, source: str, message_id: str | None = None,
+              excerpt: str | None = None) -> tuple[list[int], list[dict]]:
+        """Observed activity on items (a holder's chat post naming `#N`):
+        reset the stale clock and append history. Never changes status or
+        note. Only open items the actor holds are touched."""
+        touched, skipped = [], []
+        for n in dict.fromkeys(ns):
+            it = self.items.get(n)
+            if it is None or it.archived_at is not None:
+                skipped.append({"n": n, "reason": "not_found"})
+            elif it.status in CLOSED:
+                skipped.append({"n": n, "reason": "closed"})
+            elif self.actor["pid"] not in [h["pid"] for h in it.holders]:
+                skipped.append({"n": n, "reason": "not_holder"})
+            else:
+                it.touched_at = self.now
+                self.dirty.add(n)
+                self._event(it, f"{source}_ref", new={
+                    "message_id": message_id,
+                    "excerpt": (excerpt or "")[:200] or None,
+                })
+                touched.append(n)
+        return touched, skipped
 
     def resolve(self, n: int, action: str, *, kind: str | None = None, holders=None,
                 blocked_by=None, blocked_on=None, check_back=None, reason=None,
@@ -630,6 +658,7 @@ class BoardTx:
                 text += f" {self.actor.get('name') or self.actor['pid']}: {extra}"
             for h in it.holders:
                 self._push(it, h, "nudge", text)
+            it.touched_at = self.now  # a member acted on it
             self._event(it, "resolved", new={"action": action, "flags": resolved}, reason=reason)
             self.dirty.add(n)
             return resolved

@@ -333,14 +333,15 @@ class Waiting(unittest.TestCase):
 
 
 class TouchEventsAndPushes(unittest.TestCase):
-    def test_touch_on_status_note_holders_only(self):
+    def test_any_members_write_touches_the_item(self):
         b = Board()
-        b.create("x")
+        b.create({"title": "x", "holders": [LANE]})
         later = NOW + timedelta(hours=1)
-        b.set(1, now=later, group="RL")
-        self.assertEqual(b[1].touched_at, NOW)
-        b.set(1, now=later, note="hi")
+        b.set(1, actor=ORCH, now=later, group="RL")  # the orchestrator, not the holder
         self.assertEqual(b[1].touched_at, later)
+        even_later = later + timedelta(hours=1)
+        b.set(1, actor=OTHER, now=even_later, blocked_on="EP GO", check_back="2h")
+        self.assertEqual(b[1].touched_at, even_later)
 
     def test_update_event_records_only_changed_fields(self):
         b = Board()
@@ -352,10 +353,36 @@ class TouchEventsAndPushes(unittest.TestCase):
         self.assertEqual(event["new"], {"note": "n", "group": "g"})
         self.assertEqual(event["reason"], "why")
 
-    def test_noop_update_writes_no_event(self):
+    def test_noop_update_is_a_touch_event(self):
         b = Board()
         b.create({"title": "x", "note": "n"})
-        self.assertEqual(b.set(1, note="n").events, [])
+        later = NOW + timedelta(minutes=5)
+        tx = b.set(1, now=later, note="n")
+        self.assertEqual([e["type"] for e in tx.events], ["touched"])
+        self.assertEqual(b[1].touched_at, later)
+
+    def test_chat_touch_only_resets_the_clock_of_open_items_the_sender_holds(self):
+        b = Board()
+        b.create({"title": "mine", "holders": [LANE], "note": "keep"}, {"title": "theirs", "holders": [OTHER]},
+                 {"title": "closed", "holders": [LANE]})
+        b.set(3, actor=LANE, status="done")
+        later = NOW + timedelta(hours=3)
+        tx = BoardTx(b.board, b.items, LANE, later)
+        touched, skipped = tx.touch([1, 2, 3, 9], source="chat", message_id="m1", excerpt="x" * 500)
+        self.assertEqual(touched, [1])
+        self.assertEqual({s["n"]: s["reason"] for s in skipped}, {2: "not_holder", 3: "closed", 9: "not_found"})
+        self.assertEqual((b[1].touched_at, b[1].status, b[1].note), (later, "active", "keep"))
+        (event,) = tx.events
+        self.assertEqual(event["type"], "chat_ref")
+        self.assertEqual(event["new"]["message_id"], "m1")
+        self.assertEqual(len(event["new"]["excerpt"]), 200)
+
+    def test_nudge_resolve_touches(self):
+        b = Board()
+        b.create({"title": "x", "holders": [LANE]})
+        later = NOW + timedelta(hours=1)
+        BoardTx(b.board, b.items, ORCH, later).resolve(1, "nudge")
+        self.assertEqual(b[1].touched_at, later)
 
     def test_assigned_push_only_when_someone_else_adds_you(self):
         b = Board()

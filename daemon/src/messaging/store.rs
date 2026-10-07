@@ -2084,6 +2084,15 @@ impl Store {
         }
         json!(statuses)
     }
+    /// The body of a message, for readers outside messaging (the items board
+    /// resolves `#N` in a thread's root). Read-only.
+    pub fn message_body(&self, id: &str) -> Option<String> {
+        self.events
+            .iter()
+            .rev()
+            .find(|p| p.event["id"] == id && p.event["type"] == "message.create")
+            .and_then(|p| p.event["body"].as_str().map(str::to_owned))
+    }
     pub fn notifications(&self) -> Vec<(String, String, String)> {
         self.wake_intents()
             .into_iter()

@@ -34,8 +34,36 @@ ARCHIVE_AFTER = timedelta(hours=24)
 # raised by the write path; the engine keeps it consistent.)
 ENGINE_KINDS = frozenset({
     "unassigned", "holder_gone", "holder_idle", "holder_waiting_on_human",
-    "holder_errored", "stale", "overdue", "check_back", "blocker_dropped",
+    "holder_errored", "stale", "stale_background", "overdue", "check_back",
+    "blocker_dropped",
 })
+
+
+def background_busy(row: dict | None, now: datetime) -> bool:
+    """A holder whose engine reports background work (W1b agent_state):
+    `working-background`, or a live background job that will wake the agent
+    (a subagent, monitor or shell it waits on). Stale rows never count."""
+    if row is None or row.get("exited_at") is not None:
+        return False
+    if _seconds(now - row["reported_at"]) > STATE_FRESH_S:
+        return False
+    if row.get("state") == "working-background":
+        return True
+    jobs = ((row.get("agent_state") or {}).get("background") or {}).get("jobs") or []
+    return any(isinstance(j, dict) and j.get("wakes_agent") for j in jobs)
+
+
+def stale_step(item: Item, board: dict, now: datetime) -> str:
+    """Nudge before flag: what to do now that `stale` holds for `item`.
+    'nudge' (tell the holder, start the grace), 'wait' (grace running) or
+    'flag'. A touch after the nudge starts a new episode."""
+    episode = max(t for t in (item.touched_at, item.clock_reset_at) if t is not None)
+    nudged = item.stale_nudged_at
+    if nudged is None or nudged < episode:
+        return "nudge"
+    grace = board.get("nudge_grace_s")
+    grace = 1800 if grace is None else grace
+    return "flag" if _seconds(now - nudged) >= grace else "wait"
 
 
 def _seconds(delta: timedelta) -> float:
@@ -115,8 +143,9 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
     # (holder_gone still applies).
     exempt = exempt or item.status == OWNER_BLOCKED
 
+    busy = any(background_busy(states.get(h["pid"]), now) for h in item.holders)
     if (board.get("holder_idle_enabled") and (item.status == "active" or held_open) and item.holders
-            and all(status[h["pid"]] == "idle" for h in item.holders)):
+            and not busy and all(status[h["pid"]] == "idle" for h in item.holders)):
         since = []
         for h in item.holders:
             row = states.get(h["pid"]) or {}
@@ -127,11 +156,21 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
         if _seconds(now - idle_from) >= board["idle_s"]:
             flags["holder_idle"] = {"holders": _names(item.holders, lambda h: True)}
 
-    if not exempt:
+    # A parked item (free-text block with a check-back time) is not stale
+    # before its check-back; the check_back flag takes over after it.
+    parked = bool(item.blocked_on and item.check_back_at and now < item.check_back_at)
+    if not exempt and not parked and working:
         threshold = board["stale_s"]
         if item.status == "waiting" and item.eta_at and item.waiting_set_at:
             threshold = max(threshold, _seconds(item.eta_at - item.waiting_set_at))
-        if working and _seconds(now - touched) >= threshold:
+        age = _seconds(now - touched)
+        if busy:
+            # Busy in background work: not stale, only the softer flag after
+            # a long cap without any touch.
+            cap = board.get("stale_background_s")
+            if age >= (21600 if cap is None else cap):
+                flags["stale_background"] = None
+        elif age >= threshold:
             flags["stale"] = None
 
     if item.status == "waiting" and item.eta_at and item.waiting_set_at:
@@ -172,9 +211,11 @@ def describe(flag: dict, item: Item | None, states: dict, now: datetime) -> str:
         word = {"holder_gone": "gone", "holder_waiting_on_human": "waiting on a human",
                 "holder_errored": "errored"}[kind]
         why = f"{', '.join(detail.get('holders', []))} {word}"
-    elif kind == "stale" and item is not None:
+    elif kind in ("stale", "stale_background") and item is not None:
         touched = max(t for t in (item.touched_at, item.clock_reset_at) if t is not None)
         why = f"untouched {_short(_seconds(now - touched))}"
+        if kind == "stale_background":
+            why += ", holder busy in background work"
     elif kind == "overdue" and item is not None and item.eta_at:
         why = f"eta passed {_short(_seconds(now - item.eta_at))} ago"
     elif kind == "unassigned" and item is not None:
@@ -326,6 +367,22 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
                         continue
                     if (item.n, kind) in snoozed:
                         continue
+                    if kind == "stale":
+                        step = stale_step(item, board, now)
+                        if step == "nudge":
+                            # Quiet first: the holder gets a chance to touch
+                            # it before the orchestrator hears.
+                            item.stale_nudged_at = now
+                            tx.dirty.add(item.n)
+                            summary.setdefault("nudged", []).append(item.n)
+                            for h in item.holders:
+                                tx._push(item, h, "stale_nudge",
+                                         f"[cm-board {board['slug']}] #{item.n} \"{item.title}\" looks "
+                                         f"stale: item_set({item.n}, ...) (status, eta or note) or post "
+                                         f"#{item.n} in chat. The orchestrator is told if it stays untouched.")
+                            continue
+                        if step == "wait":
+                            continue
                     tx.raise_flag(item, kind, detail)
                     tx.dirty.add(item.n)
                     summary["raised"].append((item.n, kind))

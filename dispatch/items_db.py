@@ -17,6 +17,7 @@ from dispatch.items_rules import CLOSED, OWNER_BLOCKED, BoardTx, Item, ItemsErro
 STATE_FRESH_S = 90
 BOARD_SETTINGS = (
     "idle_s", "stale_s", "unassigned_s", "repush_s", "escalate_s", "digest_s",
+    "stale_background_s", "nudge_grace_s",
 )
 MAX_HISTORY = 50
 
@@ -146,6 +147,7 @@ def _item_from_row(row) -> Item:
         touched_at=row["touched_at"], clock_reset_at=row["clock_reset_at"],
         closed_at=row["closed_at"], archived_at=row["archived_at"],
         created_by=row["created_by"], created_at=row["created_at"],
+        stale_nudged_at=row["stale_nudged_at"],
     )
 
 
@@ -216,11 +218,12 @@ async def _apply(conn, tx: BoardTx) -> None:
                       blocked_on = $6, check_back_at = $7, eta_at = $8,
                       waiting_set_at = $9, links = $10, touched_at = $11,
                       clock_reset_at = $12, closed_at = $13, archived_at = $14,
-                      updated_at = $15
+                      updated_at = $15, stale_nudged_at = $16
                 WHERE id = $1""",
             it.id, it.title, it.status, it.note, it.group, it.blocked_on,
             it.check_back_at, it.eta_at, it.waiting_set_at, list(it.links),
             it.touched_at, it.clock_reset_at, it.closed_at, it.archived_at, now,
+            it.stale_nudged_at,
         )
     for n in sorted(tx.holders_changed):
         it = tx.items[n]
@@ -392,6 +395,17 @@ async def update_items(pool, ref: str, actor: dict, ns: list[int], fields: dict,
                              remove_holders=remove_holders, reason=reason),
     )
     return _write_reply(tx, done)
+
+
+async def touch_items(pool, ref: str, actor: dict, ns: list[int], *, source: str,
+                      message_id: str | None = None, excerpt: str | None = None) -> dict:
+    """Observed activity (doc §4): reset the stale clock of open items the
+    actor holds, with a history event; never changes status or note."""
+    tx, (touched, skipped) = await _write(
+        pool, ref, actor, ns,
+        lambda tx: tx.touch(ns, source=source, message_id=message_id, excerpt=excerpt))
+    return {"board": {"id": tx.board["id"], "slug": tx.board["slug"]},
+            "touched": touched, "skipped": skipped}
 
 
 async def resolve_item(pool, ref: str, actor: dict, n: int, action: str, **kwargs) -> dict:

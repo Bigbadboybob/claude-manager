@@ -409,7 +409,15 @@ pub fn dispatch_request(
         "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.read" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.send" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.send" => {
+            let response = crate::messaging::rpc::dispatch(state, req);
+            // Board freshness: a holder naming `#N` touches the item
+            // (queued, best effort; never delays or changes the send).
+            if let (true, Caller::Session(c), Some(reply)) = (response.ok, &req.caller, &response.result) {
+                crate::items::chat::on_send(state, &c.session_uid, &req.params, reply);
+            }
+            DispatchOutcome::Done(response)
+        }
         "messaging.dms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.people" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.channels" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),

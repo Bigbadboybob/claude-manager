@@ -86,6 +86,14 @@ class ItemsPatchBody(_Strict):
     reason: Reason | None = None
 
 
+class ItemsTouchBody(_Strict):
+    actor: Actor
+    ns: list[ItemNumber] = Field(min_length=1, max_length=50)
+    source: str = Field(default="chat", pattern="^[a-z_]{1,32}$")
+    message_id: Short | None = None
+    excerpt: str | None = Field(default=None, max_length=1000)
+
+
 class ItemResolveBody(_Strict):
     actor: Actor
     action: str = Field(max_length=32)

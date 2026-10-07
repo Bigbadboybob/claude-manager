@@ -203,6 +203,10 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
                 "INSERT INTO tasks (repo_url, prompt, name) VALUES ('r','p','root') RETURNING id"))
         self.board = await items_db.resolve_board(self.pool, task_id=self.root)
         self.ref = self.board["slug"]
+        # Most tests are about flags: with no grace, stale nudges the holder
+        # and flags on the next pass (tick() runs two). Nudge tests set it.
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE boards SET nudge_grace_s = 0")
 
     async def asyncTearDown(self):
         await self.pool.close()
@@ -229,13 +233,22 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
                                "last_pushed_at = last_pushed_at - $1::interval", d)
             await conn.execute("UPDATE boards SET last_digest_at = last_digest_at - $1::interval", d)
             await conn.execute("UPDATE item_holders SET added_at = added_at - $1::interval", d)
+            await conn.execute("UPDATE items SET stale_nudged_at = stale_nudged_at - $1::interval, "
+                               "check_back_at = check_back_at - $1::interval", d)
 
     async def pushes(self, kind=None):
         rows = await self.sql("SELECT kind, session_uid, text, owner_alert FROM item_pushes ORDER BY id")
         return [dict(r) for r in rows if kind is None or r["kind"] == kind]
 
-    async def tick(self):
-        return await board_engine.tick_board(self.pool, self.board["id"])
+    async def tick(self, passes: int = 2):
+        total = {"raised": [], "cleared": [], "nudged": [], "pushed": False, "escalated": False}
+        for _ in range(passes):
+            s = await board_engine.tick_board(self.pool, self.board["id"])
+            for k in ("raised", "cleared", "nudged"):
+                total[k] += s.get(k, [])
+            total["pushed"] |= s["pushed"]
+            total["escalated"] |= s["escalated"]
+        return total
 
     async def test_raise_push_orchestrator_then_clear(self):
         await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
@@ -271,6 +284,10 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         await items_db.resolve_item(self.pool, self.ref, ORCH, 1, "nudge")
         s = await self.tick()
         self.assertEqual(s["raised"], [])
+        # The nudge also touched the item; once it is stale again, the snooze
+        # still holds the flag back until it expires.
+        await self.age(150)
+        self.assertEqual((await self.tick())["raised"], [])
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE item_flags SET snooze_until = now() - interval '1 s'")
         s = await self.tick()
@@ -402,6 +419,69 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         await self.age(61)
         await self.tick()
         self.assertEqual(await self.pushes("escalation"), [])
+
+    async def test_stale_nudges_the_holder_first_then_flags_after_the_grace(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE boards SET nudge_grace_s = 1800")
+        await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        await self.age(150)
+        s = await self.tick(1)
+        self.assertEqual((s["nudged"], s["raised"]), ([1], []))
+        (nudge,) = await self.pushes("stale_nudge")
+        self.assertEqual(nudge["session_uid"], "lane-uid")
+        self.assertTrue(nudge["text"].startswith(f"[cm-board {self.ref}]"), nudge["text"])
+        self.assertEqual(await self.pushes("board"), [])  # the orchestrator is not told yet
+        s = await self.tick(1)
+        self.assertEqual((s["nudged"], s["raised"]), ([], []))  # grace running
+        await self.age(31)
+        s = await self.tick(1)
+        self.assertEqual(s["raised"], [(1, "stale")])
+        self.assertEqual(len(await self.pushes("stale_nudge")), 1)
+
+    async def test_a_touch_after_the_nudge_starts_a_new_episode(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE boards SET nudge_grace_s = 1800")
+        await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        await self.age(150)
+        await self.tick(1)
+        await items_db.touch_items(self.pool, self.ref, HOLDER, [1], source="chat", message_id="m")
+        self.assertEqual((await self.tick(1))["raised"], [])  # touched: not stale
+        await self.age(150)
+        s = await self.tick(1)
+        self.assertEqual((s["nudged"], s["raised"]), ([1], []))  # nudged again, not flagged
+
+    async def test_background_work_suppresses_stale_until_the_softer_cap(self):
+        busy = {**self.row(HOLDER, "working-background")}
+        await self.beat(self.row(ORCH, "working", task=self.root), busy)
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        await self.age(150)
+        s = await self.tick()
+        self.assertEqual((s["raised"], s["nudged"]), ([], []))
+        await self.age(6 * 60)
+        s = await self.tick()
+        self.assertEqual(s["raised"], [(1, "stale_background")])
+        # A live background job that wakes the agent counts too.
+        idle_with_job = {**self.row(HOLDER, "idle"),
+                         "agent_state": {"background": {"jobs": [{"id": "j", "wakes_agent": True}]}}}
+        now = datetime.now(timezone.utc)
+        self.assertTrue(board_engine.background_busy(
+            {**idle_with_job, "reported_at": now, "exited_at": None}, now))
+        self.assertFalse(board_engine.background_busy(
+            {**self.row(HOLDER, "idle"), "reported_at": now, "exited_at": None,
+             "agent_state": {"background": {"jobs": [{"id": "t", "wakes_agent": False}]}}}, now))
+
+    async def test_a_parked_item_is_not_stale_before_its_check_back(self):
+        await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        await items_db.update_items(self.pool, self.ref, ORCH, [1],
+                                    {"status": "blocked", "blocked_on": "EP GO", "check_back": "4h"})
+        await self.age(150)
+        self.assertEqual((await self.tick())["raised"], [])
+        await self.age(120)  # past the check-back
+        raised = {k for _, k in (await self.tick())["raised"]}
+        self.assertEqual(raised, {"check_back", "stale"})
 
     async def test_close_out_archives_and_prunes(self):
         await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a"}, {"title": "b"}])
