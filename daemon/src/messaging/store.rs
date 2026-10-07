@@ -21,6 +21,7 @@ mod operations;
 mod owner_sync;
 mod private_sync;
 mod replication;
+mod rebuild;
 mod task_subscriptions;
 pub use replication::ChangeSignal;
 pub use task_subscriptions::TaskBinding;
@@ -243,6 +244,8 @@ struct Published {
     event: Value,
     position: u64,
     received_at: String,
+    /// Digest of the exact retained bytes, verified on replay or computed at commit.
+    event_sha256: String,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct ReadState {
@@ -305,6 +308,9 @@ impl Store {
         Self::open_locked(cm_root, lock)
     }
     fn open_locked(cm_root: &Path, lock: File) -> Result<Self> {
+        Self::open_locked_with_workers(cm_root, lock, rebuild::worker_count())
+    }
+    fn open_locked_with_workers(cm_root: &Path, lock: File, workers: usize) -> Result<Self> {
         operations::finish_install(cm_root)?;
         let root = cm_root.join("messages/main");
         let id_path = cm_root.join("daemon-id");
@@ -386,7 +392,7 @@ impl Store {
             })?;
         }
         mkdir(&s.journal_dir())?;
-        if let Err(e) = s.rebuild() {
+        if let Err(e) = s.rebuild(workers) {
             s.degraded = Some(e.to_string());
             return Ok(s);
         }
@@ -533,109 +539,107 @@ impl Store {
         };
         Ok(dir.join("_events").join(format!("{origin}--{event}.json")))
     }
-    fn rebuild(&mut self) -> Result<()> {
+    fn rebuild(&mut self, workers: usize) -> Result<()> {
         let index = self.load_journal_index();
         let mut paths = fs::read_dir(self.journal_dir())?
             .map(|x| x.map(|e| e.path()))
             .collect::<io::Result<Vec<_>>>()?;
         paths.sort();
         let mut scan = replication::JournalScan::default();
-        for path in paths {
+        paths.retain(|path| {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
+                return false;
             }
-            // Coverage records folded into the checkpoint by an earlier
-            // compaction are skipped by name, without reading them.
-            if let Some(pos) = index.as_ref().and_then(|index| index.superseded(&path)) {
+            // Compacted coverage records are still skipped without reading.
+            if let Some(pos) = index.as_ref().and_then(|index| index.superseded(path)) {
                 scan.superseded.push(pos);
-                continue;
+                return false;
             }
-            let j = load(&path)?;
-            let pos = required(&j, "position")?
-                .parse::<u64>()
-                .map_err(|_| err("invalid_record", "Bad journal position"))?;
-            if pos <= self.position
-                || j["protocol"] != 1
-                || path.file_name().and_then(|s| s.to_str())
-                    != Some(format!("{pos:020}.json").as_str())
-                || j["replica_id"] != self.daemon_id
-                || j["generation"] != self.generation
-            {
-                return Err(err(
-                    "invalid_record",
-                    "Conflicting or unsupported journal record",
-                ));
-            }
-            if j["kind"] != "publish" {
-                self.apply_replication_journal(&j)?;
-                self.position = pos;
-                scan.observe(pos, &j);
-                continue;
-            }
-            scan.observe(pos, &j);
-            let rel = required(&j["data"], "event_path")?;
-            if Path::new(&rel).is_absolute()
-                || Path::new(&rel)
-                    .components()
-                    .any(|x| !matches!(x, std::path::Component::Normal(_)))
-            {
-                return Err(err("invalid_record", "Unsafe event path"));
-            }
-            let bytes = fs::read(self.root.join(&rel))?;
-            if hash(&bytes) != strv(&j, "event_sha256") {
-                return Err(err("corrupt_event", "Event digest mismatch"));
-            }
-            let event: Value = serde_json::from_slice(&bytes)?;
-            if event["id"] != j["event_id"]
-                || event["space_id"] != self.space_id
-                || self.event_index.contains_key(&required(&event, "id")?)
-            {
-                return Err(err("invalid_record", "Duplicate event or wrong space"));
-            }
-            if event["protocol"] != 1
-                || event["origin_daemon_id"].as_str()
-                    != strv(&event, "id").split_once(':').map(|s| s.0)
-                || !event["data"].is_object()
-                || !event["extensions"].is_object()
-                || strv(&event["actor"], "id").is_empty()
-                || strv(&event, "body").is_empty()
-                || strv(&event["request"], "key").is_empty()
-                || strv(&event["request"], "sha256").len() != 64
-            {
-                return Err(err("invalid_record", "Malformed event envelope"));
-            }
-            parse_time(&required(&event, "created_at")?)?;
-            parse_time(&required(&j["data"], "received_at")?)?;
-            required(&event, "logical_time")?
-                .parse::<u64>()
-                .map_err(|_| err("invalid_record", "Bad logical time"))?;
-            let expected = self.event_path(&event)?;
-            if expected != self.root.join(rel) {
-                return Err(err(
-                    "invalid_record",
-                    "Event in incorrect conversation directory",
-                ));
-            }
-            self.clock = self.clock.max(
-                event["logical_time"]
-                    .as_str()
-                    .unwrap_or("0")
-                    .parse()
-                    .map_err(|_| err("invalid_record", "Bad logical time"))?,
-            );
-            self.clock = self
-                .clock
-                .max(j["data"]["logical_clock"].as_u64().unwrap_or(0));
-            self.position = pos;
-            self.apply_replication_journal(&j)?;
-            self.reduce(&event)?;
-            self.push_published(Published {
-                event,
-                position: pos,
-                received_at: required(&j["data"], "received_at")?,
-            });
-        }
+            true
+        });
+        rebuild::replay(self, &paths, workers, &mut scan)?;
         self.finish_journal_scan(index, scan)
+    }
+    fn apply_rebuilt(
+        &mut self,
+        path: &Path,
+        prepared: rebuild::Prepared,
+        scan: &mut replication::JournalScan,
+    ) -> Result<()> {
+        let j = prepared.journal;
+        let pos = required(&j, "position")?
+            .parse::<u64>()
+            .map_err(|_| err("invalid_record", "Bad journal position"))?;
+        if pos <= self.position
+            || j["protocol"] != 1
+            || path.file_name().and_then(|s| s.to_str())
+                != Some(format!("{pos:020}.json").as_str())
+            || j["replica_id"] != self.daemon_id
+            || j["generation"] != self.generation
+        {
+            return Err(err(
+                "invalid_record",
+                "Conflicting or unsupported journal record",
+            ));
+        }
+        if j["kind"] != "publish" {
+            self.apply_replication_journal(&j)?;
+            self.position = pos;
+            scan.observe(pos, &j);
+            return Ok(());
+        }
+        scan.observe(pos, &j);
+        let (rel, event) = prepared.event.expect("publish was prepared")?;
+        if event["id"] != j["event_id"]
+            || event["space_id"] != self.space_id
+            || self.event_index.contains_key(&required(&event, "id")?)
+        {
+            return Err(err("invalid_record", "Duplicate event or wrong space"));
+        }
+        if event["protocol"] != 1
+            || event["origin_daemon_id"].as_str()
+                != strv(&event, "id").split_once(':').map(|s| s.0)
+            || !event["data"].is_object()
+            || !event["extensions"].is_object()
+            || strv(&event["actor"], "id").is_empty()
+            || strv(&event, "body").is_empty()
+            || strv(&event["request"], "key").is_empty()
+            || strv(&event["request"], "sha256").len() != 64
+        {
+            return Err(err("invalid_record", "Malformed event envelope"));
+        }
+        parse_time(&required(&event, "created_at")?)?;
+        parse_time(&required(&j["data"], "received_at")?)?;
+        required(&event, "logical_time")?
+            .parse::<u64>()
+            .map_err(|_| err("invalid_record", "Bad logical time"))?;
+        let expected = self.event_path(&event)?;
+        if expected != self.root.join(rel) {
+            return Err(err(
+                "invalid_record",
+                "Event in incorrect conversation directory",
+            ));
+        }
+        self.clock = self.clock.max(
+            event["logical_time"]
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .map_err(|_| err("invalid_record", "Bad logical time"))?,
+        );
+        self.clock = self
+            .clock
+            .max(j["data"]["logical_clock"].as_u64().unwrap_or(0));
+        self.position = pos;
+        self.apply_replication_journal(&j)?;
+        self.reduce(&event)?;
+        self.push_published(Published {
+            event,
+            position: pos,
+            received_at: required(&j["data"], "received_at")?,
+            event_sha256: required(&j, "event_sha256")?,
+        });
+        Ok(())
     }
     fn push_published(&mut self, published: Published) {
         self.event_index
@@ -859,8 +863,9 @@ impl Store {
                 .parse::<u64>()
                 .map_err(|_| err("invalid_record", "Bad logical time"))?,
         );
-        let receipt = receipt.or_else(|| self.is_coordinator().then(|| json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"event_id":event["id"],"event_sha256":hash(&bytes)})));
-        let j = json!({"protocol":1,"replica_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"recorded_at":received,"kind":"publish","event_id":event["id"],"event_sha256":hash(&bytes),"data":{"source":source,"received_at":received,"logical_clock":self.clock,"event_path":path.strip_prefix(&self.root).unwrap().to_string_lossy(),"hub_receipt":receipt}});
+        let digest = hash(&bytes);
+        let receipt = receipt.or_else(|| self.is_coordinator().then(|| json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"event_id":event["id"],"event_sha256":digest})));
+        let j = json!({"protocol":1,"replica_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"recorded_at":received,"kind":"publish","event_id":event["id"],"event_sha256":digest,"data":{"source":source,"received_at":received,"logical_clock":self.clock,"event_path":path.strip_prefix(&self.root).unwrap().to_string_lossy(),"hub_receipt":receipt}});
         // No reader sees the body until the durable publication record exists.
         // Within an ingest page the journal record is queued: the page flush
         // makes every body and its directory durable before any record, and
@@ -892,6 +897,7 @@ impl Store {
             event: event.clone(),
             position: pos,
             received_at: received,
+            event_sha256: digest,
         });
         if batched {
             return Ok(event);

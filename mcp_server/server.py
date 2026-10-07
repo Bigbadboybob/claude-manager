@@ -384,11 +384,29 @@ def item_resolve(
 
 
 def _chat_call(method: str, params: dict) -> dict:
+    params = {key: value for key, value in params.items() if value is not None}
+    return _messaging_ready_call("messaging." + method, params)
+
+
+def _messaging_ready_call(method: str, params: dict) -> dict:
     # The daemon's coordinator deadline is 30s. Leave time for it to return
     # outcome_unknown and retry guidance instead of masking that with socket IO.
-    return control_client.call("messaging." + method, {
-        key: value for key, value in params.items() if value is not None
-    }, timeout=45.0)
+    # Only startup refusal is safe to retry automatically. Reuse the exact
+    # request (including its ID, origin binding and body) on every attempt.
+    deadline = time.monotonic() + 30.0
+    backoff = 0.25
+    while True:
+        try:
+            return control_client.call(method, params, timeout=45.0)
+        except control_client.ControlError as exc:
+            starting = exc.code == "messaging_starting" or (
+                exc.code == "conflict" and exc.message.startswith("messaging_starting:")
+            )
+            remaining = deadline - time.monotonic()
+            if not starting or remaining <= 0:
+                raise
+            time.sleep(min(backoff, remaining))
+            backoff = min(backoff * 2, 2.0)
 
 
 @mcp.tool()
@@ -513,7 +531,7 @@ def chat_rename(name: str, expected_name_revision: int, request_id: str,
     This changes only your own name and needs coordinator connectivity on paired
     hosts. Never create a replacement session just to rename yourself.
     """
-    return control_client.call("session.set_name", {
+    return _messaging_ready_call("session.set_name", {
         key: value for key, value in locals().items() if value is not None
     })
 

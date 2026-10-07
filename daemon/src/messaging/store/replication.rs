@@ -224,19 +224,18 @@ impl Store {
                         .rejections
                         .contains_key(strv(&e.event, "id"))
             })
-            .map(|e| (e.event.clone(), e.position))
+            .map(|e| (e.event.clone(), e.position, e.event_sha256.clone()))
             .collect::<Vec<_>>();
-        for (event, position) in missing {
+        for (event, position, digest) in missing {
             if event["origin_daemon_id"] != self.daemon_id {
                 return Err(err(
                     "invalid_receipt",
                     "Foreign publication has no retained acceptance",
                 ));
             }
-            let bytes = fs::read(self.event_path(&event)?)?;
             let receipt = json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,
                 "generation":self.generation,"position":format!("{position:020}"),
-                "event_id":event["id"],"event_sha256":hash(&bytes)});
+                "event_id":event["id"],"event_sha256":digest});
             self.record_receipt(&receipt)?;
         }
         Ok(())
@@ -400,7 +399,7 @@ impl Store {
                 let event = self
                     .published(&id)
                     .ok_or_else(|| err("invalid_receipt", "Decision precedes its local event"))?;
-                if journal["event_sha256"] != hash(&fs::read(self.event_path(&event.event)?)?) {
+                if journal["event_sha256"] != event.event_sha256 {
                     return Err(err(
                         "invalid_receipt",
                         "Decision digest does not match its retained event",
@@ -557,7 +556,7 @@ impl Store {
             ));
         }
         if let Some(event) = self.published(&id) {
-            if hash(&fs::read(self.event_path(&event.event)?)?) != digest {
+            if event.event_sha256 != digest {
                 return Err(err(
                     "receipt_conflict",
                     "Receipt digest does not match the retained event",
@@ -594,7 +593,7 @@ impl Store {
         let e = self
             .published(id)
             .ok_or_else(|| err("not_found", "Local event not found"))?;
-        let digest = hash(&fs::read(self.event_path(&e.event)?)?);
+        let digest = e.event_sha256.clone();
         self.journal_status("replication.status",Some(id),Some(&digest),json!({"status":"replication_rejected","reason":reason,"coordinator_id":self.coordinator_id()}))?;
         let children: Vec<_> = self
             .events

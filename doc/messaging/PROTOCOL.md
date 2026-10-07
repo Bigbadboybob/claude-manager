@@ -16,6 +16,14 @@ Failed opens retry every five seconds and are logged. Replication starts after
 both store opening and session restoration finish. Startup logs report
 `messaging store open took Ns` separately from `rpc ready after Ns`.
 
+MCP chat tools retry only `messaging_starting` for up to 30 seconds, backing off
+from 250 ms to two seconds and preserving the request ID, origin and contents.
+Other errors, including uncertain outcomes, still reach the caller immediately.
+The rebuild uses up to eight readers for journal/event reads, hashing and JSON
+parsing, with bounded prefetch. Validation and state application remain in journal
+order. Verified event digests stay in memory for replication decisions; every
+rebuild still checks the retained event bytes. The on-disk format is unchanged.
+
 ## 1. Space, conversation, thread, identity
 
 A **space** is one shared conversation universe: its channels, participants, norms, and ordered history. The default deployment has one space called `main`. Its storage lives outside repositories and worktrees, under `~/.cm/messages/main/`, so deleting a task checkout cannot delete its conversations.

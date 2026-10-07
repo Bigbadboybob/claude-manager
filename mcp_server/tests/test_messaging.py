@@ -7,6 +7,58 @@ from mcp_server import server, control_client
 
 
 class MessagingToolsTests(unittest.TestCase):
+    def test_startup_retry_preserves_request_until_ready(self):
+        for code, message in [("conflict", "messaging_starting: retry shortly"),
+                              ("messaging_starting", "retry shortly")]:
+            with self.subTest(code=code):
+                error = control_client.ControlError(code, message)
+                with patch.object(control_client, "call", side_effect=[error, error, {}]) as call, \
+                     patch.object(server.time, "sleep") as sleep:
+                    server.chat_send("Same body", "same-request", channel="general",
+                                     origin_daemon_id="home", mentions=["peer"])
+                self.assertEqual(call.call_count, 3)
+                self.assertTrue(all(c == call.call_args_list[0] for c in call.call_args_list))
+                self.assertEqual(call.call_args.args[1]["request_id"], "same-request")
+                self.assertEqual(call.call_args.args[1]["body"], "Same body")
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [0.25, 0.5])
+
+    def test_startup_retry_stops_at_deadline_and_keeps_error(self):
+        clock = [0.0]
+        error = control_client.ControlError("conflict", "messaging_starting: retry shortly")
+        def sleep(delay):
+            self.assertGreater(delay, 0)
+            self.assertLessEqual(delay, 2.0)
+            clock[0] += delay
+        with patch.object(control_client, "call", side_effect=error) as call, \
+             patch.object(server.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(server.time, "sleep", side_effect=sleep):
+            with self.assertRaises(control_client.ControlError) as raised:
+                server.chat_open()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(clock[0], 30.0)
+        self.assertGreater(call.call_count, 1)
+
+    def test_only_startup_refusal_is_retried(self):
+        for error in [control_client.ControlError("conflict", "name_revision_conflict: stale"),
+                      control_client.ControlError("outcome_unknown", "retry same request"),
+                      control_client.TransportError("connection closed")]:
+            with self.subTest(error=error), \
+                 patch.object(control_client, "call", side_effect=error) as call, \
+                 patch.object(server.time, "sleep") as sleep:
+                with self.assertRaises(type(error)) as raised:
+                    server.chat_open()
+                self.assertIs(raised.exception, error)
+                call.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_rename_waits_for_messaging_startup(self):
+        error = control_client.ControlError("conflict", "messaging_starting: retry shortly")
+        with patch.object(control_client, "call", side_effect=[error, {}]) as call, \
+             patch.object(server.time, "sleep"):
+            server.chat_rename("Scout", 2, "rename-request", origin_daemon_id="home")
+        self.assertEqual(call.call_args_list[0], call.call_args_list[1])
+        self.assertEqual(call.call_args.args[0], "session.set_name")
+
     def test_chat_deadline_allows_daemon_timeout_to_reach_caller(self):
         error = control_client.ControlError("outcome_unknown", "retry the same request ID")
         with patch.object(control_client, "call", side_effect=error) as call:
