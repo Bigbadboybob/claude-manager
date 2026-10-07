@@ -156,14 +156,34 @@ pub(super) fn palette_match_indices(query: &str, displays: &[&str]) -> Vec<usize
     if q.is_empty() {
         return (0..displays.len()).collect();
     }
+    rank_prefix_then_substring(displays.len(), |i| {
+        let dl = displays[i].to_lowercase();
+        if dl.starts_with(&q) {
+            Some(true)
+        } else if dl.contains(&q) {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+/// Shared ranking for the type-to-filter pickers (A-p palette, A-O past
+/// workspaces): `classify(i)` answers `Some(true)` for a prefix match,
+/// `Some(false)` for a plain substring match, `None` for no match. Prefix
+/// matches come first, then substring matches, each group keeping the
+/// caller's original order.
+pub(super) fn rank_prefix_then_substring(
+    len: usize,
+    mut classify: impl FnMut(usize) -> Option<bool>,
+) -> Vec<usize> {
     let mut prefix: Vec<usize> = Vec::new();
     let mut substr: Vec<usize> = Vec::new();
-    for (i, d) in displays.iter().enumerate() {
-        let dl = d.to_lowercase();
-        if dl.starts_with(&q) {
-            prefix.push(i);
-        } else if dl.contains(&q) {
-            substr.push(i);
+    for i in 0..len {
+        match classify(i) {
+            Some(true) => prefix.push(i),
+            Some(false) => substr.push(i),
+            None => {}
         }
     }
     prefix.extend(substr);

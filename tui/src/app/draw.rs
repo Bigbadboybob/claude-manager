@@ -402,8 +402,8 @@ impl App {
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
                 }
-                InputMode::PastWorkspacePicker { candidates, selected } => {
-                    self.draw_past_workspace_picker(frame, area, candidates, *selected);
+                InputMode::PastWorkspacePicker { candidates, query, selected } => {
+                    self.draw_past_workspace_picker(frame, area, candidates, query, *selected);
                 }
                 InputMode::SessionPalette { candidates, query, selected } => {
                     self.draw_session_palette(frame, area, candidates, query, *selected);
@@ -2735,14 +2735,20 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         candidates: &[PastCandidate],
+        query: &str,
         selected: usize,
     ) {
-        let total = candidates.len();
+        // Same filtered view the handler indexes; `selected` points into it.
+        let filtered = past_workspace_match_indices(query, candidates);
+        let total = filtered.len();
+        let selected = selected.min(total.saturating_sub(1));
         let width = area.width.min(80).max(40);
-        // Dialog chrome: 2 border rows + 1 blank + 1 footer line.
-        // Below that, each candidate (or scroll-indicator) takes one row.
-        let max_dialog_height = area.height.saturating_sub(2).max(7);
-        let desired_height = (total as u16).saturating_add(4).max(7);
+        // Dialog chrome: 2 border rows + query line + blank + blank +
+        // footer line. Below that, each candidate (or scroll-indicator)
+        // takes one row. Sized off the UNFILTERED count so the dialog
+        // doesn't jump around while typing.
+        let max_dialog_height = area.height.saturating_sub(2).max(9);
+        let desired_height = (candidates.len() as u16).saturating_add(6).max(9);
         let height = desired_height.min(max_dialog_height);
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -2751,7 +2757,7 @@ impl App {
         frame.render_widget(Clear, dialog);
 
         let inner_height = height.saturating_sub(2) as usize;
-        let footer_rows = 2; // blank + key-hint line
+        let footer_rows = 4; // query + blank on top, blank + key-hint below
         let list_budget = inner_height.saturating_sub(footer_rows).max(1);
         let needs_scroll = total > list_budget;
         // Reserve one line each for "↑ N more" / "↓ N more" when scrolling.
@@ -2779,8 +2785,17 @@ impl App {
         let dim = Style::default().fg(theme::DIM);
         let mut lines: Vec<Line> = Vec::new();
 
+        lines.push(Line::from(vec![
+            Span::styled("> ", dim),
+            Span::styled(query.to_string(), Style::default().fg(theme::TEXT)),
+            Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
+            Span::styled(format!("   {} of {}", total, candidates.len()), dim),
+        ]));
+        lines.push(Line::from(""));
         if candidates.is_empty() {
             lines.push(Line::from(Span::styled("No past workspaces.", dim)));
+        } else if filtered.is_empty() {
+            lines.push(Line::from(Span::styled("(no matches)", dim)));
         } else {
             if needs_scroll {
                 if above > 0 {
@@ -2793,7 +2808,7 @@ impl App {
                 }
             }
             for idx in offset..end {
-                let cand = &candidates[idx];
+                let cand = &candidates[filtered[idx]];
                 let is_active = idx == selected;
                 let cursor = if is_active { "\u{25b8} " } else { "  " };
                 let path_repr = cand
@@ -2856,7 +2871,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "\u{2191}\u{2193} select   Enter: reopen   Esc: cancel",
+            "type to filter   \u{2191}\u{2193}/C-j/C-k select   Enter: reopen   Esc: clear/close",
             dim,
         )));
 

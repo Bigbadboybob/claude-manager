@@ -186,6 +186,7 @@ Sessions view:
 - `A-v` — toggle Status / Task sub-view
 - `A-g` — jump to the next session needing attention (pending `notify_user` alerts first, then idle sessions; wraps, crosses into the continuous column)
 - `A-;` — MRU quick-switch: alt-tab through recently focused sessions (first press ping-pongs A↔B; repeated presses walk deeper; any other key resets the walk)
+- `A-O` — reopen a past (closed) workspace; type to filter by workspace/task name, branch, worktree path, session label or host (newest first, prefix matches ranked first; Esc clears the query, then closes). See doc/task-worktree-cleanup.md.
 - `A-p` — fuzzy-find palette: type-to-filter across all workspaces/sessions (case-insensitive substring, prefix matches ranked first; Up/Down/Tab/C-j/C-k select, Enter jumps). Sessions view only — planning keeps `A-p` as project picker.
 - `A-i` — detail peek: read-only overlay with the focused row's bound task (name, status, full prompt — "what was this agent asked to do"), or workspace/session info when unbound. j/k / PgUp/PgDn scroll.
 - `A-'` — yank the focused session's last assistant message to the clipboard (OSC 52, works over SSH; ~100KB cap with truncation notice)

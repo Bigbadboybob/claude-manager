@@ -234,9 +234,12 @@ pub(super) enum InputMode {
     /// Picker over past workspaces (closed or all-tasks-done) so the user
     /// can reopen one without cluttering the sidebar. Opened via A-O from
     /// Sessions view. Carries the candidate list up-front instead of
-    /// recomputing on every input event.
+    /// recomputing on every input event. `query` is the type-to-filter
+    /// text; `selected` indexes the FILTERED view
+    /// ([`past_workspace_match_indices`]), not `candidates`.
     PastWorkspacePicker {
         candidates: Vec<PastCandidate>,
+        query: String,
         selected: usize,
     },
     /// Fuzzy-find palette over sessions + workspace headers (A-p,
@@ -282,6 +285,45 @@ pub struct PastCandidate {
     pub worktree_exists: Option<bool>,
     /// Latest tombstone `exited_at` if any — used to sort most-recent first.
     pub last_exited_at: f64,
+    /// Lowercased search fields, computed once at modal open so filtering
+    /// 2,700+ rows per keystroke is a pure in-memory scan: workspace name,
+    /// bound task names + wip branches, worktree path, session/tombstone
+    /// labels, host.
+    pub search_fields: Vec<String>,
+}
+
+impl PastCandidate {
+    /// Builds `search_fields` from raw (non-lowercased) values, dropping
+    /// empties.
+    pub fn search_fields_from<'a>(fields: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        fields
+            .into_iter()
+            .filter(|f| !f.is_empty())
+            .map(|f| f.to_lowercase())
+            .collect()
+    }
+}
+
+/// A-O picker filter: case-insensitive substring over each candidate's
+/// `search_fields`. Same ranking as the A-p palette (prefix matches —
+/// any field STARTING with the query — first, then substring matches),
+/// each group keeping the candidates' newest-first order. Empty query =
+/// everything. Returns indices into `candidates`.
+pub(crate) fn past_workspace_match_indices(query: &str, candidates: &[PastCandidate]) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return (0..candidates.len()).collect();
+    }
+    rank_prefix_then_substring(candidates.len(), |i| {
+        let fields = &candidates[i].search_fields;
+        if fields.iter().any(|f| f.starts_with(&q)) {
+            Some(true)
+        } else if fields.iter().any(|f| f.contains(&q)) {
+            Some(false)
+        } else {
+            None
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1999,8 +2041,14 @@ pub(crate) fn handle_workflow_picker(
     }
 }
 
+/// A-O past-workspace picker. Type-to-filter like the A-p palette: plain
+/// chars (including j/k/q) edit the query, Backspace deletes, movement
+/// rides Up/Down, Tab/BackTab and Ctrl-j/Ctrl-k. Esc clears a non-empty
+/// query first and closes on an empty one. Enter reopens the selected row
+/// of the CURRENT filtered view; with no matches it does nothing.
 pub(crate) fn handle_past_workspace_picker(
     candidates: &[PastCandidate],
+    query: &mut String,
     selected: &mut usize,
     _ctx: InputCtx<'_>,
     event: &CrosstermEvent,
@@ -2008,28 +2056,62 @@ pub(crate) fn handle_past_workspace_picker(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    let filtered = past_workspace_match_indices(query, candidates);
+    let flen = filtered.len();
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let down = |selected: &mut usize| {
+        if flen > 0 {
+            *selected = (*selected + 1).min(flen) % flen;
+        }
+    };
+    let up = |selected: &mut usize| {
+        if flen > 0 {
+            *selected = if *selected == 0 { flen - 1 } else { (*selected - 1).min(flen - 1) };
+        }
+    };
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => InputOutcome::Cancel,
-        KeyCode::Enter => match candidates.get(*selected) {
-            Some(c) => InputOutcome::Submit(SubmitAction::ReopenPastWorkspace {
-                ws_id: c.ws_id.clone(),
+        KeyCode::Esc => {
+            if query.is_empty() {
+                InputOutcome::Cancel
+            } else {
+                query.clear();
+                *selected = 0;
+                InputOutcome::Consumed
+            }
+        }
+        KeyCode::Enter => match filtered.get(*selected).or(filtered.first()) {
+            Some(&ci) => InputOutcome::Submit(SubmitAction::ReopenPastWorkspace {
+                ws_id: candidates[ci].ws_id.clone(),
             }),
-            None => InputOutcome::Cancel,
+            None => InputOutcome::Consumed,
         },
-        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
-            if !candidates.is_empty() {
-                *selected = (*selected + 1) % candidates.len();
+        KeyCode::Down | KeyCode::Tab => {
+            down(selected);
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            up(selected);
+            InputOutcome::Consumed
+        }
+        // Ctrl-j / Ctrl-k mirror Down / Up; MUST precede the Char(c) arm.
+        KeyCode::Char('j') if ctrl => {
+            down(selected);
+            InputOutcome::Consumed
+        }
+        KeyCode::Char('k') if ctrl => {
+            up(selected);
+            InputOutcome::Consumed
+        }
+        KeyCode::Backspace => {
+            if query.pop().is_some() {
+                *selected = 0;
             }
             InputOutcome::Consumed
         }
-        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
-            if !candidates.is_empty() {
-                *selected = if *selected == 0 {
-                    candidates.len() - 1
-                } else {
-                    *selected - 1
-                };
-            }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            query.push(c);
+            *selected = 0;
             InputOutcome::Consumed
         }
         _ => InputOutcome::Consumed,
@@ -2633,6 +2715,15 @@ impl App {
     /// status message when no past workspaces exist instead of an empty
     /// modal. Most-recent (latest tombstone) first.
     fn open_past_workspace_picker(&mut self) {
+        // ws_id -> bound tasks, built once so the per-workspace search
+        // fields don't rescan `tasks` for each of 2,700+ candidates.
+        let mut tasks_by_ws: std::collections::HashMap<&str, Vec<&TaskEntry>> =
+            std::collections::HashMap::new();
+        for t in &self.tasks {
+            if let Some(wid) = t.workspace_id.as_deref() {
+                tasks_by_ws.entry(wid).or_default().push(t);
+            }
+        }
         let mut candidates: Vec<PastCandidate> = self
             .workspaces
             .iter()
@@ -2645,12 +2736,29 @@ impl App {
                     .map(|t| t.exited_at)
                     .fold(0.0f64, f64::max);
                 let worktree_exists = ws.local_worktree_exists();
+                let path_str = ws
+                    .worktree_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let bound = tasks_by_ws.get(ws.id.as_str());
+                let search_fields = PastCandidate::search_fields_from(
+                    std::iter::once(ws.name.as_str())
+                        .chain(bound.into_iter().flatten().flat_map(|t| {
+                            std::iter::once(t.name.as_str()).chain(t.wip_branch.as_deref())
+                        }))
+                        .chain(std::iter::once(path_str.as_str()))
+                        .chain(ws.sessions.iter().map(|s| s.label.as_str()))
+                        .chain(ws.tombstones.iter().map(|t| t.label.as_str()))
+                        .chain(std::iter::once(ws.host_id.as_str())),
+                );
                 PastCandidate {
                     ws_id: ws.id.clone(),
                     display: ws.name.clone(),
                     worktree_path: ws.worktree_path.clone(),
                     worktree_exists,
                     last_exited_at,
+                    search_fields,
                 }
             })
             .collect();
@@ -2665,6 +2773,7 @@ impl App {
         });
         self.input_mode = InputMode::PastWorkspacePicker {
             candidates,
+            query: String::new(),
             selected: 0,
         };
     }
@@ -3833,9 +3942,10 @@ impl App {
             InputMode::WorkflowHistory { run_id: _ } => {
                 handle_workflow_history(InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids }, event)
             }
-            InputMode::PastWorkspacePicker { candidates, selected } => {
+            InputMode::PastWorkspacePicker { candidates, query, selected } => {
                 handle_past_workspace_picker(
                     candidates,
+                    query,
                     selected,
                     InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                     event,
@@ -4683,6 +4793,54 @@ mod past_workspace_reopen_tests {
         assert_picker_evidence(&mut app, Some(true));
         assert!(app.reopen_workspace_by_id("ws-past-worker"));
         assert!(!app.workspaces[0].is_closed);
+    }
+
+    #[test]
+    fn picker_search_fields_cover_task_branch_path_labels_and_host() {
+        let mut app = closed_workspace("sessions", Some(PathBuf::from("/srv/wt/cm-sub-alpha")));
+        app.tasks.push(TaskEntry {
+            task_id: Some("t1".into()),
+            name: "Fix Login Flow".into(),
+            api_status: TaskStatus::Done,
+            repo_url: None,
+            prompt: None,
+            wip_branch: Some("cm/login-fix".into()),
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            is_continuous: false,
+            workspace_id: Some("ws-past-worker".into()),
+            project: None,
+            parent_task_id: None,
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        });
+        app.workspaces[0].tombstones.push(SessionTombstone {
+            entry: None,
+            uid: "ts-1".into(),
+            managed_by_uid: None,
+            label: "Reviewer-Bot".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            last_transcript_id: None,
+            worktree_path: None,
+            generation: 0,
+            exited_at: 1.0,
+        });
+        app.open_past_workspace_picker();
+        let InputMode::PastWorkspacePicker { candidates, query, selected } = &app.input_mode else {
+            panic!("expected past-workspace picker");
+        };
+        assert!(query.is_empty());
+        assert_eq!(*selected, 0);
+        for q in ["past-worker", "login flow", "cm/login-fix", "cm-sub-alpha", "reviewer", "SESSIONS"] {
+            assert_eq!(
+                past_workspace_match_indices(q, candidates),
+                vec![0],
+                "query {q:?} should match"
+            );
+        }
+        assert!(past_workspace_match_indices("nope", candidates).is_empty());
     }
 
     #[test]
@@ -7914,5 +8072,169 @@ mod input_handler_tests {
             }
             other => panic!("expected StopWorkflow, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod past_workspace_search_tests {
+    //! A-O picker type-to-filter: matcher ranking + key handling.
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn cand(id: &str, fields: &[&str]) -> PastCandidate {
+        PastCandidate {
+            ws_id: id.into(),
+            display: id.into(),
+            worktree_path: None,
+            worktree_exists: None,
+            last_exited_at: 0.0,
+            search_fields: PastCandidate::search_fields_from(fields.iter().copied()),
+        }
+    }
+
+    /// Newest-first order, as `open_past_workspace_picker` sorts them.
+    fn cands() -> Vec<PastCandidate> {
+        vec![
+            cand("ws-newest", &["Billing-api", "local"]),
+            cand("ws-mid", &["scraper", "/home/x/wt/api-gateway", "sessions"]),
+            cand("ws-old", &["api-docs", "sessions"]),
+            cand("ws-oldest", &["notes", "local"]),
+        ]
+    }
+
+    fn ev(code: KeyCode, mods: KeyModifiers) -> CrosstermEvent {
+        CrosstermEvent::Key(KeyEvent::new(code, mods))
+    }
+
+    fn press(
+        c: &[PastCandidate],
+        q: &mut String,
+        sel: &mut usize,
+        code: KeyCode,
+        mods: KeyModifiers,
+    ) -> InputOutcome {
+        handle_past_workspace_picker(
+            c,
+            q,
+            sel,
+            InputCtx { repo_urls: &[], host_ids: &[], section_ids: &[] },
+            &ev(code, mods),
+        )
+    }
+
+    fn reopened(o: InputOutcome) -> Option<String> {
+        match o {
+            InputOutcome::Submit(SubmitAction::ReopenPastWorkspace { ws_id }) => Some(ws_id),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn empty_query_keeps_everything_newest_first() {
+        assert_eq!(past_workspace_match_indices("", &cands()), vec![0, 1, 2, 3]);
+        assert_eq!(past_workspace_match_indices("   ", &cands()), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn prefix_ranks_first_then_substring_each_newest_first() {
+        // "api": ws-old has a field starting with it (prefix); ws-newest
+        // ("billing-api") and ws-mid (path) only contain it.
+        assert_eq!(past_workspace_match_indices("api", &cands()), vec![2, 0, 1]);
+        // Case-insensitive on both sides; host matches too.
+        assert_eq!(past_workspace_match_indices("SESSIONS", &cands()), vec![1, 2]);
+        assert!(past_workspace_match_indices("zzz", &cands()).is_empty());
+    }
+
+    #[test]
+    fn filter_scales_to_thousands_of_rows() {
+        let many: Vec<PastCandidate> = (0..3000)
+            .map(|i| {
+                let name = format!("workspace-{i}");
+                cand(&format!("ws-{i}"), &[name.as_str(), "sessions"])
+            })
+            .collect();
+        let hits = past_workspace_match_indices("workspace-299", &many);
+        // workspace-299 and workspace-2990..2999, all prefix, in input order.
+        assert_eq!(hits.len(), 11);
+        assert_eq!(hits[0], 299);
+        assert!(hits.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn typing_edits_query_including_letters_that_used_to_be_keys() {
+        let c = cands();
+        let (mut q, mut sel) = (String::new(), 2usize);
+        for ch in ['q', 'j', 'k'] {
+            assert!(matches!(
+                press(&c, &mut q, &mut sel, KeyCode::Char(ch), KeyModifiers::empty()),
+                InputOutcome::Consumed
+            ));
+        }
+        assert_eq!(q, "qjk");
+        assert_eq!(sel, 0, "typing resets the selection");
+        // Shifted chars type too; Alt-chords don't.
+        press(&c, &mut q, &mut sel, KeyCode::Char('X'), KeyModifiers::SHIFT);
+        press(&c, &mut q, &mut sel, KeyCode::Char('z'), KeyModifiers::ALT);
+        assert_eq!(q, "qjkX");
+        press(&c, &mut q, &mut sel, KeyCode::Backspace, KeyModifiers::empty());
+        assert_eq!(q, "qjk");
+    }
+
+    #[test]
+    fn esc_clears_query_first_then_closes() {
+        let c = cands();
+        let (mut q, mut sel) = ("api".to_string(), 1usize);
+        assert!(matches!(
+            press(&c, &mut q, &mut sel, KeyCode::Esc, KeyModifiers::empty()),
+            InputOutcome::Consumed
+        ));
+        assert!(q.is_empty());
+        assert_eq!(sel, 0);
+        assert!(matches!(
+            press(&c, &mut q, &mut sel, KeyCode::Esc, KeyModifiers::empty()),
+            InputOutcome::Cancel
+        ));
+    }
+
+    #[test]
+    fn movement_wraps_within_filtered_view_and_enter_reopens_it() {
+        let c = cands();
+        let (mut q, mut sel) = ("api".to_string(), 0usize); // view: [2, 0, 1]
+        let none = KeyModifiers::empty();
+        press(&c, &mut q, &mut sel, KeyCode::Down, none);
+        assert_eq!(sel, 1);
+        press(&c, &mut q, &mut sel, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(sel, 2);
+        press(&c, &mut q, &mut sel, KeyCode::Down, none);
+        assert_eq!(sel, 0, "wraps at the filtered length, not the full list");
+        press(&c, &mut q, &mut sel, KeyCode::Up, none);
+        assert_eq!(sel, 2);
+        press(&c, &mut q, &mut sel, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(sel, 1);
+        assert_eq!(q, "api", "Ctrl-j/k move, they don't type");
+        assert_eq!(
+            reopened(press(&c, &mut q, &mut sel, KeyCode::Enter, none)).as_deref(),
+            Some("ws-newest")
+        );
+    }
+
+    #[test]
+    fn enter_with_no_matches_stays_open() {
+        let c = cands();
+        let (mut q, mut sel) = ("zzz".to_string(), 0usize);
+        assert!(matches!(
+            press(&c, &mut q, &mut sel, KeyCode::Enter, KeyModifiers::empty()),
+            InputOutcome::Consumed
+        ));
+    }
+
+    #[test]
+    fn enter_with_empty_query_reopens_newest() {
+        let c = cands();
+        let (mut q, mut sel) = (String::new(), 0usize);
+        assert_eq!(
+            reopened(press(&c, &mut q, &mut sel, KeyCode::Enter, KeyModifiers::empty())).as_deref(),
+            Some("ws-newest")
+        );
     }
 }
