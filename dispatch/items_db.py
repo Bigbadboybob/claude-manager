@@ -449,6 +449,23 @@ async def _version(conn, board_id: str) -> int:
     ))
 
 
+# The orchestrator when the board does not name one: a live session bound to
+# the coordinator (initiative) or root task. Bash panes never qualify (a push
+# into a shell is lost), Claude/Codex sessions beat any other engine, and
+# ties go to the most recent activity (last state change or turn end, then
+# last report), not to whichever session started last.
+ORCHESTRATOR_CANDIDATES_SQL = """
+SELECT * FROM session_states
+ WHERE task_id = $1 AND exited_at IS NULL AND reported_at > $2
+   AND COALESCE(engine, '') <> 'bash'
+ ORDER BY (engine IN ('claude-code', 'codex')) DESC NULLS LAST,
+          GREATEST(state_since,
+                   to_timestamp(NULLIF(agent_state->'last_turn'->>'ended_at', '')::float8))
+              DESC NULLS LAST,
+          reported_at DESC
+ LIMIT 1"""
+
+
 async def _orchestrator(conn, board: dict, now: datetime) -> dict | None:
     fresh = now - timedelta(seconds=STATE_FRESH_S)
     if board.get("orchestrator_pid"):
@@ -468,9 +485,7 @@ async def _orchestrator(conn, board: dict, now: datetime) -> dict | None:
     if anchor is None:
         return None
     row = await conn.fetchrow(
-        """SELECT * FROM session_states
-            WHERE task_id = $1 AND exited_at IS NULL AND reported_at > $2
-            ORDER BY started_at DESC NULLS LAST, reported_at DESC LIMIT 1""",
+        ORCHESTRATOR_CANDIDATES_SQL,
         anchor, fresh,
     )
     if row is None:

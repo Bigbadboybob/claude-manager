@@ -240,8 +240,9 @@ async def _snoozed(conn, board_id: str, now: datetime) -> set[tuple[int, str]]:
 
 
 async def _orchestrator_row(conn, board: dict, now: datetime) -> dict | None:
-    """The orchestrator's state row: explicit pid, else the newest live
-    session bound to the coordinator (initiative) or root task."""
+    """The orchestrator's state row: explicit pid, else the best live agent
+    session bound to the coordinator (initiative) or root task
+    (`items_db.ORCHESTRATOR_CANDIDATES_SQL`)."""
     if board.get("orchestrator_pid"):
         row = await conn.fetchrow("SELECT * FROM session_states WHERE pid = $1",
                                   board["orchestrator_pid"])
@@ -250,9 +251,7 @@ async def _orchestrator_row(conn, board: dict, now: datetime) -> dict | None:
     if anchor is None:
         return None
     row = await conn.fetchrow(
-        """SELECT * FROM session_states
-            WHERE task_id = $1 AND exited_at IS NULL AND reported_at > $2
-            ORDER BY started_at DESC NULLS LAST, reported_at DESC LIMIT 1""",
+        items_db.ORCHESTRATOR_CANDIDATES_SQL,
         anchor, now - timedelta(seconds=STATE_FRESH_S),
     )
     return dict(row) if row else None
@@ -270,14 +269,16 @@ async def _anchor_task(conn, board: dict):
 
 async def _escalation_target(conn, board: dict, orch: dict | None) -> dict | None:
     """Where an Owner alert is raised: the orchestrator's daemon and row, else
-    the coordinator's most recent session on any daemon."""
+    the coordinator's most recent non-bash session on any daemon."""
     if orch and orch.get("daemon_id") and orch.get("session_uid"):
         return orch
     anchor = await _anchor_task(conn, board)
     if anchor is None:
         return None
     row = await conn.fetchrow(
-        "SELECT * FROM session_states WHERE task_id = $1 ORDER BY reported_at DESC LIMIT 1",
+        """SELECT * FROM session_states
+            WHERE task_id = $1 AND COALESCE(engine, '') <> 'bash'
+            ORDER BY reported_at DESC LIMIT 1""",
         anchor)
     return dict(row) if row else None
 

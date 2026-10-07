@@ -377,6 +377,25 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(alert["session_uid"], "orch-uid")
         self.assertIn("with no orchestrator", alert["text"])
 
+    async def test_engine_never_pushes_or_escalates_to_a_bash_pane(self):
+        shell = {"pid": "agent:d1:shell-uid", "name": "shell", "session_uid": "shell-uid",
+                 "daemon_id": "d1"}
+        await self.beat({**self.row(shell, "working", task=self.root), "engine": "bash"},
+                        {**self.row(ORCH, "working", task=self.root), "engine": "codex"},
+                        self.row(HOLDER, "working"))
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        await self.age(150)
+        await self.tick()
+        self.assertEqual([p["session_uid"] for p in await self.pushes("board")], ["orch-uid"])
+        # With only the bash pane left on the coordinator task, escalation finds nobody.
+        await self.beat({**self.row(shell, "working", task=self.root), "engine": "bash"},
+                        self.row(HOLDER, "working"))
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM session_states WHERE pid = $1", ORCH["pid"])
+        await self.age(61)
+        await self.tick()
+        self.assertEqual(await self.pushes("escalation"), [])
+
     async def test_close_out_archives_and_prunes(self):
         await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a"}, {"title": "b"}])
         await items_db.update_items(self.pool, self.ref, ORCH, [1, 2], {"status": "done"})

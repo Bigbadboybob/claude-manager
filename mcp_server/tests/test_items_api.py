@@ -461,6 +461,43 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         board = await self.read()
         self.assertEqual([s["pid"] for s in board["free_capacity"]], [LANE["pid"]])
 
+    async def test_orchestrator_auto_pick_skips_bash_and_prefers_recent_agents(self):
+        now = datetime.now(timezone.utc)
+
+        async def state(name, engine, since_min, started_min, last_turn_min=None):
+            agent = None
+            if last_turn_min is not None:
+                ended = (now - timedelta(minutes=last_turn_min)).timestamp()
+                agent = {"last_turn": {"ended_at": ended}}
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO session_states (pid, daemon_id, session_uid, task_id, name,
+                                                   engine, state, state_since, started_at,
+                                                   agent_state, reported_at)
+                       VALUES ($1, 'd1', $2, $3, $4, $5, 'idle', $6, $7, $8, $9)""",
+                    f"agent:d1:{name}", name, uuid.UUID(self.root), name, engine,
+                    now - timedelta(minutes=since_min), now - timedelta(minutes=started_min),
+                    agent, now)
+
+        # The newest-started session is a bash pane: never the orchestrator.
+        await state("shell", "bash", 1, 1)
+        await state("old-codex", "codex", 50, 300)
+        await state("busy-claude", "claude-code", 5, 200)
+        self.assertEqual((await self.read())["board"]["orchestrator"]["name"], "busy-claude")
+        # A more recent turn end wins over an older state change.
+        await state("fresh-turn", "codex", 90, 250, last_turn_min=2)
+        self.assertEqual((await self.read())["board"]["orchestrator"]["name"], "fresh-turn")
+        # An unknown engine loses to any live Claude/Codex session, however
+        # recent its activity, and wins only when none is live.
+        await state("mystery", None, 0, 0)
+        self.assertEqual((await self.read())["board"]["orchestrator"]["name"], "fresh-turn")
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM session_states WHERE engine IN ('codex', 'claude-code')")
+        self.assertEqual((await self.read())["board"]["orchestrator"]["name"], "mystery")
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM session_states WHERE engine IS NULL")
+        self.assertIsNone((await self.read())["board"]["orchestrator"])
+
     async def test_archived_items_leave_the_board_but_stay_searchable(self):
         await self.create({"title": "fuse SEJD", "note": "PR-ready"}, "other")
         await self.patch(1, status="done")

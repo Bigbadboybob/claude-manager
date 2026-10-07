@@ -160,9 +160,12 @@ re-raise only after the snooze.
 **Free capacity** (not a flag): sessions on the board (task resolves to it or
 holding any item there) that are live and hold no `active`/`waiting` item.
 
-**Orchestrator.** `orchestrator_pid` if set; else the most recently started
-live session bound to the initiative's `coordinator_task_id` (task board: the
-root task). None → `orchestrator: null` and escalations go straight to Owner.
+**Orchestrator.** `orchestrator_pid` if set; else a live session bound to the
+initiative's `coordinator_task_id` (task board: the root task). Bash panes
+never qualify; Claude/Codex sessions beat any other engine; ties go to the
+most recent activity (latest state change or turn end, then latest report),
+not to start time. None → `orchestrator: null` and escalations go straight to
+Owner, through the coordinator's most recent non-bash session.
 
 ## 5. Pushes
 
