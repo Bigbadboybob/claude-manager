@@ -104,28 +104,6 @@ pub fn current(cm_root: &Path) -> (Option<Level>, Option<String>) {
     )
 }
 
-/// Sessions an evaluator elsewhere (the work-item board) wants woken when the
-/// level changes, keyed by its source. In memory: the board re-registers.
-static REGISTERED: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-pub fn register_orchestrators(source: &str, uids: Vec<String>) {
-    REGISTERED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(source.to_owned(), uids);
-}
-
-fn registered() -> Vec<String> {
-    REGISTERED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .values()
-        .flatten()
-        .cloned()
-        .collect()
-}
-
 fn applied_path(cm_root: &Path) -> PathBuf {
     cm_root.join("owner-availability-applied.json")
 }
@@ -186,6 +164,10 @@ pub fn tick(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>)
     }
 }
 
+/// Wake only the sessions this change affects: those with requests that
+/// were released or are still held. Everyone else reads the level from
+/// `ping().owner_availability` when they next need it (waking every
+/// orchestrator per change produced notices Owner paid for in stall alerts).
 fn wake(
     state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>,
     root: &Path,
@@ -195,49 +177,27 @@ fn wake(
     outcome: &crate::owner_attention::ReleaseOutcome,
 ) {
     let name = |l: Option<Level>| l.map(Level::as_str).unwrap_or("unset");
-    // (a) continuous orchestrators, (b) initiative coordinators, (c) board
-    // registrations, (d) sessions with held or released requests.
-    let mut targets: std::collections::BTreeSet<String> = crate::continuous::task::load_all()
-        .into_iter()
-        .filter(|t| !t.paused)
-        .filter_map(|t| t.current_session_uid)
-        .collect();
-    targets.extend(registered());
-    targets.extend(outcome.released.keys().cloned());
-    targets.extend(outcome.still_held.keys().cloned());
-    let (live, api_url, api_token): (std::collections::BTreeMap<String, Option<String>>, String, String) = {
-        let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        (
-            s.sessions.iter().map(|(uid, x)| (uid.clone(), x.task_id.clone())).collect(),
-            s.config.api_url.clone(),
-            s.config.api_token.clone(),
-        )
-    };
-    match crate::planning_client::fetch_active_coordinator_tasks(Some(&api_url), Some(&api_token)) {
-        Ok(tasks) => targets.extend(
-            live.iter()
-                .filter(|(_, task)| task.as_ref().is_some_and(|t| tasks.contains(t)))
-                .map(|(uid, _)| uid.clone()),
-        ),
-        Err(e) => eprintln!(
-            "cm owner availability: initiative coordinators unavailable ({}); waking continuous and registered orchestrators only",
-            e.to_method_err().1
-        ),
+    let targets: std::collections::BTreeSet<&String> =
+        outcome.released.keys().chain(outcome.still_held.keys()).collect();
+    if targets.is_empty() {
+        return;
     }
+    let live: std::collections::BTreeSet<String> = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        s.sessions.keys().cloned().collect()
+    };
     let at = Utc::now().format("%H:%MZ");
-    for uid in targets.iter().filter(|u| live.contains_key(*u)) {
-        let mut text = format!(
-            "Owner availability: {}→{} at {at}.",
+    // The marker must be in the text: the consumer confirms delivery by
+    // finding it in the agent's transcript.
+    let marker = format!("[cm-owner-availability {revision}]");
+    for uid in targets.into_iter().filter(|u| live.contains(*u)) {
+        let released = outcome.released.get(uid).copied().unwrap_or(0);
+        let held = outcome.still_held.get(uid).copied().unwrap_or(0);
+        let text = format!(
+            "{marker} Owner availability: {}\u{2192}{} at {at}. {released} of your requests were released; {held} still held. Check ping().owner_availability before asking Owner; continue your task.",
             name(previous),
             name(level)
         );
-        let released = outcome.released.get(uid).copied().unwrap_or(0);
-        let held = outcome.still_held.get(uid).copied().unwrap_or(0);
-        if released > 0 || held > 0 {
-            text.push_str(&format!(" {released} of your requests were released; {held} still held."));
-        }
-        text.push_str(" Check ping().owner_availability before asking Owner; continue your task.");
-        let marker = format!("[cm-owner-availability {revision}]");
         if let Err(e) = crate::notifications::publish(
             root,
             uid,

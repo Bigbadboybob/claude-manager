@@ -142,6 +142,13 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
     let mut episodes = load(root);
     let before = episodes.clone();
     for uid in uids {
+        // Notices that can never be confirmed (text without its marker,
+        // written before publish enforced it) must not hold an episode open.
+        match crate::notifications::retire_unconfirmable(root, uid) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("cm notifications: retired {n} unconfirmable notice(s) for {uid}"),
+            Err(e) => eprintln!("cm notifications: retire unconfirmable for {uid}: {e}"),
+        }
         let stall = match crate::notifications::snapshot(root, uid) {
             Ok((events, transport)) => assess(&events, transport.as_ref(), now, threshold),
             Err(_) => continue,
@@ -329,7 +336,7 @@ mod tests {
         daemon.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
         let state = Arc::new(Mutex::new(daemon));
         let uid = "ts-stalled".to_string();
-        crate::notifications::publish(root, &uid, "chat:one", "chat", "wake", "[cm-chat one]").unwrap();
+        crate::notifications::publish(root, &uid, "chat:one", "chat", "[cm-chat one] wake", "[cm-chat one]").unwrap();
         let queue = crate::notifications::directory(root, &uid);
         let event_file = |id: &str| {
             use sha2::Digest;
@@ -357,7 +364,7 @@ mod tests {
         crate::messaging::atomic_replace(&event_file("chat:one"), &event).unwrap();
         pass(&state, root, &uids, 3_200.0, 900);
         assert!(load(root).is_empty());
-        crate::notifications::publish(root, &uid, "chat:two", "chat", "wake", "[cm-chat two]").unwrap();
+        crate::notifications::publish(root, &uid, "chat:two", "chat", "[cm-chat two] wake", "[cm-chat two]").unwrap();
         let mut two: Value = serde_json::from_slice(&fs::read(event_file("chat:two")).unwrap()).unwrap();
         two["status"] = json!("submitted");
         two["updated_at"] = json!(3_300.0);
@@ -418,7 +425,7 @@ mod tests {
         let state = Arc::new(Mutex::new(daemon));
         let uid = "ts-busy".to_string();
         let existing = crate::owner_attention::raise_system(&state.lock().unwrap(), &uid, "Decision needed").unwrap().unwrap();
-        crate::notifications::publish(root, &uid, "chat:one", "chat", "wake", "[cm-chat one]").unwrap();
+        crate::notifications::publish(root, &uid, "chat:one", "chat", "[cm-chat one] wake", "[cm-chat one]").unwrap();
         let mut snapshot = crate::notifications::snapshot(root, &uid).unwrap().0;
         snapshot[0]["status"] = json!("submitted");
         assert!(assess(&snapshot, None, snapshot[0]["created_at"].as_f64().unwrap() + 1000.0, 900).is_some());

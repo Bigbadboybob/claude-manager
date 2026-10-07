@@ -769,11 +769,20 @@ mod tests {
         assert_eq!(events.len(), 1);
         let text = events[0]["text"].as_str().unwrap();
         assert!(text.contains("away→focused") && text.contains("1 of your requests were released"), "{text}");
+        // The marker is in the text, so the consumer can confirm delivery
+        // (without it the notice stayed `submitted` and paged Owner).
+        let marker = events[0]["marker"].as_str().unwrap();
+        assert!(marker.starts_with("[cm-owner-availability ") && text.starts_with(marker), "{text}");
         // Unchanged revision: no second wake.
         crate::owner_availability::tick(&state);
         assert_eq!(wakes().len(), 1);
         // Re-setting the same level is a new revision but no change: no wake.
         set_level(&state, Some("focused"), "r3");
+        crate::owner_availability::tick(&state);
+        assert_eq!(wakes().len(), 1);
+        // A real change with nothing held or released wakes nobody: agents
+        // read the level from ping() when they need it.
+        set_level(&state, Some("on-call"), "r4");
         crate::owner_availability::tick(&state);
         assert_eq!(wakes().len(), 1);
     }

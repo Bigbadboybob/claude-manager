@@ -86,11 +86,14 @@ the delivered queue), never in `owner-attention.json`, so viewers never show
 them. When the level changes (set locally or replicated from the hub), every
 daemon's delivery worker releases the held requests the new level delivers into
 the normal queue, marked `released_at` (merged into a pending alert for the same
-session, up to 4,096 bytes), and wakes once per revision: continuous
-orchestrators, live sessions bound to an active initiative's coordinator task,
-sessions the work-item board registered, and sessions with held or released
-requests. Wakes happen only when the level value changes: re-setting the same
-level, or the first run after an upgrade, wakes nobody.
+session, up to 4,096 bytes), and wakes, once per revision, only the sessions
+that have held or released requests. Other agents read the current level from
+`ping().owner_availability` when they need it; nobody else is woken. Wakes
+happen only when the level value changes: re-setting the same level, or the
+first run after an upgrade, wakes nobody. Every native notice carries its
+marker in its text (`notifications::publish` refuses one that does not), so
+delivery can be confirmed; notices written before that check, which could
+never be confirmed, are retired by the stall alarm instead of paging Owner.
 `~/.cm/owner-availability-applied.json` records the last applied revision.
 
 Out-of-band push (`notify_command`, e.g. Telegram, tag `owner-attention`):

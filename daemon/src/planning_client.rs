@@ -321,31 +321,6 @@ pub fn fetch_task_status(
         .map(|s| s.trim().to_ascii_lowercase()))
 }
 
-/// GET `<api>/initiatives?status=active` and return each initiative's
-/// `coordinator_task_id`. Called only when Owner's availability level
-/// changes (to wake initiative coordinators), never on a timer.
-pub fn fetch_active_coordinator_tasks(
-    api_url_override: Option<&str>,
-    api_token_override: Option<&str>,
-) -> Result<std::collections::BTreeSet<String>, PlanningClientError> {
-    let api_url = resolve_api_url(api_url_override)?;
-    let api_token = resolve_api_token(api_token_override)?;
-    let endpoint = format!("{}/initiatives?status=active", api_url);
-    let response = build_agent()
-        .get(&endpoint)
-        .header("Authorization", &format!("Bearer {}", api_token))
-        .call()
-        .map_err(|e| PlanningClientError::Transport(format!("GET {}: {}", endpoint, e)))?;
-    let rows: serde_json::Value = decode_json_response(response, "initiative list")?;
-    Ok(rows
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.get("coordinator_task_id").and_then(|v| v.as_str()))
-        .map(str::to_owned)
-        .collect())
-}
-
 /// POST to `<CM_API_URL>/tasks` with the propose-task body.
 /// Returns the API's JSON response on success (the new task
 /// row, including the assigned `id`).
