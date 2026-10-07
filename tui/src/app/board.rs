@@ -10,6 +10,12 @@ use serde_json::{json, Value};
 use std::sync::mpsc;
 
 const POLL: Duration = Duration::from_secs(5);
+/// Holder states change without moving the board version, so the poll also
+/// re-reads the whole board this often (doc/items-board.md §7).
+const FULL_READ: Duration = Duration::from_secs(30);
+/// First retry delay after a failed board list; doubles up to `LIST_BACKOFF_MAX`.
+const LIST_BACKOFF: Duration = Duration::from_secs(5);
+const LIST_BACKOFF_MAX: Duration = Duration::from_secs(120);
 
 /// What a typed line will be used for.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,8 +24,12 @@ enum PromptKind {
     Note,
     Reassign,
     Drop,
+    /// ETA for `s` → `w` (waiting).
+    WaitingEta,
     ResolveReassign,
     ResolveBlock,
+    /// Check-back time after a `block` resolution's free-text reason.
+    ResolveBlockCheck,
     ResolveDrop,
 }
 
@@ -30,7 +40,8 @@ enum Menu {
     Resolve,
 }
 
-type Reply = (String, Result<Value, String>);
+/// `(op, board slug the request was for, result)`.
+type Reply = (String, Option<String>, Result<Value, String>);
 
 #[derive(Default)]
 pub(super) struct Board {
@@ -44,8 +55,17 @@ pub(super) struct Board {
     prompt: Option<(PromptKind, String)>,
     menu: Option<Menu>,
     rx: Option<mpsc::Receiver<Reply>>,
+    /// Writes waiting for the in-flight request: `(method, params)`, sent in
+    /// order (each already carries its board).
+    queued: std::collections::VecDeque<(&'static str, Value)>,
     last_poll: Option<Instant>,
+    last_full: Option<Instant>,
     listed: bool,
+    list_retry_at: Option<Instant>,
+    list_backoff: Duration,
+    /// Free-text reason typed for a `block` resolution, kept while the
+    /// check-back prompt is open.
+    pending_block: Option<String>,
     status: String,
     error: String,
 }
@@ -59,8 +79,26 @@ impl Board {
         self.data["items"].as_array().map(Vec::as_slice).unwrap_or(&[])
     }
 
+    fn closed(&self) -> &[Value] {
+        self.data["recently_closed"].as_array().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Selectable rows: open items, then the recently-closed strip (so `o`
+    /// can reopen a closed item).
+    fn rows(&self) -> impl Iterator<Item = &Value> {
+        self.items().iter().chain(self.closed().iter().take(CLOSED_SHOWN))
+    }
+
+    fn row_count(&self) -> usize {
+        self.items().len() + self.closed().len().min(CLOSED_SHOWN)
+    }
+
+    fn selected(&self) -> Option<&Value> {
+        self.rows().nth(self.cursor)
+    }
+
     fn selected_n(&self) -> Option<i64> {
-        self.items().get(self.cursor).and_then(|i| i["n"].as_i64())
+        self.selected().and_then(|i| i["n"].as_i64())
     }
 
     /// Apply a `board.read` reply: `{unchanged}` keeps the current data.
@@ -70,12 +108,15 @@ impl Board {
         }
         self.version = v["board"]["version"].as_i64();
         self.data = v;
-        let n = self.items().len();
+        let n = self.row_count();
         if self.cursor >= n {
             self.cursor = n.saturating_sub(1);
         }
     }
 }
+
+/// Recently-closed items shown (and selectable) under the board.
+const CLOSED_SHOWN: usize = 10;
 
 fn age(secs: i64) -> String {
     let s = secs.max(0);
@@ -139,19 +180,20 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.board.rx = Some(rx);
         let op = op.to_owned();
+        let tag = params["board"].as_str().map(str::to_owned);
         std::thread::spawn(move || {
             let mut errors = Vec::new();
             for (host, socket, token) in targets {
                 match crate::client_session::rpc_messaging_board(&socket, &token, method, params.clone()) {
                     Ok(v) => {
-                        let _ = tx.send((op, Ok(v)));
+                        let _ = tx.send((op, tag, Ok(v)));
                         return;
                     }
                     Err(e) => errors.push(format!("{host}: {e}")),
                 }
             }
             let msg = if errors.is_empty() { "No daemon is reachable".to_owned() } else { errors.join("; ") };
-            let _ = tx.send((op, Err(msg)));
+            let _ = tx.send((op, tag, Err(msg)));
         });
     }
 
@@ -166,7 +208,7 @@ impl App {
             let result = crate::api::list_open_boards(&url, &token)
                 .map(Value::from)
                 .map_err(|e| e.to_string());
-            let _ = tx.send(("list".into(), result));
+            let _ = tx.send(("list".into(), None, result));
         });
     }
 
@@ -175,32 +217,59 @@ impl App {
             return;
         };
         let mut params = json!({"board": slug, "view": "full"});
-        if incremental {
+        let full_due = self.board.last_full.is_none_or(|t| t.elapsed() >= FULL_READ);
+        if incremental && !full_due {
             if let Some(v) = self.board.version {
                 params["since_version"] = json!(v);
             }
+        } else {
+            self.board.last_full = Some(Instant::now());
         }
         self.board.last_poll = Some(Instant::now());
         self.board_request("read", "board.read", params);
     }
 
+    /// Queue a write for the current board; sent in order as soon as no
+    /// request is in flight (never dropped behind a poll).
     fn board_write(&mut self, method: &'static str, mut params: Value) {
         if let Some(slug) = self.board.slug() {
             params["board"] = json!(slug);
+            self.board.queued.push_back((method, params));
+            self.board.status = "Saving…".into();
+            self.board_pump();
+        }
+    }
+
+    fn board_pump(&mut self) {
+        if self.board.rx.is_some() {
+            return;
+        }
+        if let Some((method, params)) = self.board.queued.pop_front() {
             self.board_request("write", method, params);
         }
     }
 
     /// Replies and the visible-only poll. Called every main-loop tick.
     pub fn board_tick(&mut self) {
-        if let Some((op, result)) = self.board.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        if let Some((op, tag, result)) = self.board.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.board.rx = None;
             self.needs_redraw = true;
+            // A read for a board the user has since switched away from is
+            // stale: drop it (a write's outcome still reports).
+            let stale = op == "read" && tag.is_some() && tag != self.board.slug();
             match (op.as_str(), result) {
+                _ if stale => {}
+                ("list", Err(e)) => {
+                    self.board.error = e;
+                    self.board.list_backoff = (self.board.list_backoff * 2).clamp(LIST_BACKOFF, LIST_BACKOFF_MAX);
+                    self.board.list_retry_at = Some(Instant::now() + self.board.list_backoff);
+                }
                 (_, Err(e)) => self.board.error = e,
                 ("list", Ok(v)) => {
                     self.board.error.clear();
                     self.board.listed = true;
+                    self.board.list_backoff = Duration::ZERO;
+                    self.board.list_retry_at = None;
                     let keep = self.board.slug();
                     self.board.boards = v.as_array().cloned().unwrap_or_default();
                     self.board.board_idx = keep
@@ -216,15 +285,19 @@ impl App {
                 (_, Ok(_)) => {
                     self.board.error.clear();
                     self.board.status = "Saved".into();
-                    self.board_read(true);
+                    // Re-read once the queue drains.
+                    self.board.last_poll = None;
                 }
             }
         }
+        self.board_pump();
         if !self.board.visible || self.board.rx.is_some() {
             return;
         }
         if !self.board.listed {
-            self.board_list();
+            if self.board.list_retry_at.is_none_or(|t| Instant::now() >= t) {
+                self.board_list();
+            }
         } else if self.board.last_poll.is_none_or(|t| t.elapsed() >= POLL) {
             self.board_read(true);
         }
@@ -257,9 +330,22 @@ impl App {
                     self.board_write("item.resolve", json!({"n": n, "action": "reassign", "holder": text}));
                 }
             }
-            PromptKind::ResolveBlock if !text.is_empty() => {
+            PromptKind::WaitingEta if !text.is_empty() => {
                 if let Some(n) = n {
-                    self.board_write("item.resolve", json!({"n": n, "action": "block", "blocked_on": text}));
+                    self.board_write("item.set", json!({"n": n, "status": "waiting", "eta": text}));
+                }
+            }
+            PromptKind::ResolveBlock if !text.is_empty() => {
+                self.board.pending_block = Some(text);
+                self.board.prompt = Some((PromptKind::ResolveBlockCheck, String::new()));
+            }
+            PromptKind::ResolveBlockCheck => {
+                if let (Some(n), Some(blocked_on)) = (n, self.board.pending_block.take()) {
+                    let mut params = json!({"n": n, "action": "block", "blocked_on": blocked_on});
+                    if !text.is_empty() {
+                        params["check_back"] = json!(text);
+                    }
+                    self.board_write("item.resolve", params);
                 }
             }
             PromptKind::ResolveDrop => {
@@ -292,7 +378,7 @@ impl App {
         self.needs_redraw = true;
         if let Some((kind, mut text)) = self.board.prompt.take() {
             match key.code {
-                KeyCode::Esc => {}
+                KeyCode::Esc => self.board.pending_block = None,
                 KeyCode::Enter => self.board_submit_prompt(kind, text),
                 KeyCode::Backspace => {
                     text.pop();
@@ -313,12 +399,15 @@ impl App {
                     let status = match c {
                         'o' => Some("open"),
                         'a' => Some("active"),
-                        'w' => Some("waiting"),
+                        'w' => None,
                         'b' => Some("blocked"),
                         'd' => Some("done"),
                         _ => None,
                     };
-                    if let Some(status) = status {
+                    if c == 'w' {
+                        // Waiting needs an ETA (e.g. 40m, 2h, or a time).
+                        self.board.prompt = Some((PromptKind::WaitingEta, String::new()));
+                    } else if let Some(status) = status {
                         self.board_write("item.set", json!({"n": n, "status": status}));
                     }
                 }
@@ -338,7 +427,7 @@ impl App {
             }
             return true;
         }
-        let count = self.board.items().len();
+        let count = self.board.row_count();
         let has_item = self.board.selected_n().is_some();
         match key.code {
             _ if alt_b => self.board.visible = false,
@@ -360,7 +449,7 @@ impl App {
             KeyCode::Char('a') => self.board.prompt = Some((PromptKind::Add, String::new())),
             KeyCode::Char('s') if has_item => self.board.menu = Some(Menu::Status),
             KeyCode::Char('n') if has_item => {
-                let note = self.board.items()[self.board.cursor]["note"].as_str().unwrap_or("").to_owned();
+                let note = self.board.selected().and_then(|i| i["note"].as_str()).unwrap_or("").to_owned();
                 self.board.prompt = Some((PromptKind::Note, note));
             }
             KeyCode::Char('r') if has_item => self.board.prompt = Some((PromptKind::Reassign, String::new())),
@@ -373,6 +462,8 @@ impl App {
             KeyCode::Char('g') => {
                 self.board.listed = false;
                 self.board.last_poll = None;
+                self.board.last_full = None;
+                self.board.list_retry_at = None;
             }
             _ => {}
         }
@@ -385,6 +476,7 @@ impl App {
         self.board.cursor = 0;
         self.board.detail = false;
         self.board.last_poll = None;
+        self.board.last_full = None;
     }
 
     pub(super) fn draw_board(&self, frame: &mut Frame) {
@@ -476,12 +568,16 @@ impl App {
                 }
             }
         }
-        let closed = b.data["recently_closed"].as_array().cloned().unwrap_or_default();
-        if !closed.is_empty() {
+        let open_rows = b.items().len();
+        if !b.closed().is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::styled("Recently closed (24 h)", bold));
-            for item in closed.iter().take(10) {
-                lines.push(Line::styled(format!("  {}", item_line(item)), dim));
+            lines.push(Line::styled("Recently closed (24 h) \u{00b7} o reopens", bold));
+            for (j, item) in b.closed().iter().take(CLOSED_SHOWN).enumerate() {
+                let mut style = dim;
+                if open_rows + j == b.cursor {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                lines.push(Line::styled(format!("  {}", item_line(item)), style));
             }
         }
         let footer_h = 2u16;
@@ -501,6 +597,8 @@ impl App {
                 PromptKind::Reassign | PromptKind::ResolveReassign => "Holder (name)",
                 PromptKind::Drop | PromptKind::ResolveDrop => "Reason",
                 PromptKind::ResolveBlock => "Blocked on",
+                PromptKind::ResolveBlockCheck => "Check back (e.g. 2h; empty for none)",
+                PromptKind::WaitingEta => "ETA (e.g. 40m, 2h)",
             };
             Line::styled(format!("{label}: {text}\u{2588}"), bold)
         } else if let Some(menu) = b.menu {
@@ -636,6 +734,81 @@ mod tests {
         assert!(app.board.data.is_null() && app.board.cursor == 0, "switching boards clears the old view");
         app.handle_event(&key(KeyCode::Esc));
         assert!(!app.board.visible);
+    }
+
+    /// Hold the request slot with a reply that never comes, so nothing in a
+    /// test spawns a real RPC.
+    fn busy(app: &mut App) -> mpsc::Sender<Reply> {
+        let (tx, rx) = mpsc::channel();
+        app.board.rx = Some(rx);
+        tx
+    }
+
+    #[test]
+    fn review_fixes_backoff_queue_stale_replies_prompts_and_closed_rows() {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let mut app = test_app();
+        // 1. A failed list backs off instead of re-listing every tick.
+        app.board.visible = true;
+        let tx = busy(&mut app);
+        tx.send(("list".into(), None, Err("api down".into()))).unwrap();
+        app.board_tick();
+        let retry = app.board.list_retry_at.expect("backoff scheduled");
+        assert!(retry > Instant::now() + Duration::from_secs(4));
+        assert!(app.board.rx.is_none() && !app.board.listed, "no immediate re-list");
+        assert_eq!(app.board.error, "api down");
+        // 2-3. Writes queue behind an in-flight request; a late read for the
+        // board we left is discarded.
+        loaded(&mut app);
+        let tx = busy(&mut app);
+        app.board_write("item.set", json!({"n": 3, "note": "a"}));
+        app.board_write("item.set", json!({"n": 1, "note": "b"}));
+        assert_eq!(app.board.queued.len(), 2, "nothing dropped while busy");
+        assert_eq!(app.board.queued[0].1["board"], "sfd");
+        app.handle_event(&key(KeyCode::Tab));
+        tx.send(("read".into(), Some("sfd".into()), Ok(json!({"board":{"version":9},"items":[{"n":42}]})))).unwrap();
+        app.board.rx.as_ref().unwrap();
+        let reply = app.board.rx.as_ref().unwrap().try_recv().unwrap();
+        let (tx2, rx2) = mpsc::channel();
+        app.board.rx = Some(rx2);
+        tx2.send(reply).unwrap();
+        let _hold = busy_after_tick(&mut app);
+        assert!(app.board.data.is_null(), "stale read for the previous board ignored");
+        assert_eq!(app.board.queued.len(), 1, "the queue drains one write per free slot");
+        // 5. s -> w asks for an ETA; x -> 3 asks for blocked_on, then check-back.
+        app.board.board_idx = 0;
+        loaded(&mut app);
+        let _hold = busy(&mut app);
+        app.board.queued.clear();
+        app.handle_event(&key(KeyCode::Char('s')));
+        app.handle_event(&key(KeyCode::Char('w')));
+        assert_eq!(app.board.prompt, Some((PromptKind::WaitingEta, String::new())));
+        for c in "40m".chars() { app.handle_event(&key(KeyCode::Char(c))); }
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(app.board.queued.back().unwrap().1, json!({"n":3,"status":"waiting","eta":"40m","board":"sfd"}));
+        app.handle_event(&key(KeyCode::Char('x')));
+        app.handle_event(&key(KeyCode::Char('3')));
+        for c in "EP GO".chars() { app.handle_event(&key(KeyCode::Char(c))); }
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(app.board.prompt, Some((PromptKind::ResolveBlockCheck, String::new())));
+        for c in "2h".chars() { app.handle_event(&key(KeyCode::Char(c))); }
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(app.board.queued.back().unwrap().1,
+            json!({"n":3,"action":"block","blocked_on":"EP GO","check_back":"2h","board":"sfd"}));
+        // 6. The closed strip is selectable, so `o` can reopen it.
+        for _ in 0..5 { app.handle_event(&key(KeyCode::Char('j'))); }
+        assert_eq!(app.board.selected_n(), Some(9));
+        app.handle_event(&key(KeyCode::Char('o')));
+        assert_eq!(app.board.queued.back().unwrap().1, json!({"n":9,"status":"active","board":"sfd"}));
+    }
+
+    /// Run one tick, then hold the slot again so the drained write is not sent.
+    fn busy_after_tick(app: &mut App) -> Option<mpsc::Sender<Reply>> {
+        app.board_tick();
+        // board_tick may have pumped a queued write into a real request;
+        // replace it with a held slot (the popped write stays popped).
+        Some(busy(app))
     }
 
     #[test]

@@ -737,7 +737,7 @@ impl App {
                             // follows the daemon's transition instead
                             // (`apply_agent_state`).
                             if ts.notify_on_idle
-                                && !self.agent_states.contains_key(&(ts.host_id.clone(), ts.uid.clone()))
+                                && !super::agent_state::covers_idle_notify(&self.agent_states, &ts.host_id, &ts.uid)
                             {
                                 notify_session_idle(&ts.label);
                             }

@@ -66,7 +66,7 @@ raises these flags and pushes you once per window with every open flag:
 |---|---|
 | `unassigned` | open with no holder for a few minutes |
 | `holder_gone` | a holder's session exited |
-| `holder_idle` | every holder sat at its prompt for 20 min (on per board) |
+| `holder_idle` | every holder sat at its prompt for 20 min (**off by default**; enabled per board once engine state is live on every host) |
 | `holder_waiting_on_human` / `holder_errored` | a holder needs a person, or failed |
 | `stale` | nobody touched it for 2 h (longer for a long declared job) |
 | `overdue` | waiting past its ETA plus a grace; the holder is asked first |

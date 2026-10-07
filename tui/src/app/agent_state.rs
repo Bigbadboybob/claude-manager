@@ -32,6 +32,14 @@ pub(crate) struct AgentStateView {
     pub error_kind: Option<String>,
     pub waiting_for: Option<String>,
     pub jobs: usize,
+    /// Reported by the engine itself (presence/hooks/relay), not the
+    /// daemon's PTY/transcript fallback.
+    pub engine_source: bool,
+    /// `stalled_since` is set: working with no visible progress.
+    pub stalled: bool,
+    /// The current idle/waiting state was entered through a live transition
+    /// (so notify-on-idle already had its chance), not seeded by a snapshot.
+    pub notified_quiet: bool,
     /// The daemon's object as received, passed through to TUI-served reads.
     pub raw: Value,
 }
@@ -54,6 +62,9 @@ impl AgentStateView {
             error_kind: v["detail"]["error_kind"].as_str().map(str::to_owned),
             waiting_for: v["detail"]["waiting_for"].as_str().map(str::to_owned),
             jobs: v["background"]["jobs"].as_array().map_or(0, Vec::len),
+            engine_source: matches!(v["source"].as_str(), Some("presence" | "hooks" | "relay")),
+            stalled: !v["stalled_since"].is_null(),
+            notified_quiet: false,
             raw: v.clone(),
         }
     }
@@ -94,6 +105,37 @@ impl App {
         self.agent_states.get(&(ts.host_id.clone(), ts.uid.clone()))
     }
 
+    /// Whether the PTY heuristic's notify-on-idle should stay quiet because
+    /// the engine's own state covers it: engine-reported, not stalled or
+    /// unknown, and — when quiet — reached by a live transition that already
+    /// notified. A seeded idle, an unknown/stalled engine, or the PTY
+    /// fallback leaves the PTY notification in place.
+    pub(crate) fn engine_covers_idle_notify(&self, host: &HostId, uid: &str) -> bool {
+        covers_idle_notify(&self.agent_states, host, uid)
+    }
+}
+
+/// See [`App::engine_covers_idle_notify`]; a free function so the PTY tick can
+/// call it while it holds `workspaces` mutably.
+pub(super) fn covers_idle_notify(
+    states: &HashMap<(HostId, String), AgentStateView>,
+    host: &HostId,
+    uid: &str,
+) -> bool {
+    {
+        states.get(&(host.clone(), uid.to_owned())).is_some_and(|v| {
+            v.engine_source
+                && !v.stalled
+                && match v.activity {
+                    Activity::Working | Activity::Background => true,
+                    Activity::Idle | Activity::Waiting => v.notified_quiet,
+                    Activity::Errored | Activity::Starting | Activity::Exited | Activity::Unknown => false,
+                }
+        })
+    }
+}
+
+impl App {
     /// The daemon's `agent_state` object for a row, or null.
     pub(crate) fn agent_state_wire(&self, ts: &TerminalSession) -> Value {
         self.agent_view(ts).map_or(Value::Null, |v| v.raw.clone())
@@ -168,18 +210,25 @@ impl App {
             self.needs_redraw = true;
             return;
         }
-        let next = AgentStateView::parse(value);
-        let previous = self.agent_states.get(&key).map(|v| v.activity);
-        let entered_quiet = matches!(next.activity, Activity::Idle | Activity::Waiting)
-            && previous.is_some_and(|p| p != next.activity && !matches!(p, Activity::Idle | Activity::Waiting));
-        if entered_quiet {
+        let mut next = AgentStateView::parse(value);
+        let old = self.agent_states.get(&key);
+        let quiet = |a: Activity| matches!(a, Activity::Idle | Activity::Waiting);
+        // A live diff into idle/waiting notifies, including the first state
+        // seen for a session (snapshots seed silently).
+        let entered_quiet = quiet(next.activity) && old.is_none_or(|o| !quiet(o.activity));
+        next.notified_quiet = entered_quiet
+            || (quiet(next.activity) && old.is_some_and(|o| o.activity == next.activity && o.notified_quiet));
+        // A working engine that just stalled while the terminal sits quiet
+        // gets the notification its stuck state would otherwise suppress.
+        let newly_stalled = next.stalled && old.is_some_and(|o| !o.stalled);
+        if entered_quiet || newly_stalled {
             if let Some(ts) = self
                 .workspaces
                 .iter()
                 .flat_map(|w| &w.sessions)
                 .find(|s| s.uid == uid && &s.host_id == host)
             {
-                if ts.notify_on_idle {
+                if ts.notify_on_idle && (entered_quiet || ts.status == SessionStatus::Idle) {
                     notify_session_idle(&ts.label);
                 }
             }
@@ -216,6 +265,25 @@ mod tests {
         assert_eq!((v.since, v.error_kind.as_deref(), v.jobs), (12.5, Some("rate_limit"), 2));
         // The exited tombstone's short shape parses.
         assert_eq!(AgentStateView::parse(&json!({"state":"exited"})).activity, Activity::Exited);
+    }
+
+    #[test]
+    fn pty_notify_is_suppressed_only_while_a_fresh_engine_state_covers_it() {
+        let host = HostId::new("sessions");
+        let mut states = HashMap::new();
+        let mut put = |state: Value, notified: bool| {
+            let mut v = AgentStateView::parse(&state);
+            v.notified_quiet = notified;
+            states.insert((host.clone(), "u".to_string()), v);
+            covers_idle_notify(&states, &host, "u")
+        };
+        assert!(put(json!({"state":"working","source":"presence"}), false), "engine working: it will notify on its idle");
+        assert!(!put(json!({"state":"working","source":"presence","stalled_since":5.0}), false), "stalled: PTY may notify");
+        assert!(!put(json!({"state":"unknown","source":"presence"}), false));
+        assert!(!put(json!({"state":"working","source":"pty"}), false), "daemon fallback is not engine state");
+        assert!(!put(json!({"state":"idle","source":"hooks"}), false), "seeded idle never notified");
+        assert!(put(json!({"state":"idle","source":"hooks"}), true));
+        assert!(!covers_idle_notify(&HashMap::new(), &host, "u"), "no state: PTY decides");
     }
 
     #[test]
