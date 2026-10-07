@@ -36,7 +36,7 @@ def state(st="working", since=None, reported=None, exited=False):
     return {"state": st, "state_since": since or ago(minutes=1),
             "idle_since": since if st == "idle" else None,
             "reported_at": reported or ago(seconds=10),
-            "exited_at": ago(minutes=1) if exited else None}
+            "exited_at": ago(minutes=5) if exited else None}
 
 
 def item(n=1, status="active", holders=(LANE,), touched=None, **kw):
@@ -57,6 +57,11 @@ class HolderStatus(unittest.TestCase):
         self.assertEqual(holder_status(stale, NOW, LIVE, "agent:d1:x"), "unknown")
         # Missing row: gone only when that holder's daemon is heartbeating.
         self.assertEqual(holder_status(None, NOW, LIVE, "agent:d1:x"), "gone")
+        # Grace: a fresh exit or a holder added since the last beat is not gone yet.
+        just_exited = {**state(exited=True), "exited_at": ago(seconds=30)}
+        self.assertEqual(holder_status(just_exited, NOW, LIVE, "agent:d1:x"), "unknown")
+        self.assertEqual(holder_status(None, NOW, LIVE, "agent:d1:x", ago(seconds=20)), "unknown")
+        self.assertEqual(holder_status(None, NOW, LIVE, "agent:d1:x", ago(minutes=5)), "gone")
         self.assertEqual(flags(item(), live=LIVE), {"holder_gone": {"holders": ["lane"]}})
         self.assertEqual(holder_status(None, NOW, LIVE, "agent:d9:x"), "unknown")
         self.assertEqual(holder_status(None, NOW, LIVE, "owner"), "unknown")
@@ -140,6 +145,17 @@ class ComputeFlags(unittest.TestCase):
         self.assertEqual(flags(item(), human),
                          {"holder_waiting_on_human": {"holders": ["lane"]}})
 
+    def test_open_with_holders_is_treated_as_held(self):
+        held = item(status="open", touched=ago(hours=3))
+        self.assertEqual(flags(held), {"stale": None})
+        gone = {LANE["pid"]: state(exited=True)}
+        self.assertIn("holder_gone", flags(item(status="open"), gone))
+        # Something blocked behind it stays exempt, but the chain end surfaces.
+        waiter = item(2, status="blocked", blocked_by={1}, touched=ago(hours=3))
+        both = {1: held, 2: waiter}
+        self.assertEqual(flags(waiter, items=both), {})
+        self.assertEqual(flags(held, items=both), {"stale": None})
+
     def test_closed_items_have_no_flags(self):
         self.assertEqual(flags(item(status="done", touched=ago(days=2))), {})
 
@@ -152,6 +168,8 @@ class Compose(unittest.TestCase):
         many = compose("sfd", [f"#{n} stale (untouched 3h)" for n in range(200)], {})
         self.assertLessEqual(len(many), 1000)
         self.assertIn("more", many)
+        digest = compose("sfd", [], {"done": list(range(1, 15))})
+        self.assertIn("14 done (#1,#2,#3,#4,#5,#6,#7,#8,#9,#10,+4)", digest)
 
 
 DSN = os.environ.get("CM_ITEMS_TEST_DSN")
@@ -198,6 +216,7 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
             await conn.execute("UPDATE item_flags SET raised_at = raised_at - $1::interval, "
                                "last_pushed_at = last_pushed_at - $1::interval", d)
             await conn.execute("UPDATE boards SET last_digest_at = last_digest_at - $1::interval", d)
+            await conn.execute("UPDATE item_holders SET added_at = added_at - $1::interval", d)
 
     async def pushes(self, kind=None):
         rows = await self.sql("SELECT kind, session_uid, text, owner_alert FROM item_pushes ORDER BY id")
@@ -256,7 +275,10 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
             await conn.execute("UPDATE items SET eta_at = now() - interval '10 min', "
                                "waiting_set_at = now() - interval '20 min' WHERE number = 1")
         s = await self.tick()
-        self.assertEqual(sorted(s["raised"]), [(1, "overdue"), (2, "holder_gone")])
+        self.assertEqual(s["raised"], [(1, "overdue")])  # dead-uid was only just added
+        await self.age(2)
+        s = await self.tick()
+        self.assertEqual(s["raised"], [(2, "holder_gone")])
         overdue = await self.pushes("overdue")
         self.assertEqual([p["session_uid"] for p in overdue], ["lane-uid"])
         board_text = (await self.pushes("board"))[0]["text"]
@@ -296,6 +318,37 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         await self.age(61)
         await self.tick()
         self.assertEqual(len(await self.pushes("escalation")), 1)
+
+    async def test_flags_raised_at_different_times_share_one_repush(self):
+        await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        await self.age(150)
+        await self.tick()                                   # #1 stale: push 1
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "b", "holders": [HOLDER]}])
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET touched_at = now() - interval '3 hours' WHERE number = 2")
+        await self.age(10)
+        await self.tick()                                   # #2 new: push 2 carries both
+        second = (await self.pushes("board"))[-1]["text"]
+        self.assertIn("2 flags", second)
+        await self.age(25)
+        await self.tick()                                   # #1 would be due alone: not yet
+        self.assertEqual(len(await self.pushes("board")), 2)
+        await self.age(6)
+        await self.tick()
+        boards = await self.pushes("board")
+        self.assertEqual(len(boards), 3)
+        self.assertIn("2 flags", boards[-1]["text"])
+
+    async def test_escalates_when_orchestrator_errored(self):
+        await self.beat(self.row(ORCH, "errored", task=self.root), self.row(HOLDER, "working"))
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        await self.age(150)
+        await self.tick()
+        await self.age(61)
+        await self.tick()
+        (alert,) = await self.pushes("escalation")
+        self.assertIn("while orch is errored", alert["text"])
 
     async def test_no_escalation_while_orchestrator_works(self):
         await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))

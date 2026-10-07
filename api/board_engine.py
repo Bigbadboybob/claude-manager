@@ -27,6 +27,7 @@ ENGINE_ACTOR = {"pid": "system:board-engine", "name": "board engine"}
 STATE_FRESH_S = items_db.STATE_FRESH_S
 OVERDUE_GRACE = 0.25
 PUSH_TEXT_LIMIT = 1000
+DIGEST_SHOWN = 10
 RETENTION = timedelta(days=7)
 ARCHIVE_AFTER = timedelta(hours=24)
 # Flags the engine owns: it raises and clears them. (blocker_dropped is also
@@ -41,15 +42,27 @@ def _seconds(delta: timedelta) -> float:
     return delta.total_seconds()
 
 
-def holder_status(row: dict | None, now: datetime, live_daemons: set[str], pid: str) -> str:
+# A holder only counts as gone after this long, so one late or partial beat
+# (a slow brain start, a session spawned between beats) never raises and
+# clears holder_gone in quick succession.
+GONE_GRACE_S = 90
+
+
+def holder_status(row: dict | None, now: datetime, live_daemons: set[str], pid: str,
+                  added_at: datetime | None = None) -> str:
     """One holder's state for flag purposes: a SESSION_STATE.md word, or
-    `gone` (exited, or missing from a daemon that is heartbeating)."""
+    `gone` (exited for GONE_GRACE_S, or missing for that long from a daemon
+    that is heartbeating)."""
     if pid == "owner" or not pid.startswith("agent:"):
         return "unknown"
     if row is None:
         daemon = pid.split(":", 2)[1] if pid.count(":") >= 2 else ""
-        return "gone" if daemon in live_daemons else "unknown"
+        settled = added_at is None or _seconds(now - added_at) >= GONE_GRACE_S
+        return "gone" if daemon in live_daemons and settled else "unknown"
     if row.get("exited_at") is not None or row.get("state") == "exited":
+        exited = row.get("exited_at") or row.get("reported_at")
+        if exited is not None and _seconds(now - exited) < GONE_GRACE_S:
+            return "unknown"
         return "gone"
     if _seconds(now - row["reported_at"]) > STATE_FRESH_S:
         return "unknown"
@@ -66,15 +79,21 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
     if item.status in CLOSED or item.archived_at is not None:
         return {}
     flags: dict[str, dict | None] = {}
-    status = {h["pid"]: holder_status(states.get(h["pid"]), now, live_daemons, h["pid"])
+    status = {h["pid"]: holder_status(states.get(h["pid"]), now, live_daemons, h["pid"],
+                                      h.get("added_at"))
               for h in item.holders}
+    # An `open` item that still has holders is being held: it gets the same
+    # holder and staleness flags as `active`, so nothing blocked behind it
+    # can hide.
+    held_open = item.status == "open" and bool(item.holders)
+    working = item.status in ("active", "waiting", "blocked") or held_open
     touched = max(t for t in (item.touched_at, item.clock_reset_at) if t is not None)
 
     if item.status == "open" and not item.holders:
         if _seconds(now - touched) >= board["unassigned_s"]:
             flags["unassigned"] = None
 
-    if item.status in ("active", "waiting", "blocked"):
+    if working:
         gone = _names(item.holders, lambda h: status[h["pid"]] == "gone")
         if gone:
             flags["holder_gone"] = {"holders": gone}
@@ -93,7 +112,7 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
     exempt = (item.status == "blocked" and bool(item.blocked_by) and not item.blocked_on
               and all(b is not None and b.status not in CLOSED for b in blockers))
 
-    if (board.get("holder_idle_enabled") and item.status == "active" and item.holders
+    if (board.get("holder_idle_enabled") and (item.status == "active" or held_open) and item.holders
             and all(status[h["pid"]] == "idle" for h in item.holders)):
         since = []
         for h in item.holders:
@@ -109,7 +128,7 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
         threshold = board["stale_s"]
         if item.status == "waiting" and item.eta_at and item.waiting_set_at:
             threshold = max(threshold, _seconds(item.eta_at - item.waiting_set_at))
-        if item.status in ("active", "blocked", "waiting") and _seconds(now - touched) >= threshold:
+        if working and _seconds(now - touched) >= threshold:
             flags["stale"] = None
 
     if item.status == "waiting" and item.eta_at and item.waiting_set_at:
@@ -176,7 +195,9 @@ def compose(slug: str, flag_parts: list[str], closed: dict[str, list[int]],
     for word in ("done", "dropped", "blocked"):
         ns = closed.get(word) or []
         if ns:
-            sections.append(f"{len(ns)} {word} (" + ",".join(f"#{n}" for n in ns) + ")")
+            shown = ",".join(f"#{n}" for n in ns[:DIGEST_SHOWN])
+            more = f",+{len(ns) - DIGEST_SHOWN}" if len(ns) > DIGEST_SHOWN else ""
+            sections.append(f"{len(ns)} {word} ({shown}{more})")
     text = f"{head} {' · '.join(sections)}.{tail}"
     if len(text) <= limit:
         return text
@@ -332,12 +353,14 @@ async def _open_flags(conn, board_id: str) -> list[dict]:
 async def _push_orchestrator(conn, board, items, states, orch, now, summary) -> None:
     flags = await _open_flags(conn, board["id"])
     repush = timedelta(seconds=board["repush_s"])
-    due = []
-    for f in flags:
-        if f["kind"] == "overdue" and now - f["raised_at"] < repush:
-            continue  # the holder is nudged first
-        if f["last_pushed_at"] is None or now - f["last_pushed_at"] >= repush:
-            due.append(f)
+    # The holder hears about an overdue item first.
+    eligible = [f for f in flags
+                if not (f["kind"] == "overdue" and now - f["raised_at"] < repush)]
+    # One wake carries every open flag: when any is new or due, all go, and
+    # their re-push clocks align so k flags never mean k wakes per window.
+    trigger = any(f["last_pushed_at"] is None or now - f["last_pushed_at"] >= repush
+                  for f in eligible)
+    due = eligible if trigger else []
     closed: dict[str, list[int]] = {}
     digest_due = (board.get("last_digest_at") is None
                   or now - board["last_digest_at"] >= timedelta(seconds=board["digest_s"]))
@@ -375,6 +398,10 @@ async def _push_orchestrator(conn, board, items, states, orch, now, summary) -> 
     summary["pushed"] = True
 
 
+# Boards whose escalation had no session to carry it (logged once).
+_UNROUTABLE: set[str] = set()
+
+
 async def _escalate(conn, board, orch, now, summary) -> None:
     flags = await _open_flags(conn, board["id"])
     threshold = timedelta(seconds=board["escalate_s"])
@@ -385,13 +412,16 @@ async def _escalate(conn, board, orch, now, summary) -> None:
     if orch:
         orch_state = holder_status(orch if "reported_at" in orch else None, now,
                                    await _live_daemons(conn, now), orch["pid"])
-    if orch_state not in ("idle", "unknown", "gone", "none"):
+    if orch_state not in ("idle", "unknown", "gone", "none", "errored", "waiting-on-human"):
         return
     target = await _escalation_target(conn, board, orch if orch_state != "none" else None)
     if target is None or not target.get("daemon_id") or not target.get("session_uid"):
-        logger.warning("board %s: %d flags need Owner but no session can carry the alert",
-                       board["slug"], len(stuck))
+        if board["id"] not in _UNROUTABLE:
+            logger.warning("board %s: %d flags need Owner but no session can carry the alert",
+                           board["slug"], len(stuck))
+            _UNROUTABLE.add(board["id"])
         return
+    _UNROUTABLE.discard(board["id"])
     who = (orch or {}).get("name") or (orch or {}).get("pid")
     situation = f"while {who} is {orch_state}" if orch_state != "none" else "with no orchestrator"
     oldest = max(_seconds(now - f["raised_at"]) for f in stuck)
@@ -414,11 +444,22 @@ async def close_out(pool, now: datetime | None = None) -> dict:
     """Archive items closed for 24 h; prune old pushes, exited states and
     create request keys. Plain runtime UPDATEs/DELETEs: no events."""
     now = now or items_db.utcnow()
+    archived = 0
     async with pool.acquire() as conn:
-        archived = await conn.execute(
-            """UPDATE items SET archived_at = $1
-                WHERE archived_at IS NULL AND closed_at IS NOT NULL AND closed_at < $2""",
-            now, now - ARCHIVE_AFTER)
+        boards = await conn.fetch(
+            """SELECT DISTINCT board_id FROM items
+                WHERE archived_at IS NULL AND closed_at IS NOT NULL AND closed_at < $1""",
+            now - ARCHIVE_AFTER)
+        for b in boards:
+            # Under the board lock, so a concurrent reopen cannot interleave.
+            async with conn.transaction():
+                await conn.execute("SELECT 1 FROM boards WHERE id = $1 FOR UPDATE", b["board_id"])
+                result = await conn.execute(
+                    """UPDATE items SET archived_at = $2
+                        WHERE board_id = $1 AND archived_at IS NULL
+                          AND closed_at IS NOT NULL AND closed_at < $3""",
+                    b["board_id"], now, now - ARCHIVE_AFTER)
+                archived += int(result.split()[-1])
         pushes = await conn.execute(
             "DELETE FROM item_pushes WHERE delivered_at IS NOT NULL AND delivered_at < $1",
             now - RETENTION)

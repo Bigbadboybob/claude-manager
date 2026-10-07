@@ -132,13 +132,17 @@ also raised by the write path. Thresholds are per board:
 | Kind | Raised when |
 |---|---|
 | `unassigned` | `open`, no holders, older than `unassigned_s` |
-| `holder_gone` | item `active`/`waiting`/`blocked` and any holder is `exited`, or has no state row while its daemon is heartbeating (a daemon not yet sending heartbeats leaves its holders `unknown`); applies even while blocked |
-| `holder_idle` | `active`, every holder `idle` with `now − max(idle_since, clock_reset_at, touched_at) ≥ idle_s` |
+| `holder_gone` | item held (below) and any holder exited ≥ 90 s ago, or has had no state row for ≥ 90 s since it was added while its daemon is heartbeating (a daemon not yet sending heartbeats leaves its holders `unknown`); applies even while blocked |
+| `holder_idle` | `active` (or `open` with holders), every holder `idle` with `now − max(idle_since, clock_reset_at, touched_at) ≥ idle_s` |
 | `holder_waiting_on_human` / `holder_errored` | any holder in `waiting-on-human` / `errored` |
-| `stale` | `active`, `blocked` or `waiting`, `now − max(touched_at, clock_reset_at) ≥ stale_s`; for `waiting` the threshold is `max(stale_s, eta_at − waiting_set_at)` |
+| `stale` | held, `now − max(touched_at, clock_reset_at) ≥ stale_s`; for `waiting` the threshold is `max(stale_s, eta_at − waiting_set_at)` |
 | `overdue` | `waiting` and `now > eta_at + 0.25·(eta_at − waiting_set_at)` |
 | `check_back` | `blocked_on` set and `check_back_at` passed |
 | `blocker_dropped` | a blocker of this item was dropped |
+
+"Held" means `active`, `waiting`, `blocked`, or `open` with holders: an
+`open` item that keeps holders gets the same holder and staleness flags as
+`active`, so nothing blocked behind it can hide.
 
 **Exemptions.** An item blocked only by open items (`blocked_by` non-empty,
 `blocked_on` empty) is exempt from `holder_idle` and `stale`. Free-text
@@ -176,13 +180,14 @@ ids are acked on the next beat; unacked rows are re-sent.
 | `unblocked` | holders | last blocker done |
 | `nudge` | holders | `item_resolve(nudge)` |
 | `overdue` | holder when raised; orchestrator once the flag is `repush_s` old | flag |
-| `board` | orchestrator | new flags immediately; unresolved flags every `repush_s`; done/dropped/blocked events by others than the orchestrator, batched over a `digest_s` window. One row per orchestrator per tick; no push without a live orchestrator |
-| `escalation` (`owner_alert`) | Owner via the orchestrator's daemon (else the coordinator's most recent session, live or not) | no orchestrator, or it is `idle`/`unknown`/gone, and flags unresolved for `escalate_s`; once per flag (`escalated_at`) |
+| `board` | orchestrator | new flags immediately; unresolved flags every `repush_s` — whenever any flag is new or due, the push carries every open flag and their re-push clocks align, so k flags are one wake per window; done/dropped/blocked events by others than the orchestrator, batched over a `digest_s` window. One row per orchestrator per tick; no push without a live orchestrator |
+| `escalation` (`owner_alert`) | Owner via the orchestrator's daemon (else the coordinator's most recent session, live or not) | no orchestrator, or it is `idle`/`unknown`/gone/`errored`/`waiting-on-human`, and flags unresolved for `escalate_s`; once per flag (`escalated_at`) |
 
 Text stays under ~1 KB, e.g.
 `[cm-board sfd] 2 flags: #14 holder_idle (rl-scale-out idle 24m); #9 stale 2h10m · 3 done (#3,#5,#6). board() / item_resolve(n, action)`.
 
-**Close-out.** Items closed for 24 h get `archived_at` (off the board, still
+**Close-out.** Items closed for 24 h get `archived_at` (per board, under the
+board-row lock, so a concurrent reopen cannot interleave) (off the board, still
 searchable with `archived=true`). Delivered pushes, state rows exited and
 `item_requests` keys older than 7 days are pruned (about every 10 minutes).
 
