@@ -240,12 +240,16 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Captured {
             })
         })
         .collect();
-    let daemon_id = s
-        .messaging
+    let messaging = s.messaging.clone();
+    let cm_root = s.messaging_root.clone();
+    // Lock order: the messaging RPC path holds the store slot while it takes
+    // the daemon lock (project_names), so never take the slot under `s`.
+    drop(s);
+    let daemon_id = messaging
         .lock()
         .ok()
         .and_then(|slot| slot.as_ref().map(|store| store.daemon_id.clone()));
-    Captured { agents, shells, inputs, cm_root: s.messaging_root.clone(), daemon_id }
+    Captured { agents, shells, inputs, cm_root, daemon_id }
 }
 
 /// Owner keystrokes between samples, at the 5 s tick resolution: a tick in
