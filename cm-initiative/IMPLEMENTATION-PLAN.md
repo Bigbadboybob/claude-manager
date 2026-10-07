@@ -273,3 +273,11 @@ steps: laptop TUI install + laptop daemon, Codex A-R round.
 as mcp_server/native_codex.py on both hosts (launcher is read per spawn; no restart). Live
 Codex fork verified by state-core. Merged-not-deployed: 537af5c (items cosmetics + DELETE /boards).
 Merged-not-deployed: a82450f (send_input_and_wait follows transcript rotation after /clear or /new; MCP payload only).
+
+**Live verification PASS (2026-10-07 18:08Z)**, state-core report
+`~/.local/share/state-core/live-772a6f5/validation.json` (Claude 2.1.292 / Codex 0.160.1): presence
+and relay states, background jobs, waiting-on-human (AskUserQuestion + permission), Escape,
+viewer input, forced 401 → errored, unknown on missing status / relay expiry + recovery, prompt
+confirmation, /clear and /new → no_turn, async monitors, both native forks (post-hotfix).
+Not covered live: brain-restart sidecar restore, 900 s stall threshold, Codex 0.153.4,
+approvals, automatic Codex terminal wake. Board smoke test PASS (items). All lanes on standby.
