@@ -205,6 +205,7 @@ reviews, merges to main and deploys (hub first).
 | W3f TUI state glyphs + board overlay; W4c docs | msgfix | in progress | | |
 | W3a Claude hooks | state-core | reviewed PASS (real 2.1.291 verified) | 39261ec | pending big deploy; new events need A-R |
 | W3b MCP consumers (+W3a follow-ups) | state-core | reviewed PASS (2 rounds) | 281fbd9, fac421b | pending big deploy |
+| A-O past-workspaces search (Owner request, subagent) | coordinator | merged | 530b64d | next TUI release |
 | W3c daemon consumers (+relay escape, no_turn, precision) | state-core | reviewed PASS (3 rounds) | 30ad916, dab40a4, 597ff68 | pending big deploy; drain reconciliations need re-recording |
 | W2d Claude status-file reader | state-core | reviewed PASS (+fixes, rollback switch presence_idle_enabled) | 327720b | cm-manager + cm-sessions 23:20Z; Claude sessions on source=presence |
 | W2e Codex relay state + 0.160 parsers | state-core | reviewed PASS (+6 fixes) | cef633b, c61f920 | cm-manager + cm-sessions 23:20Z; existing Codex sessions need A-R |
