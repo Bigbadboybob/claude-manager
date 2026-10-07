@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mcp_server import async_monitor, control_client, monitor, server
+from mcp_server.transcripts.types import Message, Role
 
 
 def observed(state, seq=2, *, ended=20.0, idle=True, source="hooks", lifecycle="ready"):
@@ -283,6 +284,46 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertFalse(result["completed"])
         self.assertTrue(result["timed_out"])
+
+    async def test_reply_wait_follows_replaced_transcript_and_resets_cursor(self):
+        for path in ("/new.jsonl", "/old.jsonl"):
+            with self.subTest(path=path):
+                resolved = dict(observed("idle", seq=9), transcript_path=path, generation=2)
+                parser = Mock()
+                parser.read_messages.return_value = (
+                    [Message(role=Role.ASSISTANT, content="new reply")], "v1:2:1"
+                )
+                with patch.object(control_client, "call", return_value=resolved), patch.object(
+                    server, "_parser_for", return_value=parser
+                ):
+                    result = await server._await_reply(
+                        "ts-test", engine="claude-code", transcript_path="/old.jsonl",
+                        anchor_cursor="v1:1:500", generation=1,
+                        deadline=time.monotonic()+1, interval=.01, grace=1,
+                        agent_baseline={"kind":"agent", "value":8},
+                    )
+                self.assertEqual(result["last_message"]["content"], "new reply")
+                parser.read_messages.assert_called_once_with(path, 2, None, server._READ_ALL_LIMIT)
+
+    async def test_reply_wait_discards_old_cached_reply_after_binding_changes(self):
+        old = dict(observed("working", seq=9), transcript_path="/old.jsonl", generation=1)
+        new = dict(observed("errored", seq=9), transcript_path="/new.jsonl", generation=2)
+        parser = Mock()
+        parser.read_messages.side_effect = [
+            ([Message(role=Role.ASSISTANT, content="old partial")], "v1:1:501"),
+            ([], "v1:2:0"),
+        ]
+        with patch.object(control_client, "call", side_effect=[old, new]), patch.object(
+            server, "_parser_for", return_value=parser
+        ):
+            result = await server._await_reply(
+                "ts-test", engine="claude-code", transcript_path="/old.jsonl",
+                anchor_cursor="v1:1:500", generation=1,
+                deadline=time.monotonic()+1, interval=.01, grace=1,
+                agent_baseline={"kind":"agent", "value":8},
+            )
+        self.assertEqual(result["status"], "errored")
+        self.assertIsNone(result["last_message"])
 
     async def test_send_and_wait_uses_sequence_from_before_send(self):
         calls = []

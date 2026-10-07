@@ -3078,12 +3078,19 @@ async def _await_reply(
         # Same as the wait loop above: the agent's own done signal, so the
         # `status` this returns agrees with what a listing would say.
         reported = bool(resolved.get("reported_done", False))
-        # A fresh session's transcript may bind only AFTER polling begins —
-        # pick it up the moment it appears.
-        if transcript_path is None and resolved.get("transcript_path"):
-            transcript_path = resolved.get("transcript_path")
-            engine = resolved.get("engine", engine)
-            generation = int(resolved.get("generation", generation))
+        # /clear and /new can bind the replacement transcript only once the
+        # next prompt starts. Cursors and cached replies belong to one binding.
+        current_path = resolved.get("transcript_path")
+        current_generation = int(resolved.get("generation", generation))
+        current_engine = resolved.get("engine", engine)
+        if current_path and (current_path, current_generation, current_engine) != (
+            transcript_path, generation, engine
+        ):
+            transcript_path, generation, engine = current_path, current_generation, current_engine
+            cursor = None
+            saw_new_assistant = False
+            last_message = None
+            semantic_idle_since = None
         now = time.monotonic()
         engine_done = engine_turn_complete(resolved)
 
