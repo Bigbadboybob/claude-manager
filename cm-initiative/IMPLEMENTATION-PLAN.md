@@ -286,3 +286,26 @@ Merged-not-deployed (next batch): d6a4c39 (board never auto-picks bash as orches
 spawns, which fixes the folder-trust dialog on Codex forks and fresh worktrees). Board visual
 pass (msgfix) in progress. Live board settings: sejd board orchestrator_pid=EP,
 holder_idle_enabled=true (19:00Z).
+
+## Batch 2 (Owner-approved 2026-10-07 ~20:00Z)
+
+Spec: `~/.local/share/swarm-coord/batch2/SPEC.md`. One combined deploy at the end; the notification fix is not a priority deploy (Owner: status changes will be rare).
+
+| Slice | Lane | Status |
+|---|---|---|
+| R restart speed (background store open, pin race, cheap rebuild) — lands first | state-core | assigned |
+| U usage recording + subagent census | state-core | queued after R |
+| B blocked_on_owner status (◇/◆ amber, OWNER tag) | items | assigned |
+| C non-blocking reap + fast preview | items | queued after B |
+| P0 availability-notice marker / stall-alarm false pages | msgfix | assigned |
+
+Deploy-procedure additions for this batch:
+- Before `daemon.restart`, pre-warm the page cache: read `~/.cm/messages/_journal/<gen>/*` and `_events` in parallel while the old brain is still serving.
+- Keep a persistent private deploy target between deploys (saves ~75s).
+- Follow-ups (not scheduled):
+  - move cm-manager `~/.cm/messages` to an SSD disk (one downtime window);
+  - store snapshot at quiesce;
+  - rotate `/var/log/claude-manager.log` (6.2 GB);
+  - steady-state brain CPU/IO (delivery loop ~0.5 core on cm-manager; 208 GB read in 22 min on cm-sessions);
+  - cm-manager `log_path` permission denied;
+  - timestamps in the cm-sessions brain log.
