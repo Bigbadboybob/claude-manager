@@ -45,19 +45,42 @@ launch command is the engine's native fork:
 - **Codex.** The command is `codex fork <source id>`, run through CM's native
   Codex launcher. Codex creates a new thread and rollout file. The daemon's
   transcript detector (and the `/proc` watcher) binds the row to that new
-  rollout. The launcher also passes `-c tui.resume_cwd="current"` to the
-  frontend. Without it, Codex 0.160 asks which working directory to use, and
-  its default is the source session's directory.
+  rollout. The launcher also passes `-c tui.resume_cwd="current"` and
+  `--cd <worktree>` to the frontend. Without them, Codex 0.160 asks which
+  working directory to use, and its default is the source session's
+  directory.
 
-**First prompt.** The fork always takes a first turn, because Claude writes
-the forked transcript only when the first message is sent, and an unwritten
-fork cannot be resumed after a daemon restart. If no prompt is given, the
-fork receives a note that says:
-- which session and branch it was forked from;
-- which task, branch and worktree it now works in;
-- which commits on the source branch are missing from its branch and were
-  not carried over (`git log --oneline B..A`, at most 10);
-- that it should wait for instructions.
+**Folder trust (Codex).** Before every Codex spawn the daemon adds the
+working directory to `~/.codex/config.toml` as a trusted project, as it does
+for Claude in `~/.claude.json`. This matters for forks: CM's remote Codex
+frontend (`codex --remote … --cd <worktree>`) checks trust for the exact
+directory and does not fall back to the trusted main checkout of a linked
+worktree, as a plain `codex` does. A new worktree therefore opened at a
+"Folder access — Trust this folder?" screen (verified on codex-cli 0.160.1).
+Before 2026-10-07 the pre-trust missed CM's native launcher argv and was not
+called on the holder spawn path, so it never ran.
+
+**No first prompt.** A fork starts at its composer with nothing typed into
+it. Owner gives it its first message. The TUI form has no Prompt field. An
+agent may still pass `prompt=` to `fork_session`; that text is delivered as
+before and arms the usual completion monitor (`prompt_source: "caller"`;
+otherwise `"none"`). An earlier version typed a default note into every fork.
+On Codex that note's Enter answered the folder-trust screen and the fork
+started blank (2026-10-07), so it was removed.
+
+What that note said is now in the result and on the TUI status line:
+- `forked_from`: the source session's uid, label, transcript id, worktree
+  and `branch`;
+- `branch` and `worktree_path`: where the fork now works;
+- `commits_not_carried`: commits on the source that the fork's checkout
+  lacks (`git log --oneline <fork HEAD>..<source HEAD>`, at most 10, with
+  `commits_not_carried_truncated` set when there are more). The status line
+  shows their short SHAs.
+
+**Durability.** Owner accepted this: a Claude fork writes its transcript
+only when it receives its first message. Until then there is nothing on disk
+to resume, so a fork that was never prompted does not survive a daemon
+restart or reboot. Codex creates its fork thread at launch.
 
 **Uncommitted edits.** These never come along, because the cut is a commit.
 The result reports `uncommitted_left_behind` and `uncommitted_files`, and
