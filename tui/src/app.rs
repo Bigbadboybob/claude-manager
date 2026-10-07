@@ -60,6 +60,7 @@ mod draw;
 mod messages;
 mod global_settings;
 mod availability;
+mod agent_state;
 
 pub(crate) use lifecycle::try_attach_via_daemon_with_deps;
 
@@ -594,6 +595,8 @@ pub struct App {
     /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
     alerts: HashMap<String, String>,
     owner_alerts: HashMap<(crate::hosts::HostId, String), cm_daemon::owner_attention::Alert>,
+    /// Engine-reported `agent_state` per (host, uid); see `app/agent_state.rs`.
+    agent_states: HashMap<(crate::hosts::HostId, String), agent_state::AgentStateView>,
     owner_alert_rows: HashSet<String>,
     dismissed_owner_alerts: HashSet<String>,
     /// Fingerprint of every open-workspace idle session's `(uid, age
@@ -988,6 +991,7 @@ impl App {
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
             owner_alerts: HashMap::new(),
+            agent_states: HashMap::new(),
             owner_alert_rows: HashSet::new(),
             dismissed_owner_alerts: HashSet::new(),
             last_alert_frame: 0,

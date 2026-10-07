@@ -335,9 +335,17 @@ impl App {
                 if ts.session.exited {
                     continue;
                 }
-                match ts.status {
-                    SessionStatus::Running => running += 1,
-                    SessionStatus::Idle => idle += 1,
+                // Engine state when reported: background work is running;
+                // waiting/errored/unknown are neither (they show as glyphs).
+                use super::agent_state::Activity;
+                match self.agent_activity(ts) {
+                    Some(Activity::Working | Activity::Starting | Activity::Background) => running += 1,
+                    Some(Activity::Idle) => idle += 1,
+                    Some(_) => {}
+                    None => match ts.status {
+                        SessionStatus::Running => running += 1,
+                        SessionStatus::Idle => idle += 1,
+                    },
                 }
             }
         }

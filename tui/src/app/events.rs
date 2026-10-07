@@ -733,7 +733,12 @@ impl App {
                         if quiet && ts.status == SessionStatus::Running {
                             ts.set_status(SessionStatus::Idle);
                             visible_dirty = true;
-                            if ts.notify_on_idle {
+                            // With an engine-reported state, notify-on-idle
+                            // follows the daemon's transition instead
+                            // (`apply_agent_state`).
+                            if ts.notify_on_idle
+                                && !self.agent_states.contains_key(&(ts.host_id.clone(), ts.uid.clone()))
+                            {
                                 notify_session_idle(&ts.label);
                             }
                         } else if burst && ts.status != SessionStatus::Running {
@@ -1832,6 +1837,9 @@ impl App {
         if let Some(alerts) = &snapshot.owner_attention {
             self.apply_owner_attention_snapshot(&snapshot.host, alerts);
         }
+        if let Some(states) = &snapshot.agent_states {
+            self.apply_agent_state_snapshot(&snapshot.host, states);
+        }
         // 10e-d: collect uids we adopted with memory_cap_kill=true
         // so we can fire toasts AFTER the workspaces-iteration
         // is done — avoids the &mut self contention from calling
@@ -2181,6 +2189,9 @@ impl App {
                     } else if let Ok(alert) = serde_json::from_value(value.clone()) {
                         self.apply_owner_attention(&host, &uid, Some(alert));
                     }
+                }
+                if let Some(value) = entry.get("agent_state") {
+                    self.apply_agent_state(&host, &uid, value);
                 }
                 self.apply_messaging_name(&host, &uid, &entry);
                 self.apply_global_perms_from_diff(&uid, &entry);
@@ -2980,6 +2991,56 @@ mod apply_manifest_diff_tests {
     }
 
     #[test]
+    fn agent_state_snapshot_and_diffs_drive_glyphs_and_attention_order() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        let session = crate::session::Session::new("/bin/true", &[], 80, 24, None,
+            std::collections::HashMap::new(), None).expect("test PTY");
+        let second = make_simple_session_with_uid("other".to_string(), "other-label", "claude", session, None);
+        app.workspaces[0].sessions.push(second);
+        for ts in &mut app.workspaces[0].sessions {
+            ts.host_id = host.clone();
+            ts.session.exited = false;
+            ts.status = SessionStatus::Idle;
+        }
+        // Snapshot: "self" idle, "other" waiting on a human.
+        let mut snap = snapshot_payload(host.clone(), &["self", "other"], &[]);
+        snap.agent_states = Some([
+            ("self".to_string(), serde_json::json!({"state":"idle","since":1.0})),
+            ("other".to_string(), serde_json::json!({"state":"waiting-on-human","since":2.0})),
+        ].into_iter().collect());
+        app.apply_agent_state_snapshot(&host, snap.agent_states.as_ref().unwrap());
+        assert_eq!(app.agent_indicator(&app.workspaces[0].sessions[1]).unwrap().0, "?");
+        // A-g: waiting outranks idle even though it comes later visually.
+        app.cursor = Cursor::Session(0, 0);
+        app.jump_to_next_attention();
+        assert_eq!(app.cursor, Cursor::Session(0, 1));
+        // A diff to errored, applied twice, is idempotent.
+        let diff = || ManifestDiff::Updated { uid: "other".into(),
+            entry: serde_json::json!({"agent_state":{"state":"errored","since":3.0,"detail":{"error_kind":"rate_limit"}}}) };
+        app.apply_manifest_diff_from_host(host.clone(), diff());
+        app.needs_redraw = false;
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"errored","since":3.0,"detail":{"error_kind":"rate_limit"}}));
+        assert!(!app.needs_redraw, "re-applying the same state does not repaint");
+        assert_eq!(app.agent_indicator(&app.workspaces[0].sessions[1]).unwrap().0, "\u{2717}");
+        assert_eq!(app.agent_state_wire(&app.workspaces[0].sessions[1])["detail"]["error_kind"], "rate_limit");
+        // Working by the engine beats a quiet PTY: renders as running.
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated { uid: "self".into(),
+            entry: serde_json::json!({"agent_state":{"state":"working","since":4.0}}) });
+        assert!(app.display_running(&app.workspaces[0].sessions[0]));
+        assert!(!app.display_idle(&app.workspaces[0].sessions[0]));
+        // Null clears back to the PTY heuristic; another host's snapshot
+        // leaves these rows alone.
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated { uid: "self".into(),
+            entry: serde_json::json!({"agent_state": null}) });
+        assert!(app.agent_activity(&app.workspaces[0].sessions[0]).is_none());
+        app.apply_agent_state_snapshot(&crate::hosts::HostId::local(), &Default::default());
+        assert!(app.agent_activity(&app.workspaces[0].sessions[1]).is_some());
+        let _ = diff;
+    }
+
+    #[test]
     fn owner_attention_local_and_cloud_stream_indicators_clear_on_focus() {
         for host in [crate::hosts::HostId::local(), crate::hosts::HostId::new("sessions")] {
             let mut app = build_app_with_session("self");
@@ -3405,6 +3466,7 @@ mod apply_manifest_diff_tests {
             host,
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             listed_uids: listed.iter().map(|u| u.to_string()).collect(),
             session_last_exits: listed
@@ -3992,6 +4054,7 @@ mod apply_manifest_diff_tests {
             session_last_exits: Vec::new(),
             session_transcripts: vec![("ts-snap-resume".into(), "current".into())],
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
         };
@@ -4023,6 +4086,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
@@ -4067,6 +4131,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
@@ -4228,6 +4293,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
@@ -4270,6 +4336,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(

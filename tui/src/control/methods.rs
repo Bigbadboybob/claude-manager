@@ -673,6 +673,10 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
             "type": public_session_type(&ts.session_type),
             "state": runtime.kind.as_wire(),
             "idle": runtime.idle,
+            // Engine-reported state (doc/SESSION_STATE.md), passed through
+            // from the owning daemon's manifest stream; absent from older
+            // daemons.
+            "agent_state": app.agent_state_wire(ts),
             "managed_by_uid": ts.managed_by_uid,
             // Grouping + perms metadata (parity with the daemon's
             // list_sessions): lets the MCP layer group by

@@ -105,6 +105,9 @@ pub struct ManifestSnapshotPayload {
     pub session_transcripts: Vec<(String, String)>,
     pub sidebar_assignments: Option<std::collections::BTreeMap<String, cm_daemon::sidebar::Assignment>>,
     pub owner_attention: Option<std::collections::BTreeMap<String, cm_daemon::owner_attention::Alert>>,
+    /// `agent_states: {uid: agent_state}` (doc/SESSION_STATE.md); None from
+    /// daemons that predate it.
+    pub agent_states: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// When the consumer thread read the frame. Rows created locally
     /// after (or just before) this instant may be newer than the
     /// daemon's capture and are exempt from the reconcile prune.
@@ -642,6 +645,8 @@ fn parse_snapshot_payload(
             .transpose().map_err(|e| format!("invalid sidebar assignments: {e}"))?,
         owner_attention: payload.get("owner_attention").filter(|v| !v.is_null()).map(|v| serde_json::from_value(v.clone()))
             .transpose().map_err(|e| format!("invalid Owner attention snapshot: {e}"))?,
+        agent_states: payload.get("agent_states").and_then(|v| v.as_object())
+            .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         received_at: std::time::Instant::now(),
     })
 }

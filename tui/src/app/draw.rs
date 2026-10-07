@@ -1410,15 +1410,15 @@ impl App {
             };
             // Idle age tints the needs-human ● and stale orchestrator labels.
             // Subtask labels retain their durable lifecycle color.
-            let idle_bucket = (ts.status == SessionStatus::Idle
-                && !ts.session.exited)
-                .then(|| idle_age_bucket_at(ts.idle_since, now));
+            let idle_bucket = self.display_idle_bucket(ts, now);
             let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
                 ("\u{27f3}", Style::default().fg(theme::ATTN))
             } else if ts.hidden {
                 (" ", Style::default())
+            } else if let Some(engine) = self.agent_indicator(ts) {
+                engine
             } else {
-                match ts.status {
+                match if self.display_running(ts) { SessionStatus::Running } else { SessionStatus::Idle } {
                     SessionStatus::Running => (spinner, Style::default().fg(theme::OK)),
                     // Idle splits three ways: ◉ (cyan) = a pending operator
                     // QUESTION the orchestrator parked (metadata.operator_question);
@@ -1928,9 +1928,7 @@ impl App {
 
                     // Idle-age bucket — colors the idle dot (afterglow /
                     // settled / stale) and, when stale, dims the whole row.
-                    let idle_bucket = (ts.status == SessionStatus::Idle
-                        && !ts.session.exited)
-                        .then(|| idle_age_bucket_at(ts.idle_since, now));
+                    let idle_bucket = self.display_idle_bucket(ts, now);
 
                     let (indicator, indicator_style) = if self
                         .reconnecting_sessions
@@ -1946,8 +1944,13 @@ impl App {
                         ("\u{27f3}", Style::default().fg(theme::ATTN))
                     } else if ts.hidden {
                         (" ", Style::default())
+                    } else if let Some(engine) = self.agent_indicator(ts) {
+                        // Engine-reported state the PTY cannot express:
+                        // ◐ background work, ? waiting on a human,
+                        // ✗ errored, · unknown (never shown as idle).
+                        engine
                     } else {
-                        match ts.status {
+                        match if self.display_running(ts) { SessionStatus::Running } else { SessionStatus::Idle } {
                             SessionStatus::Running => {
                                 (spinner, Style::default().fg(theme::OK))
                             }
@@ -2404,6 +2407,8 @@ impl App {
         let mut n_running = 0usize;
         let mut n_idle = 0usize;
         let mut n_alert = 0usize;
+        let mut n_waiting = 0usize;
+        let mut n_errored = 0usize;
         let mut any_afterglow = false;
         let now = Instant::now();
         for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
@@ -2417,13 +2422,17 @@ impl App {
                 if ts.session.exited {
                     continue;
                 }
-                match ts.status {
-                    SessionStatus::Running => n_running += 1,
-                    SessionStatus::Idle => {
+                // Engine-reported state wins; waiting-on-human and errored
+                // get their own clusters, background work counts as running.
+                match self.agent_activity(ts) {
+                    Some(super::agent_state::Activity::Waiting) => n_waiting += 1,
+                    Some(super::agent_state::Activity::Errored) => n_errored += 1,
+                    Some(super::agent_state::Activity::Unknown) => {}
+                    _ if self.display_running(ts)
+                        || self.agent_activity(ts) == Some(super::agent_state::Activity::Background) => n_running += 1,
+                    _ => {
                         n_idle += 1;
-                        if idle_age_bucket_at(ts.idle_since, now)
-                            == IdleAgeBucket::Afterglow
-                        {
+                        if self.display_idle_bucket(ts, now) == Some(IdleAgeBucket::Afterglow) {
                             any_afterglow = true;
                         }
                     }
@@ -2446,6 +2455,18 @@ impl App {
             rollup.push(Span::styled(
                 format!("\u{25cf}{} ", n_idle),
                 Style::default().fg(idle_color),
+            ));
+        }
+        if n_waiting > 0 {
+            rollup.push(Span::styled(
+                format!("?{} ", n_waiting),
+                Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if n_errored > 0 {
+            rollup.push(Span::styled(
+                format!("\u{2717}{} ", n_errored),
+                Style::default().fg(theme::ERROR),
             ));
         }
         if n_alert > 0 {
