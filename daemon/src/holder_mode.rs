@@ -117,6 +117,25 @@ fn unix_now() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// No allocations, locks, formatting or error propagation after the arm.
+/// `recv` without an ancillary buffer discards any queued SCM_RIGHTS in the
+/// kernel, closing those duplicates rather than leaking received descriptors.
+fn drain_armed_channel(fd: RawFd) {
+    // SAFETY: the HolderClient keeps this channel fd owned through exit.
+    unsafe { libc::shutdown(fd, libc::SHUT_RD); }
+    let mut bytes = [0u8; 65536];
+    loop {
+        // SAFETY: the stack buffer is valid for its full length. The read is
+        // nonblocking, and SHUT_RD prevents the peer from refilling the queue.
+        let n = unsafe {
+            libc::recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT)
+        };
+        if n <= 0 {
+            break;
+        }
+    }
+}
+
 /// What `signal` did.
 #[derive(Debug, PartialEq)]
 pub enum SignalOutcome {
@@ -129,6 +148,9 @@ pub struct HolderClient {
     /// directions; the reader thread and senders use it
     /// concurrently — reads and writes are independent halves).
     fd: OwnedFd,
+    /// Set only after an acknowledged deploy arm. The reader must not turn
+    /// our deliberate receive shutdown into a competing exit(70).
+    armed_exit: std::sync::atomic::AtomicBool,
     send_lock: Mutex<()>,
     next_req: std::sync::atomic::AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::Sender<(Frame, Vec<OwnedFd>)>>>,
@@ -232,6 +254,7 @@ impl HolderClient {
 
         let client = Arc::new(HolderClient {
             fd,
+            armed_exit: std::sync::atomic::AtomicBool::new(false),
             send_lock: Mutex::new(()),
             next_req: std::sync::atomic::AtomicU64::new(2),
             pending: Mutex::new(HashMap::new()),
@@ -263,7 +286,11 @@ impl HolderClient {
     /// brain (C5) — the holder respawns us.
     fn reader_loop(self: Arc<HolderClient>, mut reader: FrameReader) {
         loop {
-            let fed = match reader.feed(self.fd.as_fd()) {
+            let received = reader.feed(self.fd.as_fd());
+            if self.armed_exit.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let fed = match received {
                 Ok(s) => s,
                 Err(v) => {
                     eprintln!("cm-daemon: holder channel protocol violation: {} — exiting (holder respawns us)", v.0);
@@ -275,6 +302,9 @@ impl HolderClient {
                 std::process::exit(70);
             }
             loop {
+                if self.armed_exit.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
                 match reader.next_frame() {
                     Ok(Some((frame, fds))) => self.dispatch(frame, fds),
                     Ok(None) => break,
@@ -285,6 +315,16 @@ impl HolderClient {
                 }
             }
         }
+    }
+
+    /// Infallible arm-to-exit tail (C8): stop further holder writes, discard
+    /// queued input, then let the caller exit(0). Closing a Unix stream with
+    /// unread input reports ECONNRESET to an older holder, which classifies it
+    /// as a protocol failure and discards the new pin. SHUT_RD closes the
+    /// refill race; MSG_DONTWAIT never waits for a peer or the reader thread.
+    fn prepare_armed_exit(&self) {
+        self.armed_exit.store(true, std::sync::atomic::Ordering::Release);
+        drain_armed_channel(self.fd.as_raw_fd());
     }
 
     fn dispatch(&self, frame: Frame, fds: Vec<OwnedFd>) {
@@ -1528,6 +1568,7 @@ fn spawn_deploy_thread(
             // the brain alive under a 30s armed pin that an unrelated
             // later crash would then fire. Raw best-effort write, then
             // exit.
+            client.prepare_armed_exit();
             let msg = b"cm-daemon: deploy armed - exiting for the holder to act\n";
             // SAFETY: plain write(2) to stderr; the result is ignored.
             unsafe {
@@ -2235,6 +2276,61 @@ fn orphan_meta(uid: &str) -> AdoptedSessionMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn drain_test_client(stream: std::os::unix::net::UnixStream) -> Arc<HolderClient> {
+        Arc::new(HolderClient {
+            fd: stream.into(),
+            armed_exit: std::sync::atomic::AtomicBool::new(false),
+            send_lock: Mutex::new(()),
+            next_req: std::sync::atomic::AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            exit_subs: Mutex::new(HashMap::new()),
+            parked_exits: Mutex::new(Vec::new()),
+            holder_build_id: Mutex::new("test".into()),
+            epoch: 1,
+            holder_proto_min: ch::PROTO_VERSION_MIN,
+            holder_proto_max: ch::PROTO_VERSION_MAX,
+        })
+    }
+
+    #[test]
+    fn armed_exit_drains_unread_bytes_and_rights_so_old_holder_gets_eof() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (brain, mut holder) = UnixStream::pair().unwrap();
+        let (mut payload_reader, payload_writer) = UnixStream::pair().unwrap();
+        holder.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        payload_reader.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        ch::send_frame_blocking(holder.as_fd(), &Frame::new(
+            verbs::OK, Some(1), 1, serde_json::json!({}),
+        ), &[payload_writer.as_raw_fd()]).unwrap();
+        drop(payload_writer);
+        let client = drain_test_client(brain);
+        client.prepare_armed_exit();
+        drop(client);
+        let mut buf = [0u8; 1];
+        assert_eq!(holder.read(&mut buf).unwrap(), 0, "reset would discard the armed pin");
+        assert_eq!(payload_reader.read(&mut buf).unwrap(), 0, "queued SCM_RIGHTS must close");
+    }
+
+    #[test]
+    fn armed_exit_releases_blocking_reader_without_fatal_exit() {
+        use std::io::Read;
+        let (brain, mut holder) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = drain_test_client(brain);
+        let reader_client = client.clone();
+        let (done, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            reader_client.reader_loop(FrameReader::new());
+            done.send(()).unwrap();
+        });
+        client.prepare_armed_exit();
+        result.recv_timeout(Duration::from_secs(1)).unwrap();
+        reader.join().unwrap();
+        drop(client);
+        holder.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(holder.read(&mut [0u8; 1]).unwrap(), 0);
+    }
 
     /// The S2/O4 source-scan guard: brain-side code outside
     /// `session.rs` (the `kill()` primitive + the pre-arm spawn
