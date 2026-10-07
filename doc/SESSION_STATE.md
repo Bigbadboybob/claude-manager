@@ -131,15 +131,17 @@ startup delays, with one Enter retry after ten seconds using the original
 encoding. It never re-pastes the body. A human draft after the paste suppresses
 the retry but does not prevent later evidence from confirming. Unrelated or
 unreadable transcript activity and restart pause defer recovery while observation
-continues; process replacement/exit ends it. The first transcript binding is
-allowed; later rotations are not.
+continues; process replacement/exit ends it. Same-process transcript rebindings
+(including repeated detector/hook corrections) defer for an observation, then
+follow the new path while retaining the original write-time evidence cutoff.
 
 `submitted=false` means confirmation failed, not proof the engine received
 nothing. Inspect state/transcript before re-sending. The session and worktree
 remain available; no reply wait or completed-work claim follows failure.
 Successful launches use a level completion watch, retaining a first turn or done
 report that finished during confirmation. Receipts are ephemeral: a daemon
-restart can lose the receipt, producing an unconfirmed result. Old daemons omit
+restart can lose the receipt, producing an unconfirmed result explicitly labeled
+unknown, not failed. Old daemons omit
 these fields. Promptless and bash launches retain existing behavior. Deployment
 needs the brain and complete MCP payload; callers reconnect MCP for the new
 background confirmation handling.

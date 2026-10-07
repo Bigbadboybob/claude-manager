@@ -560,9 +560,14 @@ def _format_fire_message(record: dict, result: dict) -> str:
     head = f"[cm-monitor {record['monitor_id']} fired]"
     if result.get("submitted") is False and result.get("prompt_delivery"):
         receipt = result["prompt_delivery"]
+        uncertainty = (
+            " The daemon lost the confirmation receipt after a restart or session change; "
+            "delivery is unknown, not failed."
+            if receipt.get("reason") == "confirmation_lost_or_session_replaced" else ""
+        )
         return (f"{head} Initial prompt submission unconfirmed for "
                 f"{', '.join(record['watching'])}: {receipt.get('reason')}. "
-                "submitted=false means no confirmation, not proof of no delivery. "
+                f"{uncertainty} submitted=false means no confirmation, not proof of no delivery. "
                 "Inspect its state/transcript before "
                 "re-sending to avoid a duplicate prompt. No completion is claimed.")
     if record["note"]:

@@ -7603,7 +7603,6 @@ fn spawn_initial_prompt_delivery(
                             (
                                 s.pid,
                                 s.generation,
-                                s.transcript_path.is_none(),
                                 Baseline::capture(&cell.inputs, now_unix_f64()),
                             )
                         })
@@ -7627,7 +7626,7 @@ fn spawn_initial_prompt_delivery(
                     delivery::finish(&ticket, Err("write_failed_or_cancelled"));
                     return;
                 }
-                let Some((pid, generation, unbound, baseline)) = captured else {
+                let Some((pid, generation, baseline)) = captured else {
                     delivery::finish(&ticket, Err("session_gone"));
                     return;
                 };
@@ -7636,17 +7635,14 @@ fn spawn_initial_prompt_delivery(
                     return;
                 }
                 let transcript = std::cell::RefCell::new(transcript);
+                let generation = std::cell::Cell::new(generation);
                 let check = || {
                     {
                         let state = state.lock().unwrap_or_else(|p| p.into_inner());
                         let Some(s) = state.sessions.get(&uid) else {
                             return Check::Stop("session_gone");
                         };
-                        let first_bind = unbound
-                            && s.transcript_path.is_some()
-                            && s.generation == generation.saturating_add(1);
                         if s.pid != pid
-                            || (s.generation != generation && !first_bind)
                             || s.last_exit.kernel_set()
                             || !s
                                 .prompt_delivery
@@ -7654,6 +7650,10 @@ fn spawn_initial_prompt_delivery(
                                 .is_some_and(|t| Arc::ptr_eq(t, &ticket))
                         {
                             return Check::Stop("session_replaced_or_exited");
+                        }
+                        if s.generation != generation.get() {
+                            generation.set(s.generation);
+                            return Check::Deferred;
                         }
                         let cell = s.agent_state.lock().unwrap_or_else(|p| p.into_inner());
                         if let Some(source) = baseline.confirmed_by(&cell.inputs) {
@@ -20878,12 +20878,14 @@ while True:
             spawn_initial_prompt_delivery(state.clone(), handle, fanout, uid.clone(), body.into(), ticket.clone());
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(110);
             loop {
-                // Simulate the detector's first None→path bind AFTER receipt
-                // creation. Its generation bump must not look like replacement.
+                // Detector bind followed by a hook/path correction before
+                // evidence is observed. Two bumps still belong to this process.
                 if rollout.exists() {
                     let mut state = state.lock().unwrap();
                     let session = state.sessions.get_mut(&uid).unwrap();
                     if session.transcript_path.is_none() {
+                        session.transcript_path = Some(dir.path().join("detector-guess.jsonl").display().to_string());
+                        session.generation += 1;
                         session.transcript_path = Some(rollout.display().to_string());
                         session.generation += 1;
                     }

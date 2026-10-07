@@ -47,7 +47,7 @@ pub(super) enum Observation {
 
 pub(super) struct DeliveryEvidence {
     claude: bool,
-    allow_first_bind: bool,
+    follow_rebinds: bool,
     pid: libc::pid_t,
     generation: u64,
     since_ms: u64,
@@ -93,14 +93,13 @@ impl DeliveryEvidence {
                 session.session_type == "claude-code",
             )
         };
-        let allow_first_bind = launch && path.is_none();
         let baseline = path.and_then(|p| {
             let p = PathBuf::from(p);
             Some((p.clone(), FileStamp::read(&p)?))
         });
         Some(Self {
             claude,
-            allow_first_bind,
+            follow_rebinds: launch,
             pid,
             generation,
             since_ms: SystemTime::now()
@@ -128,17 +127,17 @@ impl DeliveryEvidence {
             if session.pid != self.pid {
                 return Observation::Gone;
             }
-            // A fresh launch normally binds its first transcript AFTER body
-            // delivery. That one None→path generation increment is expected.
-            if self.allow_first_bind
-                && session.transcript_path.is_some()
-                && session.generation == self.generation.saturating_add(1)
-            {
-                self.generation = session.generation;
-                self.allow_first_bind = false;
-            }
             if session.generation != self.generation {
-                return Observation::Gone;
+                if !self.follow_rebinds {
+                    return Observation::Gone;
+                }
+                // Detector and hook corrections can rebind several times.
+                // Same process: follow the new path on the next observation,
+                // retaining the original write-time cutoff and file baseline.
+                self.generation = session.generation;
+                self.last_scan = None;
+                self.last_observation = Observation::Pending;
+                return Observation::Unknown;
             }
             session.transcript_path.clone()
         };
@@ -299,7 +298,7 @@ mod tests {
     fn evidence(path: &Path) -> DeliveryEvidence {
         DeliveryEvidence {
             claude: false,
-            allow_first_bind: false,
+            follow_rebinds: false,
             pid: 1,
             generation: 0,
             since_ms: crate::workflow::history::iso8601_to_ms("2026-09-12T06:45:00.000Z").unwrap(),
