@@ -328,6 +328,8 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "item.resolve",
     "board.read",
     "board.owner_blocked",
+    # Usage recording (doc/usage-recording.md): read this host's samples.
+    "usage.read",
 })
 
 

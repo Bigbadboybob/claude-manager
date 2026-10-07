@@ -320,6 +320,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "backtest.result",
     "board.read",
     "board.owner_blocked",
+    "usage.read",
     "continuous.list",
     "continuous.context",
     "continuous.dispatch_pending",
@@ -817,6 +818,17 @@ pub fn dispatch_request(
         // callable proxies to the planning API. The daemon stamps the
         // caller's participant id as the actor and resolves holder names;
         // editing rights are checked in `items::rpc`.
+        // Usage recording (doc/usage-recording.md): this host's samples.
+        "usage.read" => DispatchOutcome::Done(
+            if let Some(resp) = reject_forged_operator(req) {
+                resp
+            } else {
+                match crate::usage::read_rpc(state, &req.params) {
+                    Ok(value) => Response::ok(req.id.clone(), value),
+                    Err(error) => Response::err(req.id.clone(), ErrorCode::InvalidParams, error),
+                }
+            },
+        ),
         "item.create" | "item.set" | "item.resolve" | "board.read" | "board.owner_blocked" => {
             DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
         }
