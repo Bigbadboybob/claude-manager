@@ -1147,7 +1147,9 @@ impl App {
         // uid (`restart_suppressed_exit_uids`, consumed by the diff path).
         if !agent_exit_prunes.is_empty() {
             for (wi, uid) in agent_exit_prunes {
-                if self.restart_suppressed_exit_uids.contains(&uid) {
+                if self.restart_suppressed_exit_uids.contains(&uid)
+                    || self.revive_failed.contains_key(&uid)
+                {
                     continue;
                 }
                 eprintln!(
@@ -2025,6 +2027,7 @@ impl App {
                     || ts.managed_by_uid.is_none()
                     || ts.workflow_run_id.is_some()
                     || self.restart_suppressed_exit_uids.contains(&ts.uid)
+                    || self.revive_failed.contains_key(&ts.uid)
                 {
                     continue;
                 }
@@ -2161,6 +2164,7 @@ impl App {
                             // here too, so the remote repro is covered.
                             if ts.managed_by_uid.is_some()
                                 && ts.workflow_run_id.is_none()
+                                && !self.revive_failed.contains_key(&uid)
                             {
                                 prune_ws = Some(wi);
                             }
@@ -3620,6 +3624,35 @@ mod apply_manifest_diff_tests {
         age_agent_row(&mut app, 0, 0, remote.clone());
         app.restart_suppressed_exit_uids.insert("ts-snap-ar".into());
         assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "A-R uid kept");
+
+        let mut app = build_app_with_session("ts-snap-revive-failed");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.note_revive_failure("ts-snap-revive-failed", "worktree missing");
+        assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "failed revive kept");
+    }
+
+    /// 2026-10-08: a forced A-R whose revive failed lost its row to the
+    /// next exit prune, and its error to a transient status line. The row
+    /// now stays, marked, with the error kept.
+    #[test]
+    fn a_failed_revive_keeps_its_row_marked_through_exit_prunes() {
+        let mut app = build_app_with_session("ts-revive-x");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.note_revive_failure("ts-revive-x", "worktree /w/x missing");
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-revive-x".into(),
+            last_exit: LastExit { code: Some(0), memory_cap_kill: false, kills_file_offset: None, exited_at: 1.0 },
+        });
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "row kept after the exit diff");
+        assert!(app.status_msg.as_ref().is_some_and(|(m, _)| m.contains("worktree /w/x missing")));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal.draw(|f| app.draw_session_list(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("revive failed") && text.contains('\u{2717}'), "{text}");
     }
 
     // ── kill-time close of adoption-minted `agent:` markers ──

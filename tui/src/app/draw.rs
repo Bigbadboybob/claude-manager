@@ -1996,8 +1996,11 @@ impl App {
                     // — the whole point is to grab the eye regardless of status.
                     // Below a pending alert: work blocked on an Owner decision.
                     let owner_blocked = self.owner_blocked_session(&ts.uid);
+                    let revive_failed = self.revive_failed.contains_key(&ts.uid);
                     let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
                         self.alert_indicator()
+                    } else if revive_failed {
+                        ("\u{2717}", Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD))
                     } else if owner_blocked {
                         self.owner_indicator()
                     } else {
@@ -2075,6 +2078,12 @@ impl App {
                     spans.push(Span::raw(display));
                     if owner_blocked {
                         spans.push(super::owner_blocked::owner_tag());
+                    }
+                    if revive_failed {
+                        spans.push(Span::styled(
+                            " revive failed",
+                            Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+                        ));
                     }
                     if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
                         spans.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));

@@ -1874,6 +1874,15 @@ pub fn send_input(
         let is_agent = session.session_type != "bash";
         (session.input_handle(), session.fanout.clone(), is_agent)
     };
+    // The target's checkout vanished (an agent removed its own worktree):
+    // re-create it before delivering, so the turn's tools have a cwd again.
+    let healed = heal_missing_session_worktree(state_arc, &p.session_uid);
+    let with_heal = |mut reply: Value| {
+        if let (Some(obj), Some(Value::Object(extra))) = (reply.as_object_mut(), healed.clone()) {
+            obj.extend(extra);
+        }
+        reply
+    };
 
     // SUBMIT encoding depends on the target's input mode:
     //   - AGENT (claude-code/codex): a bare `\n` does NOT submit a kitty-TUI
@@ -1893,7 +1902,7 @@ pub fn send_input(
         // the PTY write is deferred to the delivery thread (which stamps too).
         let handle = handle.prepare_agent_input(&p.text);
         spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false, Some(Arc::clone(state_arc)));
-        Ok(json!({ "ok": true, "delivery": "agent-kitty-async" }))
+        Ok(with_heal(json!({ "ok": true, "delivery": "agent-kitty-async" })))
     } else {
         let mut payload = p.text.into_bytes();
         payload.push(b'\n'); // submit=false is rejected above, so always Enter
@@ -1904,8 +1913,34 @@ pub fn send_input(
             )
         })?;
         handle.note_turn_start();
-        Ok(json!({ "ok": true }))
+        Ok(with_heal(json!({ "ok": true })))
     }
+}
+
+/// A live session's workspace checkout is missing on disk (typically an
+/// agent ran `git worktree remove` on its own cwd): re-create it from its
+/// branch with the same healer `start_session` uses. Returns the fields to
+/// report (`worktree_recreated` / `worktree_warning`), or None when the
+/// checkout is there. Cheap when healthy: one `stat`, no Git.
+pub(crate) fn heal_missing_session_worktree(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<Value> {
+    let (ws_id, path, task_id) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let sess = state.sessions.get(uid)?;
+        let ws = state.workspaces.get(&sess.workspace_id)?;
+        (sess.workspace_id.clone(), ws.worktree_path.clone()?, sess.task_id.clone())
+    };
+    if path.is_dir() {
+        return None;
+    }
+    let mut extra = serde_json::Map::new();
+    match ensure_ready_worktree(state_arc, &ws_id, &path, task_id.as_deref()) {
+        Ok(report) => report.decorate(&mut extra),
+        Err((_, message)) => {
+            eprintln!("cm-daemon: session {uid}: missing worktree {} not re-created: {message}", path.display());
+            extra.insert("worktree_warning".into(), json!(message));
+        }
+    }
+    Some(Value::Object(extra))
 }
 
 // ============================================================
@@ -10685,6 +10720,10 @@ fn restore_one_session(
         None => Vec::new(),
     };
 
+    // Revive / A-R / startup restore into a checkout that is gone (an agent
+    // removed its own worktree): re-create it from its branch first, and
+    // report it, instead of spawning into a missing cwd.
+    let worktree_report = ensure_ready_worktree(state_arc, workspace_id, worktree, e.task_id.as_deref())?;
     let params = compose_restore_params(state_arc, workspace_id, worktree, e)?;
     {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -10695,7 +10734,10 @@ fn restore_one_session(
             entry: e.clone(), transcript_ids: Default::default(),
         }) { eprintln!("cm-daemon: restore identity archive: {err}"); }
     }
-    let result = start_session(state_arc, &params)?;
+    let mut result = start_session(state_arc, &params)?;
+    if let Some(obj) = result.as_object_mut() {
+        worktree_report.decorate(obj);
+    }
     {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(sess) = state.sessions.get_mut(&e.uid) {
@@ -34624,6 +34666,80 @@ while True:
                 assert_eq!(child.workspace_id, "ws-sub");
                 assert_eq!(child.task_id.as_deref(), Some("task-sub"));
             }
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// 2026-10-08: a live agent deleted its own worktree. Delivering input
+    /// re-creates it from the branch (and says so) instead of feeding a turn
+    /// into a session with no cwd; the missing-checkout watch uses the same
+    /// helper.
+    #[test]
+    fn send_input_recreates_a_live_sessions_deleted_worktree() {
+        with_home_and_repo("healsend", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            let (wt, branch, sha) =
+                seed_bound_subtask_with_reaped_worktree(&state, &repo, name, "task-sub", true);
+            let stub = spawn_routed_stub(|_m, _p, _b| (404, "{}".to_string()));
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(&state,
+                &json!({"type": "bash", "label": "w", "task_id": "task-sub"}), Some("ts-orch"))
+                .expect("spawn");
+            set_spawn_program_override_for_test(None);
+            let uid = resp["session_uid"].as_str().unwrap().to_string();
+            assert!(heal_missing_session_worktree(&state, &uid).is_none(), "healthy: nothing to do");
+            // The agent runs `git worktree remove --force` on its own cwd.
+            run_git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            assert!(!wt.exists());
+            let reply = send_input(&state, &json!({"session_uid": uid, "text": "true"}), None)
+                .expect("delivered");
+            assert!(wt.is_dir() && crate::worktree::is_git_worktree_root(&wt));
+            assert_eq!(crate::worktree::worktree_current_branch(&wt).as_deref(), Some(branch.as_str()));
+            assert_eq!(crate::worktree::worktree_head_sha(&wt).as_deref(), Some(sha.as_str()));
+            assert_eq!(reply["worktree_recreated"]["branch"], json!(branch), "{reply}");
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// A-R / `session.revive` of a session whose checkout is gone re-creates
+    /// it first and reports it, instead of failing on a missing cwd.
+    #[test]
+    fn revive_recreates_a_deleted_worktree_before_respawning() {
+        with_home_and_repo("healrevive", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            let (wt, branch, _sha) =
+                seed_bound_subtask_with_reaped_worktree(&state, &repo, name, "task-sub", true);
+            let stub = spawn_routed_stub(|_m, _p, _b| (404, "{}".to_string()));
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(&state,
+                &json!({"type": "bash", "label": "w", "task_id": "task-sub"}), Some("ts-orch"))
+                .expect("spawn");
+            let uid = resp["session_uid"].as_str().unwrap().to_string();
+            kill_all_sessions(&state);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while state.lock().unwrap().sessions.contains_key(&uid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            run_git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            assert!(!wt.exists());
+            let revived = revive_session(&state, &json!({"uid": uid, "workspace_id": "ws-sub",
+                "worktree_path": wt.to_string_lossy(), "session_type": "bash"}))
+                .expect("revive heals the checkout and respawns");
+            set_spawn_program_override_for_test(None);
+            assert!(wt.is_dir() && crate::worktree::is_git_worktree_root(&wt));
+            assert_eq!(revived["worktree_recreated"]["branch"], json!(branch), "{revived}");
             kill_all_sessions(&state);
         });
     }

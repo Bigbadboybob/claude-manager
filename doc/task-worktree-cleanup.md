@@ -110,6 +110,18 @@ hook in another repository:
 python3 ~/.cm/worktree-tools/worktree_lineage.py install /absolute/repository
 ```
 
+## A session that deleted its own checkout
+
+An agent must never remove the worktree its own session runs in (see the
+agent guide). If one does, CM re-creates the checkout from its branch with the
+same healer `start_session` uses: when input is delivered to the session
+(`send_input`, reply fields `worktree_recreated` / `worktree_warning`), when it
+is revived or restarted (A-R, `session.revive`, startup restore), and within a
+minute from the daemon's missing-checkout watch, which also sends the session
+a `[cm-worktree <uid>]` notice. A revive that still fails keeps its sidebar
+row, marked `✗ revive failed` with the error in the status line, instead of
+losing it to an exit prune (2026-10-08).
+
 ## Preview speed
 
 A preview scans every checkout the host knows about (manifest, lineage

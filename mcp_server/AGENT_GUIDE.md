@@ -119,6 +119,12 @@ If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
 
 ## Worktree ownership and task cleanup
 
+**Never remove the worktree your own session runs in** (no `git worktree
+remove` or `rm -rf` on your cwd, even under the disk rule): your next turn
+then has no cwd and its tools fail. Ask Owner to close the workspace
+(Alt+Shift+w), which cleans up safely after the session ends. If it happens
+anyway, CM re-creates the checkout from its branch and tells you.
+
 Owner can choose **Reap this task + descendants** when completing a task in the
 work view (Alt+d). This preserves branches/WIP/artifacts and retains active,
 shared, pinned or continuous work. Raw `git worktree add` creation is tracked by

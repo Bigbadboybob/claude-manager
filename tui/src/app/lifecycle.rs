@@ -2272,9 +2272,11 @@ impl App {
                 &ws_id,
                 &wt_path.to_string_lossy(),
             ) {
-                self.set_status_msg(&format!("Revive failed: {e}"));
+                let uid = self.workspaces[wi].sessions[si].uid.clone();
+                self.note_revive_failure(&uid, &e.to_string());
                 return;
             }
+            self.revive_failed.remove(&self.workspaces[wi].sessions[si].uid.clone());
             {
                 let ts = &mut self.workspaces[wi].sessions[si];
                 ts.session.exited = false;
@@ -2317,6 +2319,7 @@ impl App {
         };
         match spawned {
             Some((mut fresh, outcome)) => {
+                self.revive_failed.remove(&fresh.uid);
                 // Same post-swap kick as the workflow respawn path: force
                 // the daemon PTY to the pane size so the pane repaints.
                 fresh.session.resize(cols, rows);
@@ -2335,11 +2338,22 @@ impl App {
                 });
             }
             None => {
-                self.set_status_msg(
-                    "Revive failed — could not respawn the session (see stderr log)",
-                );
+                let uid = self.workspaces[wi].sessions[si].uid.clone();
+                self.note_revive_failure(&uid, "could not respawn the session (details in the TUI log)");
             }
         }
+    }
+
+    /// A failed A-R keeps its row: exit prunes skip it, the row shows
+    /// `✗ revive failed`, and the error stays in the status line. Pre-fix a
+    /// forced restart whose revive failed (its worktree had been deleted)
+    /// lost the row to the next exit prune and the error to a transient
+    /// status line Owner never saw (2026-10-08).
+    pub(super) fn note_revive_failure(&mut self, uid: &str, error: &str) {
+        eprintln!("cm-tui: revive of {uid} failed: {error}");
+        self.revive_failed.insert(uid.to_owned(), error.to_owned());
+        self.set_status_msg(&format!("Revive failed: {error} — the row is kept; fix and press A-R again"));
+        self.needs_redraw = true;
     }
 
     /// A-R on a LIVE session — the kill half of a forced restart.

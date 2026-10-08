@@ -535,6 +535,9 @@ pub struct App {
     /// once the reap is confirmed; consumed one-shot in
     /// `apply_manifest_diff_from_host`.
     pub(crate) restart_suppressed_exit_uids: std::collections::HashSet<String>,
+    /// Sessions whose last A-R failed, with the error: the row stays (no
+    /// exit prune) and shows the failure until a later revive succeeds.
+    pub(crate) revive_failed: HashMap<String, String>,
     /// 12a (Phase 3): parsed `~/.cm/hosts.toml`. Synthesized
     /// local-default when the file is missing (A1 in the Phase 3
     /// plan). No consumer yet — 12b adds the field to manifest
@@ -992,6 +995,7 @@ impl App {
             continuous_dispatch_pending: std::collections::HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
             restart_suppressed_exit_uids: std::collections::HashSet::new(),
+            revive_failed: HashMap::new(),
             hosts,
             host_pool,
             skipped_manifest_entries: HashMap::new(),

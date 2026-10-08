@@ -71,6 +71,7 @@ pub mod holder_mode;
 pub mod host_id;
 pub mod items;
 pub mod usage;
+pub mod worktree_watch;
 pub mod manifest;
 pub mod messaging;
 pub mod mcp_config;
@@ -1228,6 +1229,7 @@ pub fn run() -> anyhow::Result<()> {
     messaging::tasks::spawn(&state);
     items::start(&state);
     usage::start(&state);
+    worktree_watch::start(&state);
 
     // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver
     // since Phase 4 (the TUI is a pure observer). It fires transitions,
