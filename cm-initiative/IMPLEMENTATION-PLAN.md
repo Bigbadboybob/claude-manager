@@ -309,3 +309,17 @@ Deploy-procedure additions for this batch:
   - steady-state brain CPU/IO (delivery loop ~0.5 core on cm-manager; 208 GB read in 22 min on cm-sessions);
   - cm-manager `log_path` permission denied;
   - timestamps in the cm-sessions brain log.
+
+## Batch 2/3 status (2026-10-08)
+- Deployed 2026-10-07 22:31Z on both hosts, as f65a8a0. The usage-sampler lock inversion deadlocked both brains 22:36–22:41Z; fixed and redeployed as 8cfbce9. The cm-manager MCP venv was missing; rebuilt.
+- Deployed 2026-10-08 14:24Z on both hosts, as 320f734: read cursors + reactions, board auto-touch, worktree self-heal. The laptop daemon was upgraded by Owner via cm-redeploy; M is instant.
+- Merged 25fb05a: laptop daemon installer (scripts/package-cm-daemon.py, install-cm-daemon.py). Every future deploy includes the laptop daemon.
+- In progress: stale pane rendering after attach (msgfix).
+- Follow-ups:
+  - reap_gate test isolation flake;
+  - the usage subagent total counts historical files;
+  - holder upgrade (8247cc7) on both hosts;
+  - move cm-manager messages to SSD;
+  - rotate the 6.2 GB claude-manager.log;
+  - steady-state brain CPU;
+  - unknown cause of the cm-manager .venv loss.
