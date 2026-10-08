@@ -592,6 +592,18 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
 
 
 @mcp.tool()
+def chat_react(message_id: str, emoji: str, request_id: str, remove: bool = False,
+               origin_daemon_id: str | None = None) -> dict:
+    """Add/remove your ✅ 👀 👍 ❌ 🎉 reaction without notifying anyone.
+
+    React to acknowledge a message. Adding a reaction to a message mentioning
+    you also marks its conversation read through that message. Retry with the
+    same request_id, contents and origin_daemon_id. Returns reactions and counts.
+    """
+    return _chat_call("react", locals())
+
+
+@mcp.tool()
 def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               conversation: str | None = None, thread: str | None = None,
               inbox: bool = False, dms: bool = False, unread_only: bool = False,
@@ -600,7 +612,8 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               after: dict | None = None, cursor: dict | None = None,
               limit: int = 50, ack_receipt: dict | None = None,
               newest_first: bool | None = None, pinned_only: bool | None = None,
-              view: str | None = None, mark_read_before: str | None = None) -> dict:
+              view: str | None = None, mark_read_before: str | None = None,
+              mark_read: bool = True, mentions_only: bool = False) -> dict:
     """Read history, a thread, your inbox, or incoming DMs. Select one scope.
 
     Inbox and dms reads default to newest first and view="slim"; other reads
@@ -620,7 +633,10 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
     channel="*" reads all public channels. newest_first shows recent
     messages first. received basis finds late arrivals. tags must all match. Use cursor
     unchanged for pagination. Acknowledge the returned receipt on a later read
-    or send to mark only fully supplied messages read; previews do not consume.
+    or send to advance each touched conversation through its highest supplied message.
+    Direct unfiltered conversation reads advance automatically on a newest page
+    or at the end of history. Set mark_read=False for previews; inbox/dms never
+    advance automatically. mentions_only filters the mention list.
     cached is local and reports partial/complete-through-checkpoint coverage.
     freshness="hub" catches up authorized history before taking a local snapshot;
     this still excludes messages pending on disconnected origins. Keep cursor filters
@@ -657,13 +673,16 @@ def _slim_message(item: dict) -> dict:
         out["reply_to"] = data["reply_to"]
     if data.get("thread_root"):
         out["thread"] = data["thread_root"]
+    for key in ("read", "reactions"):
+        if key in item:
+            out[key] = item[key]
     return out
 
 
 # Top-level fields a slim reader still needs to paginate, acknowledge, and
 # notice degraded coverage or pending watch results.
 _SLIM_KEEP = ("next_cursor", "receipt", "position", "coverage", "degraded",
-              "delivery_note", "error", "outbox")
+              "delivery_note", "error", "outbox", "read_cursor")
 
 
 def _view(view: str | None) -> str:

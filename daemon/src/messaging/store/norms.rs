@@ -92,7 +92,7 @@ impl Store {
     }
 
     fn norm_event(&self, scope: &str, revision: &str) -> Option<&Published> {
-        self.events.iter().find(|e| {
+        self.read_model.metadata.iter().map(|i| &self.events[*i]).find(|e| {
             e.event["type"] == "norms.update"
                 && e.event["data"]["scope"] == scope
                 && e.event["data"]["revision"] == revision

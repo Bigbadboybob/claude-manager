@@ -750,15 +750,13 @@ mod tests {
         fs::write(path, bytes).unwrap();
         destination.sync_admin(&install, &[]).unwrap();
         destination.load_read("owner").unwrap();
-        assert!(destination.reads["owner"].ids.contains(&id));
+        assert!(destination.is_read("owner", &destination.published(&id).unwrap().event));
         assert!(destination
             .events
             .iter()
-            .any(|e| e.event["type"] == "read.ack"
-                && e.event["data"]["ids"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!(id))));
+            .any(|e| e.event["type"] == "read.cursor"
+                && e.event["data"]["cursors"].as_object().unwrap().values().any(|c|c["event_id"]==id)));
+
     }
     #[test]
     fn messaging_handoff_preserves_ids_receipts_and_can_resume_both_endpoints() {

@@ -58,26 +58,7 @@ impl Store {
             }
         }
         if !marked.is_empty() {
-            self.ensure_messaging_writable()?;
-            if actor == "owner" && self.sync_enabled() {
-                let ids: Vec<_> = marked.iter().cloned().collect();
-                // Same 200-id bound as ordinary receipts.
-                for chunk in ids.chunks(200) {
-                    self.publish(
-                        "read.ack",
-                        None,
-                        "Owner acknowledged messages",
-                        json!({"ids":chunk}),
-                        "owner",
-                        "Owner",
-                        "owner",
-                        &uuid(),
-                        "",
-                    )?;
-                }
-            } else {
-                self.merge_read_ids(actor, marked.clone())?;
-            }
+            self.merge_read_ids(actor, marked.clone())?;
         }
         let monitors_advanced = self.advance_monitor_acks_past_reads(actor, &marked)?;
         Ok(json!({
@@ -97,20 +78,16 @@ impl Store {
         marked: &BTreeSet<String>,
     ) -> Result<usize> {
         self.load_read(actor)?;
-        let read = &self.reads[actor].ids;
         let mut state = self.personal_state(actor);
         let mut advanced = 0;
         for m in state.monitors.values_mut().filter(|m| m.state != "dismissed") {
-            let mut hits: Vec<&Published> = self
-                .events
-                .iter()
-                .filter(|e| e.position > m.acknowledged && e.position <= m.hit_high)
+            let mut hits: Vec<&Published> = self.events_between(m.acknowledged,m.hit_high).iter()
                 .collect();
             hits.sort_by_key(|e| e.position);
             let mut through = m.acknowledged;
             for e in hits {
                 let id = strv(&e.event, "id");
-                if self.monitor_matches(actor, m, e) && !read.contains(id) && !marked.contains(id) {
+                if self.monitor_matches(actor, m, e) && !self.is_read(actor,&e.event) && !marked.contains(id) {
                     break;
                 }
                 through = e.position;

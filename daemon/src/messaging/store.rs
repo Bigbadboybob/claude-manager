@@ -22,6 +22,9 @@ mod owner_sync;
 mod private_sync;
 mod replication;
 mod rebuild;
+mod read_model;
+mod reactions;
+use read_model::{ReadState, ReadModel, ReadCursor};
 mod task_subscriptions;
 pub use replication::ChangeSignal;
 pub use task_subscriptions::TaskBinding;
@@ -247,10 +250,6 @@ struct Published {
     /// Digest of the exact retained bytes, verified on replay or computed at commit.
     event_sha256: String,
 }
-#[derive(Default, Serialize, Deserialize)]
-struct ReadState {
-    ids: BTreeSet<String>,
-}
 
 pub struct Store {
     pub root: PathBuf,
@@ -281,6 +280,7 @@ pub struct Store {
     position: u64,
     clock: u64,
     reads: BTreeMap<String, ReadState>,
+    read_model: ReadModel,
     personal: BTreeMap<String, Personal>,
     pub norms: Value,
     /// Latest `owner.availability` record (Null until Owner sets a level).
@@ -371,6 +371,7 @@ impl Store {
             position: 0,
             clock: 0,
             reads: BTreeMap::new(),
+            read_model: ReadModel::default(),
             personal: BTreeMap::new(),
             norms: json!({}),
             owner_availability: Value::Null,
@@ -642,6 +643,7 @@ impl Store {
         Ok(())
     }
     fn push_published(&mut self, published: Published) {
+        self.index_read_model(&published, self.events.len());
         self.event_index
             .insert(strv(&published.event, "id").to_owned(), self.events.len());
         self.events.push(published);
@@ -664,6 +666,7 @@ impl Store {
         self.reduce_membership(e)?;
         self.reduce_replication(e)?;
         self.reduce_private_sync(e)?;
+        self.reduce_reaction(e)?;
         if let Some(c) = e["data"].get("conversation_create") {
             let id = required(c, "id")?;
             let members: Vec<String> = serde_json::from_value(c["members"].clone())?;
@@ -922,7 +925,7 @@ impl Store {
         key: &str,
         digest: &str,
     ) -> Result<Value> {
-        if !matches!(ty, "message.create" | "read.ack") {
+        if !matches!(ty, "message.create" | "read.ack" | "read.cursor" | "reaction") {
             self.shared_mutation_allowed()?;
         }
         let e = self.event(ty, conv, body, data, actor, name, kind, key, digest)?;
@@ -1006,9 +1009,7 @@ impl Store {
     /// publishes (which bypass `request()`) stay idempotent across restarts.
     fn prior_system_event(&self, key: &str) -> Option<Value> {
         let (id, _, _) = self.requests.get(&format!("system\n{key}"))?;
-        self.events
-            .iter()
-            .find(|x| strv(&x.event, "id") == id)
+        self.published(id)
             .map(|x| x.event.clone())
     }
     /// Scheduler-only: give `actor` (the session bound as a continuous task's
@@ -1289,9 +1290,7 @@ impl Store {
             return Ok((
                 key,
                 digest,
-                self.events
-                    .iter()
-                    .find(|x| strv(&x.event, "id") == id)
+                self.published(id)
                     .map(|x| x.event.clone()),
             ));
         }
@@ -1615,19 +1614,8 @@ impl Store {
     pub fn channels_for(&mut self, actor: &str) -> Result<Vec<Value>> {
         self.load_read(actor)?;
         let mut channels = self.channels().as_array().cloned().unwrap_or_default();
-        // (unread, mentions) per conversation, from one pass over the history.
-        let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-        for e in self.events.iter().filter(|e| {
-            e.event["type"] == "message.create"
-                && e.event["actor"]["id"] != actor
-                && !self.reads[actor].ids.contains(strv(&e.event, "id"))
-        }) {
-            let count = counts.entry(strv(&e.event, "conversation_id")).or_default();
-            count.0 += 1;
-            count.1 += usize::from(mention_recipients(&e.event).contains(&actor));
-        }
         for channel in &mut channels {
-            let (unread, mentions) = counts.get(strv(channel, "id")).copied().unwrap_or_default();
+            let (unread, mentions) = self.unread_counts(actor,strv(channel,"id"));
             self.channel_permissions(actor, channel);
             channel["unread"] = json!(unread);
             channel["mentions"] = json!(mentions);
@@ -1652,21 +1640,6 @@ impl Store {
             .filter(|p| *p <= self.position)
             .ok_or_else(|| err("invalid_cursor", "Invalid position"))
     }
-    fn load_read(&mut self, actor: &str) -> Result<()> {
-        if !self.reads.contains_key(actor) {
-            let p = self
-                .root
-                .join("_state")
-                .join(format!("{}.json", hash(actor.as_bytes())));
-            let state = if p.exists() {
-                serde_json::from_value(load(&p)?)?
-            } else {
-                ReadState::default()
-            };
-            self.reads.insert(actor.into(), state);
-        }
-        Ok(())
-    }
     pub fn acknowledge(&mut self, actor: &str, receipt: &Value) -> Result<()> {
         self.load_read(actor)?;
         if receipt.is_null() {
@@ -1680,36 +1653,11 @@ impl Store {
             return Err(err("invalid_receipt", "Receipt too large"));
         }
         for id in &ids {
-            if !self.events.iter().any(|e| {
-                e.event["id"] == *id && self.visible(actor, strv(&e.event, "conversation_id"))
-            }) {
+            if !self.published(id).is_some_and(|e| Self::readable_event(&e.event) && self.visible(actor,strv(&e.event,"conversation_id"))) {
                 return Err(err("not_found", "Receipt message not found"));
             }
         }
-        let unseen: BTreeSet<_> = ids
-            .into_iter()
-            .filter(|id| !self.reads[actor].ids.contains(id))
-            .collect();
-        if unseen.is_empty() {
-            return Ok(());
-        }
-        self.ensure_messaging_writable()?;
-        if actor == "owner" && self.sync_enabled() {
-            self.publish(
-                "read.ack",
-                None,
-                "Owner acknowledged messages",
-                json!({"ids":unseen}),
-                "owner",
-                "Owner",
-                "owner",
-                &uuid(),
-                "",
-            )?;
-            Ok(())
-        } else {
-            self.merge_read_ids(actor, unseen)
-        }
+        self.merge_read_ids(actor,ids.into_iter().collect())
     }
 
     pub fn read(&mut self, actor: &str, p: &Value, people: &[Person]) -> Result<Value> {
@@ -1728,7 +1676,7 @@ impl Store {
         {
             normalized = p.clone();
             if let Some(thread) = p["thread"].as_str() {
-                let event = self.events.iter().find(|e| e.event["id"] == thread)
+                let event = self.published(thread)
                     .ok_or_else(|| err("not_found", "Thread is not available in the local cache; request hub freshness to fetch it"))?;
                 normalized["conversation"] = event.event["conversation_id"].clone();
             } else {
@@ -1766,7 +1714,7 @@ impl Store {
             Some(self.resolve(actor, p, people, false)?.0)
         };
         let mut filter = p.clone();
-        for k in ["cursor", "ack_receipt", "limit"] {
+        for k in ["cursor", "ack_receipt", "limit", "mark_read"] {
             filter.as_object_mut().unwrap().remove(k);
         }
         let digest = hash(&serde_json::to_vec(&filter)?);
@@ -1808,11 +1756,11 @@ impl Store {
             vec![]
         };
         let pin_states = self.pin_states(high);
-        let read = &self.reads[actor].ids;
-        let mut items: Vec<_> = self
-            .events
-            .iter()
-            .filter(|e| {
+        let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+        let newest = p["newest_first"] == true && p.get("after").is_none();
+        let anchor = last_id.map(|id|self.published(id).map(|e|ReadCursor::of(&e.event))
+            .ok_or_else(||err("invalid_cursor","Missing page anchor"))).transpose()?;
+        let matches = |e: &&Published| {
                 let v = &e.event;
                 let cid = strv(v, "conversation_id");
                 if v["type"] == "conversation.pin" || v["type"] == "channel.membership"
@@ -1832,9 +1780,12 @@ impl Store {
                 if public && !self.channels.values().any(|id| id == cid) {
                     return false;
                 }
+                if p["mentions_only"] == true && !mention_recipients(v).contains(&actor) { return false; }
                 if broad {
                     let incoming = v["actor"]["id"] != actor;
-                    let eligible = if p["inbox"] == true {
+                    let eligible = if p["mentions_only"] == true {
+                        mention_recipients(v).contains(&actor)
+                    } else if p["inbox"] == true {
                         self.preference_for_event(actor, e).0 || self.monitor_inbox(actor,e)
                     } else {
                         self.conversations.contains_key(cid)
@@ -1844,7 +1795,7 @@ impl Store {
                     }
                 }
                 if p["unread_only"] == true
-                    && (read.contains(strv(v, "id")) || v["actor"]["id"] == actor)
+                    && (self.is_read(actor,v) || v["actor"]["id"] == actor)
                 {
                     return false;
                 }
@@ -1869,8 +1820,18 @@ impl Store {
                     return false;
                 };
                 start_dt.is_none_or(|s| t >= s) && end_dt.is_none_or(|end| t < end)
-            })
-            .collect();
+        };
+        let default_inbox = p["inbox"] == true && self.personal.get(actor).is_none_or(|s|s.preferences.rules.is_empty() && s.monitors.is_empty());
+        let mut items: Vec<_> = if p.get("after").is_some() {
+            self.events_between(last_id.and_then(|id|self.published(id)).map_or(after,|e|after.max(e.position)),high).iter().filter(|e|Self::readable_event(&e.event))
+                .filter(matches).take(limit+1).collect()
+        } else {
+            self.read_model.conversations.keys()
+                .filter(|cid|conv.as_ref().is_none_or(|wanted|*cid==wanted) && self.visible(actor,cid))
+                .flat_map(|cid|self.message_candidates(actor,cid,anchor.as_ref(),newest,p["unread_only"]==true,
+                    p["mentions_only"]==true || (default_inbox && !self.conversations.contains_key(cid)))
+                    .filter(matches).take(limit+1)).collect()
+        };
         if p.get("after").is_some() {
             items.sort_by_key(|e| e.position);
         } else {
@@ -1884,41 +1845,10 @@ impl Store {
                 )
             });
         }
-        let newest = p["newest_first"] == true && p.get("after").is_none();
         if newest {
             items.reverse();
         }
-        if let Some(last) = last_id {
-            let anchor = self
-                .events
-                .iter()
-                .find(|e| strv(&e.event, "id") == last)
-                .ok_or_else(|| err("invalid_cursor", "Missing page anchor"))?;
-            // Cursor advances through the ordering, even if acknowledged items
-            // disappear from an unread-only query between pages.
-            items.retain(|e| {
-                if p.get("after").is_some() {
-                    e.position > anchor.position
-                } else {
-                    let order = (
-                        strv(&e.event, "logical_time").parse::<u64>().unwrap_or(0),
-                        strv(&e.event, "id"),
-                    )
-                        .cmp(&(
-                            strv(&anchor.event, "logical_time")
-                                .parse::<u64>()
-                                .unwrap_or(0),
-                            strv(&anchor.event, "id"),
-                        ));
-                    if newest {
-                        order.is_lt()
-                    } else {
-                        order.is_gt()
-                    }
-                }
-            });
-        }
-        let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+        items.truncate(limit+1);
         let mut out = vec![];
         let mut chars = 0;
         let mut bytes = 0;
@@ -1929,8 +1859,9 @@ impl Store {
             let mut v = e.event.clone();
             v["pinned"] = json!(pin_states.contains_key(strv(&v, "id")));
             v["pin"] = pin_states.get(strv(&v, "id")).cloned().unwrap_or(Value::Null);
+            v["reactions"] = self.reaction_summary(actor,strv(&e.event,"id"));
             v["received_at"] = json!(e.received_at);
-            v["read"] = json!(read.contains(strv(&e.event, "id")) || e.event["actor"]["id"] == actor);
+            v["read"] = json!(self.is_read(actor,&e.event) || e.event["actor"]["id"] == actor);
             v["conversation_kind"] = json!(if self.conversations.contains_key(strv(&e.event, "conversation_id")) { "dm" } else { "channel" });
             if e.event["actor"]["id"] == actor {
                 v["notification"] = self.notification_status(&e.event);
@@ -1956,7 +1887,7 @@ impl Store {
                 if !ids.iter().any(|id| id == parent)
                     && !context.iter().any(|x: &Value| x["id"] == parent)
                 {
-                    if let Some(e) = self.events.iter().find(|e| e.event["id"] == parent) {
+                    if let Some(e) = self.published(parent) {
                         if e.position <= high
                             && self.visible(actor, strv(&e.event, "conversation_id"))
                             && chars + strv(&e.event, "body").chars().count() <= 16000
@@ -1979,19 +1910,23 @@ impl Store {
                 c
             });
         let pins_revision = conv.as_deref().map(|id| self.pins_revision(id, high));
-        let pins: Option<BTreeMap<_, _>> = conv.as_deref().map(|cid| {
-            self.events
-                .iter()
-                .filter(|e| e.event["conversation_id"] == cid)
-                .filter_map(|e| {
-                    pin_states
-                        .get(strv(&e.event, "id"))
-                        .map(|pin| (strv(&e.event, "id"), pin.clone()))
-                })
-                .collect()
-        });
+        let pins: Option<BTreeMap<_, _>> = conv.as_deref().map(|cid| pin_states.iter()
+            .filter(|(id,_)|self.published(id).is_some_and(|e|e.event["conversation_id"]==cid))
+            .map(|(id,pin)|(id.clone(),pin.clone())).collect());
+        // Filters/previews never mark unrelated history. A newest page marks
+        // through its newest supplied message; reaching the chronological end
+        // does the same, without consuming messages arriving after this snapshot.
+        if self.degraded.is_none() && !self.messaging_frozen() && p["mark_read"] != false && !broad && !public && p["mentions_only"] != true
+            && p["thread"].is_null() && p["time"].is_null() && p["tags"].is_null()
+            && p["pinned_only"] != true && p["after"].is_null()
+            && ((newest && cursor.is_none()) || (!newest && next.is_null())) {
+            if let Some(v) = out.iter().max_by_key(|v| ReadCursor::of(v)) {
+                self.advance_cursors(actor,BTreeMap::from([(strv(v,"conversation_id").to_owned(),ReadCursor::of(v))]))?;
+            }
+        }
+        let read_cursor = conv.as_deref().map(|cid|self.read_cursor(actor,cid));
         Ok(
-            json!({"target":target,"pins_revision":pins_revision,"pins":pins,"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded}),
+            json!({"read_cursor":read_cursor,"target":target,"pins_revision":pins_revision,"pins":pins,"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded}),
         )
     }
     pub fn dms(&mut self, actor: &str, unread: bool) -> Result<Value> {
@@ -2009,25 +1944,13 @@ impl Store {
             if p["peer"].as_str().is_some_and(|s| !peers.iter().any(|id| id.as_str() == s)) {
                 continue;
             }
-            let events: Vec<_> = self
-                .events
-                .iter()
-                .filter(|e| {
-                    e.event["conversation_id"] == *id && e.event["type"] == "message.create"
-                })
-                .collect();
-            let count = events
-                .iter()
-                .filter(|e| {
-                    e.event["actor"]["id"] != actor
-                        && !self.reads[actor].ids.contains(strv(&e.event, "id"))
-                })
-                .count();
+            let last_event = self.messages_in(id).next_back();
+            let (count, mentions) = self.unread_counts(actor,id);
             if p["unread_only"] == true && count == 0 {
                 continue;
             }
-            let last=events.last().map(|e|json!({"id":e.event["id"],"actor":e.event["actor"],"created_at":e.event["created_at"],"preview":strv(&e.event,"body").chars().take(180).collect::<String>()}));
-            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"group":m.len()>2,"unread":count,"last":last}));
+            let last=last_event.map(|e|json!({"id":e.event["id"],"actor":e.event["actor"],"created_at":e.event["created_at"],"preview":strv(&e.event,"body").chars().take(180).collect::<String>()}));
+            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"group":m.len()>2,"unread":count,"mentions":mentions,"last":last}));
         }
         self.directory_page(actor, p, out)
     }
@@ -2399,7 +2322,7 @@ mod tests {
         assert_eq!(
             s.read(
                 "owner",
-                &json!({"channel":"general","unread_only":true}),
+                &json!({"channel":"general","unread_only":true,"mark_read":false}),
                 &[]
             )
             .unwrap()["items"]
@@ -2412,7 +2335,7 @@ mod tests {
         assert_eq!(
             s.read(
                 "owner",
-                &json!({"channel":"general","unread_only":true}),
+                &json!({"channel":"general","unread_only":true,"mark_read":false}),
                 &[]
             )
             .unwrap()["items"]

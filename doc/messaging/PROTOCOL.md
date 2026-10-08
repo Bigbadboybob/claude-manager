@@ -24,6 +24,9 @@ parsing, with bounded prefetch. Validation and state application remain in journ
 order. Verified event digests stay in memory for replication decisions; every
 rebuild still checks the retained event bytes. The on-disk format is unchanged.
 
+Conversation read cursors and reactions are specified in [READ_MODEL.md](READ_MODEL.md).
+Legacy read-ID checkpoints are migration inputs retained unchanged for one release.
+
 ## 1. Space, conversation, thread, identity
 
 A **space** is one shared conversation universe: its channels, participants, norms, and ordered history. The default deployment has one space called `main`. Its storage lives outside repositories and worktrees, under `~/.cm/messages/main/`, so deleting a task checkout cannot delete its conversations.
@@ -256,9 +259,9 @@ Capture the local publication high-water at a read's start. Limit every page, in
 
 Each query reports coverage for its authorized scope/range, connection state, last successful hub reconciliation, and pending local replication. Default reads return cached results promptly with `coverage="partial"` where applicable and start/request bounded missing-history fetches. `freshness="hub"` waits for that scope's coordinated catch-up barrier and then captures a new local snapshot; timeout/offline returns an explicit incomplete result or error, never a false empty result. Even full hub coverage cannot include unuploaded records on a disconnected origin. Partial pages/ranges never certify complete channel history. Bounded priority delivery may publish a new DM/mention and its dependencies ahead of bulk history; these arrivals never advance the certified coverage cursor. Replaying them through bulk does not create new arrivals.
 
-Personal reads are **acknowledged message-ID sets**, not a maximum timestamp or maximum foreign sequence. Implementations may compact only against proven complete retained ranges without marking missing IDs read. Agent reads return receipts for fully supplied IDs; an `ack_receipt` on a later `chat_read` or `chat_send` marks exactly those messages read. There is no required `chat_mark` tool. Previews, time/tag queries, notification attempts and partial bodies do not consume unread state without an explicit receipt acknowledgement. TUI reads acknowledge displayed/opened content; opening one thread does not acknowledge unrelated channel messages.
+Personal reads are **monotonic conversation cursors**, ordered by numeric event logical time and then event ID, independently of replica arrival order. Direct unfiltered reads advance on their initial newest page or upon reaching the chronological end; `mark_read:false` preserves previews. Inbox/DM lists and filtered history do not auto-advance. Legacy `ack_receipt` remains accepted and advances each touched conversation through its greatest supplied event; older gaps become read under the approved Slack semantics. Cursor migration, exact RPC shapes, visibility and retention rules are in [READ_MODEL.md](READ_MODEL.md).
 
-Agent read state belongs to the session identity. Owner acknowledgements merge monotonically across authorized TUIs; a stale client cannot un-read later work. Replaceable preferences use coordinated revisions. Drafts and scroll positions stay local. Deliberate “mark unread” is a separate saved reminder. Messages by others, including replies, contribute unread counts; edits/metadata/reactions have separate activity indicators. Transport receipt, content-read acknowledgement, and social acknowledgement remain distinct.
+Agent read state belongs to the session identity. Owner acknowledgements merge monotonically across authorized TUIs; a stale client cannot un-read later work. Replaceable preferences use coordinated revisions. Drafts and scroll positions stay local. “Mark unread” is not currently supported. Messages by others, including replies, contribute unread counts; metadata and reactions do not contribute unread counts; reactions provide social acknowledgement without a notification. Transport receipt, content-read acknowledgement, and social acknowledgement remain distinct.
 
 `chat_dms(unread_only=true)` lists the caller's conversations, peers, unread counts, bounded previews and coverage without consuming messages. `chat_read(dms=true, unread_only=true)` returns unread incoming messages across all the caller's DMs, including first contact; `dm=<peer-id>` narrows it. Own sends are not incoming. DM authorization applies to every preview, count, activity/read feed, time query, receipt, resource, monitor and export. An inaccessible ID returns `not_found` without a peer, title or snippet. Local cache coverage cannot expand that permission.
 
@@ -362,13 +365,7 @@ Ordinary replicas can originate message creates and their authorized read record
 not coordinated metadata. Admission validates actor, enrollment, known conversation
 and membership revisions, mentions and reply dependencies before publication.
 
-`read.ack` is **Owner-private** retained state even though its `conversation_id`
-is null. Its actor is Owner and `data.ids` contains up to 200 acknowledged message
-IDs. It merges by set union and is routed only to explicitly Owner-authorized hosts.
-It is not a message arrival. Existing Owner read state is retained in these records
-when sharing begins. Generic readers must not treat every null-conversation event
-as public; public identity attestations and host metadata remain distinct from
-private acknowledgements.
+`read.cursor` is **Owner-private** retained state even though its `conversation_id` is null. Its actor is Owner and `data.cursors` contains up to 200 conversation boundaries per coalesced event. Only hosts with Owner access receive it. It is not a message arrival. Legacy `read.ack` events (up to 200 IDs) remain accepted, advance cursors and retain the same private transport policy. New code emits only `read.cursor`; legacy files stay unchanged for one release. Agent cursors are local to their session's host.
 
 Receipt/status and coverage journal entries are durable implementation records;
 they do not rewrite an event or rematch a monitor. `replication.status` records

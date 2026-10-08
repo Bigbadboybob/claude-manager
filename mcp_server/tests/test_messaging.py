@@ -59,6 +59,29 @@ class MessagingToolsTests(unittest.TestCase):
         self.assertEqual(call.call_args_list[0], call.call_args_list[1])
         self.assertEqual(call.call_args.args[0], "session.set_name")
 
+    def test_react_routes_to_daemon_and_preserves_retry_identity(self):
+        params = dict(message_id="host:message", emoji="✅", request_id="react-1",
+                      remove=False, origin_daemon_id="host")
+        with patch.object(control_client, "call", return_value={"reactions": {}}) as call:
+            server.chat_react(**params)
+            first = copy.deepcopy(call.call_args.args)
+            server.chat_react(**params)
+            self.assertEqual(call.call_args.args, first)
+            self.assertEqual(call.call_args.args, ("messaging.react", params))
+            self.assertIn("messaging.react", control_client.DAEMON_METHODS)
+
+    def test_read_flags_and_reactions_survive_slim_projection(self):
+        result = {"items": [{"id": "m", "actor": {"name": "Scout"}, "body": "hi",
+                             "read": True, "reactions": {"✅": {"count": 1, "names": ["Owner"], "mine": True}}}],
+                  "read_cursor": {"logical_time": "9", "event_id": "m"}}
+        with patch.object(control_client, "call", return_value=result) as call:
+            read = server.chat_read(inbox=True, mentions_only=True, mark_read=False)
+            self.assertTrue(call.call_args.args[1]["mentions_only"])
+            self.assertFalse(call.call_args.args[1]["mark_read"])
+            self.assertEqual(read["items"][0]["reactions"], result["items"][0]["reactions"])
+            self.assertTrue(read["items"][0]["read"])
+            self.assertEqual(read["read_cursor"], result["read_cursor"])
+
     def test_chat_deadline_allows_daemon_timeout_to_reach_caller(self):
         error = control_client.ControlError("outcome_unknown", "retry the same request ID")
         with patch.object(control_client, "call", side_effect=error) as call:

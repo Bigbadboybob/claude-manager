@@ -29,6 +29,10 @@ impl Store {
         for actor in actors {
             self.load_read(&actor)?;
         }
+        if self.sync_enabled() && !self.messaging_frozen()
+            && (self.is_coordinator() || self.replication.hosts.get(&self.daemon_id).is_some_and(|h|h["owner_access"]==true)) {
+            self.retain_legacy_owner_reads()?;
+        }
         Ok(())
     }
     /// Local agent recipients (actor, session uid). Owner is always passive:
@@ -43,11 +47,8 @@ impl Store {
         for members in self.conversations.values() {
             actors.extend(members.iter().cloned());
         }
-        for e in &self.events {
-            actors.extend(
-                mention_recipients(&e.event).into_iter()
-                    .map(str::to_owned),
-            );
+        for conv in self.read_model.conversations.values() {
+            actors.extend(conv.mentions.keys().cloned());
         }
         let prefix = format!("agent:{}:", self.daemon_id);
         actors
@@ -69,7 +70,7 @@ impl Store {
     /// delivery status needs only this; evaluating every recipient against
     /// the whole history took seconds per displayed message.
     pub(super) fn wake_intents_for_event(&self, event_id: &str) -> Vec<(String, WakeIntent)> {
-        let Some(e) = self.events.iter().find(|e| strv(&e.event, "id") == event_id) else {
+        let Some(e) = self.published(event_id) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -90,9 +91,12 @@ impl Store {
     fn wake_intents_for_actor(&self, actor: &str) -> Vec<WakeIntent> {
         let mut intents = Vec::new();
         let personal = self.personal.get(actor);
-        for e in &self.events {
-            self.event_wake_intents(actor, personal, e, &mut intents);
+        for cid in self.read_model.conversations.keys().filter(|cid|self.visible(actor,cid)) {
+            for e in self.message_candidates(actor,cid,None,false,true,false) {
+                self.event_wake_intents(actor,personal,e,&mut intents);
+            }
         }
+        intents.sort_by_key(|intent| self.published(&intent.event_id).map(|e|e.position).unwrap_or(0));
         intents
     }
 
@@ -110,7 +114,7 @@ impl Store {
         }
         let (_, wake, muted) = self.preference_for_event(actor, e);
         let id = strv(&e.event, "id");
-        if wake && !self.reads.get(actor).is_some_and(|r| r.ids.contains(id)) {
+        if wake && !self.is_read(actor,&e.event) {
             intents.push(WakeIntent {
                 key: id.into(),
                 event_id: id.into(),
@@ -123,6 +127,7 @@ impl Store {
         for m in personal.into_iter().flat_map(|p| p.monitors.values()) {
             if m.notify == "wake"
                 && !["cancelled", "dismissed"].contains(&m.state.as_str())
+                && !self.is_read(actor,&e.event)
                 && e.position > m.acknowledged
                 && e.position <= m.hit_high
                 && self.monitor_matches(actor, m, e)
@@ -146,30 +151,25 @@ impl Store {
             return Ok(Value::Null);
         }
         self.load_read(actor)?;
+        if !claim {
+            let counts = self.counts(actor)?;
+            return Ok(json!({"unread":counts["unread"],"dms":counts["dms"],"mentions":counts["mentions"],"ring":false,"monitor_badges":self.monitor_status(actor)["badges"]}));
+        }
         let mut state = self.personal_state(actor);
-        let inbox: Vec<_> = self
-            .events
+        let counts = self.counts(actor)?;
+        let inbox: Vec<_> = self.events_between(state.bell_position,self.position)
             .iter()
             .filter(|e| {
                 self.preference_for_event(actor, e).0
-                    && !self.reads[actor].ids.contains(strv(&e.event, "id"))
+                    && !self.is_read(actor,&e.event)
             })
             .collect();
-        let unread = inbox.len();
+        let unread = counts["unread"].as_u64().unwrap_or(0);
         // Split for the viewer's status-bar indicator (same pass): unread
         // DMs (incl. group DMs) and unread messages that mention Owner
         // directly or through @here.
-        let dms = inbox
-            .iter()
-            .filter(|e| self.conversations.contains_key(strv(&e.event, "conversation_id")))
-            .count();
-        let mentions = inbox
-            .iter()
-            .filter(|e| {
-                !self.conversations.contains_key(strv(&e.event, "conversation_id"))
-                    && (mention_recipients(&e.event).contains(&actor) || e.event["data"]["mention_here"] == true)
-            })
-            .count();
+        let dms = counts["dms"].as_u64().unwrap_or(0);
+        let mentions = counts["mentions"].as_u64().unwrap_or(0);
         let mut ring = inbox
             .iter()
             .any(|e| e.position > state.bell_position && !self.preference_for_event(actor, e).2);
@@ -184,7 +184,7 @@ impl Store {
                 .copied()
                 .unwrap_or(m.start)
                 .max(m.acknowledged);
-            ring |= self.events.iter().any(|e| {
+            ring |= self.events_between(seen,m.hit_high).iter().any(|e| {
                 e.position > seen
                     && e.position <= m.hit_high
                     && self.monitor_matches(actor, m, e)

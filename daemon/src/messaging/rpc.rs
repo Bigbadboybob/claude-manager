@@ -352,7 +352,7 @@ fn execute_with_freshness(
     // Full-message reads advance the wake batch boundary. Serialize their
     // snapshot with publication; native adapter I/O runs outside this gate.
     let coordinates_delivery = kind != "owner"
-        && (req.method == "messaging.read"
+        && (matches!(req.method.as_str(), "messaging.read" | "messaging.mark_read" | "messaging.react")
             || req.method == "messaging.follow"
                 && matches!(req.params["action"].as_str(), Some("set" | "remove"))
             || req.method == "messaging.monitors"
@@ -421,6 +421,17 @@ fn execute_with_freshness(
             code: "unauthorized".into(),
             message: "This messaging host is not enrolled to serve Owner".into(),
         });
+    }
+    if req.method == "messaging.counts" { return store.counts(&actor); }
+    if req.method == "messaging.attention" {
+        return store.attention(&actor,false).map(|attention|json!({"attention":attention}));
+    }
+    if req.method == "messaging.mark_read" {
+        let result = store.mark_read(&actor,p,&people);
+        if result.is_ok() && kind != "owner" {
+            super::delivery::reconcile_session(&root,store,&uid).map_err(|e|ChatError {code:"outcome_unknown".into(),message:format!("Cursor saved; wake reconciliation needs retry: {e}")})?;
+        }
+        return result;
     }
     store.enroll_participants(&people)?;
     if store.sync_enabled() && store.is_coordinator() {
@@ -531,12 +542,8 @@ fn execute_with_freshness(
             return execute_with_freshness(state, req, true);
         }
     }
-    // Owner's unread counts only (the viewer's status-bar indicator polls
-    // this): skip every response decoration a full messaging call adds.
-    if req.method == "messaging.attention" {
-        return store.attention(&actor, false).map(|attention| json!({"attention": attention}));
-    }
     let result = match req.method.as_str() {
+        "messaging.react" => store.react(&actor,p),
         "messaging.send" => {
             if kind != "owner" && !store.names.contains_key(&actor) {
                 repair_legacy_binding(state, &uid)?;
@@ -596,11 +603,12 @@ fn execute_with_freshness(
             {
                 query["channel"] = json!("general");
             }
+            query["mark_read"] = json!(false);
             query["limit"] = json!(10);
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":super::tasks::orientation(store,&graph,&uid),"owner_availability":crate::owner_availability::exposure_at(&store.owner_availability, chrono::Utc::now()),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":super::tasks::orientation(store,&graph,&uid),"owner_availability":crate::owner_availability::exposure_at(&store.owner_availability, chrono::Utc::now()),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins","react","mark_read","counts"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add","read_cursors","reactions"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
@@ -828,6 +836,25 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn cursor_and_reaction_rpcs_use_the_authenticated_reader_and_return_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        call(&state,"b","send",json!({"channel":"general","body":"Here","name":"Bravo","request_id":"claim"})).unwrap();
+        let actor=call(&state,"b","open",json!({"channel":"general"})).unwrap()["actor_id"].clone();
+        let sent=call(&state,"a","send",json!({"channel":"general","body":"Review","name":"Alpha","request_id":"review","mentions":[actor]})).unwrap();
+        assert_eq!(call(&state,"b","counts",json!({})).unwrap()["mentions"],1);
+        let preview=call(&state,"b","read",json!({"channel":"general","mark_read":false})).unwrap();
+        assert!(preview["items"].as_array().unwrap().iter().any(|v|v["id"]==sent["event_id"] && v["read"]==false));
+        let reaction=call(&state,"b","react",json!({"message_id":sent["event_id"],"emoji":"✅","request_id":"ack"})).unwrap();
+        assert_eq!(reaction["reactions"]["✅"]["mine"],true);
+        assert_eq!(reaction["counts"]["mentions"],0);
+        let marked=call(&state,"b","mark_read",json!({"channel":"general"})).unwrap();
+        assert_eq!(marked["changed"],false);
+        assert_eq!(marked["read_cursor"]["event_id"],sent["event_id"]);
+        assert!(call(&state,"b","counts",json!({"from":"owner"})).is_err());
+    }
+
     #[test]
     fn messaging_full_read_covers_unscanned_watch_but_preview_and_invalid_read_do_not() {
         let root = tempfile::tempdir().unwrap();

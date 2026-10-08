@@ -271,7 +271,7 @@ impl Store {
         json!({"enabled":self.sync_enabled(),"role":if self.is_coordinator(){"coordinator"}else{"replica"},
             "coordinator_id":self.coordinator_id(),"connected":self.is_coordinator() || self.replication.connected,
             "last_reconciled":self.replication.last_reconciled,"error":self.replication.error,
-            "handoff_paused":self.messaging_frozen(),"pending":self.events.iter().filter(|e| e.event["origin_daemon_id"] == self.daemon_id && !self.replication.receipts.contains_key(strv(&e.event,"id")) && !self.replication.rejections.contains_key(strv(&e.event,"id"))).count()})
+            "handoff_paused":self.messaging_frozen(),"pending":self.read_model.pending_local.len()})
     }
     /// The caller's own events saved on this replica that the hub has not
     /// accepted within `OUTBOX_GRACE_S`: `{pending_sync, oldest_age_s,
@@ -326,7 +326,7 @@ impl Store {
         let cutoff = now - chrono::Duration::seconds(OUTBOX_GRACE_S);
         let mut pending = 0usize;
         let mut oldest: Option<(&str, &str)> = None;
-        for e in &self.events {
+        for e in self.read_model.pending_local.iter().map(|i| &self.events[*i]) {
             let id = strv(&e.event, "id");
             if e.event["origin_daemon_id"] != self.daemon_id
                 || e.event["actor"]["id"] != actor
@@ -450,6 +450,11 @@ impl Store {
                 self.replication.last_reconciled = Some(required(journal, "recorded_at")?);
             }
             _ => return Err(err("invalid_record", "Unsupported journal kind")),
+        }
+        if journal["kind"] == "replication.status" {
+            if let Some(index) = self.event_index.get(strv(journal,"event_id")) {
+                self.read_model.pending_local.remove(index);
+            }
         }
         Ok(())
     }
@@ -619,8 +624,7 @@ impl Store {
         Ok(json!({"event":body,"receipt":self.replication.receipts.get(id),"position":e.position}))
     }
     pub fn pending_uploads(&self, limit: usize) -> Result<Vec<Value>> {
-        self.events
-            .iter()
+        self.read_model.pending_local.iter().map(|i| &self.events[*i])
             .filter(|e| {
                 e.event["origin_daemon_id"] == self.daemon_id
                     && !self.replication.receipts.contains_key(strv(&e.event, "id"))
@@ -880,9 +884,9 @@ impl Store {
             "channel.membership" => {
                 self.validate_membership_event(e)?;
             }
-            "read.ack" => {
-                self.validate_read_event(e, false)?;
-            }
+            "read.ack" => { self.validate_read_event(e, false)?; }
+            "read.cursor" => { self.validate_cursor_event(e, false)?; }
+            "reaction" => { self.validate_reaction(e)?; }
             _ => {}
         }
         if let Some(c) = data.get("conversation_create") {
@@ -1194,7 +1198,7 @@ impl Store {
         if !self.host_authorized(host, Some(&actor)) {
             return Err(err("host_revoked", "Host or participant is not enrolled"));
         }
-        if !matches!(e["type"].as_str(), Some("message.create" | "read.ack"))
+        if !matches!(e["type"].as_str(), Some("message.create" | "read.ack" | "read.cursor" | "reaction"))
             || [
                 "channels",
                 "identity_claim",
@@ -1209,8 +1213,12 @@ impl Store {
                 "Only ordinary messages may originate at a replica",
             ));
         }
-        if e["type"] == "read.ack" {
-            self.validate_read_event(&e, true)?;
+        if matches!(strv(&e,"type"), "read.ack" | "read.cursor" | "reaction") {
+            match strv(&e,"type") {
+                "read.ack" => { self.validate_read_event(&e, true)?; }
+                "read.cursor" => { self.validate_cursor_event(&e, true)?; }
+                _ => self.validate_reaction(&e)?,
+            }
             let key = format!("{actor}\n{}", required(&e["request"], "key")?);
             if self.requests.contains_key(&key) {
                 return Err(err(
@@ -1480,7 +1488,7 @@ impl Store {
         json!({"protocol":1,"space_id":self.space_id,"coordinator_id":self.coordinator_id(),"owner_identity_revision":self.owner_identity_revision,"coordinator_lineage":self.replication.coordinator_lineage})
     }
     fn eligible_for_host(&self, host: &str, interests: &BTreeSet<String>, e: &Value) -> bool {
-        if e["type"] == "read.ack" {
+        if matches!(strv(e,"type"), "read.ack" | "read.cursor") {
             return self
                 .replication
                 .hosts
@@ -1519,7 +1527,7 @@ impl Store {
     fn dependency_ids(&self, e: &Value) -> Result<Vec<String>> {
         // Parent chains are walked iteratively. Pages can stop within a chain;
         // the publication cursor advances only after its target is durable.
-        let mut parent = e["data"]["reply_to"].as_str().or_else(|| {
+        let mut parent = e["data"]["message_id"].as_str().filter(|_|e["type"] == "reaction").or_else(|| e["data"]["reply_to"].as_str()).or_else(|| {
             (e["type"] == "conversation.pin")
                 .then(|| e["data"]["target_id"].as_str())
                 .flatten()
@@ -1704,15 +1712,11 @@ impl Store {
         })
     }
     fn backfill_member(scope: &str, e: &Value) -> bool {
-        e["type"] == "message.create" && strv(e, "conversation_id") == scope
+        matches!(strv(e,"type"), "message.create" | "reaction") && strv(e, "conversation_id") == scope
     }
     /// Messages of `scope` in `(after, through]`, for backfill progress.
     pub fn scope_message_count(&self, scope: &str, after: u64, through: u64) -> u64 {
-        self.events
-            .iter()
-            .filter(|p| p.position > after && p.position <= through)
-            .filter(|p| Self::backfill_member(scope, &p.event))
-            .count() as u64
+        self.read_model.conversations.get(scope).map_or(0,|c| c.arrivals.partition_point(|p| *p <= through).saturating_sub(c.arrivals.partition_point(|p| *p <= after))) as u64
     }
     /// Per-scope coverage this replica holds in `generation`; a hub uses it to
     /// start a re-added scope's backfill where the earlier coverage ended.

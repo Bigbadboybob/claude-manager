@@ -224,10 +224,7 @@ impl Store {
         let high = monitor.closing_fence.unwrap_or(self.position);
         let mut changed = high != monitor.scanned || expired;
         let scanned = monitor.scanned;
-        for e in self
-            .events
-            .iter()
-            .filter(|e| e.position > scanned && e.position <= high)
+        for e in self.events_between(scanned,high).iter()
         {
             if self.monitor_matches(actor, monitor, e) {
                 monitor.hits = monitor
@@ -271,17 +268,9 @@ impl Store {
         // bulk mark_read_before) is not outstanding, even before the monitor's
         // own result receipt is acknowledged: the two ack systems used to be
         // independent, so reading never lowered this count.
-        let read = self.reads.get(actor).map(|r| &r.ids);
-        let unseen = self
-            .events
-            .iter()
-            .filter(|e| {
-                e.position > m.acknowledged
-                    && e.position <= m.hit_high
-                    && self.monitor_matches(actor, m, e)
-                    && !read.is_some_and(|r| r.contains(strv(&e.event, "id")))
-            })
-            .count();
+        let unseen = self.read_model.conversations.keys().filter(|cid|self.visible(actor,cid))
+            .flat_map(|cid|self.message_candidates(actor,cid,None,false,true,false))
+            .filter(|e| e.position > m.acknowledged && e.position <= m.hit_high && self.monitor_matches(actor,m,e)).count();
         let delivery = actor
             .strip_prefix(&format!("agent:{}:", self.daemon_id))
             .map(|uid| super::super::delivery::monitor_status(&self.root, uid, &m.id))

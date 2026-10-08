@@ -93,6 +93,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "messaging.dms", "messaging.people", "messaging.channels", "messaging.pins", "session.set_name",
     "messaging.norms", "messaging.monitor", "messaging.monitors", "messaging.follow",
     "messaging.availability", "messaging.attention",
+    "messaging.counts", "messaging.mark_read", "messaging.react",
     "ping",
     "notify_user",
     "owner_attention.ack",
