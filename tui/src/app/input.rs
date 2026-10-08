@@ -3277,10 +3277,11 @@ impl App {
                     }
                     KeyCode::Char('r') => {
                         self.backend.refresh();
-                        // Outer-buffer clearing cannot reconstruct a Codex
-                        // screen missing from the daemon's bounded replay tail.
+                        // Outer-buffer clearing cannot reconstruct an agent
+                        // screen missing from the daemon's bounded replay tail;
+                        // a resize pulse makes Codex / Claude Code redraw it.
                         if let Some(ts) = self.active_session_mut() {
-                            if ts.session_type == "codex" {
+                            if crate::session::repaints_on_resize(&ts.session_type) {
                                 ts.session.request_repaint();
                             }
                         }

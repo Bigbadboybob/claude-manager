@@ -59,6 +59,16 @@ impl EventListener for EventProxy {
     }
 }
 
+/// Agent TUIs that rebuild their whole screen on a resize (SIGWINCH). A
+/// reattach replays only the daemon's bounded byte tail, which starts
+/// mid-frame; these engines then draw incremental updates over a screen the
+/// viewer never saw (Claude Code's prompt box, status line and agent list
+/// stayed missing or mangled). A resize pulse makes them repaint. Shells
+/// cannot recreate their output, so they are never pulsed.
+pub fn repaints_on_resize(session_type: &str) -> bool {
+    matches!(session_type, "codex" | "claude" | "claude-code")
+}
+
 /// A terminal session wrapping alacritty's Term + PTY + EventLoop.
 pub struct Session {
     repaint: Repaint,
@@ -345,9 +355,9 @@ impl Session {
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
         // A bounded raw replay can start after the application's last complete
-        // screen. Codex can reconstruct its history on resize; defer that work
-        // until this pane is viewed, rather than repainting the whole fleet.
-        let repaint = if config.session_type == "codex" {
+        // screen. Codex and Claude Code rebuild their screen on resize; defer
+        // that until this pane is viewed, rather than repainting the fleet.
+        let repaint = if repaints_on_resize(&config.session_type) {
             Repaint::WhenVisible
         } else {
             Repaint::None
@@ -553,7 +563,8 @@ impl Session {
     }
 
     /// Ask a repaintable application to rebuild its screen, without input or
-    /// restart. Callers restrict this to Codex; shells cannot recreate output.
+    /// restart. Callers restrict this to [`repaints_on_resize`] engines;
+    /// shells cannot recreate output.
     pub fn request_repaint(&mut self) {
         if !self.exited && !matches!(self.repaint, Repaint::RestoreAt(_)) {
             self.repaint = Repaint::WhenVisible;

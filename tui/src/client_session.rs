@@ -2959,6 +2959,22 @@ while True:
         }
         drop(viewer);
 
+        // A Claude Code pane reattaches the same way (its Ink renderer only
+        // draws diffs against its last frame): it is pulsed once when viewed.
+        let mut config = bash_config(&socket, &working_dir, "op-test", &uid,
+            "ws-repaint", "claude-fixture", &argv, 80, 24);
+        config.session_type = "claude";
+        let mut claude_viewer = crate::session::Session::new_attached_existing(config).unwrap();
+        let later = Instant::now();
+        claude_viewer.poll_repaint(true, later);
+        wait_until(|| dimensions() == (79, 24));
+        wait_until(|| claude_viewer.term.lock().grid()[Line(0)][Column(0)].c == 'C');
+        claude_viewer.poll_repaint(false, later + Duration::from_millis(500));
+        wait_until(|| dimensions() == (80, 24));
+        drop(claude_viewer);
+        assert!(crate::session::repaints_on_resize("claude-code"));
+        assert!(!crate::session::repaints_on_resize("bash"));
+
         // A shell attach uses the same transport but is never auto-repainted.
         let config = bash_config(&socket, &working_dir, "op-test", &uid,
             "ws-repaint", "shell-fixture", &argv, 100, 30);
