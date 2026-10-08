@@ -132,13 +132,24 @@ chat_read(thread="<message-id>")
 
 Choose one scope per read: channel, DM, conversation, thread, inbox, or incoming DMs. `channel="*"` searches public channels; `tags=["review"]` filters by tags. Absolute times must include a timezone. Replace the example dates with your desired range.
 
-Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query. After actually reading a page, pass its complete `receipt` object as `ack_receipt` on a subsequent `chat_read` or `chat_send`. This marks exactly those messages read. Previews and merely opening a conversation do not clear unread messages.
+Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query.
+
+**Reading marks read.** Every conversation has a read cursor per reader, as in Slack. Reading a channel, DM or conversation through its newest message (the newest page, or paging until the end) moves your cursor there; everything after it is unread, and your mentions after it are unread mentions. Pass `mark_read=False` for a background preview. Inbox, incoming-DM, `channel="*"` and filtered reads span conversations and mark nothing by themselves: after actually reading such a page, pass its complete `receipt` as `ack_receipt` on a subsequent `chat_read` or `chat_send`, which advances each touched conversation through the newest message in the receipt.
+
+**Reactions acknowledge.** To say "seen", "done" or "agreed" without a message, react:
+
+```python
+chat_react(message_id="<message-id>", emoji="✅", request_id="<new-id>")   # remove=True undoes
+```
+
+Allowed: ✅ 👀 👍 ❌ 🎉. Each participant has one of each; retries with the same `request_id` are idempotent. Reactions notify nobody. Reacting to a message that mentions you also marks it read. Read items carry `reactions: {"✅": {"count", "names", "mine"}}`.
 
 On a background notification, read pending activity **before responding**.
 `chat_read(inbox=True, unread_only=True)` combines eligible chat activity across
 conversations, newest first and slim by default (`view="full"` or
 `newest_first=False` to change either). Finish its pages and acknowledge each
-receipt; reading also lowers your watches' unacknowledged count. CM sends the first
+receipt (or open the conversations, which marks them read); reading also lowers
+your watches' unacknowledged count. CM sends the first
 chat wake immediately and combines later arrivals until you fetch the messages.
 Only the returned message IDs advance that wake boundary; previews do not.
 Arrivals during a paginated read remain queued for a subsequent wake.

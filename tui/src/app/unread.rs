@@ -29,8 +29,9 @@ impl Unread {
     /// Apply a `messaging.attention` reply (or an old daemon's `attention`
     /// decoration). Returns true when the counts changed.
     fn accept(&mut self, v: &Value) -> bool {
-        let a = &v["attention"];
-        if !a.is_object() {
+        // messaging.counts answers at the top level; attention nests it.
+        let a = if v["attention"].is_object() { &v["attention"] } else { v };
+        if !["dms", "mentions", "unread"].iter().any(|k| a[*k].is_u64()) {
             return false;
         }
         let (dms, mentions) = match (a["dms"].as_u64(), a["mentions"].as_u64()) {
@@ -64,6 +65,13 @@ pub(super) fn indicator_variants(dms: u64, mentions: u64) -> Vec<String> {
         format!(" \u{2709}{} ", dms + mentions),
         " \u{2709} ".into(),
     ]
+}
+
+impl Unread {
+    /// Counts carried by a mark-read or react reply.
+    pub(super) fn accept_counts(&mut self, counts: &Value) -> bool {
+        self.accept(counts)
+    }
 }
 
 impl App {
@@ -101,15 +109,15 @@ impl App {
             let call = |m: &str, p: Value| {
                 crate::client_session::rpc_messaging_board(&socket, &token, m, p).map_err(|e| e.to_string())
             };
-            let result = call("messaging.attention", json!({})).or_else(|e| {
-                // An older daemon: fall back to the total its responses carry.
+            // Cursor counts (one cheap call), then the older attention
+            // summary, then the total an old daemon's responses carry.
+            let unsupported = |e: &str| {
                 let l = e.to_lowercase();
-                if l.contains("not implemented") || (l.contains("unknown") && l.contains("method")) {
-                    call("messaging.dms", json!({"limit": 1}))
-                } else {
-                    Err(e)
-                }
-            });
+                l.contains("not implemented") || (l.contains("unknown") && l.contains("method"))
+            };
+            let result = call("messaging.counts", json!({}))
+                .or_else(|e| if unsupported(&e) { call("messaging.attention", json!({})) } else { Err(e) })
+                .or_else(|e| if unsupported(&e) { call("messaging.dms", json!({"limit": 1})) } else { Err(e) });
             let _ = tx.send(result);
         });
     }
@@ -230,6 +238,9 @@ mod tests {
         assert!(u.accept(&json!({"attention":{"unread":5,"dms":2,"mentions":1}})));
         assert_eq!((u.dms, u.mentions), (2, 1));
         assert!(!u.accept(&json!({"attention":{"unread":5,"dms":2,"mentions":1}})), "unchanged");
+        // messaging.counts answers at the top level.
+        assert!(u.accept(&json!({"conversations":{},"dms":4,"mentions":2,"unread":6})));
+        assert_eq!((u.dms, u.mentions), (4, 2));
         // An older daemon only reports the total.
         assert!(u.accept(&json!({"attention":{"unread":3}})));
         assert_eq!((u.dms, u.mentions), (3, 0));

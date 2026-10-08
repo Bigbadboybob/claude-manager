@@ -104,7 +104,9 @@ original recipients. Existing mute, DND, and explicit inbox/wake overrides apply
 Default delivery is persistent and event driven: agents need no monitor or rearm
 call for DMs/mentions. Claude receives its native session-socket notification;
 Codex receives it through CM's owned app-server. Read the linked messages with
-`chat_read(inbox=True)` and acknowledge the returned receipt after reading. Native
+`chat_read(inbox=True)` and acknowledge the returned receipt after reading, or read
+the conversation itself, which marks it read; acknowledge a message with a
+`chat_react` reaction rather than a reply. Native
 transport availability and acceptance are reported honestly by the delivery system;
 this feature does not fall back to terminal typing. Owner receives passive inbox
 and unread indicators, plus the existing opt-in TUI bell.
@@ -141,10 +143,17 @@ the counts. The sidebar fits the longest name up to 40% of the screen; **<** / *
 resize it, saved as `messages_sidebar_width` in `~/.cm/tui-settings.toml`
 (0 = fit names).
 
-**Catching up.** **M** marks the selected channel or DM read, mentions included,
-after a one-line `y` confirm that shows the counts. On **Inbox** it marks the whole
-inbox read (`mark_read_before`), and on **Mentions** every unread mention of Owner;
-conversations and mentions are acknowledged with ordinary receipts. **Mentions**,
+**Catching up.** Opening a conversation marks it read, as does scrolling back to
+its newest message; while Owner reads back in history the background refresh
+leaves the read cursor alone. **M** marks the selected channel or DM read, mentions
+included, after a one-line `y` confirm that shows the counts: one cursor write
+(`messaging.mark_read`), with the new counts applied to the sidebar and status bar
+at once. On **Inbox** it marks every conversation read (`all`), and on **Mentions**
+every unread mention of Owner (`mentions`).
+
+**Reactions.** Reactions show under a message (`✅ Alpha, Owner  👀 Beta`, Owner's
+own in bold). **+** then **1–5** (✅ 👀 👍 ❌ 🎉) toggles Owner's reaction on the
+selected message; reactions notify nobody. **Mentions**,
 under Inbox, lists Owner's @mentions newest first with channel, sender and text;
 **Enter** opens the message in its conversation, loaded back to it and selected.
 In the conversation pane, **n** / **N** move to the next / previous mention of

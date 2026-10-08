@@ -97,6 +97,8 @@ pub struct Messages {
     seek_mention: (i8, u8),
     /// A one-line `y` confirm for marking a conversation read.
     confirm: Option<(String, Value)>,
+    /// `+` was pressed: the next 1–5 toggles a reaction on the selection.
+    reacting: bool,
     /// Screen width at the last draw (sidebar resize bounds).
     screen_width: u16,
     /// Older messages just prepended: the timeline keeps its place.
@@ -105,6 +107,33 @@ pub struct Messages {
     layout_epoch: u64,
     /// (epoch, width, count, rows per message incl. separator).
     row_heights: (u64, u16, usize, Vec<usize>),
+}
+
+/// The reactions Owner can add (the daemon's allowlist), keys 1–5 after `+`.
+const REACTIONS: [&str; 5] = ["\u{2705}", "\u{1f440}", "\u{1f44d}", "\u{274c}", "\u{1f389}"];
+
+/// Has Owner already reacted with `emoji`? `reactions_mine` when the daemon
+/// supplies it, else Owner's display name among the reactors.
+fn reacted_by_me(m: &Value, emoji: &str) -> bool {
+    let r = &m["reactions"][emoji];
+    if let Some(mine) = r["mine"].as_bool() {
+        return mine;
+    }
+    match m["reactions_mine"].as_array() {
+        Some(mine) => mine.iter().any(|e| e == emoji),
+        None => reaction_names(r).iter().any(|n| n == "Owner"),
+    }
+}
+
+/// Reactor names from `{count, names, mine}` or a bare name list.
+fn reaction_names(r: &Value) -> Vec<String> {
+    r["names"]
+        .as_array()
+        .or_else(|| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Messages addressed to Owner: a structured mention or `@here`.
@@ -626,7 +655,13 @@ impl App {
                             }
                         }
                     }
-                    self.messages.error = e;
+                    self.messages.error = if method == "messaging.react"
+                        && (e.contains("unknown") || e.contains("not implemented"))
+                    {
+                        "Reactions need the updated daemon (next deploy)".into()
+                    } else {
+                        e
+                    };
                 }
                 Ok(v) => {
                     self.messages.error.clear();
@@ -728,8 +763,13 @@ impl App {
                                 Some(n) => format!("Marked {n} read"),
                                 None => "Marked read".into(),
                             };
+                            self.messaging_apply_counts(&v["counts"]);
                             self.messages.page_cursor = Value::Null;
                             self.messaging_refresh_target();
+                        }
+                        "messaging.react" => {
+                            self.messages.accept_reaction(&v);
+                            self.messaging_apply_counts(&v["counts"]);
                         }
                         "channel_members" => {
                             self.messages.channel_members = v["items"].as_array().cloned().unwrap_or_default();
@@ -788,10 +828,18 @@ impl App {
         };
         let token = self.host_pool.operator_token_for(&host);
         self.messages.management.request = params.clone();
-        let catch_up_to = (method == "messaging.read"
+        let refresh = matches!(method, "messaging.read" | "hub_refresh")
             && self.messages.live_conversation()
             && self.messages.loaded_target == self.messages.query()
-            && params["cursor"].is_null())
+            && params["cursor"].is_null();
+        // Reading a conversation marks it read (the daemon's default for a
+        // direct read); a background refresh only does so while Owner is at
+        // the newest message, not while scrolled back in history.
+        if refresh {
+            params["mark_read"] = json!(self.messages.selected + 1 >= self.messages.items.len());
+            self.messages.management.request = params.clone();
+        }
+        let catch_up_to = (method == "messaging.read" && refresh)
             .then(|| self.messages.items.last().map(|m| m["id"].clone())).flatten();
         let method = method.to_owned();
         let (tx, rx) = mpsc::channel();
@@ -877,7 +925,9 @@ impl App {
                 // (the read API has no mention filter).
                 (|| {
                     let mut out = Vec::new();
-                    let mut p = json!({"inbox":true,"newest_first":true,"limit":200});
+                    // mentions_only filters on the daemon; the client filter
+                    // below keeps an older daemon (which ignores it) correct.
+                    let mut p = json!({"inbox":true,"mentions_only":true,"newest_first":true,"limit":200});
                     for _ in 0..5 {
                         let page = call("messaging.read", p.clone())?;
                         out.extend(page["items"].as_array().into_iter().flatten().filter(|m| mentions_owner(m)).cloned());
@@ -916,9 +966,28 @@ impl App {
                 // receipts of ≤ 200 (the ordinary receipt path).
                 (|| {
                     let target = params["target"].clone();
+                    let unsupported = |e: &str| {
+                        let l = e.to_lowercase();
+                        l.contains("not implemented") || (l.contains("unknown") && l.contains("method"))
+                    };
+                    // Read cursors: one O(1) write per affected conversation;
+                    // the reply carries the new counts.
+                    let request = if target["inbox"] == true {
+                        json!({"all": true})
+                    } else if target["mentions"] == true {
+                        json!({"mentions": true})
+                    } else {
+                        target.clone()
+                    };
+                    match call("messaging.mark_read", request) {
+                        Err(e) if unsupported(&e) => {}
+                        other => return other,
+                    }
+                    // An older daemon: the inbox bulk mark, else receipts.
                     if target["inbox"] == true {
                         return call("messaging.read", json!({"inbox":true,"mark_read_before":rfc3339_now()}));
                     }
+                    // An older daemon: acknowledge the unread ids in receipts.
                     let mentions_only = target["mentions"] == true;
                     let mut q = if mentions_only { json!({"inbox":true}) } else { target.clone() };
                     q["unread_only"] = json!(true);
@@ -1031,6 +1100,7 @@ impl App {
         // state queue behind the request in flight.
         let navigation = self.messages.mode.is_empty()
             && self.messages.confirm.is_none()
+            && !self.messages.reacting
             && self.messages.queued_events.is_empty()
             && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             && matches!(
@@ -1059,7 +1129,28 @@ impl App {
             }
             return true;
         }
+        if std::mem::take(&mut self.messages.reacting) {
+            match key.code {
+                KeyCode::Char(c @ '1'..='5') => self.messaging_react((c as u8 - b'1') as usize),
+                _ => self.messages.status = "No reaction".into(),
+            }
+            return true;
+        }
         if self.messages.mode.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+        if self.messages.mode.is_empty()
+            && key.code == KeyCode::Char('+')
+            && self.messages.pane == 1
+            && !self.messages.management_view()
+        {
+            if self.messages.items.get(self.messages.selected).is_some() {
+                self.messages.reacting = true;
+                self.messages.status = format!(
+                    "React: {} · same key again removes yours · any other key cancels",
+                    REACTIONS.iter().enumerate().map(|(i, e)| format!("{} {e}", i + 1)).collect::<Vec<_>>().join("  ")
+                );
+            }
             return true;
         }
         // In a conversation n / N step between mentions of Owner (in the
@@ -1532,6 +1623,35 @@ impl App {
         p["_jump"] = m["id"].clone();
         self.messaging_request("jump", p);
     }
+    /// Fresh `messaging.counts` from a mark-read or react reply: update the
+    /// sidebar rows and the status-bar indicator without another call.
+    fn messaging_apply_counts(&mut self, counts: &Value) {
+        let Some(per) = counts["conversations"].as_object() else { return };
+        for row in self.messages.channels.iter_mut().chain(self.messages.dms.iter_mut()) {
+            let Some(id) = row["id"].as_str() else { continue };
+            let c = per.get(id);
+            row["unread"] = json!(c.and_then(|c| c["unread"].as_u64()).unwrap_or(0));
+            row["mentions"] = json!(c.and_then(|c| c["mentions"].as_u64()).unwrap_or(0));
+        }
+        if self.unread.accept_counts(counts) {
+            self.needs_redraw = true;
+        }
+    }
+    /// Toggle reaction `REACTIONS[i]` by Owner on the selected message.
+    fn messaging_react(&mut self, i: usize) {
+        let Some(m) = self.messages.items.get(self.messages.selected) else { return };
+        let emoji = REACTIONS[i];
+        let remove = reacted_by_me(m, emoji);
+        let p = json!({
+            "message_id": m["id"],
+            "emoji": emoji,
+            "remove": remove,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "origin_daemon_id": self.messages.daemon_id,
+        });
+        self.messages.status = format!("{} {emoji}…", if remove { "Removing" } else { "Reacting" });
+        self.messaging_request("messaging.react", p);
+    }
     /// `M`: confirm, then mark the selected conversation (or the Inbox /
     /// mention list) read, mentions included.
     fn messaging_confirm_mark_read(&mut self) {
@@ -1962,6 +2082,7 @@ impl App {
                     ("b", "channels"),
                     ("J/L", "join/leave"),
                     ("u", "members"),
+                    ("+", "react"),
                     ("M", "mark read"),
                 ]),
                 chat_help(&[
@@ -2290,6 +2411,76 @@ mod tests {
         let after_resize = app.messages.layout_builds;
         narrow.draw(|f| app.draw_messages(f)).unwrap();
         assert_eq!(app.messages.layout_builds - after_resize, 1);
+    }
+
+    #[test]
+    fn reactions_render_toggle_owner_and_counts_replies_update_sidebar_and_indicator() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        app.messages.target = json!({"channel":"behavior-triage"});
+        app.messages.pane = 1;
+        let mut m = chat(1, false, "deploy done");
+        m["reactions"] = json!({"\u{2705}":{"count":2,"names":["Alpha","Owner"],"mine":true},"\u{1f440}":["Beta"]});
+        app.messages.items = vec![m];
+        let text = screen(&mut app, 160, 30);
+        if std::env::var_os("CM_MSG_DUMP").is_some() {
+            println!("--- reactions ---\n{text}");
+        }
+        // (A wide emoji's second cell reads as a blank in the buffer dump.)
+        let line = text.lines().find(|l| l.contains("Alpha, Owner")).unwrap_or_else(|| panic!("{text}"));
+        assert!(line.contains('\u{2705}') && line.contains('\u{1f440}') && line.contains("Beta"), "{line}");
+        assert!(reacted_by_me(&app.messages.items[0], "\u{2705}"));
+        assert!(!reacted_by_me(&app.messages.items[0], "\u{1f440}"));
+        // + then 1 toggles Owner's ✅ off (Owner already reacted).
+        press(&mut app, KeyCode::Char('+'));
+        assert!(app.messages.status.starts_with("React: 1 \u{2705}"));
+        press(&mut app, KeyCode::Char('1'));
+        let r = &app.messages.management.request;
+        assert!(
+            (r["emoji"] == "\u{2705}" && r["remove"] == true && r["request_id"].is_string())
+                || app.messages.error.contains("unavailable"),
+            "{r}"
+        );
+        app.messages.busy = false;
+        app.messages.rx = None;
+        // The reply replaces the aggregate and carries the new counts.
+        app.messages.accept_reaction(&json!({"message_id":"m1","reactions":{"\u{2705}":{"count":1,"names":["Alpha"],"mine":false}}}));
+        assert!(!reacted_by_me(&app.messages.items[0], "\u{2705}"));
+        let text = screen(&mut app, 160, 30);
+        assert!(text.lines().any(|l| l.contains('\u{2705}') && l.contains("Alpha ") && !l.contains("Owner")), "{text}");
+        app.messaging_apply_counts(&json!({"conversations":{"c1":{"unread":0,"mentions":0}},"dms":1,"mentions":0,"unread":1}));
+        assert_eq!(app.messages.menu_counts(&json!({"channel":"behavior-triage"})), (0, 0), "M clears the row at once");
+        assert_eq!(app.messages.menu_counts(&json!({"conversation":"d1"})), (0, 0), "absent from counts = read");
+        assert_eq!((app.unread.dms, app.unread.mentions), (1, 0));
+        // Any other key after + cancels.
+        press(&mut app, KeyCode::Char('+'));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.messages.status, "No reaction");
+    }
+
+    #[test]
+    fn refreshes_mark_read_only_at_the_newest_message() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        app.messages.target = json!({"channel":"behavior-triage"});
+        app.messages.items = (0..3).map(|i| chat(i, false, "x")).collect();
+        app.messages.loaded_target = app.messages.query();
+        app.messages.selected = 0;
+        app.messaging_refresh_target();
+        assert_eq!(app.messages.management.request["mark_read"], false, "scrolled back: a refresh does not mark read");
+        app.messages.busy = false;
+        app.messages.rx = None;
+        app.messages.selected = 2;
+        app.messaging_refresh_target();
+        assert_eq!(app.messages.management.request["mark_read"], true);
+        // Opening a conversation leaves the daemon default (reading marks read).
+        app.messages.busy = false;
+        app.messages.rx = None;
+        app.messages.loaded_target = Value::Null;
+        app.messaging_refresh_target();
+        assert!(app.messages.management.request.get("mark_read").is_none());
     }
 
     pub(super) struct Home {

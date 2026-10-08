@@ -312,6 +312,34 @@ impl Messages {
                     .map(|s| Line::styled(s, Style::default().fg(theme::CHAT_TAG).bg(bg))),
             );
         }
+        // Reactions: `✅ Alpha, Owner  👀 Beta`, Owner's own in bold.
+        if let Some(reactions) = m["reactions"].as_object().filter(|r| !r.is_empty()) {
+            let mut spans = vec![Span::styled("  ", Style::default().bg(bg))];
+            for (emoji, r) in reactions {
+                let names = super::reaction_names(r);
+                let count = r["count"].as_u64().map_or(names.len(), |c| c as usize);
+                if count == 0 {
+                    continue;
+                }
+                let mine = super::reacted_by_me(m, emoji);
+                let style = if mine {
+                    Style::default().fg(theme::CHAT_OWNER).add_modifier(Modifier::BOLD)
+                } else {
+                    muted
+                };
+                let list = if count > 3 && names.len() >= 3 {
+                    format!("{} +{}", names[..3].join(", "), count - 3)
+                } else if names.is_empty() {
+                    count.to_string()
+                } else {
+                    names.join(", ")
+                };
+                spans.push(Span::styled(format!("{emoji} {list}  "), style.bg(bg)));
+            }
+            if spans.len() > 1 {
+                lines.push(Line::from(spans).style(Style::default().bg(bg)));
+            }
+        }
         if let Some(links) = m["data"]["links"].as_array() {
             for link in links {
                 let text = format!(
@@ -327,6 +355,33 @@ impl Messages {
             }
         }
         lines
+    }
+    /// Apply a `messaging.react` reply to the loaded message.
+    pub(super) fn accept_reaction(&mut self, v: &Value) {
+        let Some(item) = self.items.iter_mut().find(|m| m["id"] == v["message_id"]) else {
+            return;
+        };
+        if v["reactions"].is_object() {
+            item["reactions"] = v["reactions"].clone();
+        }
+        let has_mine = v["reactions"].as_object().is_some_and(|r| r.values().any(|e| e["mine"].is_boolean()));
+        if v["reactions_mine"].is_array() {
+            item["reactions_mine"] = v["reactions_mine"].clone();
+        } else if has_mine {
+            // The aggregate carries `mine` per emoji.
+        } else if let Some(emoji) = self.management.request["emoji"].as_str() {
+            // Older replies omit the caller's set: track our own toggle.
+            let mut mine: Vec<Value> = item["reactions_mine"].as_array().cloned().unwrap_or_default();
+            mine.retain(|e| e != emoji);
+            if self.management.request["remove"] != true {
+                mine.push(json!(emoji));
+            }
+            item["reactions_mine"] = json!(mine);
+        }
+        let id = item["id"].as_str().unwrap_or("").to_owned();
+        self.layout.remove(&id);
+        self.layout_epoch += 1;
+        self.status = "Reaction saved".into();
     }
     fn unread_marker(&self, m: &Value) -> (&'static str, Style) {
         let muted = Style::default().fg(theme::CHAT_MUTED);
