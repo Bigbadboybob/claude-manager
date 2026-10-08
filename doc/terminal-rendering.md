@@ -121,15 +121,20 @@ screen those updates depended on. Replaying it into a fresh terminal can leave
 the upper conversation blank even while new messages and input work. The agent's
 saved transcript is separate from this display buffer.
 
-Existing Codex panes now request a repaint the first time they are viewed after
-attachment or reconnect. The viewer briefly changes the PTY width by one column
-and restores the current viewport size 400 ms later. Codex rebuilds its history
-and composer in response. The viewer ticks drive this asynchronously: no input,
+Existing Codex and Claude Code panes request a repaint the first time they are
+viewed after attachment or reconnect (TUI restore, Alt+a, a brain-restart or
+tunnel reattach). The viewer briefly changes the PTY width by one column and
+restores the current viewport size 400 ms later. Both agents rebuild their
+screen in response. Without it, Claude Code's renderer kept drawing only the
+changed lines over a screen the viewer never received: its prompt box, status
+line and agent list stayed missing, with stale fragments such as a leftover
+"(running Stop hooks…)" line and a half-overwritten hint row. The viewer ticks drive this asynchronously: no input,
 agent restart, blocking delay, or extra control RPC is involved. Hidden panes
 defer the work until viewed. A size restoration still completes if focus moves,
 and a user window resize during recovery takes precedence over the old size.
 
-**Alt+r** also requests this repaint for the focused Codex session, alongside
+**Alt+r** also requests this repaint for the focused Codex or Claude session (the
+manual "redraw this pane" key), alongside
 the existing planning refresh, reconnect nudge, and outer-screen clear.
 **Alt+Shift+r** retains its distinct agent restart/revive behavior.
 
