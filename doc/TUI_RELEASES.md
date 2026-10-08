@@ -112,3 +112,114 @@ To roll back on the laptop, copy the named backup to a temporary file beside the
 installed binary, preserve executable permissions, atomically rename it over the
 installed binary, and reopen the TUI. Do not truncate an executable in place or
 restart the holder/agent sessions for a viewer rollback.
+
+## Laptop daemon releases (including Messages changes)
+
+The TUI's Messages view uses the **laptop's local daemon**. Deploying new
+messaging RPCs on `cm-sessions` and `cm-manager` alone does not update the
+Owner-facing store, counts, or mark-read behavior. Ship the laptop brain as well
+when those behaviors change. The laptop must already run the holder/brain split;
+this installer does not migrate a monolith or stop agent sessions.
+
+The cloud packager is [`scripts/package-cm-daemon.py`](../scripts/package-cm-daemon.py).
+From a clean, committed checkout on `cm-sessions`:
+
+```bash
+python3 scripts/test-install-cm-daemon.py
+python3 scripts/test-install-cm-tui.py
+python3 scripts/package-cm-daemon.py \
+  --target-dir "$HOME/.local/share/<lane>/target" --offline --with-tui
+```
+
+Label the lane directory with `OWNER.md` before building, as for other private
+builds. The packager labels its target and release directories. It builds the
+release workspace when `--with-tui` is supplied, otherwise `cm-daemon` and
+`cm-holder`, using a private target and two Cargo jobs. Omit `--offline` if
+dependencies need downloading. The packager rejects a dirty or changing checkout,
+the installed shared target, and an existing release directory. It never calls a
+daemon RPC or replaces an installed binary.
+
+The resulting `~/.cm/releases/daemon-<12-character-commit>/` contains:
+
+- `cm-daemon` and `cm-holder` from the selected revision;
+- `install-laptop-daemon.py`, with source paths and expected SHA-256 embedded;
+- `SHA256SUMS`, `release.json`, and ownership/retention metadata;
+- with `--with-tui`, the TUI binary and its existing checksum-embedded installer.
+
+Packaging verifies `SHA256SUMS`. Record actual review/test results alongside the
+receipt, keeping its checksums current if you edit it. Remove your private target
+after packaging/checks; preserve staged releases and rollback backups.
+
+Give Owner the concrete command printed by the packager. It runs in a **local
+laptop terminal**, not a CM cloud Bash pane:
+
+```bash
+ssh cm-sessions 'cat ~/.cm/releases/daemon-<commit>/install-laptop-daemon.py' | python3
+# Combined package: activate the brain, then install the TUI for its next launch.
+ssh cm-sessions 'cat ~/.cm/releases/daemon-<commit>/install-laptop-daemon.py' | python3 - --with-tui
+```
+
+The daemon installer authenticates with the laptop's `~/.cm/operator-token` on
+`~/.cm/daemon.sock`. It ignores inherited remote socket/token environment
+overrides, refuses cloud hosts, and serializes installer invocations with a local
+lock. Preflight requires a healthy split, strong operator authentication, matching
+brain/holder session counts, and no restart already in flight.
+
+The running brain's `/proc/<brain_pid>/exe` identifies the active pinned image
+and its path, including the ` (deleted)` suffix left after an atomic update.
+This is more reliable than the holder's original `--brain` command line after
+later deploys. The destination is therefore the actual shared-target or `/opt`
+path, and the restart always passes that exact `binary_path`. An explicit
+`--binary-path /absolute/path/cm-daemon` overrides detection; when changing the
+path, also account for the holder's startup configuration on a later full launch.
+The ordinary default updates the existing startup location.
+
+For a root-owned `/opt` destination, run `sudo -v` in the laptop terminal first,
+then append `--sudo` to the installer command (`python3 - --sudo`). Only file
+installation uses `sudo -n`; run the installer itself as the laptop user so it
+uses that user's token, socket and state. It does not silently switch to a
+writable shared target while the holder still pins `/opt`.
+
+Before replacement it downloads and checks the binary, runs
+`--daemon-preflight` against the laptop's durable state, rechecks the generation,
+and saves the **running pinned image** and its SHA-256 as
+`cm-daemon.before-<commit>` beside the destination. Repeated installs retain the
+original backup. A sibling temporary file plus rename atomically replaces the
+destination; a running executable is never truncated. Checksum, download or
+preflight failures leave the installed brain unchanged.
+
+Activation calls `daemon.restart` once and then verifies:
+
+- `holder_epoch` increased by exactly one and the brain PID changed;
+- the running `/proc/<new_brain_pid>/exe` SHA-256 equals the expected artifact;
+- the holder PID/start time and executable hash stayed unchanged;
+- the breaker is running, MCP preflight passed, and session counts are unchanged;
+- those checks remain true during a 90-second initial stability check.
+
+EOF or timeout from the restart call only begins verification; it never counts
+as success. A refused or unverified restart reports failure, retains the installed
+file and backup, and prints the rollback command. A late crash after the initial
+check remains possible: the holder's breaker horizon is ten minutes. Do not call
+the initial check a ten-minute soak. `--soak-seconds` can select a different
+initial observation period, which the installer reports explicitly.
+
+The printed rollback line reruns the same staged installer with `--rollback`
+and the exact destination. It verifies the backup checksum, runs preflight,
+atomically restores it, and performs the same restart/hash/epoch checks. It does
+not rely on a potentially changed in-memory previous-pin slot. Example:
+
+```bash
+ssh cm-sessions 'cat ~/.cm/releases/daemon-<commit>/install-laptop-daemon.py' | python3 - --rollback
+```
+
+`cm-holder` is **packaged only**. The routine install neither overwrites nor
+upgrades the running holder; a holder change still needs the separate
+`daemon.upgrade_holder` procedure in the daemon runbook. The installer also does
+not update MCP files or the planning API. The optional TUI install happens after
+verified brain activation: Owner still closes and reopens the viewer. If that
+second component fails, the brain remains activated and the TUI installer can be
+retried separately. Use the TUI's own backup procedure to roll back the viewer.
+
+Report cloud staging, laptop activation, and viewer relaunch separately. A lane
+that is authorized only to stage a release must hand it off to its coordinator
+without running the laptop install command.
