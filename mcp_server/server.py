@@ -1312,8 +1312,8 @@ def ping() -> dict:
          owner_availability: {level, set, changed_at, age_s, ...}}
 
     `owner_availability.level` is how reachable Owner is right now:
-    away (emergencies only), around (blocking and above), focused
-    (decisions and above), on-call (everything), or null when unset
+    away (emergencies only), around (decisions and above), focused
+    (everything), on-call (everything), or null when unset
     (every alert is delivered). Check it before asking Owner anything;
     chat_open reports the same value.
 
@@ -2192,7 +2192,7 @@ def notify_user(message: str = "", urgency: str = "decision") -> dict:
     Owner must choose something), "blocking" (you or others cannot proceed),
     "emergency" (harm or loss is happening now; also pushed to Owner's phone).
     Owner's availability (ping().owner_availability.level) decides delivery:
-    away delivers emergencies only, around blocking+, focused decision+,
+    away delivers emergencies only, around decision+, focused everything,
     on-call everything; unset delivers everything. The result says
     delivery="immediate" or delivery="held" with release_when (the level that
     will deliver it). Held is not lost: keep working, and you are woken when a

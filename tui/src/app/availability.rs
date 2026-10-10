@@ -15,8 +15,8 @@ use std::sync::mpsc;
 /// Picker rows: (level sent to the daemon, what it means).
 const CHOICES: [(&str, &str); 5] = [
     ("away", "emergencies only"),
-    ("around", "blocking and above"),
-    ("focused", "decisions and above"),
+    ("around", "decisions and above"),
+    ("focused", "everything"),
     ("on-call", "everything"),
     ("unset", "default: everything, no extra pushes"),
 ];

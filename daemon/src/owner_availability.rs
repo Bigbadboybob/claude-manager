@@ -72,8 +72,8 @@ impl Urgency {
 pub fn bar(level: Level) -> Urgency {
     match level {
         Level::Away => Urgency::Emergency,
-        Level::Around => Urgency::Blocking,
-        Level::Focused => Urgency::Decision,
+        Level::Around => Urgency::Decision,
+        Level::Focused => Urgency::Fyi,
         Level::OnCall => Urgency::Fyi,
     }
 }
@@ -284,8 +284,8 @@ mod tests {
         use Urgency::*;
         for (level, delivered) in [
             (Level::Away, vec![Emergency]),
-            (Level::Around, vec![Blocking, Emergency]),
-            (Level::Focused, vec![Decision, Blocking, Emergency]),
+            (Level::Around, vec![Decision, Blocking, Emergency]),
+            (Level::Focused, vec![Fyi, Decision, Blocking, Emergency]),
             (Level::OnCall, vec![Fyi, Decision, Blocking, Emergency]),
         ] {
             for u in Urgency::ALL {
@@ -295,8 +295,8 @@ mod tests {
         assert!(Urgency::ALL.into_iter().all(|u| delivers(None, u)));
         assert_eq!(release_level(Emergency), Level::Away);
         assert_eq!(release_level(Blocking), Level::Around);
-        assert_eq!(release_level(Decision), Level::Focused);
-        assert_eq!(release_level(Fyi), Level::OnCall);
+        assert_eq!(release_level(Decision), Level::Around);
+        assert_eq!(release_level(Fyi), Level::Focused);
     }
 
     #[test]

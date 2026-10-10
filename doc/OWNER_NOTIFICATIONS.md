@@ -48,7 +48,7 @@ operator acknowledges it. No agent can acknowledge another session's alert.
 ## Owner availability
 
 Owner sets how reachable they are: `away` (emergencies only), `around`
-(blocking and above), `focused` (decisions and above) or `on-call` (everything).
+(decisions and above), `focused` (everything) or `on-call` (everything).
 In the TUI press **F7** (any view): 1–5 or ↑/↓ + Enter sets, Esc cancels. The
 picker asks the laptop daemon first and falls back to the other configured
 hosts if that daemon predates availability. The status bar shows the current

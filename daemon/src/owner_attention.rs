@@ -617,8 +617,8 @@ mod tests {
         for (level, delivered) in [
             (None, ["fyi", "decision", "blocking", "emergency"].as_slice()),
             (Some("on-call"), &["fyi", "decision", "blocking", "emergency"]),
-            (Some("focused"), &["decision", "blocking", "emergency"]),
-            (Some("around"), &["blocking", "emergency"]),
+            (Some("focused"), &["fyi", "decision", "blocking", "emergency"]),
+            (Some("around"), &["decision", "blocking", "emergency"]),
             (Some("away"), &["emergency"]),
         ] {
             set_level(&state, level, "rev");
@@ -659,12 +659,12 @@ mod tests {
         assert_eq!(h["local"].alert.urgency.as_deref(), Some("decision"), "a later fyi never downgrades");
         // An emergency still gets through, and stays pending for the merge.
         let emergency = notify_with(&state, "local", "prod down", "emergency");
-        // around: decision still held.
-        let out = release_for_level(&state.lock().unwrap(), Some(Level::Around)).unwrap();
+        // away: decision still held.
+        let out = release_for_level(&state.lock().unwrap(), Some(Level::Away)).unwrap();
         assert!(out.released.is_empty());
         assert_eq!(out.still_held["local"], 2);
-        // focused: released into the delivered map, merged with the pending one.
-        let out = release_for_level(&state.lock().unwrap(), Some(Level::Focused)).unwrap();
+        // around: released into the delivered map, merged with the pending one.
+        let out = release_for_level(&state.lock().unwrap(), Some(Level::Around)).unwrap();
         assert_eq!(out.released["local"], 2);
         let alerts = snapshot(&state.lock().unwrap()).unwrap();
         let a = &alerts["local"];

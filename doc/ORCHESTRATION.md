@@ -136,7 +136,7 @@ mention wake you; do not poll in a loop.
   `emergency`) when Owner action is needed. Ask only when it really needs
   Owner; decisions inside the authorized task are yours to make.
 - Check `ping().owner_availability.level` first: `away` (emergencies only),
-  `around` (blocking and above), `focused` (decisions and above), `on-call`
+  `around` (decisions and above), `focused` (everything), `on-call`
   (everything); null means Owner has not set one. A request below the bar comes
   back `delivery="held"`: keep working on what you can; you are woken when it
   is released.
