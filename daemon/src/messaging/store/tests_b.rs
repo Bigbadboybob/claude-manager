@@ -361,3 +361,35 @@ fn owner_attention_splits_unread_dms_and_mentions_and_reading_clears_them() {
     // Agents get nothing.
     assert!(s.attention(&a.id, false).unwrap().is_null());
 }
+
+/// A thread-scoped watch makes its own conversation a sync interest and no
+/// other. The lookup is indexed: this runs on every sync-loop pass under the
+/// store slot, and the old per-channel scan of every event starved messaging
+/// RPCs on cm-sessions (2026-10-12).
+#[test]
+fn thread_watch_interest_is_its_own_conversation_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    let people = vec![a.clone()];
+    for path in ["alpha", "beta"] {
+        s.create_channel("owner", &json!({"action":"create","path":path,"request_id":path}))
+            .unwrap();
+        s.channel_action(&a.id, &json!({"action":"join","path":path,"request_id":format!("j-{path}")}), &people)
+            .unwrap();
+    }
+    let root = post(&mut s, &a, json!({"channel":"alpha"}), "root", &people);
+    post(&mut s, &a, json!({"channel":"beta"}), "other", &people);
+    s.register_monitor(
+        "owner",
+        &json!({"scope":{"thread":root["event_id"]},"mode":"continuous","expires_in":"10m","request_id":"t"}),
+        &people,
+    )
+    .unwrap();
+    let interests = s.local_transport_interests();
+    assert_eq!(
+        interests,
+        BTreeSet::from([s.channels["alpha"].clone()]),
+        "only the thread's conversation"
+    );
+}
