@@ -8,7 +8,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="CM Board">
   <title>CM Board</title>
-  <link rel="manifest" href="/manifest.webmanifest">
+  <!-- The manifest is fetched without cookies by default; behind Access it must carry them. -->
+  <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
   <link rel="icon" href="/icons/icon-192.png">
   <link rel="stylesheet" href="/app.css">
