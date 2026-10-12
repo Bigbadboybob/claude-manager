@@ -8119,7 +8119,7 @@ mod migrate_tui_local_tests {
 }
 
 #[cfg(test)]
-mod revive_session_tests {
+pub(crate) mod revive_session_tests {
     //! A-R (`revive_active_session`) behavior pins: the guards that keep
     //! revive scoped to genuinely-dead, non-workflow sessions, and the
     //! remote branch's fail-closed handling when the host daemon can't be
@@ -8129,7 +8129,7 @@ mod revive_session_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn dummy_ts(uid: &str, exited: bool, host: cm_daemon::host_id::HostId) -> TerminalSession {
+    pub(crate) fn dummy_ts(uid: &str, exited: bool, host: cm_daemon::host_id::HostId) -> TerminalSession {
         let mut session = crate::session::Session::new(
             "/bin/true",
             &[],

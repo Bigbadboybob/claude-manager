@@ -115,10 +115,35 @@ fn level_now(state: &DaemonState) -> Option<Level> {
 }
 
 fn broadcast(state: &DaemonState, key: &str, alert: Option<&Alert>) {
+    // This boundary is reached only for delivered alerts (including releases
+    // from the existing availability gate). Web Push is a separate subscriber:
+    // it must not count as an attached viewer or change Telegram's policy.
+    if let Some(alert) = alert {
+        if let Err(e) = state.owner_notifications.publish(&state.messaging_root,
+            format!("cm-alert:{}", alert.id), &alert.label, &alert.message,
+            format!("/#alerts&alert={}", crate::owner_notifications::url_component(&alert.id))) {
+            eprintln!("cm Owner notification checkpoint failed: {e}");
+        }
+    }
     state.manifest_watcher.broadcast(ManifestDiff::Updated {
         uid: key.to_owned(),
         entry: json!({"owner_attention": alert}),
     });
+}
+
+/// Local daemon alerts only. Cross-host relay and seen routing is B5b.
+pub fn list(state: &DaemonState, req: &Request) -> Response {
+    match snapshot(state) {
+        Ok(alerts) => {
+            let items: Vec<_> = alerts.into_iter().map(|(key, alert)| {
+                let mut v = serde_json::to_value(alert).unwrap();
+                v["key"] = json!(key); v
+            }).collect();
+            Response::ok(req.id.clone(), json!({"items":items,"seen_supported":true,
+                "scope":"local","scope_label":"cm-manager alerts only"}))
+        }
+        Err(e) => Response::err(req.id.clone(), ErrorCode::Internal, e),
+    }
 }
 
 /// Out-of-band push (`notify_command`, e.g. Telegram) for an emergency, or —
@@ -608,6 +633,32 @@ mod tests {
     }
     fn held(state: &Arc<Mutex<DaemonState>>) -> BTreeMap<String, Held> {
         held_snapshot(&state.lock().unwrap()).unwrap()
+    }
+    #[test]
+    fn web_feed_receives_delivered_and_released_alerts_but_not_held_or_seen() {
+        let _guard = crate::test_support::env_lock();
+        let (dir,state) = fixture(); local(&state);
+        let feed = state.lock().unwrap().owner_notifications.clone();
+        set_level(&state,Some("away"),"away");
+        notify_with(&state,"local","please decide","decision");
+        feed.flush();
+        assert!(feed.next(dir.path(),&json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
+        release_for_level(&state.lock().unwrap(),Some(Level::Around)).unwrap();
+        feed.flush();
+        let page = feed.next(dir.path(),&json!({"wait_ms":0})).unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(),1);
+        let listed = list(&state.lock().unwrap(),&request("owner_attention.list",Caller::session("local"),json!({}))).result.unwrap();
+        let alert = &listed["items"][0];
+        let stale = acknowledge(&state.lock().unwrap(),&request("owner_attention.ack",Caller::session("local"),json!({"session_uid":alert["key"],"alert_id":"stale"})));
+        assert_eq!(stale.result.unwrap()["acknowledged"],false);
+        acknowledge(&state.lock().unwrap(),&request("owner_attention.ack",Caller::session("local"),json!({"session_uid":alert["key"],"alert_id":alert["id"]})));
+        feed.flush();
+        assert!(feed.next(dir.path(),&json!({"wait_ms":0,"cursor":page["cursor"]})).unwrap()["events"].as_array().unwrap().is_empty());
+        for method in ["owner_attention.list","owner.notifications.next"] {
+            let response = dispatch_request(&state,&request(method,Caller::session("local"),json!({"wait_ms":0}))).into_response();
+            assert_eq!(response.error.unwrap().code,ErrorCode::Unauthorized);
+            assert!(!crate::control::dispatch::method_counts_as_restart_mutation(method));
+        }
     }
     #[test]
     fn gate_matrix_delivers_or_holds_per_level_and_urgency() {

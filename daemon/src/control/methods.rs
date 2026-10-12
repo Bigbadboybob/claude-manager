@@ -3936,6 +3936,7 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
+        "owner_notifications": state.owner_notifications.health(),
         "sessions": total,
         "sessions_with_transcript": with_transcript,
         "sessions_by_state": sessions_by_state,

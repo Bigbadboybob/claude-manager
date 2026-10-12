@@ -23,6 +23,7 @@ pub(super) struct IngestBatch {
     pub journal: Vec<(PathBuf, Vec<u8>)>,
     /// Monitors were advanced before the page's first publication.
     pub advanced: bool,
+    pub owner_notifications: Vec<crate::owner_notifications::Notification>,
 }
 
 /// Deletes superseded legacy coverage records in the background. The journal
@@ -711,6 +712,9 @@ impl Store {
         if let Err(e) = result {
             self.degraded = Some(format!("Publication outcome requires reconciliation: {e}"));
             return Err(err("outcome_unknown", self.degraded.clone().unwrap()));
+        }
+        for notification in batch.owner_notifications {
+            self.publish_owner_notification(notification);
         }
         Ok(())
     }
@@ -1861,6 +1865,28 @@ mod tests {
                 break;
             }
         }
+    }
+    #[test]
+    fn owner_push_is_coordinator_only_and_respects_dm_mute_and_frozen_here() {
+        let mut p = pair();
+        let hub_feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
+        let replica_feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
+        p.hub.owner_notifications = Some(hub_feed.clone());
+        p.replica.owner_notifications = Some(replica_feed.clone());
+        let host = p.replica.daemon_id.clone();
+        let actor = p.people[0].id.clone();
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"DM for Owner","request_id":"owner-dm"})).unwrap();
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Everyone","mention_here":true,"request_id":"owner-here"})).unwrap();
+        hub_feed.flush();
+        let first = hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0})).unwrap();
+        assert_eq!(first["events"].as_array().unwrap().len(), 2);
+        catch_up(&mut p);
+        replica_feed.flush();
+        assert!(replica_feed.next(p.replica.cm_root(), &json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
+        p.hub.follow("owner", &json!({"action":"set","dnd":true,"request_id":"quiet"}), &[]).unwrap();
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"Muted","request_id":"owner-muted"})).unwrap();
+        hub_feed.flush();
+        assert!(hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0,"cursor":first["cursor"]})).unwrap()["events"].as_array().unwrap().is_empty());
     }
     #[test]
     fn self_rename_preserves_identity_history_and_routing_across_replication_and_restart() {

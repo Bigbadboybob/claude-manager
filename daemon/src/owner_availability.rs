@@ -67,8 +67,8 @@ impl Urgency {
 }
 
 /// The least urgency a level delivers immediately (Owner decision
-/// 2026-10-06): away → emergency, around → blocking, focused → decision,
-/// on-call → everything.
+/// updated 2026-10-12): away → emergency, around → decision,
+/// focused/on-call → everything.
 pub fn bar(level: Level) -> Urgency {
     match level {
         Level::Away => Urgency::Emergency,

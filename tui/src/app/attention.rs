@@ -36,6 +36,7 @@ impl App {
             // across TUI restarts. It also keeps every socket/disk/DBus call off
             // the input thread. A missing sidebar row never suppresses delivery.
             self.push_worker.present_owner_alert(alert.clone());
+            self.owner_alert_since.entry(alert.id.clone()).or_insert_with(SystemTime::now);
             self.owner_alerts.insert(key, alert);
         } else {
             self.owner_alerts.remove(&key);
@@ -80,6 +81,73 @@ impl App {
             }
             self.needs_redraw = true;
         }
+    }
+
+    /// Open Owner alerts, one row per agent session, oldest first, for the
+    /// Messages sidebar: daemon alerts from every host plus alerts the TUI
+    /// raised itself for older MCP clients.
+    pub(crate) fn open_owner_alerts(&mut self) -> Vec<super::messages::OpenAlert> {
+        let label_of = |app: &App, host: &HostId, uid: &str| {
+            app.workspaces
+                .iter()
+                .flat_map(|w| &w.sessions)
+                .find(|s| &s.host_id == host && s.uid == uid)
+                .map(|s| s.label.clone())
+        };
+        let mut out = Vec::new();
+        for ((host, uid), alert) in &self.owner_alerts {
+            out.push(super::messages::OpenAlert {
+                uid: uid.clone(),
+                host: host.clone(),
+                label: label_of(self, host, uid).unwrap_or_else(|| alert.label.clone()),
+                reason: alert.message.lines().next().unwrap_or("").to_owned(),
+                since: self.owner_alert_since.get(&alert.id).copied().unwrap_or_else(SystemTime::now),
+            });
+        }
+        let legacy: Vec<(String, String)> = self
+            .alerts
+            .iter()
+            .filter(|(uid, _)| !self.owner_alert_rows.contains(*uid))
+            .map(|(u, m)| (u.clone(), m.clone()))
+            .collect();
+        for (uid, message) in legacy {
+            let since = *self.owner_alert_since.entry(format!("legacy:{uid}")).or_insert_with(SystemTime::now);
+            let host = HostId::local();
+            out.push(super::messages::OpenAlert {
+                label: label_of(self, &host, &uid).unwrap_or_else(|| uid.clone()),
+                reason: message.lines().next().unwrap_or("").to_owned(),
+                uid,
+                host,
+                since,
+            });
+        }
+        out.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.label.cmp(&b.label)));
+        out
+    }
+
+    /// Enter on an "Open alerts" row: go to that session (as A-g does) and
+    /// mark its alert seen.
+    pub(crate) fn jump_to_owner_alert(&mut self, uid: &str, host: &HostId) {
+        let target = self.workspaces.iter().enumerate().find_map(|(wi, w)| {
+            (!w.is_closed).then(|| w.sessions.iter().position(|s| s.uid == uid && &s.host_id == host)).flatten()
+                .map(|si| (wi, si))
+        });
+        let Some((wi, si)) = target else {
+            self.messages.error = format!("That session is not in the sidebar ({} on `{}`)", uid, host.as_str());
+            return;
+        };
+        let continuous = self.continuous_members().contains(&(wi, si));
+        if continuous && !self.continuous_column_on {
+            self.messages.error = "That session is in the continuous column: A-c shows it".into();
+            return;
+        }
+        self.cursor_column = if continuous { SidebarColumn::Continuous } else { SidebarColumn::Main };
+        self.cursor = Cursor::Session(wi, si);
+        self.acknowledge_owner_alerts_for_row(uid);
+        self.alerts.remove(uid);
+        self.owner_alert_since.remove(&format!("legacy:{uid}"));
+        self.messages.visible = false;
+        self.needs_redraw = true;
     }
 
     pub(crate) fn acknowledge_owner_alerts_for_row(&mut self, uid: &str) {

@@ -325,6 +325,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "continuous.context",
     "continuous.dispatch_pending",
     "queue.stats",
+    "owner_attention.list",
 ];
 
 /// Coordinator-adjacent methods that must NOT count as mutations even
@@ -340,6 +341,9 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
 /// `daemon.restart` call would wait on a counter it is itself
 /// inflating.
 pub(crate) const RESTART_BARRIER_EXEMPT_METHODS: &[&str] = &[
+    // Leaf feed recovery may quarantine a corrupt checkpoint. No registry,
+    // child or session state is touched; a 25s wait must not pin quiescence.
+    "owner.notifications.next",
     "daemon.health",
     "daemon.drain",
     "daemon.reload_config",
@@ -375,6 +379,13 @@ pub fn dispatch_request(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> DispatchOutcome {
+    // Reserved board credentials never fall through legacy fail-open Operator
+    // auth. Delegate only this service's fixed method/action capability.
+    let delegated = match super::board_token::authorize(state, req) {
+        Ok(r) => r,
+        Err(r) => return DispatchOutcome::Done(r),
+    };
+    let req = delegated.as_ref().unwrap_or(req);
     // DESIGN_SEAMLESS_RESTART phase 2d (R2): in-flight mutation guard,
     // taken BEFORE the method body runs and dropped when this function
     // RETURNS — which for the streaming outcomes (`attach.open`,
@@ -406,6 +417,7 @@ pub fn dispatch_request(
         None
     };
     match req.method.as_str() {
+        "owner.board_token" => DispatchOutcome::Done(super::board_token::manage(state, req)),
         "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.read" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
@@ -450,6 +462,19 @@ pub fn dispatch_request(
         "notify_user" => {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             DispatchOutcome::Done(crate::owner_attention::notify(&s, req))
+        }
+        "owner.notifications.next" => {
+            if let Err(resp) = require_operator(req, "Owner notifications are Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            DispatchOutcome::Done(crate::owner_notifications::next_rpc(state, req))
+        }
+        "owner_attention.list" => {
+            if let Err(resp) = require_operator(req, "Owner alerts are Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::list(&s, req))
         }
         "owner_attention.ack" => {
             if let Err(resp) = require_operator(req, "Owner attention acknowledgement is Operator-only") {

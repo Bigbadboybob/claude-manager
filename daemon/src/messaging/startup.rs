@@ -87,9 +87,10 @@ fn start_with(
     Ok(())
 }
 
-fn install(state: &Arc<Mutex<DaemonState>>, store: Store) {
+fn install(state: &Arc<Mutex<DaemonState>>, mut store: Store) {
     let (handle, gate) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        store.owner_notifications = Some(s.owner_notifications.clone());
         (s.messaging.clone(), s.messaging_delivery.clone())
     };
     let _guard = gate.lock().unwrap_or_else(|p| p.into_inner());

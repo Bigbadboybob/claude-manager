@@ -1,0 +1,176 @@
+// Headless smoke test for the CM Board frontend (no browser needed):
+//   node web/dev/smoke.mjs
+// 1. Unit tests for the pure helpers in web/static/js/format.js.
+// 2. Starts web/dev/fake_server.py and checks that the app shell, the files
+//    the service worker caches and the API flows the app uses all work.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import * as f from "../static/js/format.js";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const staticDir = path.join(here, "..", "static");
+
+test("bodies are escaped; only code spans and links are rendered", () => {
+  const html = f.renderBody('<img src=x onerror=alert(1)> `a<b` see https://example.com/x?y=1&z=2.');
+  assert.ok(!html.includes("<img"));
+  assert.ok(html.includes("&lt;img"));
+  assert.ok(html.includes("<code>a&lt;b</code>"));
+  assert.ok(html.includes('<a href="https://example.com/x?y=1&amp;z=2"'));
+  assert.ok(html.endsWith("</a>."), "trailing punctuation stays outside the link");
+});
+
+test("conversations sort mentions first, then unread, then by name", () => {
+  const rows = [
+    { name: "#b", unread: 0, mentions: 0 },
+    { name: "#a", unread: 3, mentions: 0 },
+    { name: "#z", unread: 1, mentions: 2 },
+    { name: "#c", unread: 0, mentions: 0 },
+  ];
+  assert.deepEqual(f.sortConversations(rows).map((r) => r.name), ["#z", "#a", "#b", "#c"]);
+  assert.deepEqual(f.filterConversations(rows, "Z").map((r) => r.name), ["#z"]);
+});
+
+test("badge uses the server's deduplicated unread, not a per-channel sum", () => {
+  assert.equal(f.badgeCount({ unread: 3, dms: 2, mentions: 1, conversations: { a: { unread: 40 } } }), 3);
+  assert.equal(f.badgeCount(null), 0);
+});
+
+test("reactions accept both shapes and keep the allowlist order", () => {
+  const list = f.reactionList({ "🎉": { count: 1, names: ["A"], mine: false }, "✅": ["Owner", "B"] });
+  assert.deepEqual(list.map((r) => [r.emoji, r.count, r.mine]), [["✅", 2, true], ["🎉", 1, false]]);
+  assert.deepEqual(f.reactionList({ "👀": { count: 0, names: [] } }), []);
+});
+
+test("routes use the push URL format from web/API.md", () => {
+  const r = f.parseRoute("#conversation=conv-1&message=origin%3Aevent");
+  assert.deepEqual(r, { view: "conversation", id: "conv-1", message: "origin:event" });
+  assert.equal(f.routeHash(r), "#conversation=conv-1&message=origin%3Aevent");
+  assert.deepEqual(f.parseRoute("#alerts&alert=a%201"), { view: "alerts", alert: "a 1" });
+  assert.deepEqual(f.parseRoute(""), { view: "list" });
+  assert.deepEqual(f.parseRoute("#settings"), { view: "settings" });
+});
+
+test("VAPID keys decode from base64url", () => {
+  assert.deepEqual([...f.urlBase64ToUint8Array("AQID_-8")], [1, 2, 3, 255, 239]);
+});
+
+test("time labels", () => {
+  const now = new Date(2026, 9, 12, 15, 0);
+  assert.equal(f.dayLabel(new Date(2026, 9, 12, 9, 0).toISOString(), now), "Today");
+  assert.equal(f.dayLabel(new Date(2026, 9, 11, 9, 0).toISOString(), now), "Yesterday");
+  assert.match(f.formatTime(new Date(2026, 9, 11, 9, 5).toISOString(), now), /^Yesterday 09:05$/);
+  assert.equal(f.truncate("abcdef", 4), "abc…");
+});
+
+test("open alerts group one row per agent, oldest first", () => {
+  const rows = f.groupAlerts([
+    { key: "k1", id: "a", session_uid: "s1", label: "Scout", message: "decide", released_at: "2026-10-12T10:00:00Z" },
+    { key: "k2", id: "b", session_uid: "s2", label: "Perf", host: "sessions", message: "merge?\nmore", released_at: "2026-10-12T08:00:00Z" },
+    { key: "k2", id: "c", session_uid: "s2", label: "Perf", host: "sessions", message: "still waiting", released_at: "2026-10-12T09:30:00Z" },
+  ]);
+  assert.deepEqual(rows.map((r) => [r.label, r.host, r.count, r.reason]),
+    [["Perf", "sessions", 2, "still waiting"], ["Scout", null, 1, "decide"]]);
+  assert.equal(rows[0].since, "2026-10-12T08:00:00Z");
+  const now = new Date("2026-10-12T12:00:00Z");
+  assert.equal(f.age("2026-10-12T11:59:30Z", now), "30s");
+  assert.equal(f.age("2026-10-12T09:00:00Z", now), "3h");
+  assert.equal(f.age("2026-10-10T12:00:00Z", now), "2d");
+});
+
+// ---------- against the fake backend ----------
+async function withServer(fn) {
+  const port = 18000 + Math.floor(Math.random() * 2000);
+  const proc = spawn("python3", [path.join(here, "fake_server.py"), "--port", String(port)], { stdio: ["ignore", "pipe", "inherit"] });
+  await new Promise((resolve, reject) => {
+    proc.stdout.once("data", resolve);
+    proc.once("exit", (code) => reject(new Error(`fake server exited ${code}`)));
+  });
+  try {
+    await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    proc.kill();
+  }
+}
+
+const write = (base, method, p, body) => fetch(base + p, {
+  method, headers: { "Content-Type": "application/json", "X-CM-Board": "1" }, body: JSON.stringify(body),
+}).then(async (r) => ({ status: r.status, json: await r.json() }));
+
+test("the app shell and every service-worker file are served", async () => {
+  const sw = readFileSync(path.join(staticDir, "sw.js"), "utf8");
+  const shell = JSON.parse(sw.match(/SHELL_FILES = (\[[\s\S]*?\]);/)[1].replace(/,\s*\]/, "]"));
+  const html = readFileSync(path.join(staticDir, "index.html"), "utf8");
+  const refs = [...html.matchAll(/(?:href|src)="(\/[^"]*)"/g)].map((m) => m[1]);
+  const manifest = JSON.parse(readFileSync(path.join(staticDir, "manifest.webmanifest"), "utf8"));
+  await withServer(async (base) => {
+    for (const p of new Set([...shell, ...refs, "/sw.js", ...manifest.icons.map((i) => i.src)])) {
+      const res = await fetch(base + p);
+      assert.equal(res.status, 200, `${p} must be served`);
+      if (p.endsWith(".js")) assert.match(res.headers.get("content-type"), /javascript/, p);
+    }
+  });
+  assert.equal(manifest.display, "standalone");
+  for (const icon of manifest.icons) assert.ok(existsSync(path.join(staticDir, icon.src)), icon.src);
+});
+
+test("API flows the app uses: open, page back, send, react, clear mentions, availability, push", async () => {
+  await withServer(async (base) => {
+    const get = (p) => fetch(base + p).then((r) => r.json());
+    const boot = await get("/api/bootstrap");
+    assert.equal(boot.actor, "owner");
+    const counts = await get("/api/counts");
+    assert.ok(counts.conversations["c-swarm"].mentions > 0);
+    // Writes without the board header are refused, like the real server.
+    const bare = await fetch(`${base}/api/send`, { method: "POST", body: "{}" });
+    assert.equal(bare.status, 403);
+
+    // Opening marks read; paging back does not.
+    const first = await write(base, "POST", "/api/read", { conversation: "c-swarm", newest_first: true, limit: 50 });
+    assert.equal(first.json.items.length, 50);
+    assert.ok(first.json.next_cursor);
+    const after = await get("/api/counts");
+    assert.equal(after.conversations["c-swarm"].unread, 0, "opening reads the conversation");
+    const older = await write(base, "POST", "/api/read",
+      { conversation: "c-swarm", newest_first: true, limit: 50, cursor: first.json.next_cursor, mark_read: false });
+    assert.equal(older.json.items.length, 50);
+    assert.ok(older.json.items[0].created_at < first.json.items.at(-1).created_at, "older page is older");
+
+    // Send is idempotent per request id.
+    const rid = "req-1";
+    const a = await write(base, "POST", "/api/send", { conversation: "c-general", body: "hello", request_id: rid });
+    const b = await write(base, "POST", "/api/send", { conversation: "c-general", body: "hello", request_id: rid });
+    assert.equal(a.json.event_id, b.json.event_id);
+
+    // React toggles with `mine` and returns counts.
+    const msg = first.json.items[0].id;
+    const on = await write(base, "POST", "/api/react", { message_id: msg, emoji: "✅", remove: false, request_id: "r1" });
+    assert.equal(on.json.reactions["✅"].mine, true);
+    assert.ok(on.json.counts);
+    const off = await write(base, "POST", "/api/react", { message_id: msg, emoji: "✅", remove: true, request_id: "r2" });
+    assert.equal(off.json.reactions["✅"], undefined);
+
+    // Clear mentions on another conversation, mark all, availability.
+    const cleared = await write(base, "POST", "/api/mark-read", { all: true });
+    assert.equal(cleared.json.counts.unread, 0);
+    const level = await write(base, "POST", "/api/availability", { level: "away", request_id: "a1" });
+    assert.equal(level.json.owner_availability.level, "away");
+
+    // Push subscription lifecycle.
+    const key = await get("/api/push/vapid-public-key");
+    assert.ok(key.public_key && key.enabled);
+    const sub = { endpoint: "https://push.example/1", expirationTime: null, keys: { p256dh: "k", auth: "a" } };
+    assert.equal((await write(base, "POST", "/api/push/subscribe", sub)).json.subscribed, true);
+    assert.equal((await write(base, "POST", "/api/push/test", { endpoint: sub.endpoint })).json.accepted, true);
+    assert.equal((await write(base, "DELETE", "/api/push/subscribe", { endpoint: sub.endpoint })).json.removed, true);
+
+    // Alerts: seen removes only the matching alert.
+    const alerts = await get("/api/alerts");
+    const [alert] = alerts.items;
+    const seen = await write(base, "POST", "/api/alerts/seen", { key: alert.key, alert_id: alert.id });
+    assert.equal(seen.json.acknowledged, true);
+  });
+});
