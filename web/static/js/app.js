@@ -602,6 +602,10 @@ function renderAlerts() {
   const el = document.getElementById("alerts");
   if (!el) return;
   put(el, h("div", { class: "scroll" },
+    // v1 lists the hub host's alerts only; cm-sessions alerts arrive with the
+    // hub relay (B5b). Hidden once the server reports more hosts.
+    state.me?.features?.alert_hosts?.length > 1 ? null
+      : h("div", { class: "section" }, "Alerts from cm-manager only (cm-sessions alerts coming)"),
     state.alerts.length ? state.alerts.map((a) => h("div", {
       class: "alert", id: `alert-${a.id}`,
     },
