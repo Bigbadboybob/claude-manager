@@ -350,6 +350,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
+        # The strict policy the frontend is written for: no inline script or
+        # style attributes (CSSOM property writes are still allowed).
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+                         "connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; "
+                         "frame-ancestors 'none'")
         if target.name == "sw.js":
             self.send_header("Service-Worker-Allowed", "/")
         self.end_headers()

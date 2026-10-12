@@ -499,9 +499,9 @@ function renderConversation(keepScroll = false) {
   const prev = el.querySelector(".scroll");
   const prevTop = prev?.scrollTop;
   const counts = convCounts(c.id);
-  const tools = h("div", { class: "bar", style: "position:static" },
+  const tools = h("div", { class: "bar toolbar" },
     h("span", { class: "sub" }, c.items.length ? `${c.items.length} loaded` : ""),
-    h("span", { style: "flex:1" }),
+    h("span", { class: "spacer" }),
     counts.mentions
       ? h("button", { onclick: () => markRead({ conversation: c.id, mentions: true }, "Mentions cleared") }, `Clear @${counts.mentions}`)
       : null,
@@ -597,7 +597,7 @@ function renderThread() {
   openSheet(`Thread`, [
     messageEl(t.root, { inThread: true }),
     ...t.items.filter((m) => m.id !== t.root.id).map((m) => messageEl(m, { inThread: true })),
-    h("button", { class: "primary", style: "width:100%;margin-top:8px", onclick: () => {
+    h("button", { class: "primary wide gap-top", onclick: () => {
       closeSheet();
       startReply(t.root);
     } }, "Reply in thread"),
@@ -633,7 +633,7 @@ function renderAlerts() {
     h("div", { class: "meta" },
       h("strong", {}, row.label),
       row.host ? h("span", { class: "sub" }, ` · ${row.host}`) : null,
-      h("span", { style: "flex:1" }),
+      h("span", { class: "spacer" }),
       row.count > 1 ? h("span", { class: "badge at" }, row.count) : null,
       h("span", { class: "when" }, ` ${age(row.since)}`)),
     h("div", { class: "body" }, row.reason),
@@ -696,7 +696,7 @@ async function settingsSheet() {
   };
   const children = [h("p", {}, lines[status])];
   if (status === "off") {
-    const b = h("button", { class: "primary", style: "width:100%" }, "Enable notifications");
+    const b = h("button", { class: "primary wide" }, "Enable notifications");
     b.onclick = busy(b, async () => {
       await push.enable();
       toast("Notifications enabled");
@@ -705,14 +705,14 @@ async function settingsSheet() {
     children.push(b);
   }
   if (status === "on") {
-    const test = h("button", { style: "width:100%;margin-bottom:8px" }, "Send test notification");
+    const test = h("button", { class: "wide gap-bottom" }, "Send test notification");
     test.onclick = busy(test, async () => {
       const reg = await navigator.serviceWorker.ready;
       const sub = await reg.pushManager.getSubscription();
       await api.pushTest(sub?.endpoint);
       toast("Test sent — it should arrive in a few seconds");
     });
-    const off = h("button", { style: "width:100%" }, "Turn off on this device");
+    const off = h("button", { class: "wide" }, "Turn off on this device");
     off.onclick = busy(off, async () => {
       await push.disable();
       toast("Notifications off");
