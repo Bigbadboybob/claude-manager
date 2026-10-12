@@ -2084,7 +2084,7 @@ pub fn rpc_task_update_tree(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cm_daemon::session::{DaemonSession, SpawnParams};
     use cm_daemon::state::DaemonState;
@@ -2288,7 +2288,7 @@ mod tests {
     /// registers as the workspace's `worktree_path`; tests pass it
     /// as `working_dir` in their `ClientSessionConfig` so the
     /// daemon-side spawn uses a known-good directory.
-    fn start_test_daemon(
+    pub(crate) fn start_test_daemon(
         ws_id: &str,
     ) -> (
         std::path::PathBuf,
@@ -2647,7 +2647,7 @@ time.sleep(60)
     }
 
     /// Fresh TUI-format uid for tests (slice 10c-e-3b-fix).
-    fn test_uid() -> String {
+    pub(crate) fn test_uid() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2659,7 +2659,7 @@ time.sleep(60)
         format!("ts-{:x}-{:x}", nanos, n)
     }
 
-    fn stop_test_daemon(
+    pub(crate) fn stop_test_daemon(
         socket_path: &Path,
         stop: StdArc<AtomicBool>,
         handle: std::thread::JoinHandle<()>,
