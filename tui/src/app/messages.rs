@@ -26,6 +26,27 @@ pub struct Draft {
     links: Vec<Value>,
     origin: Option<String>,
 }
+/// One agent session with an open Owner alert (the "Open alerts" rows).
+#[derive(Clone, Debug)]
+pub struct OpenAlert {
+    pub uid: String,
+    pub host: cm_daemon::host_id::HostId,
+    pub label: String,
+    pub reason: String,
+    pub since: SystemTime,
+}
+
+/// `45s`, `12m`, `3h`, `2d` since `t`.
+fn short_age(t: SystemTime) -> String {
+    let s = SystemTime::now().duration_since(t).map_or(0, |d| d.as_secs());
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Saved {
@@ -103,6 +124,9 @@ pub struct Messages {
     screen_width: u16,
     /// Older messages just prepended: the timeline keeps its place.
     prepended: usize,
+    /// Pinned "Open alerts" rows, refreshed from the App before each draw
+    /// and key event.
+    pub open_alerts: Vec<OpenAlert>,
     /// Bumped whenever the loaded messages change; keys `row_heights`.
     layout_epoch: u64,
     /// (epoch, width, count, rows per message incl. separator).
@@ -161,6 +185,18 @@ fn middle_truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(head).collect();
     out.push('\u{2026}');
     out.extend(s.chars().skip(n - tail));
+    out
+}
+
+/// Shorten from the end with `…`.
+fn end_truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    if max > 0 {
+        out.push('\u{2026}');
+    }
     out
 }
 
@@ -259,7 +295,27 @@ impl Messages {
         self.persist()
     }
     fn menu_items(&self) -> Vec<(String, Value)> {
-        let mut out = vec![
+        let mut out = Vec::new();
+        // Pinned first: agents waiting on Owner, oldest first.
+        if !self.open_alerts.is_empty() {
+            out.push((
+                format!("\u{2691} Open alerts ({})", self.open_alerts.len()),
+                json!({"alerts_header": true}),
+            ));
+            for a in &self.open_alerts {
+                let host = if a.host == cm_daemon::host_id::HostId::local() {
+                    String::new()
+                } else {
+                    format!(" \u{00b7} {}", a.host.as_str())
+                };
+                out.push((
+                    // Age first (like the count column), so it survives truncation.
+                    format!("  {:>3} {}{host} \u{00b7} {}", short_age(a.since), a.label, a.reason),
+                    json!({"alert": a.uid, "alert_host": a.host.as_str()}),
+                ));
+            }
+        }
+        out.extend(vec![
             ("Inbox".into(), json!({"inbox":true})),
             ("  Mentions".into(), json!({"mentions":true})),
             (
@@ -282,7 +338,7 @@ impl Messages {
                 json!({"monitors":true}),
             ),
             ("Preferences".into(), json!({"preferences":true})),
-        ];
+        ]);
         out.push((
             "Browse channels · b".into(),
             json!({"channel_browser":true}),
@@ -1096,6 +1152,7 @@ impl App {
         if !self.messages.visible {
             return false;
         }
+        self.messages.open_alerts = self.open_owner_alerts();
         // Moving around never waits for a refresh: only keys that change
         // state queue behind the request in flight.
         let navigation = self.messages.mode.is_empty()
@@ -1287,6 +1344,14 @@ impl App {
                     {
                         if target["channel_browser"] == true {
                             self.messages.browse_channels();
+                            return true;
+                        }
+                        if target["alerts_header"] == true {
+                            return true;
+                        }
+                        if let Some(uid) = target["alert"].as_str() {
+                            let host = cm_daemon::host_id::HostId::new(target["alert_host"].as_str().unwrap_or("local"));
+                            self.jump_to_owner_alert(uid, &host);
                             return true;
                         }
                         if target["dm_section"] == true {
@@ -1687,7 +1752,15 @@ impl App {
             return saved.clamp(16, total * 3 / 5);
         }
         let (cw, _) = self.messages.count_columns();
-        let longest = self.messages.menu_items().iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
+        // Alert rows (long reasons) truncate; they don't widen the sidebar.
+        let longest = self
+            .messages
+            .menu_items()
+            .iter()
+            .filter(|(_, t)| t.get("alert").is_none())
+            .map(|(l, _)| l.chars().count())
+            .max()
+            .unwrap_or(0);
         // "› " + counts + name + borders.
         ((2 + cw + longest + 2) as u16).clamp(24, (total * 2 / 5).max(24))
     }
@@ -1808,6 +1881,7 @@ impl App {
         self.needs_redraw = true;
     }
     pub(super) fn draw_messages(&mut self, frame: &mut Frame) {
+        self.messages.open_alerts = self.open_owner_alerts();
         let area = frame.area();
         let text_style = Style::default().fg(theme::CHAT_TEXT);
         let muted = Style::default().fg(theme::CHAT_MUTED);
@@ -1858,7 +1932,9 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, (label, target))| {
-                let color = if target.get("tags").is_some() {
+                let color = if target.get("alert").is_some() || target["alerts_header"] == true {
+                    theme::CHAT_TAG
+                } else if target.get("tags").is_some() {
                     theme::CHAT_TAG
                 } else if target.get("channel").is_some() {
                     theme::CHAT_FOCUS
@@ -1878,7 +1954,12 @@ impl App {
                     Span::raw(if selected { "› " } else { "  " }),
                     Span::styled(mention, Style::default().fg(theme::CHAT_TAG).add_modifier(Modifier::BOLD)),
                     Span::styled(unread, Style::default().fg(theme::CHAT_OWNER)),
-                    Span::raw(middle_truncate(label, name_room)),
+                    // Alert rows keep their start (who, where, how long).
+                    Span::raw(if target.get("alert").is_some() {
+                        end_truncate(label, name_room)
+                    } else {
+                        middle_truncate(label, name_room)
+                    }),
                 ])
                 .style(if selected {
                     style.bg(theme::CHAT_SELECTION).add_modifier(Modifier::BOLD)
@@ -2481,6 +2562,56 @@ mod tests {
         app.messages.loaded_target = Value::Null;
         app.messaging_refresh_target();
         assert!(app.messages.management.request.get("mark_read").is_none());
+    }
+
+    #[test]
+    fn open_alerts_pin_agents_oldest_first_and_enter_jumps_and_marks_seen() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        let sessions = cm_daemon::host_id::HostId::new("sessions");
+        let mut ws = crate::app::lifecycle::revive_session_tests::dummy_ts("ts-perf", false, sessions.clone());
+        ws.label = "Native-Rollout-Perf".into();
+        app.workspaces.push(Workspace {
+            color: None, pinned: false, id: "ws-perf".into(), name: "perf".into(), is_closed: false,
+            is_cloud: false, repo_url: None, worktree_path: None, main_repo_path: None, worker_vm: None,
+            worker_zone: None, host_id: sessions.clone(), sessions: vec![ws], tombstones: vec![],
+        });
+        let alert = |id: &str, uid: &str, label: &str, message: &str| cm_daemon::owner_attention::Alert {
+            id: id.into(), session_uid: uid.into(), label: label.into(), message: message.into(),
+            task_id: None, continuous_task_id: None, urgency: Some("decision".into()),
+            held_since: None, released_at: None,
+        };
+        let now = SystemTime::now();
+        app.owner_alerts.insert((sessions.clone(), "ts-perf".into()), alert("a1", "ts-perf", "perf", "Bench done: merge?\nmore"));
+        app.owner_alert_since.insert("a1".into(), now - Duration::from_secs(3 * 3600));
+        app.owner_alerts.insert((cm_daemon::host_id::HostId::local(), "ts-scout".into()), alert("a2", "ts-scout", "Scout", "Deploy tonight?"));
+        app.owner_alert_since.insert("a2".into(), now - Duration::from_secs(120));
+
+        for width in [100u16, 160] {
+            let text = screen(&mut app, width, 30);
+            if std::env::var_os("CM_MSG_DUMP").is_some() {
+                println!("--- open alerts {width} ---\n{text}");
+            }
+            let lines: Vec<&str> = text.lines().collect();
+            let header = lines.iter().position(|l| l.contains("\u{2691} Open alerts (2)")).unwrap_or_else(|| panic!("{text}"));
+            assert!(lines[header + 1].contains(" 3h Native-Rollout-Perf \u{00b7} session"), "oldest first, with age and host: {}", lines[header + 1]);
+            assert!(lines[header + 2].contains(" 2m Scout \u{00b7} Deploy"), "{}", lines[header + 2]);
+            if width >= 160 {
+                // The reason follows and is cut to the sidebar (> widens it).
+                assert!(lines[header + 1].contains("sessions \u{00b7} Ben"), "the reason's first line: {}", lines[header + 1]);
+            }
+            assert!(lines[header + 3].contains("Inbox"), "pinned above Inbox");
+        }
+        // Enter on the Perf row: jump to the session and mark it seen.
+        app.messages.pane = 0;
+        app.messages.menu = 1;
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.messages.visible, "Messages closes on the jump");
+        let wi = app.workspaces.iter().position(|w| w.id == "ws-perf").unwrap();
+        assert!(matches!(app.cursor, Cursor::Session(w, 0) if w == wi));
+        assert!(!app.owner_alerts.contains_key(&(sessions, "ts-perf".to_string())), "seen");
+        assert_eq!(app.open_owner_alerts().len(), 1);
     }
 
     pub(super) struct Home {
