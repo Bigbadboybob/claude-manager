@@ -144,6 +144,8 @@ main { flex: 1; min-height: 0; display: flex; }
 .toast.error { border-color: var(--danger); }
 .alert { padding: 10px 16px; border-bottom: 1px solid var(--line); }
 .alert .when { color: var(--muted); font-size: 12px; }
+.alert .meta { display: flex; gap: 8px; align-items: center; }
+.alert .body { margin: 2px 0 6px; }
 
 /* Wide screens: list and conversation side by side. */
 .list-pane { display: flex; flex-direction: column; min-height: 0; }

@@ -116,3 +116,38 @@ export function routeHash(route) {
   if (route.view === "settings") return "#settings";
   return "#";
 }
+
+/** Compact age: `45s`, `12m`, `3h`, `2d`. */
+export function age(iso, now = new Date()) {
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "";
+  const s = Math.max(0, Math.round((now.getTime() - t) / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+/** Open Owner alerts, one row per agent (session + host), oldest first:
+ *  {key, label, host, reason (first line of the newest), since (oldest),
+ *  count, alerts}. */
+export function groupAlerts(alerts) {
+  const when = (a) => a.held_since || a.released_at || a.created_at || "";
+  const rows = new Map();
+  for (const a of alerts || []) {
+    const key = `${a.host || ""}|${a.session_uid || a.label || a.id}`;
+    const row = rows.get(key) || { key, label: a.label || a.session_uid || "agent", host: a.host || null, alerts: [] };
+    row.alerts.push(a);
+    rows.set(key, row);
+  }
+  return [...rows.values()].map((r) => {
+    r.alerts.sort((x, y) => when(x).localeCompare(when(y)));
+    const newest = r.alerts[r.alerts.length - 1];
+    return {
+      ...r,
+      count: r.alerts.length,
+      since: when(r.alerts[0]),
+      reason: String(newest.message || "").split("\n")[0],
+    };
+  }).sort((x, y) => x.since.localeCompare(y.since));
+}

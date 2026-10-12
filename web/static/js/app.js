@@ -3,7 +3,7 @@
 import { api, allPages, newRequestId, ApiError } from "./api.js";
 import {
   REACTIONS, LEVELS, renderBody, formatTime, dayLabel, sortConversations, filterConversations,
-  badgeCount, reactionList, truncate, parseRoute, routeHash,
+  badgeCount, reactionList, truncate, parseRoute, routeHash, groupAlerts, age,
 } from "./format.js";
 import * as push from "./push.js";
 
@@ -394,7 +394,7 @@ function renderHeader() {
     h("button", { class: "pill", "data-level": level, "aria-label": "Availability", onclick: availabilitySheet },
       h("span", { class: "dot" }), level),
     h("button", { class: "ghost", "aria-label": "Alerts", onclick: () => go({ view: "alerts" }) },
-      "⚑", state.alerts.length ? h("span", { class: "badge at" }, state.alerts.length) : null),
+      "⚑", state.alerts.length ? h("span", { class: "badge at" }, groupAlerts(state.alerts).length) : null),
     h("button", { class: "ghost", "aria-label": "Settings", onclick: settingsSheet }, "⚙"),
   ));
 }
@@ -444,8 +444,14 @@ function renderListRows() {
   h("span", { class: "name" }, r.name),
   r.mentions ? h("span", { class: "badge at" }, `@${r.mentions}`) : null,
   r.unread && !r.mentions ? h("span", { class: "badge" }, r.unread) : null);
-  put(rows, 
-    attention.length ? h("div", { class: "section" }, "Needs you") : null,
+  const alertRows = groupAlerts(state.alerts);
+  const alertsRow = alertRows.length && !state.query ? h("button", {
+    class: "row unread", onclick: () => go({ view: "alerts" }),
+  }, h("span", { class: "name" }, `⚑ Open alerts · ${alertRows.map((r) => r.label).join(", ")}`),
+  h("span", { class: "badge at" }, alertRows.length)) : null;
+  put(rows,
+    attention.length || alertsRow ? h("div", { class: "section" }, "Needs you") : null,
+    alertsRow,
     ...attention.map(row),
     rest.length ? h("div", { class: "section" }, "Conversations") : null,
     ...rest.map(row),
@@ -601,28 +607,42 @@ function renderThread() {
 function renderAlerts() {
   const el = document.getElementById("alerts");
   if (!el) return;
+  // One row per agent with an open notify_user alert, oldest first.
+  const rows = groupAlerts(state.alerts);
+  const seen = (row) => async (e) => {
+    e.target.disabled = true;
+    try {
+      for (const a of row.alerts) await api.alertSeen(a.key, a.id);
+      state.alerts = state.alerts.filter((a) => !row.alerts.includes(a));
+      renderAlerts();
+      renderHeader();
+      renderListRows();
+    } catch (err) {
+      e.target.disabled = false;
+      fail(err);
+    }
+  };
   put(el, h("div", { class: "scroll" },
     // v1 lists the hub host's alerts only; cm-sessions alerts arrive with the
     // hub relay (B5b). Hidden once the server reports more hosts.
     state.me?.features?.alert_hosts?.length > 1 ? null
       : h("div", { class: "section" }, "Alerts from cm-manager only (cm-sessions alerts coming)"),
-    state.alerts.length ? state.alerts.map((a) => h("div", {
-      class: "alert", id: `alert-${a.id}`,
+    rows.length ? rows.map((row) => h("div", {
+      class: "alert", id: `alert-row-${row.key}`, "data-alerts": row.alerts.map((a) => a.id).join(" "),
     },
-    h("div", {}, h("strong", {}, a.label || a.session_uid), a.urgency ? ` · ${a.urgency}` : ""),
-    h("div", { class: "body" }, a.message),
-    h("div", { class: "when" }, a.released_at ? formatTime(a.released_at) : a.held_since ? `held since ${formatTime(a.held_since)}` : ""),
-    h("button", { onclick: async () => {
-      try {
-        await api.alertSeen(a.key, a.id);
-        state.alerts = state.alerts.filter((x) => x !== a);
-        renderAlerts();
-        renderHeader();
-      } catch (e) {
-        fail(e);
-      }
-    } }, "Seen"))) : h("div", { class: "empty" }, "No pending alerts")));
-  if (state.route.alert) document.getElementById(`alert-${state.route.alert}`)?.scrollIntoView({ block: "center" });
+    h("div", { class: "meta" },
+      h("strong", {}, row.label),
+      row.host ? h("span", { class: "sub" }, ` · ${row.host}`) : null,
+      h("span", { style: "flex:1" }),
+      row.count > 1 ? h("span", { class: "badge at" }, row.count) : null,
+      h("span", { class: "when" }, ` ${age(row.since)}`)),
+    h("div", { class: "body" }, row.reason),
+    h("button", { onclick: seen(row) }, row.count > 1 ? `Seen (${row.count})` : "Seen")))
+      : h("div", { class: "empty" }, "No open alerts")));
+  if (state.route.alert) {
+    [...el.querySelectorAll(".alert")].find((x) => x.dataset.alerts.split(" ").includes(state.route.alert))
+      ?.scrollIntoView({ block: "center" });
+  }
 }
 
 function openSheet(title, children, onClose) {

@@ -66,6 +66,21 @@ test("time labels", () => {
   assert.equal(f.truncate("abcdef", 4), "abc…");
 });
 
+test("open alerts group one row per agent, oldest first", () => {
+  const rows = f.groupAlerts([
+    { key: "k1", id: "a", session_uid: "s1", label: "Scout", message: "decide", released_at: "2026-10-12T10:00:00Z" },
+    { key: "k2", id: "b", session_uid: "s2", label: "Perf", host: "sessions", message: "merge?\nmore", released_at: "2026-10-12T08:00:00Z" },
+    { key: "k2", id: "c", session_uid: "s2", label: "Perf", host: "sessions", message: "still waiting", released_at: "2026-10-12T09:30:00Z" },
+  ]);
+  assert.deepEqual(rows.map((r) => [r.label, r.host, r.count, r.reason]),
+    [["Perf", "sessions", 2, "still waiting"], ["Scout", null, 1, "decide"]]);
+  assert.equal(rows[0].since, "2026-10-12T08:00:00Z");
+  const now = new Date("2026-10-12T12:00:00Z");
+  assert.equal(f.age("2026-10-12T11:59:30Z", now), "30s");
+  assert.equal(f.age("2026-10-12T09:00:00Z", now), "3h");
+  assert.equal(f.age("2026-10-10T12:00:00Z", now), "2d");
+});
+
 // ---------- against the fake backend ----------
 async function withServer(fn) {
   const port = 18000 + Math.floor(Math.random() * 2000);

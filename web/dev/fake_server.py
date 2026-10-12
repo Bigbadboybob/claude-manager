@@ -64,6 +64,15 @@ class Board:
             "key": "q-1", "id": "alert-1", "session_uid": "ts-scout", "label": "Scout",
             "message": "Need a decision: deploy R1.1 tonight or tomorrow?", "task_id": None,
             "continuous_task_id": None, "urgency": "decision", "released_at": iso(now()),
+        }, {
+            "key": "q-2", "id": "alert-2", "session_uid": "ts-perf", "label": "Native-Rollout-Perf",
+            "host": "sessions", "message": "Bench finished: 18% faster. Merge?\nDetails in #gpu-utilization.",
+            "task_id": "fb838659", "continuous_task_id": None, "urgency": "decision",
+            "released_at": iso(now() - timedelta(hours=3)),
+        }, {
+            "key": "q-2", "id": "alert-3", "session_uid": "ts-perf", "label": "Native-Rollout-Perf",
+            "host": "sessions", "message": "Still waiting on the merge decision.", "task_id": "fb838659",
+            "continuous_task_id": None, "urgency": "decision", "released_at": iso(now() - timedelta(minutes=20)),
         }]
         start = now() - timedelta(hours=30)
         for i in range(160):
