@@ -36,7 +36,7 @@ impl Store {
             sequence: 0, id: format!("cm-message:{}", strv(&e.event,"id")),
             created_at: 0, // Feed stamps the committed notification decision.
             title: format!("{sender} · {place}"), body: strv(&e.event,"body").into(),
-            url: format!("/#conversation={cid}&message={}", strv(&e.event,"id").replace(':', "%3A")),
+            url: format!("/#conversation={}&message={}", crate::owner_notifications::url_component(cid), crate::owner_notifications::url_component(strv(&e.event,"id"))),
         })
     }
 

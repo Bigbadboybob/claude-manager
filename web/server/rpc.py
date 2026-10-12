@@ -2,6 +2,7 @@
 import asyncio
 import json
 import struct
+import time
 import uuid
 
 
@@ -19,8 +20,16 @@ class DaemonClient:
     async def call(self, method, params, *, timeout=30, feed=False):
         if feed:
             return await self._call(method, params, timeout)
-        async with self.slots:
-            return await self._call(method, params, timeout)
+        deadline = time.monotonic() + timeout
+        try:
+            async with asyncio.timeout(timeout):
+                await self.slots.acquire()
+        except TimeoutError as exc:
+            raise DaemonError("daemon_busy", "The daemon request queue is busy.") from exc
+        try:
+            return await self._call(method, params, max(0, deadline - time.monotonic()))
+        finally:
+            self.slots.release()
 
     async def _call(self, method, params, timeout):
         writer = None
@@ -29,7 +38,7 @@ class DaemonClient:
             async with asyncio.timeout(timeout):
                 token = self.settings.token_path.read_text().strip()
                 if not token:
-                    raise DaemonError("daemon_unavailable", "The daemon operator token is unavailable.")
+                    raise DaemonError("daemon_unavailable", "The daemon board token is unavailable.")
                 request = json.dumps({"id": str(uuid.uuid4()), "caller": {"token_id": token},
                                       "method": method, "params": params}).encode()
                 reader, writer = await asyncio.open_unix_connection(str(self.settings.socket_path))

@@ -2,7 +2,7 @@
 
 The app shell and static files live at `/`; JSON endpoints live under `/api/`.
 The server acts as **Owner** through the local daemon's operator-authenticated
-socket. No caller can choose a different actor or invoke arbitrary daemon RPCs.
+socket using the daemon-issued scoped board token. No caller can choose a different actor or invoke arbitrary daemon RPCs.
 Every route except `GET /healthz` requires a valid Cloudflare Access assertion.
 Use same-origin requests. JSON writes require `Content-Type: application/json`
 and `X-CM-Board: 1`; the server also rejects foreign Origin headers. No CORS.
@@ -139,6 +139,6 @@ supported; also refresh the badge from `/api/counts` on app foreground.
 The backend consumes daemon notification decisions; it does not poll full
 message history or implement a second availability table. Vanished push
 subscriptions (404/410) are removed. Temporary failures retry with bounded
-backoff. The app may refresh visible data on focus and every 30 seconds while
+per-endpoint backoff, honoring Retry-After; 400/403/413 are not retried. The app may refresh visible data on focus and every 30 seconds while
 visible; stop refreshing while hidden. No frontend event stream is required in
 v1. Access/session expiry should show a sign-in/reload action and preserve drafts.

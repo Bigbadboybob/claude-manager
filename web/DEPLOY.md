@@ -79,15 +79,37 @@ policies before changing them. Preserve all other services and SSH rules.
    ```
 
    Keep `/opt/cm-board-web` root-owned and readable/executable by lucas. The
-   service writes only `~/.cm/web-push`; code and home are read-only in its
-   systemd sandbox. One worker is mandatory: the retry queue is a single-writer
+   service writes only `~/.cm/web-push`. Home is hidden by a tmpfs; the sandbox
+   binds only the scoped token, daemon socket and push directory. Code is
+   read-only, memory is capped at 256 MB and tasks at 64. One worker is mandatory: the retry queue is a single-writer
    JSON checkpoint. Never run two service instances against the same state.
 3. Copy [deploy/board.env.example](deploy/board.env.example) to
    `/etc/cm-board-web.env`, owner root:lucas, mode 0640, and replace all three
    Cloudflare placeholders. Check the configured daemon socket and token file
    belong to this host and are readable by lucas. Do not embed the token in the
-   env file. The adapter reads it per call so token rotation works. The token
-   grants Owner RPC authority; neither it nor push endpoints are HTTP outputs.
+   env file. First issue a scoped credential on manager using the **full**
+   operator's normal CLI (not the web service):
+
+   ```sh
+   scripts/cm-op owner.board_token '{"action":"issue"}'
+   ```
+
+   This creates `~/.cm/board-token` mode 0600; the response contains its path,
+   never its secret. `issue` is idempotent, `rotate` explicitly replaces it,
+   and `revoke` deletes it. These management operations fail closed without
+   configured strong operator authentication. Use `BOARD_TOKEN_FILE` in the
+   service env, never the full operator token. The scoped credential permits
+   only the board's messaging reads/sends/reactions/read marks, channel
+   list/join, availability, alerts/seen and notification feed. It cannot spawn
+   sessions, administer channels, manage tokens, restart the daemon or invoke
+   arbitrary operator RPCs. A wrong/revoked scoped token never falls through
+   the daemon's legacy operator compatibility mode.
+
+   The adapter reads the token per call. **Restart cm-board-web after rotating
+   its token or recreating the daemon socket**, since systemd binds those file
+   inodes into its restricted mount namespace. Revocation takes effect at the
+   daemon immediately; an old service instance cannot keep using a revoked
+   token. Neither credentials nor push endpoints are HTTP outputs.
 4. Install [deploy/cm-board-web.service](deploy/cm-board-web.service) to
    `/etc/systemd/system/cm-board-web.service`. Check with
    `systemd-analyze verify /etc/systemd/system/cm-board-web.service`, then run
@@ -109,10 +131,15 @@ policies before changing them. Preserve all other services and SSH rules.
    python3 web/deploy/cloudflare_firewall.py --format nginx > cm-board-cloudflare.conf
    ```
 
-   The generator only fetches Cloudflare's published IPv4/IPv6 lists and prints
-   text. It does **not** execute gcloud or install anything. Review before
-   running the generated script. It creates separate v4/v6 allow rules at
-   priority 1000 and deny-other rules at 1001, limited to TCP 443 and target tag
+   The generator fetches Cloudflare's IPv4/IPv6 lists, runs a **read-only**
+   `gcloud compute firewall-rules list` audit and prints a script. It never
+   applies rules or installs anything. It fails if an enabled ingress allow
+   for TCP 443/all protocols at priority ≤901 could override the restriction.
+   `--rules-file exported-rules.json` supports offline review; regenerate with
+   live rules just before applying. On `--update`, only the exact existing
+   managed Cloudflare allow rules (restricted sources/target/port) are exempt.
+   Review the output before running it. It creates separate v4/v6 allow rules
+   at priority 900 and deny-other rules at 901, limited to TCP 443 and target tag
    `cm-board-origin`. Confirm the VPC name and audit **higher-priority existing
    rules and hierarchical firewall policies**: a broader prior allow must not
    override this restriction. Add the tag to **cm-manager only** with the
@@ -184,13 +211,18 @@ generates its P-256 VAPID key once and refuses malformed existing keys. Back up
 this directory privately and restore key + subscriptions together. Key rotation
 requires devices to unsubscribe/re-subscribe; do not rotate during an upgrade.
 `OWNER.md` describes retention. Subscriptions cap at 32 devices and retries at
-2048 jobs; endpoints returning 404/410 are removed. Other failures retry at
-10 seconds up to 15 minutes, for at most one hour from the notification decision.
-Explicit test pushes bypass availability, with a 30-second test rate limit.
+2048 jobs; endpoints returning 404/410 are removed. 400/403/413 discard the
+failed notification without retries. Temporary failures back off per endpoint
+from 10 seconds up to 15 minutes, respecting a longer `Retry-After` (seconds or
+HTTP date). Four endpoint requests can run concurrently, one message per
+endpoint per sweep; the queue is saved once per sweep. Retry jobs expire one
+hour after the decision. VAPID's public contact is the board origin, not Owner's
+email. Explicit test pushes bypass availability, with a 30-second test rate limit.
 
-The manager daemon checkpoints at most 1024 decisions in
-`~/.cm/owner-notifications.json`; the web process long-polls this feed (25s) and
-checkpoints its cursor with queued jobs. No message-history polling or second
+The manager daemon retains at most 256 decisions / 512 KiB in
+`~/.cm/owner-notifications.json`. Producers only enqueue to a bounded queue;
+its writer does disk I/O outside the daemon/store locks. The web process
+long-polls the feed (25s) and checkpoints its cursor with queued jobs. No message-history polling or second
 availability table. The hook reuses Owner inbox, mute/DND and read decisions;
 it emits on the coordinator for replicated messages only after publication
 durability, and does not replay the store's entire history on daemon startup.
@@ -201,8 +233,13 @@ Delivery is **best effort**, not exactly-once: a push send accepted before a
 checkpoint crash can repeat (stable notification tags replace duplicates).
 Daemon death/storage failure between committing a message/alert and saving its
 notification decision can lose that push; it never loses the source message.
-A replay overrun logs a warning and resumes retained events. Decisions older
-than one hour expire. Recent queued notifications may be shown after a message
+A full producer queue drops the notification and increments the daemon health
+counter. A replay overrun logs a warning and resumes retained events. A corrupt
+or oversize checkpoint is renamed `.corrupt-<timestamp>-<uuid>` and replaced by
+a new generation. `daemon.health.owner_notifications` reports queued/dropped
+counts, the last error and recovery path. Keep quarantine evidence until the
+incident is understood, then remove it. Malformed individual feed events are
+logged/skipped without stalling the cursor. Decisions older than one hour expire. Recent queued notifications may be shown after a message
 was read or an alert seen; the app always loads authoritative current state on
 tap. Availability gates at the daemon's decision time, not at each retry.
 

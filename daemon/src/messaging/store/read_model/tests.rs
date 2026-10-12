@@ -42,18 +42,23 @@ fn scoped_mentions_stop_at_mention_and_owner_push_uses_shared_gate() {
     assert_eq!(marked["read_cursor"]["event_id"], mention["id"]);
     assert_eq!(s.unread_counts(&b.id,strv(&mention,"conversation_id")),(1,0));
     assert!(s.mark_read(&b.id,&json!({"channel":"general","mentions":true,"through":mention["id"]}),&[]).is_err());
+    feed.flush();
     let first = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap();
     assert_eq!(first["events"].as_array().unwrap().len(),1);
     assert!(first["events"][0]["url"].as_str().unwrap().starts_with("/#conversation="));
     for (level, expected) in [("away",0),("around",0),("focused",1),("on-call",1)] {
         s.availability("owner",&json!({"action":"set","level":level,"request_id":level})).unwrap();
+        feed.flush();
         let before = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap()["cursor"].clone();
         send(&mut s,level,json!({"mentions":["owner"]}));
+        feed.flush();
         let result = feed.next(tmp.path(),&json!({"wait_ms":0,"cursor":before})).unwrap();
         assert_eq!(result["events"].as_array().unwrap().len(),expected,"{level}");
     }
+    feed.flush();
     let cursor = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap()["cursor"].clone();
     s.react(&b.id,&json!({"message_id":mention["id"],"emoji":"✅","request_id":"react"})).unwrap();
+    feed.flush();
     assert!(feed.next(tmp.path(),&json!({"cursor":cursor,"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
 }
 #[test]

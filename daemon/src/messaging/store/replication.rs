@@ -1877,12 +1877,15 @@ mod tests {
         let actor = p.people[0].id.clone();
         p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"DM for Owner","request_id":"owner-dm"})).unwrap();
         p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Everyone","mention_here":true,"request_id":"owner-here"})).unwrap();
+        hub_feed.flush();
         let first = hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0})).unwrap();
         assert_eq!(first["events"].as_array().unwrap().len(), 2);
         catch_up(&mut p);
+        replica_feed.flush();
         assert!(replica_feed.next(p.replica.cm_root(), &json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
         p.hub.follow("owner", &json!({"action":"set","dnd":true,"request_id":"quiet"}), &[]).unwrap();
         p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"Muted","request_id":"owner-muted"})).unwrap();
+        hub_feed.flush();
         assert!(hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0,"cursor":first["cursor"]})).unwrap()["events"].as_array().unwrap().is_empty());
     }
     #[test]

@@ -13,7 +13,7 @@ class Settings:
     owner_email: str
     origin: str = "https://board.latentoracle.xyz"
     socket_path: Path = Path.home() / ".cm/daemon.sock"
-    token_path: Path = Path.home() / ".cm/operator-token"
+    token_path: Path = Path.home() / ".cm/board-token"
     push_path: Path = Path.home() / ".cm/web-push"
     static_path: Path = Path(__file__).resolve().parents[1] / "static"
 
@@ -34,7 +34,7 @@ class Settings:
     @classmethod
     def from_env(cls):
         paths = {field: Path(os.environ[key]).expanduser() for field, key in {
-            "socket_path": "BOARD_DAEMON_SOCKET", "token_path": "BOARD_OPERATOR_TOKEN_FILE",
+            "socket_path": "BOARD_DAEMON_SOCKET", "token_path": "BOARD_TOKEN_FILE",
             "push_path": "BOARD_PUSH_PATH", "static_path": "BOARD_STATIC_PATH",
         }.items() if key in os.environ}
         return cls(team_domain=os.environ.get("CF_ACCESS_TEAM_DOMAIN", ""),

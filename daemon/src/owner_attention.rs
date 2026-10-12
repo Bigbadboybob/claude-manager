@@ -121,7 +121,7 @@ fn broadcast(state: &DaemonState, key: &str, alert: Option<&Alert>) {
     if let Some(alert) = alert {
         if let Err(e) = state.owner_notifications.publish(&state.messaging_root,
             format!("cm-alert:{}", alert.id), &alert.label, &alert.message,
-            format!("/#alerts&alert={}", alert.id)) {
+            format!("/#alerts&alert={}", crate::owner_notifications::url_component(&alert.id))) {
             eprintln!("cm Owner notification checkpoint failed: {e}");
         }
     }
@@ -641,8 +641,10 @@ mod tests {
         let feed = state.lock().unwrap().owner_notifications.clone();
         set_level(&state,Some("away"),"away");
         notify_with(&state,"local","please decide","decision");
+        feed.flush();
         assert!(feed.next(dir.path(),&json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
         release_for_level(&state.lock().unwrap(),Some(Level::Around)).unwrap();
+        feed.flush();
         let page = feed.next(dir.path(),&json!({"wait_ms":0})).unwrap();
         assert_eq!(page["events"].as_array().unwrap().len(),1);
         let listed = list(&state.lock().unwrap(),&request("owner_attention.list",Caller::session("local"),json!({}))).result.unwrap();
@@ -650,6 +652,7 @@ mod tests {
         let stale = acknowledge(&state.lock().unwrap(),&request("owner_attention.ack",Caller::session("local"),json!({"session_uid":alert["key"],"alert_id":"stale"})));
         assert_eq!(stale.result.unwrap()["acknowledged"],false);
         acknowledge(&state.lock().unwrap(),&request("owner_attention.ack",Caller::session("local"),json!({"session_uid":alert["key"],"alert_id":alert["id"]})));
+        feed.flush();
         assert!(feed.next(dir.path(),&json!({"wait_ms":0,"cursor":page["cursor"]})).unwrap()["events"].as_array().unwrap().is_empty());
         for method in ["owner_attention.list","owner.notifications.next"] {
             let response = dispatch_request(&state,&request(method,Caller::session("local"),json!({"wait_ms":0}))).into_response();

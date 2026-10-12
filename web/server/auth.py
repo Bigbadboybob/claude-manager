@@ -60,12 +60,16 @@ class AccessMiddleware:
         self.app, self.verifier, self.origin = app, verifier, origin
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope["type"] == "lifespan":
             return await self.app(scope, receive, send)
+        if scope["type"] == "websocket":
+            return await send({"type": "websocket.close", "code": 1008})
+        if scope["type"] != "http":
+            raise ValueError("Unsupported board protocol")
         if scope["path"] == "/healthz" and scope["method"] == "GET":
             return await self.app(scope, receive, send)
-        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
         try:
+            headers = {k.decode("ascii").lower(): v.decode("ascii") for k, v in scope["headers"]}
             claims = await self.verifier.verify(headers.get("cf-access-jwt-assertion"))
         except (ValueError, KeyError, TypeError, jwt.PyJWTError, httpx.HTTPError):
             return await JSONResponse({"error": {"code": "access_denied", "message": "Sign in through Cloudflare Access."}},

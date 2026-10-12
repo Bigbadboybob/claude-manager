@@ -259,6 +259,7 @@ class PushTests(unittest.IsolatedAsyncioTestCase):
             self.store.subscribe(self.device)
             self.store.enqueue([self.payload])
             for job in self.store.state["jobs"].values(): job["next_at"] = 0
+            for backoff in self.store.state["backoffs"].values(): backoff["next_at"] = 0
             await PushService(self.cfg, FakeDaemon(), store=self.store, sender=lambda *a: status).deliver_due()
             self.assertFalse(self.store.state["subscriptions"])
             self.assertFalse(self.store.state["jobs"])

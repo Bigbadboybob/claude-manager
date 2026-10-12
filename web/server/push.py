@@ -3,9 +3,11 @@ import asyncio
 import base64
 import copy
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -85,6 +87,35 @@ def atomic(path, data):
         Path(name).unlink(missing_ok=True)
 
 
+def retry_after(value):
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (ValueError, TypeError):
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return max(0, seconds) if math.isfinite(seconds) else None
+
+
+def event_payload(event, badge):
+    if not isinstance(event, dict):
+        raise ValueError("Invalid event")
+    for field, limit in (("id", 1024), ("title", 400), ("body", 560), ("url", 4096)):
+        if not isinstance(event[field], str) or len(event[field]) > limit:
+            raise ValueError("Invalid event field")
+    if (not event["id"] or not event["url"].startswith("/") or event["url"].startswith("//")
+            or "\\" in event["url"] or any(ord(c) < 32 or ord(c) == 127 for c in event["url"])):
+        raise ValueError("Invalid notification link/identity")
+    created = event["created_at"]
+    if isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(created):
+        raise ValueError("Invalid event time")
+    return {"title": event["title"][:100], "body": event["body"][:140], "url": event["url"],
+            "tag": event["id"], "badge": badge, "expires_at": created + TTL}
+
+
 class PushStore:
     def __init__(self, root):
         self.root = root
@@ -116,6 +147,7 @@ class PushStore:
             self.path.chmod(0o600)
         else:
             self.state = {"version": 1, "subscriptions": {}, "jobs": {}, "cursor": None, "badge": 0}
+        self.state.setdefault("backoffs", {})
         self.durable = copy.deepcopy(self.state)
         if not self.path.exists():
             self.save()
@@ -138,6 +170,7 @@ class PushStore:
 
     def unsubscribe(self, endpoint):
         removed = self.state["subscriptions"].pop(endpoint, None) is not None
+        self.state["backoffs"].pop(endpoint, None)
         self.state["jobs"] = {k: j for k, j in self.state["jobs"].items() if j["endpoint"] != endpoint}
         if removed:
             self.save()
@@ -205,16 +238,21 @@ class PushService:
                 events = result["events"]
                 if result.get("lost"):
                     log.warning("Owner notification replay window was exceeded; historical pushes were lost")
-                if events:
+                valid = []
+                for event in events:
+                    try:
+                        valid.append(event_payload(event, self.store.state["badge"]))
+                    except (KeyError, ValueError, TypeError, OverflowError):
+                        log.warning("Skipped malformed Owner notification event")
+                if valid:
                     try:
                         counts = await self.daemon.call("messaging.counts", {})
                         self.store.state["badge"] = counts["unread"]
                     except Exception:
                         log.warning("Unread badge refresh failed; retaining the previous badge count")
-                    payloads = [{"title": e["title"], "body": e["body"], "url": e["url"],
-                                 "tag": e["id"], "badge": self.store.state["badge"],
-                                 "expires_at": e["created_at"] + TTL} for e in events]
-                    self.store.enqueue(payloads, cursor=result["cursor"])
+                    for payload in valid:
+                        payload["badge"] = self.store.state["badge"]
+                    self.store.enqueue(valid, cursor=result["cursor"])
                     self.ready.set()
                 elif result["cursor"] != self.store.state["cursor"]:
                     self.store.state["cursor"] = result["cursor"]
@@ -234,48 +272,75 @@ class PushService:
                 session.trust_env = False
                 response = webpush(subscription_info=data, data=json.dumps(payload),
                                    vapid_private_key=str(self.store.key_path),
-                                   vapid_claims={"sub": "mailto:" + self.settings.owner_email},
+                                   vapid_claims={"sub": self.settings.origin},
                                    ttl=TTL, timeout=10, requests_session=session)
-            return response.status_code
+            return response.status_code, retry_after(response.headers.get("Retry-After"))
         except WebPushException as exc:
-            return exc.response.status_code if exc.response is not None else 503
+            if exc.response is None:
+                return 503, None
+            return exc.response.status_code, retry_after(exc.response.headers.get("Retry-After"))
 
     async def deliver_due(self):
-        for key in list(self.store.state["jobs"]):
-            job = self.store.state["jobs"].get(key)
-            if not job or job["next_at"] > time.time():
-                continue
-            device = self.store.state["subscriptions"].get(job["endpoint"])
-            if not device or job["expires"] <= time.time():
+        now = time.time()
+        selected = {}
+        changed = False
+        for key, job in list(self.store.state["jobs"].items()):
+            endpoint = job["endpoint"]
+            if endpoint not in self.store.state["subscriptions"] or job["expires"] <= now:
                 self.store.state["jobs"].pop(key, None)
-                self.store.save()
-                continue
-            try:
-                status = await asyncio.to_thread(self.sender, device, job["payload"])
-            except Exception:
-                status = 503
-            # A subscription may have been removed, or a failed checkpoint
-            # rolled state back, while the network call was in flight.
+                changed = True
+            elif (job["next_at"] <= now and self.store.state["backoffs"].get(endpoint, {}).get("next_at", 0) <= now):
+                selected.setdefault(endpoint, (key, job))
+        slots = asyncio.Semaphore(4)
+
+        async def send_one(endpoint, key, job):
+            async with slots:
+                device = self.store.state["subscriptions"].get(endpoint)
+                if not device:
+                    return key, 410, None
+                try:
+                    result = await asyncio.to_thread(self.sender, device, job["payload"])
+                    status, after = result if isinstance(result, tuple) else (result, None)
+                    return key, status, after
+                except Exception:
+                    return key, 503, None
+
+        results = await asyncio.gather(*(send_one(endpoint, *job) for endpoint, job in selected.items()))
+        for key, status, after in results:
+            # Subscribe/unsubscribe/feed activity may run during network awaits.
             job = self.store.state["jobs"].get(key)
             if job is None:
                 continue
+            changed = True
+            endpoint = job["endpoint"]
             if status in (404, 410):
-                self.store.unsubscribe(job["endpoint"])
-            elif 200 <= status < 300:
+                self.store.state["subscriptions"].pop(endpoint, None)
+                self.store.state["backoffs"].pop(endpoint, None)
+                self.store.state["jobs"] = {k: j for k, j in self.store.state["jobs"].items() if j["endpoint"] != endpoint}
+            elif 200 <= status < 300 or status in (400, 403, 413):
                 self.store.state["jobs"].pop(key, None)
-                self.store.save()
+                self.store.state["backoffs"].pop(endpoint, None)
+                if status >= 400:
+                    log.warning("Push delivery returned permanent failure %s; discarded notification", status)
             else:
-                job["attempts"] += 1
-                job["next_at"] = time.time() + min(900, 10 * (2 ** min(job["attempts"] - 1, 7)))
-                self.store.save()
-                log.warning("Push delivery returned %s; queued for retry", status)
+                attempts = self.store.state["backoffs"].get(endpoint, {}).get("attempts", 0) + 1
+                delay = min(900, 10 * (2 ** min(attempts - 1, 7)))
+                if after is not None:
+                    delay = max(delay, after)
+                next_at = time.time() + delay
+                self.store.state["backoffs"][endpoint] = {"attempts": attempts, "next_at": next_at}
+                job["attempts"], job["next_at"] = attempts, next_at
+                log.warning("Push delivery returned %s; endpoint queued for retry", status)
+        if changed:
+            self.store.save()
 
     async def send_loop(self):
         while True:
             try:
                 self.ready.clear()
                 await self.deliver_due()
-                due = min((j["next_at"] for j in self.store.state["jobs"].values()), default=time.time() + 3600)
+                due = min((min(j["expires"], max(j["next_at"], self.store.state["backoffs"].get(j["endpoint"], {}).get("next_at", 0)))
+                           for j in self.store.state["jobs"].values()), default=time.time() + 3600)
                 try:
                     await asyncio.wait_for(self.ready.wait(), timeout=max(1, due - time.time()))
                 except TimeoutError:
