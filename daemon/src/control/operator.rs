@@ -160,6 +160,12 @@ fn configured_token() -> Option<String> {
     EXPECTED_TOKEN.get().and_then(|t| t.clone())
 }
 
+/// Internal delegation only, after the board capability's method/action gate.
+/// Never serialize or return this credential to the board service.
+pub(super) fn configured_caller() -> Option<Caller> {
+    configured_token().map(Caller::operator)
+}
+
 /// Is strong operator authentication configured on this daemon?
 ///
 /// True ONLY when operator-token validation is actually enabled —

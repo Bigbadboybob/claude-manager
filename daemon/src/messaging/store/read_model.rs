@@ -286,7 +286,8 @@ impl Store {
     }
     pub fn mark_read(&mut self, actor: &str, p: &Value, people: &[Person]) -> Result<Value> {
         self.load_read(actor)?;
-        if p["all"] == true || p["mentions"] == true {
+        let targeted = ["conversation", "channel", "dm"].iter().any(|k| !p[k].is_null());
+        if p["all"] == true || p["mentions"] == true && !targeted {
             if p["all"] == true && p["mentions"] == true
                 || ["conversation", "channel", "dm", "through"]
                     .iter()
@@ -318,8 +319,14 @@ impl Store {
             }
             return Ok(json!({"changed":changed,"counts":self.counts(actor)?}));
         }
+        if p["mentions"] == true && !p["through"].is_null() {
+            return Err(err("invalid_target", "Choose mentions or an explicit message boundary"));
+        }
         let cid = self.resolve(actor, p, people, false)?.0;
-        let cursor = if let Some(id) = p["through"].as_str() {
+        let cursor = if p["mentions"] == true {
+            self.read_model.conversations.get(&cid)
+                .and_then(|c| c.mentions.get(actor)).and_then(|m| m.last()).cloned()
+        } else if let Some(id) = p["through"].as_str() {
             let e = self
                 .published(id)
                 .filter(|e| {

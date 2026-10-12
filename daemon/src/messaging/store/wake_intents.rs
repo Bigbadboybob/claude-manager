@@ -8,6 +8,46 @@ pub struct WakeIntent {
 }
 
 impl Store {
+    /// Shared passive Owner inbox decision; the terminal bell and Web Push
+    /// retain their own opt-in transports without duplicating inbox/mute rules.
+    fn owner_inbox_notification(&self, e: &Published) -> bool {
+        let (inbox, _, muted) = self.preference_for_event("owner", e);
+        inbox && !muted && !self.is_read("owner", &e.event)
+    }
+
+    pub(super) fn owner_message_notification(&self, e: &Published) -> Option<crate::owner_notifications::Notification> {
+        use crate::owner_availability::{self, Level, Urgency};
+        if self.owner_notifications.is_none() || self.sync_enabled() && !self.is_coordinator()
+            || !self.owner_inbox_notification(e) {
+            return None;
+        }
+        let cid = strv(&e.event, "conversation_id");
+        // B5 pushes direct/group DMs and explicit/frozen @here mentions;
+        // following all traffic in another channel is not an implicit push opt-in.
+        if !self.conversations.contains_key(cid) && !mention_recipients(&e.event).contains(&"owner") {
+            return None;
+        }
+        let level = self.owner_availability["level"].as_str().and_then(Level::parse);
+        if !owner_availability::delivers(level, Urgency::Fyi) { return None; }
+        let place = self.channel_path_of(cid).map(|p| format!("#{p}")).unwrap_or_else(|| "DM".into());
+        let sender = self.names.get(strv(&e.event["actor"], "id"))
+            .map(|n| n.name.as_str()).unwrap_or_else(|| strv(&e.event["actor"], "name"));
+        Some(crate::owner_notifications::Notification {
+            sequence: 0, id: format!("cm-message:{}", strv(&e.event,"id")),
+            created_at: 0, // Feed stamps the committed notification decision.
+            title: format!("{sender} · {place}"), body: strv(&e.event,"body").into(),
+            url: format!("/#conversation={}&message={}", crate::owner_notifications::url_component(cid), crate::owner_notifications::url_component(strv(&e.event,"id"))),
+        })
+    }
+
+    pub(super) fn publish_owner_notification(&self, n: crate::owner_notifications::Notification) {
+        if let Some(feed) = &self.owner_notifications {
+            if let Err(e) = feed.publish(self.cm_root(), n.id, &n.title, &n.body, n.url) {
+                eprintln!("cm Owner message notification checkpoint failed: {e}");
+            }
+        }
+    }
+
     pub(super) fn load_known_reads(&mut self) -> Result<()> {
         let mut actors: BTreeSet<_> = self
             .names
@@ -160,8 +200,7 @@ impl Store {
         let inbox: Vec<_> = self.events_between(state.bell_position,self.position)
             .iter()
             .filter(|e| {
-                self.preference_for_event(actor, e).0
-                    && !self.is_read(actor,&e.event)
+                self.owner_inbox_notification(e)
             })
             .collect();
         let unread = counts["unread"].as_u64().unwrap_or(0);

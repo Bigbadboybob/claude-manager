@@ -285,6 +285,7 @@ pub struct Store {
     pub norms: Value,
     /// Latest `owner.availability` record (Null until Owner sets a level).
     pub owner_availability: Value,
+    pub owner_notifications: Option<std::sync::Arc<crate::owner_notifications::Feed>>,
     channel_norms: BTreeMap<String, Value>,
     enrollment_revision: String,
     owner_identity_revision: String,
@@ -346,6 +347,7 @@ impl Store {
             ));
         }
         let mut s = Self {
+            owner_notifications: None,
             root,
             daemon_id,
             space_id: required(&meta, "space_id")?,
@@ -902,9 +904,14 @@ impl Store {
             received_at: received,
             event_sha256: digest,
         });
+        let notification = self.owner_message_notification(self.events.last().unwrap());
         if batched {
+            if let Some(n) = notification {
+                self.ingest_batch.as_mut().unwrap().owner_notifications.push(n);
+            }
             return Ok(event);
         }
+        if let Some(n) = notification { self.publish_owner_notification(n); }
         // A durable message stays successful if a derived checkpoint fails;
         // restart replays from the prior saved monitor scan position.
         if let Err(e) = self.advance_monitors_at(Utc::now()) {
