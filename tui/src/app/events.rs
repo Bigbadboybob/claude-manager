@@ -3175,6 +3175,7 @@ mod apply_manifest_diff_tests {
         let diff = ManifestDiff::Exited {
             uid: "ts-t15".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: true,
                 kills_file_offset: Some(42),
@@ -3208,6 +3209,7 @@ mod apply_manifest_diff_tests {
         app.needs_redraw = false;
 
         let last_exit = LastExit {
+            killed_by: None,
             code: None,
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -3254,6 +3256,7 @@ mod apply_manifest_diff_tests {
         let diff = ManifestDiff::Exited {
             uid: "ts-t16-stranger".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(1),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3316,6 +3319,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-agent".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3342,6 +3346,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-user".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3374,6 +3379,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-wf".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3405,6 +3411,7 @@ mod apply_manifest_diff_tests {
             ManifestDiff::Exited {
                 uid: "ts-remote".into(),
                 last_exit: LastExit {
+                    killed_by: None,
                     code: None,
                     memory_cap_kill: false,
                     kills_file_offset: None,
@@ -3524,6 +3531,7 @@ mod apply_manifest_diff_tests {
                 .iter()
                 .map(|u| {
                     let le = exited.contains(u).then(|| LastExit {
+                        killed_by: None,
                         code: Some(0),
                         memory_cap_kill: false,
                         kills_file_offset: None,
@@ -3641,7 +3649,7 @@ mod apply_manifest_diff_tests {
         app.note_revive_failure("ts-revive-x", "worktree /w/x missing");
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-revive-x".into(),
-            last_exit: LastExit { code: Some(0), memory_cap_kill: false, kills_file_offset: None, exited_at: 1.0 },
+            last_exit: LastExit { code: Some(0), memory_cap_kill: false, kills_file_offset: None, exited_at: 1.0, killed_by: None },
         });
         assert_eq!(app.workspaces[0].sessions.len(), 1, "row kept after the exit diff");
         assert!(app.status_msg.as_ref().is_some_and(|(m, _)| m.contains("worktree /w/x missing")));
@@ -3655,12 +3663,75 @@ mod apply_manifest_diff_tests {
         assert!(text.contains("revive failed") && text.contains('\u{2717}'), "{text}");
     }
 
+    /// 2026-10-12: a worker the terminal-task sweep closed looked like a
+    /// crash. Its row, the A-i peek and the A-O picker now say why.
+    #[test]
+    fn a_swept_session_says_closed_task_done_on_row_peek_and_reopen_picker() {
+        let mut app = build_app_with_session("ts-swept");
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-swept".into(),
+            last_exit: LastExit {
+                code: None,
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+                killed_by: Some("terminal-task-sweep (terminal task)".into()),
+            },
+        });
+        app.workspaces[0].sessions[0].session.exited = true;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 8)).unwrap();
+        terminal.draw(|f| app.draw_session_list(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("closed: task done"), "{text}");
+
+        app.cursor = Cursor::Session(0, 0);
+        let peek = format!("{:?}", app.build_peek_lines());
+        assert!(peek.contains("closed: task done"), "{peek}");
+
+        // Closing the row keeps the reason on its tombstone for A-O.
+        app.tombstone_exited_and_remove(0, |_| true);
+        let entry = app.workspaces[0].tombstones[0].entry.as_ref().unwrap();
+        assert_eq!(super::model::exit_note(entry.last_exit.as_ref()), Some("closed: task done"));
+
+        // An operator kill is not relabelled.
+        let other = LastExit {
+            code: None,
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: 1.0,
+            killed_by: Some("operator".into()),
+        };
+        assert_eq!(super::model::exit_note(Some(&other)), None);
+    }
+
+    /// The shown session is reported once, then not again until the
+    /// interval passes or the selection changes.
+    #[test]
+    fn the_shown_session_is_reported_on_change_and_then_throttled() {
+        let mut app = build_app_with_session("ts-shown");
+        app.cursor = Cursor::Session(0, 0);
+        app.report_viewed_session();
+        let first = app.viewed_report.clone().expect("reported");
+        assert_eq!(first.0, "ts-shown");
+        app.report_viewed_session();
+        assert_eq!(app.viewed_report.as_ref().unwrap().1, first.1, "throttled");
+        app.workspaces[0].sessions[0].session.exited = true;
+        app.viewed_report = None;
+        app.report_viewed_session();
+        assert!(app.viewed_report.is_none(), "an exited row is not reported");
+    }
+
     // ── kill-time close of adoption-minted `agent:` markers ──
 
     fn exit_diff(uid: &str) -> ManifestDiff {
         ManifestDiff::Exited {
             uid: uid.into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3822,6 +3893,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-cursor".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3848,6 +3920,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-capkill".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: true,
                 kills_file_offset: Some(9),
@@ -3876,6 +3949,7 @@ mod apply_manifest_diff_tests {
         let make = || ManifestDiff::Exited {
             uid: "ts-dup".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3910,6 +3984,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-drop".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -4156,6 +4231,7 @@ mod apply_manifest_diff_tests {
         assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
 
         let last_exit = LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(7),
@@ -4192,6 +4268,7 @@ mod apply_manifest_diff_tests {
     fn apply_snapshot_does_not_overwrite_existing_local_last_exit() {
         let mut app = build_app_with_session("ts-t23");
         let local_exit = LastExit {
+            killed_by: None,
             code: Some(0),
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -4201,6 +4278,7 @@ mod apply_manifest_diff_tests {
         app.needs_redraw = false;
 
         let snapshot_exit = LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(99),
@@ -4269,6 +4347,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-t24".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(1),
@@ -4311,6 +4390,7 @@ mod apply_manifest_diff_tests {
             let diff = ManifestDiff::Exited {
                 uid: "ts-t25".into(),
                 last_exit: LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(2),
@@ -4345,6 +4425,7 @@ mod apply_manifest_diff_tests {
         let make_diff = || ManifestDiff::Exited {
             uid: "ts-t26".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(3),
@@ -4379,6 +4460,7 @@ mod apply_manifest_diff_tests {
             session_last_exits: vec![(
                 "ts-t27".into(),
                 Some(LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(4),
@@ -4404,6 +4486,7 @@ mod apply_manifest_diff_tests {
         // previous TUI session's manifest write.
         app.workspaces[0].sessions[0].preserved_last_exit =
             Some(LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(5),
@@ -4422,6 +4505,7 @@ mod apply_manifest_diff_tests {
             session_last_exits: vec![(
                 "ts-t28".into(),
                 Some(LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(5),
@@ -4463,6 +4547,7 @@ mod apply_manifest_diff_tests {
         app_detached.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-t29d".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(7),

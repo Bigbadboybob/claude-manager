@@ -446,6 +446,13 @@ pub struct DaemonState {
     /// [`ExitedTombstone`]. Bounded by [`KILL_REQUEST_CAP`]. See
     /// [`DaemonState::record_kill_request`].
     pub kill_requests: HashMap<String, KillRequest>,
+    /// Last time Owner was seen USING a session other than by typing into it
+    /// (typing is `DaemonSession::last_operator_input_at`): the TUI reports
+    /// the session it shows (`session.viewed`), and a revive or resume counts
+    /// too. In memory only: the terminal-task sweep treats every session as
+    /// seen when its brain started, so a restart never loses a grace window.
+    /// Pruned to live sessions by [`Self::note_owner_activity`].
+    pub owner_seen: HashMap<String, std::time::Instant>,
     /// Snapshot of the persisted manifest's workspaces, keyed by
     /// stable workspace id. Loaded at daemon startup via
     /// [`load_manifest_from_disk`](Self::load_manifest_from_disk).
@@ -804,6 +811,7 @@ impl Default for DaemonState {
             resume_history: Mutex::new(Default::default()),
             resume_claims: Default::default(),
             kill_requests: HashMap::new(),
+            owner_seen: HashMap::new(),
             workspaces: HashMap::new(),
             bindings: HashMap::new(),
             daemon_sessions_path: None,
@@ -862,6 +870,16 @@ impl DaemonState {
         }
         // Let the items board see the exit within seconds, not a full beat.
         crate::items::heartbeat::poke();
+    }
+
+    /// Owner used `uid` just now (viewed it in the TUI, revived or resumed
+    /// it). Read by the terminal-task sweep's grace rule.
+    pub fn note_owner_activity(&mut self, uid: &str) {
+        self.owner_seen.insert(uid.to_string(), std::time::Instant::now());
+        if self.owner_seen.len() > 4 * self.sessions.len().max(64) {
+            let live: std::collections::HashSet<&String> = self.sessions.keys().collect();
+            self.owner_seen.retain(|k, _| live.contains(k));
+        }
     }
 
     /// Stamp who requested a session's kill, so the tombstone built later

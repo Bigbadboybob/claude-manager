@@ -292,6 +292,9 @@ pub struct PastCandidate {
     /// bound task names + wip branches, worktree path, session/tombstone
     /// labels, host.
     pub search_fields: Vec<String>,
+    /// Why the workspace's last session closed, when that explains it
+    /// ("closed: task done"); shown beside the name.
+    pub note: Option<&'static str>,
 }
 
 impl PastCandidate {
@@ -2757,6 +2760,12 @@ impl App {
                         .chain(ws.tombstones.iter().map(|t| t.label.as_str()))
                         .chain(std::iter::once(ws.host_id.as_str())),
                 );
+                let note = ws
+                    .tombstones
+                    .iter()
+                    .max_by(|a, b| a.exited_at.total_cmp(&b.exited_at))
+                    .and_then(|t| t.entry.as_ref())
+                    .and_then(|e| super::model::exit_note(e.last_exit.as_ref()));
                 PastCandidate {
                     ws_id: ws.id.clone(),
                     display: ws.name.clone(),
@@ -2764,6 +2773,7 @@ impl App {
                     worktree_exists,
                     last_exited_at,
                     search_fields,
+                    note,
                 }
             })
             .collect();
@@ -8184,6 +8194,7 @@ mod past_workspace_search_tests {
             worktree_exists: None,
             last_exited_at: 0.0,
             search_fields: PastCandidate::search_fields_from(fields.iter().copied()),
+            note: None,
         }
     }
 

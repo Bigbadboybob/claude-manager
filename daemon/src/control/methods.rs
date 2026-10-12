@@ -1462,6 +1462,13 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     // continuous-task tag BEFORE the registry remove (after which `get(uid)`
     // sees None) so a CLEAN exit of a continuous-task session can clear its
     // ACTIVE run below.
+    // The exit record carries the same attribution as the tombstone, so a
+    // viewer can say why a row closed ("closed: task done") instead of
+    // showing what looks like a crash.
+    let last_exit_opt = last_exit_opt.map(|mut le| {
+        le.killed_by = tombstone.as_ref().and_then(|t| t.killed_by.clone());
+        le
+    });
     let continuous_task_id = state
         .sessions
         .get(uid)
@@ -17869,17 +17876,23 @@ fn wait_for_task_sessions_gone(
 /// * NEVER a continuous orchestrator (`continuous_task_id`): the scheduler owns
 ///   that lifecycle, and its planning row's status says nothing about the run.
 /// * NEVER a workflow participant: the workflow engine owns those.
+/// * With `owner_grace`, never a session Owner used within the window (see
+///   [`crate::terminal_sweep::owner_recently_used`]).
 pub(crate) fn sweep_terminal_task_sessions(
     state_arc: &Arc<Mutex<DaemonState>>,
     task_id: &str,
     killer: &str,
+    owner_grace: Option<crate::terminal_sweep::OwnerGrace>,
 ) -> Vec<String> {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let targets: Vec<String> = state
         .sessions
         .iter()
-        .filter(|(_, s)| {
+        .filter(|(uid, s)| {
             s.task_id.as_deref() == Some(task_id)
+                && !owner_grace.is_some_and(|grace| {
+                    crate::terminal_sweep::owner_recently_used(&state, uid, s, grace)
+                })
                 && s.continuous_task_id.is_none()
                 && s.workflow_run_id.is_none()
                 && {
@@ -23230,6 +23243,7 @@ while True:
         assert!(!restore_in_scope(&w), "workflow participant skipped");
         let mut x = me("ts-4444444444444444-0", "bash");
         x.last_exit = Some(crate::manifest::LastExit {
+            killed_by: None,
             code: Some(0),
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -23294,6 +23308,7 @@ while True:
         wf.workflow_run_id = Some("wf-1".into());
         let mut exited = me("ts-dddddddddddddddd-0", "bash");
         exited.last_exit = Some(crate::manifest::LastExit {
+            killed_by: None,
             code: Some(0),
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -23755,6 +23770,7 @@ while True:
             e.seeded_from_snapshot = Some("seed".into());
             e.managed_by_uid = Some("ts-parent-0".into());
             e.last_exit = Some(crate::manifest::LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -23887,6 +23903,7 @@ while True:
             let mut e = me(uid, "bash");
             e.workflow_run_id = Some("wf-1".into());
             e.last_exit = Some(crate::manifest::LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -23915,6 +23932,7 @@ while True:
             let mut e = me(uid, "bash");
             e.continuous_task_id = Some("ct-1".into());
             e.last_exit = Some(crate::manifest::LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -35715,7 +35733,7 @@ while True:
             });
             state.lock().unwrap().sessions.insert(uid.into(), session);
         }
-        let mut swept = sweep_terminal_task_sessions(&state, "done-task", "test");
+        let mut swept = sweep_terminal_task_sessions(&state, "done-task", "test", None);
         swept.sort();
         assert_eq!(
             swept,
@@ -35753,7 +35771,7 @@ while True:
         // A different task's worker is untouched even though it is idle.
         state.lock().unwrap().sessions.insert("ts-other".into(), make("ts-other", "task-open"));
 
-        let mut swept = sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep");
+        let mut swept = sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep", None);
         swept.sort(); // `sessions` is a HashMap; the sweep's order is not a contract.
         assert_eq!(swept, vec!["ts-w1".to_string(), "ts-w2".to_string()]);
 
@@ -35851,6 +35869,75 @@ while True:
         // A session on a DIFFERENT task is untouched.
         assert!(s.sessions.contains_key("ts-other"));
         drop(s);
+        kill_all_sessions(&state);
+    }
+
+    /// 2026-10-12: the terminal-task sweep closed a worker Owner was still
+    /// using. A session Owner typed into, showed in the TUI, revived or
+    /// resumed within the grace window is spared; the one nobody touched is
+    /// closed, and its exit record says the sweep did it so the TUI can show
+    /// "closed: task done" instead of a crash.
+    #[test]
+    fn terminal_sweep_spares_sessions_owner_used_and_labels_the_rest() {
+        use std::time::{Duration, Instant};
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(3 * 3600))
+            .expect("host uptime above three hours");
+        for uid in ["ts-typed", "ts-viewed", "ts-stale-typed", "ts-untouched"] {
+            insert_session(&state, uid, "ws-owner");
+        }
+        {
+            let mut s = state.lock().unwrap();
+            for sess in s.sessions.values_mut() {
+                sess.task_id = Some("task-owner".into());
+                *sess.last_activity_at.lock().unwrap() = None;
+            }
+            *s.sessions["ts-typed"].last_operator_input_at.lock().unwrap() = Some(Instant::now());
+            *s.sessions["ts-stale-typed"].last_operator_input_at.lock().unwrap() = Some(long_ago);
+            s.note_owner_activity("ts-viewed");
+        }
+        let (rx, _guard) = state.lock().unwrap().manifest_watcher.subscribe();
+        let grace = crate::terminal_sweep::OwnerGrace {
+            window: Duration::from_secs(2 * 3600),
+            floor: long_ago,
+        };
+        let mut swept =
+            sweep_terminal_task_sessions(&state, "task-owner", "terminal-task-sweep", Some(grace));
+        swept.sort();
+        assert_eq!(swept, ["ts-stale-typed", "ts-untouched"]);
+
+        // A brain that started inside the window spares everything.
+        let fresh = crate::terminal_sweep::OwnerGrace { floor: Instant::now(), ..grace };
+        insert_session(&state, "ts-new", "ws-owner");
+        {
+            let mut s = state.lock().unwrap();
+            let sess = s.sessions.get_mut("ts-new").unwrap();
+            sess.task_id = Some("task-owner".into());
+            *sess.last_activity_at.lock().unwrap() = None;
+        }
+        assert!(
+            sweep_terminal_task_sessions(&state, "task-owner", "terminal-task-sweep", Some(fresh))
+                .is_empty()
+        );
+
+        poll_until_session_removed(&state, "ts-untouched");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut labelled = 0;
+        while labelled < 2 && Instant::now() < deadline {
+            if let Ok(crate::manifest::ManifestDiff::Exited { last_exit, .. }) =
+                rx.recv_timeout(Duration::from_millis(200))
+            {
+                assert_eq!(
+                    last_exit.killed_by.as_deref(),
+                    Some("terminal-task-sweep (terminal task)")
+                );
+                labelled += 1;
+            }
+        }
+        assert_eq!(labelled, 2, "both swept exits carry the sweep's attribution");
+        assert!(state.lock().unwrap().sessions.contains_key("ts-typed"));
+        assert!(state.lock().unwrap().sessions.contains_key("ts-viewed"));
         kill_all_sessions(&state);
     }
     fn migration_request(state: &Arc<Mutex<DaemonState>>, id: &str, home: &std::path::Path) -> Value {

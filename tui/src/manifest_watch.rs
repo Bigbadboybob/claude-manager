@@ -1235,6 +1235,7 @@ mod tests {
         // Snapshot frame with two sessions: one with last_exit
         // populated (memory_cap_kill: true), one without.
         let last_exit = LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(42),

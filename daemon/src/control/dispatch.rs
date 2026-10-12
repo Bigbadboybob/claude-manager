@@ -683,6 +683,7 @@ pub fn dispatch_request(
         "session.revive" => {
             DispatchOutcome::Done(dispatch_session_revive(state, req))
         }
+        "session.viewed" => DispatchOutcome::Done(dispatch_session_viewed(state, req)),
 
         // Sub-2b-2: `propose_task` — daemon-side HTTP forwarder
         // to the planning API. Both Operator and Session callers
@@ -977,7 +978,10 @@ fn dispatch_start_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
         return resp;
     }
     match methods::start_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1241,7 +1245,10 @@ fn dispatch_create_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
         return resp;
     }
     match methods::create_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1261,7 +1268,10 @@ fn dispatch_add_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.resume requires resume_id");
     }
     match methods::add_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1797,6 +1807,41 @@ fn dispatch_set_global_perms(
     }
 }
 
+/// An Operator spawn, revive or resume is Owner using that session: stamp it
+/// so the terminal-task sweep does not close it again moments later (the
+/// 2026-10-12 revive that had to reopen its task first).
+fn note_owner_spawn(state: &Arc<Mutex<DaemonState>>, req: &Request, result: &serde_json::Value) {
+    if !matches!(req.caller, Caller::Operator(_)) {
+        return;
+    }
+    let uid = ["session_uid", "uid"]
+        .iter()
+        .find_map(|k| result.get(*k).or_else(|| req.params.get(*k)))
+        .and_then(serde_json::Value::as_str);
+    if let Some(uid) = uid {
+        state.lock().unwrap_or_else(|p| p.into_inner()).note_owner_activity(uid);
+    }
+}
+
+/// `session.viewed {uid}` — the TUI reports the session it is showing (on
+/// focus and every few minutes while it stays shown). Operator-only; feeds
+/// the terminal-task sweep's owner-activity grace. Unknown uids are accepted
+/// and ignored: a viewer may lag the registry.
+fn dispatch_session_viewed(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "session.viewed is Operator-callable only") {
+        return resp;
+    }
+    let Some(uid) = req.params.get("uid").and_then(serde_json::Value::as_str) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.viewed requires uid");
+    };
+    let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+    let known = guard.sessions.contains_key(uid);
+    if known {
+        guard.note_owner_activity(uid);
+    }
+    Response::ok(req.id.clone(), serde_json::json!({ "uid": uid, "known": known }))
+}
+
 /// `session.revive` — operator-triggered resurrection of an exited
 /// session at its same uid (see `methods::revive_session`).
 /// Operator-only: the revive re-applies the persisted identity
@@ -1815,7 +1860,10 @@ fn dispatch_session_revive(
         return resp;
     }
     match methods::revive_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -2946,6 +2994,50 @@ mod tests {
             caller: Caller::operator("op-default"),
             method: method.into(),
             params,
+        }
+    }
+
+    #[test]
+    fn session_viewed_stamps_owner_activity_for_operators_only() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut sp = crate::session::SpawnParams::new("ts-seen", "seen", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        let sess = crate::session::DaemonSession::spawn(sp).unwrap();
+        state.lock().unwrap().sessions.insert("ts-seen".into(), sess);
+
+        let agent = dispatch_session_viewed(
+            &state,
+            &session_request("session.viewed", serde_json::json!({"uid": "ts-seen"}), "ts-seen"),
+        );
+        assert!(!agent.ok, "agents cannot claim Owner attention");
+        assert!(state.lock().unwrap().owner_seen.is_empty());
+
+        let ok = dispatch_session_viewed(
+            &state,
+            &operator_request("session.viewed", serde_json::json!({"uid": "ts-seen"})),
+        );
+        assert!(ok.ok);
+        assert_eq!(ok.result.unwrap()["known"], true);
+        assert!(state.lock().unwrap().owner_seen.contains_key("ts-seen"));
+
+        let unknown = dispatch_session_viewed(
+            &state,
+            &operator_request("session.viewed", serde_json::json!({"uid": "ts-gone"})),
+        );
+        assert_eq!(unknown.result.unwrap()["known"], false);
+        assert!(!state.lock().unwrap().owner_seen.contains_key("ts-gone"));
+
+        // A revive's result names the uid: the same stamp, so the sweep does
+        // not close a just-revived worker whose task is still done.
+        state.lock().unwrap().owner_seen.clear();
+        note_owner_spawn(
+            &state,
+            &operator_request("session.revive", serde_json::json!({"uid": "ts-seen"})),
+            &serde_json::json!({"session_uid": "ts-seen"}),
+        );
+        assert!(state.lock().unwrap().owner_seen.contains_key("ts-seen"));
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
         }
     }
 

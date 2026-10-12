@@ -156,6 +156,17 @@ pub struct TerminalSession {
     pub host_id: crate::hosts::HostId,
 }
 
+/// Why a session's exit happened, when it was tidy-up rather than a failure:
+/// the daemon's terminal-task sweep closes a done task's idle workers and
+/// names itself in `killed_by`. Without the note the row looks like a crash.
+pub(crate) fn exit_note(last_exit: Option<&cm_daemon::manifest::LastExit>) -> Option<&'static str> {
+    last_exit?
+        .killed_by
+        .as_deref()
+        .filter(|who| who.starts_with("terminal-task-sweep"))
+        .map(|_| "closed: task done")
+}
+
 impl TerminalSession {
     /// Assign a new status while maintaining `idle_since` (the start of
     /// the current idle spell): a genuine Running→Idle flip stamps
@@ -755,6 +766,7 @@ mod manifest_entry_seeded_from_tests {
             global_perms: false,
             seeded_from_snapshot: None,
             last_exit: Some(cm_daemon::manifest::LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(0),
@@ -794,6 +806,7 @@ mod manifest_entry_seeded_from_tests {
     fn last_exit_survives_load_mutate_save_reload_cycle() {
         // Initial state, as a manifest written by the daemon.
         let stored_exit = cm_daemon::manifest::LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(0),
