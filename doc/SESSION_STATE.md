@@ -337,6 +337,8 @@ falling back to semantic idle only without an engine source.
 The terminal-task sweep closes engine idle, errored or waiting-on-human sessions.
 Legacy and unknown sessions must be PTY-quiet. Foreground/background work survives,
 and continuous orchestrators/workflow participants retain their lifecycle exclusions.
+It also spares any session Owner used in the last two hours and waits 15 minutes
+after the task turns terminal (doc/task-worktree-cleanup.md).
 Migration reports include full `agent_state`. Reconciliation hashes omit heartbeat
 observation times and per-job CPU samples; state, turn and inventory changes
 still invalidate the reviewed evidence. Reconciliations recorded before this

@@ -2084,6 +2084,8 @@ impl App {
                             " revive failed",
                             Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
                         ));
+                    } else if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
+                        spans.push(Span::styled(format!(" {note}"), Style::default().fg(theme::DIM)));
                     }
                     if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
                         spans.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
@@ -2942,6 +2944,9 @@ impl App {
                         suffix,
                         Style::default().fg(theme::ERROR),
                     ));
+                }
+                if let Some(note) = cand.note {
+                    spans.push(Span::styled(format!("  {note}"), Style::default().fg(theme::DIM)));
                 }
                 lines.push(Line::from(spans));
             }

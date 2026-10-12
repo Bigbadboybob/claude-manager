@@ -1653,6 +1653,22 @@ pub fn rpc_set_transcript_path(
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
 
+/// `session.viewed` — tell a daemon Owner is looking at `session_uid`
+/// (feeds the terminal-task sweep's owner-activity grace).
+pub fn rpc_session_viewed(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    session_uid: &str,
+) -> anyhow::Result<()> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "session.viewed".into(),
+        params: serde_json::json!({ "uid": session_uid }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
 /// `session.resize` RPC — reliably re-assert a daemon-owned session's
 /// PTY size. Unlike `ClientSession::resize` (which queues a
 /// `{"resize": …}` data frame on the attach stream and silently drops
@@ -2779,6 +2795,7 @@ time.sleep(60)
             global_perms: false,
             seeded_from_snapshot: None,
             last_exit: Some(cm_daemon::manifest::LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: false,
                 kills_file_offset: None,

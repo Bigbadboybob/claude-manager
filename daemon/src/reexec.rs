@@ -2886,6 +2886,7 @@ fn rehydrate_transaction(
                 mw.sessions.iter_mut().find(|e| e.uid == rec.uid)
             {
                 entry.last_exit = Some(crate::manifest::LastExit {
+                    killed_by: None,
                     code: status.code,
                     memory_cap_kill: false,
                     kills_file_offset: None,

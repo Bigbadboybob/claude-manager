@@ -1980,6 +1980,7 @@ mod tests {
             .broadcast(crate::manifest::ManifestDiff::Exited {
                 uid: "ts-t3-victim".into(),
                 last_exit: crate::manifest::LastExit {
+                    killed_by: None,
                     code: Some(1),
                     memory_cap_kill: false,
                     kills_file_offset: None,

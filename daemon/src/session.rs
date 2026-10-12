@@ -947,6 +947,7 @@ impl LastExitProbe {
                 exited_at,
             ),
             None => crate::manifest::LastExit {
+                killed_by: None,
                 code,
                 memory_cap_kill: false,
                 kills_file_offset: None,

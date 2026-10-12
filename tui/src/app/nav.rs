@@ -1927,7 +1927,9 @@ impl App {
             .iter()
             .map(|ts| {
                 let status = if ts.session.exited {
-                    "exited".to_string()
+                    super::model::exit_note(ts.preserved_last_exit.as_ref())
+                        .unwrap_or("exited")
+                        .to_string()
                 } else {
                     match ts.status {
                         SessionStatus::Running => "running".to_string(),
@@ -1951,7 +1953,7 @@ impl App {
     /// when a task resolves (session's `task_id` or the Task cursor's),
     /// the workspace fallback otherwise; Session cursors get an identity
     /// header block on top either way.
-    fn build_peek_lines(&self) -> Vec<PeekLine> {
+    pub(crate) fn build_peek_lines(&self) -> Vec<PeekLine> {
         let mut out: Vec<PeekLine> = Vec::new();
         match &self.cursor {
             Cursor::Session(wi, si) => {
@@ -1968,6 +1970,9 @@ impl App {
                     ts.seeded_from_snapshot.as_deref(),
                     ts.last_delivery.as_ref().map(|(s, _)| s.as_str()),
                 ));
+                if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
+                    out.push(PeekLine::Field { label: "Status".into(), value: note.to_string() });
+                }
                 out.push(PeekLine::Blank);
                 match ts.task_id.as_deref().and_then(|t| self.find_task_entry(t)) {
                     Some(task) => {
