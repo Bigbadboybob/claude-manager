@@ -137,6 +137,12 @@ Unread ordinary posts have a subtle dot; DMs and resolved mentions to Owner have
 stronger indicators. Membership/settings events do not create unread messages or
 wake agents.
 
+**Open alerts.** While agents wait on Owner (`notify_user`), the sidebar starts
+with a pinned **⚑ Open alerts (N)** entry and one row per agent session, oldest
+first: age, label, host (when not local) and the first line of the reason.
+**Enter** on a row closes Messages, jumps to that session (as **Alt+g** does) and
+marks its alert seen. The web board's Alerts screen shows the same list.
+
 **Sidebar.** Channel and DM rows start with a fixed count column, mentions then
 unread (`@2 ●5 #gpu-utilization`); a long name is shortened in the middle, never
 the counts. The sidebar fits the longest name up to 40% of the screen; **<** / **>**

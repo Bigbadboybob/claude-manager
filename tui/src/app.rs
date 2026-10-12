@@ -622,6 +622,9 @@ pub struct App {
     agent_states: HashMap<(crate::hosts::HostId, String), agent_state::AgentStateView>,
     owner_alert_rows: HashSet<String>,
     dismissed_owner_alerts: HashSet<String>,
+    /// When this viewer first saw each open alert (alert id, or `legacy:<uid>`
+    /// for TUI-raised ones): the Messages "Open alerts" ages and order.
+    owner_alert_since: HashMap<String, SystemTime>,
     /// Fingerprint of every open-workspace idle session's `(uid, age
     /// bucket)` set at the last `tick_idle_ages` evaluation. Idle ages only
     /// matter at bucket granularity (afterglow → settled → stale), and an
@@ -1025,6 +1028,7 @@ impl App {
             agent_states: HashMap::new(),
             owner_alert_rows: HashSet::new(),
             dismissed_owner_alerts: HashSet::new(),
+            owner_alert_since: HashMap::new(),
             last_alert_frame: 0,
             idle_bucket_fingerprint: 0,
             last_idle_bucket_check: None,
