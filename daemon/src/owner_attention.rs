@@ -34,6 +34,9 @@ pub struct Alert {
     /// Set when a level change released a held request into delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<String>,
+    /// Original request time; absent for alerts created before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// A held request: the latest per key, plus how many were held in total.
@@ -115,6 +118,9 @@ fn level_now(state: &DaemonState) -> Option<Level> {
 }
 
 fn broadcast(state: &DaemonState, key: &str, alert: Option<&Alert>) {
+    if let Some(sync) = &state.messaging_sync {
+        sync.signal_owner_alerts();
+    }
     // This boundary is reached only for delivered alerts (including releases
     // from the existing availability gate). Web Push is a separate subscriber:
     // it must not count as an attached viewer or change Telegram's policy.
@@ -129,21 +135,6 @@ fn broadcast(state: &DaemonState, key: &str, alert: Option<&Alert>) {
         uid: key.to_owned(),
         entry: json!({"owner_attention": alert}),
     });
-}
-
-/// Local daemon alerts only. Cross-host relay and seen routing is B5b.
-pub fn list(state: &DaemonState, req: &Request) -> Response {
-    match snapshot(state) {
-        Ok(alerts) => {
-            let items: Vec<_> = alerts.into_iter().map(|(key, alert)| {
-                let mut v = serde_json::to_value(alert).unwrap();
-                v["key"] = json!(key); v
-            }).collect();
-            Response::ok(req.id.clone(), json!({"items":items,"seen_supported":true,
-                "scope":"local","scope_label":"cm-manager alerts only"}))
-        }
-        Err(e) => Response::err(req.id.clone(), ErrorCode::Internal, e),
-    }
 }
 
 /// Out-of-band push (`notify_command`, e.g. Telegram) for an emergency, or —
@@ -227,6 +218,7 @@ fn gate(
         return Ok(GateOutcome::Coalesced { alert_id: old.id.clone() });
     }
     alert.urgency = Some(urgency.as_str().into());
+    alert.created_at.get_or_insert_with(now_rfc3339);
     if availability::delivers(level_now(state), urgency) {
         if alerts.len() >= MAX_ENTRIES && !alerts.contains_key(key) {
             return Err("Owner alert queue is full; pending alerts were retained".into());
@@ -578,27 +570,28 @@ pub fn acknowledge(state: &DaemonState, req: &Request) -> Response {
         Ok(p) => p,
         Err(e) => return Response::err(req.id.clone(), ErrorCode::InvalidParams, e.to_string()),
     };
-    let mut alerts = match snapshot(state) {
-        Ok(a) => a,
-        Err(e) => return Response::err(req.id.clone(), ErrorCode::Internal, e),
-    };
-    let matched = alerts
-        .get(&params.session_uid)
-        .is_some_and(|a| a.id == params.alert_id);
-    if matched {
-        alerts.remove(&params.session_uid);
-        if let Err(e) = save(state, &alerts) {
-            return Response::err(req.id.clone(), ErrorCode::Internal, e);
-        }
-        state.manifest_watcher.broadcast(ManifestDiff::Updated {
-            uid: params.session_uid,
-            entry: json!({"owner_attention": null}),
-        });
+    match acknowledge_ids(state, &[(params.session_uid, params.alert_id)]) {
+        Ok(count) => Response::ok(req.id.clone(), json!({"ok":true,"acknowledged":count>0})),
+        Err(e) => Response::err(req.id.clone(), ErrorCode::Internal, e),
     }
-    Response::ok(
-        req.id.clone(),
-        json!({"ok": true, "acknowledged": matched}),
-    )
+}
+
+/// Batch a peer's exact-ID acknowledgements into one durable queue rewrite.
+/// Only delivered alerts are considered; held requests cannot be cleared.
+pub(crate) fn acknowledge_ids(state: &DaemonState, ids: &[(String, String)]) -> Result<usize, String> {
+    let mut alerts = snapshot(state)?;
+    let mut removed = Vec::new();
+    for (key, id) in ids {
+        if alerts.get(key).is_some_and(|a| &a.id == id) {
+            alerts.remove(key);
+            removed.push(key);
+        }
+    }
+    if !removed.is_empty() {
+        save(state, &alerts)?;
+        for key in &removed { broadcast(state, key, None); }
+    }
+    Ok(removed.len())
 }
 
 #[cfg(test)]
@@ -613,6 +606,7 @@ mod tests {
         let mut state = DaemonState::new();
         state.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
         state.messaging_root = dir.path().to_path_buf();
+        std::fs::write(dir.path().join("daemon-id"), uuid::Uuid::new_v4().to_string()).unwrap();
         (dir, Arc::new(Mutex::new(state)))
     }
     /// Write the availability projection the way the messaging store does.
@@ -647,11 +641,11 @@ mod tests {
         feed.flush();
         let page = feed.next(dir.path(),&json!({"wait_ms":0})).unwrap();
         assert_eq!(page["events"].as_array().unwrap().len(),1);
-        let listed = list(&state.lock().unwrap(),&request("owner_attention.list",Caller::session("local"),json!({}))).result.unwrap();
+        let listed = crate::owner_alert_relay::list(&state,&request("owner_attention.list",Caller::operator("test"),json!({}))).result.unwrap();
         let alert = &listed["items"][0];
-        let stale = acknowledge(&state.lock().unwrap(),&request("owner_attention.ack",Caller::session("local"),json!({"session_uid":alert["key"],"alert_id":"stale"})));
+        let stale = crate::owner_alert_relay::acknowledge(&state,&request("owner_attention.ack",Caller::operator("test"),json!({"session_uid":alert["key"],"alert_id":"stale"})));
         assert_eq!(stale.result.unwrap()["acknowledged"],false);
-        acknowledge(&state.lock().unwrap(),&request("owner_attention.ack",Caller::session("local"),json!({"session_uid":alert["key"],"alert_id":alert["id"]})));
+        crate::owner_alert_relay::acknowledge(&state,&request("owner_attention.ack",Caller::operator("test"),json!({"session_uid":alert["key"],"alert_id":alert["id"]})));
         feed.flush();
         assert!(feed.next(dir.path(),&json!({"wait_ms":0,"cursor":page["cursor"]})).unwrap()["events"].as_array().unwrap().is_empty());
         for method in ["owner_attention.list","owner.notifications.next"] {

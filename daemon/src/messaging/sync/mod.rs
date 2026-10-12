@@ -121,6 +121,7 @@ pub struct Runtime {
     views: Mutex<BTreeMap<String, Instant>>,
     /// Negotiated `scoped_backfill` on the current hub connection.
     pub(super) scoped: AtomicBool,
+    owner_alert_version: AtomicU64,
     pub(super) stream_cursor: AtomicU64,
     pub(super) stream_revision: AtomicU64,
     pub(super) backfills: Mutex<BTreeMap<String, BackfillProgress>>,
@@ -168,6 +169,7 @@ impl Runtime {
             pending: Mutex::new(BTreeMap::new()),
             views: Mutex::new(BTreeMap::new()),
             scoped: AtomicBool::new(false),
+            owner_alert_version: AtomicU64::new(0),
             stream_cursor: AtomicU64::new(0),
             stream_revision: AtomicU64::new(1),
             backfills: Mutex::new(BTreeMap::new()),
@@ -189,6 +191,134 @@ impl Runtime {
                 .spawn(move || transport::run_client(cloned))?;
         }
         Ok(Some(runtime))
+    }
+    pub fn signal_owner_alerts(&self) {
+        self.owner_alert_version.fetch_add(1, Ordering::Release);
+        self.signal.signal();
+    }
+    pub(crate) fn owner_alert_hosts<'a>(
+        &self,
+        hosts: impl IntoIterator<Item = &'a String>,
+    ) -> BTreeSet<String> {
+        if self.daemon_id != self.config.coordinator_id {
+            return BTreeSet::new();
+        }
+        let slot = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        hosts
+            .into_iter()
+            .filter(|host| {
+                slot.as_ref()
+                    .is_some_and(|s| s.host_authorized(host, Some("owner")))
+            })
+            .cloned()
+            .collect()
+    }
+    pub(crate) fn peer_connected(&self, host: &str) -> bool {
+        self.peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(host)
+            .is_some_and(|p| !p.closed.load(Ordering::Acquire))
+    }
+    fn alert_snapshot(&self) -> Result<crate::owner_alert_relay::Snapshot> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| error("stopped", "Daemon stopped"))?;
+        let (relay, alerts) = {
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                s.owner_alert_relay.clone(),
+                crate::owner_attention::snapshot(&s).map_err(|e| error("alert_storage", e))?,
+            )
+        };
+        relay
+            .source(
+                &self.root,
+                crate::items::heartbeat::host_label().unwrap_or_else(|| self.daemon_id.clone()),
+                alerts,
+            )
+            .map_err(|e| error("alert_storage", e))
+    }
+    fn accept_alert_snapshot(&self, host: &str, frame: &Value) -> Result<()> {
+        if !self.owner_alert_hosts([&host.to_string()]).contains(host) {
+            return Err(error("unauthorized", "Peer cannot relay Owner alerts"));
+        }
+        let snapshot: crate::owner_alert_relay::Snapshot =
+            serde_json::from_value(frame["snapshot"].clone())?;
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| error("stopped", "Daemon stopped"))?;
+        let (relay, feed) = {
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            (s.owner_alert_relay.clone(), s.owner_notifications.clone())
+        };
+        let added = relay
+            .ingest(&self.root, host, snapshot)
+            .map_err(|e| error("alert_storage", e))?;
+        for alert in added {
+            // The source's delivered queue is the authoritative availability
+            // decision. Never feed held alerts or invent a second gate here.
+            if let Err(e) = feed.publish(
+                &self.root,
+                format!("cm-alert:{host}:{}", alert.id),
+                &alert.label,
+                &alert.message,
+                format!(
+                    "/#alerts&alert={}",
+                    crate::owner_notifications::url_component(&alert.id)
+                ),
+            ) {
+                eprintln!("cm relayed Owner notification: {e}");
+            }
+        }
+        self.signal.signal();
+        Ok(())
+    }
+    fn alert_seen_pending(&self, host: &str) -> Result<Vec<crate::owner_alert_relay::Seen>> {
+        if !self.owner_alert_hosts([&host.to_string()]).contains(host) {
+            return Err(error(
+                "unauthorized",
+                "Peer cannot receive Owner alert Seen",
+            ));
+        }
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| error("stopped", "Daemon stopped"))?;
+        let relay = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .owner_alert_relay
+            .clone();
+        relay
+            .pending(&self.root, host)
+            .map_err(|e| error("alert_storage", e))
+    }
+    fn apply_alert_seen(&self, frame: &Value) -> Result<()> {
+        let pending: Vec<crate::owner_alert_relay::Seen> =
+            serde_json::from_value(frame["items"].clone())?;
+        if pending.len() > 4096
+            || pending.iter().any(|s| {
+                s.key.is_empty() || s.key.len() > 1024 || s.id.is_empty() || s.id.len() > 1024
+            })
+        {
+            return Err(error("invalid_record", "Invalid Owner alert Seen batch"));
+        }
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| error("stopped", "Daemon stopped"))?;
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let ids = pending
+            .into_iter()
+            .map(|seen| (seen.key, seen.id))
+            .collect::<Vec<_>>();
+        crate::owner_attention::acknowledge_ids(&s, &ids).map_err(|e| error("alert_storage", e))?;
+        drop(s);
+        self.signal_owner_alerts();
+        Ok(())
     }
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);

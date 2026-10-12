@@ -9,6 +9,7 @@ struct Network {
 fn state(root: &Path, uid: &str) -> Arc<Mutex<DaemonState>> {
     let mut state = DaemonState::default();
     state.messaging_root = root.into();
+    state.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
     state.tui_sessions.insert(
         uid.into(),
         serde_json::from_value(json!({"uid":uid,"label":"default"})).unwrap(),
@@ -989,7 +990,7 @@ fn messaging_sync_legacy_replica_keeps_single_cursor_protocol() {
     let next = loop {
         let frame = receive_frame(&mut socket);
         assert!(
-            !matches!(frame["kind"].as_str(), Some("backfill" | "backfills")),
+            !matches!(frame["kind"].as_str(), Some("backfill" | "backfills" | "owner_alert_seen")),
             "{frame}"
         );
         if frame["kind"] == "batch" && frame["revision"].as_u64().unwrap() > 1 {
@@ -1022,7 +1023,7 @@ fn messaging_sync_scoped_replica_falls_back_with_a_legacy_hub() {
     let (mut hub, _) = listener.accept().unwrap();
     hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let hello = receive_frame(&mut hub);
-    assert_eq!(hello["features"], json!([FEATURE]));
+    assert_eq!(hello["features"], json!([FEATURE, transport::FEATURE_ALERTS]));
     // A hub from before the feature answers with the old hello shape.
     send_frame(
         &mut hub,
@@ -1111,4 +1112,244 @@ fn messaging_sync_probe_large_channel_join_timing() {
         started.elapsed()
     );
     assert!(all_present(b, &ids));
+}
+
+#[test]
+fn messaging_sync_owner_alert_relay_offline_seen_restart_newer_id_and_scope() {
+    let n = Network::new();
+    let a = &n.clients[0];
+    let request = |method: &str, params: Value| Request {
+        id: "alerts".into(),
+        method: method.into(),
+        caller: Caller::operator("test"),
+        params,
+    };
+    let notify = |s: &Arc<Mutex<DaemonState>>, msg: &str| {
+        let req = Request {
+            id: "notify".into(),
+            method: "notify_user".into(),
+            caller: Caller::session("client-0"),
+            params: json!({"message":msg}),
+        };
+        let reply = crate::owner_attention::notify(&s.lock().unwrap(), &req);
+        assert!(reply.ok, "{reply:?}");
+        reply.result.unwrap()["alert_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let list = || {
+        crate::owner_alert_relay::list(&n.hub, &request("owner_attention.list", json!({})))
+            .result
+            .unwrap()
+    };
+    let aid = with_store(a, |s| s.daemon_id.clone());
+    let first = notify(a, "First review");
+    wait_for(|| {
+        list()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == first)
+    });
+    let page = list();
+    let row = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == first)
+        .unwrap();
+    assert_eq!(row["origin_host"], aid);
+    assert_eq!(row["origin_key"], "client-0");
+    assert!(row["created_at"].is_string());
+    assert_eq!(page["alert_hosts"].as_array().unwrap().len(), 3);
+    let key = row["key"].as_str().unwrap().to_owned();
+    let feed = { n.hub.lock().unwrap().owner_notifications.clone() };
+    feed.flush();
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let events = feed.next(&root, &json!({"wait_ms":0})).unwrap();
+    assert_eq!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["id"] == format!("cm-alert:{aid}:{first}"))
+            .count(),
+        1
+    );
+    let runtime = a.lock().unwrap().messaging_sync.take().unwrap();
+    runtime.stop();
+    let seen = crate::owner_alert_relay::acknowledge(
+        &n.hub,
+        &request(
+            "owner_attention.ack",
+            json!({"session_uid":key,"alert_id":first}),
+        ),
+    );
+    assert!(seen.ok);
+    assert_eq!(seen.result.unwrap()["pending_origin"], true);
+    assert!(list()["items"].as_array().unwrap().is_empty());
+    // Reload hub state exactly as a brain restart, retaining durable Seen.
+    n.hub.lock().unwrap().owner_alert_relay = Arc::new(crate::owner_alert_relay::Relay::default());
+    assert!(list()["items"].as_array().unwrap().is_empty());
+    let second = notify(a, "New review while source offline");
+    start(a);
+    wait_for(|| {
+        list()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == second)
+    });
+    assert_eq!(
+        crate::owner_attention::snapshot(&a.lock().unwrap()).unwrap()["client-0"].id,
+        second
+    );
+    let stale = crate::owner_alert_relay::acknowledge(
+        &n.hub,
+        &request(
+            "owner_attention.ack",
+            json!({"session_uid":key,"alert_id":first}),
+        ),
+    );
+    assert_eq!(stale.result.unwrap()["acknowledged"], false);
+    let seen = crate::owner_alert_relay::acknowledge(
+        &n.hub,
+        &request(
+            "owner_attention.ack",
+            json!({"session_uid":key,"alert_id":second}),
+        ),
+    );
+    assert!(seen.ok);
+    wait_for(|| {
+        crate::owner_attention::snapshot(&a.lock().unwrap())
+            .unwrap()
+            .is_empty()
+    });
+    wait_for(|| {
+        n.hub
+            .lock()
+            .unwrap()
+            .owner_alert_relay
+            .pending(&root, &aid)
+            .unwrap()
+            .is_empty()
+    });
+    // Held requests never enter the relay; release keeps original request time.
+    let source_root = a.lock().unwrap().messaging_root.clone();
+    let projection = crate::owner_availability::projection_path(&source_root);
+    fs::create_dir_all(projection.parent().unwrap()).unwrap();
+    fs::write(
+        &projection,
+        json!({"level":"away","event_id":"hold-test","changed_at":"2026-10-12T23:00:00Z"})
+            .to_string(),
+    )
+    .unwrap();
+    let held = notify(a, "Held review");
+    let source_runtime = { a.lock().unwrap().messaging_sync.clone().unwrap() };
+    assert!(source_runtime.alert_snapshot().unwrap().alerts.is_empty());
+    assert!(list()["items"].as_array().unwrap().is_empty());
+    let original = crate::owner_attention::held_snapshot(&a.lock().unwrap()).unwrap()["client-0"]
+        .alert
+        .created_at
+        .clone();
+    fs::write(
+        &projection,
+        json!({"level":"focused","event_id":"release-test","changed_at":"2026-10-12T23:00:00Z"})
+            .to_string(),
+    )
+    .unwrap();
+    crate::owner_attention::release_for_level(
+        &a.lock().unwrap(),
+        Some(crate::owner_availability::Level::Focused),
+    )
+    .unwrap();
+    wait_for(|| {
+        list()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == held)
+    });
+    assert_eq!(
+        crate::owner_attention::snapshot(&a.lock().unwrap()).unwrap()["client-0"].created_at,
+        original
+    );
+    crate::owner_attention::withdraw(&a.lock().unwrap(), "client-0", &held).unwrap();
+    wait_for(|| list()["items"].as_array().unwrap().is_empty());
+    let third = notify(a, "Check enrollment scope");
+    wait_for(|| {
+        list()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == third)
+    });
+    with_store(&n.hub, |s| {
+        s.register_host(&aid, false, false, &[]).unwrap()
+    });
+    assert!(list()["items"].as_array().unwrap().is_empty());
+    let denied = crate::owner_alert_relay::acknowledge(
+        &n.hub,
+        &request(
+            "owner_attention.ack",
+            json!({"session_uid":key,"alert_id":third}),
+        ),
+    );
+    assert!(!denied.ok);
+    let runtime = n.hub.lock().unwrap().messaging_sync.clone().unwrap();
+    assert!(runtime
+        .accept_alert_snapshot(&aid, &json!({"snapshot":{}}))
+        .is_err());
+}
+
+#[test]
+fn messaging_sync_owner_alert_feature_requires_owner_access_and_rejects_unnegotiated_frames() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    b.lock().unwrap().messaging_sync.take().unwrap().stop();
+    let local_root = b.lock().unwrap().messaging_root.clone();
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let config = Config::load(&local_root).unwrap().unwrap();
+    let token = fs::read_to_string(config.token_file.unwrap()).unwrap();
+    let (host, space) = with_store(b, |s| (s.daemon_id.clone(), s.space_id.clone()));
+    fs::write(root.join("messaging-peers").join(format!("{host}.json")),json!({"active":true,"owner_access":false,"token_sha256":transport::digest(token.trim().as_bytes())}).to_string()).unwrap();
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(root.join("messaging-sync.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    send_frame(
+        &mut socket,
+        &json!({"kind":"hello","daemon_id":host,"space_id":space,"token":token,"people":[],"interests":[],"resume":null,"features":[transport::FEATURE_ALERTS]}),
+    );
+    let hello = receive_frame(&mut socket);
+    assert!(hello["features"].is_null(), "{hello}");
+    send_frame(
+        &mut socket,
+        &json!({"kind":"owner_alert_snapshot","snapshot":{}}),
+    );
+    // The unexpected feature frame closes the authenticated but unprivileged link.
+    use std::io::Read;
+    let mut header = [0; 4];
+    loop {
+        match socket.read_exact(&mut header) {
+            Ok(()) => {
+                let len = u32::from_be_bytes(header) as usize;
+                assert!(len <= 4 * 1024 * 1024);
+                let mut data = vec![0; len];
+                socket.read_exact(&mut data).unwrap();
+            }
+            Err(e) => {
+                assert!(
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "{e}"
+                );
+                break;
+            }
+        }
+    }
 }

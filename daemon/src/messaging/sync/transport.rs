@@ -54,7 +54,7 @@ fn unmarshal_error(v: &Value) -> ChatError {
 #[derive(Clone)]
 pub(super) struct PeerConnection {
     writer: Writer,
-    closed: Arc<AtomicBool>,
+    pub(super) closed: Arc<AtomicBool>,
     shutdown: Arc<dyn Fn() + Send + Sync>,
 }
 impl PeerConnection {
@@ -219,6 +219,8 @@ fn authenticate(runtime: &Runtime, hello: &Value) -> Result<(String, bool, bool)
 /// on; the main stream carries that scope only after the backfill's fixed
 /// `through` position. Shrinking the set never replays anything.
 pub(super) const FEATURE_SCOPED: &str = "scoped_backfill";
+/// Optional delivered-alert snapshot and exact-ID Seen frames; Owner hosts only.
+pub(super) const FEATURE_ALERTS: &str = "owner_alerts_v1";
 /// Bulk page bounds `(records, bytes)` on scoped connections. Each page costs
 /// an acknowledgement round trip over SSH; a 4 MiB frame comfortably carries
 /// 2 MiB of records plus framing.
@@ -516,6 +518,7 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
     }
     let initial: BTreeSet<String> = serde_json::from_value(hello["interests"].clone())?;
     let scoped = has_feature(&hello, FEATURE_SCOPED);
+    let alerts = owner_access && has_feature(&hello, FEATURE_ALERTS);
     let (generation, subscription, live_start) = {
         let slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
         let store = slot.as_ref().unwrap();
@@ -572,8 +575,15 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
         .unwrap_or_else(|p| p.into_inner())
         .cursor;
     let mut reply = json!({"kind":"hello","coordinator_id":runtime.daemon_id,"space_id":runtime.config.space_id,"generation":generation,"cursor":cursor,"revision":1});
+    let mut features = Vec::new();
     if scoped {
-        reply["features"] = json!([FEATURE_SCOPED]);
+        features.push(FEATURE_SCOPED);
+    }
+    if alerts {
+        features.push(FEATURE_ALERTS);
+    }
+    if !features.is_empty() {
+        reply["features"] = json!(features);
     }
     write_frame(&link.connection.writer, &reply)?;
     if let Some(old) = runtime
@@ -591,7 +601,7 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
     thread::Builder::new()
         .name("cm-chat-peer-push".into())
         .spawn(move || {
-            if let Err(e) = push_loop(&cloned, &peer, &conn, &sub, live_start) {
+            if let Err(e) = push_loop(&cloned, &peer, &conn, &sub, live_start, alerts) {
                 eprintln!("cm messaging push: {e}");
             }
             conn.close();
@@ -603,6 +613,14 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
         {
             let frame = read_frame(link.reader.as_mut())?;
             match frame["kind"].as_str().unwrap_or("") {
+                "owner_alert_snapshot" if alerts => {
+                    let current = runtime.peers.lock().unwrap_or_else(|p| p.into_inner())
+                        .get(&host).is_some_and(|c| Arc::ptr_eq(&c.closed, &link.connection.closed));
+                    if !current {
+                        return Err(error("stale_connection", "Replaced alert peer connection"));
+                    }
+                    runtime.accept_alert_snapshot(&host, &frame)?;
+                }
                 "ack" => {
                     let cursor = frame["cursor"]
                         .as_u64()
@@ -889,23 +907,45 @@ fn serve_revoked(runtime: &Arc<Runtime>, host: &str, owner: bool, link: &mut Lin
     }
     Ok(())
 }
+fn push_alert_seen(
+    runtime: &Runtime,
+    host: &str,
+    conn: &PeerConnection,
+    last: &mut Value,
+) -> Result<()> {
+    let items = json!(runtime.alert_seen_pending(host)?);
+    if *last != items {
+        write_frame(
+            &conn.writer,
+            &json!({"kind":"owner_alert_seen","items":items}),
+        )?;
+        *last = items;
+    }
+    Ok(())
+}
+
 fn push_loop(
     runtime: &Arc<Runtime>,
     host: &str,
     conn: &PeerConnection,
     subscription: &Arc<Mutex<Subscription>>,
     mut live_cursor: u64,
+    alerts: bool,
 ) -> Result<()> {
     if subscription
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .scoped
     {
-        return push_loop_scoped(runtime, host, conn, subscription, live_cursor);
+        return push_loop_scoped(runtime, host, conn, subscription, live_cursor, alerts);
     }
     let mut last_owner = Value::Null;
+    let mut last_seen = Value::Null;
     while !conn.closed.load(Ordering::Acquire) && !runtime.stopped.load(Ordering::Acquire) {
         let signal = runtime.signal.version();
+        if alerts {
+            push_alert_seen(runtime, host, conn, &mut last_seen)?;
+        }
         let (interests, previous_resolved, revision, cursor, dependency_offset, inflight) = {
             let sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -1004,10 +1044,15 @@ fn push_loop_scoped(
     conn: &PeerConnection,
     subscription: &Arc<Mutex<Subscription>>,
     mut live_cursor: u64,
+    alerts: bool,
 ) -> Result<()> {
     let mut last_owner = Value::Null;
+    let mut last_seen = Value::Null;
     while !conn.closed.load(Ordering::Acquire) && !runtime.stopped.load(Ordering::Acquire) {
         let signal = runtime.signal.version();
+        if alerts {
+            push_alert_seen(runtime, host, conn, &mut last_seen)?;
+        }
         let mut frames = Vec::new();
         let idle = {
             let slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -1209,7 +1254,7 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
     runtime.scoped.store(false, Ordering::Release);
     write_frame(
         &link.connection.writer,
-        &json!({"kind":"hello","daemon_id":runtime.daemon_id,"space_id":runtime.config.space_id,"token":token.trim(),"people":runtime.local_people(),"interests":interests,"resume":resume,"features":[FEATURE_SCOPED],"coverage_generation":coverage_generation,"coverage":coverage}),
+        &json!({"kind":"hello","daemon_id":runtime.daemon_id,"space_id":runtime.config.space_id,"token":token.trim(),"people":runtime.local_people(),"interests":interests,"resume":resume,"features":[FEATURE_SCOPED,FEATURE_ALERTS],"coverage_generation":coverage_generation,"coverage":coverage}),
     )?;
     let hello = read_frame(link.reader.as_mut())?;
     if hello["kind"] == "error" {
@@ -1233,6 +1278,7 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
         .map_err(|_| error("invalid_cursor", "Invalid hub generation"))?;
     drop(handshake_done);
     let scoped = has_feature(&hello, FEATURE_SCOPED);
+    let alerts = has_feature(&hello, FEATURE_ALERTS) && hello["revoked"] != true;
     runtime.scoped.store(scoped, Ordering::Release);
     let inflight = Arc::new(Mutex::new(BTreeSet::<String>::new()));
     runtime
@@ -1281,6 +1327,7 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
                 &uploading,
                 &generation,
                 initial_cursor,
+                alerts,
             );
             if let Err(e) = result {
                 if !cloned.stopped.load(Ordering::Acquire) {
@@ -1308,9 +1355,25 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
     let result = (|| {
         let mut last_interests = interests;
         let mut last_ping = Instant::now();
+        let mut last_alert_version = None;
+        let mut last_alert_snapshot = None;
+        let mut last_alert_check = Instant::now();
         while !runtime.stopped.load(Ordering::Acquire) && !connection.closed.load(Ordering::Acquire)
         {
             let version = runtime.signal.version();
+            let alert_version = runtime.owner_alert_version.load(Ordering::Acquire);
+            if alerts && (last_alert_version != Some(alert_version)
+                || last_alert_check.elapsed() >= Duration::from_secs(10))
+            {
+                let snapshot = runtime.alert_snapshot()?;
+                if last_alert_snapshot.as_ref() != Some(&snapshot) {
+                    write_frame(&connection.writer,
+                        &json!({"kind":"owner_alert_snapshot","snapshot":snapshot}))?;
+                    last_alert_snapshot = Some(snapshot);
+                }
+                last_alert_version = Some(alert_version);
+                last_alert_check = Instant::now();
+            }
             let interests = runtime.interests();
             if interests != last_interests {
                 let mut frame = json!({"kind":"interests","interests":interests});
@@ -1407,6 +1470,7 @@ fn client_reader(
     inflight: &Arc<Mutex<BTreeSet<String>>>,
     generation: &str,
     initial_cursor: u64,
+    alerts: bool,
 ) -> Result<()> {
     let mut cursor = initial_cursor;
     let mut revision = 1;
@@ -1416,6 +1480,9 @@ fn client_reader(
             return Ok(());
         }
         match frame["kind"].as_str().unwrap_or("") {
+            "owner_alert_seen" if alerts => {
+                runtime.apply_alert_seen(&frame)?;
+            }
             "live" => {
                 let items = frame["items"]
                     .as_array()

@@ -161,7 +161,7 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Option<Snapshot> {
 }
 
 /// This machine's name for the board's host column.
-fn host_label() -> Option<String> {
+pub(crate) fn host_label() -> Option<String> {
     let from_env = std::env::var("HOSTNAME").ok();
     let from_file = || std::fs::read_to_string("/etc/hostname").ok();
     let from_libc = || {
