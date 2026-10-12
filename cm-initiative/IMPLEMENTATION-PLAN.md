@@ -323,3 +323,11 @@ Deploy-procedure additions for this batch:
   - rotate the 6.2 GB claude-manager.log;
   - steady-state brain CPU;
   - unknown cause of the cm-manager .venv loss.
+
+## Batch 4 (2026-10-12): session restore + sweep grace
+
+Trigger: Native-Rollout-Perf was closed by the terminal-task sweep 4 min after its task went done; A-O refused cloud workspaces. Spec: `~/.local/share/swarm-coord/batch4/SPEC-restore-sweep.md`.
+- S1 (msgfix) 96a5cda → main a984638: A-O revives cloud tombstones via `session.revive`, reopens a done task, reopened workspaces are exempt from auto-close. TUI only.
+- S2 (items) 2176bd6 → main a252cdf: sweep spares sessions Owner typed into / viewed (`session.viewed`) / revived in the last 2h, waits 15 min after done, `LastExit.killed_by` → "closed: task done".
+- Deployed a252cdf to cm-manager (epoch 32, 70 sessions) and cm-sessions (epoch 18, 34 sessions); exe sha e25185af…; 5-min watch 30/30. Laptop release staged: `daemon-a252cdfcde0a` (daemon + TUI).
+- Follow-up: planning A-l into an existing remote workspace still refuses (needs daemon-side spawn). Deploy recipe note: preflight is `/opt/cm-daemon/cm-daemon --daemon-preflight`, not server.py.
