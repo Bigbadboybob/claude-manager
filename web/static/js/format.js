@@ -151,3 +151,15 @@ export function groupAlerts(alerts) {
     };
   }).sort((x, y) => x.since.localeCompare(y.since));
 }
+
+/** Alerts minus those acknowledged locally (`seen`: id -> ms). An entry is
+ *  forgotten once the server stops listing that alert, or after `ttlMs` in
+ *  case it never does; until then a refresh that raced the acknowledgement
+ *  cannot bring the row back. Mutates `seen` (pruning). */
+export function withoutSeenAlerts(items, seen, nowMs, ttlMs = 120_000) {
+  const listed = new Set((items || []).map((a) => a.id));
+  for (const [id, at] of seen) {
+    if (!listed.has(id) || nowMs - at > ttlMs) seen.delete(id);
+  }
+  return (items || []).filter((a) => !seen.has(a.id));
+}
