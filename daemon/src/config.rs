@@ -406,6 +406,14 @@ impl Default for SchedulerConfig {
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Project Claude presence into the legacy idle boolean. Disable and call
+    /// daemon.reload_config to restore PTY-based idle while keeping agent_state.
+    #[serde(default = "default_presence_idle_enabled")]
+    pub presence_idle_enabled: bool,
+    /// Gate workflow transcript-idle transitions on engine state after rollout
+    /// soak. Hot reloadable; off until deliberately enabled.
+    #[serde(default)]
+    pub workflow_state_gate: bool,
     /// Absolute path to `mcp_server/server.py`. The daemon
     /// injects this into every agent's `CM_MCP_SERVER` env so
     /// the agent's MCP runtime knows where to find the
@@ -480,7 +488,16 @@ pub struct DaemonConfig {
     /// logged and nothing was pushed.
     #[serde(default)]
     pub notify_command: Option<String>,
+    /// Launch Codex sessions with `--no-alt-screen` (inline mode) so their
+    /// history lands in the viewer's scrollback. Default on; set `false` and
+    /// `daemon.reload_config` if inline rendering misbehaves. Takes effect on
+    /// the next Codex spawn or A-R revive, never on a running session.
+    #[serde(default = "default_codex_inline_scrollback")]
+    pub codex_inline_scrollback: bool,
 }
+
+fn default_presence_idle_enabled() -> bool { true }
+fn default_codex_inline_scrollback() -> bool { true }
 
 impl DaemonConfig {
     /// Effective clone directory: the configured `repos_dir`, or the
@@ -500,6 +517,8 @@ impl DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            presence_idle_enabled: default_presence_idle_enabled(),
+            workflow_state_gate: false,
             mcp_server_path: String::new(),
             api_url: String::new(),
             api_token: String::new(),
@@ -512,6 +531,7 @@ impl Default for DaemonConfig {
             repos: Vec::new(),
             scheduler: SchedulerConfig::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
         }
     }
 }
@@ -786,6 +806,8 @@ mode = "ssh-trust"
     #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            presence_idle_enabled: false,
+            workflow_state_gate: true,
             mcp_server_path: "/opt/x.py".into(),
             api_url: "http://h:8000".into(),
             api_token: "tok".into(),
@@ -803,11 +825,14 @@ mode = "ssh-trust"
             }],
             scheduler: SchedulerConfig::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
         };
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =
             toml::from_str(&toml_text).expect("de");
         assert_eq!(reparsed.mcp_server_path, original.mcp_server_path);
+        assert_eq!(reparsed.presence_idle_enabled, original.presence_idle_enabled);
+        assert_eq!(reparsed.workflow_state_gate, original.workflow_state_gate);
         assert_eq!(reparsed.api_url, original.api_url);
         assert_eq!(reparsed.api_token, original.api_token);
         assert_eq!(reparsed.log_path, original.log_path);

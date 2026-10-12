@@ -318,6 +318,9 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "sidebar.list",
     "get_initiative",
     "backtest.result",
+    "board.read",
+    "board.owner_blocked",
+    "usage.read",
     "continuous.list",
     "continuous.context",
     "continuous.dispatch_pending",
@@ -406,7 +409,15 @@ pub fn dispatch_request(
         "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.read" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.send" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.send" => {
+            let response = crate::messaging::rpc::dispatch(state, req);
+            // Board freshness: a holder naming `#N` touches the item
+            // (queued, best effort; never delays or changes the send).
+            if let (true, Caller::Session(c), Some(reply)) = (response.ok, &req.caller, &response.result) {
+                crate::items::chat::on_send(state, &c.session_uid, &req.params, reply);
+            }
+            DispatchOutcome::Done(response)
+        }
         "messaging.dms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.people" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.channels" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
@@ -415,6 +426,9 @@ pub fn dispatch_request(
         "messaging.monitor" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.availability" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.counts" | "messaging.mark_read" | "messaging.react" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.attention" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "sidebar.list" | "sidebar.assign" => {
             if matches!(req.caller, Caller::Operator(_)) {
@@ -443,6 +457,20 @@ pub fn dispatch_request(
             }
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             DispatchOutcome::Done(crate::owner_attention::acknowledge(&s, req))
+        }
+        "owner_attention.escalate" => {
+            if let Err(resp) = require_operator(req, "Owner attention escalation is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::escalate_rpc(&s, req))
+        }
+        "owner_attention.withdraw" => {
+            if let Err(resp) = require_operator(req, "Owner attention withdrawal is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::withdraw_rpc(&s, req))
         }
         // Reads the caller's session (when known) to report its own scope.
         "ping" => DispatchOutcome::Done(dispatch_ping(state, req)),
@@ -613,6 +641,17 @@ pub fn dispatch_request(
         "session.turn_ended" => {
             DispatchOutcome::Done(dispatch_session_turn_ended(state, req))
         }
+        "session.agent_report" => {
+            let caller_uid = match &req.caller {
+                Caller::Operator(_) => None,
+                Caller::Session(s) => Some(s.session_uid.as_str()),
+            };
+            let response = match methods::session_agent_report(state, &req.params, caller_uid) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+            };
+            DispatchOutcome::Done(response)
+        }
 
         // Sub-2b-1 review #1: TUI pushes the discovered
         // transcript path post-detection so the resolver can
@@ -644,6 +683,7 @@ pub fn dispatch_request(
         "session.revive" => {
             DispatchOutcome::Done(dispatch_session_revive(state, req))
         }
+        "session.viewed" => DispatchOutcome::Done(dispatch_session_viewed(state, req)),
 
         // Sub-2b-2: `propose_task` — daemon-side HTTP forwarder
         // to the planning API. Both Operator and Session callers
@@ -784,6 +824,25 @@ pub fn dispatch_request(
         "backtest.submit" => DispatchOutcome::Done(dispatch_backtest_submit(state, req)),
         "backtest.result" => DispatchOutcome::Done(dispatch_backtest_result(state, req)),
 
+        // Work items and boards (doc/items-board.md): Session + Operator
+        // callable proxies to the planning API. The daemon stamps the
+        // caller's participant id as the actor and resolves holder names;
+        // editing rights are checked in `items::rpc`.
+        // Usage recording (doc/usage-recording.md): this host's samples.
+        "usage.read" => DispatchOutcome::Done(
+            if let Some(resp) = reject_forged_operator(req) {
+                resp
+            } else {
+                match crate::usage::read_rpc(state, &req.params) {
+                    Ok(value) => Response::ok(req.id.clone(), value),
+                    Err(error) => Response::err(req.id.clone(), ErrorCode::InvalidParams, error),
+                }
+            },
+        ),
+        "item.create" | "item.set" | "item.resolve" | "board.read" | "board.owner_blocked" => {
+            DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
+        }
+
         // remote-session-execution Phase 1: Operator-only daemon RPCs
         // that resolve every path on the daemon's own filesystem, so the
         // TUI can run interactive `A-n` / `A-s` against a REMOTE host.
@@ -827,6 +886,9 @@ pub fn dispatch_request(
         "add_session" | "session.resume" => {
             DispatchOutcome::Done(dispatch_add_session(state, req))
         }
+        // Fork into new task: Operator (TUI A-F) or Session (MCP
+        // `fork_session`, scoped to sources the caller can reach).
+        "session.fork" => DispatchOutcome::Done(dispatch_session_fork(state, req)),
 
         // Continuous Tasks Phase 2 (DESIGN_CONTINUOUS_TASKS.md §8) — the
         // trigger funnel + continuous-task CRUD. `trigger` is bimodal
@@ -916,7 +978,10 @@ fn dispatch_start_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
         return resp;
     }
     match methods::start_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1013,6 +1078,25 @@ fn dispatch_mcp_start_session(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::mcp_start_session(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.fork` — Operator frames must carry a valid operator token;
+/// Session callers are scoped in the method body (source reachable,
+/// explicit parent within the caller's task tree).
+fn dispatch_session_fork(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => {
+            if let Err(resp) = require_operator(req, "session.fork requires an authenticated Operator") {
+                return resp;
+            }
+            None
+        }
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::session_fork(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1161,7 +1245,10 @@ fn dispatch_create_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
         return resp;
     }
     match methods::create_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1181,7 +1268,10 @@ fn dispatch_add_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.resume requires resume_id");
     }
     match methods::add_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1402,7 +1492,13 @@ fn dispatch_report_done(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return resp;
     }
     match methods::report_done(state, &req.caller, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(mut value) => {
+            // Items the caller still holds (best effort, bounded; never fails).
+            if let Some(uid) = req.caller.session_uid() {
+                crate::items::held::attach(state, uid, &mut value);
+            }
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1711,6 +1807,41 @@ fn dispatch_set_global_perms(
     }
 }
 
+/// An Operator spawn, revive or resume is Owner using that session: stamp it
+/// so the terminal-task sweep does not close it again moments later (the
+/// 2026-10-12 revive that had to reopen its task first).
+fn note_owner_spawn(state: &Arc<Mutex<DaemonState>>, req: &Request, result: &serde_json::Value) {
+    if !matches!(req.caller, Caller::Operator(_)) {
+        return;
+    }
+    let uid = ["session_uid", "uid"]
+        .iter()
+        .find_map(|k| result.get(*k).or_else(|| req.params.get(*k)))
+        .and_then(serde_json::Value::as_str);
+    if let Some(uid) = uid {
+        state.lock().unwrap_or_else(|p| p.into_inner()).note_owner_activity(uid);
+    }
+}
+
+/// `session.viewed {uid}` — the TUI reports the session it is showing (on
+/// focus and every few minutes while it stays shown). Operator-only; feeds
+/// the terminal-task sweep's owner-activity grace. Unknown uids are accepted
+/// and ignored: a viewer may lag the registry.
+fn dispatch_session_viewed(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "session.viewed is Operator-callable only") {
+        return resp;
+    }
+    let Some(uid) = req.params.get("uid").and_then(serde_json::Value::as_str) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.viewed requires uid");
+    };
+    let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+    let known = guard.sessions.contains_key(uid);
+    if known {
+        guard.note_owner_activity(uid);
+    }
+    Response::ok(req.id.clone(), serde_json::json!({ "uid": uid, "known": known }))
+}
+
 /// `session.revive` — operator-triggered resurrection of an exited
 /// session at its same uid (see `methods::revive_session`).
 /// Operator-only: the revive re-applies the persisted identity
@@ -1729,7 +1860,10 @@ fn dispatch_session_revive(
         return resp;
     }
     match methods::revive_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -2538,6 +2672,7 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
             eprintln!("cm-daemon: {e}; sidebar requests unavailable in snapshot");
         }).ok(),
         "owner_attention": owner_attention,
+        "agent_states": crate::agent_state::snapshot(state),
         "workspaces": state.workspaces,
         "bindings": state.bindings,
         "messaging_names": state.messaging_names,
@@ -2776,6 +2911,7 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             // round-trip. An unknown uid (e.g. post-restart) still
             // pongs, with `global_perms=false` and null scope.
             let st = state.lock().unwrap_or_else(|p| p.into_inner());
+            let messaging_root = st.messaging_root.clone();
             let (
                 global_perms,
                 task_id,
@@ -2808,6 +2944,10 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     }
                     None => (false, None, None, None, None, None, None, None, None),
                 };
+            drop(st);
+            // Owner availability from the messaging store's projection: a
+            // small local file, so ping stays lock-free and network-free.
+            let owner_availability = crate::owner_availability::exposure(&messaging_root);
             Response::ok(
                 req.id.clone(),
                 serde_json::json!({
@@ -2823,6 +2963,7 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     "workflow_role": workflow_role,
                     "managed_by_session_id": managed_by_session_id,
                     "worktree_path": worktree_path,
+                    "owner_availability": owner_availability,
                 }),
             )
         }
@@ -2853,6 +2994,50 @@ mod tests {
             caller: Caller::operator("op-default"),
             method: method.into(),
             params,
+        }
+    }
+
+    #[test]
+    fn session_viewed_stamps_owner_activity_for_operators_only() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut sp = crate::session::SpawnParams::new("ts-seen", "seen", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        let sess = crate::session::DaemonSession::spawn(sp).unwrap();
+        state.lock().unwrap().sessions.insert("ts-seen".into(), sess);
+
+        let agent = dispatch_session_viewed(
+            &state,
+            &session_request("session.viewed", serde_json::json!({"uid": "ts-seen"}), "ts-seen"),
+        );
+        assert!(!agent.ok, "agents cannot claim Owner attention");
+        assert!(state.lock().unwrap().owner_seen.is_empty());
+
+        let ok = dispatch_session_viewed(
+            &state,
+            &operator_request("session.viewed", serde_json::json!({"uid": "ts-seen"})),
+        );
+        assert!(ok.ok);
+        assert_eq!(ok.result.unwrap()["known"], true);
+        assert!(state.lock().unwrap().owner_seen.contains_key("ts-seen"));
+
+        let unknown = dispatch_session_viewed(
+            &state,
+            &operator_request("session.viewed", serde_json::json!({"uid": "ts-gone"})),
+        );
+        assert_eq!(unknown.result.unwrap()["known"], false);
+        assert!(!state.lock().unwrap().owner_seen.contains_key("ts-gone"));
+
+        // A revive's result names the uid: the same stamp, so the sweep does
+        // not close a just-revived worker whose task is still done.
+        state.lock().unwrap().owner_seen.clear();
+        note_owner_spawn(
+            &state,
+            &operator_request("session.revive", serde_json::json!({"uid": "ts-seen"})),
+            &serde_json::json!({"session_uid": "ts-seen"}),
+        );
+        assert!(state.lock().unwrap().owner_seen.contains_key("ts-seen"));
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
         }
     }
 
@@ -3497,11 +3682,14 @@ mod tests {
         assert_eq!(result["workflow_role"], serde_json::Value::Null);
         assert_eq!(result["managed_by_session_id"], serde_json::Value::Null);
         assert_eq!(result["worktree_path"], serde_json::Value::Null);
+        // Owner availability is always present; unset until Owner picks a level.
+        assert!(result["owner_availability"]["set"].is_boolean());
+        assert!(result["owner_availability"].get("level").is_some());
         assert_eq!(
             result.as_object().map(|o| o.len()),
-            Some(12),
-            "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context. \
-             Any other key drift would be a client-visible change.",
+            Some(13),
+            "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context, \
+             owner_availability. Any other key drift would be a client-visible change.",
         );
     }
 
@@ -9591,6 +9779,8 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                presence_idle_enabled: true,
+                workflow_state_gate: false,
                 mcp_server_path: String::new(),
                 api_url: cfg_url.clone(),
                 api_token: "cfg-tok-threaded".into(),
@@ -9603,6 +9793,7 @@ mod tests {
                 repos: Vec::new(),
                 scheduler: Default::default(),
                 notify_command: None,
+                codex_inline_scrollback: true,
             };
         }
         let resp = dispatch_request(
@@ -9650,6 +9841,8 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+            presence_idle_enabled: true,
+            workflow_state_gate: false,
             mcp_server_path: String::new(),
             api_url: format!("http://127.0.0.1:{}", port),
             api_token: "bt-test-token".into(),
@@ -9662,6 +9855,7 @@ mod tests {
             repos: Vec::new(),
             scheduler: Default::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
         };
     }
 

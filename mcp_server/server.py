@@ -9,6 +9,7 @@ import re
 import socket
 import sys
 import time
+import uuid
 
 # Optional: full JSON-Schema validation for the `schema=` structured-output
 # option on the spawn-and-run / send-and-wait tools. Absent on the lean
@@ -45,6 +46,7 @@ except ModuleNotFoundError:
                 "(headless/remote host). Workflow and session tools are unaffected."
             )
 
+from mcp_server.launch_confirmation import await_launch_confirmation as _await_launch_confirmation
 from mcp_server import control_client
 from mcp_server.transcripts.types import Role
 # Session status + transcript-tail helpers and the multi-session monitor
@@ -59,6 +61,10 @@ from mcp_server.monitor import (
     _read_all_messages,
     _READ_ALL_LIMIT,
     _session_status,
+    engine_state,
+    engine_turn_complete,
+    no_turn_at,
+    _edge_passed,
     SEMANTIC_IDLE_GRACE_S,
     transcript_turn_complete,
 )
@@ -212,12 +218,195 @@ def _git_origin_url() -> str:
     return result.stdout.strip()
 
 
+# ---- Work items and boards (doc/items-board.md) ---------------------------
+# Daemon-only: the daemon knows the caller, stamps the actor and resolves
+# holder names; there is no PlanningClient fallback.
+
+# Worst case is several 8 s planning-API calls in a row, plus a spawn for
+# item_resolve(launch). A client timeout shorter than that would hide a write
+# that already happened, so these exceed it.
+_ITEMS_TIMEOUT_S = 90.0
+_ITEMS_LAUNCH_TIMEOUT_S = 180.0
+
+
+def _items_call(method: str, params: dict, timeout: float = _ITEMS_TIMEOUT_S) -> dict:
+    params = {key: value for key, value in params.items() if value is not None}
+    try:
+        return control_client.call(method, params, timeout=timeout)
+    except control_client.TransportError as exc:
+        if "request_id" in params:
+            raise control_client.TransportError(
+                f"{exc} (the call may have completed; retry with request_id="
+                f"{params['request_id']!r} to avoid a duplicate)"
+            ) from exc
+        raise
+
+
+@mcp.tool()
+def item(
+    title: str | list[str],
+    holder: str | list[str] | None = None,
+    status: str | None = None,
+    note: str | None = None,
+    group: str | None = None,
+    blocked_by: list[int] | None = None,
+    blocked_on: str | None = None,
+    eta: str | None = None,
+    links: list[str] | None = None,
+    board: str | None = None,
+    request_id: str | None = None,
+) -> dict:
+    """Create one work item, or several from a list of titles, on your board.
+
+    If you are doing something, it has an item. Items are small units of work
+    (not planning tasks) on a shared board: your initiative's, else your
+    top-level task's. The holder defaults to you; name others by chat name,
+    session uid or participant id, or holder="none" to leave it unassigned.
+    status: open/active/waiting/blocked/blocked_on_owner/done/dropped (default active).
+    eta ("40m", "2h" or a time) marks a long job as waiting, which keeps it
+    from being flagged idle. blocked_by takes open item numbers on the same
+    board (no cycles); blocked_on is free text ("EP GO") and gets no idle or
+    stale exemption.
+
+    request_id makes a retry safe: the same id returns the first call's items
+    instead of creating duplicates (one is generated when omitted and named
+    in any transport error).
+
+    Returns {board, items: [{n, title, status, holders}], replayed?}.
+    """
+    params = dict(locals())
+    params["request_id"] = request_id or uuid.uuid4().hex
+    return _items_call("item.create", params)
+
+
+@mcp.tool()
+def item_set(
+    n: int | list[int],
+    status: str | None = None,
+    note: str | None = None,
+    holder: str | list[str] | None = None,
+    add_holder: str | list[str] | None = None,
+    remove_holder: str | list[str] | None = None,
+    group: str | None = None,
+    blocked_by: list[int] | None = None,
+    blocked_on: str | None = None,
+    check_back: str | None = None,
+    eta: str | None = None,
+    title: str | None = None,
+    links: list[str] | None = None,
+    reason: str | None = None,
+    board: str | None = None,
+) -> dict:
+    """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
+    note="needs EP GO"), item_set(15, blocked_by=[14]),
+    item_set(14, "waiting", eta="40m", note="full C2 run").
+
+    Waiting on a decision only Owner can make: item_set(14, "blocked_on_owner",
+    blocked_on="approve 8xH100 for SEJD?") (you must hold the item and name the
+    decision). It is shown loudly to Owner and never flagged idle or stale.
+    Only Owner clears it; when Owner answers you elsewhere, record it with
+    item_resolve(14, "answer", message="<Owner's answer>").
+
+    holder replaces the holders ("none" hands the item back); add_holder /
+    remove_holder adjust them. An empty string clears note, group or
+    blocked_on; blocked_by=[] clears blockers. Marking an item done unblocks
+    items waiting only on it and wakes their holders. Anyone on the board may
+    edit any item; history is kept, so give a reason for drops and handoffs.
+
+    Returns {board, items, unblocked?, warnings?}.
+    """
+    return _items_call("item.set", locals())
+
+
+@mcp.tool()
+def board(
+    board: str | None = None,
+    view: str = "slim",
+    mine: bool = False,
+    group: str | None = None,
+    include_closed: bool = True,
+    archived: bool = False,
+    query: str | None = None,
+) -> dict:
+    """Read your board: flags first, then items by group, recently closed
+    items (24 h) and free capacity (sessions on the board holding no active
+    item). Each item shows its holders' live state, e.g.
+    `#14 active "fuse SEJD" [RL] @rl-scale-out[idle 24m] ⚑holder_idle`.
+
+    view="full" returns item dicts with their last 5 history events.
+    mine=True keeps only your items; group filters by heading; archived=True
+    adds archived items; query searches titles, notes and groups. Any
+    session may read any board by slug.
+    """
+    return _items_call("board.read", locals())
+
+
+@mcp.tool()
+def item_resolve(
+    n: int,
+    action: str,
+    holder: str | list[str] | None = None,
+    blocked_by: list[int] | None = None,
+    blocked_on: str | None = None,
+    check_back: str | None = None,
+    reason: str | None = None,
+    engine: str | None = None,
+    message: str | None = None,
+    kind: str | None = None,
+    task_id: str | None = None,
+    board: str | None = None,
+    request_id: str | None = None,
+) -> dict:
+    """Resolve an item's flags (orchestrators) with one action:
+
+    - nudge: send the holder a standard update/close/hand-back prompt
+      (plus `message`) and snooze the flag;
+    - reassign: give it to `holder`;
+    - launch: start a new session (`engine` codex or claude, default your
+      own engine) with the item as its prompt and make it the holder. It
+      joins your task and checkout unless `task_id` names a task, whose own
+      worktree it then gets (minted if needed), as with start_session;
+    - block: blocked_by items, or blocked_on text with a check_back time;
+    - drop: cancel it with a reason;
+    - answer: record Owner's answer (`message`) to an item blocked on Owner,
+      which returns it to active.
+
+    kind limits the action to one flag kind; by default it resolves all of
+    the item's open flags. A launch retried with the same request_id reassigns
+    the already-spawned worker instead of starting another. Returns
+    {item, flag_resolved, launched?: {uid, engine, worktree_path, warning?…}}.
+    """
+    params = dict(locals())
+    if action == "launch":
+        params["request_id"] = request_id or uuid.uuid4().hex
+        return _items_call("item.resolve", params, timeout=_ITEMS_LAUNCH_TIMEOUT_S)
+    return _items_call("item.resolve", params)
+
+
 def _chat_call(method: str, params: dict) -> dict:
+    params = {key: value for key, value in params.items() if value is not None}
+    return _messaging_ready_call("messaging." + method, params)
+
+
+def _messaging_ready_call(method: str, params: dict) -> dict:
     # The daemon's coordinator deadline is 30s. Leave time for it to return
     # outcome_unknown and retry guidance instead of masking that with socket IO.
-    return control_client.call("messaging." + method, {
-        key: value for key, value in params.items() if value is not None
-    }, timeout=45.0)
+    # Only startup refusal is safe to retry automatically. Reuse the exact
+    # request (including its ID, origin binding and body) on every attempt.
+    deadline = time.monotonic() + 30.0
+    backoff = 0.25
+    while True:
+        try:
+            return control_client.call(method, params, timeout=45.0)
+        except control_client.ControlError as exc:
+            starting = exc.code == "messaging_starting" or (
+                exc.code == "conflict" and exc.message.startswith("messaging_starting:")
+            )
+            remaining = deadline - time.monotonic()
+            if not starting or remaining <= 0:
+                raise
+            time.sleep(min(backoff, remaining))
+            backoff = min(backoff * 2, 2.0)
 
 
 @mcp.tool()
@@ -342,7 +531,7 @@ def chat_rename(name: str, expected_name_revision: int, request_id: str,
     This changes only your own name and needs coordinator connectivity on paired
     hosts. Never create a replacement session just to rename yourself.
     """
-    return control_client.call("session.set_name", {
+    return _messaging_ready_call("session.set_name", {
         key: value for key, value in locals().items() if value is not None
     })
 
@@ -354,12 +543,17 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
               mentions: list[str] | None = None, mention_here: bool | None = None,
               tags: list[str] | None = None,
               links: list[dict] | None = None, norms_seen: dict | None = None,
-              ack_receipt: dict | None = None, origin_daemon_id: str | None = None) -> dict:
+              ack_receipt: dict | None = None, origin_daemon_id: str | None = None,
+              view: str = "slim") -> dict:
     """Send to exactly one channel, participant DM, or conversation ID.
 
     Join channels with chat_channels(action="join") before posting. mentions
-    contains participant IDs; mention_here=True notifies channel members at send
-    time and is unavailable in DMs. Body text alone never triggers a mention.
+    takes participant IDs or exact names/aliases; mention_here=True notifies
+    channel members at send time and is unavailable in DMs. A body @Name that
+    names exactly one current member of the conversation becomes a mention;
+    any other body @token (non-member, unknown, ambiguous, @here, @Owner) is
+    NOT notified and comes back in warnings. mentions_resolved lists who was
+    mentioned and from where. Code spans, emails and URLs are never scanned.
     Incoming DMs and mentions notify by default; no monitor or rearming needed.
     Membership alone does not notify on every post.
 
@@ -378,14 +572,35 @@ def chat_send(body: str, request_id: str, channel: str | None = None,
     Keep request_id and original daemon binding for retries, including timeouts.
     Prefer channels for Owner; needs-owner is quiet. Urgent attention uses
     notify_user. Unsolicited Owner DMs are only for critical urgent private issues.
-    Posting and notification/read receipt are separate. Read returned norms and
-    channel_norms; context_status lists stale scopes.
+    Posting and notification/read receipt are separate. norms/channel_norms and
+    context_status appear only with a document you have not seen; read it and
+    pass context_status.ack_with as norms_seen on your next send.
     On paired hosts, enrolled agents can post to known conversations offline.
     pending_sync means saved locally; replicated means the hub accepted the same ID.
+    created_at is the authoritative send time; outbox reports your messages still
+    pending_sync on this host after a minute. A hub-executed send reports submitted_at and delay_s.
     First naming, a new DM, and shared metadata edits need connectivity. Offline
     @here freezes the last-known membership audience; reconnect never expands it.
+    view="slim" (default) returns what a sender acts on: event_id, created_at,
+    conversation_id, replication, notification, mentions_resolved, warnings,
+    outbox, and norms/sync/monitor details only when they need attention.
+    view="full" returns the complete daemon response.
     """
-    return _chat_call("send", locals())
+    params = dict(locals())
+    view = _view(params.pop("view"))
+    return _project(_chat_call("send", params), view)
+
+
+@mcp.tool()
+def chat_react(message_id: str, emoji: str, request_id: str, remove: bool = False,
+               origin_daemon_id: str | None = None) -> dict:
+    """Add/remove your ✅ 👀 👍 ❌ 🎉 reaction without notifying anyone.
+
+    React to acknowledge a message. Adding a reaction to a message mentioning
+    you also marks its conversation read through that message. Retry with the
+    same request_id, contents and origin_daemon_id. Returns reactions and counts.
+    """
+    return _chat_call("react", locals())
 
 
 @mcp.tool()
@@ -396,30 +611,44 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               freshness: str = "cached", tags: list[str] | None = None,
               after: dict | None = None, cursor: dict | None = None,
               limit: int = 50, ack_receipt: dict | None = None,
-              newest_first: bool = False, pinned_only: bool | None = None,
-              view: str = "full") -> dict:
+              newest_first: bool | None = None, pinned_only: bool | None = None,
+              view: str | None = None, mark_read_before: str | None = None,
+              mark_read: bool = True, mentions_only: bool = False) -> dict:
     """Read history, a thread, your inbox, or incoming DMs. Select one scope.
 
+    Inbox and dms reads default to newest first and view="slim"; other reads
+    default to oldest first and view="full". Pass either explicitly to override.
     view="slim" returns per message only id, time, conversation (#path or
     dm:<sender>), conversation_id, sender, body and reply_to/thread when set,
     plus next_cursor and receipt; cursors and receipts work across views.
-    Prefer slim for routine inbox reads; "full" (default) keeps metadata.
+    "full" keeps metadata.
+
+    mark_read_before=RFC3339 (inbox or dms only) marks every unread message
+    created before that time as read in one call and moves your watches past
+    them; it returns {marked, monitors_advanced} instead of messages. Use it
+    after a long absence, once you have skimmed the newest messages.
 
     time={"since":"10m"} or {"start":RFC3339,"end":RFC3339} filters a fixed
     window. pinned_only filters to pinned messages at the read snapshot.
     channel="*" reads all public channels. newest_first shows recent
     messages first. received basis finds late arrivals. tags must all match. Use cursor
     unchanged for pagination. Acknowledge the returned receipt on a later read
-    or send to mark only fully supplied messages read; previews do not consume.
+    or send to advance each touched conversation through its highest supplied message.
+    Direct unfiltered conversation reads advance automatically on a newest page
+    or at the end of history. Set mark_read=False for previews; inbox/dms never
+    advance automatically. mentions_only filters the mention list.
     cached is local and reports partial/complete-through-checkpoint coverage.
     freshness="hub" catches up authorized history before taking a local snapshot;
     this still excludes messages pending on disconnected origins. Keep cursor filters
     unchanged. received time finds messages arriving late from another machine.
     """
     params = dict(locals())
-    view = params.pop("view") or "full"
-    if view not in ("full", "slim"):
-        raise ValueError('view must be "full" or "slim"')
+    broad = bool(inbox or dms)
+    view = _view(params.pop("view") or ("slim" if broad else "full"))
+    if params["newest_first"] is None:
+        params["newest_first"] = broad
+    if mark_read_before is not None:
+        return _project(_chat_call("read", params), view)
     result = _chat_call("read", params)
     return slim_read_result(result) if view == "slim" else result
 
@@ -444,13 +673,84 @@ def _slim_message(item: dict) -> dict:
         out["reply_to"] = data["reply_to"]
     if data.get("thread_root"):
         out["thread"] = data["thread_root"]
+    for key in ("read", "reactions"):
+        if key in item:
+            out[key] = item[key]
     return out
 
 
 # Top-level fields a slim reader still needs to paginate, acknowledge, and
 # notice degraded coverage or pending watch results.
 _SLIM_KEEP = ("next_cursor", "receipt", "position", "coverage", "degraded",
-              "delivery_note", "error")
+              "delivery_note", "error", "outbox", "read_cursor")
+
+
+def _view(view: str | None) -> str:
+    view = view or "slim"
+    if view not in ("full", "slim"):
+        raise ValueError('view must be "full" or "slim"')
+    return view
+
+
+def _attention_fields(result: dict, out: dict) -> None:
+    """Envelope fields worth showing only when they call for action: pending
+    watch results, a sync problem, and norms the caller has not acknowledged
+    (a supplied document plus the acknowledgement to send)."""
+    monitors = result.get("monitor_status")
+    if isinstance(monitors, dict) and monitors.get("unacknowledged"):
+        out["monitor_status"] = {"unacknowledged": monitors["unacknowledged"]}
+    if isinstance(monitors, dict) and monitors.get("recently_expired"):
+        out.setdefault("monitor_status", {})["recently_expired"] = monitors["recently_expired"]
+    sync = result.get("sync")
+    if isinstance(sync, dict) and sync.get("enabled") and (
+            not sync.get("connected") or sync.get("error") or sync.get("handoff_paused")):
+        out["sync"] = {k: sync.get(k) for k in ("connected", "error", "pending", "handoff_paused")}
+    context = result.get("context_status")
+    if isinstance(context, dict) and (context.get("stale_scopes") or context.get("acknowledgement_note")):
+        out["context_status"] = {k: context[k] for k in (
+            "stale_scopes", "ack_with", "ack_note", "acknowledgement_note") if k in context}
+        for key in ("norms", "channel_norms"):
+            if isinstance(result.get(key), dict) and (
+                    result[key].get("text") or result[key].get("complete") is False):
+                out[key] = result[key]
+
+
+# Envelope keys a slim send/people/channels response drops (re-added by
+# _attention_fields when they need attention). Everything else is payload.
+_ENVELOPE = frozenset({
+    "cache", "connection", "coverage", "daemon_id", "hub_completeness_note",
+    "space_id", "position", "coordinator_position", "operation", "sync",
+    "monitor_status", "context_status", "norms", "channel_norms", "event",
+    "degraded", "name_publication", "attention",
+})
+
+
+def _project(result: dict, view: str) -> dict:
+    """MCP-side slim projection of a send/people/channels response: the
+    payload the caller acts on, without the ~3-4 KB sync/cache/norms/event
+    envelope. The daemon response is unchanged; view="full" returns it."""
+    if view == "full" or not isinstance(result, dict):
+        return result
+    out = {k: v for k, v in result.items() if k not in _ENVELOPE and v is not None}
+    event = result.get("event")
+    if isinstance(event, dict):
+        out.setdefault("event_id", event.get("id"))
+        out.setdefault("created_at", event.get("created_at"))
+        out["conversation_id"] = event.get("conversation_id")
+        data = event.get("data") or {}
+        if data.get("reply_to"):
+            out["reply_to"] = data["reply_to"]
+        if data.get("thread_root"):
+            out["thread"] = data["thread_root"]
+    if result.get("degraded"):
+        out["degraded"] = result["degraded"]
+    if result.get("name_publication") == "pending":
+        out["name_publication"] = "pending"
+    if result.get("connection") == "offline":
+        out["connection"] = "offline"
+    _attention_fields(result, out)
+    out["view"] = "slim"
+    return out
 
 
 def slim_read_result(result: dict) -> dict:
@@ -463,11 +763,7 @@ def slim_read_result(result: dict) -> dict:
     out["items"] = [_slim_message(item) for item in result.get("items") or []]
     if result.get("context"):
         out["context"] = [_slim_message(item) for item in result["context"]]
-    monitors = result.get("monitor_status")
-    if isinstance(monitors, dict) and monitors.get("unacknowledged"):
-        out["monitor_status"] = {"unacknowledged": monitors["unacknowledged"]}
-    if isinstance(monitors, dict) and monitors.get("recently_expired"):
-        out.setdefault("monitor_status", {})["recently_expired"] = monitors["recently_expired"]
+    _attention_fields(result, out)
     return out
 
 
@@ -484,9 +780,14 @@ def chat_dms(unread_only: bool = False, peer: str | None = None,
 
 @mcp.tool()
 def chat_people(query: str | None = None, include_exited: bool = False,
-                cursor: dict | None = None, limit: int = 50) -> dict:
-    """Find participant IDs, task-based names, aliases and presence. Does not grant session control."""
-    return _chat_call("people", locals())
+                cursor: dict | None = None, limit: int = 50, view: str = "slim") -> dict:
+    """Find participant IDs, task-based names, aliases and presence. Does not grant session control.
+
+    view="slim" (default) returns the items and next_cursor without the sync,
+    cache and norms envelope; view="full" returns the complete response."""
+    params = dict(locals())
+    view = _view(params.pop("view"))
+    return _project(_chat_call("people", params), view)
 
 
 @mcp.tool()
@@ -499,7 +800,7 @@ def chat_channels(action: str = "list", path: str | None = None,
                   joined_only: bool | None = None, query: str | None = None,
                   default_join: bool | None = None, archived: bool | None = None,
                   origin_daemon_id: str | None = None,
-                  participant_id: str | None = None) -> dict:
+                  participant_id: str | None = None, view: str = "slim") -> dict:
     """List/get/create/update/join/leave channels, list members, or add_member.
 
     Join before posting; public history stays browsable. Join/leave require path
@@ -528,8 +829,12 @@ def chat_channels(action: str = "list", path: str | None = None,
     offline message using a previously observed open revision can still sync and is
     labeled delayed. Once the origin observes the archive it refuses new posts.
     Names are at most 100 characters; descriptions at most 1000. No deletion.
+    view="slim" (default) drops the sync/cache/norms envelope and the event echo
+    (event_id stays); view="full" returns the complete response.
     """
-    return _chat_call("channels", locals())
+    params = dict(locals())
+    view = _view(params.pop("view"))
+    return _project(_chat_call("channels", params), view)
 
 
 @mcp.tool()
@@ -1003,7 +1308,14 @@ def ping() -> dict:
         {pong, uid, caller_kind,
          global_perms: bool,        # ← do you have global permissions?
          task_id: str | null,       # ← the task you're bound to (if any)
-         workspace_id: str | null}  # ← the workspace you live in
+         workspace_id: str | null,  # ← the workspace you live in
+         owner_availability: {level, set, changed_at, age_s, ...}}
+
+    `owner_availability.level` is how reachable Owner is right now:
+    away (emergencies only), around (decisions and above), focused
+    (everything), on-call (everything), or null when unset
+    (every alert is delivered). Check it before asking Owner anything;
+    chat_open reports the same value.
 
     `global_perms` is the one to check before you try to drive another
     task's sessions: when true, you can prompt / read / kill / spawn
@@ -1094,6 +1406,7 @@ def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
             s.get("state", "pending"),
             bool(s.get("idle", False)),
             bool(s.get("reported_done", False)),
+            s.get("agent_state"),
         )
         for k in _SESSION_NOISE_FIELDS:
             s.pop(k, None)
@@ -1145,13 +1458,18 @@ def list_sessions(
             signal — and what it said. Present on live rows AND on exited
             ones, so "finished, then exited" is distinguishable from
             "stopped mid-task".
-        status ∈ {"starting", "working", "awaiting_input", "reported",
-            "exited"} — the legible summary; branch on this instead of
+        status ∈ {"starting", "working", "awaiting_input", "needs_human",
+            "errored", "unknown", "reported", "exited"} — the legible summary; branch on this instead of
             decoding (state, idle) yourself. "reported" means the agent
             declared itself done and has had no new input since — it is
             the one status that means completion. "awaiting_input" means
             only that it stopped talking. See the status legend on
             `wait_for_session_idle`.
+        agent_state / pty_idle: engine-reported state and raw terminal quietness,
+            when available. needs_human means permission/input is needed;
+            errored means an engine failure; unknown never proves idle.
+            working-background keeps awaiting_input for compatibility but its
+            background jobs may still be running. These are not done reports.
         managed_by_uid: the session that spawned this one (None if
             operator-spawned) — the parent link for orchestration.
         task_id / workspace_id: grouping keys (see `list_sessions_grouped`).
@@ -1280,9 +1598,10 @@ async def start_session(
     spawns, waits for the initial `prompt`'s reply, and returns the
     worker's final message inline, so you don't have to hand-write the
     spawn → `wait_for_session_idle` → `read_last_turn` sequence (and its
-    post-send race). Leave `wait=false` (default) for fire-and-forget
-    spawns you'll drive yourself. `isolated=true` additionally gives the
-    worker its own git worktree in one call — the analogue of
+    post-send race). `wait=false` returns promptly once the daemon accepts
+    the launch; its background monitor checks initial delivery before waiting
+    for completion. `wait=true` checks delivery before waiting for the reply.
+    `isolated=true` additionally gives the worker its own git worktree — the analogue of
     `Agent(isolation="worktree")`.
 
     Args:
@@ -1296,9 +1615,11 @@ async def start_session(
             returns after it goes quiet with `last_message=null`.
         label: Sidebar label for the new session.
         prompt: Optional initial prompt to deliver once the session is
-            ready (queued via the same PendingWrite drainer the workflow
-            activation flow uses). For a bash session this is just a
-            command line. Required in practice when `wait=true` — there's
+            ready. CM confirms a new engine turn or an exact transcript
+            receipt (a new main user turn suffices for Claude), with one
+            guarded Enter retry if needed. Slash commands count as delivered
+            after body plus Enter, without requiring a model turn. For a bash session
+            this is just a command line. Required in practice when `wait=true` — there's
             nothing to wait for otherwise.
             **Omit it to launch a planning task as written**: when
             `prompt` is empty/absent AND you named a task EXPLICITLY
@@ -1402,6 +1723,17 @@ async def start_session(
           - `prompt_source` — "caller" (your `prompt`), "task" (the
             bound task's stored prompt, auto-delivered because you
             passed none), or "none" (spawned promptless).
+          - `prompt_delivery` — on updated daemons, a receipt with status
+            pending/confirmed/delivered/unconfirmed, attempt count, source and
+            reason. `wait=false` usually returns pending; the auto-monitor
+            checks it in the background and reports either completion or
+            uncertain submission. With notify_on_done=false, inspect the receipt
+            using read_last_turn. `submitted` is present only when
+            the tool has a terminal receipt, never false merely for pending.
+            False means unconfirmed; inspect before re-sending to avoid duplicates.
+            The session remains available and no completion is claimed.
+            Older daemons omit these fields. `prompt_source` identifies text,
+            not proof it was submitted.
           - `shared_workspace` / `warning` / `workspace_shared_with` —
             present ONLY when `allow_shared_workspace=true` actually put
             the worker in your own checkout. `workspace_shared_with` is
@@ -1502,6 +1834,18 @@ async def start_session(
         control_client.call, method, params, socket_path=route.path
     )
 
+    # wait=false remains a fast spawn/acceptance call. Its monitor consumes
+    # the receipt in the background; pending never means submitted=false.
+    launch_receipt = spawn.get("prompt_delivery") if isinstance(spawn, dict) else None
+    if isinstance(launch_receipt, dict) and spawn.get("session_uid"):
+        if wait:
+            launch_receipt = await _await_launch_confirmation(
+                spawn["session_uid"], launch_receipt, socket_path=route.path,
+            )
+            spawn["prompt_delivery"] = launch_receipt
+        if launch_receipt.get("status") != "pending":
+            spawn["submitted"] = launch_receipt.get("submitted") is True
+
     # ux-5c: the server tells us which prompt (if any) the child was
     # actually handed — "caller" (the `prompt` arg), "task" (the task's
     # own stored prompt, auto-delivered because we passed none while
@@ -1546,6 +1890,8 @@ async def start_session(
                 "worktree_path",
                 "task_id",
                 "prompt_source",
+                "submitted",
+                "prompt_delivery",
                 "shared_workspace",
                 "warning",
                 "workspace_shared_with",
@@ -1555,6 +1901,10 @@ async def start_session(
                 if spawn.get(key) is not None and d.get(key) is None:
                     d[key] = spawn[key]
         return d
+
+    if wait and isinstance(launch_receipt, dict) and not launch_receipt["submitted"]:
+        spawn.update(completed=False, timed_out=False, last_message=None)
+        return _with_isolation(spawn)
 
     if not wait:
         spawn_uid = spawn.get("session_uid") if isinstance(spawn, dict) else None
@@ -1576,6 +1926,11 @@ async def start_session(
                         else f"worker '{label}' finished its initial prompt"
                     ),
                     source="auto",
+                    # Confirmation gates the level watch so startup cannot
+                    # fire it, while a fast first turn/report_done is retained.
+                    edge=not isinstance(launch_receipt, dict),
+                    **({"launch_receipt": launch_receipt, "launch_socket_path": route.path}
+                       if isinstance(launch_receipt, dict) else {}),
                 )
             except async_monitor.RegistrationError as e:
                 spawn["monitor"] = {"error": e.code, "message": str(e)}
@@ -1589,14 +1944,19 @@ async def start_session(
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     interval = max(0.5, min(poll_interval_s, 30.0))
     grace = max(1.0, min(pending_idle_grace_s, 60.0))
-    # Fresh session: no transcript bound yet, so anchor on None — every
-    # assistant message it writes is the reply. `_await_reply` picks up the
-    # transcript path the moment the detector binds it.
+    # The receipt captures the counter before the launch body is written.
+    # Anchor there even after confirmation, retaining a fast completed launch
+    # turn while rejecting startup idle. Old receipts use a fresh counter of 0.
+    # Legacy engines still use their initial transcript cursor.
     res = await _await_reply(
         session_uid,
         engine="claude-code", transcript_path=None,
         anchor_cursor=None, generation=0,
         deadline=deadline, interval=interval, grace=grace,
+        agent_baseline=({"kind": "agent", "value": (
+            launch_receipt.get("turn_seq_before", 0)
+            if isinstance(launch_receipt, dict) else 0
+        ), "no_turn_at": None} if delivered_a_prompt else None),
     )
     res["session_uid"] = session_uid
     if schema is not None:
@@ -1605,6 +1965,121 @@ async def start_session(
             deadline=deadline, interval=interval, grace=grace,
         )
     return _with_isolation(_with_spawn_fields(res))
+
+
+@mcp.tool()
+async def fork_session(
+    session_uid: str,
+    task_name: str | None = None,
+    task_id: str | None = None,
+    base: str = "source",
+    parent_task_id: str | None = None,
+    prompt: str | None = None,
+    request_id: str | None = None,
+    top_level: bool = False,
+    label: str | None = None,
+    notify_on_done: bool = True,
+    notify_until: str = "turn_end",
+) -> dict:
+    """Fork a Claude or Codex session's conversation into a task.
+
+    Starts a session that continues from a copy of the source's
+    conversation via the engine's native fork (`claude --resume <id>
+    --fork-session` / `codex fork <id>`). The source keeps running
+    unchanged; CM stores no history copy. Pass exactly one of:
+
+    - `task_name`: a NEW task with its own `cm-sub/...` worktree. Parent
+      defaults to the source session's task; `parent_task_id` overrides it
+      (must be within your task tree) and `top_level=true` files it
+      top-level in the same project (global permissions only).
+    - `task_id`: an EXISTING task. The fork joins that task's workspace
+      exactly like `start_session(task_id=…)` — shared checkouts are fine
+      and reported in `workspace_shared_with`; a task that never ran gets
+      a worktree minted at `base`.
+
+    Args:
+        session_uid: The session to fork (must have completed a turn).
+        base: "source" (default) cuts new branches at the source worktree's
+            committed HEAD; "trunk" at the project's main branch. Uncommitted
+            source edits never come along (`uncommitted_left_behind`).
+        prompt: Optional first message for the fork. When blank NOTHING is
+            typed: the fork waits at its composer (a Claude fork writes its
+            transcript only on its first message, so an unprompted fork
+            cannot be resumed after a daemon restart). Where it came from is
+            in the result instead (`forked_from`, `commits_not_carried`).
+        request_id: Idempotency key; generated per call when omitted. A
+            retry with the same key returns the first fork.
+        label: Sidebar label for the new session (default: the task name).
+        notify_on_done / notify_until: As for `start_session` — with a
+            prompt, a self-waking monitor is registered on the fork.
+
+    Returns `{task_id, session_uid, worktree_path, branch, base_sha,
+    forked_from: {session_uid, label, branch, ...}, commits_not_carried
+    (`git log --oneline` lines on the source the fork's checkout lacks,
+    capped at 10; `commits_not_carried_truncated`), engine, target,
+    prompt_source ("caller" | "none"), uncommitted_left_behind, ...}`.
+
+    State your intent in plain language and ask the user to confirm
+    before calling this tool.
+    """
+    params: dict = {
+        "source_uid": session_uid,
+        "base": base,
+        "request_id": request_id or str(uuid.uuid4()),
+    }
+    for key, value in (
+        ("task_name", task_name), ("task_id", task_id),
+        ("parent_task_id", parent_task_id), ("label", label),
+    ):
+        if value:
+            params[key] = value
+    if top_level:
+        params["top_level"] = True
+    if prompt and prompt.strip():
+        params["prompt"] = prompt
+    socket_path = control_client.resolve_socket_for_method("session.fork")
+    try:
+        res = await asyncio.to_thread(
+            control_client.call, "session.fork", params,
+            # The host mints a task + worktree and provisions it before it
+            # replies; the request_id makes a post-timeout retry safe.
+            timeout=FORK_SESSION_TIMEOUT_S, socket_path=socket_path,
+        )
+    except control_client.ControlError as e:
+        if e.code == "unknown_method":
+            return {"error": e.code, "message": FORK_UNSUPPORTED_MESSAGE}
+        raise
+    if not isinstance(res, dict):
+        return res
+    receipt = res.get("prompt_delivery")
+    if isinstance(receipt, dict) and receipt.get("status") != "pending":
+        res["submitted"] = receipt.get("submitted") is True
+    fork_uid = res.get("session_uid")
+    name = task_name or res.get("task_name") or task_id
+    if notify_on_done and fork_uid and res.get("prompt_source") == "caller":
+        try:
+            res["monitor"] = async_monitor.register_monitor(
+                [fork_uid], mode="any", until=notify_until,
+                note=(
+                    f"fork '{name}' reported done"
+                    if notify_until in ("final", "task_done")
+                    else f"fork '{name}' finished its first prompt"
+                ),
+                source="auto",
+                edge=not isinstance(receipt, dict),
+                **({"launch_receipt": receipt, "launch_socket_path": socket_path}
+                   if isinstance(receipt, dict) else {}),
+            )
+        except async_monitor.RegistrationError as e:
+            res["monitor"] = {"error": e.code, "message": str(e)}
+    return res
+
+
+FORK_SESSION_TIMEOUT_S = 180.0
+FORK_UNSUPPORTED_MESSAGE = (
+    "The host daemon is too old for fork_session (no session.fork method); "
+    "it needs a brain deploy."
+)
 
 
 @mcp.tool()
@@ -1701,29 +2176,56 @@ def set_session_section(section: str, session_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-def notify_user(message: str = "") -> dict:
+def notify_user(message: str = "", urgency: str = "decision") -> dict:
     """Request Owner attention for your own session (local, cloud, or continuous).
 
-    Continuous workers must DM their orchestrator for routine reviews, progress,
-    recoverable failures and handoffs; do not notify Owner for those events.
+    Continuous workers post routine reviews, progress, recoverable failures and
+    handoffs in their task channel mentioning the orchestrator; do not notify
+    Owner for those events.
     Orchestrators use this only for a reviewed decision/blocker requiring Owner,
     preserving stricter quiet policies. Interactive sessions use it when Owner
     action is needed. Supply a concise reason and relevant message/file link.
     Routine progress stays in session chat; this does not authorize deployment,
     session control, or unsolicited Owner DMs.
 
-    The daemon retains the alert until Owner selects the session. A connected
+    urgency is honest: "fyi" (no action needed soon), "decision" (default:
+    Owner must choose something), "blocking" (you or others cannot proceed),
+    "emergency" (harm or loss is happening now; also pushed to Owner's phone).
+    Owner's availability (ping().owner_availability.level) decides delivery:
+    away delivers emergencies only, around decision+, focused everything,
+    on-call everything; unset delivers everything. The result says
+    delivery="immediate" or delivery="held" with release_when (the level that
+    will deliver it). Held is not lost: keep working, and you are woken when a
+    level change releases it. Repeated held requests keep the latest text.
+
+    A delivered alert stays until Owner selects the session. A connected
     updated TUI submits the normal desktop notification and blinks the sidebar;
-    otherwise delivery waits for reconnection. Alt+g jumps to attention, including
-    continuous tasks. Identical pending reasons coalesce; a changed reason raises
-    a new alert. Returns status="queued", not proof of desktop delivery/read.
+    otherwise delivery waits for reconnection (blocking and emergency requests
+    also reach notify_command when no viewer is connected). Identical pending
+    reasons coalesce; a changed reason raises a new alert. status="queued" is
+    not proof of desktop delivery/read.
 
     message is optional (maximum 4096 UTF-8 bytes). Identity and label come from
     the live caller, never a target parameter; no global permission is required.
-    Desktop/DND preferences, notify_on_idle, chat mutes/follows, and Telegram
-    escalation settings are unchanged. See doc/OWNER_NOTIFICATIONS.md.
+    See doc/OWNER_NOTIFICATIONS.md.
     """
-    return control_client.call("notify_user", {"message": message})
+    params = {"message": message}
+    # Omit the default so a daemon predating urgency still accepts the call.
+    if urgency != "decision":
+        params["urgency"] = urgency
+    try:
+        return control_client.call("notify_user", params)
+    except control_client.ControlError as e:
+        # A daemon predating urgency rejects the unknown field; never fail the
+        # request over it. Deliver it ungated and say so.
+        if "urgency" not in params or "urgency" not in str(e) or "unknown field" not in str(e):
+            raise
+        result = control_client.call("notify_user", {"message": message})
+        if isinstance(result, dict):
+            result["urgency_ignored"] = (
+                "This host's daemon predates urgency; the request was delivered without it."
+            )
+        return result
 
 
 @mcp.tool()
@@ -1775,6 +2277,9 @@ _OUTCOME_FIELDS = (
     "reported_done",
     "reported_done_at",
     "report_reason",
+    "prompt_delivery",
+    "agent_state",
+    "pty_idle",
 )
 
 
@@ -1783,6 +2288,9 @@ def _with_outcome(out: dict, resolved: dict) -> dict:
     for key in _OUTCOME_FIELDS:
         if resolved.get(key) is not None:
             out[key] = resolved[key]
+    if (out.get("completed") or out.get("timed_out") is False) and resolved.get("state") != "exited" and no_turn_at(engine_state(resolved)) is not None:
+        out["completion_kind"] = "no_turn"
+        out["last_message"] = None
     return out
 
 
@@ -1819,13 +2327,14 @@ def read_session_output(
         - messages: list of {role, content, ts}
         - cursor: opaque, pass back on next call
         - state: "ready" | "pending" | "exited"
-        - status: "starting"|"working"|"awaiting_input"|"reported"|
-          "exited" — the legible summary; "reported" means the agent
+        - status: "starting"|"working"|"awaiting_input"|"needs_human"|
+          "errored"|"unknown"|"reported"|"exited" — the legible summary; "reported" means the agent
           called `report_done`.
         - When state="pending", messages is empty and you can poll again.
         - note: present only when no transcript is bound (messages empty).
           Explains the bash-session read dead-end and what to do instead.
         - Outcome fields, present when the daemon knows them:
+          prompt_delivery (the initial launch receipt),
           reported_done / reported_done_at / report_reason (the agent's
           own "I'm finished" signal) and, for a session that has ended,
           killed / killed_by / exited_at. Read them before trusting the
@@ -1854,7 +2363,7 @@ def read_session_output(
             "generation": generation,
             "state": state,
             "idle": idle,
-            "status": _session_status(state, idle, reported),
+            "status": _session_status(state, idle, reported, resolved.get("agent_state")),
         }
         if transcript_path is None:
             out["note"] = _NO_TRANSCRIPT_NOTE
@@ -1873,7 +2382,7 @@ def read_session_output(
         "generation": generation,
         "state": state,
         "idle": idle,
-        "status": _session_status(state, idle, reported),
+        "status": _session_status(state, idle, reported, resolved.get("agent_state")),
     }, resolved)
 
 
@@ -1901,8 +2410,8 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
           message, or null if the agent hasn't produced one yet.
         - messages: the last `context_messages` rendered messages
           (oldest-first), for context around the final turn.
-        - status: "starting"|"working"|"awaiting_input"|"reported"|
-          "exited". "reported" is the only one that means the agent
+        - status: "starting"|"working"|"awaiting_input"|"needs_human"|
+          "errored"|"unknown"|"reported"|"exited". "reported" is the only one that means the agent
           considers the work DONE; "awaiting_input" just means it
           stopped talking.
         - cursor: end cursor — pass to `read_session_output(since_cursor=)`
@@ -1930,7 +2439,7 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
     generation = int(resolved.get("generation", 0))
     idle = bool(resolved.get("idle", False))
     status = _session_status(
-        state, idle, bool(resolved.get("reported_done", False))
+        state, idle, bool(resolved.get("reported_done", False)), resolved.get("agent_state")
     )
 
     if transcript_path is None:
@@ -2187,7 +2696,12 @@ async def wait_for_workflow_stop(
                     state["binding_warning"] = "Active role has no unambiguous stable session binding"
             for session in sessions:
                 if active_uid and session.get("session_uid") == active_uid:
-                    active_idle = bool(session.get("idle", False))
+                    agent_state = session.get("agent_state")
+                    active_idle = (
+                        agent_state.get("state") == "idle"
+                        if isinstance(agent_state, dict)
+                        else bool(session.get("idle", False))
+                    )
                     break
 
         now = time.monotonic()
@@ -2274,6 +2788,14 @@ async def wait_for_session_idle(
         - status="working" (idle=False, timed_out=True): deadline
           reached while still busy.
 
+    With agent_state, engine evidence governs the wait: idle, needs_human,
+    errored, or working-background after a foreground turn end can return.
+    Working and starting keep waiting even with idle=True. Unknown returns
+    only when explicit pty_idle=True, preserving status=unknown and labeling
+    idle_source=pty; reply/edge monitors do not use that exception. Results
+    include agent_state and pty_idle; a human wait or error is not finished work.
+    Legacy PTY/transcript fallback retains the quietness behavior below.
+
     Note: this returns on the FIRST quiet-at-prompt poll, which can race
     a slow-to-start agent right after `send_input` (the session looks
     quiet for ~2s before the agent's first token). To send a prompt and
@@ -2322,17 +2844,33 @@ async def wait_for_session_idle(
         reported = bool(resolved.get("reported_done", False))
         now = time.monotonic()
         if state == "exited":
-            return {
+            return _with_outcome({
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle, reported),
-            }
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+            }, resolved)
+        engine_done = engine_turn_complete(resolved)
+        if engine_done is not None:
+            if ((engine_state(resolved) or {}).get("state") == "unknown"
+                    and resolved.get("pty_idle") is True):
+                return _with_outcome({
+                    "idle": True, "timed_out": False, "state": state,
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+                    "idle_source": "pty",
+                }, resolved)
+            if engine_done or now >= deadline:
+                return _with_outcome({
+                    "idle": engine_done, "timed_out": not engine_done, "state": state,
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+                }, resolved)
+            await asyncio.sleep(interval)
+            continue
         # A READY session (transcript bound) that's quiet is unambiguously
         # done with its turn — return immediately.
         if state == "ready" and idle:
-            return {
+            return _with_outcome({
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle, reported),
-            }
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+            }, resolved)
         # READY but PTY-busy: a background task's spinner keeps the PTY
         # noisy while the agent is at the prompt (false-busy). Consult
         # the transcript shape, debounced — see monitor.py. A daemon
@@ -2348,11 +2886,11 @@ async def wait_for_session_idle(
                 if resolved.get("semantic_idle") is True or (
                     now - semantic_idle_since >= SEMANTIC_IDLE_GRACE_S
                 ):
-                    return {
+                    return _with_outcome({
                         "idle": True, "timed_out": False, "state": state,
                         "status": "reported" if reported else "awaiting_input",
                         "idle_source": "transcript",
-                    }
+                    }, resolved)
             else:
                 semantic_idle_since = None
         # A `pending` session reports idle=True as soon as its PTY is
@@ -2371,17 +2909,17 @@ async def wait_for_session_idle(
             if pending_idle_since is None:
                 pending_idle_since = now
             elif now - pending_idle_since >= grace:
-                return {
+                return _with_outcome({
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle, reported),
-            }
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+            }, resolved)
         else:
             pending_idle_since = None
         if now >= deadline:
-            return {
+            return _with_outcome({
                 "idle": False, "timed_out": True, "state": state,
-                "status": _session_status(state, idle, reported),
-            }
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+            }, resolved)
         await asyncio.sleep(interval)
 
 
@@ -2530,11 +3068,16 @@ async def _await_reply(
     deadline: float,
     interval: float,
     grace: float,
+    agent_baseline: dict | None = None,
 ) -> dict:
     """Poll a session until its next reply lands and it goes quiet, or the
     deadline passes. Completion is anchored on transcript progress past
     `anchor_cursor` (a NEW assistant message must appear), so it can't
     return the turn that was already there when polling began.
+
+    When an engine counter was captured before sending, a newer turn_seq plus
+    a boundary/attention state is the completion evidence. Transcript reads only
+    supply message content; errors and human waits can return without a reply.
 
     Shared by `send_input_and_wait` (anchor = the transcript end captured
     just before the send) and `start_session(wait=True)` (anchor = None on
@@ -2586,13 +3129,21 @@ async def _await_reply(
         # Same as the wait loop above: the agent's own done signal, so the
         # `status` this returns agrees with what a listing would say.
         reported = bool(resolved.get("reported_done", False))
-        # A fresh session's transcript may bind only AFTER polling begins —
-        # pick it up the moment it appears.
-        if transcript_path is None and resolved.get("transcript_path"):
-            transcript_path = resolved.get("transcript_path")
-            engine = resolved.get("engine", engine)
-            generation = int(resolved.get("generation", generation))
+        # /clear and /new can bind the replacement transcript only once the
+        # next prompt starts. Cursors and cached replies belong to one binding.
+        current_path = resolved.get("transcript_path")
+        current_generation = int(resolved.get("generation", generation))
+        current_engine = resolved.get("engine", engine)
+        if current_path and (current_path, current_generation, current_engine) != (
+            transcript_path, generation, engine
+        ):
+            transcript_path, generation, engine = current_path, current_generation, current_engine
+            cursor = None
+            saw_new_assistant = False
+            last_message = None
+            semantic_idle_since = None
         now = time.monotonic()
+        engine_done = engine_turn_complete(resolved)
 
         if state == "exited":
             last_message = await asyncio.to_thread(_final_read)
@@ -2603,31 +3154,36 @@ async def _await_reply(
             }
             if last_message is None and transcript_path is None:
                 out["note"] = _NO_TRANSCRIPT_NOTE
-            return out
+            return _with_outcome(out, resolved)
 
         if transcript_path is not None:
             # Transcript-anchored: pull new messages since the anchor, latch
             # the reply, complete only when a NEW assistant message exists
             # AND the session is quiet at the prompt.
-            new_msgs, cursor = await asyncio.to_thread(
-                _parser_for(engine).read_messages,
-                transcript_path, generation, cursor, _READ_ALL_LIMIT,
-            )
+            try:
+                new_msgs, cursor = await asyncio.to_thread(
+                    _parser_for(engine).read_messages,
+                    transcript_path, generation, cursor, _READ_ALL_LIMIT,
+                )
+            except OSError:
+                if engine_done is None:
+                    raise
+                new_msgs = []
             for m in new_msgs:
                 if m.role == Role.ASSISTANT:
                     saw_new_assistant = True
                     last_message = m.to_dict()
-            if saw_new_assistant and state == "ready" and idle:
-                return {
+            if engine_done is None and saw_new_assistant and state == "ready" and idle:
+                return _with_outcome({
                     "completed": True, "timed_out": False,
-                    "status": _session_status(state, idle, reported),
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
                     "state": state, "idle": idle, "last_message": last_message,
-                }
+                }, resolved)
             # New assistant reply + PTY still noisy: a background
             # task's spinner can hold `idle` false forever. Fall back
             # to transcript shape (debounced) — see monitor.py. A
             # daemon hook-confirmed `semantic_idle` skips the debounce.
-            if saw_new_assistant and state == "ready":
+            if engine_done is None and saw_new_assistant and state == "ready":
                 if await asyncio.to_thread(
                     transcript_turn_complete, engine, transcript_path
                 ):
@@ -2636,7 +3192,7 @@ async def _await_reply(
                     if resolved.get("semantic_idle") is True or (
                         now - semantic_idle_since >= SEMANTIC_IDLE_GRACE_S
                     ):
-                        return {
+                        return _with_outcome({
                             "completed": True, "timed_out": False,
                             "status": (
                                 "reported" if reported else "awaiting_input"
@@ -2644,37 +3200,57 @@ async def _await_reply(
                             "state": state, "idle": idle,
                             "last_message": last_message,
                             "idle_source": "transcript",
-                        }
+                        }, resolved)
                 else:
                     semantic_idle_since = None
-        else:
+        elif engine_done is None:
             # Transcript-less fallback == `wait_for_session_idle` semantics.
             if state == "ready" and idle:
-                return {
+                return _with_outcome({
                     "completed": True, "timed_out": False,
-                    "status": _session_status(state, idle, reported),
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
                     "state": state, "idle": idle, "last_message": None,
                     "note": _NO_TRANSCRIPT_NOTE,
-                }
+                }, resolved)
             if state == "pending" and idle:
                 if pending_idle_since is None:
                     pending_idle_since = now
                 elif now - pending_idle_since >= grace:
-                    return {
+                    return _with_outcome({
                         "completed": True, "timed_out": False,
-                        "status": _session_status(state, idle, reported),
+                        "status": _session_status(state, idle, reported, resolved.get("agent_state")),
                         "state": state, "idle": idle, "last_message": None,
                         "note": _NO_TRANSCRIPT_NOTE,
-                    }
+                    }, resolved)
             else:
                 pending_idle_since = None
 
+        if engine_done is not None:
+            edge_ok = (
+                _edge_passed(agent_baseline, engine, transcript_path, resolved)
+                if agent_baseline is not None else anchor_cursor is None or saw_new_assistant
+            )
+            if engine_done and edge_ok:
+                out = _with_outcome({
+                    "completed": True, "timed_out": False,
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+                    "state": state, "idle": idle, "last_message": last_message,
+                }, resolved)
+                if transcript_path is None:
+                    out["note"] = _NO_TRANSCRIPT_NOTE
+                return out
+            if now >= deadline:
+                return _with_outcome({
+                    "completed": False, "timed_out": True,
+                    "status": _session_status(state, idle, reported, resolved.get("agent_state")),
+                    "state": state, "idle": idle, "last_message": last_message,
+                }, resolved)
         if now >= deadline:
-            return {
+            return _with_outcome({
                 "completed": False, "timed_out": True,
-                "status": _session_status(state, idle, reported),
+                "status": _session_status(state, idle, reported, resolved.get("agent_state")),
                 "state": state, "idle": idle, "last_message": last_message,
-            }
+            }, resolved)
         await asyncio.sleep(interval)
 
 
@@ -2721,6 +3297,9 @@ async def _send_and_await(
         engine=engine, transcript_path=transcript_path,
         anchor_cursor=anchor_cursor, generation=generation,
         deadline=deadline, interval=interval, grace=grace,
+        agent_baseline=({"kind": "agent", "value": engine_state(pre).get("turn_seq"),
+                         "no_turn_at": no_turn_at(engine_state(pre))}
+                        if engine_state(pre) is not None else None),
     )
     res["delivered"] = True
     return res
@@ -2756,6 +3335,8 @@ async def _settle_schema(
             attempts_left <= 0
             or res.get("state") == "exited"
             or res.get("timed_out")
+            or res.get("completion_kind") == "no_turn"
+            or res.get("status") in ("needs_human", "errored", "unknown")
             or time.monotonic() >= deadline
         )
         if stuck:

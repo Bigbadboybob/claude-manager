@@ -92,6 +92,8 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "messaging.open", "messaging.read", "messaging.send", "messaging.sync",
     "messaging.dms", "messaging.people", "messaging.channels", "messaging.pins", "session.set_name",
     "messaging.norms", "messaging.monitor", "messaging.monitors", "messaging.follow",
+    "messaging.availability", "messaging.attention",
+    "messaging.counts", "messaging.mark_read", "messaging.react",
     "ping",
     "notify_user",
     "owner_attention.ack",
@@ -131,6 +133,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # Session-caller self-target; feeds `semantic_idle` in
     # resolve_authorized_session. No TUI handler — always daemon-routed.
     "session.turn_ended",
+    "session.agent_report",
     # PTY resize (TIOCSWINSZ). Operator-only, TUI-called over the daemon
     # socket on (re)attach; no MCP tool routes it. Listed for dispatch-
     # surface alignment only.
@@ -142,6 +145,15 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # index issues. No MCP tool routes it. Listed for dispatch-surface
     # alignment only.
     "continuous.dispatch_pending",
+    # Operator-only: create/repair a continuous task's `ct/<slug>` channel
+    # (migration scripts). Listed for dispatch-surface alignment only.
+    "continuous.ensure_channel",
+    # Operator-only shared Owner-attention gate for evaluators outside the
+    # daemon (work-item board). No MCP tool routes them. Alignment only.
+    "owner_attention.escalate", "owner_attention.withdraw",
+    # Operator-only kitty-graphics file read for TUI panes. No MCP tool
+    # routes it. Listed for dispatch-surface alignment only.
+    "graphics.read_file",
     # Operator-only grant of global session permissions (TUI A-e toggle →
     # this RPC). No MCP tool routes it — an agent escalates via
     # start_session(global_perms=true), not this. Listed for dispatch-surface
@@ -154,6 +166,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "session.set_workflow_context",
     "propose_task",
     "mcp_start_session",
+    # Fork into new task (`fork_session` tool + the TUI's A-F action):
+    # mints a subtask + worktree and spawns the engine-native fork. Daemon-
+    # owned on every host (there is no TUI handler), like mcp_start_session.
+    "session.fork",
     # Headless-capable subtask status PATCH. Unlike its create_subtask /
     # list_subtasks / mark_subtask_done siblings (TUI-served on a laptop —
     # see DAEMON_DISPATCHED_BUT_TUI_ROUTED), there is NO TUI handler, so it
@@ -305,6 +321,16 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # daemon-routed under a daemon pin.
     "backtest.submit",
     "backtest.result",
+    # Work items and boards (doc/items-board.md): daemon-only proxies to the
+    # planning API. The daemon stamps the caller as actor and resolves holder
+    # names; there is no TUI handler and no PlanningClient fallback.
+    "item.create",
+    "item.set",
+    "item.resolve",
+    "board.read",
+    "board.owner_blocked",
+    # Usage recording (doc/usage-recording.md): read this host's samples.
+    "usage.read",
 })
 
 

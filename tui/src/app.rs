@@ -48,6 +48,7 @@ use events::*;
 mod lifecycle;
 mod plan_launch;
 mod remote_create;
+mod fork;
 mod image_paste;
 use lifecycle::*;
 mod input;
@@ -59,6 +60,11 @@ use transcripts::*;
 mod draw;
 mod messages;
 mod global_settings;
+mod availability;
+mod agent_state;
+mod board;
+mod owner_blocked;
+mod unread;
 
 pub(crate) use lifecycle::try_attach_via_daemon_with_deps;
 
@@ -256,6 +262,12 @@ pub struct App {
     pub last_adopt_scan: Option<Instant>,
     pub config: Config,
     global_settings: global_settings::GlobalSettings,
+    availability: availability::Availability,
+    board: board::Board,
+    owner_blocked: owner_blocked::OwnerBlocked,
+    /// Reap requests submitted from the cleanup dialog, tracked after it closed.
+    cleanup_jobs: Vec<worktree_cleanup::Menu>,
+    unread: unread::Unread,
     pub backend: BackendHandle,
     pub connected: bool,
     pub status_msg: Option<(String, Instant)>,
@@ -372,6 +384,12 @@ pub struct App {
     pub(crate) sidebar_pending: HashMap<(cm_daemon::host_id::HostId, String), cm_daemon::sidebar::Assignment>,
     /// Adopted agent workspace ids, persisted independently of display names.
     pub(crate) auto_close_workspaces: HashSet<String>,
+    /// Workspaces Owner reopened with A-O in this viewer run. A reopen is an
+    /// explicit claim: neither the spent sweep nor the agent-marker close
+    /// may hide them again (2026-10-12: a reopened cloud workspace whose
+    /// restore had failed was auto-closed seconds later). Cleared when Owner
+    /// closes the workspace.
+    pub(crate) user_reopened: HashSet<String>,
     /// Cloud backtest runs, rendered in the continuous panel's `backtests`
     /// group instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
@@ -498,6 +516,8 @@ pub struct App {
     pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
     plan_launches: Vec<plan_launch::PlanLaunchFlight>,
     remote_creates: Vec<remote_create::RemoteCreateFlight>,
+    /// A-F forks in flight (the host provisions a worktree before replying).
+    fork_flights: Vec<fork::ForkFlight>,
     image_pastes: Vec<image_paste::ImagePasteFlight>,
     /// 10e-d: per-process de-dup set for cap-kill toasts. A given
     /// session's cap-kill event can reach the TUI through two
@@ -521,6 +541,12 @@ pub struct App {
     /// once the reap is confirmed; consumed one-shot in
     /// `apply_manifest_diff_from_host`.
     pub(crate) restart_suppressed_exit_uids: std::collections::HashSet<String>,
+    /// Sessions whose last A-R failed, with the error: the row stays (no
+    /// exit prune) and shows the failure until a later revive succeeds.
+    pub(crate) revive_failed: HashMap<String, String>,
+    /// Last `session.viewed` report: which session, and when. See
+    /// `report_viewed_session`.
+    pub(crate) viewed_report: Option<(String, std::time::Instant)>,
     /// 12a (Phase 3): parsed `~/.cm/hosts.toml`. Synthesized
     /// local-default when the file is missing (A1 in the Phase 3
     /// plan). No consumer yet — 12b adds the field to manifest
@@ -592,6 +618,8 @@ pub struct App {
     /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
     alerts: HashMap<String, String>,
     owner_alerts: HashMap<(crate::hosts::HostId, String), cm_daemon::owner_attention::Alert>,
+    /// Engine-reported `agent_state` per (host, uid); see `app/agent_state.rs`.
+    agent_states: HashMap<(crate::hosts::HostId, String), agent_state::AgentStateView>,
     owner_alert_rows: HashSet<String>,
     dismissed_owner_alerts: HashSet<String>,
     /// Fingerprint of every open-workspace idle session's `(uid, age
@@ -914,6 +942,11 @@ impl App {
             last_adopt_scan: None,
             config,
             global_settings: global_settings::GlobalSettings::load(),
+            availability: availability::Availability::load(),
+            board: board::Board::default(),
+            owner_blocked: owner_blocked::OwnerBlocked::default(),
+            cleanup_jobs: Vec::new(),
+            unread: unread::Unread::default(),
             backend,
             connected: false,
             status_msg: None,
@@ -953,6 +986,7 @@ impl App {
             sidebar_pending: HashMap::new(),
             sidebar_retry_at: Instant::now(),
             auto_close_workspaces,
+            user_reopened: HashSet::new(),
             backtest_rows: Vec::new(),
             backtests_folded: false,
             backtest_unfolded_fleets: HashSet::new(),
@@ -971,6 +1005,8 @@ impl App {
             continuous_dispatch_pending: std::collections::HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
             restart_suppressed_exit_uids: std::collections::HashSet::new(),
+            revive_failed: HashMap::new(),
+            viewed_report: None,
             hosts,
             host_pool,
             skipped_manifest_entries: HashMap::new(),
@@ -979,12 +1015,14 @@ impl App {
             attaching: HashMap::new(),
             plan_launches: Vec::new(),
             remote_creates: Vec::new(),
+            fork_flights: Vec::new(),
             image_pastes: Vec::new(),
             push_worker,
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
             owner_alerts: HashMap::new(),
+            agent_states: HashMap::new(),
             owner_alert_rows: HashSet::new(),
             dismissed_owner_alerts: HashSet::new(),
             last_alert_frame: 0,

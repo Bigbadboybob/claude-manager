@@ -1,0 +1,1 @@
+Normalized fixtures for the Claude Code 2.1.291 presence schema documented in doc/SESSION_STATE.md. No private transcript, paths or session IDs. PID 1001 and procStart 42 are test identities; timestamps are milliseconds. Tests supply a fake /proc tree, including dead and reused PIDs. Extra tempo fields model optional upstream metadata and must not override status.

@@ -335,6 +335,8 @@ impl App {
                 "messaging.follow",
                 json!({"action":"get","scope":scope,"claim_bell":true}),
             );
+        } else if self.messages.target["mentions"] == true {
+            self.messaging_request("mentions_list", json!({}));
         } else {
             self.messaging_request("messaging.read", self.messages.query());
         }
@@ -1452,6 +1454,7 @@ mod tests {
         assert_eq!(a.messages.draft().body,"Shared convention");
         key(&mut a,KeyCode::Esc,KeyModifiers::NONE);
         a.messages.target = json!({"channel":"work"});
+        a.messages.pane = 0; // In the conversation pane N steps to the previous mention.
         key(&mut a,KeyCode::Char('N'),KeyModifiers::NONE);
         assert_eq!(a.messages.norms_scope(),"channel:cid");
         assert_eq!(a.messages.target_label(),"#work norms");

@@ -75,6 +75,13 @@ pub struct LastExit {
     /// existing `SessionTombstone.exited_at` so tombstone pruning
     /// uses the same clock.
     pub exited_at: f64,
+    /// Who or what asked for the exit, as on the tombstone (`killed_by`):
+    /// a session uid, `"operator"`, `"memory-cap"`, or
+    /// `"terminal-task-sweep (terminal task)"` for a worker whose task was
+    /// done. `None` for a natural exit or an unattributed kill. Lets the TUI
+    /// say why a row closed instead of making it look like a crash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub killed_by: Option<String>,
 }
 
 /// One change to the session manifest, broadcast to live
@@ -259,6 +266,16 @@ impl ManifestWatcher {
     /// `SyncSender` BLOCKS when full, which would freeze the
     /// broadcaster (and thus whichever lock the caller is
     /// holding — typically `DaemonState`).
+    /// Connected `manifest.watch` subscribers (viewers). Owner attention uses
+    /// it to tell "a TUI will show this alert" from "nobody is watching".
+    pub fn subscriber_count(&self) -> usize {
+        self.inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
     pub fn broadcast(&self, diff: ManifestDiff) {
         let mut subs = self
             .inner
@@ -632,6 +649,7 @@ mod tests {
 
     fn sample_exit(memory_cap_kill: bool) -> LastExit {
         LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill,
             kills_file_offset: Some(1024),
@@ -707,6 +725,7 @@ mod tests {
     #[test]
     fn last_exit_omits_none_fields_on_serialize() {
         let minimal = LastExit {
+            killed_by: None,
             code: None,
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -831,6 +850,7 @@ mod tests {
         let w = ManifestWatcher::new();
         let (rx, _guard) = w.subscribe();
         let last_exit = LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(0),

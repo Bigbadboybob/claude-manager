@@ -5,10 +5,39 @@ cells, and writes incremental buffer differences through the Crossterm backend.
 The grid is already a display model: its cell contents must not be replayed as
 terminal commands.
 
+## Scrolling Codex sessions
+
+Codex 0.160 draws in the alternate screen by default. The alternate screen
+has no scrollback, so CM's mouse wheel and Shift+PageUp, which move CM's own
+scrollback, had nothing to scroll. Codex there also does not enable mouse
+reporting (only `?1049h` + `?1007h`), so the wheel was not forwarded either.
+
+CM now launches Codex with `--no-alt-screen` (inline mode) in both argv
+composers (`daemon/src/mcp_config.rs::build_args`, `tui/src/mcp_config.rs::
+codex_args`), for fresh launches and resumes; `mcp_server/native_codex.py`
+passes the flag to the remote frontend. Inline Codex inserts history above its
+viewport, so it lands in CM's scrollback; on resize it clears and reprints the
+transcript (`CSI 2J` + `CSI 3J`) rather than duplicating it. A resumed session
+replays its history into scrollback. The startup banner can appear two or three
+times while the thread loads.
+
+Running sessions keep the mode they started with. Revive one with **A-R** to
+switch it. Turn inline mode off with `codex_inline_scrollback = false` in
+`~/.cm/daemon.toml` (then `daemon.reload_config`) for daemon-composed spawns and
+revives, and in `~/.cm/tui-settings.toml` for TUI-composed ones (restart the
+TUI).
+
+For any alternate-screen app that does not request mouse reporting, the wheel
+is translated into keys the app scrolls with. Codex gets PageUp/PageDown,
+because Up/Down recall its composer history. Other apps get the standard
+alternate-scroll arrows (three per notch). This makes the wheel work in Codex
+sessions that have not been revived. Plain PageUp/PageDown already reach
+alternate-screen apps.
+
 ## Copying from mouse-enabled clients
 
-Fullscreen Codex enables mouse tracking, so ordinary clicks, drags and scrolling
-belong to Codex. Hold **Shift** while starting a left-button drag to select text
+When a fullscreen client enables mouse tracking, ordinary clicks, drags and scrolling
+belong to the client. Hold **Shift** while starting a left-button drag to select text
 in CM instead. Releasing the mouse copies the selection through OSC 52 to the
 viewing terminal's clipboard. **Shift+Alt+drag** selects a rectangular block.
 The gesture stays with CM if Shift is released first, and dragging outside the
@@ -92,15 +121,20 @@ screen those updates depended on. Replaying it into a fresh terminal can leave
 the upper conversation blank even while new messages and input work. The agent's
 saved transcript is separate from this display buffer.
 
-Existing Codex panes now request a repaint the first time they are viewed after
-attachment or reconnect. The viewer briefly changes the PTY width by one column
-and restores the current viewport size 400 ms later. Codex rebuilds its history
-and composer in response. The viewer ticks drive this asynchronously: no input,
+Existing Codex and Claude Code panes request a repaint the first time they are
+viewed after attachment or reconnect (TUI restore, Alt+a, a brain-restart or
+tunnel reattach). The viewer briefly changes the PTY width by one column and
+restores the current viewport size 400 ms later. Both agents rebuild their
+screen in response. Without it, Claude Code's renderer kept drawing only the
+changed lines over a screen the viewer never received: its prompt box, status
+line and agent list stayed missing, with stale fragments such as a leftover
+"(running Stop hooks…)" line and a half-overwritten hint row. The viewer ticks drive this asynchronously: no input,
 agent restart, blocking delay, or extra control RPC is involved. Hidden panes
 defer the work until viewed. A size restoration still completes if focus moves,
 and a user window resize during recovery takes precedence over the old size.
 
-**Alt+r** also requests this repaint for the focused Codex session, alongside
+**Alt+r** also requests this repaint for the focused Codex or Claude session (the
+manual "redraw this pane" key), alongside
 the existing planning refresh, reconnect nudge, and outer-screen clear.
 **Alt+Shift+r** retains its distinct agent restart/revive behavior.
 

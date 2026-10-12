@@ -41,6 +41,51 @@ pub(crate) fn guard_local_host_only(
     )))
 }
 
+/// The manifest entry a remote `session.revive` restores from: the
+/// tombstone's full entry when it saved one, else one rebuilt from its
+/// fields. Same uid, label, task and transcript; the exit is cleared.
+pub(crate) fn remote_revive_entry(
+    tomb: &SessionTombstone,
+    host: &cm_daemon::host_id::HostId,
+) -> cm_daemon::manifest::ManifestEntry {
+    let mut entry = tomb.entry.clone().unwrap_or_else(|| cm_daemon::manifest::ManifestEntry {
+        transcript_path: None,
+        reported_done_at: None,
+        report_reason: None,
+        memory_cap_soft_bytes: None,
+        memory_cap_hard_bytes: None,
+        cgroup_prefix: None,
+        uid: tomb.uid.clone(),
+        managed_by_uid: tomb.managed_by_uid.clone(),
+        generation: tomb.generation,
+        label: tomb.label.clone(),
+        session_type: tomb.session_type.clone(),
+        transcript_id: tomb.last_transcript_id.clone(),
+        hidden: false,
+        idle_timeout_secs: super::model::DEFAULT_IDLE_TIMEOUT_SECS,
+        burst_threshold: 0,
+        workflow_run_id: None,
+        workflow_role: None,
+        continuous_task_id: None,
+        task_id: tomb.task_id.clone(),
+        notify_on_idle: false,
+        color: None,
+        global_perms: false,
+        seeded_from_snapshot: None,
+        last_exit: None,
+        host_id: host.clone(),
+    });
+    entry.uid = tomb.uid.clone();
+    if entry.transcript_id.is_none() {
+        entry.transcript_id = tomb.last_transcript_id.clone();
+    }
+    entry.last_exit = None;
+    entry.reported_done_at = None;
+    entry.report_reason = None;
+    entry.host_id = host.clone();
+    entry
+}
+
 /// migrate-tui-local Issue 1: attach to a daemon session whose
 /// UID the daemon already knows. This is the manifest-restore
 /// path on TUI startup: the daemon + its PTY children survive
@@ -701,6 +746,10 @@ impl App {
         }
 
         self.workspaces[wi].is_closed = false;
+        // Owner's reopen claims the workspace: it is no longer an agent
+        // wrapper to auto-close, and no sweep may hide it again this run.
+        self.auto_close_workspaces.remove(ws_id);
+        self.user_reopened.insert(ws_id.to_string());
 
         let bound_done: Vec<String> = self
             .tasks
@@ -782,12 +831,15 @@ impl App {
         // Restore INTO this workspace → use the workspace's host (not the
         // global active_host, which could mismatch the worktree's host).
         let active_host = self.workspaces[wi].host_id.clone();
-        // migrate-tui-local Issue C: the daemon-routed spawn
-        // below sends local-only paths (worktree + per-session
-        // MCP config under `~/.cm/mcp/...`). A non-local active
-        // host would route those at a daemon that can't read
-        // them. Fail fast with the shared helper — same shape
-        // every other entry point uses.
+        // A remote workspace's sessions live on their host: revive each
+        // tombstone there (same uid, label, task and transcript), as
+        // remote A-R does. The local spawn below sends local-only paths.
+        if active_host != cm_daemon::host_id::HostId::local() {
+            self.restore_remote_tombstones(wi);
+            return;
+        }
+        // Below this point the spawn sends local-only paths (worktree +
+        // per-session MCP config); the guard keeps that invariant explicit.
         if let Err(e) = guard_local_host_only(
             &active_host,
             "A-O restore-tombstones-for-workspace",
@@ -953,6 +1005,93 @@ impl App {
         ));
     }
 
+    /// A-O restore on a remote workspace: `session.revive {uid}` on the
+    /// owning daemon for each tombstone, then the deferred-reattach flow
+    /// binds the rows (the pending reattach also keeps the sweep away while
+    /// it is in flight). A tombstone whose revive fails stays listed and
+    /// its error is reported.
+    fn restore_remote_tombstones(&mut self, wi: usize) {
+        let ws = &self.workspaces[wi];
+        let ws_id = ws.id.clone();
+        let host_id = ws.host_id.clone();
+        let ws_worktree = ws.worktree_path.clone();
+        let Some(socket) = self.host_pool.for_host(&host_id).ok().and_then(|h| h.socket_path()) else {
+            self.set_status_msg(&format!(
+                "Host `{}` unreachable — nothing restored; the closed sessions stay listed",
+                host_id.as_str(),
+            ));
+            return;
+        };
+        let token = self.host_pool.operator_token_for(&host_id);
+        let tombstones = std::mem::take(&mut self.workspaces[wi].tombstones);
+        let total = tombstones.len();
+        let mut restored = 0;
+        let mut failed: Vec<SessionTombstone> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut reopen_tasks: Vec<String> = Vec::new();
+        for tomb in tombstones {
+            let entry = remote_revive_entry(&tomb, &host_id);
+            let Some(worktree) = tomb.worktree_path.clone().or_else(|| ws_worktree.clone()) else {
+                errors.push(format!("{}: no worktree", tomb.label));
+                failed.push(tomb);
+                continue;
+            };
+            match crate::client_session::rpc_session_revive(
+                &socket,
+                &token,
+                &entry,
+                &ws_id,
+                &worktree.to_string_lossy(),
+            ) {
+                Ok(()) => {
+                    if let Some(task) = &entry.task_id {
+                        reopen_tasks.push(task.clone());
+                    }
+                    self.pending_remote_reattach
+                        .push(super::remote::PendingRemoteReattach::new(ws_id.clone(), entry));
+                    restored += 1;
+                }
+                Err(e) => {
+                    eprintln!("cm-tui: A-O revive of {} on {} failed: {e:#}", tomb.uid, host_id.as_str());
+                    errors.push(format!("{}: {e}", tomb.label));
+                    failed.push(tomb);
+                }
+            }
+        }
+        // A restored worker's task is work in progress again; a done task
+        // would have the terminal-task sweep close the session once more.
+        // (`self.tasks` keeps only non-terminal tasks, so reopen's bound-done
+        // flip cannot see these.)
+        reopen_tasks.sort();
+        reopen_tasks.dedup();
+        for task in reopen_tasks {
+            let active = self.tasks.iter().any(|t| {
+                t.task_id.as_deref() == Some(task.as_str()) && !matches!(t.api_status, TaskStatus::Done)
+            });
+            if !active {
+                let mut fields = HashMap::new();
+                fields.insert("status".to_string(), serde_json::Value::String("running".into()));
+                self.backend.update_task(task.clone(), fields);
+                self.planning.mark_task_running_by_id(&task);
+            }
+        }
+        self.workspaces[wi].tombstones.extend(failed);
+        self.save_session_manifest();
+        self.cursor = Cursor::Workspace(wi);
+        self.clamp_cursor();
+        let mut msg = format!(
+            "Restored {}/{} session{} on `{}` — reattaching…",
+            restored,
+            total,
+            if total == 1 { "" } else { "s" },
+            host_id.as_str(),
+        );
+        if !errors.is_empty() {
+            msg.push_str(&format!(" · failed (still listed, A-O retries): {}", errors.join("; ")));
+        }
+        self.set_status_msg(&msg);
+    }
+
     /// Soft-close the workspace under the cursor: kill its session PTYs
     /// and hide from the sidebar. Worktree stays on disk; bindings persist.
     /// Each closed session leaves behind a `SessionTombstone` so the
@@ -967,6 +1106,7 @@ impl App {
         self.tombstone_and_remove(wi, |_| true);
         if let Some(ws) = self.workspaces.get_mut(wi) {
             ws.is_closed = true;
+            self.user_reopened.remove(&ws.id);
         }
         // Persist again in case `is_closed` flipped after the helper
         // already saved (cheap, just rewrites the same JSON).
@@ -1020,6 +1160,11 @@ impl App {
         // Resurrect INTO this workspace → use the workspace's host (not the
         // global active_host).
         let active_host = self.workspaces[wi].host_id.clone();
+        // A remote workspace's designer tombstones stay listed: the reopen's
+        // restore prompt revives them on their host with the others.
+        if active_host != cm_daemon::host_id::HostId::local() {
+            return 0;
+        }
         // migrate-tui-local Issue C: the resurrect path resolves a
         // claude transcript path on the local filesystem and
         // hands it (plus the workspace's worktree) to the daemon.
@@ -2272,9 +2417,11 @@ impl App {
                 &ws_id,
                 &wt_path.to_string_lossy(),
             ) {
-                self.set_status_msg(&format!("Revive failed: {e}"));
+                let uid = self.workspaces[wi].sessions[si].uid.clone();
+                self.note_revive_failure(&uid, &e.to_string());
                 return;
             }
+            self.revive_failed.remove(&self.workspaces[wi].sessions[si].uid.clone());
             {
                 let ts = &mut self.workspaces[wi].sessions[si];
                 ts.session.exited = false;
@@ -2317,6 +2464,7 @@ impl App {
         };
         match spawned {
             Some((mut fresh, outcome)) => {
+                self.revive_failed.remove(&fresh.uid);
                 // Same post-swap kick as the workflow respawn path: force
                 // the daemon PTY to the pane size so the pane repaints.
                 fresh.session.resize(cols, rows);
@@ -2335,11 +2483,22 @@ impl App {
                 });
             }
             None => {
-                self.set_status_msg(
-                    "Revive failed — could not respawn the session (see stderr log)",
-                );
+                let uid = self.workspaces[wi].sessions[si].uid.clone();
+                self.note_revive_failure(&uid, "could not respawn the session (details in the TUI log)");
             }
         }
+    }
+
+    /// A failed A-R keeps its row: exit prunes skip it, the row shows
+    /// `✗ revive failed`, and the error stays in the status line. Pre-fix a
+    /// forced restart whose revive failed (its worktree had been deleted)
+    /// lost the row to the next exit prune and the error to a transient
+    /// status line Owner never saw (2026-10-08).
+    pub(super) fn note_revive_failure(&mut self, uid: &str, error: &str) {
+        eprintln!("cm-tui: revive of {uid} failed: {error}");
+        self.revive_failed.insert(uid.to_owned(), error.to_owned());
+        self.set_status_msg(&format!("Revive failed: {error} — the row is kept; fix and press A-R again"));
+        self.needs_redraw = true;
     }
 
     /// A-R on a LIVE session — the kill half of a forced restart.
@@ -3304,6 +3463,7 @@ impl App {
 
     fn agent_workspace_can_close(&self, ws: &Workspace) -> bool {
         !ws.is_closed && !ws.is_cloud && !ws.pinned && ws.sessions.is_empty()
+            && !self.user_reopened.contains(&ws.id)
             && (self.auto_close_workspaces.contains(&ws.id) || ws.name.starts_with("agent: "))
     }
 
@@ -3331,7 +3491,7 @@ impl App {
                 continue;
             }
             let ws = &self.workspaces[wi];
-            if attach_pending.contains(ws.id.as_str()) {
+            if attach_pending.contains(ws.id.as_str()) || self.user_reopened.contains(&ws.id) {
                 continue;
             }
             if self.agent_workspace_can_close(ws) || Self::workspace_is_spent(ws, &self.tasks) {
@@ -8107,6 +8267,134 @@ mod revive_session_tests {
             app.workspaces[0].sessions[0].session.exited,
             "slot left as-is",
         );
+    }
+
+    fn hosts_with(remote: &cm_daemon::host_id::HostId, socket: std::path::PathBuf) -> crate::hosts::HostsConfig {
+        crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: std::env::temp_dir().join("cm-restore-test-nonexistent-local.sock"),
+                    },
+                    default: true,
+                    operator_token: None,
+                    operator_token_file: None,
+                },
+                crate::hosts::HostConfig {
+                    id: remote.clone(),
+                    transport: crate::hosts::HostTransport::Unix { socket },
+                    default: false,
+                    operator_token: None,
+                    operator_token_file: None,
+                },
+            ],
+        }
+    }
+
+    /// 2026-10-12: A-O on a cloud workspace failed with "not yet supported"
+    /// and the emptied workspace was auto-closed seconds later. Remote
+    /// restore now revives each tombstone at its own uid on the owning
+    /// daemon, queues the reattach, reopens its done task, and the
+    /// reopened workspace survives the sweeps.
+    #[test]
+    fn remote_restore_revives_tombstones_on_their_host_and_the_workspace_stays_open() {
+        let _home = crate::test_support::home_lock();
+        let (socket, worktree, daemon, stop, handle) =
+            crate::client_session::tests::start_test_daemon("ws-cloud");
+        let sessions = cm_daemon::host_id::HostId::new("sessions");
+        let mut app = app_with_session(dummy_ts("ts-aaaaaaaaaaaaaa09-0", true, sessions.clone()));
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(&sessions, socket.clone())).expect("pool"),
+        );
+        let uid = crate::client_session::tests::test_uid();
+        let ws = &mut app.workspaces[0];
+        ws.id = "ws-cloud".into();
+        ws.name = "Native-Rollout-Perf".into();
+        ws.host_id = sessions.clone();
+        ws.worktree_path = Some(worktree.clone());
+        ws.sessions.clear();
+        ws.is_closed = true;
+        ws.tombstones = vec![SessionTombstone {
+            entry: None,
+            uid: uid.clone(),
+            managed_by_uid: None,
+            label: "Native-Rollout-Perf".into(),
+            session_type: "bash".into(),
+            task_id: Some("fb838659".into()),
+            last_transcript_id: None,
+            worktree_path: Some(worktree.clone()),
+            generation: 0,
+            exited_at: 1.0,
+        }];
+        app.auto_close_workspaces.insert("ws-cloud".into());
+
+        assert!(app.reopen_workspace_by_id("ws-cloud"));
+        assert!(!app.auto_close_workspaces.contains("ws-cloud"), "a reopen claims the workspace");
+        app.restore_tombstones_for_workspace("ws-cloud");
+
+        let status = status_text(&app);
+        assert!(status.starts_with("Restored 1/1 session on `sessions`"), "{status}");
+        assert!(app.workspaces[0].tombstones.is_empty());
+        assert_eq!(app.pending_remote_reattach.len(), 1, "the row binds through deferred reattach");
+        assert_eq!(app.pending_remote_reattach[0].ws_id(), "ws-cloud");
+        {
+            let d = daemon.lock().unwrap();
+            let revived = d.sessions.get(&uid).expect("revived at the SAME uid on its host");
+            assert_eq!(revived.task_id.as_deref(), Some("fb838659"));
+        }
+
+        // Neither sweep closes it: not with the reattach pending, and not
+        // after it (the reopen is Owner's claim) — even off the cursor.
+        app.cursor = Cursor::Section("elsewhere".into());
+        app.reap_spent_workspaces();
+        assert!(!app.workspaces[0].is_closed);
+        app.pending_remote_reattach.clear();
+        app.reap_spent_workspaces();
+        assert!(!app.close_agent_marker_if_empty(0));
+        assert!(!app.workspaces[0].is_closed, "a reopened workspace is never auto-closed");
+
+        let _ = crate::client_session::rpc_kill_session(&socket, "op-test", &uid);
+        crate::client_session::tests::stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// A failed remote revive keeps the tombstone listed and says why.
+    #[test]
+    fn remote_restore_failure_keeps_tombstones_and_reports_them() {
+        let ghost = cm_daemon::host_id::HostId::new("ghost");
+        let mut app = app_with_session(dummy_ts("ts-aaaaaaaaaaaaaa0a-0", true, ghost.clone()));
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(
+                &ghost,
+                std::env::temp_dir().join("cm-restore-test-nonexistent-ghost.sock"),
+            ))
+            .expect("pool"),
+        );
+        let ws = &mut app.workspaces[0];
+        ws.host_id = ghost.clone();
+        ws.sessions.clear();
+        ws.tombstones = vec![SessionTombstone {
+            entry: None,
+            uid: "ts-dead-1".into(),
+            managed_by_uid: None,
+            label: "worker".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            last_transcript_id: Some("tid".into()),
+            worktree_path: None,
+            generation: 0,
+            exited_at: 1.0,
+        }];
+        let id = app.workspaces[0].id.clone();
+        app.restore_tombstones_for_workspace(&id);
+        let status = status_text(&app);
+        assert!(status.starts_with("Restored 0/1 session on `ghost`"), "{status}");
+        assert!(status.contains("failed (still listed, A-O retries): worker:"), "{status}");
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+        assert!(app.pending_remote_reattach.is_empty());
+        let entry = remote_revive_entry(&app.workspaces[0].tombstones[0], &ghost);
+        assert_eq!((entry.uid.as_str(), entry.transcript_id.as_deref()), ("ts-dead-1", Some("tid")));
+        assert!(entry.last_exit.is_none());
     }
 
     /// Remote branch, fail-closed: when the `session.revive` RPC can't

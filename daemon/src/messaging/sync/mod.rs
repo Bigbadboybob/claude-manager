@@ -138,11 +138,8 @@ impl Runtime {
             return Ok(None);
         };
         let (daemon_id, signal, is_hub) = {
-            let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-            if slot.is_none() {
-                *slot = Some(Store::open(&root)?);
-            }
-            let store = slot.as_ref().unwrap();
+            let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+            let store = slot.as_ref().ok_or_else(super::startup::starting)?;
             if store.space_id != config.space_id || store.coordinator_id() != config.coordinator_id
             {
                 return Err(error(

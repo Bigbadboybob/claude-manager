@@ -249,6 +249,23 @@ pub struct TaskCreateBody {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// `GET /boards?open_only=true`: item boards with open items, newest first
+/// (doc/items-board.md). For the board overlay's picker; called off-thread.
+pub fn list_open_boards(base_url: &str, token: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build(),
+    );
+    let url = format!("{}/boards?open_only=true", base_url.trim_end_matches('/'));
+    Ok(agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .call()?
+        .body_mut()
+        .read_json::<Vec<serde_json::Value>>()?)
+}
+
 /// Blocking HTTP client for the Claude Manager API.
 pub struct ApiClient {
     base_url: String,

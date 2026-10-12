@@ -16,6 +16,9 @@ dependencies = [
 [tool.uv]
 package = true
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"

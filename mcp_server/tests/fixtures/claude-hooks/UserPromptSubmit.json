@@ -1,0 +1,10 @@
+{
+  "session_id": "engine-session",
+  "transcript_path": "/fixture/project/engine-session.jsonl",
+  "cwd": "/fixture/project",
+  "permission_mode": "default",
+  "prompt_id": "prompt-1",
+  "hook_event_name": "UserPromptSubmit",
+  "source": "user",
+  "prompt": "PRIVATE prompt contents"
+}

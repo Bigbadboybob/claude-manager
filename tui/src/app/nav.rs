@@ -25,7 +25,7 @@ pub(crate) enum IdleAgeBucket {
 
 /// Pure bucket classifier over "how long has this session been idle".
 /// `None` = unknown age → treated as old ([`IdleAgeBucket::Stale`]).
-fn idle_age_bucket(idle_for: Option<Duration>) -> IdleAgeBucket {
+pub(super) fn idle_age_bucket(idle_for: Option<Duration>) -> IdleAgeBucket {
     match idle_for {
         Some(d) if d < IDLE_AFTERGLOW_WINDOW => IdleAgeBucket::Afterglow,
         Some(d) if d < IDLE_STALE_THRESHOLD => IdleAgeBucket::Settled,
@@ -50,24 +50,31 @@ pub(super) fn idle_age_bucket_at(idle_since: Option<Instant>, now: Instant) -> I
 /// Returns the row index to jump to: the candidate after `current` in the
 /// priority-ordered ring (wrapping), or the top-priority candidate when the
 /// cursor isn't on a candidate. `None` = nothing needs attention.
+#[cfg(test)]
 fn next_attention_index(
     rows: &[(bool, bool, bool)],
     current: Option<usize>,
 ) -> Option<usize> {
-    let mut candidates: Vec<usize> = rows
+    let tiers: Vec<Option<u8>> = rows
+        .iter()
+        .map(|(has_alert, is_idle, hidden)| {
+            super::agent_state::attention_tier(*has_alert, *hidden, None, *is_idle)
+        })
+        .collect();
+    next_attention_index_tiered(&tiers, current)
+}
+
+/// Tiered A-g picker: each row's priority tier (lower first; None = not a
+/// candidate), candidates within a tier in visual order. Tiers come from
+/// `agent_state::attention_tier`: alerts, waiting-on-human, errored, idle.
+fn next_attention_index_tiered(rows: &[Option<u8>], current: Option<usize>) -> Option<usize> {
+    let mut candidates: Vec<(u8, usize)> = rows
         .iter()
         .enumerate()
-        .filter(|(_, (has_alert, _, _))| *has_alert)
-        .map(|(i, _)| i)
+        .filter_map(|(i, t)| t.map(|t| (t, i)))
         .collect();
-    candidates.extend(
-        rows.iter()
-            .enumerate()
-            .filter(|(_, (has_alert, is_idle, hidden))| {
-                !*has_alert && *is_idle && !*hidden
-            })
-            .map(|(i, _)| i),
-    );
+    candidates.sort();
+    let candidates: Vec<usize> = candidates.into_iter().map(|(_, i)| i).collect();
     if candidates.is_empty() {
         return None;
     }
@@ -156,14 +163,34 @@ pub(super) fn palette_match_indices(query: &str, displays: &[&str]) -> Vec<usize
     if q.is_empty() {
         return (0..displays.len()).collect();
     }
+    rank_prefix_then_substring(displays.len(), |i| {
+        let dl = displays[i].to_lowercase();
+        if dl.starts_with(&q) {
+            Some(true)
+        } else if dl.contains(&q) {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+/// Shared ranking for the type-to-filter pickers (A-p palette, A-O past
+/// workspaces): `classify(i)` answers `Some(true)` for a prefix match,
+/// `Some(false)` for a plain substring match, `None` for no match. Prefix
+/// matches come first, then substring matches, each group keeping the
+/// caller's original order.
+pub(super) fn rank_prefix_then_substring(
+    len: usize,
+    mut classify: impl FnMut(usize) -> Option<bool>,
+) -> Vec<usize> {
     let mut prefix: Vec<usize> = Vec::new();
     let mut substr: Vec<usize> = Vec::new();
-    for (i, d) in displays.iter().enumerate() {
-        let dl = d.to_lowercase();
-        if dl.starts_with(&q) {
-            prefix.push(i);
-        } else if dl.contains(&q) {
-            substr.push(i);
+    for i in 0..len {
+        match classify(i) {
+            Some(true) => prefix.push(i),
+            Some(false) => substr.push(i),
+            None => {}
         }
     }
     prefix.extend(substr);
@@ -1603,14 +1630,15 @@ impl App {
                 if let Some(si) = r.sess_idx { rows.push((r.ws_idx, si, true)); }
             }
         }
-        let flags: Vec<(bool, bool, bool)> = rows
+        let tiers: Vec<Option<u8>> = rows
             .iter()
             .map(|(wi, si, _)| {
                 let ts = &self.workspaces[*wi].sessions[*si];
-                (
+                super::agent_state::attention_tier(
                     self.session_has_alert(&ts.uid),
-                    ts.status == SessionStatus::Idle && !ts.session.exited,
                     ts.hidden,
+                    (!ts.session.exited).then(|| self.agent_activity(ts)).flatten(),
+                    ts.status == SessionStatus::Idle && !ts.session.exited,
                 )
             })
             .collect();
@@ -1620,7 +1648,7 @@ impl App {
                 .position(|(wi, si, _)| wi == cwi && si == csi),
             _ => None,
         };
-        let Some(next) = next_attention_index(&flags, current) else {
+        let Some(next) = next_attention_index_tiered(&tiers, current) else {
             self.set_status_msg("No sessions need attention");
             return;
         };
@@ -1899,7 +1927,9 @@ impl App {
             .iter()
             .map(|ts| {
                 let status = if ts.session.exited {
-                    "exited".to_string()
+                    super::model::exit_note(ts.preserved_last_exit.as_ref())
+                        .unwrap_or("exited")
+                        .to_string()
                 } else {
                     match ts.status {
                         SessionStatus::Running => "running".to_string(),
@@ -1923,7 +1953,7 @@ impl App {
     /// when a task resolves (session's `task_id` or the Task cursor's),
     /// the workspace fallback otherwise; Session cursors get an identity
     /// header block on top either way.
-    fn build_peek_lines(&self) -> Vec<PeekLine> {
+    pub(crate) fn build_peek_lines(&self) -> Vec<PeekLine> {
         let mut out: Vec<PeekLine> = Vec::new();
         match &self.cursor {
             Cursor::Session(wi, si) => {
@@ -1940,6 +1970,9 @@ impl App {
                     ts.seeded_from_snapshot.as_deref(),
                     ts.last_delivery.as_ref().map(|(s, _)| s.as_str()),
                 ));
+                if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
+                    out.push(PeekLine::Field { label: "Status".into(), value: note.to_string() });
+                }
                 out.push(PeekLine::Blank);
                 match ts.task_id.as_deref().and_then(|t| self.find_task_entry(t)) {
                     Some(task) => {
@@ -2179,6 +2212,19 @@ mod idle_attention_tests {
     const IDLE_HIDDEN: (bool, bool, bool) = (false, true, true);
     const ALERT: (bool, bool, bool) = (true, false, false);
     const ALERT_HIDDEN: (bool, bool, bool) = (true, true, true);
+
+    #[test]
+    fn tiered_picker_orders_alert_waiting_errored_idle_then_cycles() {
+        // Visual order: idle, errored, waiting, alert, running.
+        let rows = [Some(3), Some(2), Some(1), Some(0), None];
+        assert_eq!(next_attention_index_tiered(&rows, None), Some(3));
+        assert_eq!(next_attention_index_tiered(&rows, Some(3)), Some(2));
+        assert_eq!(next_attention_index_tiered(&rows, Some(2)), Some(1));
+        assert_eq!(next_attention_index_tiered(&rows, Some(1)), Some(0));
+        assert_eq!(next_attention_index_tiered(&rows, Some(0)), Some(3), "wraps");
+        assert_eq!(next_attention_index_tiered(&rows, Some(4)), Some(3), "off-candidate starts at the top");
+        assert_eq!(next_attention_index_tiered(&[None, None], None), None);
+    }
 
     #[test]
     fn no_rows_or_no_candidates_yields_none() {

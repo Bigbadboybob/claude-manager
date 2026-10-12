@@ -23,6 +23,8 @@ from api.models import (
     TaskChangesResponse,
 )
 from api.dispatch_daemon import dispatch_loop, warm_pool_loop
+from api.board_engine import board_loop
+from api.items import router as items_router
 from api.task_changes import ChangeBroker, change_log_maintenance_loop
 from dispatch import db
 from dispatch.config import DB_DSN, REPOS
@@ -96,14 +98,16 @@ async def lifespan(app: FastAPI):
     app.state.change_prune_task = asyncio.create_task(
         change_log_maintenance_loop(app.state.pool)
     )
+    # Work-item flags, orchestrator pushes, escalation, close-out.
+    app.state.board_task = asyncio.create_task(board_loop(app.state.pool))
     logger.info("API server started")
     yield
     # Shutdown
     for task in (app.state.dispatch_task, app.state.warm_pool_task,
-                 app.state.change_prune_task):
+                 app.state.change_prune_task, app.state.board_task):
         task.cancel()
     for task in (app.state.dispatch_task, app.state.warm_pool_task,
-                 app.state.change_prune_task):
+                 app.state.change_prune_task, app.state.board_task):
         try:
             await task
         except asyncio.CancelledError:
@@ -123,6 +127,7 @@ app = FastAPI(title="Claude Manager", lifespan=lifespan)
 # Level 5 keeps the (event-loop-blocking) compression of a full snapshot in
 # the tens of milliseconds; the incremental feed makes snapshots rare anyway.
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+app.include_router(items_router)
 
 
 @app.exception_handler(RequestValidationError)

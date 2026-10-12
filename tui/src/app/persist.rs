@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// How often the TUI re-reports the session it keeps showing. Well inside
+/// the daemon sweep's two-hour owner grace.
+pub(crate) const VIEWED_REPORT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
 impl App {
     /// Path to the session manifest file.
     fn manifest_path() -> PathBuf {
@@ -648,18 +653,49 @@ impl App {
         self.adopt_untracked_daemon_sessions();
     }
 
+    /// Tell the owning daemon which session Owner is looking at, when the
+    /// selection changes and every [`VIEWED_REPORT_INTERVAL`] while it stays.
+    /// The terminal-task sweep never closes a session Owner showed within its
+    /// grace window, so a worker Owner is reading cannot vanish because its
+    /// task was marked done. Fire-and-forget on a thread: a remote host may
+    /// need its tunnel warmed, and an older daemon that lacks the method
+    /// just answers an error nobody needs to see.
+    pub(crate) fn report_viewed_session(&mut self) {
+        let Some((ws, ts)) = self.active_session() else { return };
+        if ts.session.exited {
+            return;
+        }
+        if self.viewed_report.as_ref().is_some_and(|(uid, at)| {
+            *uid == ts.uid && at.elapsed() < VIEWED_REPORT_INTERVAL
+        }) {
+            return;
+        }
+        let uid = ts.uid.clone();
+        let host = ws.host_id.clone();
+        self.viewed_report = Some((uid.clone(), std::time::Instant::now()));
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let _ = std::thread::Builder::new()
+            .name("cm-viewed-report".into())
+            .spawn(move || {
+                let Ok(handle) = pool.for_host(&host) else { return };
+                let Some(socket) = handle.socket_path() else { return };
+                let _ = crate::client_session::rpc_session_viewed(
+                    &socket,
+                    &pool.operator_token_for(&host),
+                    &uid,
+                );
+            });
+    }
+
     /// Throttled entry point for daemon-session adoption, called from the
     /// main tick. Bounds the `list_sessions` RPC to once per
     /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
     pub fn maybe_adopt_daemon_sessions(&mut self) {
         if let InputMode::WorktreeCleanup(menu) = &mut self.input_mode {
             self.needs_redraw |= menu.poll();
-            if menu.close_ready() {
-                let InputMode::WorktreeCleanup(menu) = std::mem::replace(&mut self.input_mode, InputMode::Normal) else { unreachable!() };
-                self.complete_with_cleanup(menu);
-                self.needs_redraw = true;
-            }
         }
+        self.cleanup_tick();
+        self.report_viewed_session();
         if let InputMode::ContinuousControl(menu) = &mut self.input_mode {
             self.needs_redraw |= menu.poll();
         }

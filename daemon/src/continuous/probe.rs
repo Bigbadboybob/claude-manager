@@ -75,6 +75,9 @@ pub enum TailShape {
 #[derive(Debug, Clone)]
 pub struct TailProbe {
     pub shape: TailShape,
+    /// Machine-readable tag on the latest synthetic API-error assistant.
+    /// Presence consumers apply this only while the engine itself says idle.
+    pub api_error: Option<String>,
     /// `Some(banner text)` when the newest assistant record carries
     /// `error: "authentication_failed"` — e.g. `"Login expired · Please run
     /// /login"` or `"Please run /login · API Error: 401 OAuth access token
@@ -114,6 +117,7 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
     let mut shape: Option<TailShape> = None;
     let mut auth_error: Option<String> = None;
     let mut usage_limit: Option<String> = None;
+    let mut api_error: Option<String> = None;
     for line in text.lines().rev().take(MAX_SCAN_LINES) {
         let line = line.trim();
         if line.is_empty() {
@@ -135,6 +139,14 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
             }
             Some("assistant") => {
                 let text = assistant_text(&v);
+                if v.get("isApiErrorMessage").and_then(|v| v.as_bool()) == Some(true)
+                    || (v.pointer("/message/model").and_then(|v| v.as_str()) == Some("<synthetic>")
+                        && v.get("error").and_then(|v| v.as_str()).is_some())
+                {
+                    api_error = Some(v.get("error").and_then(|v| v.as_str())
+                        .filter(|kind| !kind.is_empty() && kind.len() <= 4096)
+                        .unwrap_or("api_error").to_string());
+                }
                 if v.get("error").and_then(|e| e.as_str()) == Some("authentication_failed") {
                     auth_error = Some(text.clone());
                 } else if is_usage_limit_banner(&text) {
@@ -158,6 +170,7 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
     }
     shape.map(|shape| TailProbe {
         shape,
+        api_error,
         auth_error,
         usage_limit,
         pool_unavailable: None,
@@ -332,6 +345,7 @@ mod tests {
         );
         let p = probe_transcript_tail(&path).expect("probe");
         assert_eq!(p.shape, TailShape::TurnComplete);
+        assert_eq!(p.api_error.as_deref(), Some("authentication_failed"));
         assert_eq!(
             p.auth_error.as_deref(),
             Some("Login expired · Please run /login"),
@@ -350,7 +364,26 @@ mod tests {
         let p = probe_transcript_tail(&path).expect("probe");
         assert_eq!(p.shape, TailShape::TurnComplete);
         assert!(p.auth_error.is_none());
+        assert!(p.api_error.is_none());
         assert!(p.usage_limit.is_none());
+    }
+
+    #[test]
+    fn synthetic_api_tags_do_not_classify_ordinary_prose_or_cross_a_new_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in ["rate_limit", "server_error", "billing_error"] {
+            let line = serde_json::json!({"type":"assistant","isApiErrorMessage":true,"error":kind,"message":{"model":"<synthetic>"}}).to_string();
+            let path = write_lines(&dir, &[&line, TURN_DURATION_LINE]);
+            assert_eq!(probe_transcript_tail(&path).unwrap().api_error.as_deref(), Some(kind));
+            let path = write_lines(&dir, &[&line, TURN_DURATION_LINE, USER_LINE]);
+            assert!(probe_transcript_tail(&path).unwrap().api_error.is_none());
+        }
+        let ordinary = r#"{"type":"assistant","error":"server_error","message":{"model":"claude","content":[{"type":"text","text":"Explaining server_error"}]}}"#;
+        let benign_synthetic = r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#;
+        for line in [ordinary, benign_synthetic, WEEKLY_LIMIT_LINE] {
+            let path = write_lines(&dir, &[line, TURN_DURATION_LINE]);
+            assert!(probe_transcript_tail(&path).unwrap().api_error.is_none());
+        }
     }
 
     /// A trailing tool_use assistant record = mid-turn (long tool call), never

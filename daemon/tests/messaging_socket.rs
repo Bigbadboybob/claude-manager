@@ -66,6 +66,13 @@ fn messaging_framed_clients_exchange_channel_dm_and_owner_reply() {
     }
     cm_daemon::control::operator::init_from_env();
     let state = Arc::new(Mutex::new(state));
+    state.lock().unwrap().messaging_registry_restored = true;
+    cm_daemon::messaging::startup::start(&state).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while cm_daemon::messaging::rpc::initialize(&state).is_err() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
     let observed = state.clone();
     let daemon = thread::spawn(move || {
         for _ in 0..10 {

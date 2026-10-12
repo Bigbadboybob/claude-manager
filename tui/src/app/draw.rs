@@ -109,7 +109,7 @@ fn log_draw_section(section: &str, elapsed: std::time::Duration) {
 }
 
 impl App {
-    fn spinner_frame(&self) -> &'static str {
+    pub(super) fn spinner_frame(&self) -> &'static str {
         let elapsed = self.start_time.elapsed().as_millis();
         let idx = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
         SPINNER_FRAMES[idx]
@@ -134,9 +134,16 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.board.visible {
+            self.draw_board(frame);
+            self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
+            return;
+        }
         if self.messages.visible {
             self.draw_messages(frame);
             self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
             return;
         }
         let area = frame.area();
@@ -252,6 +259,7 @@ impl App {
             match &self.input_mode {
                 InputMode::ContinuousControl(menu) => menu.draw(frame, area),
                 InputMode::WorktreeCleanup(menu) => menu.draw(frame, area),
+                InputMode::ForkSession(form) => form.draw(frame, area),
                 InputMode::NewSession {
                     engine,
                     label_text,
@@ -401,8 +409,8 @@ impl App {
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
                 }
-                InputMode::PastWorkspacePicker { candidates, selected } => {
-                    self.draw_past_workspace_picker(frame, area, candidates, *selected);
+                InputMode::PastWorkspacePicker { candidates, query, selected } => {
+                    self.draw_past_workspace_picker(frame, area, candidates, query, *selected);
                 }
                 InputMode::SessionPalette { candidates, query, selected } => {
                     self.draw_session_palette(frame, area, candidates, query, *selected);
@@ -432,6 +440,7 @@ impl App {
             Rect { width: terminal_width, ..area }
         } else { area };
         self.global_settings.draw(frame, settings_area);
+        self.draw_availability(frame, area);
     }
 
     /// Minimal dialog for renaming a task from the sidebar.
@@ -1408,15 +1417,15 @@ impl App {
             };
             // Idle age tints the needs-human ● and stale orchestrator labels.
             // Subtask labels retain their durable lifecycle color.
-            let idle_bucket = (ts.status == SessionStatus::Idle
-                && !ts.session.exited)
-                .then(|| idle_age_bucket_at(ts.idle_since, now));
+            let idle_bucket = self.display_idle_bucket(ts, now);
             let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
                 ("\u{27f3}", Style::default().fg(theme::ATTN))
             } else if ts.hidden {
                 (" ", Style::default())
+            } else if let Some(engine) = self.agent_indicator(ts) {
+                engine
             } else {
-                match ts.status {
+                match if self.display_running(ts) { SessionStatus::Running } else { SessionStatus::Idle } {
                     SessionStatus::Running => (spinner, Style::default().fg(theme::OK)),
                     // Idle splits three ways: ◉ (cyan) = a pending operator
                     // QUESTION the orchestrator parked (metadata.operator_question);
@@ -1446,6 +1455,8 @@ impl App {
             };
             let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
                 self.alert_indicator()
+            } else if self.owner_blocked_session(&ts.uid) {
+                self.owner_indicator()
             } else {
                 (indicator, indicator_style)
             };
@@ -1505,6 +1516,7 @@ impl App {
                 Style::default().fg(stage.color())
             } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
                 && !self.session_has_alert(&ts.uid)
+                && !self.owner_blocked_session(&ts.uid)
                 && !self.reconnecting_sessions.contains(&ts.uid)
             {
                 // Stale-idle rows fade like the main sidebar's — see the
@@ -1815,7 +1827,7 @@ impl App {
             ("A-o    stop wf", "A-c  cont-col"),
             ("A-C    cont-stop", "A-,  activity"),
             ("A-b    snapshot", "A-g  attention"),
-            ("A-O    reopen ws", ""),
+            ("A-O    reopen ws", "A-F  fork task"),
             ("A-N    +section", "A-J/K sect order"),
             ("PgUp/Dn scroll", ""),
             ("A-Ent  newline", "A-;  recent"),
@@ -1874,10 +1886,16 @@ impl App {
 
                     // Reserve room for the tags so the name truncates before
                     // them (the pin glyph 📌 is double-width + a space).
+                    // A member session blocked on Owner marks the header too.
+                    let ws_owner_blocked = ws
+                        .sessions
+                        .iter()
+                        .any(|s| self.owner_blocked_session(&s.uid));
                     let max_name = (inner.width as usize)
                         .saturating_sub(2)
                         .saturating_sub(host_tag.chars().count())
-                        .saturating_sub(if ws.pinned { 3 } else { 0 });
+                        .saturating_sub(if ws.pinned { 3 } else { 0 })
+                        .saturating_sub(if ws_owner_blocked { 8 } else { 0 });
                     // Char-boundary-safe truncation — a raw `&ws.name[..n]` byte
                     // slice panics when the cut lands inside a multibyte char
                     // (e.g. '≤' in a workspace name). Matches the session/task
@@ -1885,10 +1903,17 @@ impl App {
                     let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
                     let mut header_spans = vec![Span::raw(" "), Span::raw(indent(*wi))];
+                    if ws_owner_blocked {
+                        let (glyph, style) = self.owner_indicator();
+                        header_spans.push(Span::styled(format!("{glyph} "), style));
+                    }
                     if ws.pinned {
                         header_spans.push(Span::raw("\u{1f4cc} "));
                     }
                     header_spans.push(Span::raw(name));
+                    if ws_owner_blocked {
+                        header_spans.push(super::owner_blocked::owner_tag());
+                    }
                     if !host_tag.is_empty() {
                         header_spans.push(Span::styled(host_tag, Style::default().fg(theme::DIM)));
                     }
@@ -1926,9 +1951,7 @@ impl App {
 
                     // Idle-age bucket — colors the idle dot (afterglow /
                     // settled / stale) and, when stale, dims the whole row.
-                    let idle_bucket = (ts.status == SessionStatus::Idle
-                        && !ts.session.exited)
-                        .then(|| idle_age_bucket_at(ts.idle_since, now));
+                    let idle_bucket = self.display_idle_bucket(ts, now);
 
                     let (indicator, indicator_style) = if self
                         .reconnecting_sessions
@@ -1944,8 +1967,13 @@ impl App {
                         ("\u{27f3}", Style::default().fg(theme::ATTN))
                     } else if ts.hidden {
                         (" ", Style::default())
+                    } else if let Some(engine) = self.agent_indicator(ts) {
+                        // Engine-reported state the PTY cannot express:
+                        // ◐ background work, ? waiting on a human,
+                        // ✗ errored, · unknown (never shown as idle).
+                        engine
                     } else {
-                        match ts.status {
+                        match if self.display_running(ts) { SessionStatus::Running } else { SessionStatus::Idle } {
                             SessionStatus::Running => {
                                 (spinner, Style::default().fg(theme::OK))
                             }
@@ -1966,8 +1994,15 @@ impl App {
                     // pending, the rainbow-heartbeat bead takes over the icon
                     // cell entirely (overriding even a hidden session's blank)
                     // — the whole point is to grab the eye regardless of status.
+                    // Below a pending alert: work blocked on an Owner decision.
+                    let owner_blocked = self.owner_blocked_session(&ts.uid);
+                    let revive_failed = self.revive_failed.contains_key(&ts.uid);
                     let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
                         self.alert_indicator()
+                    } else if revive_failed {
+                        ("\u{2717}", Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD))
+                    } else if owner_blocked {
+                        self.owner_indicator()
                     } else {
                         (indicator, indicator_style)
                     };
@@ -2041,6 +2076,17 @@ impl App {
                         spans.push(Span::styled(badge, style));
                     }
                     spans.push(Span::raw(display));
+                    if owner_blocked {
+                        spans.push(super::owner_blocked::owner_tag());
+                    }
+                    if revive_failed {
+                        spans.push(Span::styled(
+                            " revive failed",
+                            Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+                        ));
+                    } else if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
+                        spans.push(Span::styled(format!(" {note}"), Style::default().fg(theme::DIM)));
+                    }
                     if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
                         spans.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
                     }
@@ -2060,6 +2106,7 @@ impl App {
                             .add_modifier(Modifier::BOLD)
                     } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
                         && !self.session_has_alert(&ts.uid)
+                        && !owner_blocked
                         && !self.reconnecting_sessions.contains(&ts.uid)
                     {
                         // Stale-idle rows (idle > 30 min) fade out label and
@@ -2402,6 +2449,8 @@ impl App {
         let mut n_running = 0usize;
         let mut n_idle = 0usize;
         let mut n_alert = 0usize;
+        let mut n_waiting = 0usize;
+        let mut n_errored = 0usize;
         let mut any_afterglow = false;
         let now = Instant::now();
         for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
@@ -2415,13 +2464,17 @@ impl App {
                 if ts.session.exited {
                     continue;
                 }
-                match ts.status {
-                    SessionStatus::Running => n_running += 1,
-                    SessionStatus::Idle => {
+                // Engine-reported state wins; waiting-on-human and errored
+                // get their own clusters, background work counts as running.
+                match self.agent_activity(ts) {
+                    Some(super::agent_state::Activity::Waiting) => n_waiting += 1,
+                    Some(super::agent_state::Activity::Errored) => n_errored += 1,
+                    Some(super::agent_state::Activity::Unknown) => {}
+                    _ if self.display_running(ts)
+                        || self.agent_activity(ts) == Some(super::agent_state::Activity::Background) => n_running += 1,
+                    _ => {
                         n_idle += 1;
-                        if idle_age_bucket_at(ts.idle_since, now)
-                            == IdleAgeBucket::Afterglow
-                        {
+                        if self.display_idle_bucket(ts, now) == Some(IdleAgeBucket::Afterglow) {
                             any_afterglow = true;
                         }
                     }
@@ -2446,21 +2499,48 @@ impl App {
                 Style::default().fg(idle_color),
             ));
         }
+        if n_waiting > 0 {
+            rollup.push(Span::styled(
+                format!("?{} ", n_waiting),
+                Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if n_errored > 0 {
+            rollup.push(Span::styled(
+                format!("\u{2717}{} ", n_errored),
+                Style::default().fg(theme::ERROR),
+            ));
+        }
         if n_alert > 0 {
             rollup.push(Span::styled(
                 format!("\u{2691}{} ", n_alert),
                 Style::default().fg(theme::ATTN),
             ));
         }
+        // Background worktree cleanups (Alt+d / Alt+Shift+w reap).
+        if let Some(progress) = self.cleanup_progress() {
+            rollup.push(Span::styled(format!("\u{27f2} {progress} "), Style::default().fg(theme::MUTED)));
+        }
+        // Items blocked on an Owner decision, across every board.
+        let n_owner = self.owner_blocked.count();
+        if n_owner > 0 {
+            rollup.push(Span::styled(
+                format!("\u{25c6}{} OWNER ", n_owner),
+                super::owner_blocked::owner_style(),
+            ));
+        }
 
         let left1 = format!(" {} ", conn_indicator);
         let left2 = "claude-manager ";
+        // Owner availability (F7), e.g. `● focused 14m`; absent while unset.
+        let availability = self.availability.status_span();
+        let availability_width = availability.as_ref().map_or(0, |s| s.content.chars().count() as u16);
         let right = format!(" {}r {}b {}q ", running, blocked, backlog);
 
         // Width math from the ACTUAL span contents (every glyph used here is
         // single-cell, so char count == display width) — no hardcoded
         // left-side constant to drift out of sync.
-        let left_used = (left1.chars().count() + left2.chars().count()) as u16;
+        let left_used = (left1.chars().count() + left2.chars().count()) as u16 + availability_width;
         let right_width = right.chars().count() as u16;
         let center_width = center.chars().count() as u16;
         let mouse_width = mouse_indicator.chars().count() as u16;
@@ -2476,13 +2556,22 @@ impl App {
         } else {
             (rollup, rollup_width)
         };
-        let pad = area.width.saturating_sub(fixed + rollup_width);
+        // Owner's unread DMs / mentions (`✉2 @1 F8`), bottom right. Takes
+        // only spare room: shortens to the glyph, then disappears, rather
+        // than pushing anything else off the bar.
+        let unread = super::unread::indicator_variants(self.unread.dms, self.unread.mentions)
+            .into_iter()
+            .find(|v| fixed + rollup_width + v.chars().count() as u16 <= area.width)
+            .unwrap_or_default();
+        let unread_width = unread.chars().count() as u16;
+        let pad = area.width.saturating_sub(fixed + rollup_width + unread_width);
         let pad_left = pad / 2;
         let pad_right = pad - pad_left;
 
         let mut spans = vec![
             Span::styled(left1, Style::default().fg(conn_color)),
             Span::styled(left2, Style::default().fg(theme::DIM)),
+            availability.unwrap_or_else(|| Span::raw("")),
             Span::styled(
                 mouse_indicator,
                 Style::default().fg(theme::BADGE_FG).bg(theme::ATTN).add_modifier(Modifier::BOLD),
@@ -2499,6 +2588,12 @@ impl App {
         ];
         spans.extend(rollup);
         spans.push(Span::styled(right, Style::default().fg(theme::DIM)));
+        if !unread.is_empty() {
+            spans.push(Span::styled(
+                unread,
+                Style::default().fg(theme::BADGE_FG).bg(theme::ATTN).add_modifier(Modifier::BOLD),
+            ));
+        }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -2729,14 +2824,20 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         candidates: &[PastCandidate],
+        query: &str,
         selected: usize,
     ) {
-        let total = candidates.len();
+        // Same filtered view the handler indexes; `selected` points into it.
+        let filtered = past_workspace_match_indices(query, candidates);
+        let total = filtered.len();
+        let selected = selected.min(total.saturating_sub(1));
         let width = area.width.min(80).max(40);
-        // Dialog chrome: 2 border rows + 1 blank + 1 footer line.
-        // Below that, each candidate (or scroll-indicator) takes one row.
-        let max_dialog_height = area.height.saturating_sub(2).max(7);
-        let desired_height = (total as u16).saturating_add(4).max(7);
+        // Dialog chrome: 2 border rows + query line + blank + blank +
+        // footer line. Below that, each candidate (or scroll-indicator)
+        // takes one row. Sized off the UNFILTERED count so the dialog
+        // doesn't jump around while typing.
+        let max_dialog_height = area.height.saturating_sub(2).max(9);
+        let desired_height = (candidates.len() as u16).saturating_add(6).max(9);
         let height = desired_height.min(max_dialog_height);
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -2745,7 +2846,7 @@ impl App {
         frame.render_widget(Clear, dialog);
 
         let inner_height = height.saturating_sub(2) as usize;
-        let footer_rows = 2; // blank + key-hint line
+        let footer_rows = 4; // query + blank on top, blank + key-hint below
         let list_budget = inner_height.saturating_sub(footer_rows).max(1);
         let needs_scroll = total > list_budget;
         // Reserve one line each for "↑ N more" / "↓ N more" when scrolling.
@@ -2773,8 +2874,17 @@ impl App {
         let dim = Style::default().fg(theme::DIM);
         let mut lines: Vec<Line> = Vec::new();
 
+        lines.push(Line::from(vec![
+            Span::styled("> ", dim),
+            Span::styled(query.to_string(), Style::default().fg(theme::TEXT)),
+            Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
+            Span::styled(format!("   {} of {}", total, candidates.len()), dim),
+        ]));
+        lines.push(Line::from(""));
         if candidates.is_empty() {
             lines.push(Line::from(Span::styled("No past workspaces.", dim)));
+        } else if filtered.is_empty() {
+            lines.push(Line::from(Span::styled("(no matches)", dim)));
         } else {
             if needs_scroll {
                 if above > 0 {
@@ -2787,7 +2897,7 @@ impl App {
                 }
             }
             for idx in offset..end {
-                let cand = &candidates[idx];
+                let cand = &candidates[filtered[idx]];
                 let is_active = idx == selected;
                 let cursor = if is_active { "\u{25b8} " } else { "  " };
                 let path_repr = cand
@@ -2835,6 +2945,9 @@ impl App {
                         Style::default().fg(theme::ERROR),
                     ));
                 }
+                if let Some(note) = cand.note {
+                    spans.push(Span::styled(format!("  {note}"), Style::default().fg(theme::DIM)));
+                }
                 lines.push(Line::from(spans));
             }
             if needs_scroll {
@@ -2850,7 +2963,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "\u{2191}\u{2193} select   Enter: reopen   Esc: cancel",
+            "type to filter   \u{2191}\u{2193}/C-j/C-k select   Enter: reopen   Esc: clear/close",
             dim,
         )));
 

@@ -1,0 +1,48 @@
+{
+  "session_id": "engine-session",
+  "transcript_path": "/fixture/project/engine-session.jsonl",
+  "cwd": "/fixture/project",
+  "permission_mode": "default",
+  "prompt_id": "prompt-1",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "Turn finished.",
+  "background_tasks": [
+    {
+      "id": "shell-1",
+      "type": "shell",
+      "status": "running",
+      "description": "test runner",
+      "command": "python -m pytest"
+    },
+    {
+      "id": "agent-1",
+      "type": "subagent",
+      "status": "running",
+      "description": "review lane",
+      "agent_type": "general-purpose"
+    },
+    {
+      "id": "monitor-1",
+      "type": "monitor",
+      "status": "backgrounded",
+      "description": "job watcher",
+      "server": "cm",
+      "tool": "watch"
+    },
+    {
+      "id": "workflow-1",
+      "type": "workflow",
+      "status": "pending",
+      "description": "build workflow"
+    }
+  ],
+  "session_crons": [
+    {
+      "id": "cron-1",
+      "schedule": "*/5 * * * *",
+      "recurring": true,
+      "prompt": "PRIVATE cron instructions"
+    }
+  ]
+}

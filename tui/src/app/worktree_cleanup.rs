@@ -17,7 +17,14 @@ pub(super) struct Menu {
     commands: HashMap<HostId, mpsc::Sender<()>>,
     jobs: HashMap<HostId, Value>,
     errors: HashMap<HostId, String>,
+    /// When Reap was submitted; the dialog is gone by then and the job is
+    /// tracked in the background (`App::cleanup_jobs`).
+    submitted_at: Option<Instant>,
 }
+
+/// A submitted cleanup that no host has accepted for this long is reported
+/// as failed (the host threads keep retrying until the job is dropped).
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn rpc(pool: &crate::host_pool::HostPool, host: &HostId, params: Value) -> Result<Value, String> {
     let handle = pool.for_host(host).map_err(|e| e.to_string())?;
@@ -84,6 +91,7 @@ impl Menu {
             commands,
             jobs: HashMap::new(),
             errors: HashMap::new(),
+            submitted_at: None,
         }
     }
 
@@ -127,20 +135,6 @@ impl Menu {
         ids
     }
 
-    pub fn close_ready(&self) -> bool {
-        self.submitted
-            && !self.closed
-            && self.errors.is_empty()
-            && !self.commands.is_empty()
-            && self.commands.len() == self.jobs.len()
-            && self.jobs.values().all(|job| {
-                matches!(
-                    job["phase"].as_str(),
-                    Some("queued" | "running" | "complete")
-                )
-            })
-    }
-
     pub fn key(&mut self, key: crossterm::event::KeyEvent) -> InputOutcome {
         match key.code {
             KeyCode::Esc => return InputOutcome::Cancel,
@@ -152,7 +146,11 @@ impl Menu {
             KeyCode::Char('j') | KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::Enter if !self.submitted => {
-                if (self.reap || (self.mark_done && self.task_id.is_none())) && !self.ready() {
+                // Reap no longer waits for the preview: the host resolves it
+                // and reaps in the background with the same safety checks.
+                // Only "mark done" without a selected task needs the preview,
+                // which names the task that owns the workspace.
+                if self.mark_done && self.task_id.is_none() && !self.ready() {
                     return InputOutcome::Status(
                         "Wait for the host to resolve task ownership and the cleanup preview."
                             .into(),
@@ -174,6 +172,7 @@ impl Menu {
             return false;
         }
         self.submitted = true;
+        self.submitted_at = Some(Instant::now());
         for (host, tx) in &self.commands {
             if tx.send(()).is_err() {
                 self.errors.insert(
@@ -183,6 +182,73 @@ impl Menu {
             }
         }
         true
+    }
+
+    /// Every host's job finished (or failed), or nothing was ever accepted.
+    fn finished(&self) -> Option<Outcome> {
+        let accepted = |job: &Value| {
+            job["apply_requested"] == true
+                || matches!(job["phase"].as_str(), Some("queued" | "running" | "complete" | "error"))
+        };
+        let all_done = !self.commands.is_empty()
+            && self.commands.keys().all(|h| {
+                self.jobs.get(h).is_some_and(|j| matches!(j["phase"].as_str(), Some("complete" | "error")))
+            });
+        let stalled = self.submitted_at.is_some_and(|t| t.elapsed() >= ACCEPT_TIMEOUT)
+            && self.commands.keys().any(|h| !self.jobs.get(h).is_some_and(accepted));
+        if !all_done && !stalled {
+            return None;
+        }
+        let mut out = Outcome::default();
+        for (host, job) in &self.jobs {
+            if job["phase"] == "error" {
+                out.failed.push(format!("{}: {}", host.as_str(), job["message"].as_str().unwrap_or("failed")));
+            }
+            for row in job["results"].as_array().into_iter().flatten() {
+                if row["removed"] == true {
+                    out.reaped += 1;
+                } else if row["already_absent"] != true {
+                    out.retained.push(format!(
+                        "{} ({})",
+                        row["path"].as_str().unwrap_or("?"),
+                        row["message"].as_str().unwrap_or("retained")
+                    ));
+                }
+            }
+        }
+        if stalled {
+            for host in self.commands.keys().filter(|h| !self.jobs.get(*h).is_some_and(accepted)) {
+                let why = self.errors.get(host).map(String::as_str).unwrap_or("no answer");
+                out.failed.push(format!("{}: cleanup not accepted ({why})", host.as_str()));
+            }
+        }
+        Some(out)
+    }
+
+    /// Short progress for the status bar, e.g. `cleanup: reaping 2/5`.
+    fn progress(&self) -> String {
+        let mut phases: Vec<String> = Vec::new();
+        for host in self.commands.keys() {
+            let text = match (self.jobs.get(host), self.errors.get(host)) {
+                (_, Some(_)) => "retrying host".to_string(),
+                (None, None) => "finding worktrees".to_string(),
+                (Some(job), None) => match job["phase"].as_str() {
+                    Some("scanning") => "scanning".into(),
+                    Some("preview" | "queued") => "queued".into(),
+                    Some("running") => {
+                        let total = job["candidates"].as_array().map_or(0, Vec::len);
+                        let done = job["results"].as_array().map_or(0, Vec::len);
+                        format!("reaping {done}/{total}")
+                    }
+                    Some(other) => other.to_string(),
+                    None => "working".into(),
+                },
+            };
+            if !phases.contains(&text) {
+                phases.push(text);
+            }
+        }
+        format!("cleanup: {}", phases.join(", "))
     }
 
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
@@ -217,9 +283,11 @@ impl Menu {
                 ),
                 Style::default().fg(theme::TEXT),
             ));
-            lines.push(Line::from(
-                "Tab/←/→ choose · Enter close · j/k scroll · Esc cancel",
-            ));
+            lines.push(Line::from(if self.reap {
+                "Tab/←/→ choose · Enter reap (runs in the background) · j/k scroll · Esc cancel"
+            } else {
+                "Tab/←/→ choose · Enter close · j/k scroll · Esc cancel"
+            }));
         } else {
             lines.push(Line::from(if self.closed {
                 "Cleanup continues on the host if you disconnect. Esc closes this report."
@@ -302,6 +370,13 @@ impl Menu {
         );
         frame.render_widget(Paragraph::new(lines), inner);
     }
+}
+
+#[derive(Default, Debug)]
+struct Outcome {
+    reaped: usize,
+    retained: Vec<String>,
+    failed: Vec<String>,
 }
 
 fn reason_text(reason: &str, mark_done: bool) -> &str {
@@ -413,20 +488,62 @@ impl App {
             },
             None => Cursor::Workspace(wi),
         };
-        if !menu.submitted && menu.start() {
-            // Do not close locally until every host acknowledges its durable
-            // job. If the viewer exits before that, the task stays open.
-            self.input_mode = InputMode::WorktreeCleanup(menu);
-            return;
-        }
+        // Reap submits at once: the hosts accept it durably (even mid-preview)
+        // and resolve + reap in the background with the usual safety checks,
+        // so the task is closed now and the dialog goes away.
+        let reaping = !menu.submitted && menu.start();
         if menu.mark_done {
             self.mark_active_done();
         } else {
             self.close_active_workspace();
         }
-        if menu.submitted {
+        if reaping {
             menu.closed = true;
-            self.input_mode = InputMode::WorktreeCleanup(menu);
+            self.set_status_msg(
+                "Cleanup continues in the background; you are told only if something is kept or fails.",
+            );
+            self.cleanup_jobs.push(menu);
+        }
+    }
+
+    /// Track background cleanups: progress for the status bar, a notification
+    /// only when something was retained or failed.
+    pub(super) fn cleanup_tick(&mut self) {
+        let mut finished = Vec::new();
+        for (i, job) in self.cleanup_jobs.iter_mut().enumerate() {
+            self.needs_redraw |= job.poll();
+            if let Some(outcome) = job.finished() {
+                finished.push((i, outcome, job.title.clone()));
+            }
+        }
+        for (i, outcome, title) in finished.into_iter().rev() {
+            self.cleanup_jobs.remove(i);
+            self.needs_redraw = true;
+            if outcome.retained.is_empty() && outcome.failed.is_empty() {
+                self.set_status_msg(&format!("Cleanup of {title} finished: reaped {}.", outcome.reaped));
+                continue;
+            }
+            let mut parts = Vec::new();
+            if !outcome.failed.is_empty() {
+                parts.push(format!("failed: {}", outcome.failed.join("; ")));
+            }
+            if !outcome.retained.is_empty() {
+                parts.push(format!("kept {}: {}", outcome.retained.len(), outcome.retained.join("; ")));
+            }
+            let message = format!("reaped {}, {}", outcome.reaped, parts.join(" · "));
+            self.set_status_msg(&format!("Cleanup of {title}: {message} (receipts in ~/.cm/worktree-cleanup/)"));
+            if !cfg!(test) {
+                crate::app::notify_user_alert(&format!("Cleanup of {title}"), &message);
+            }
+        }
+    }
+
+    /// `cleanup: reaping 2/5` while background cleanups run.
+    pub(super) fn cleanup_progress(&self) -> Option<String> {
+        match self.cleanup_jobs.as_slice() {
+            [] => None,
+            [one] => Some(one.progress()),
+            many => Some(format!("cleanup: {} jobs running", many.len())),
         }
     }
 }
@@ -462,6 +579,7 @@ mod tests {
                 commands,
                 jobs: HashMap::new(),
                 errors: HashMap::new(),
+                submitted_at: None,
             },
             tx,
             receivers,
@@ -481,43 +599,60 @@ mod tests {
         ));
         assert!(!menu.start());
         assert!(receivers.iter().all(|rx| rx.try_recv().is_err()));
-        assert!(!menu.close_ready());
+        assert!(menu.submitted_at.is_none(), "keep queues nothing");
     }
 
     #[test]
-    fn worktree_cleanup_requires_every_preview_and_durable_host_ack_before_close() {
-        let (mut menu, tx, receivers) = fixture();
+    fn reap_submits_at_once_without_waiting_for_any_preview() {
+        let (mut menu, _tx, receivers) = fixture();
         menu.key(key(KeyCode::Tab));
-        tx.send((HostId::new("sessions"), Ok(json!({"phase":"preview"}))))
-            .unwrap();
-        menu.poll();
         assert!(matches!(
             menu.key(key(KeyCode::Enter)),
-            InputOutcome::Status(_)
+            InputOutcome::Submit(SubmitAction::CompleteWithCleanup)
         ));
-        tx.send((HostId::new("manager"), Err("offline".into())))
-            .unwrap();
-        menu.poll();
-        assert!(!menu.ready());
-        tx.send((HostId::new("manager"), Ok(json!({"phase":"preview"}))))
-            .unwrap();
-        menu.poll();
-        assert!(menu.ready());
         assert!(menu.start());
-        assert!(receivers.iter().all(|rx| rx.try_recv().is_ok()));
-        assert!(!menu.close_ready());
-        tx.send((HostId::new("sessions"), Ok(json!({"phase":"queued"}))))
-            .unwrap();
+        assert!(receivers.iter().all(|rx| rx.try_recv().is_ok()), "apply sent to every host");
+        assert!(menu.finished().is_none());
+        assert_eq!(menu.progress(), "cleanup: finding worktrees");
+    }
+
+    #[test]
+    fn background_cleanup_reports_progress_then_only_retained_or_failed() {
+        let (mut menu, tx, _rx) = fixture();
+        menu.reap = true;
+        menu.start();
+        tx.send((HostId::new("sessions"), Ok(json!({"phase":"scanning","apply_requested":true})))).unwrap();
+        tx.send((HostId::new("manager"), Ok(json!({"phase":"running",
+            "candidates":[{"path":"/a"},{"path":"/b"}], "results":[{"path":"/a","removed":true}]})))).unwrap();
         menu.poll();
-        assert!(!menu.close_ready());
-        tx.send((HostId::new("manager"), Ok(json!({"phase":"running"}))))
-            .unwrap();
+        assert!(menu.finished().is_none());
+        let progress = menu.progress();
+        assert!(progress.contains("scanning") && progress.contains("reaping 1/2"), "{progress}");
+        tx.send((HostId::new("sessions"), Ok(json!({"phase":"complete","results":[]})))).unwrap();
+        tx.send((HostId::new("manager"), Ok(json!({"phase":"complete","results":[
+            {"path":"/a","removed":true},
+            {"path":"/b","removed":false,"message":"retained: live_session"},
+            {"path":"/c","removed":false,"already_absent":true}]})))).unwrap();
         menu.poll();
-        assert!(menu.close_ready());
-        assert_eq!(menu.workspace_id, "captured-workspace");
-        assert_eq!(menu.task_id.as_deref(), Some("captured-task"));
-        menu.closed = true;
-        assert!(!menu.close_ready(), "one close only");
+        let outcome = menu.finished().expect("finished");
+        assert_eq!(outcome.reaped, 1);
+        assert_eq!(outcome.retained, vec!["/b (retained: live_session)".to_string()]);
+        assert!(outcome.failed.is_empty());
+    }
+
+    #[test]
+    fn an_unaccepted_cleanup_is_reported_as_failed_after_the_timeout() {
+        let (mut menu, tx, _rx) = fixture();
+        menu.reap = true;
+        menu.start();
+        tx.send((HostId::new("sessions"), Ok(json!({"phase":"complete","results":[]})))).unwrap();
+        tx.send((HostId::new("manager"), Err("offline".into()))).unwrap();
+        menu.poll();
+        assert!(menu.finished().is_none(), "still within the timeout");
+        menu.submitted_at = Some(Instant::now() - ACCEPT_TIMEOUT);
+        let outcome = menu.finished().expect("gives up");
+        assert_eq!(outcome.failed, vec!["manager: cleanup not accepted (offline)".to_string()]);
+        assert!(menu.progress().contains("retrying host"), "{}", menu.progress());
     }
 
     #[test]

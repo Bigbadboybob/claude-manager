@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""cm-availability — show or set Owner's availability level.
+
+    cm-availability                      # print the current level
+    cm-availability focused              # away | around | focused | on-call | unset
+    cm-availability away --note "back 08:00Z"
+    cm-availability --ssh cm-manager away
+
+Levels, least to most reachable: away (emergencies only), around (blocking and
+above), focused (decisions and above), on-call (everything). `unset` returns to
+the default, where every Owner alert is delivered. Agents read the level from
+`ping` and `chat_open`.
+
+The level is an Owner-only messaging event published on the messaging hub and
+replicated to every enrolled host, so set it on any host whose daemon serves
+Owner (`owner_access`). Uses the host's ~/.cm/operator-token and
+$CM_DAEMON_SOCKET or ~/.cm/daemon.sock, like scripts/cm-op. Installed to
+~/.cm/bin/ on cloud hosts so `ssh cm-manager cm-availability away` works.
+"""
+import datetime as dt
+import json
+import os
+import pathlib
+import shlex
+import socket
+import struct
+import subprocess
+import sys
+import uuid
+
+LEVELS = ("away", "around", "focused", "on-call", "unset")
+
+
+def rpc(method, params, timeout=45):
+    home = pathlib.Path.home()
+    tok = (home / ".cm/operator-token").read_text().strip()
+    sock = os.environ.get("CM_DAEMON_SOCKET") or str(home / ".cm/daemon.sock")
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(timeout)
+        s.connect(sock)
+        req = json.dumps({"id": "cm-availability", "caller": {"token_id": tok},
+                          "method": method, "params": params}).encode()
+        s.sendall(struct.pack(">I", len(req)) + req)
+        hdr = s.recv(4)
+        if len(hdr) < 4:
+            raise ConnectionError("daemon closed the connection without answering")
+        ln = struct.unpack(">I", hdr)[0]
+        buf = b""
+        while len(buf) < ln:
+            chunk = s.recv(ln - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf)
+
+
+def describe(state):
+    if not state.get("set"):
+        return "unset (every Owner alert is delivered)"
+    out = state["level"]
+    if state.get("changed_at"):
+        changed = state["changed_at"]
+        age = state.get("age_s")
+        when = changed[11:16] + "Z" if len(changed) >= 16 else changed
+        out += f" since {when}"
+        if isinstance(age, int):
+            out += f" ({age // 3600}h{age % 3600 // 60:02d}m)" if age >= 3600 else f" ({age // 60}m)"
+    if state.get("owner_note"):
+        out += f" — {state['owner_note']}"
+    return out
+
+
+def parse(argv):
+    ssh_host, note, level = None, None, None
+    args = list(argv)
+    while args:
+        a = args.pop(0)
+        if a == "--ssh" and args:
+            ssh_host = args.pop(0)
+        elif a == "--note" and args:
+            note = args.pop(0)
+        elif a in ("-h", "--help"):
+            return None
+        elif a in LEVELS and level is None:
+            level = a
+        else:
+            raise SystemExit(f"unknown argument {a!r}; levels: {', '.join(LEVELS)}")
+    if note is not None and level is None:
+        raise SystemExit("--note needs a level")
+    return ssh_host, note, level
+
+
+def main(argv):
+    parsed = parse(argv)
+    if parsed is None:
+        print(__doc__)
+        return 0
+    ssh_host, note, level = parsed
+    if ssh_host:
+        # Run this script on the host (its token and socket are host-local).
+        remote_args = [a for a in argv if a not in ("--ssh", ssh_host)]
+        remote = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=15", ssh_host, "python3 - " + shlex.join(remote_args)],
+            input=pathlib.Path(__file__).read_text(), capture_output=True, text=True)
+        sys.stdout.write(remote.stdout)
+        sys.stderr.write(remote.stderr)
+        return remote.returncode
+    params = {"action": "get"}
+    if level:
+        params = {"action": "set", "level": level, "source": "cli",
+                  "request_id": f"cm-availability-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"}
+        if note:
+            params["note"] = note
+    reply = rpc("messaging.availability", params)
+    if reply.get("error"):
+        print(f"error: {reply['error'].get('message', reply['error'])}", file=sys.stderr)
+        return 1
+    print(describe(reply["result"]["owner_availability"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

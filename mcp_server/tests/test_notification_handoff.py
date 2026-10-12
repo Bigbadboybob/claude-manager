@@ -322,18 +322,99 @@ class SlimReadTests(unittest.TestCase):
         self.assertEqual(slim["monitor_status"], {"unacknowledged": 2, "recently_expired": [{"id": "w1"}]})
         self.assertEqual(slim["view"], "slim")
 
-    def test_tool_strips_view_before_the_daemon_and_defaults_to_full(self):
+    def test_inbox_defaults_to_slim_newest_first_and_history_to_full_oldest_first(self):
         with mock.patch.object(control_client, "call", return_value=json.loads(json.dumps(self.FULL))) as call:
-            full = server.chat_read(inbox=True, unread_only=True)
-            self.assertIn("norms", full)
-            slim = server.chat_read(inbox=True, unread_only=True, view="slim")
+            slim = server.chat_read(inbox=True, unread_only=True)
             self.assertNotIn("view", call.call_args.args[1])
             self.assertEqual(call.call_args.args[1], {"inbox": True, "unread_only": True,
                                                       "time_basis": "created", "freshness": "cached",
-                                                      "limit": 50, "dms": False, "newest_first": False})
+                                                      "limit": 50, "dms": False, "newest_first": True})
             self.assertEqual(slim["view"], "slim")
+            full = server.chat_read(inbox=True, unread_only=True, view="full", newest_first=False)
+            self.assertIn("norms", full)
+            self.assertFalse(call.call_args.args[1]["newest_first"])
+            history = server.chat_read(channel="general")
+            self.assertIn("norms", history)
+            self.assertFalse(call.call_args.args[1]["newest_first"])
+            server.chat_read(dms=True)
+            self.assertTrue(call.call_args.args[1]["newest_first"])
             with self.assertRaises(ValueError):
                 server.chat_read(inbox=True, view="tiny")
+
+    def test_slim_read_keeps_unacknowledged_norms_and_outbox(self):
+        full = json.loads(json.dumps(self.FULL))
+        full["context_status"] = {"stale_scopes": ["global"], "ack_with": {"norms_seen": {"global": "r2"}},
+                                  "current": {"global": "r2"}}
+        full["outbox"] = {"pending_sync": 2, "oldest_age_s": 900}
+        slim = server.slim_read_result(full)
+        self.assertEqual(slim["norms"], {"text": "long"})
+        self.assertEqual(slim["context_status"]["ack_with"], {"norms_seen": {"global": "r2"}})
+        self.assertNotIn("current", slim["context_status"])
+        self.assertEqual(slim["outbox"]["pending_sync"], 2)
+
+    def test_mark_read_before_passes_through_and_returns_the_summary(self):
+        reply = {"marked": 40, "monitors_advanced": 1, "before": "2026-10-06T12:00:00Z",
+                 "scope": "inbox", "sync": {"enabled": True, "connected": True}, "cache": {}}
+        with mock.patch.object(control_client, "call", return_value=reply) as call:
+            out = server.chat_read(inbox=True, mark_read_before="2026-10-06T12:00:00Z")
+        self.assertEqual(call.call_args.args[1]["mark_read_before"], "2026-10-06T12:00:00Z")
+        self.assertEqual(out, {"marked": 40, "monitors_advanced": 1, "before": "2026-10-06T12:00:00Z",
+                               "scope": "inbox", "view": "slim"})
+
+
+class SlimEnvelopeTests(unittest.TestCase):
+    SEND = {
+        "cache": {"checkpoint": {"through": 1}}, "connection": "connected",
+        "context_status": {"stale_scopes": [], "changed": False, "current": {"global": "r"}},
+        "coordinator_position": {"p": 1}, "position": {"p": 2}, "items": None,
+        "event": {"id": "e1", "created_at": "2026-10-06T19:29:27.705Z", "conversation_id": "c1",
+                  "body": "hi", "data": {"reply_to": "e0", "thread_root": "e0", "metadata_seen": {"x": 1}}},
+        "event_id": "e1", "created_at": "2026-10-06T19:29:27.705Z", "name": "msgfix",
+        "name_publication": "published", "notification": [{"recipient": "ts-1", "status": "pending"}],
+        "operation": {"request_id": "r"}, "replication": "pending_sync",
+        "monitor_status": {"active": 0, "unacknowledged": 0, "recently_expired": []},
+        "mentions_resolved": [{"token": "@lane", "id": "agent:x", "name": "lane", "source": "body"}],
+        "warnings": [{"code": "unresolved_body_mention", "token": "@nobody"}],
+        "outbox": {"pending_sync": 1, "oldest_age_s": 3},
+        "sync": {"enabled": True, "connected": True, "error": None, "pending": 1, "role": "replica"},
+    }
+
+    def test_send_slim_keeps_what_the_sender_acts_on(self):
+        with mock.patch.object(control_client, "call", return_value=json.loads(json.dumps(self.SEND))) as call:
+            slim = server.chat_send(body="hi", request_id="r", channel="general")
+            self.assertNotIn("view", call.call_args.args[1])
+            full = server.chat_send(body="hi", request_id="r", channel="general", view="full")
+        self.assertEqual(full, self.SEND)
+        self.assertEqual(slim, {
+            "event_id": "e1", "created_at": "2026-10-06T19:29:27.705Z", "conversation_id": "c1",
+            "reply_to": "e0", "thread": "e0", "name": "msgfix", "replication": "pending_sync",
+            "notification": self.SEND["notification"], "mentions_resolved": self.SEND["mentions_resolved"],
+            "warnings": self.SEND["warnings"], "outbox": self.SEND["outbox"], "view": "slim"})
+        self.assertLess(len(json.dumps(slim)), len(json.dumps(self.SEND)) / 2)
+
+    def test_slim_surfaces_sync_trouble_and_pending_name(self):
+        reply = json.loads(json.dumps(self.SEND))
+        reply["sync"].update(connected=False, error="storage_error: connection reset")
+        reply["connection"] = "offline"
+        reply["name_publication"] = "pending"
+        with mock.patch.object(control_client, "call", return_value=reply):
+            slim = server.chat_send(body="hi", request_id="r", channel="general")
+        self.assertEqual(slim["sync"], {"connected": False, "error": "storage_error: connection reset",
+                                        "pending": 1, "handoff_paused": None})
+        self.assertEqual(slim["connection"], "offline")
+        self.assertEqual(slim["name_publication"], "pending")
+
+    def test_people_and_channels_keep_items_and_cursor(self):
+        reply = {"items": [{"id": "agent:x", "name": "lane", "present": True}], "next_cursor": None,
+                 "cache": {}, "sync": {"enabled": True, "connected": True}, "space_id": "s",
+                 "daemon_id": "d", "monitor_status": {"unacknowledged": 0},
+                 "context_status": {"stale_scopes": []}, "coverage": "complete"}
+        with mock.patch.object(control_client, "call", return_value=reply):
+            people = server.chat_people(query="lane")
+            channels = server.chat_channels(action="list")
+        expected = {"items": reply["items"], "view": "slim"}
+        self.assertEqual(people, expected)
+        self.assertEqual(channels, expected)
 
 
 if __name__ == "__main__":

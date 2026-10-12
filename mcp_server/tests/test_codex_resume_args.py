@@ -74,6 +74,24 @@ class CodexResumeArgsTests(unittest.TestCase):
         self.assertEqual(apply_launch_permissions({"threadId": "saved", "sandbox": "read-only"}, policy),
                          {"threadId": "saved", **policy})
 
+    def test_fork_is_shaped_like_resume(self):
+        # CM fork-into-a-task: `fork <id>` reaches the remote frontend as
+        # a fork, never a resume, with no permission flag on the frontend.
+        with patch("mcp_server.native_codex.os.getcwd", return_value="/work/fork with spaces"):
+            backend, frontend = split_args(["fork", "-c", "x=1", "--no-alt-screen", "src-thread"])
+        # The fork runs in its new worktree, never the source's directory.
+        self.assertEqual(frontend, [
+            "--no-alt-screen", "-c", 'tui.resume_cwd="current"',
+            "--cd", "/work/fork with spaces", "fork", "src-thread",
+        ])
+        self.assertEqual(backend, ["-c", "x=1"])
+        policy = {"approvalPolicy": "never", "approvalsReviewer": "user",
+                  "permissions": ":danger-full-access"}
+        backend, frontend = split_args(["fork", "src-thread"], policy)
+        self.assertEqual(frontend[-2:], ["fork", "src-thread"])
+        self.assertNotIn("resume", frontend)
+        self.assertIn('sandbox_mode="danger-full-access"', backend)
+
     def test_fresh_session_retains_yolo_on_backend_and_frontend(self):
         backend, frontend = split_args([BYPASS, "--no-alt-screen"])
         self.assertEqual(backend, [

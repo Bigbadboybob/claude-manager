@@ -54,10 +54,12 @@
 #![cfg(target_os = "linux")]
 
 pub mod adopt;
+pub mod agent_state;
 pub mod attach;
 pub mod attach_output;
 pub mod claude_trust;
 pub mod claude_channels;
+pub mod claude_presence;
 pub mod codex_trust;
 pub mod config;
 pub mod env_sanitize;
@@ -67,12 +69,16 @@ pub mod continuous;
 pub mod control;
 pub mod holder_mode;
 pub mod host_id;
+pub mod items;
+pub mod usage;
+pub mod worktree_watch;
 pub mod manifest;
 pub mod messaging;
 pub mod mcp_config;
 pub mod migrate;
 pub mod notify;
 pub mod owner_attention;
+pub mod owner_availability;
 pub mod sidebar;
 pub mod path;
 pub mod planning_client;
@@ -410,6 +416,7 @@ pub fn run_daemon_preflight() -> i32 {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    let startup_at = std::time::Instant::now();
     // Deterministic comm regardless of how we were exec'd: a
     // /proc/self/fd or execveat(AT_EMPTY_PATH) exec (re-exec deploys,
     // holder spawns, the phase-7 reverse migration) derives comm from
@@ -726,6 +733,7 @@ pub fn run() -> anyhow::Result<()> {
     // 12f: stash the loaded config so `start_session`'s
     // env-injection step can read it (mcp_server_path /
     // api_url / api_token).
+    crate::mcp_config::set_codex_inline_scrollback(daemon_config.codex_inline_scrollback);
     initial_state.config = daemon_config;
     // Phase 3b: the dev flag (read once above) and the listener's
     // raw fd — the latter is MANIFEST INPUT ONLY (see the field doc):
@@ -877,7 +885,7 @@ pub fn run() -> anyhow::Result<()> {
         initial_state.seed_recently_exited_from_sidecar(&sidecar);
     }
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
-    if let Err(e) = messaging::rpc::initialize(&state) {
+    if let Err(e) = messaging::startup::start(&state) {
         eprintln!("cm-daemon: messaging unavailable: {e}");
     }
 
@@ -1202,6 +1210,14 @@ pub fn run() -> anyhow::Result<()> {
     }
     } // !holder_active
 
+    // Restore only after all holder/re-exec adoption and fresh restoration.
+    // Starting the tick earlier could overwrite the sidecar with an empty registry.
+    if let Err(e) = agent_state::restore(&state.lock().unwrap_or_else(|p| p.into_inner())) {
+        eprintln!("cm-daemon: could not restore agent state: {e}");
+    }
+    agent_state::start(&state)?;
+
+    state.lock().unwrap_or_else(|p| p.into_inner()).messaging_registry_restored = true;
     if let Err(e) = messaging::rpc::initialize(&state) {
         eprintln!("cm-daemon: messaging pending: {e}");
     }
@@ -1210,8 +1226,10 @@ pub fn run() -> anyhow::Result<()> {
     state.lock().unwrap_or_else(|p| p.into_inner())
         .persist_sessions_best_effort();
     messaging::delivery::spawn(&state);
-    messaging::sync::start(&state);
     messaging::tasks::spawn(&state);
+    items::start(&state);
+    usage::start(&state);
+    worktree_watch::start(&state);
 
     // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver
     // since Phase 4 (the TUI is a pure observer). It fires transitions,
@@ -1283,6 +1301,7 @@ pub fn run() -> anyhow::Result<()> {
 
     worktree_cleanup::bootstrap();
 
+    eprintln!("cm-daemon: rpc ready after {:.3}s ({})", startup_at.elapsed().as_secs_f64(), path.display());
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {

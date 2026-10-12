@@ -61,7 +61,7 @@ impl Network {
         .unwrap();
         drop(hub_store);
         let hub = state(&hub_root, "hub-agent");
-        super::super::rpc::initialize(&hub).unwrap();
+        super::super::startup::open_for_test(&hub).unwrap();
         fs::create_dir(hub_root.join("messaging-peers")).unwrap();
         let mut clients = Vec::new();
         for i in 0..2 {
@@ -81,7 +81,7 @@ impl Network {
             )
             .unwrap();
             let client = state(&root, &format!("client-{i}"));
-            super::super::rpc::initialize(&client).unwrap();
+            super::super::startup::open_for_test(&client).unwrap();
             clients.push(client);
         }
         start(&hub);
@@ -1017,7 +1017,7 @@ fn messaging_sync_scoped_replica_falls_back_with_a_legacy_hub() {
         "token_file":root.join("sync-token")});
     fs::write(root.join("messaging-sync.json"), serde_json::to_vec(&config).unwrap()).unwrap();
     let replica = state(&root, "client");
-    super::super::rpc::initialize(&replica).unwrap();
+    super::super::startup::open_for_test(&replica).unwrap();
     start(&replica);
     let (mut hub, _) = listener.accept().unwrap();
     hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();

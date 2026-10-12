@@ -30,6 +30,9 @@ pub(crate) const HEADER: Color = Color::Cyan;
 /// borders, active workflow role, in-progress planning status, status-bar
 /// flash messages.
 pub(crate) const ATTN: Color = Color::Yellow;
+/// Amber for work blocked on an Owner decision (◇/◆ + `OWNER`): warmer than
+/// ATTN's yellow so it reads as "needs you", without the alert's red.
+pub(crate) const OWNER_BLOCKED: Color = Color::Rgb(255, 176, 0);
 
 /// Positive/running: session running spinner, connected dot, done planning
 /// status, workflow-done tick.

@@ -201,6 +201,10 @@ impl Replication {
     }
 }
 
+/// Own messages younger than this are not reported in `outbox`: a healthy
+/// link uploads them within seconds.
+pub(super) const OUTBOX_GRACE_S: i64 = 60;
+
 impl Store {
     /// A/B committed locally before receipts existed. The original coordinator
     /// may attest those verified publications, preserving bytes, IDs, arrival
@@ -220,19 +224,18 @@ impl Store {
                         .rejections
                         .contains_key(strv(&e.event, "id"))
             })
-            .map(|e| (e.event.clone(), e.position))
+            .map(|e| (e.event.clone(), e.position, e.event_sha256.clone()))
             .collect::<Vec<_>>();
-        for (event, position) in missing {
+        for (event, position, digest) in missing {
             if event["origin_daemon_id"] != self.daemon_id {
                 return Err(err(
                     "invalid_receipt",
                     "Foreign publication has no retained acceptance",
                 ));
             }
-            let bytes = fs::read(self.event_path(&event)?)?;
             let receipt = json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,
                 "generation":self.generation,"position":format!("{position:020}"),
-                "event_id":event["id"],"event_sha256":hash(&bytes)});
+                "event_id":event["id"],"event_sha256":digest});
             self.record_receipt(&receipt)?;
         }
         Ok(())
@@ -268,7 +271,84 @@ impl Store {
         json!({"enabled":self.sync_enabled(),"role":if self.is_coordinator(){"coordinator"}else{"replica"},
             "coordinator_id":self.coordinator_id(),"connected":self.is_coordinator() || self.replication.connected,
             "last_reconciled":self.replication.last_reconciled,"error":self.replication.error,
-            "handoff_paused":self.messaging_frozen(),"pending":self.events.iter().filter(|e| e.event["origin_daemon_id"] == self.daemon_id && !self.replication.receipts.contains_key(strv(&e.event,"id")) && !self.replication.rejections.contains_key(strv(&e.event,"id"))).count()})
+            "handoff_paused":self.messaging_frozen(),"pending":self.read_model.pending_local.len()})
+    }
+    /// The caller's own events saved on this replica that the hub has not
+    /// accepted within `OUTBOX_GRACE_S`: `{pending_sync, oldest_age_s,
+    /// oldest_event_id}`, or None when nothing is overdue (and always None on
+    /// the hub or a standalone host, whose events are authoritative where
+    /// they are written). The grace keeps a just-sent message, which is
+    /// normally uploaded within seconds, from reporting itself.
+    pub fn outbox_status(&self, actor: &str) -> Option<Value> {
+        self.outbox_status_at(actor, Utc::now())
+    }
+    /// Every actor's overdue outbox in ONE pass over the events (the alarm's
+    /// path: per-actor scans of a 2M-event store under its lock stalled the
+    /// delivery worker). Only actors with something overdue appear.
+    pub fn outbox_overdue(&self) -> BTreeMap<String, Value> {
+        let mut out = BTreeMap::new();
+        if self.is_coordinator() || !self.sync_enabled() {
+            return out;
+        }
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::seconds(OUTBOX_GRACE_S);
+        let mut acc: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
+        for e in &self.events {
+            if e.event["origin_daemon_id"] != self.daemon_id {
+                continue;
+            }
+            let id = strv(&e.event, "id");
+            if self.replication.receipts.contains_key(id) || self.replication.rejections.contains_key(id) {
+                continue;
+            }
+            let at = strv(&e.event, "created_at");
+            if DateTime::parse_from_rfc3339(at).is_ok_and(|t| t.with_timezone(&Utc) > cutoff) {
+                continue;
+            }
+            let entry = acc.entry(strv(&e.event["actor"], "id")).or_insert((0, at));
+            entry.0 += 1;
+            if at < entry.1 {
+                entry.1 = at;
+            }
+        }
+        for (actor, (pending, oldest)) in acc {
+            let age = DateTime::parse_from_rfc3339(oldest)
+                .map(|t| (now - t.with_timezone(&Utc)).num_seconds().max(0))
+                .ok();
+            out.insert(actor.to_owned(), json!({"pending_sync":pending,"oldest_age_s":age}));
+        }
+        out
+    }
+    pub(super) fn outbox_status_at(&self, actor: &str, now: DateTime<Utc>) -> Option<Value> {
+        if self.is_coordinator() || !self.sync_enabled() {
+            return None;
+        }
+        let cutoff = now - chrono::Duration::seconds(OUTBOX_GRACE_S);
+        let mut pending = 0usize;
+        let mut oldest: Option<(&str, &str)> = None;
+        for e in self.read_model.pending_local.iter().map(|i| &self.events[*i]) {
+            let id = strv(&e.event, "id");
+            if e.event["origin_daemon_id"] != self.daemon_id
+                || e.event["actor"]["id"] != actor
+                || self.replication.receipts.contains_key(id)
+                || self.replication.rejections.contains_key(id)
+            {
+                continue;
+            }
+            let at = strv(&e.event, "created_at");
+            if DateTime::parse_from_rfc3339(at).is_ok_and(|t| t.with_timezone(&Utc) > cutoff) {
+                continue;
+            }
+            pending += 1;
+            if oldest.is_none_or(|(_, o)| at < o) {
+                oldest = Some((id, at));
+            }
+        }
+        let (id, at) = oldest?;
+        let age = DateTime::parse_from_rfc3339(at)
+            .map(|t| (now - t.with_timezone(&Utc)).num_seconds().max(0))
+            .ok();
+        Some(json!({"pending_sync":pending,"oldest_age_s":age,"oldest_event_id":id}))
     }
     pub fn set_sync_connection(&mut self, connected: bool, error: Option<String>) {
         self.replication.connected = connected;
@@ -319,7 +399,7 @@ impl Store {
                 let event = self
                     .published(&id)
                     .ok_or_else(|| err("invalid_receipt", "Decision precedes its local event"))?;
-                if journal["event_sha256"] != hash(&fs::read(self.event_path(&event.event)?)?) {
+                if journal["event_sha256"] != event.event_sha256 {
                     return Err(err(
                         "invalid_receipt",
                         "Decision digest does not match its retained event",
@@ -370,6 +450,11 @@ impl Store {
                 self.replication.last_reconciled = Some(required(journal, "recorded_at")?);
             }
             _ => return Err(err("invalid_record", "Unsupported journal kind")),
+        }
+        if journal["kind"] == "replication.status" {
+            if let Some(index) = self.event_index.get(strv(journal,"event_id")) {
+                self.read_model.pending_local.remove(index);
+            }
         }
         Ok(())
     }
@@ -476,7 +561,7 @@ impl Store {
             ));
         }
         if let Some(event) = self.published(&id) {
-            if hash(&fs::read(self.event_path(&event.event)?)?) != digest {
+            if event.event_sha256 != digest {
                 return Err(err(
                     "receipt_conflict",
                     "Receipt digest does not match the retained event",
@@ -513,7 +598,7 @@ impl Store {
         let e = self
             .published(id)
             .ok_or_else(|| err("not_found", "Local event not found"))?;
-        let digest = hash(&fs::read(self.event_path(&e.event)?)?);
+        let digest = e.event_sha256.clone();
         self.journal_status("replication.status",Some(id),Some(&digest),json!({"status":"replication_rejected","reason":reason,"coordinator_id":self.coordinator_id()}))?;
         let children: Vec<_> = self
             .events
@@ -539,8 +624,7 @@ impl Store {
         Ok(json!({"event":body,"receipt":self.replication.receipts.get(id),"position":e.position}))
     }
     pub fn pending_uploads(&self, limit: usize) -> Result<Vec<Value>> {
-        self.events
-            .iter()
+        self.read_model.pending_local.iter().map(|i| &self.events[*i])
             .filter(|e| {
                 e.event["origin_daemon_id"] == self.daemon_id
                     && !self.replication.receipts.contains_key(strv(&e.event, "id"))
@@ -743,6 +827,9 @@ impl Store {
                     .map_err(|_| err("invalid_record", "Invalid channel UUID"))?;
             }
         }
+        if e["type"] == crate::owner_availability::EVENT_TYPE {
+            Self::validate_owner_availability(e)?;
+        }
         if e["type"] == "host.update" {
             if e["actor"]["id"] != "system" {
                 return Err(err("invalid_record", "Host enrollment is system-owned"));
@@ -797,9 +884,9 @@ impl Store {
             "channel.membership" => {
                 self.validate_membership_event(e)?;
             }
-            "read.ack" => {
-                self.validate_read_event(e, false)?;
-            }
+            "read.ack" => { self.validate_read_event(e, false)?; }
+            "read.cursor" => { self.validate_cursor_event(e, false)?; }
+            "reaction" => { self.validate_reaction(e)?; }
             _ => {}
         }
         if let Some(c) = data.get("conversation_create") {
@@ -1036,6 +1123,7 @@ impl Store {
             "messaging.follow" if actor == "owner" => self.follow(actor, p, &people),
             "messaging.channels" => self.channel_action(actor, p, &people),
             "messaging.pins" => self.pins(actor, p, &people),
+            "messaging.availability" if actor == "owner" => self.availability(actor, p),
             "messaging.norms" => {
                 let name = self
                     .names
@@ -1110,7 +1198,7 @@ impl Store {
         if !self.host_authorized(host, Some(&actor)) {
             return Err(err("host_revoked", "Host or participant is not enrolled"));
         }
-        if !matches!(e["type"].as_str(), Some("message.create" | "read.ack"))
+        if !matches!(e["type"].as_str(), Some("message.create" | "read.ack" | "read.cursor" | "reaction"))
             || [
                 "channels",
                 "identity_claim",
@@ -1125,8 +1213,12 @@ impl Store {
                 "Only ordinary messages may originate at a replica",
             ));
         }
-        if e["type"] == "read.ack" {
-            self.validate_read_event(&e, true)?;
+        if matches!(strv(&e,"type"), "read.ack" | "read.cursor" | "reaction") {
+            match strv(&e,"type") {
+                "read.ack" => { self.validate_read_event(&e, true)?; }
+                "read.cursor" => { self.validate_cursor_event(&e, true)?; }
+                _ => self.validate_reaction(&e)?,
+            }
             let key = format!("{actor}\n{}", required(&e["request"], "key")?);
             if self.requests.contains_key(&key) {
                 return Err(err(
@@ -1396,7 +1488,7 @@ impl Store {
         json!({"protocol":1,"space_id":self.space_id,"coordinator_id":self.coordinator_id(),"owner_identity_revision":self.owner_identity_revision,"coordinator_lineage":self.replication.coordinator_lineage})
     }
     fn eligible_for_host(&self, host: &str, interests: &BTreeSet<String>, e: &Value) -> bool {
-        if e["type"] == "read.ack" {
+        if matches!(strv(e,"type"), "read.ack" | "read.cursor") {
             return self
                 .replication
                 .hosts
@@ -1435,7 +1527,7 @@ impl Store {
     fn dependency_ids(&self, e: &Value) -> Result<Vec<String>> {
         // Parent chains are walked iteratively. Pages can stop within a chain;
         // the publication cursor advances only after its target is durable.
-        let mut parent = e["data"]["reply_to"].as_str().or_else(|| {
+        let mut parent = e["data"]["message_id"].as_str().filter(|_|e["type"] == "reaction").or_else(|| e["data"]["reply_to"].as_str()).or_else(|| {
             (e["type"] == "conversation.pin")
                 .then(|| e["data"]["target_id"].as_str())
                 .flatten()
@@ -1620,15 +1712,11 @@ impl Store {
         })
     }
     fn backfill_member(scope: &str, e: &Value) -> bool {
-        e["type"] == "message.create" && strv(e, "conversation_id") == scope
+        matches!(strv(e,"type"), "message.create" | "reaction") && strv(e, "conversation_id") == scope
     }
     /// Messages of `scope` in `(after, through]`, for backfill progress.
     pub fn scope_message_count(&self, scope: &str, after: u64, through: u64) -> u64 {
-        self.events
-            .iter()
-            .filter(|p| p.position > after && p.position <= through)
-            .filter(|p| Self::backfill_member(scope, &p.event))
-            .count() as u64
+        self.read_model.conversations.get(scope).map_or(0,|c| c.arrivals.partition_point(|p| *p <= through).saturating_sub(c.arrivals.partition_point(|p| *p <= after))) as u64
     }
     /// Per-scope coverage this replica holds in `generation`; a hub uses it to
     /// start a re-added scope's backfill where the earlier coverage ended.
@@ -2021,6 +2109,69 @@ mod tests {
             p.replica.cached_coverage("general")["checkpoint"]["through"],
             50
         );
+    }
+    #[test]
+    fn owner_availability_replicates_to_every_host_and_is_hub_only() {
+        let mut p = pair();
+        let set = json!({"action":"set","level":"around","note":"in meetings","request_id":"avail-1"});
+        // A replica forwards the change to the hub instead of publishing it.
+        assert!(p.replica.needs_coordinator("owner", "messaging.availability", &set, &p.people).unwrap());
+        assert!(!p.replica.needs_coordinator("owner", "messaging.availability", &json!({"action":"get"}), &p.people).unwrap());
+        assert_eq!(p.replica.availability("owner", &set).unwrap_err().code, "coordinator_required");
+        // Agents cannot set it through the hub either.
+        let agent = p.people[0].id.clone();
+        assert!(p.hub.coordinate(&p.replica.daemon_id, &agent, "messaging.availability", &set).is_err());
+        let hub = p.hub.availability("owner", &set).unwrap();
+        assert_eq!(hub["owner_availability"]["level"], "around");
+        catch_up(&mut p);
+        assert_eq!(p.replica.owner_availability["level"], "around");
+        assert_eq!(p.replica.owner_availability["note"], "in meetings");
+        let projected = crate::owner_availability::exposure(p.replica.cm_root());
+        assert_eq!(projected["level"], "around");
+        assert_eq!(projected["owner_note"], "in meetings");
+        // A forged Owner record cannot be replicated in by another author.
+        let mut forged = p.hub.events.iter().find(|e| e.event["type"] == "owner.availability").unwrap().event.clone();
+        forged["actor"]["id"] = json!(agent);
+        assert!(p.replica.preflight_projection(&forged).is_err());
+    }
+    #[test]
+    fn outbox_counts_own_pending_messages_until_the_hub_accepts_them() {
+        let mut p = pair();
+        let (a, b) = (p.people[0].id.clone(), p.people[1].id.clone());
+        assert!(p.replica.outbox_status(&a).is_none());
+        let later = Utc::now() + chrono::Duration::seconds(OUTBOX_GRACE_S + 5);
+        p.replica.set_sync_connection(false, Some("storage_error: connection reset".into()));
+        for key in ["o1", "o2"] {
+            p.replica
+                .send(&a, "a", "agent", &json!({"channel":"general","body":"Offline","request_id":key}), &p.people)
+                .unwrap();
+        }
+        // Just sent: inside the grace window, not reported yet.
+        assert!(p.replica.outbox_status(&a).is_none());
+        let outbox = p.replica.outbox_status_at(&a, later).unwrap();
+        assert_eq!(outbox["pending_sync"], 2);
+        assert!(outbox["oldest_age_s"].as_i64().is_some_and(|s| s >= OUTBOX_GRACE_S));
+        assert!(outbox["oldest_event_id"].is_string());
+        // Another participant's view of the same replica is unaffected.
+        assert!(p.replica.outbox_status_at(&b, later).is_none());
+        // The hub's own events are authoritative where written.
+        assert!(p.hub.outbox_status_at(&a, later).is_none());
+        // A body-promoted mention keeps the ID-only stored shape, so the hub's
+        // mention-audience validation accepts it; receipts drain the outbox.
+        let promoted = p
+            .replica
+            .send(&a, "a", "agent", &json!({"channel":"general","body":"@Scout-b over to you","request_id":"o3"}), &p.people)
+            .unwrap();
+        assert_eq!(promoted["event"]["data"]["mentions"], json!([b]));
+        assert_eq!(p.replica.outbox_status_at(&a, later).unwrap()["pending_sync"], 3);
+        for wire in p.replica.pending_uploads(64).unwrap() {
+            let receipt = p.hub.accept_upload(&p.replica.daemon_id, &wire).unwrap();
+            p.replica.record_receipt(&receipt).unwrap();
+        }
+        let id = promoted["event_id"].as_str().unwrap();
+        assert!(mention_recipients(&p.hub.events.iter().find(|e| e.event["id"] == id).unwrap().event)
+            .contains(&b.as_str()));
+        assert!(p.replica.outbox_status_at(&a, later).is_none());
     }
     #[test]
     fn offline_messages_and_monitors_survive_receipt_loss_and_origin_restart() {
@@ -2491,6 +2642,7 @@ impl Store {
                 Some("pin" | "unpin" | "set" | "remove")
             ),
             "messaging.norms" => matches!(p["action"].as_str(), Some("publish" | "revert")),
+            "messaging.availability" => p["action"] == "set",
             "session.set_name" => true,
             "messaging.follow" | "messaging.monitor" | "messaging.monitors" if actor == "owner" => {
                 true

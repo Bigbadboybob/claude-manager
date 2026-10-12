@@ -383,6 +383,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.drain_plan_launches();
         app.drain_remote_creates();
+        app.drain_fork_flights();
         app.drain_image_pastes();
         app.drain_attach_results();
         log_slow_phase("drain_attach_results", t.elapsed());
@@ -415,6 +416,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // only on an actual bucket change.
         app.tick_idle_ages();
         app.messaging_tick();
+        app.availability_tick();
+        app.board_tick();
+        app.owner_blocked_tick();
+        app.unread_tick();
 
         // Kitty graphics passthrough: answer pane queries and send image
         // bytes. Runs every tick (replies must not wait for a redraw), and

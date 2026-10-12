@@ -46,6 +46,8 @@ pub(super) enum Observation {
 }
 
 pub(super) struct DeliveryEvidence {
+    claude: bool,
+    follow_rebinds: bool,
     pid: libc::pid_t,
     generation: u64,
     since_ms: u64,
@@ -59,19 +61,36 @@ impl DeliveryEvidence {
     /// Called immediately before the body write, after startup/typing waits.
     /// Only copy registry fields while locked; filesystem I/O stays outside.
     pub fn capture(state: &Arc<Mutex<DaemonState>>, uid: &str, body: &str) -> Option<Self> {
+        Self::capture_inner(state, uid, body, false)
+    }
+
+    /// Initial launch confirmation supports both engines; existing Codex-only
+    /// recovery callers retain their original behavior via capture().
+    pub fn capture_launch(state: &Arc<Mutex<DaemonState>>, uid: &str, body: &str) -> Option<Self> {
+        Self::capture_inner(state, uid, body, true)
+    }
+
+    fn capture_inner(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        body: &str,
+        launch: bool,
+    ) -> Option<Self> {
         if body.trim().is_empty() || body.trim_start().starts_with('/') {
             return None; // Enter-only nudges and slash commands aren't user turns.
         }
-        let (pid, generation, path) = {
+        let (pid, generation, path, claude) = {
             let state = state.lock().unwrap_or_else(|p| p.into_inner());
             let session = state.sessions.get(uid)?;
-            if session.session_type != "codex" {
+            if session.session_type != "codex" && !(launch && session.session_type == "claude-code")
+            {
                 return None;
             }
             (
                 session.pid,
                 session.generation,
                 session.transcript_path.clone(),
+                session.session_type == "claude-code",
             )
         };
         let baseline = path.and_then(|p| {
@@ -79,6 +98,8 @@ impl DeliveryEvidence {
             Some((p.clone(), FileStamp::read(&p)?))
         });
         Some(Self {
+            claude,
+            follow_rebinds: launch,
             pid,
             generation,
             since_ms: SystemTime::now()
@@ -103,8 +124,20 @@ impl DeliveryEvidence {
             let Some(session) = state.sessions.get(uid) else {
                 return Observation::Gone;
             };
-            if session.pid != self.pid || session.generation != self.generation {
-                return Observation::Gone; // A replacement using the same CM UID.
+            if session.pid != self.pid {
+                return Observation::Gone;
+            }
+            if session.generation != self.generation {
+                if !self.follow_rebinds {
+                    return Observation::Gone;
+                }
+                // Detector and hook corrections can rebind several times.
+                // Same process: follow the new path on the next observation,
+                // retaining the original write-time cutoff and file baseline.
+                self.generation = session.generation;
+                self.last_scan = None;
+                self.last_observation = Observation::Pending;
+                return Observation::Unknown;
             }
             session.transcript_path.clone()
         };
@@ -182,6 +215,35 @@ impl DeliveryEvidence {
             if stamp < self.since_ms {
                 continue;
             }
+            if self.claude {
+                if v["isSidechain"] == true || v["isMeta"] == true {
+                    continue;
+                }
+                match v["type"].as_str() {
+                    Some("user") => {
+                        let content = &v["message"]["content"];
+                        let text = content.as_str().map(str::to_string).or_else(|| {
+                            content.as_array().map(|parts| {
+                                parts
+                                    .iter()
+                                    .filter(|p| p["type"] == "text")
+                                    .filter_map(|p| p["text"].as_str())
+                                    .collect::<String>()
+                            })
+                        });
+                        // Claude may expand skills/slash commands or normalize
+                        // the prompt before its user row lands. A new main
+                        // user text row is a turn receipt even if text differs.
+                        if text.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                            return Some(Observation::Accepted);
+                        }
+                        active = true;
+                    }
+                    Some("assistant") => active = true,
+                    _ => {}
+                }
+                continue;
+            }
             let p = &v["payload"];
             match (v["type"].as_str(), p["type"].as_str()) {
                 (Some("event_msg"), Some("user_message")) => {
@@ -235,6 +297,8 @@ mod tests {
     }
     fn evidence(path: &Path) -> DeliveryEvidence {
         DeliveryEvidence {
+            claude: false,
+            follow_rebinds: false,
             pid: 1,
             generation: 0,
             since_ms: crate::workflow::history::iso8601_to_ms("2026-09-12T06:45:00.000Z").unwrap(),
@@ -301,6 +365,38 @@ mod tests {
         std::fs::write(&p, row).unwrap();
         assert_eq!(e.observe_path(Some(&p), "batch"), Observation::Accepted);
         std::fs::write(&p, event("2026-09-12T06:45:03.000Z", "task_started", "")).unwrap();
+        assert_eq!(e.observe_path(Some(&p), "batch"), Observation::Active);
+    }
+
+    #[test]
+    fn claude_launch_requires_new_main_prompt_text() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("claude.jsonl");
+        let mut e = evidence(&p);
+        e.claude = true;
+        let row = serde_json::json!({"timestamp":"2026-09-12T06:45:03.000Z",
+            "type":"user", "message":{"content":"batch"}});
+        for field in ["isMeta", "isSidechain"] {
+            let mut excluded = row.clone();
+            excluded[field] = true.into();
+            std::fs::write(&p, format!("{excluded}\n")).unwrap();
+            assert_eq!(e.observe_path(Some(&p), "batch"), Observation::Pending);
+        }
+        let mut old = row.clone();
+        old["timestamp"] = "2026-09-11T00:00:00.000Z".into();
+        std::fs::write(&p, format!("{old}\n")).unwrap();
+        assert_eq!(e.observe_path(Some(&p), "batch"), Observation::Pending);
+        std::fs::write(&p, format!("{row}")).unwrap();
+        assert_eq!(e.observe_path(Some(&p), "batch"), Observation::Pending);
+        std::fs::write(&p, format!("{row}\n")).unwrap();
+        assert_eq!(e.observe_path(Some(&p), "batch\n"), Observation::Accepted);
+        let mut blocks = row.clone();
+        blocks["message"]["content"] = serde_json::json!([{"type":"text","text":"batch"}]);
+        std::fs::write(&p, format!("{blocks}\n")).unwrap();
+        assert_eq!(e.observe_path(Some(&p), "batch"), Observation::Accepted);
+        blocks["message"]["content"] =
+            serde_json::json!([{"type":"tool_result","content":"batch"}]);
+        std::fs::write(&p, format!("{blocks}\n")).unwrap();
         assert_eq!(e.observe_path(Some(&p), "batch"), Observation::Active);
     }
 }

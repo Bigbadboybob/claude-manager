@@ -947,6 +947,7 @@ impl LastExitProbe {
                 exited_at,
             ),
             None => crate::manifest::LastExit {
+                killed_by: None,
                 code,
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -959,6 +960,9 @@ impl LastExitProbe {
 pub struct DaemonSession {
     pub uid: String,
     pub title: String,
+    pub agent_state: crate::agent_state::AgentStateCell,
+    /// Initial MCP launch prompt receipt; absence after adoption is unknown.
+    pub prompt_delivery: Option<crate::control::prompt_delivery::Ticket>,
     /// Holder-minted process identity when this session is
     /// holder-owned (split mode) — the key every holder verb and the
     /// phase-7 `rollback_record` stream use. `None` in monolith mode.
@@ -1089,8 +1093,9 @@ pub struct DaemonSession {
     /// operator first types; control-plane `send_input` (agent- or
     /// workflow-driven) never stamps it.
     pub last_operator_input_at: SharedLastActivity,
-    /// Last time ANY input (operator typing, agent-prompt delivery,
-    /// bash send) was written/accepted for this PTY. Paired with
+    /// Last time submitted operator input, agent-prompt delivery, or
+    /// a bash send was written/accepted for this PTY. Viewer navigation
+    /// and unsubmitted drafts do not count. Paired with
     /// `last_turn_end_at` to derive `semantic_idle`: a turn-end
     /// reported AFTER the last input means the agent is at its
     /// prompt, whatever the PTY-output heuristic says.
@@ -1952,6 +1957,8 @@ impl PendingSession {
         };
 
         Ok(DaemonSession {
+            agent_state: crate::agent_state::StateCell::for_process(pid),
+            prompt_delivery: None,
             holder_incarnation: None,
             uid,
             title,
@@ -2495,6 +2502,8 @@ impl AdoptedSessionBuild {
         };
 
         Ok(DaemonSession {
+            agent_state: crate::agent_state::StateCell::for_process(pid),
+            prompt_delivery: None,
             holder_incarnation: None,
             title: meta.title,
             // Phase 4b (R11): the full v2 record lands verbatim — no
@@ -2722,8 +2731,11 @@ impl Drop for PendingSession {
 /// PTY would freeze every other daemon RPC. The handle pattern
 /// keeps the lock-then-clone-then-drop-then-write shape
 /// load-bearing.
+#[derive(Clone)]
 pub struct InputHandle {
+    delivery_token: Option<f64>,
     session_uid: Option<String>,
+    agent_state: crate::agent_state::AgentStateCell,
     writer: SessionWriter,
     last_activity_at: SharedLastActivity,
     last_operator_input_at: SharedLastActivity,
@@ -2733,6 +2745,87 @@ pub struct InputHandle {
 fn stamp_now(cell: &SharedLastActivity) {
     let mut slot = cell.lock().unwrap_or_else(|p| p.into_inner());
     *slot = Some(Instant::now());
+}
+
+/// The viewer sends either a raw Enter or a kitty keyboard Enter (CSI 13 u,
+/// optionally with numeric modifier/event parameters). Draft input affects
+/// delivery timing but does not start an agent turn.
+fn contains_operator_submit(bytes: &[u8]) -> bool {
+    bytes.contains(&b'\r')
+        || bytes.windows(4).enumerate().any(|(i, prefix)| {
+            if prefix != b"\x1b[13" {
+                return false;
+            }
+            let tail = &bytes[i + 4..];
+            if tail.starts_with(b"u") {
+                return true;
+            }
+            let Some(params) = tail.strip_prefix(b";") else {
+                return false;
+            };
+            let end = params
+                .iter()
+                .take_while(|&&b| b.is_ascii_digit() || b == b':' || b == b';')
+                .count();
+            end > 0 && params.get(end) == Some(&b'u')
+        })
+}
+
+/// Automatic terminal replies and viewer navigation cannot edit the composer.
+/// Recognize complete frames only; mixed text/unknown bytes remain typing.
+fn passive_viewer_input(mut bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    while !bytes.is_empty() {
+        if let Some(csi) = bytes.strip_prefix(b"\x1b[") {
+            let Some(end) = csi.iter().position(|b| (0x40..=0x7e).contains(b)) else {
+                return false;
+            };
+            let params = &csi[..end];
+            let final_byte = csi[end];
+            let passive = matches!(
+                final_byte,
+                b'A' | b'B'
+                    | b'C'
+                    | b'D'
+                    | b'H'
+                    | b'F'
+                    | b'I'
+                    | b'O'
+                    | b'R'
+                    | b'c'
+                    | b'n'
+                    | b't'
+                    | b'y'
+            ) || (final_byte == b'u' && params.starts_with(b"?"))
+                || (matches!(final_byte, b'M' | b'm') && params.starts_with(b"<"));
+            if !passive {
+                return false;
+            }
+            bytes = &csi[end + 1..];
+        } else if bytes.starts_with(b"\x1bP>|") || bytes.starts_with(b"\x1b_G") {
+            let Some(end) = bytes.windows(2).position(|p| p == b"\x1b\\") else {
+                return false;
+            };
+            bytes = &bytes[end + 2..];
+        } else if let Some(osc) = bytes.strip_prefix(b"\x1b]") {
+            // Color-query replies from the terminal emulator.
+            if !osc.starts_with(b"10;") && !osc.starts_with(b"11;") {
+                return false;
+            }
+            if let Some(end) = osc.iter().position(|b| *b == 7) {
+                bytes = &osc[end + 1..];
+            } else if let Some(end) = osc.windows(2).position(|p| p == b"\x1b\\") {
+                bytes = &osc[end + 2..];
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 impl InputHandle {
@@ -2770,7 +2863,7 @@ impl InputHandle {
         Ok(())
     }
 
-    /// A recovery Enter must not submit a draft typed since the agent paste.
+    /// A recovery Enter must not touch a draft typed since the agent paste.
     /// Check under the same writer lock used to stamp human input, closing
     /// the race between checking operator activity and writing the retry.
     pub(crate) fn write_recovery_enter(&self, bytes: &[u8], since: Instant) -> std::io::Result<bool> {
@@ -2826,22 +2919,68 @@ impl InputHandle {
         if self.session_uid.as_deref().is_some_and(|uid| crate::continuous::retirement::ensure_open(uid).is_err()) { return; }
         stamp_now(&self.last_activity_at);
         stamp_now(&self.last_input_at);
+        self.note_turn_start();
+    }
+
+    /// Each asynchronous delivery carries its own token so an older writer
+    /// cannot mark a newer queued prompt submitted. Commands do not start turns.
+    pub(crate) fn prepare_agent_input(mut self, body: &str) -> Self {
+        if self.delivery_token.is_some() { return self; }
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = match gate.as_ref().map(|g| g.try_read()) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(_)) => return self,
+            None => None,
+        };
+        if self.session_uid.as_deref().is_some_and(|uid|
+            crate::continuous::retirement::ensure_open(uid).is_err()) { return self; }
+        let now = crate::agent_state::unix_now();
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        {
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            if body.trim().is_empty() || body.trim_start().starts_with('/') {
+                cell.note_command(now);
+            } else { cell.note_input(now); }
+        }
+        self.delivery_token = Some(now);
+        self
+    }
+
+    pub(crate) fn note_agent_submitted(&self) {
+        if let Some(token) = self.delivery_token {
+            self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+                .note_submitted(token, crate::agent_state::unix_now());
+        }
+    }
+
+    pub(crate) fn note_turn_start(&self) {
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+            .note_input(crate::agent_state::unix_now());
     }
 
     /// [`write_and_stamp`](Self::write_and_stamp) for OPERATOR input
     /// (the attach stream — a human typing). Additionally stamps
-    /// `last_operator_input_at` so the agent-prompt delivery threads
-    /// can defer injection while the operator is actively typing.
+    /// `last_operator_input_at` for typing (excluding recognized terminal
+    /// replies/navigation) so delivery can defer while the operator types. Only
+    /// a submit key stamps `last_input_at`: drafts and navigation must
+    /// preserve semantic idle and the agent's done report.
     pub fn write_and_stamp_operator(&self, bytes: &[u8]) -> std::io::Result<()> {
         let _permit = crate::writer_gate::write_permit();
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         // Stamp while holding the same writer lock as explicit prompt delivery.
         // Even a partial/failed human write means the composer may contain text.
-        stamp_now(&self.last_operator_input_at);
+        if !passive_viewer_input(bytes) { stamp_now(&self.last_operator_input_at); }
         writer.write_all(bytes)?;
         writer.flush()?;
         stamp_now(&self.last_activity_at);
-        stamp_now(&self.last_input_at);
+        if contains_operator_submit(bytes) {
+            stamp_now(&self.last_input_at);
+            let now = crate::agent_state::unix_now();
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            cell.note_input(now);
+            cell.note_submitted(now, now);
+        }
         Ok(())
     }
 
@@ -2872,7 +3011,11 @@ impl InputHandle {
     #[cfg(test)]
     pub(crate) fn test_handle() -> Self {
         InputHandle {
+            delivery_token: None,
             session_uid: None,
+            agent_state: Arc::new(Mutex::new(crate::agent_state::StateCell::new(
+                crate::agent_state::unix_now(), None,
+            ))),
             writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
             last_activity_at: Arc::new(Mutex::new(None)),
             last_operator_input_at: Arc::new(Mutex::new(None)),
@@ -2903,7 +3046,11 @@ impl InputHandle {
         let captured: Arc<Mutex<Vec<(Instant, Vec<u8>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let handle = InputHandle {
+            delivery_token: None,
             session_uid: None,
+            agent_state: Arc::new(Mutex::new(crate::agent_state::StateCell::new(
+                crate::agent_state::unix_now(), None,
+            ))),
             writer: Arc::new(Mutex::new(Box::new(CapturingWriter(
                 Arc::clone(&captured),
             )))),
@@ -2933,7 +3080,9 @@ impl DaemonSession {
     /// PTY writes don't stall other daemon RPCs.
     pub fn input_handle(&self) -> InputHandle {
         InputHandle {
+            delivery_token: None,
             session_uid: Some(self.uid.clone()),
+            agent_state: Arc::clone(&self.agent_state),
             writer: Arc::clone(&self.writer),
             last_activity_at: Arc::clone(&self.last_activity_at),
             last_operator_input_at: Arc::clone(&self.last_operator_input_at),
@@ -2945,6 +3094,12 @@ impl DaemonSession {
     /// → `session.turn_ended`).
     pub fn stamp_turn_end(&self) {
         stamp_now(&self.last_turn_end_at);
+    }
+
+    /// An engine start mirrors legacy clocks without counting the same turn twice.
+    pub(crate) fn stamp_engine_activity(&self) {
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
     }
 
     /// Record the agent's own "my work is finished" report
@@ -2971,8 +3126,8 @@ impl DaemonSession {
     /// Superseding is the whole reason this is a method rather than a
     /// field read: input delivered after a report means the session was
     /// given new work, so it is no longer done. Deriving that from
-    /// `last_input_at` (which every input path already stamps — operator
-    /// typing, agent prompt delivery, bash sends) rather than clearing
+    /// `last_input_at` (stamped by operator submissions, agent prompt
+    /// delivery and bash sends) rather than clearing
     /// the flag at each of those call sites means a new input path
     /// cannot forget to invalidate the report. Same comparison
     /// [`Self::semantic_idle`] makes for turn ends.

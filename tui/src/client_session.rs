@@ -653,6 +653,26 @@ pub(crate) fn rpc_worktree_cleanup(socket: &Path, token: &str, params: serde_jso
     rpc_round_trip_with_read_timeout(socket, &request, Duration::from_secs(10))?.result.context("cleanup response missing result")
 }
 
+/// `session.fork` (fork into new task). The host mints a task, cuts and
+/// provisions a worktree and spawns the engine-native fork before it
+/// replies, so the read budget is the remote-create one.
+pub(crate) fn rpc_session_fork(
+    socket: &Path,
+    token: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    let request = Request {
+        id: next_request_id(),
+        caller: Caller::operator(token),
+        method: "session.fork".into(),
+        params,
+    };
+    rpc_round_trip_with_read_timeout(socket, &request, timeout)?
+        .result
+        .context("session.fork response missing result")
+}
+
 /// Catalog requests use the host's operator channel, independent of continuous tasks.
 pub(crate) fn rpc_catalog_control(
     socket: &Path, token: &str, method: &str, params: serde_json::Value,
@@ -1633,6 +1653,22 @@ pub fn rpc_set_transcript_path(
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
 
+/// `session.viewed` — tell a daemon Owner is looking at `session_uid`
+/// (feeds the terminal-task sweep's owner-activity grace).
+pub fn rpc_session_viewed(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    session_uid: &str,
+) -> anyhow::Result<()> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "session.viewed".into(),
+        params: serde_json::json!({ "uid": session_uid }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
 /// `session.resize` RPC — reliably re-assert a daemon-owned session's
 /// PTY size. Unlike `ClientSession::resize` (which queues a
 /// `{"resize": …}` data frame on the attach stream and silently drops
@@ -2064,7 +2100,7 @@ pub fn rpc_task_update_tree(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cm_daemon::session::{DaemonSession, SpawnParams};
     use cm_daemon::state::DaemonState;
@@ -2268,7 +2304,7 @@ mod tests {
     /// registers as the workspace's `worktree_path`; tests pass it
     /// as `working_dir` in their `ClientSessionConfig` so the
     /// daemon-side spawn uses a known-good directory.
-    fn start_test_daemon(
+    pub(crate) fn start_test_daemon(
         ws_id: &str,
     ) -> (
         std::path::PathBuf,
@@ -2627,7 +2663,7 @@ time.sleep(60)
     }
 
     /// Fresh TUI-format uid for tests (slice 10c-e-3b-fix).
-    fn test_uid() -> String {
+    pub(crate) fn test_uid() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2639,7 +2675,7 @@ time.sleep(60)
         format!("ts-{:x}-{:x}", nanos, n)
     }
 
-    fn stop_test_daemon(
+    pub(crate) fn stop_test_daemon(
         socket_path: &Path,
         stop: StdArc<AtomicBool>,
         handle: std::thread::JoinHandle<()>,
@@ -2759,6 +2795,7 @@ time.sleep(60)
             global_perms: false,
             seeded_from_snapshot: None,
             last_exit: Some(cm_daemon::manifest::LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -2938,6 +2975,22 @@ while True:
                 "repaint must never send input or submit a prompt");
         }
         drop(viewer);
+
+        // A Claude Code pane reattaches the same way (its Ink renderer only
+        // draws diffs against its last frame): it is pulsed once when viewed.
+        let mut config = bash_config(&socket, &working_dir, "op-test", &uid,
+            "ws-repaint", "claude-fixture", &argv, 80, 24);
+        config.session_type = "claude";
+        let mut claude_viewer = crate::session::Session::new_attached_existing(config).unwrap();
+        let later = Instant::now();
+        claude_viewer.poll_repaint(true, later);
+        wait_until(|| dimensions() == (79, 24));
+        wait_until(|| claude_viewer.term.lock().grid()[Line(0)][Column(0)].c == 'C');
+        claude_viewer.poll_repaint(false, later + Duration::from_millis(500));
+        wait_until(|| dimensions() == (80, 24));
+        drop(claude_viewer);
+        assert!(crate::session::repaints_on_resize("claude-code"));
+        assert!(!crate::session::repaints_on_resize("bash"));
 
         // A shell attach uses the same transport but is never auto-repainted.
         let config = bash_config(&socket, &working_dir, "op-test", &uid,

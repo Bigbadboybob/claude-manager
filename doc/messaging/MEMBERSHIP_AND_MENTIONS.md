@@ -77,10 +77,24 @@ chat_send(channel="work/parser", body="@here: the review is ready.",
           mention_here=True, request_id="review-ready-1")
 ```
 
-`mentions` contains stable participant IDs from `chat_people`. `mention_here` is
-only valid for channels. Body text alone never notifies; quoting an `@here`
-example or writing an email address cannot accidentally broadcast. Topic `tags`
-remain passive, searchable labels. Membership does not subscribe a participant
+`mentions` contains stable participant IDs from `chat_people`, or exact current
+names/aliases, which CM resolves to IDs (an unknown or ambiguous name is an
+error). `mention_here` is only valid for channels.
+
+A body `@Name` becomes a mention when it names exactly one current member of the
+conversation (joined channel members, or the DM's members); normalized spelling
+and aliases resolve, and a released name yields to its current holder. Every
+other body token is not notified and is reported in `warnings`
+(`unresolved_body_mention`, `ambiguous_body_mention`, `body_mention_not_member`,
+`body_broadcast_not_promoted` for `@here`/`@channel`/`@everyone`/`@all`,
+`owner_not_promoted` for `@Owner`, `too_many_mentions` past 32). Text inside
+code spans and fences, email addresses and URL/path segments is never scanned,
+so quoting an `@here` example or an address cannot accidentally broadcast. The
+response's `mentions_resolved` lists `{token, id, name, source: "param" | "body"}`
+for everyone mentioned. The stored event still holds participant IDs only, so
+replication and older clients are unaffected; resolution runs where the send
+executes (the hub for forwarded sends). Topic `tags` remain passive, searchable
+labels. Membership does not subscribe a participant
 to every ordinary post. Existing follows/monitors remain separate preferences.
 
 The committed event stores its resolved audience. Later joins do not receive old
@@ -90,7 +104,9 @@ original recipients. Existing mute, DND, and explicit inbox/wake overrides apply
 Default delivery is persistent and event driven: agents need no monitor or rearm
 call for DMs/mentions. Claude receives its native session-socket notification;
 Codex receives it through CM's owned app-server. Read the linked messages with
-`chat_read(inbox=True)` and acknowledge the returned receipt after reading. Native
+`chat_read(inbox=True)` and acknowledge the returned receipt after reading, or read
+the conversation itself, which marks it read; acknowledge a message with a
+`chat_react` reaction rather than a reply. Native
 transport availability and acceptance are reported honestly by the delivery system;
 this feature does not fall back to terminal typing. Owner receives passive inbox
 and unread indicators, plus the existing opt-in TUI bell.
@@ -120,6 +136,33 @@ participant rename does not redirect a saved mention. **Ctrl+s** sends.
 Unread ordinary posts have a subtle dot; DMs and resolved mentions to Owner have
 stronger indicators. Membership/settings events do not create unread messages or
 wake agents.
+
+**Sidebar.** Channel and DM rows start with a fixed count column, mentions then
+unread (`@2 ●5 #gpu-utilization`); a long name is shortened in the middle, never
+the counts. The sidebar fits the longest name up to 40% of the screen; **<** / **>**
+resize it, saved as `messages_sidebar_width` in `~/.cm/tui-settings.toml`
+(0 = fit names).
+
+**Catching up.** Opening a conversation marks it read, as does scrolling back to
+its newest message; while Owner reads back in history the background refresh
+leaves the read cursor alone. **M** marks the selected channel or DM read, mentions
+included, after a one-line `y` confirm that shows the counts: one cursor write
+(`messaging.mark_read`), with the new counts applied to the sidebar and status bar
+at once. On **Inbox** it marks every conversation read (`all`), and on **Mentions**
+every unread mention of Owner (`mentions`).
+
+**Reactions.** Reactions show under a message (`✅ Alpha, Owner  👀 Beta`, Owner's
+own in bold). **+** then **1–5** (✅ 👀 👍 ❌ 🎉) toggles Owner's reaction on the
+selected message; reactions notify nobody. **Mentions**,
+under Inbox, lists Owner's @mentions newest first with channel, sender and text;
+**Enter** opens the message in its conversation, loaded back to it and selected.
+In the conversation pane, **n** / **N** move to the next / previous mention of
+Owner, loading older history as needed. (In the sidebar, **n** still creates a
+channel and **N** opens norms.)
+
+**Scrolling.** Rendered messages are cached per width and only the visible rows
+are drawn; moving around never waits behind a refresh, **PgUp** pages a screen and
+fetches older history in pages of 100 ahead of the view, keeping its place.
 
 ## Deferred
 

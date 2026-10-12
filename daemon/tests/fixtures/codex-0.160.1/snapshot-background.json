@@ -1,0 +1,31 @@
+{
+  "backend_connected": true,
+  "foreground": "idle",
+  "engine_version": "0.160.1",
+  "turn_seq": 2,
+  "turn_started_at": 1791325758.5239754,
+  "last_turn": {
+    "ended_at": 1791325759.8191352,
+    "status": "completed"
+  },
+  "active_flags": [],
+  "pending_requests": [],
+  "child_active": false,
+  "retrying": false,
+  "error_kind": null,
+  "background": {
+    "complete": true,
+    "observed_at": 1791325759.823149,
+    "jobs": [
+      {
+        "id": "35850",
+        "kind": "terminal",
+        "label": "sleep 4; echo BACKGROUND_DONE",
+        "first_seen_at": 1791325759.823149,
+        "wakes_agent": false
+      }
+    ],
+    "crons": [],
+    "ended": []
+  }
+}

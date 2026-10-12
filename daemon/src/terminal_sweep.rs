@@ -31,13 +31,21 @@
 //!   conversation. It only lets the reaper's clock start.
 //! * It never touches a continuous orchestrator or a workflow participant:
 //!   the scheduler and the workflow engine own those lifecycles.
+//! * It never closes a session Owner has used in the last [`OWNER_GRACE`]:
+//!   typed into, shown in the TUI (`session.viewed`), revived or resumed.
+//!   2026-10-12: a worker whose task was marked done the second it called
+//!   `report_done` was closed four minutes later while Owner was still using
+//!   it, which read as a random kill; the revive then had to reopen the task
+//!   to keep the sweep from closing it again. A revive now counts as use.
+//! * It waits [`DONE_DELAY`] after first seeing a task terminal, so a task
+//!   marked done by mistake can be reopened before its workers close.
 //!
 //! COST. It reads ONE planning row per task that owns a live session, on a
 //! five-minute cadence — never `GET /tasks`. A periodic whole-board poll is the
 //! precise shape that cost ~80 GiB/day before 2026-09-10 (CLAUDE.md), and the
 //! sweep only ever needs the handful of rows that own a session.
 use crate::state::DaemonState;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,6 +66,40 @@ pub const MAX_LOOKUPS_PER_PASS: usize = 64;
 /// the two lists disagreeing would make the sweep close sessions the reaper
 /// still refuses to act on, or vice versa.
 pub const TERMINAL_TASK_STATUSES: [&str; 2] = ["done", "archived"];
+
+/// A session Owner used this recently is never swept.
+pub const OWNER_GRACE: Duration = Duration::from_secs(2 * 3600);
+
+/// How long a task must have been seen terminal before its workers close.
+pub const DONE_DELAY: Duration = Duration::from_secs(15 * 60);
+
+/// The owner-activity rule's inputs: the window, and the moment this brain
+/// started. Owner-view stamps live in memory only, so every session counts as
+/// used at brain start: a deploy delays sweeps by one window instead of
+/// forgetting a session Owner was looking at.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnerGrace {
+    pub window: Duration,
+    pub floor: Instant,
+}
+
+/// True when Owner typed into `sess`, showed it in the TUI, or revived or
+/// resumed it within `grace.window` (or the brain started within it).
+pub fn owner_recently_used(
+    state: &DaemonState,
+    uid: &str,
+    sess: &crate::session::DaemonSession,
+    grace: OwnerGrace,
+) -> bool {
+    let typed = *sess
+        .last_operator_input_at
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    [typed, state.owner_seen.get(uid).copied(), Some(grace.floor)]
+        .into_iter()
+        .flatten()
+        .any(|at| at.elapsed() < grace.window)
+}
 
 pub fn is_terminal(status: &str) -> bool {
     TERMINAL_TASK_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
@@ -81,15 +123,45 @@ pub struct TerminalTaskSweeper {
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<AtomicBool>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    grace: OwnerGrace,
+    done_delay: Duration,
+    /// When each candidate task was first seen terminal by this brain.
+    terminal_since: Mutex<HashMap<String, Instant>>,
 }
 
 impl TerminalTaskSweeper {
     pub fn new(state: Arc<Mutex<DaemonState>>) -> Self {
+        Self::with_timing(state, OWNER_GRACE, DONE_DELAY)
+    }
+
+    pub fn with_timing(
+        state: Arc<Mutex<DaemonState>>,
+        owner_grace: Duration,
+        done_delay: Duration,
+    ) -> Self {
         Self {
             state,
             shutdown: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
+            grace: OwnerGrace { window: owner_grace, floor: Instant::now() },
+            done_delay,
+            terminal_since: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether a task seen with `status` now has waited out the done delay.
+    /// Records the first terminal sighting and forgets a reopened task.
+    fn due(&self, task_id: &str, status: &str) -> bool {
+        let mut since = self.terminal_since.lock().unwrap_or_else(|p| p.into_inner());
+        if !is_terminal(status) {
+            since.remove(task_id);
+            return false;
+        }
+        since
+            .entry(task_id.to_string())
+            .or_insert_with(Instant::now)
+            .elapsed()
+            >= self.done_delay
     }
 
     /// One pass. Returns the uids it closed. Never panics on a planning-API
@@ -102,7 +174,16 @@ impl TerminalTaskSweeper {
             (state.config.api_url.clone(), state.config.api_token.clone())
         };
         let mut closed = Vec::new();
-        for task_id in candidate_task_ids(&self.state) {
+        let candidates = candidate_task_ids(&self.state);
+        {
+            // Forget tasks that no longer own a sweepable session.
+            let keep: BTreeSet<&String> = candidates.iter().collect();
+            self.terminal_since
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|task, _| keep.contains(task));
+        }
+        for task_id in candidates {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
@@ -123,13 +204,14 @@ impl TerminalTaskSweeper {
                     continue;
                 }
             };
-            if !is_terminal(&status) {
+            if !self.due(&task_id, &status) {
                 continue;
             }
             let swept = crate::control::methods::sweep_terminal_task_sessions(
                 &self.state,
                 &task_id,
                 "terminal-task-sweep",
+                Some(self.grace),
             );
             if !swept.is_empty() {
                 eprintln!(
@@ -271,6 +353,35 @@ mod tests {
         }
         assert_eq!(candidate_task_ids(&state), vec!["task-plain".to_string()]);
         kill_fixtures(&state);
+    }
+
+    #[test]
+    fn a_task_waits_out_the_done_delay_and_reopening_resets_it() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let slow = TerminalTaskSweeper::with_timing(
+            Arc::clone(&state),
+            OWNER_GRACE,
+            Duration::from_secs(3600),
+        );
+        assert!(!slow.due("t", "done"), "first sighting starts the clock");
+        assert!(!slow.due("t", "done"), "still inside the delay");
+        assert!(!slow.due("t", "running"), "reopened");
+        assert!(!slow.terminal_since.lock().unwrap().contains_key("t"));
+
+        let instant = TerminalTaskSweeper::with_timing(Arc::clone(&state), OWNER_GRACE, Duration::ZERO);
+        assert!(instant.due("t", "archived"));
+        assert!(!instant.due("t", "blocked"));
+    }
+
+    #[test]
+    fn the_defaults_match_the_spec() {
+        // Owner: never close what Owner used in the last two hours; give a
+        // just-marked-done task a quarter hour to be reopened.
+        assert_eq!(OWNER_GRACE, Duration::from_secs(7200));
+        assert_eq!(DONE_DELAY, Duration::from_secs(900));
+        let sweeper = TerminalTaskSweeper::new(Arc::new(Mutex::new(DaemonState::default())));
+        assert_eq!(sweeper.grace.window, OWNER_GRACE);
+        assert_eq!(sweeper.done_delay, DONE_DELAY);
     }
 
     #[test]

@@ -62,6 +62,15 @@ pub fn publish(
             "notification must contain 1–65536 UTF-8 bytes",
         ));
     }
+    // The consumer confirms delivery by finding the marker in the agent's
+    // transcript; a text without it can never be observed and would sit
+    // `submitted` until the stall alarm pages Owner.
+    if marker.is_empty() || !text.contains(marker) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "notification text must contain its marker",
+        ));
+    }
     let _guard = lock(root, uid)?;
     let path = path(root, uid, id);
     if let Some(old) = read(&path)? {
@@ -133,6 +142,39 @@ pub fn snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<Value>
     let transport = read(&dir.join("transport.json")).ok().flatten();
     Ok((events, transport))
 }
+/// Retire this recipient's submitted/uncertain events whose text lacks their
+/// marker (published before `publish` enforced it): they were delivered but
+/// can never be observed, so they would keep a stall-alarm episode open
+/// forever. Pending ones are left alone (delivery does not need the marker,
+/// so retiring them would drop a wake); once submitted they are retired on a
+/// later pass. Marks them cancelled with `retired: "marker_missing"`; returns
+/// how many.
+pub fn retire_unconfirmable(root: &Path, uid: &str) -> io::Result<usize> {
+    let dir = directory(root, uid);
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let _guard = lock(root, uid)?;
+    let mut retired = 0;
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|x| x != "json") || path.file_name().is_some_and(|n| n == "transport.json") {
+            continue;
+        }
+        let Ok(Some(mut event)) = read(&path) else { continue };
+        let open = matches!(event["status"].as_str(), Some("submitted" | "uncertain"));
+        let marker = event["marker"].as_str().unwrap_or("");
+        let confirmable = !marker.is_empty() && event["text"].as_str().is_some_and(|t| t.contains(marker));
+        if open && !confirmable {
+            event["status"] = json!("cancelled");
+            event["retired"] = json!("marker_missing");
+            atomic_replace(&path, &event)?;
+            retired += 1;
+        }
+    }
+    Ok(retired)
+}
+
 /// Only unclaimed events can be rewritten or retracted. A submitted native
 /// frame cannot be recalled; leave the receipt state intact.
 pub fn update_pending(
@@ -168,18 +210,18 @@ mod tests {
         let _env = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let event = publish(root, "uid", "event", "chat", "wake", "marker").unwrap();
+        let event = publish(root, "uid", "event", "chat", "wake marker", "marker").unwrap();
         assert_eq!(
-            publish(root, "uid", "event", "chat", "wake", "marker").unwrap(),
+            publish(root, "uid", "event", "chat", "wake marker", "marker").unwrap(),
             event
         );
-        assert!(publish(root, "uid", "event", "chat", "different", "marker").is_err());
+        assert!(publish(root, "uid", "event", "chat", "different marker", "marker").is_err());
         assert!(get(root, "other", "event").unwrap().is_none());
         assert_eq!(
             update_pending(root, "uid", "event", None).unwrap().unwrap()["status"],
             "cancelled"
         );
-        let mut claimed = publish(root, "uid", "second", "chat", "wake", "marker").unwrap();
+        let mut claimed = publish(root, "uid", "second", "chat", "wake marker", "marker").unwrap();
         claimed["status"] = json!("submitting");
         atomic_replace(&path(root, "uid", "second"), &claimed).unwrap();
         assert_eq!(
@@ -190,13 +232,47 @@ mod tests {
         );
     }
     #[test]
+    fn notifications_require_the_marker_in_the_text_and_retire_old_unconfirmable_events() {
+        let _env = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let err = publish(root, "uid", "x", "owner", "no marker here", "[cm-x 1]").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(publish(root, "uid", "x", "owner", "text", "").is_err(), "an empty marker is refused");
+        publish(root, "uid", "ok", "owner", "[cm-x 2] fine", "[cm-x 2]").unwrap();
+        // An event written before the check (marker missing), stuck submitted.
+        let mut stuck = get(root, "uid", "ok").unwrap().unwrap();
+        stuck["id"] = json!("old");
+        stuck["text"] = json!("Owner availability: away→focused");
+        stuck["marker"] = json!("[cm-owner-availability r1]");
+        stuck["status"] = json!("submitted");
+        atomic_replace(&path(root, "uid", "old"), &stuck).unwrap();
+        assert_eq!(retire_unconfirmable(root, "uid").unwrap(), 1);
+        let old = get(root, "uid", "old").unwrap().unwrap();
+        assert_eq!((old["status"].as_str(), old["retired"].as_str()), (Some("cancelled"), Some("marker_missing")));
+        assert_eq!(get(root, "uid", "ok").unwrap().unwrap()["status"], "pending", "confirmable events untouched");
+        assert_eq!(retire_unconfirmable(root, "uid").unwrap(), 0, "idempotent");
+        // A pending marker-less event can still be delivered: left alone
+        // until it is submitted.
+        let mut pending = old.clone();
+        pending["id"] = json!("old-pending");
+        pending["status"] = json!("pending");
+        atomic_replace(&path(root, "uid", "old-pending"), &pending).unwrap();
+        assert_eq!(retire_unconfirmable(root, "uid").unwrap(), 0);
+        assert_eq!(get(root, "uid", "old-pending").unwrap().unwrap()["status"], "pending");
+        pending["status"] = json!("submitted");
+        atomic_replace(&path(root, "uid", "old-pending"), &pending).unwrap();
+        assert_eq!(retire_unconfirmable(root, "uid").unwrap(), 1);
+        assert_eq!(retire_unconfirmable(root, "nobody").unwrap(), 0);
+    }
+    #[test]
     fn notifications_python_and_rust_share_queue_and_receipts() {
         let _env = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        publish(tmp.path(), "uid", "from-rust", "chat", "wake", "marker").unwrap();
+        publish(tmp.path(), "uid", "from-rust", "chat", "wake marker", "marker").unwrap();
         let output = std::process::Command::new("python3")
             .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
-            .args(["-c", "from pathlib import Path; import sys; from mcp_server.notifications import Queue; q=Queue('uid',Path(sys.argv[1])); assert q.get('from-rust')['status']=='pending'; q.cancel('from-rust'); q.publish('from-python','session_monitor','worker done','marker')"])
+            .args(["-c", "from pathlib import Path; import sys; from mcp_server.notifications import Queue; q=Queue('uid',Path(sys.argv[1])); assert q.get('from-rust')['status']=='pending'; q.cancel('from-rust'); q.publish('from-python','session_monitor','worker done marker','marker')"])
             .arg(tmp.path()).output().unwrap();
         assert!(
             output.status.success(),

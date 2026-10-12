@@ -338,3 +338,26 @@ fn messaging_group_monitors_and_mutes_do_not_spill_into_other_dms() {
     assert!(!wakes["b"].iter().any(|w| w.event_id == group_msg["event"]["id"].as_str().unwrap()));
     assert!(wakes["b"].iter().any(|w| w.event_id == pair_msg["event"]["id"].as_str().unwrap()));
 }
+
+#[test]
+fn owner_attention_splits_unread_dms_and_mentions_and_reading_clears_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    let people = vec![a.clone()];
+    post(&mut s, &a, json!({"dm":"owner"}), "dm one", &people);
+    post(&mut s, &a, json!({"dm":"owner"}), "dm two", &people);
+    let mention = post(&mut s, &a, json!({"channel":"general","mentions":["owner"]}), "mention", &people);
+    let mut here = json!({"channel":"general","mention_here":true});
+    here["body"] = json!("here");
+    here["request_id"] = json!("here");
+    s.send(&a.id, "a", "agent", &here, &people).unwrap();
+    post(&mut s, &a, json!({"channel":"general"}), "plain", &people);
+    let att = s.attention("owner", false).unwrap();
+    assert_eq!((att["dms"].as_u64(), att["mentions"].as_u64()), (Some(2), Some(2)), "{att}");
+    // Reading the mention clears it from the count.
+    s.acknowledge("owner", &json!({"actor":"owner","space_id":s.space_id,"ids":[mention["event_id"]]})).unwrap();
+    assert_eq!(s.attention("owner", false).unwrap()["mentions"], 1);
+    // Agents get nothing.
+    assert!(s.attention(&a.id, false).unwrap().is_null());
+}

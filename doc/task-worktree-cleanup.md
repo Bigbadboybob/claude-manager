@@ -2,9 +2,16 @@
 
 In the work view, **Alt+d** opens the completion dialog for the selected task.
 **Keep worktrees** is the default. Use Tab or the arrow keys to select
-**Reap this task + descendants**, inspect the paths and retention reasons, and
-press Enter. Use j/k to scroll the preview or result. Escape cancels before
-submission, or closes the report afterward.
+**Reap this task + descendants** and press Enter. Reap does not wait for the
+preview: Enter marks the task done (or closes the workspace), closes the
+dialog, and the owning hosts resolve the preview and reap in the background
+with the same safety checks. The status bar shows progress (`⟲ cleanup:
+scanning`, `reaping 2/5`), and you are notified only if a checkout was kept or a
+host failed (a host that never accepts the request within 2 minutes counts as
+failed); a clean finish is a status line. Paths and reasons that have arrived
+are shown while the dialog is open; j/k scrolls them. Escape cancels before
+submission. Marking a workspace done without a selected task still waits for
+the preview, which names the task that owns it.
 
 **Alt+Shift+w** opens the same choice for closing a workspace. Closing a
 workspace does not mark its associated planning tasks done: any nonterminal
@@ -30,13 +37,20 @@ The policy applies to newly adopted workspaces after the viewer update. Older em
 
 **A finished task closes its own workers (2026-09-18).** When a task reaches `done` or `archived` by ANY route — the planning API, the TUI, an MCP call, a cloud status flip — the daemon's terminal-task sweep closes the idle worker sessions still bound to it, within five minutes. Before this, only the `mark_subtask_done` MCP tool swept; every other route left workers alive at their prompt, and because the reaper refuses a checkout holding a live session BEFORE it computes age, the retention clock never started and no such checkout was ever reapable (65 live sessions on cm-manager the morning it shipped, 47 of them past `report_done`, some since August). Closing a session deletes nothing: the checkout, branch, files and transcript remain and `A-R` still revives the conversation. It only lets the clock start. The sweep never touches a continuous orchestrator or a workflow participant, and skips a session that is mid-turn, picking it up once it settles. A worker whose task is still open — including one that has called `report_done` and is awaiting review — stays live by design.
 
-Automatic closure never submits a reap request. The scheduled reaper still applies its usual seven-day retention and task/activity protections; an unfinished triage task keeps its checkout. For immediate cleanup later, **Alt+Shift+O** opens past workspaces. Reopen the workspace, then use **Alt+d → Reap this task + descendants** once that task is finished. Reopening returns bound Done tasks to Running and can resume designated designer sessions; restoring other closed sessions is optional. Cloud paths are not checked on the laptop or falsely labelled gone: the owning host validates them when launching sessions or previewing cleanup. A missing local worktree still blocks reopening.
+**The sweep never surprises Owner (2026-10-12).** A worker whose task was marked done the second it called `report_done` was closed four minutes later while Owner was still using it, and read as a random kill. Now:
+
+- A task must have been seen `done`/`archived` for 15 minutes before its workers close (the pass runs every five, so 15–20 minutes), so a task marked done by mistake can be reopened first.
+- A session Owner used in the last two hours is never closed: typed into, shown in the TUI (the viewer reports the session it shows to its owning daemon with `session.viewed`, on selection and every five minutes), or revived, resumed or started by Owner. A revived worker on a still-done task therefore stays up; there is no need to reopen the task first. View stamps live in the brain's memory, so after a brain restart every session counts as used at start, which only delays sweeps by one window.
+- A closed worker says why: its exit record carries `killed_by: "terminal-task-sweep (terminal task)"`, and the sidebar row, the Alt+i peek and the Alt+Shift+O reopen picker show **closed: task done** instead of a bare exit. `A-R` revives it as before.
+
+Automatic closure never submits a reap request. The scheduled reaper still applies its usual seven-day retention and task/activity protections; an unfinished triage task keeps its checkout. For immediate cleanup later, **Alt+Shift+O** opens past workspaces; type to filter them by workspace or task name, branch, worktree path, session label or host (Esc clears the query, then closes). Reopen the workspace, then use **Alt+d → Reap this task + descendants** once that task is finished. Reopening returns bound Done tasks to Running and can resume designated designer sessions; restoring other closed sessions is optional. Cloud paths are not checked on the laptop or falsely labelled gone: the owning host validates them when launching sessions or previewing cleanup. A missing local worktree still blocks reopening.
 
 Task completion previews the owning host and other configured remote hosts,
 so CM children created on a different worker host can be included. A remote
 task does not include the laptop's retained migration copies. A workspace-only
 close stays on its owning host. Unavailable hosts are reported and must return
-a preview before recursive cleanup can be selected; Keep remains available.
+a preview of their own; the request to them is retried in the background and
+reported as failed if it is never accepted. Keep remains available.
 
 ## What cleanup includes
 
@@ -102,6 +116,30 @@ hook in another repository:
 python3 ~/.cm/worktree-tools/worktree_lineage.py install /absolute/repository
 ```
 
+## A session that deleted its own checkout
+
+An agent must never remove the worktree its own session runs in (see the
+agent guide). If one does, CM re-creates the checkout from its branch with the
+same healer `start_session` uses: when input is delivered to the session
+(`send_input`, reply fields `worktree_recreated` / `worktree_warning`), when it
+is revived or restarted (A-R, `session.revive`, startup restore), and within a
+minute from the daemon's missing-checkout watch, which also sends the session
+a `[cm-worktree <uid>]` notice. A revive that still fails keeps its sidebar
+row, marked `✗ revive failed` with the error in the status line, instead of
+losing it to an exit prune (2026-10-08).
+
+## Preview speed
+
+A preview scans every checkout the host knows about (manifest, lineage
+records, Git's worktree lists) to register raw worktrees and owners. It used to
+re-register all of them with about seven Git processes each — 40 s for 226
+checkouts on a loaded cm-sessions (2026-10-07). Now a checkout whose stored
+record is current and already lists every owner and parent found is skipped
+without spawning Git; the Git common dir and branch are read from `.git`/`HEAD`
+(falling back to Git for anything unusual), `origin` is read once per
+repository, and Claude's subagent metadata is read only for candidate project
+directories. The same scan takes about 2 s.
+
 ## Durable jobs and recovery
 
 The operator-only daemon RPC is `worktree.cleanup` with actions `preview`,
@@ -112,10 +150,12 @@ returns `root_tasks` with their current status, including ownership resolved
 from a workspace path. Agent session callers cannot invoke
 this destructive RPC through MCP. Normal task/session permissions are unchanged.
 
-The TUI waits for every host to acknowledge its persisted cleanup request
-before completing the task. If the viewer exits before acknowledgment, it
-leaves the task open. Once queued, a detached host worker continues without the
-viewer and waits briefly for closure; a failed status update retains a
+`apply` is accepted at any point after `preview`: during the scan it is
+recorded durably on the job (`apply_requested`), and the scanning worker merges
+it under the request lock when it saves the preview, then continues straight
+into the cleanup. The TUI therefore submits Reap and completes the task at
+once. Once queued, a detached host worker continues without the viewer and
+waits briefly for closure; a failed status update retains a
 nonterminal task's checkout. Requests and per-path results are saved after every
 step under `~/.cm/worktree-cleanup/<id>.json`, with a sibling `.log`. The daemon
 resumes unfinished jobs at startup; a worker lock prevents duplicate execution.

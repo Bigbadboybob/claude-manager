@@ -7,6 +7,81 @@ from mcp_server import server, control_client
 
 
 class MessagingToolsTests(unittest.TestCase):
+    def test_startup_retry_preserves_request_until_ready(self):
+        for code, message in [("conflict", "messaging_starting: retry shortly"),
+                              ("messaging_starting", "retry shortly")]:
+            with self.subTest(code=code):
+                error = control_client.ControlError(code, message)
+                with patch.object(control_client, "call", side_effect=[error, error, {}]) as call, \
+                     patch.object(server.time, "sleep") as sleep:
+                    server.chat_send("Same body", "same-request", channel="general",
+                                     origin_daemon_id="home", mentions=["peer"])
+                self.assertEqual(call.call_count, 3)
+                self.assertTrue(all(c == call.call_args_list[0] for c in call.call_args_list))
+                self.assertEqual(call.call_args.args[1]["request_id"], "same-request")
+                self.assertEqual(call.call_args.args[1]["body"], "Same body")
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [0.25, 0.5])
+
+    def test_startup_retry_stops_at_deadline_and_keeps_error(self):
+        clock = [0.0]
+        error = control_client.ControlError("conflict", "messaging_starting: retry shortly")
+        def sleep(delay):
+            self.assertGreater(delay, 0)
+            self.assertLessEqual(delay, 2.0)
+            clock[0] += delay
+        with patch.object(control_client, "call", side_effect=error) as call, \
+             patch.object(server.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(server.time, "sleep", side_effect=sleep):
+            with self.assertRaises(control_client.ControlError) as raised:
+                server.chat_open()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(clock[0], 30.0)
+        self.assertGreater(call.call_count, 1)
+
+    def test_only_startup_refusal_is_retried(self):
+        for error in [control_client.ControlError("conflict", "name_revision_conflict: stale"),
+                      control_client.ControlError("outcome_unknown", "retry same request"),
+                      control_client.TransportError("connection closed")]:
+            with self.subTest(error=error), \
+                 patch.object(control_client, "call", side_effect=error) as call, \
+                 patch.object(server.time, "sleep") as sleep:
+                with self.assertRaises(type(error)) as raised:
+                    server.chat_open()
+                self.assertIs(raised.exception, error)
+                call.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_rename_waits_for_messaging_startup(self):
+        error = control_client.ControlError("conflict", "messaging_starting: retry shortly")
+        with patch.object(control_client, "call", side_effect=[error, {}]) as call, \
+             patch.object(server.time, "sleep"):
+            server.chat_rename("Scout", 2, "rename-request", origin_daemon_id="home")
+        self.assertEqual(call.call_args_list[0], call.call_args_list[1])
+        self.assertEqual(call.call_args.args[0], "session.set_name")
+
+    def test_react_routes_to_daemon_and_preserves_retry_identity(self):
+        params = dict(message_id="host:message", emoji="✅", request_id="react-1",
+                      remove=False, origin_daemon_id="host")
+        with patch.object(control_client, "call", return_value={"reactions": {}}) as call:
+            server.chat_react(**params)
+            first = copy.deepcopy(call.call_args.args)
+            server.chat_react(**params)
+            self.assertEqual(call.call_args.args, first)
+            self.assertEqual(call.call_args.args, ("messaging.react", params))
+            self.assertIn("messaging.react", control_client.DAEMON_METHODS)
+
+    def test_read_flags_and_reactions_survive_slim_projection(self):
+        result = {"items": [{"id": "m", "actor": {"name": "Scout"}, "body": "hi",
+                             "read": True, "reactions": {"✅": {"count": 1, "names": ["Owner"], "mine": True}}}],
+                  "read_cursor": {"logical_time": "9", "event_id": "m"}}
+        with patch.object(control_client, "call", return_value=result) as call:
+            read = server.chat_read(inbox=True, mentions_only=True, mark_read=False)
+            self.assertTrue(call.call_args.args[1]["mentions_only"])
+            self.assertFalse(call.call_args.args[1]["mark_read"])
+            self.assertEqual(read["items"][0]["reactions"], result["items"][0]["reactions"])
+            self.assertTrue(read["items"][0]["read"])
+            self.assertEqual(read["read_cursor"], result["read_cursor"])
+
     def test_chat_deadline_allows_daemon_timeout_to_reach_caller(self):
         error = control_client.ControlError("outcome_unknown", "retry the same request ID")
         with patch.object(control_client, "call", side_effect=error) as call:
@@ -111,12 +186,25 @@ class MessagingToolsTests(unittest.TestCase):
         self.assertTrue(result["timed_out"])
         self.assertIn("binding_warning", result["state"])
 
+    def test_workflow_wait_counts_only_explicit_agent_idle_as_stuck(self):
+        binding = {"daemon_session_uid": "actual"}
+        for state in ("working", "working-background", "waiting-on-human", "errored", "unknown", "starting"):
+            with self.subTest(state=state):
+                result = self.run_wait(binding, [{"session_uid": "actual", "idle": True,
+                                                "agent_state": {"state": state}}])
+                self.assertTrue(result["timed_out"])
+                self.assertFalse(result["stuck"])
+        result = self.run_wait(binding, [{"session_uid": "actual", "idle": False,
+                                        "agent_state": {"state": "idle"}}])
+        self.assertTrue(result["stuck"], "explicit state wins over compatibility idle")
+
     def test_stop_hook_reports_continuation_for_inbox_work(self):
         from mcp_server.hooks import cm_stop_hook as hook
         import io
         with patch.object(hook, "_session_uid", return_value="a"), patch.object(hook, "_drain_inbox", return_value=["Wake"]), patch.object(hook, "_report_turn_ended") as report, patch("sys.stdin", io.StringIO("{}")), patch("sys.stdout", io.StringIO()):
             self.assertEqual(hook.main(), 0)
-        report.assert_called_once_with("a", None, continuing=True)
+        from unittest.mock import ANY
+        report.assert_called_once_with("a", None, continuing=True, payload={}, observed_at=ANY)
 
     def test_milestone_b_tools_keep_daemon_routing_and_explicit_acknowledgements(self):
         calls = [

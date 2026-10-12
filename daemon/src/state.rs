@@ -386,6 +386,10 @@ pub type WorktreeSpawnQueues = Arc<Mutex<HashMap<PathBuf, Arc<WorktreeSpawnQueue
 /// `list_sessions` need a consistent snapshot.
 pub struct DaemonState {
     pub messaging: Arc<Mutex<Option<crate::messaging::Store>>>,
+    /// One background opener per brain; rebuilding never holds daemon/store locks.
+    pub messaging_startup: Arc<std::sync::atomic::AtomicBool>,
+    /// Name recovery must not persist the session registry before adoption finishes.
+    pub messaging_registry_restored: bool,
     /// Serializes chat cancellation/preferences with the final delivery boundary.
     pub messaging_delivery: Arc<Mutex<()>>,
     pub messaging_wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
@@ -397,6 +401,7 @@ pub struct DaemonState {
     /// spawning sessions. Indexed by the stable session uid that
     /// already lives on `ManifestEntry` / `TerminalSession`.
     pub sessions: HashMap<String, DaemonSession>,
+    pub agent_state_runtime: Arc<crate::agent_state::Runtime>,
     /// H3 (restart hardening): drain mode. While true, spawn-shaped
     /// operations (`mcp_start_session`, `session.revive`) refuse and
     /// the continuous scheduler's tick no-ops, so an operator can bring
@@ -441,6 +446,13 @@ pub struct DaemonState {
     /// [`ExitedTombstone`]. Bounded by [`KILL_REQUEST_CAP`]. See
     /// [`DaemonState::record_kill_request`].
     pub kill_requests: HashMap<String, KillRequest>,
+    /// Last time Owner was seen USING a session other than by typing into it
+    /// (typing is `DaemonSession::last_operator_input_at`): the TUI reports
+    /// the session it shows (`session.viewed`), and a revive or resume counts
+    /// too. In memory only: the terminal-task sweep treats every session as
+    /// seen when its brain started, so a restart never loses a grace window.
+    /// Pruned to live sessions by [`Self::note_owner_activity`].
+    pub owner_seen: HashMap<String, std::time::Instant>,
     /// Snapshot of the persisted manifest's workspaces, keyed by
     /// stable workspace id. Loaded at daemon startup via
     /// [`load_manifest_from_disk`](Self::load_manifest_from_disk).
@@ -794,10 +806,12 @@ impl Default for DaemonState {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
+            agent_state_runtime: Arc::new(crate::agent_state::Runtime::default()),
             recently_exited: VecDeque::new(),
             resume_history: Mutex::new(Default::default()),
             resume_claims: Default::default(),
             kill_requests: HashMap::new(),
+            owner_seen: HashMap::new(),
             workspaces: HashMap::new(),
             bindings: HashMap::new(),
             daemon_sessions_path: None,
@@ -815,6 +829,8 @@ impl Default for DaemonState {
             workflow_definitions: HashMap::new(),
             base_workflow_definitions: HashMap::new(),
             messaging: Arc::new(Mutex::new(None)),
+            messaging_startup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            messaging_registry_restored: false,
             messaging_delivery: Arc::new(Mutex::new(())),
             messaging_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             messaging_root: crate::messaging::rpc::default_root(),
@@ -851,6 +867,18 @@ impl DaemonState {
         self.recently_exited.push_back(tomb);
         while self.recently_exited.len() > RECENTLY_EXITED_CAP {
             self.recently_exited.pop_front();
+        }
+        // Let the items board see the exit within seconds, not a full beat.
+        crate::items::heartbeat::poke();
+    }
+
+    /// Owner used `uid` just now (viewed it in the TUI, revived or resumed
+    /// it). Read by the terminal-task sweep's grace rule.
+    pub fn note_owner_activity(&mut self, uid: &str) {
+        self.owner_seen.insert(uid.to_string(), std::time::Instant::now());
+        if self.owner_seen.len() > 4 * self.sessions.len().max(64) {
+            let live: std::collections::HashSet<&String> = self.sessions.keys().collect();
+            self.owner_seen.retain(|k, _| live.contains(k));
         }
     }
 

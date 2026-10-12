@@ -332,6 +332,10 @@ pub fn codex_args(
         // Codex resumes inherit saved permissions; overriding them is rejected.
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
     }
+    // Inline mode keeps Codex history in CM's scrollback (wheel/Shift+PgUp).
+    args.extend(cm_daemon::mcp_config::codex_screen_args(
+        cm_daemon::mcp_config::codex_inline_scrollback(),
+    ));
     // Disable codex's startup update check: when a new version is published,
     // accepting the popup tears down the TUI and exits with "Please restart
     // Codex", which inside our PTY looks like a blank/dead session.
@@ -636,6 +640,19 @@ mod tests {
         assert_eq!(args.first().map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some("saved-id"));
         assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn codex_args_launch_inline_for_scrollback_fresh_and_resume() {
+        for target in [SpawnTarget::TuiLocal, SpawnTarget::Daemon] {
+            let fresh = codex_args(target, "uid-x", None, None);
+            assert!(fresh.iter().any(|a| a == "--no-alt-screen"), "{:?}", fresh);
+            let resumed = codex_args(target, "uid-x", None, Some("saved-id"));
+            let flag = resumed.iter().position(|a| a == "--no-alt-screen").expect("resume inline");
+            assert_eq!(resumed.first().map(String::as_str), Some("resume"));
+            assert_eq!(resumed.last().map(String::as_str), Some("saved-id"));
+            assert!(flag < resumed.len() - 1);
+        }
     }
 
     #[test]

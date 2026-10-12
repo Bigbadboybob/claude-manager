@@ -2,6 +2,7 @@
 pub mod delivery;
 pub mod sync;
 pub mod rpc;
+pub mod startup;
 pub mod tasks;
 mod store;
 pub use store::{atomic_replace, now, ChatError, Name, Person, Store, TaskBinding, WakeIntent, norms_diff};

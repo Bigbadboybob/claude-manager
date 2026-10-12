@@ -265,6 +265,48 @@ pub(super) fn encode_mouse_for_pty(
     crate::input::event_to_bytes(&CrosstermEvent::Mouse(translated), &term_mode)
 }
 
+/// Bytes for a mouse-wheel notch over an ALTERNATE-screen app that did not
+/// enable mouse reporting (CM forwards real reports itself when it did).
+/// The alternate screen has no scrollback, so moving CM's own viewport is a
+/// silent no-op; translate the wheel into keys the app scrolls with instead.
+///
+/// - Codex: one PageUp/PageDown. In Codex's alternate screen (0.160.1)
+///   PageUp/PageDown scroll the transcript while Up/Down recall composer
+///   history, so the usual arrow translation would rewrite the draft.
+/// - Anything else (less, vim, …): xterm/alacritty "alternate scroll"
+///   (`?1007`, on by default): three cursor-key presses per notch, in
+///   application-cursor form (`ESC O A`) when DECCKM is set.
+///
+/// `None` = not applicable (primary screen, mouse reporting, not a wheel
+/// event, or the app turned alternate scroll off).
+pub(super) fn alt_screen_wheel_bytes(
+    kind: MouseEventKind,
+    term_mode: TermMode,
+    codex: bool,
+) -> Option<Vec<u8>> {
+    let up = match kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+    if !term_mode.contains(TermMode::ALT_SCREEN) || term_mode.intersects(TermMode::MOUSE_MODE) {
+        return None;
+    }
+    if codex {
+        return Some(if up { b"\x1b[5~".to_vec() } else { b"\x1b[6~".to_vec() });
+    }
+    if !term_mode.contains(TermMode::ALTERNATE_SCROLL) {
+        return None;
+    }
+    let key: &[u8] = match (term_mode.contains(TermMode::APP_CURSOR), up) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1bOB",
+        (false, true) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+    };
+    Some(key.repeat(3))
+}
+
 /// Decide the actual byte sequence to write for a workflow delivery body,
 /// given the inner program's current terminal mode.
 ///
@@ -733,7 +775,12 @@ impl App {
                         if quiet && ts.status == SessionStatus::Running {
                             ts.set_status(SessionStatus::Idle);
                             visible_dirty = true;
-                            if ts.notify_on_idle {
+                            // With an engine-reported state, notify-on-idle
+                            // follows the daemon's transition instead
+                            // (`apply_agent_state`).
+                            if ts.notify_on_idle
+                                && !super::agent_state::covers_idle_notify(&self.agent_states, &ts.host_id, &ts.uid)
+                            {
                                 notify_session_idle(&ts.label);
                             }
                         } else if burst && ts.status != SessionStatus::Running {
@@ -1100,7 +1147,9 @@ impl App {
         // uid (`restart_suppressed_exit_uids`, consumed by the diff path).
         if !agent_exit_prunes.is_empty() {
             for (wi, uid) in agent_exit_prunes {
-                if self.restart_suppressed_exit_uids.contains(&uid) {
+                if self.restart_suppressed_exit_uids.contains(&uid)
+                    || self.revive_failed.contains_key(&uid)
+                {
                     continue;
                 }
                 eprintln!(
@@ -1832,6 +1881,9 @@ impl App {
         if let Some(alerts) = &snapshot.owner_attention {
             self.apply_owner_attention_snapshot(&snapshot.host, alerts);
         }
+        if let Some(states) = &snapshot.agent_states {
+            self.apply_agent_state_snapshot(&snapshot.host, states);
+        }
         // 10e-d: collect uids we adopted with memory_cap_kill=true
         // so we can fire toasts AFTER the workspaces-iteration
         // is done — avoids the &mut self contention from calling
@@ -1975,6 +2027,7 @@ impl App {
                     || ts.managed_by_uid.is_none()
                     || ts.workflow_run_id.is_some()
                     || self.restart_suppressed_exit_uids.contains(&ts.uid)
+                    || self.revive_failed.contains_key(&ts.uid)
                 {
                     continue;
                 }
@@ -2111,6 +2164,7 @@ impl App {
                             // here too, so the remote repro is covered.
                             if ts.managed_by_uid.is_some()
                                 && ts.workflow_run_id.is_none()
+                                && !self.revive_failed.contains_key(&uid)
                             {
                                 prune_ws = Some(wi);
                             }
@@ -2181,6 +2235,9 @@ impl App {
                     } else if let Ok(alert) = serde_json::from_value(value.clone()) {
                         self.apply_owner_attention(&host, &uid, Some(alert));
                     }
+                }
+                if let Some(value) = entry.get("agent_state") {
+                    self.apply_agent_state(&host, &uid, value);
                 }
                 self.apply_messaging_name(&host, &uid, &entry);
                 self.apply_global_perms_from_diff(&uid, &entry);
@@ -2975,7 +3032,63 @@ mod apply_manifest_diff_tests {
         cm_daemon::owner_attention::Alert {
             id: id.into(), session_uid: uid.into(), label: "Task".into(),
             message: "Ready for review".into(), task_id: None, continuous_task_id: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn agent_state_snapshot_and_diffs_drive_glyphs_and_attention_order() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        let session = crate::session::Session::new("/bin/true", &[], 80, 24, None,
+            std::collections::HashMap::new(), None).expect("test PTY");
+        let second = make_simple_session_with_uid("other".to_string(), "other-label", "claude", session, None);
+        app.workspaces[0].sessions.push(second);
+        for ts in &mut app.workspaces[0].sessions {
+            ts.host_id = host.clone();
+            ts.session.exited = false;
+            ts.status = SessionStatus::Idle;
+        }
+        // Snapshot: "self" idle, "other" waiting on a human.
+        let mut snap = snapshot_payload(host.clone(), &["self", "other"], &[]);
+        snap.agent_states = Some([
+            ("self".to_string(), serde_json::json!({"state":"idle","since":1.0})),
+            ("other".to_string(), serde_json::json!({"state":"waiting-on-human","since":2.0})),
+        ].into_iter().collect());
+        app.apply_agent_state_snapshot(&host, snap.agent_states.as_ref().unwrap());
+        assert_eq!(app.agent_indicator(&app.workspaces[0].sessions[1]).unwrap().0, "?");
+        // A-g: waiting outranks idle even though it comes later visually.
+        app.cursor = Cursor::Session(0, 0);
+        app.jump_to_next_attention();
+        assert_eq!(app.cursor, Cursor::Session(0, 1));
+        // A diff to errored, applied twice, is idempotent.
+        let diff = || ManifestDiff::Updated { uid: "other".into(),
+            entry: serde_json::json!({"agent_state":{"state":"errored","since":3.0,"detail":{"error_kind":"rate_limit"}}}) };
+        app.apply_manifest_diff_from_host(host.clone(), diff());
+        app.needs_redraw = false;
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"errored","since":3.0,"detail":{"error_kind":"rate_limit"}}));
+        assert!(!app.needs_redraw, "re-applying the same state does not repaint");
+        assert_eq!(app.agent_indicator(&app.workspaces[0].sessions[1]).unwrap().0, "\u{2717}");
+        assert_eq!(app.agent_state_wire(&app.workspaces[0].sessions[1])["detail"]["error_kind"], "rate_limit");
+        // waiting -> idle keeps the earlier notification (no second notify).
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"waiting-on-human","since":3.5,"source":"hooks"}));
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"idle","since":3.6,"source":"hooks"}));
+        assert!(app.agent_view(&app.workspaces[0].sessions[1]).unwrap().notified_quiet);
+        assert!(app.engine_covers_idle_notify(&host, "other"));
+        // Working by the engine beats a quiet PTY: renders as running.
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated { uid: "self".into(),
+            entry: serde_json::json!({"agent_state":{"state":"working","since":4.0}}) });
+        assert!(app.display_running(&app.workspaces[0].sessions[0]));
+        assert!(!app.display_idle(&app.workspaces[0].sessions[0]));
+        // Null clears back to the PTY heuristic; another host's snapshot
+        // leaves these rows alone.
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated { uid: "self".into(),
+            entry: serde_json::json!({"agent_state": null}) });
+        assert!(app.agent_activity(&app.workspaces[0].sessions[0]).is_none());
+        app.apply_agent_state_snapshot(&crate::hosts::HostId::local(), &Default::default());
+        assert!(app.agent_activity(&app.workspaces[0].sessions[1]).is_some());
+        let _ = diff;
     }
 
     #[test]
@@ -3062,6 +3175,7 @@ mod apply_manifest_diff_tests {
         let diff = ManifestDiff::Exited {
             uid: "ts-t15".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: true,
                 kills_file_offset: Some(42),
@@ -3095,6 +3209,7 @@ mod apply_manifest_diff_tests {
         app.needs_redraw = false;
 
         let last_exit = LastExit {
+            killed_by: None,
             code: None,
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -3141,6 +3256,7 @@ mod apply_manifest_diff_tests {
         let diff = ManifestDiff::Exited {
             uid: "ts-t16-stranger".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(1),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3203,6 +3319,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-agent".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3229,6 +3346,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-user".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3261,6 +3379,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-wf".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3292,6 +3411,7 @@ mod apply_manifest_diff_tests {
             ManifestDiff::Exited {
                 uid: "ts-remote".into(),
                 last_exit: LastExit {
+                    killed_by: None,
                     code: None,
                     memory_cap_kill: false,
                     kills_file_offset: None,
@@ -3404,12 +3524,14 @@ mod apply_manifest_diff_tests {
             host,
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             listed_uids: listed.iter().map(|u| u.to_string()).collect(),
             session_last_exits: listed
                 .iter()
                 .map(|u| {
                     let le = exited.contains(u).then(|| LastExit {
+                        killed_by: None,
                         code: Some(0),
                         memory_cap_kill: false,
                         kills_file_offset: None,
@@ -3510,6 +3632,97 @@ mod apply_manifest_diff_tests {
         age_agent_row(&mut app, 0, 0, remote.clone());
         app.restart_suppressed_exit_uids.insert("ts-snap-ar".into());
         assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "A-R uid kept");
+
+        let mut app = build_app_with_session("ts-snap-revive-failed");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.note_revive_failure("ts-snap-revive-failed", "worktree missing");
+        assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "failed revive kept");
+    }
+
+    /// 2026-10-08: a forced A-R whose revive failed lost its row to the
+    /// next exit prune, and its error to a transient status line. The row
+    /// now stays, marked, with the error kept.
+    #[test]
+    fn a_failed_revive_keeps_its_row_marked_through_exit_prunes() {
+        let mut app = build_app_with_session("ts-revive-x");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.note_revive_failure("ts-revive-x", "worktree /w/x missing");
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-revive-x".into(),
+            last_exit: LastExit { code: Some(0), memory_cap_kill: false, kills_file_offset: None, exited_at: 1.0, killed_by: None },
+        });
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "row kept after the exit diff");
+        assert!(app.status_msg.as_ref().is_some_and(|(m, _)| m.contains("worktree /w/x missing")));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal.draw(|f| app.draw_session_list(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("revive failed") && text.contains('\u{2717}'), "{text}");
+    }
+
+    /// 2026-10-12: a worker the terminal-task sweep closed looked like a
+    /// crash. Its row, the A-i peek and the A-O picker now say why.
+    #[test]
+    fn a_swept_session_says_closed_task_done_on_row_peek_and_reopen_picker() {
+        let mut app = build_app_with_session("ts-swept");
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-swept".into(),
+            last_exit: LastExit {
+                code: None,
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+                killed_by: Some("terminal-task-sweep (terminal task)".into()),
+            },
+        });
+        app.workspaces[0].sessions[0].session.exited = true;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 8)).unwrap();
+        terminal.draw(|f| app.draw_session_list(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("closed: task done"), "{text}");
+
+        app.cursor = Cursor::Session(0, 0);
+        let peek = format!("{:?}", app.build_peek_lines());
+        assert!(peek.contains("closed: task done"), "{peek}");
+
+        // Closing the row keeps the reason on its tombstone for A-O.
+        app.tombstone_exited_and_remove(0, |_| true);
+        let entry = app.workspaces[0].tombstones[0].entry.as_ref().unwrap();
+        assert_eq!(super::model::exit_note(entry.last_exit.as_ref()), Some("closed: task done"));
+
+        // An operator kill is not relabelled.
+        let other = LastExit {
+            code: None,
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: 1.0,
+            killed_by: Some("operator".into()),
+        };
+        assert_eq!(super::model::exit_note(Some(&other)), None);
+    }
+
+    /// The shown session is reported once, then not again until the
+    /// interval passes or the selection changes.
+    #[test]
+    fn the_shown_session_is_reported_on_change_and_then_throttled() {
+        let mut app = build_app_with_session("ts-shown");
+        app.cursor = Cursor::Session(0, 0);
+        app.report_viewed_session();
+        let first = app.viewed_report.clone().expect("reported");
+        assert_eq!(first.0, "ts-shown");
+        app.report_viewed_session();
+        assert_eq!(app.viewed_report.as_ref().unwrap().1, first.1, "throttled");
+        app.workspaces[0].sessions[0].session.exited = true;
+        app.viewed_report = None;
+        app.report_viewed_session();
+        assert!(app.viewed_report.is_none(), "an exited row is not reported");
     }
 
     // ── kill-time close of adoption-minted `agent:` markers ──
@@ -3518,6 +3731,7 @@ mod apply_manifest_diff_tests {
         ManifestDiff::Exited {
             uid: uid.into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3679,6 +3893,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-cursor".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3705,6 +3920,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-capkill".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: true,
                 kills_file_offset: Some(9),
@@ -3733,6 +3949,7 @@ mod apply_manifest_diff_tests {
         let make = || ManifestDiff::Exited {
             uid: "ts-dup".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3767,6 +3984,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-drop".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3991,6 +4209,7 @@ mod apply_manifest_diff_tests {
             session_last_exits: Vec::new(),
             session_transcripts: vec![("ts-snap-resume".into(), "current".into())],
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
         };
@@ -4012,6 +4231,7 @@ mod apply_manifest_diff_tests {
         assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
 
         let last_exit = LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(7),
@@ -4022,6 +4242,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
@@ -4047,6 +4268,7 @@ mod apply_manifest_diff_tests {
     fn apply_snapshot_does_not_overwrite_existing_local_last_exit() {
         let mut app = build_app_with_session("ts-t23");
         let local_exit = LastExit {
+            killed_by: None,
             code: Some(0),
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -4056,6 +4278,7 @@ mod apply_manifest_diff_tests {
         app.needs_redraw = false;
 
         let snapshot_exit = LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(99),
@@ -4066,6 +4289,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
@@ -4123,6 +4347,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-t24".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(1),
@@ -4165,6 +4390,7 @@ mod apply_manifest_diff_tests {
             let diff = ManifestDiff::Exited {
                 uid: "ts-t25".into(),
                 last_exit: LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(2),
@@ -4199,6 +4425,7 @@ mod apply_manifest_diff_tests {
         let make_diff = || ManifestDiff::Exited {
             uid: "ts-t26".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(3),
@@ -4227,11 +4454,13 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t27".into(),
                 Some(LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(4),
@@ -4257,6 +4486,7 @@ mod apply_manifest_diff_tests {
         // previous TUI session's manifest write.
         app.workspaces[0].sessions[0].preserved_last_exit =
             Some(LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(5),
@@ -4269,11 +4499,13 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t28".into(),
                 Some(LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(5),
@@ -4315,6 +4547,7 @@ mod apply_manifest_diff_tests {
         app_detached.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-t29d".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(7),
@@ -4639,6 +4872,38 @@ mod mouse_forwarding_tests {
                 .is_some(),
             "bare motion forwards under any-motion tracking"
         );
+    }
+
+    #[test]
+    fn alt_screen_wheel_translates_for_non_mouse_apps() {
+        let alt = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        // Codex (alt screen, no mouse reporting): PageUp/PageDown, which
+        // scroll its transcript; arrows would recall composer history.
+        assert_eq!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt, true).unwrap(), b"\x1b[5~");
+        assert_eq!(alt_screen_wheel_bytes(MouseEventKind::ScrollDown, alt, true).unwrap(), b"\x1b[6~");
+        // Other apps: alternate-scroll arrows, three per notch, DECCKM-aware.
+        assert_eq!(
+            alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt, false).unwrap(),
+            b"\x1b[A\x1b[A\x1b[A"
+        );
+        assert_eq!(
+            alt_screen_wheel_bytes(MouseEventKind::ScrollDown, alt | TermMode::APP_CURSOR, false)
+                .unwrap(),
+            b"\x1bOB\x1bOB\x1bOB"
+        );
+        // ?1007l turns the arrow translation off for non-Codex apps.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, TermMode::ALT_SCREEN, false).is_none());
+    }
+
+    #[test]
+    fn alt_screen_wheel_leaves_primary_screen_and_mouse_apps_alone() {
+        let alt = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        // Primary screen (inline Codex, shells): CM scrolls its own scrollback.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, TermMode::ALTERNATE_SCROLL, true).is_none());
+        // Mouse-reporting apps get real SGR reports via encode_mouse_for_pty.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt | TermMode::MOUSE_REPORT_CLICK, true).is_none());
+        // Non-wheel events are never translated.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::Moved, alt, true).is_none());
     }
 }
 

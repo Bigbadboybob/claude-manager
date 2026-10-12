@@ -52,6 +52,73 @@ def git(path: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def git_dirs(path: Path) -> tuple[Path, Path] | None:
+    """(admin git dir, common dir) read from `.git` without spawning Git.
+
+    A cleanup preview inspects every checkout on the host; at ~20 ms per Git
+    process on a loaded host, seven processes per checkout made previews take
+    40 s (2026-10-07, 226 checkouts). Returns None for anything unusual
+    (symlinks, missing files, an unexpected `.git` form) so callers fall back
+    to asking Git.
+    """
+    dotgit = path / '.git'
+    try:
+        if dotgit.is_symlink():
+            return None
+        if dotgit.is_dir():
+            admin = dotgit.resolve()
+            return admin, admin
+        link = dotgit.read_text().strip()
+        if not link.startswith('gitdir: '):
+            return None
+        admin = (path / link[8:]).resolve()
+        common = (admin / (admin / 'commondir').read_text().strip()).resolve()
+    except (OSError, ValueError):
+        return None
+    if not (admin / 'HEAD').is_file() or not (common / 'config').is_file():
+        return None
+    return admin, common
+
+
+def common_dir(path: Path) -> str:
+    """`git rev-parse --path-format=absolute --git-common-dir`, resolved."""
+    dirs = git_dirs(path)
+    if dirs is not None:
+        return str(dirs[1])
+    return str(Path(git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve())
+
+
+def current_branch(path: Path) -> str:
+    """`git branch --show-current`: the branch name, '' when detached."""
+    dirs = git_dirs(path)
+    if dirs is not None:
+        try:
+            head = (dirs[0] / 'HEAD').read_text().strip()
+        except OSError:
+            head = None
+        if head is not None:
+            if head.startswith('ref: refs/heads/'):
+                return head[len('ref: refs/heads/'):]
+            if not head.startswith('ref:'):
+                return ''  # detached: HEAD holds an object id
+    return git(path, 'branch', '--show-current')
+
+
+_ORIGIN_CACHE: dict[str, str | None] = {}
+
+
+def origin_url(path: Path) -> str | None:
+    """`git remote get-url origin` (None when there is no origin), cached per
+    repository: every checkout of one repository shares its config."""
+    key = common_dir(path)
+    if key not in _ORIGIN_CACHE:
+        try:
+            _ORIGIN_CACHE[key] = git(path, 'remote', 'get-url', 'origin')
+        except subprocess.SubprocessError:
+            _ORIGIN_CACHE[key] = None
+    return _ORIGIN_CACHE[key]
+
+
 def checkout(path: Path, *, create: bool = True) -> dict:
     """A UUID in Git's per-worktree admin dir detects deletion + path reuse."""
     if path.is_symlink():

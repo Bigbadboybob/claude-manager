@@ -31,7 +31,7 @@ impl Store {
             by_id.entry(*id).or_default().push(index);
         }
         let targets = |id: &Value| id.as_str().and_then(|id| by_id.get(id)).cloned().unwrap_or_default();
-        for published in self.events.iter().filter(|e| e.position <= high) {
+        for published in self.read_model.metadata.iter().map(|i| &self.events[*i]).filter(|e| e.position <= high) {
             let e = &published.event;
             let mut seen = BTreeSet::new();
             for created in e["data"]["channels"].as_array().into_iter().flatten() {
@@ -359,9 +359,8 @@ impl Store {
     pub(super) fn pin_states(&self, high: u64) -> BTreeMap<String, Value> {
         let mut pins = BTreeMap::new();
         for p in self
-            .events
-            .iter()
-            .filter(|p| p.position <= high && p.event["type"] == "conversation.pin")
+            .read_model.pins.iter().map(|i| &self.events[*i])
+            .filter(|p| p.position <= high)
         {
             let e = &p.event;
             let id = strv(&e["data"], "target_id");
@@ -377,9 +376,7 @@ impl Store {
         pins
     }
     pub(super) fn pins_revision(&self, cid: &str, high: u64) -> String {
-        self.events
-            .iter()
-            .rev()
+        self.read_model.pins.iter().rev().map(|i| &self.events[*i])
             .find(|e| {
                 e.position <= high
                     && e.event["conversation_id"] == cid

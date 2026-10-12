@@ -15,10 +15,12 @@ pub fn default_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".cm")
 }
+/// Project an already-open store. Startup owns opening/retrying in the
+/// background; no RPC or maintenance caller may rebuild the store here.
 pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
-    let (handle, root) = {
+    let handle = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        (s.messaging.clone(), s.messaging_root.clone())
+        s.messaging.clone()
     };
     let delivery_gate = state
         .lock()
@@ -26,11 +28,9 @@ pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
         .messaging_delivery
         .clone();
     let _delivery_guard = delivery_gate.lock().unwrap_or_else(|p| p.into_inner());
-    let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_none() {
-        *slot = Some(Store::open(&root)?);
-    }
-    project_names(state, slot.as_ref().unwrap(), false);
+    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let store = slot.as_ref().ok_or_else(super::startup::starting)?;
+    project_names(state, store, false);
     Ok(())
 }
 pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bool) {
@@ -67,7 +67,7 @@ pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bo
             s.manifest_watcher.broadcast(crate::manifest::ManifestDiff::Updated{uid:n.session_uid.clone(),entry:json!({"uid":n.session_uid,"label":n.name,"name_revision":n.revision,"messaging_daemon_id":store.daemon_id})});
         }
     }
-    if any_changed && persist {
+    if any_changed && (persist || s.messaging_registry_restored) {
         s.persist_sessions_best_effort();
     }
 }
@@ -171,6 +171,12 @@ fn repair_legacy_binding(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Result<(
 }
 
 fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, ChatError> {
+    // A readiness check must not take the delivery gate: plain sends are
+    // deliberately allowed while another thread is publishing a wake.
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    if handle.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+        return Err(super::startup::starting());
+    }
     if req.method == "messaging.sync" {
         return execute_sync_admin(state, req);
     }
@@ -346,7 +352,7 @@ fn execute_with_freshness(
     // Full-message reads advance the wake batch boundary. Serialize their
     // snapshot with publication; native adapter I/O runs outside this gate.
     let coordinates_delivery = kind != "owner"
-        && (req.method == "messaging.read"
+        && (matches!(req.method.as_str(), "messaging.read" | "messaging.mark_read" | "messaging.react")
             || req.method == "messaging.follow"
                 && matches!(req.params["action"].as_str(), Some("set" | "remove"))
             || req.method == "messaging.monitors"
@@ -366,10 +372,7 @@ fn execute_with_freshness(
     let _delivery_guard =
         coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_none() {
-        *slot = Some(Store::open(&root)?);
-    }
-    let store = slot.as_mut().unwrap();
+    let store = slot.as_mut().ok_or_else(super::startup::starting)?;
     let actor = if kind == "owner" {
         "owner".into()
     } else {
@@ -418,6 +421,17 @@ fn execute_with_freshness(
             code: "unauthorized".into(),
             message: "This messaging host is not enrolled to serve Owner".into(),
         });
+    }
+    if req.method == "messaging.counts" { return store.counts(&actor); }
+    if req.method == "messaging.attention" {
+        return store.attention(&actor,false).map(|attention|json!({"attention":attention}));
+    }
+    if req.method == "messaging.mark_read" {
+        let result = store.mark_read(&actor,p,&people);
+        if result.is_ok() && kind != "owner" {
+            super::delivery::reconcile_session(&root,store,&uid).map_err(|e|ChatError {code:"outcome_unknown".into(),message:format!("Cursor saved; wake reconciliation needs retry: {e}")})?;
+        }
+        return result;
     }
     store.enroll_participants(&people)?;
     if store.sync_enabled() && store.is_coordinator() {
@@ -497,12 +511,17 @@ fn execute_with_freshness(
             drop(slot);
             drop(_delivery_guard);
             if forward {
+                let submitted_at = chrono::Utc::now();
                 let mut result = sync.request(&actor, &req.method, &forwarded)?;
                 let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
                 let store = slot.as_mut().unwrap();
                 if req.method == "messaging.send" {
                     result["coordinator_position"] = result["position"].clone();
                     result["position"] = submission_position;
+                    annotate_forward_delay(&mut result, submitted_at);
+                }
+                if let Some(o) = result.as_object_mut() {
+                    o.remove("_marked_ids");
                 }
                 if let Some(snapshot) = result.get("owner_snapshot").cloned() {
                     store.apply_owner_snapshot(&snapshot)?;
@@ -510,6 +529,7 @@ fn execute_with_freshness(
                 project_names(state, store, true);
                 result = store.context_response(&actor, p, result, false);
                 store.decorate_sync_response(p, &mut result);
+                annotate_outbox(store, &actor, &mut result);
                 annotate_backfill(Some(&sync), store, p, &mut result);
                 return Ok(result);
             }
@@ -523,6 +543,7 @@ fn execute_with_freshness(
         }
     }
     let result = match req.method.as_str() {
+        "messaging.react" => store.react(&actor,p),
         "messaging.send" => {
             if kind != "owner" && !store.names.contains_key(&actor) {
                 repair_legacy_binding(state, &uid)?;
@@ -559,6 +580,7 @@ fn execute_with_freshness(
         "messaging.monitor" => store.register_monitor(&actor, p, &people),
         "messaging.monitors" => store.monitors(&actor, p),
         "messaging.follow" => store.follow(&actor, p, &people),
+        "messaging.availability" => store.availability(&actor, p),
         "messaging.people" => {
             let mut value = store.people(&people);
             if let Some(items) = value.as_array_mut() {
@@ -581,11 +603,12 @@ fn execute_with_freshness(
             {
                 query["channel"] = json!("general");
             }
+            query["mark_read"] = json!(false);
             query["limit"] = json!(10);
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":super::tasks::orientation(store,&graph,&uid),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":super::tasks::orientation(store,&graph,&uid),"owner_availability":crate::owner_availability::exposure_at(&store.owner_availability, chrono::Utc::now()),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins","react","mark_read","counts"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add","read_cursors","reactions"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
@@ -609,6 +632,19 @@ fn execute_with_freshness(
     };
     project_names(state, store, true);
     let mut retraction_note = None;
+    // A bulk mark settles pending wakes for every message it marked, exactly
+    // like supplying those messages in a page would.
+    let mut result = result.map(|mut value| {
+        if let Some(ids) = value.as_object_mut().and_then(|o| o.remove("_marked_ids")) {
+            value["items"] = json!(ids
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|id| json!({"id":id}))
+                .collect::<Vec<_>>());
+        }
+        value
+    });
     if kind != "owner" && req.method == "messaging.read" {
         if let Ok(value) = &result {
             if let Err(error) = super::delivery::read_boundary(store, &uid, value) {
@@ -616,6 +652,14 @@ fn execute_with_freshness(
                 retraction_note = Some("Messages supplied, but the notification boundary could not be saved; retry the read.".into());
             }
         }
+    }
+    if p.get("mark_read_before").is_some_and(|v| !v.is_null()) {
+        result = result.map(|mut value| {
+            if let Some(o) = value.as_object_mut() {
+                o.remove("items");
+            }
+            value
+        });
     }
     if coordinates_delivery {
         if let Err(error) = super::delivery::reconcile_session(&root, store, &uid) {
@@ -636,9 +680,15 @@ fn execute_with_freshness(
                 .map(|s| s["monitor_status"].clone())
                 .unwrap_or(json!({"state":"uncached","execution_host":store.coordinator_id()}))
         } else {
+            // Read receipts lower the outstanding count; make sure they are
+            // loaded even for methods that never touched them.
+            if let Err(error) = store.load_reads(&actor) {
+                eprintln!("cm messaging: load read receipts: {error}");
+            }
             store.monitor_status(&actor)
         };
         store.decorate_sync_response(p, &mut value);
+        annotate_outbox(store, &actor, &mut value);
         annotate_backfill(sync.as_ref(), store, p, &mut value);
         if req.method == "messaging.read" {
             super::delivery::annotate_conversations(store, &mut value);
@@ -657,6 +707,39 @@ fn execute_with_freshness(
         }
         value
     })
+}
+
+/// A send executed on the hub is stamped with the hub's `created_at`. Tell the
+/// sender when it submitted and, when the hub stamped it more than a minute
+/// later (a stalled link), by how much: `created_at` stays authoritative.
+fn annotate_forward_delay(result: &mut Value, submitted_at: chrono::DateTime<chrono::Utc>) {
+    if !result.is_object() {
+        return;
+    }
+    result["submitted_at"] = json!(submitted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let created = result["created_at"]
+        .as_str()
+        .or_else(|| result["event"]["created_at"].as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    if let Some(created) = created {
+        let delay = (created.with_timezone(&chrono::Utc) - submitted_at).num_seconds();
+        if delay > 60 {
+            result["delay_s"] = json!(delay);
+            result["delay_note"] = json!(format!("The hub stamped this message {delay}s after you submitted it; its created_at is the authoritative send time"));
+        }
+    }
+}
+
+/// Own messages still waiting for the hub (`pending_sync`), on every messaging
+/// response, so a stalled link is visible to the sender rather than silent.
+/// Only scanned when the replica reports anything pending at all.
+fn annotate_outbox(store: &Store, actor: &str, value: &mut Value) {
+    if !value.is_object() || value["sync"]["pending"].as_u64().unwrap_or(0) == 0 {
+        return;
+    }
+    if let Some(outbox) = store.outbox_status(actor) {
+        value["outbox"] = outbox;
+    }
 }
 
 /// Report a conversation whose history is still arriving from the hub, so a
@@ -703,7 +786,27 @@ fn annotate_backfill(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwarded_send_reports_submission_time_and_hub_delay() {
+        let submitted = chrono::DateTime::parse_from_rfc3339("2026-10-06T15:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut prompt = json!({"created_at":"2026-10-06T15:00:02.000Z"});
+        annotate_forward_delay(&mut prompt, submitted);
+        assert_eq!(prompt["submitted_at"], "2026-10-06T15:00:00.000Z");
+        assert!(prompt.get("delay_s").is_none());
+        // Older hubs only carry created_at inside the event.
+        let mut stalled = json!({"event":{"created_at":"2026-10-06T15:40:00.000Z"}});
+        annotate_forward_delay(&mut stalled, submitted);
+        assert_eq!(stalled["delay_s"], 2400);
+        assert!(stalled["delay_note"].as_str().unwrap().contains("authoritative"));
+    }
     fn setup(root: &std::path::Path) -> Arc<Mutex<DaemonState>> {
+        let state = uninitialized(root);
+        super::super::startup::open_for_test(&state).unwrap();
+        state
+    }
+    fn uninitialized(root: &std::path::Path) -> Arc<Mutex<DaemonState>> {
         let mut state = DaemonState::default();
         state.messaging_root = root.into();
         for uid in ["a", "b", "outsider"] {
@@ -733,6 +836,25 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn cursor_and_reaction_rpcs_use_the_authenticated_reader_and_return_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        call(&state,"b","send",json!({"channel":"general","body":"Here","name":"Bravo","request_id":"claim"})).unwrap();
+        let actor=call(&state,"b","open",json!({"channel":"general"})).unwrap()["actor_id"].clone();
+        let sent=call(&state,"a","send",json!({"channel":"general","body":"Review","name":"Alpha","request_id":"review","mentions":[actor]})).unwrap();
+        assert_eq!(call(&state,"b","counts",json!({})).unwrap()["mentions"],1);
+        let preview=call(&state,"b","read",json!({"channel":"general","mark_read":false})).unwrap();
+        assert!(preview["items"].as_array().unwrap().iter().any(|v|v["id"]==sent["event_id"] && v["read"]==false));
+        let reaction=call(&state,"b","react",json!({"message_id":sent["event_id"],"emoji":"✅","request_id":"ack"})).unwrap();
+        assert_eq!(reaction["reactions"]["✅"]["mine"],true);
+        assert_eq!(reaction["counts"]["mentions"],0);
+        let marked=call(&state,"b","mark_read",json!({"channel":"general"})).unwrap();
+        assert_eq!(marked["changed"],false);
+        assert_eq!(marked["read_cursor"]["event_id"],sent["event_id"]);
+        assert!(call(&state,"b","counts",json!({"from":"owner"})).is_err());
+    }
+
     #[test]
     fn messaging_full_read_covers_unscanned_watch_but_preview_and_invalid_read_do_not() {
         let root = tempfile::tempdir().unwrap();
@@ -801,6 +923,49 @@ mod tests {
                 .len(),
             1
         );
+    }
+    #[test]
+    fn mark_read_before_clears_backlog_monitor_count_and_pending_wakes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        let b_id = call(&state, "b", "open", json!({})).unwrap()["actor_id"].clone();
+        call(&state, "b", "send", json!({"channel":"general","name":"Reader","body":"here","request_id":"hello"})).unwrap();
+        call(&state, "b", "monitor", json!({"scope":{"dms":true},"mode":"continuous","request_id":"dm-watch"})).unwrap();
+        let mut times = vec![];
+        for (i, name) in [(1, Some("Publisher")), (2, None), (3, None)] {
+            let mut q = json!({"dm":b_id,"body":format!("update {i}"),"request_id":format!("dm-{i}")});
+            if let Some(n) = name {
+                q["name"] = json!(n);
+            }
+            times.push(call(&state, "a", "send", q).unwrap()["created_at"].as_str().unwrap().to_owned());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = call(&state, "b", "monitors", json!({})).unwrap();
+        assert_eq!(before["monitor_status"]["unacknowledged"], 3);
+        // Everything created before the third message is marked in one call.
+        let marked = call(&state, "b", "read", json!({"inbox":true,"mark_read_before":times[2]})).unwrap();
+        assert_eq!(marked["marked"], 2);
+        assert_eq!(marked["monitors_advanced"], 1);
+        assert!(marked["items"].is_null() && marked.get("_marked_ids").is_none());
+        assert_eq!(marked["monitor_status"]["unacknowledged"], 1);
+        let rest = call(&state, "b", "read", json!({"inbox":true,"unread_only":true})).unwrap();
+        assert_eq!(rest["items"].as_array().unwrap().len(), 1);
+        assert_eq!(rest["items"][0]["body"], "update 3");
+        // Pending wakes for the marked messages were settled like a read.
+        use sha2::Digest;
+        let uid_hash = format!("{:x}", sha2::Sha256::digest(b"b"));
+        let ledger = root.path().join("messages/main/_delivery").join(format!("{uid_hash}.json"));
+        let q: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        let checked: usize = q["batches"].as_array().unwrap().iter()
+            .map(|b| b["checked"].as_array().unwrap().len()).sum();
+        assert!(checked >= 2, "{q}");
+        // Acknowledging the last page lowers the watch count too: reading is
+        // enough, no separate monitor receipt needed.
+        let after = call(&state, "b", "read", json!({"inbox":true,"unread_only":true,"ack_receipt":rest["receipt"]})).unwrap();
+        assert!(after["items"].as_array().unwrap().is_empty());
+        assert_eq!(after["monitor_status"]["unacknowledged"], 0);
+        // Only inbox/dms reads accept the bulk mark.
+        assert_eq!(call(&state, "b", "read", json!({"channel":"general","mark_read_before":times[2]})).unwrap_err().code, "invalid_target");
     }
     #[test]
     fn messaging_channel_norms_authentication_and_scoped_context_through_rpc() {
@@ -1115,12 +1280,12 @@ mod tests {
         )
         .unwrap();
         drop(state);
-        let state = setup(tmp.path());
+        let state = uninitialized(tmp.path());
         let manifest = tmp.path().join("daemon-sessions.json");
         let original = b"headless registry must survive initialization";
         std::fs::write(&manifest, original).unwrap();
         state.lock().unwrap().daemon_sessions_path = Some(manifest.clone());
-        initialize(&state).unwrap();
+        super::super::startup::open_for_test(&state).unwrap();
         assert_eq!(std::fs::read(&manifest).unwrap(), original);
         assert_eq!(state.lock().unwrap().messaging_names["a"].name, "Scout");
         let stale = tmp.path().join("stale-tui.json");
@@ -1135,5 +1300,27 @@ mod tests {
         assert_eq!(entry.label, "Scout");
         assert_eq!(entry.workflow_role.as_deref(), Some("worker"));
         assert_eq!(entry.task_id.as_deref(), Some("task-a"));
+    }
+
+    #[test]
+    fn messaging_late_name_recovery_persists_after_registry_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        call(&state, "a", "send", json!({
+            "channel":"general", "name":"Restored-Scout", "body":"Ready", "request_id":"name",
+        })).unwrap();
+        drop(state);
+        let state = uninitialized(tmp.path());
+        let manifest = tmp.path().join("daemon-sessions.json");
+        {
+            let mut s = state.lock().unwrap();
+            s.daemon_sessions_path = Some(manifest.clone());
+            s.messaging_registry_restored = true;
+        }
+        super::super::startup::open_for_test(&state).unwrap();
+        assert!(manifest.exists(), "late name recovery must persist the restored registry");
+        assert_eq!(state.lock().unwrap().messaging_names["a"].name, "Restored-Scout");
+        let saved: Value = serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+        assert_eq!(saved["messaging_names"]["a"]["name"], "Restored-Scout");
     }
 }

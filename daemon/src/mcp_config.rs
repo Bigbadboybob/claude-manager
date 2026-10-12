@@ -40,11 +40,35 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
+
+/// Whether CM launches Codex in inline mode (`--no-alt-screen`). Codex's
+/// default alternate screen has no scrollback, so CM's mouse wheel and
+/// Shift+PageUp (which move CM's own terminal scrollback) had nothing to
+/// scroll. Inline mode inserts history above the viewport, where it reaches
+/// the scrollback. Process-wide: the daemon sets it from `daemon.toml`'s
+/// `codex_inline_scrollback` (startup + reload_config), the TUI from
+/// `~/.cm/tui-settings.toml`. Applies to the next spawn/resume only.
+static CODEX_INLINE_SCROLLBACK: AtomicBool = AtomicBool::new(true);
+
+pub fn set_codex_inline_scrollback(on: bool) {
+    CODEX_INLINE_SCROLLBACK.store(on, Ordering::Relaxed);
+}
+
+pub fn codex_inline_scrollback() -> bool {
+    CODEX_INLINE_SCROLLBACK.load(Ordering::Relaxed)
+}
+
+/// Screen-mode flags for a CM Codex argv. Both argv composers (this
+/// module's `build_args` and the TUI's `codex_args`) call this, fresh and
+/// resume alike; `native_codex.py::split_args` forwards it to the frontend.
+pub fn codex_screen_args(inline: bool) -> Vec<String> {
+    if inline { vec!["--no-alt-screen".into()] } else { Vec::new() }
+}
 
 /// Per-session MCP config dir. `~/.cm/mcp/<session_uid>/`.
 fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
@@ -352,9 +376,9 @@ pub fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf
 }
 
 /// Build the inline-JSON value for a claude-code spawn's `--settings`
-/// flag, injecting the cm Stop hook (`mcp_server/hooks/cm_stop_hook.py`
+/// flag, injecting cm state hooks plus the synchronous Stop hook (`mcp_server/hooks/cm_stop_hook.py`
 /// beside the resolved server.py). The hook (a) reports turn-ends to
-/// the daemon (`session.turn_ended` → `semantic_idle`) and (b) drains
+/// the daemon (`session.agent_report`, legacy `session.turn_ended`) and (b) drains
 /// the session's monitor inbox at turn boundaries via Stop-hook
 /// block+reason. Returns `None` (spawn proceeds hook-less) when the
 /// script isn't present at the resolved location — e.g. a deployment
@@ -372,29 +396,43 @@ pub fn claude_settings_hook_arg(server_path_override: Option<&str>) -> Option<St
     // config: the `--settings` argv is frozen for the life of the
     // claude process, so a baked interpreter path here goes stale the
     // same way — route through the launcher, direct pair as fallback.
-    let command = match ensure_launcher(&server) {
-        Ok(launcher) => format!(
-            "'{}' 'hooks/cm_stop_hook.py'",
-            launcher.to_string_lossy()
+    let launcher = ensure_launcher(&server).ok();
+    let hook_command = |filename: &str| match &launcher {
+        Some(launcher) => format!(
+            "'{}' 'hooks/{}'",
+            sh_squote(&launcher.to_string_lossy()),
+            filename
         ),
-        Err(_) => format!(
+        None => format!(
             "'{}' '{}'",
-            resolve_python_interpreter(&server),
-            hook.to_string_lossy()
+            sh_squote(&resolve_python_interpreter(&server)),
+            sh_squote(
+                &server
+                    .parent()
+                    .unwrap()
+                    .join("hooks")
+                    .join(filename)
+                    .to_string_lossy()
+            )
         ),
     };
-    Some(
-        serde_json::json!({
-            "hooks": {
-                "Stop": [
-                    {"hooks": [
-                        {"type": "command", "command": command, "timeout": 15}
-                    ]}
-                ]
-            }
-        })
-        .to_string(),
-    )
+    let mut hooks = serde_json::json!({
+        "Stop": [{"hooks": [{"type": "command", "command": hook_command("cm_stop_hook.py"), "timeout": 15}]}]
+    });
+    if server.parent()?.join("hooks/cm_state_hook.py").is_file() {
+        // async is supported in Claude 2.1.291's command-hook settings.
+        // The script also double-forks so older runners cannot block on IPC.
+        for event in [
+            "UserPromptSubmit",
+            "StopFailure",
+            "PermissionRequest",
+            "Notification",
+        ] {
+            hooks[event] = serde_json::json!([{"hooks": [{"type": "command",
+                "command": hook_command("cm_state_hook.py"), "timeout": 5, "async": true}]}]);
+        }
+    }
+    Some(serde_json::json!({"hooks": hooks}).to_string())
 }
 
 /// Resolve the Python interpreter that runs `server.py`, in priority order:
@@ -728,6 +766,45 @@ pub fn build_args(
     server_path_override: Option<&str>,
     resume_session_id: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>, Option<String>)> {
+    let launch = match resume_session_id {
+        Some(id) => Launch::Resume(id),
+        None => Launch::Fresh,
+    };
+    build_launch_args(session_type, session_uid, workflow, server_path_override, launch)
+}
+
+/// How an agent conversation starts: fresh, continuing a transcript in
+/// place, or as an engine-native FORK of one (a new conversation whose
+/// history is copied from the source by the engine itself — the source
+/// is never touched and CM keeps no copy of its own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch<'a> {
+    Fresh,
+    Resume(&'a str),
+    Fork(&'a str),
+}
+
+/// [`build_args`] with an explicit [`Launch`]. Forks:
+///
+/// - claude: `--resume <src> --fork-session --session-id <pin>`. The CLI
+///   accepts `--session-id` alongside `--resume` only with
+///   `--fork-session`, so the fork's transcript id is a daemon-minted pin
+///   (returned like a fresh spawn's) and the binding is exact from birth.
+///   Works across directories: the fork lands in the new cwd's project dir.
+/// - codex: the `fork` subcommand, shaped exactly like `resume` (SESSION_ID
+///   last, no permission flag); codex mints a new thread + rollout, which
+///   the detector / native relay bind.
+pub fn build_launch_args(
+    session_type: &str,
+    session_uid: &str,
+    workflow: Option<&WorkflowMeta>,
+    server_path_override: Option<&str>,
+    launch: Launch<'_>,
+) -> std::io::Result<(String, Vec<String>, Option<String>)> {
+    let resume_session_id = match launch {
+        Launch::Resume(id) => Some(id),
+        _ => None,
+    };
     match session_type {
         "claude-code" => {
             let cfg = write_claude_mcp_config(session_uid, workflow, server_path_override)?;
@@ -753,13 +830,22 @@ pub fn build_args(
             // Fresh spawns instead get a daemon-minted `--session-id` pin
             // (hyphenated: the CLI requires "a valid UUID"); never both
             // flags — a resume's identity IS the resumed id.
-            let pinned = match resume_session_id {
-                Some(sid) => {
+            let pinned = match launch {
+                Launch::Resume(sid) => {
                     args.push("--resume".to_string());
                     args.push(sid.to_string());
                     None
                 }
-                None => {
+                Launch::Fork(src) => {
+                    let pin = uuid::Uuid::new_v4().to_string();
+                    args.push("--resume".to_string());
+                    args.push(src.to_string());
+                    args.push("--fork-session".to_string());
+                    args.push("--session-id".to_string());
+                    args.push(pin.clone());
+                    Some(pin)
+                }
+                Launch::Fresh => {
                     let pin = uuid::Uuid::new_v4().to_string();
                     args.push("--session-id".to_string());
                     args.push(pin.clone());
@@ -778,12 +864,17 @@ pub fn build_args(
             // to rebind `transcript_path`.
             if resume_session_id.is_some() {
                 args.push("resume".into());
+            } else if matches!(launch, Launch::Fork(_)) {
+                // Same frontend shape as `resume`: a remote fork inherits
+                // the source thread's policy (or the host policy file).
+                args.push("fork".into());
             } else {
                 // The native launcher always uses Codex's remote frontend,
                 // including on a local CM host. Remote resumes reject CLI
                 // permission overrides and inherit the saved task's policy.
                 args.push("--dangerously-bypass-approvals-and-sandbox".into());
             }
+            args.extend(codex_screen_args(codex_inline_scrollback()));
             // Same update-check disable the TUI applies — prevents
             // codex's popup from tearing down the PTY.
             args.push("-c".into());
@@ -795,7 +886,7 @@ pub fn build_args(
             args.push("-c".into());
             args.push("project_doc_max_bytes=262144".into());
             args.extend(codex_overrides(session_uid, workflow, server_path_override));
-            if let Some(sid) = resume_session_id {
+            if let Launch::Resume(sid) | Launch::Fork(sid) = launch {
                 args.push(sid.to_string());
             }
             // No pin for codex: `--session-id` is a claude flag; codex
@@ -1136,6 +1227,18 @@ mod tests {
             entry["timeout"].as_u64().is_some(),
             "hook must carry an explicit timeout"
         );
+        assert!(parsed["hooks"].get("UserPromptSubmit").is_none(), "partial old payload keeps Stop only");
+        std::fs::write(srv_dir.join("hooks/cm_state_hook.py"), "").unwrap();
+        let new_arg = claude_settings_hook_arg(Some(server.to_str().unwrap())).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&new_arg).unwrap();
+        assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["timeout"], 15);
+        assert!(settings["hooks"]["Stop"][0]["hooks"][0].get("async").is_none());
+        for event in ["UserPromptSubmit", "StopFailure", "PermissionRequest", "Notification"] {
+            let hook = &settings["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["async"], true);
+            assert_eq!(hook["timeout"], 5);
+            assert!(hook["command"].as_str().unwrap().contains("hooks/cm_state_hook.py"));
+        }
     }
 
     #[test]
@@ -1778,6 +1881,83 @@ mod tests {
             args,
         );
         assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    // ---- fork-into-a-task: engine-native fork argv ------------------
+
+    #[test]
+    fn build_launch_args_claude_fork_resumes_source_with_fork_and_new_pin() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args, pin) = build_launch_args(
+            "claude-code", "ts-fork-1", None, None, Launch::Fork("src-sid"),
+        )
+        .expect("ok");
+        assert_eq!(prog, "claude");
+        let pin = pin.expect("a claude fork pins its NEW conversation id");
+        assert_ne!(pin, "src-sid", "the fork's identity must not be the source's");
+        assert_eq!(pin.len(), 36, "hyphenated uuid, got {:?}", pin);
+        let at = args.iter().position(|a| a == "--resume").expect("--resume present");
+        assert_eq!(
+            &args[at..at + 5],
+            &["--resume", "src-sid", "--fork-session", "--session-id", pin.as_str()],
+            "claude fork argv: {:?}",
+            args,
+        );
+        // MCP injection + hooks ride along exactly like a fresh spawn.
+        assert!(args.iter().any(|a| a == "--mcp-config"));
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn build_launch_args_codex_fork_uses_fork_subcommand_and_trailing_source() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args, pin) = build_launch_args(
+            "codex", "ts-fork-2", None, None, Launch::Fork("src-thread"),
+        )
+        .expect("ok");
+        assert!(prog.ends_with("launcher.sh"));
+        assert!(pin.is_none(), "codex fork identity is bound post-spawn");
+        let dash = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dash + 1], "fork", "fork is the first engine argument: {:?}", args);
+        assert_eq!(args.last().map(String::as_str), Some("src-thread"));
+        assert!(!args.iter().any(|a| a == "resume"));
+        assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(args.iter().any(|a| a.contains("ts-fork-2")), "MCP env carries the NEW uid");
+    }
+
+    #[test]
+    fn build_args_matches_launch_variants() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (_, resumed, _) = build_args("codex", "ts-v-1", None, None, Some("x")).unwrap();
+        let (_, launched, _) =
+            build_launch_args("codex", "ts-v-1", None, None, Launch::Resume("x")).unwrap();
+        assert_eq!(resumed, launched);
+    }
+
+    #[test]
+    fn build_args_codex_launches_inline_for_scrollback_fresh_and_resume() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        for resume in [None, Some("sid-inline")] {
+            let (_p, args, _pin) = build_args("codex", "ts-inl-1", None, None, resume).expect("ok");
+            let engine = &args[args.iter().position(|a| a == "--").unwrap() + 1..];
+            let flag = engine.iter().position(|a| a == "--no-alt-screen");
+            assert!(flag.is_some(), "codex must launch inline (scrollback): {:?}", engine);
+            if let Some(sid) = resume {
+                assert_eq!(engine.last().map(String::as_str), Some(sid));
+                assert!(flag.unwrap() < engine.len() - 1, "flag precedes the resume id");
+            }
+        }
+        // The off switch (daemon.toml codex_inline_scrollback = false).
+        assert!(codex_screen_args(false).is_empty());
+        assert_eq!(codex_screen_args(true), vec!["--no-alt-screen".to_string()]);
     }
 
     #[test]

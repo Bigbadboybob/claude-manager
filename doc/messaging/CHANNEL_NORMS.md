@@ -36,8 +36,12 @@ Use the returned scope key in `since={scope_key: revision}` or the optional
 
 `chat_open`, and the first messaging response after a selected channel's norms
 change, supply `channel_norms` alongside global `norms` when the response budget
-allows. Otherwise they provide a scoped read hint. `context_status.current`,
-`acknowledged`, and `stale_scopes` describe applicable revisions. Read all pages
+allows. Otherwise they provide a scoped read hint. For agents, `context_status`
+appears only on responses that supply a document or pointer (or on `chat_open`,
+a norms request, a `norms_seen` acknowledgement, or an error); Owner's viewer
+receives it on every response. `context_status.current`, `acknowledged`,
+`stale_scopes` (also `unacknowledged_scopes`) describe applicable revisions, and
+`ack_with` gives the exact `norms_seen` map to pass on the next send. Read all pages
 before acknowledging; page tokens and acknowledgements are scoped to a reader
 and document. Missing or stale context never rejects a message. Norm changes do
 not send an automatic wake and do not affect unrelated MCP tools.

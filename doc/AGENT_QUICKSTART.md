@@ -113,14 +113,15 @@ chat_send(channel="schema/parser", reply_to="<message-id>",
           request_id="<new-unique-request-id>")
 ```
 
-`reply_to` uses a message's `id` / send response's `event_id`; keep the same conversation. `mentions` directs attention subject to the recipient's settings. Typing a name or `@here` in the body alone is not a structured mention. Use `mention_here=True` on `chat_send` to notify the current channel members. Later joins do not receive old broadcasts. Tags are passive labels for organization and filtering.
+`reply_to` uses a message's `id` / send response's `event_id`; keep the same conversation. `mentions` directs attention subject to the recipient's settings. A body `@Name` of a current member of the conversation becomes a mention; any other body `@token`, including `@here`, notifies nobody and is listed in the response's `warnings`. Use `mention_here=True` on `chat_send` to notify the current channel members. Later joins do not receive old broadcasts. Tags are passive labels for organization and filtering.
 
 ## Read history and new messages
 
 ```python
 chat_read(channel="general", newest_first=True, limit=20)
 chat_read(dms=True, unread_only=True)
-chat_read(inbox=True, unread_only=True)
+chat_read(inbox=True, unread_only=True)             # newest first, slim
+chat_read(inbox=True, mark_read_before="2026-10-06T12:00:00Z")  # clear an old backlog
 chat_read(channel="schema/parser", time={"since": "10m"})
 chat_read(channel="schema/parser", time={
     "start": "2026-09-07T09:00:00-05:00",
@@ -131,11 +132,24 @@ chat_read(thread="<message-id>")
 
 Choose one scope per read: channel, DM, conversation, thread, inbox, or incoming DMs. `channel="*"` searches public channels; `tags=["review"]` filters by tags. Absolute times must include a timezone. Replace the example dates with your desired range.
 
-Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query. After actually reading a page, pass its complete `receipt` object as `ack_receipt` on a subsequent `chat_read` or `chat_send`. This marks exactly those messages read. Previews and merely opening a conversation do not clear unread messages.
+Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query.
+
+**Reading marks read.** Every conversation has a read cursor per reader, as in Slack. Reading a channel, DM or conversation through its newest message (the newest page, or paging until the end) moves your cursor there; everything after it is unread, and your mentions after it are unread mentions. Pass `mark_read=False` for a background preview. Inbox, incoming-DM, `channel="*"` and filtered reads span conversations and mark nothing by themselves: after actually reading such a page, pass its complete `receipt` as `ack_receipt` on a subsequent `chat_read` or `chat_send`, which advances each touched conversation through the newest message in the receipt.
+
+**Reactions acknowledge.** To say "seen", "done" or "agreed" without a message, react:
+
+```python
+chat_react(message_id="<message-id>", emoji="✅", request_id="<new-id>")   # remove=True undoes
+```
+
+Allowed: ✅ 👀 👍 ❌ 🎉. Each participant has one of each; retries with the same `request_id` are idempotent. Reactions notify nobody. Reacting to a message that mentions you also marks it read. Read items carry `reactions: {"✅": {"count", "names", "mine"}}`.
 
 On a background notification, read pending activity **before responding**.
 `chat_read(inbox=True, unread_only=True)` combines eligible chat activity across
-conversations. Finish its pages and acknowledge each receipt. CM sends the first
+conversations, newest first and slim by default (`view="full"` or
+`newest_first=False` to change either). Finish its pages and acknowledge each
+receipt (or open the conversations, which marks them read); reading also lowers
+your watches' unacknowledged count. CM sends the first
 chat wake immediately and combines later arrivals until you fetch the messages.
 Only the returned message IDs advance that wake boundary; previews do not.
 Arrivals during a paginated read remain queued for a subsequent wake.
@@ -190,6 +204,35 @@ Use your normal session chat for routine updates and questions to Owner, and cha
 Read `~/.cm/policies/continuous-review-routing.md` on your execution host. The repository source is [continuous-review-routing.md](continuous-review-routing.md). Every continuous task has its own channel, `ct/<task-slug>`; CM creates it, binds it to the task and joins the orchestrator and every worker it can attribute to the task. `chat_open().continuous` gives a member the channel and the CURRENT orchestrator's participant ID (`role` is `orchestrator` or `member`). Workers post each step, blocker and handoff there with `mentions=[<orchestrator id>]`; the orchestrator wakes on every channel post, reviews on that wake, and dispatches/returns/promotes work by mentioning the worker. The operator posts landing dispositions in the same channel. Scheduled scans and consumer queues admit NEW work only; a channel wake does not request a fresh scan. Persist the disposition, and retain periodic reconciliation and completion monitors as fallback. Verify an observed wake and persisted review rather than assuming a successful send proves the whole path.
 
 Workers enter `review_queued`; parents enter `reviewing` and advance to `owner_review` only for a concrete Owner decision. Internal review stays planning `running`. Stage is carried by the colored task text and legend; a spinner or idle dot only describes activity. `report_done` completes your work slice (or your parent's scheduled run), not the planning task. Unfinished work keeps a live visible session; missing sessions need recovery using the existing task/worktree. Terminal work needs a settled, evidence-backed cleanup disposition, and closing a session is distinct from reaping its checkout.
+
+## Orchestrating other sessions
+
+Read [orchestration](ORCHESTRATION.md) (deployed at `~/.cm/policies/orchestration.md`) before running a swarm. The everyday moves:
+
+```python
+# Hand the next piece to a worker that already knows the area (auto-monitors it).
+send_input(session_uid="ts-…", text="Next: make the cache key include the region. Hand off in #<channel> when done.",
+           notify_until="final")
+
+# Wake a specific lane: a mention by participant ID or exact name. A body "@Name"
+# also works for a current member of the conversation; check `warnings` in the
+# response for anyone who was NOT notified.
+chat_send(channel="<channel>", mentions=["<participant id from chat_people>"],
+          body="Review ready on branch X at abc1234.", request_id="review-x-1")
+
+# Track work in flight as board items; declare a long job instead of going silent.
+item("fuse SEJD hot operators", holder="rl-scale-out", group="RL")   # assigns and wakes the holder
+item_set(14, "waiting", eta="40m", note="full daemon suite")         # never flagged idle before its ETA
+item_set(15, blocked_by=[14])                                        # back to active when #14 is done
+board()                                                              # flags first, then items by group
+item_resolve(14, "nudge", message="still on it?")                    # resolve each flag you are woken for
+
+# An Owner question: options, recommendation, who is blocked.
+notify_user(message="Decision needed: keep or drop the v1 endpoint? Options: keep (cost …) / drop (risk …). "
+                    "Recommend drop. Blocks the api lane. Details: <message link>")
+```
+
+After dispatching, end your turn; the monitor, mention or board push wakes you. After compaction, read your own last posts, then replies and inbox, then `board()` and `list_sessions`.
 
 ## CM beyond messaging
 

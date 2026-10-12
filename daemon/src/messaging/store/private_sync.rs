@@ -1,34 +1,8 @@
-//! Read acknowledgements are a grow-only set of message identities. Their
+//! Legacy read acknowledgements advance conversation cursors. Their
 //! retained events travel only between explicitly Owner-authorized hosts.
 use super::*;
 
 impl Store {
-    pub(super) fn merge_read_ids(&mut self, actor: &str, ids: BTreeSet<String>) -> Result<()> {
-        self.load_read(actor)?;
-        let mut next = self.reads[actor].ids.clone();
-        next.extend(ids);
-        if next == self.reads[actor].ids {
-            return Ok(());
-        }
-        if let Some(reason) = &self.degraded {
-            return Err(err("store_read_only", reason.clone()));
-        }
-        if let Err(e) = atomic_replace(
-            &self
-                .root
-                .join("_state")
-                .join(format!("{}.json", hash(actor.as_bytes()))),
-            &json!({"ids":next}),
-        ) {
-            self.degraded = Some(format!(
-                "Read checkpoint outcome requires reconciliation: {e}"
-            ));
-            return Err(err("outcome_unknown", self.degraded.clone().unwrap()));
-        }
-        self.reads.get_mut(actor).unwrap().ids = next;
-        self.replication.signal.signal();
-        Ok(())
-    }
     pub(super) fn validate_read_event(
         &self,
         e: &Value,
@@ -55,10 +29,7 @@ impl Store {
                 .and_then(|_| Uuid::parse_str(event))
                 .map_err(|_| err("invalid_receipt", "Invalid message identity"))?;
             if require_messages {
-                let event = self
-                    .events
-                    .iter()
-                    .find(|v| v.event["id"] == *id)
+                let event = self.published(id)
                     .ok_or_else(|| {
                         err(
                             "dependency_missing",
@@ -77,32 +48,12 @@ impl Store {
         }
         Ok(ids)
     }
-    pub(super) fn retain_legacy_owner_reads(&mut self) -> Result<()> {
-        self.load_read("owner")?;
-        let ids = self.reads["owner"].ids.iter().cloned().collect::<Vec<_>>();
-        for chunk in ids.chunks(200) {
-            let digest = hash(&serde_json::to_vec(chunk)?);
-            let key = format!("bootstrap-owner-reads:{digest}");
-            if !self.requests.contains_key(&format!("owner\n{key}")) {
-                self.publish(
-                    "read.ack",
-                    None,
-                    "Retained Owner read checkpoint",
-                    json!({"ids":chunk}),
-                    "owner",
-                    "Owner",
-                    "owner",
-                    &key,
-                    "",
-                )?;
-            }
-        }
-        Ok(())
-    }
     pub(super) fn reduce_private_sync(&mut self, e: &Value) -> Result<()> {
         if e["type"] == "read.ack" {
             let ids = self.validate_read_event(e, false)?;
-            self.merge_read_ids("owner", ids)?;
+            self.merge_legacy_memory("owner", ids);
+        } else if e["type"] == "read.cursor" {
+            self.reduce_cursor_event(e)?;
         }
         Ok(())
     }
