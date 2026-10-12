@@ -384,6 +384,12 @@ pub struct App {
     pub(crate) sidebar_pending: HashMap<(cm_daemon::host_id::HostId, String), cm_daemon::sidebar::Assignment>,
     /// Adopted agent workspace ids, persisted independently of display names.
     pub(crate) auto_close_workspaces: HashSet<String>,
+    /// Workspaces Owner reopened with A-O in this viewer run. A reopen is an
+    /// explicit claim: neither the spent sweep nor the agent-marker close
+    /// may hide them again (2026-10-12: a reopened cloud workspace whose
+    /// restore had failed was auto-closed seconds later). Cleared when Owner
+    /// closes the workspace.
+    pub(crate) user_reopened: HashSet<String>,
     /// Cloud backtest runs, rendered in the continuous panel's `backtests`
     /// group instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
@@ -977,6 +983,7 @@ impl App {
             sidebar_pending: HashMap::new(),
             sidebar_retry_at: Instant::now(),
             auto_close_workspaces,
+            user_reopened: HashSet::new(),
             backtest_rows: Vec::new(),
             backtests_folded: false,
             backtest_unfolded_fleets: HashSet::new(),
