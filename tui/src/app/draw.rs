@@ -2113,7 +2113,8 @@ impl App {
                         // all — they're background noise; a pending alert or
                         // an in-flight reconnect still gets full styling, and
                         // the selection branch above keeps the cursor legible.
-                        Style::default().fg(theme::DIM)
+                        // A user accent fades instead of turning grey.
+                        Style::default().fg(accent.map_or(theme::DIM, theme::faded))
                     } else if let Some(c) = accent {
                         Style::default().fg(c)
                     } else {

@@ -116,6 +116,18 @@ pub(crate) fn user_color(name: &str) -> Option<Color> {
     USER_COLORS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
 }
 
+/// A user accent faded for a stale-idle row: same hue, lower brightness, so
+/// the row recedes like other stale rows but keeps the color Owner chose.
+pub(crate) fn faded(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => {
+            let f = |c: u8| (u16::from(c) * 55 / 100) as u8;
+            Color::Rgb(f(r), f(g), f(b))
+        }
+        _ => DIM,
+    }
+}
+
 /// Step an `Option<palette name>` one slot through `USER_COLORS`,
 /// treating `None` (default) as an extra slot in the cycle so the same
 /// key both sets and clears a color.
@@ -151,4 +163,21 @@ pub(crate) fn sidebar_section_bg(color: Option<&str>, strength: f64) -> Color {
     // Float-to-u8 conversion saturates, keeping large intensities in range.
     Color::Rgb((r as f64 * strength).round() as u8,
         (g as f64 * strength).round() as u8, (b as f64 * strength).round() as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-10-12: a session set to blue showed grey once it went stale-idle,
+    /// because the stale fade replaced the accent. The fade keeps the hue.
+    #[test]
+    fn faded_accent_keeps_its_hue_and_loses_brightness() {
+        let blue = user_color("blue").unwrap();
+        let Color::Rgb(r, g, b) = faded(blue) else { panic!("rgb in, rgb out") };
+        assert!(b > r && b > g, "still blue: {r},{g},{b}");
+        let Color::Rgb(_, _, b0) = blue else { unreachable!() };
+        assert!(b < b0, "dimmer than the full accent");
+        assert_eq!(faded(Color::Blue), DIM, "non-rgb falls back to the stale grey");
+    }
 }
