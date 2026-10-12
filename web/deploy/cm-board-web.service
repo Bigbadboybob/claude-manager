@@ -1,0 +1,33 @@
+[Unit]
+Description=Authenticated CM Owner message board
+After=network-online.target cm-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lucas
+Group=lucas
+WorkingDirectory=/opt/cm-board-web
+EnvironmentFile=/etc/cm-board-web.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/cm-board-web/.venv/bin/uvicorn web.server.app:create_app --factory --host 127.0.0.1 --port 8010 --workers 1 --no-access-log --no-proxy-headers --limit-concurrency 32 --timeout-keep-alive 5
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/lucas/.cm/web-push
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

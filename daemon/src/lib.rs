@@ -94,6 +94,7 @@ pub mod terminal_sweep;
 pub mod session_watch;
 pub mod state;
 pub mod notifications;
+pub mod owner_notifications;
 pub mod transcript_detect;
 pub mod transcript_catalog;
 pub mod workflow;

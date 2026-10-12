@@ -93,7 +93,10 @@ message mentioning Owner also advances the read cursor.
 
 `GET /api/alerts` returns `{items:[{key,id,session_uid,label,message,task_id,
 continuous_task_id,urgency?,held_since?,released_at?},…],seen_supported:true}`.
-Only delivered, pending Owner alerts appear. `key` is the daemon queue key.
+Only delivered, pending Owner alerts appear. Core B5 is explicitly limited to
+cm-manager alerts (`scope:"local", scope_label:"cm-manager alerts only"`);
+B5b adds the approved cross-host relay and `features.alert_hosts` in bootstrap.
+`key` is the daemon queue key.
 `POST /api/alerts/seen {key,alert_id}` acknowledges only the matching alert ID,
 returning `{ok:true,acknowledged:bool}`. A stale acknowledgement cannot clear a
 newer alert. The list is read-only apart from this seen action.

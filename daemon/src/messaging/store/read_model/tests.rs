@@ -25,6 +25,38 @@ fn post(s: &mut Store, p: &Person, key: &str, extra: Value) -> Value {
         .clone()
 }
 #[test]
+fn scoped_mentions_stop_at_mention_and_owner_push_uses_shared_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, a, b) = setup(tmp.path());
+    let feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
+    s.owner_notifications = Some(feed.clone());
+    let owner = Person { id:"owner".into(),name:"Owner".into(),session_uid:String::new(),task:None,present:true,kind:"owner".into() };
+    let send = |s: &mut Store, key: &str, extra: Value| {
+        let mut p = json!({"channel":"general","body":key,"request_id":key});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        s.send(&a.id,&a.session_uid,"agent",&p,&[a.clone(),b.clone(),owner.clone()]).unwrap()["event"].clone()
+    };
+    let mention = send(&mut s,"mention",json!({"mentions":[b.id,"owner"]}));
+    send(&mut s,"tail",json!({}));
+    let marked = s.mark_read(&b.id,&json!({"channel":"general","mentions":true}),&[]).unwrap();
+    assert_eq!(marked["read_cursor"]["event_id"], mention["id"]);
+    assert_eq!(s.unread_counts(&b.id,strv(&mention,"conversation_id")),(1,0));
+    assert!(s.mark_read(&b.id,&json!({"channel":"general","mentions":true,"through":mention["id"]}),&[]).is_err());
+    let first = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap();
+    assert_eq!(first["events"].as_array().unwrap().len(),1);
+    assert!(first["events"][0]["url"].as_str().unwrap().starts_with("/#conversation="));
+    for (level, expected) in [("away",0),("around",0),("focused",1),("on-call",1)] {
+        s.availability("owner",&json!({"action":"set","level":level,"request_id":level})).unwrap();
+        let before = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap()["cursor"].clone();
+        send(&mut s,level,json!({"mentions":["owner"]}));
+        let result = feed.next(tmp.path(),&json!({"wait_ms":0,"cursor":before})).unwrap();
+        assert_eq!(result["events"].as_array().unwrap().len(),expected,"{level}");
+    }
+    let cursor = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap()["cursor"].clone();
+    s.react(&b.id,&json!({"message_id":mention["id"],"emoji":"✅","request_id":"react"})).unwrap();
+    assert!(feed.next(tmp.path(),&json!({"cursor":cursor,"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
+}
+#[test]
 fn migration_keeps_legacy_file_and_collapses_gaps_to_cursor() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut s, a, _) = setup(tmp.path());

@@ -325,6 +325,8 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "continuous.context",
     "continuous.dispatch_pending",
     "queue.stats",
+    "owner.notifications.next",
+    "owner_attention.list",
 ];
 
 /// Coordinator-adjacent methods that must NOT count as mutations even
@@ -450,6 +452,19 @@ pub fn dispatch_request(
         "notify_user" => {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             DispatchOutcome::Done(crate::owner_attention::notify(&s, req))
+        }
+        "owner.notifications.next" => {
+            if let Err(resp) = require_operator(req, "Owner notifications are Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            DispatchOutcome::Done(crate::owner_notifications::next_rpc(state, req))
+        }
+        "owner_attention.list" => {
+            if let Err(resp) = require_operator(req, "Owner alerts are Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::list(&s, req))
         }
         "owner_attention.ack" => {
             if let Err(resp) = require_operator(req, "Owner attention acknowledgement is Operator-only") {
