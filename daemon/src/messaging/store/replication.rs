@@ -2605,10 +2605,13 @@ impl Store {
                             || base == path
                             || scope.include_children && path.starts_with(&format!("{base}/"))
                     }) || scope.conversation.as_ref() == Some(id)
+                        // Indexed lookup: this runs on every sync-loop pass
+                        // under the store slot, once per scope × channel, so a
+                        // scan of every event here starved all messaging RPCs
+                        // (cm-sessions, 2026-10-12).
                         || scope.thread.as_deref().is_some_and(|thread| {
-                            self.events.iter().any(|e| {
-                                e.event["id"] == thread && e.event["conversation_id"] == *id
-                            })
+                            self.published(thread)
+                                .is_some_and(|e| e.event["conversation_id"] == *id)
                         });
                     if follows {
                         out.insert(id.clone());
