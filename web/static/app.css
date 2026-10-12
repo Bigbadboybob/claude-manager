@@ -159,3 +159,10 @@ main { flex: 1; min-height: 0; display: flex; }
 @media (min-width: 820px) {
   .bar .back { display: none; }
 }
+
+/* Utility classes (no inline style attributes: the CSP forbids them). */
+.bar.toolbar { position: static; padding-top: 6px; }
+.spacer { flex: 1; }
+button.wide { width: 100%; }
+.gap-top { margin-top: 8px; }
+.gap-bottom { margin-bottom: 8px; }

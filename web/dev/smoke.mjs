@@ -81,6 +81,26 @@ test("open alerts group one row per agent, oldest first", () => {
   assert.equal(f.age("2026-10-10T12:00:00Z", now), "2d");
 });
 
+test("relayed alerts group by origin host id, not the display name", () => {
+  const rows = f.groupAlerts([
+    { key: "k1", id: "a", origin_host: "uuid-1", host: "cm", session_uid: "s1", label: "W", message: "x", created_at: "2026-10-12T10:00:00Z" },
+    { key: "k2", id: "b", origin_host: "uuid-2", host: "cm", session_uid: "s1", label: "W", message: "y", created_at: "2026-10-12T09:00:00Z" },
+  ]);
+  assert.equal(rows.length, 2, "same display host and uid on two hosts are two agents");
+  assert.equal(rows[0].since, "2026-10-12T09:00:00Z", "created_at orders and ages");
+});
+
+test("an alert seen here stays hidden through a racing refresh, then is forgotten", () => {
+  const seen = new Map([["a1", 1000]]);
+  const stale = [{ id: "a1" }, { id: "a2" }];
+  assert.deepEqual(f.withoutSeenAlerts(stale, seen, 2000).map((a) => a.id), ["a2"], "refresh fetched before the ack");
+  assert.ok(seen.has("a1"));
+  assert.deepEqual(f.withoutSeenAlerts([{ id: "a2" }], seen, 3000).map((a) => a.id), ["a2"]);
+  assert.ok(!seen.has("a1"), "forgotten once the server drops it");
+  seen.set("a3", 0);
+  assert.deepEqual(f.withoutSeenAlerts([{ id: "a3" }], seen, 200_000).map((a) => a.id), ["a3"], "an ack that never landed reappears after the ttl");
+});
+
 // ---------- against the fake backend ----------
 async function withServer(fn) {
   const port = 18000 + Math.floor(Math.random() * 2000);

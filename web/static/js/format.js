@@ -132,10 +132,13 @@ export function age(iso, now = new Date()) {
  *  {key, label, host, reason (first line of the newest), since (oldest),
  *  count, alerts}. */
 export function groupAlerts(alerts) {
-  const when = (a) => a.held_since || a.released_at || a.created_at || "";
+  // Original creation time when the relay supplies it (B5b), else the
+  // held/released stamps of older daemons.
+  const when = (a) => a.created_at || a.held_since || a.released_at || "";
   const rows = new Map();
   for (const a of alerts || []) {
-    const key = `${a.host || ""}|${a.session_uid || a.label || a.id}`;
+    // origin_host is the relay's stable host id; display names can collide.
+    const key = `${a.origin_host || a.host || ""}|${a.session_uid || a.label || a.id}`;
     const row = rows.get(key) || { key, label: a.label || a.session_uid || "agent", host: a.host || null, alerts: [] };
     row.alerts.push(a);
     rows.set(key, row);
@@ -150,4 +153,16 @@ export function groupAlerts(alerts) {
       reason: String(newest.message || "").split("\n")[0],
     };
   }).sort((x, y) => x.since.localeCompare(y.since));
+}
+
+/** Alerts minus those acknowledged locally (`seen`: id -> ms). An entry is
+ *  forgotten once the server stops listing that alert, or after `ttlMs` in
+ *  case it never does; until then a refresh that raced the acknowledgement
+ *  cannot bring the row back. Mutates `seen` (pruning). */
+export function withoutSeenAlerts(items, seen, nowMs, ttlMs = 120_000) {
+  const listed = new Set((items || []).map((a) => a.id));
+  for (const [id, at] of seen) {
+    if (!listed.has(id) || nowMs - at > ttlMs) seen.delete(id);
+  }
+  return (items || []).filter((a) => !seen.has(a.id));
 }

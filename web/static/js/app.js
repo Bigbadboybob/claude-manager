@@ -3,7 +3,7 @@
 import { api, allPages, newRequestId, ApiError } from "./api.js";
 import {
   REACTIONS, LEVELS, renderBody, formatTime, dayLabel, sortConversations, filterConversations,
-  badgeCount, reactionList, truncate, parseRoute, routeHash, groupAlerts, age,
+  badgeCount, reactionList, truncate, parseRoute, routeHash, groupAlerts, age, withoutSeenAlerts,
 } from "./format.js";
 import * as push from "./push.js";
 
@@ -18,6 +18,9 @@ const state = {
   counts: { conversations: {}, unread: 0, dms: 0, mentions: 0 },
   availability: null,
   alerts: [],
+  // Alert ids acknowledged here: hidden at once and kept hidden even if a
+  // refresh that raced the acknowledgement still returns them.
+  seenAlerts: new Map(), // id -> time acknowledged
   route: parseRoute(location.hash),
   query: "",
   conv: null, // {id, items, next, loadingOlder, replyTo, thread, atBottom}
@@ -341,10 +344,16 @@ async function openThread(root) {
 async function loadAlerts() {
   try {
     const res = await api.alerts();
-    state.alerts = res.items || [];
+    state.alerts = visibleAlerts(res.items || []);
   } catch (e) {
     fail(e);
   }
+}
+
+/** Drop alerts acknowledged here; forget an acknowledgement once the server
+ *  stops listing that alert (or after two minutes, in case it never did). */
+function visibleAlerts(items) {
+  return withoutSeenAlerts(items, state.seenAlerts, Date.now());
 }
 
 async function setLevel(level) {
@@ -499,9 +508,9 @@ function renderConversation(keepScroll = false) {
   const prev = el.querySelector(".scroll");
   const prevTop = prev?.scrollTop;
   const counts = convCounts(c.id);
-  const tools = h("div", { class: "bar", style: "position:static" },
+  const tools = h("div", { class: "bar toolbar" },
     h("span", { class: "sub" }, c.items.length ? `${c.items.length} loaded` : ""),
-    h("span", { style: "flex:1" }),
+    h("span", { class: "spacer" }),
     counts.mentions
       ? h("button", { onclick: () => markRead({ conversation: c.id, mentions: true }, "Mentions cleared") }, `Clear @${counts.mentions}`)
       : null,
@@ -597,7 +606,7 @@ function renderThread() {
   openSheet(`Thread`, [
     messageEl(t.root, { inThread: true }),
     ...t.items.filter((m) => m.id !== t.root.id).map((m) => messageEl(m, { inThread: true })),
-    h("button", { class: "primary", style: "width:100%;margin-top:8px", onclick: () => {
+    h("button", { class: "primary wide gap-top", onclick: () => {
       closeSheet();
       startReply(t.root);
     } }, "Reply in thread"),
@@ -611,16 +620,27 @@ function renderAlerts() {
   const rows = groupAlerts(state.alerts);
   const seen = (row) => async (e) => {
     e.target.disabled = true;
-    try {
-      for (const a of row.alerts) await api.alertSeen(a.key, a.id);
-      state.alerts = state.alerts.filter((a) => !row.alerts.includes(a));
+    // Hide by id first: a background refresh may replace state.alerts (new
+    // objects, possibly fetched before the acknowledgement committed).
+    const ids = row.alerts.map((a) => a.id);
+    const now = Date.now();
+    for (const id of ids) state.seenAlerts.set(id, now);
+    const redraw = () => {
+      state.alerts = state.alerts.filter((a) => !state.seenAlerts.has(a.id));
       renderAlerts();
       renderHeader();
       renderListRows();
+    };
+    redraw();
+    try {
+      for (const a of row.alerts) await api.alertSeen(a.key, a.id);
     } catch (err) {
-      e.target.disabled = false;
+      // Not acknowledged: show the row again.
+      for (const id of ids) state.seenAlerts.delete(id);
       fail(err);
+      await loadAlerts();
     }
+    redraw();
   };
   put(el, h("div", { class: "scroll" },
     // v1 lists the hub host's alerts only; cm-sessions alerts arrive with the
@@ -633,7 +653,7 @@ function renderAlerts() {
     h("div", { class: "meta" },
       h("strong", {}, row.label),
       row.host ? h("span", { class: "sub" }, ` · ${row.host}`) : null,
-      h("span", { style: "flex:1" }),
+      h("span", { class: "spacer" }),
       row.count > 1 ? h("span", { class: "badge at" }, row.count) : null,
       h("span", { class: "when" }, ` ${age(row.since)}`)),
     h("div", { class: "body" }, row.reason),
@@ -696,7 +716,7 @@ async function settingsSheet() {
   };
   const children = [h("p", {}, lines[status])];
   if (status === "off") {
-    const b = h("button", { class: "primary", style: "width:100%" }, "Enable notifications");
+    const b = h("button", { class: "primary wide" }, "Enable notifications");
     b.onclick = busy(b, async () => {
       await push.enable();
       toast("Notifications enabled");
@@ -705,14 +725,14 @@ async function settingsSheet() {
     children.push(b);
   }
   if (status === "on") {
-    const test = h("button", { style: "width:100%;margin-bottom:8px" }, "Send test notification");
+    const test = h("button", { class: "wide gap-bottom" }, "Send test notification");
     test.onclick = busy(test, async () => {
       const reg = await navigator.serviceWorker.ready;
       const sub = await reg.pushManager.getSubscription();
       await api.pushTest(sub?.endpoint);
       toast("Test sent — it should arrive in a few seconds");
     });
-    const off = h("button", { style: "width:100%" }, "Turn off on this device");
+    const off = h("button", { class: "wide" }, "Turn off on this device");
     off.onclick = busy(off, async () => {
       await push.disable();
       toast("Notifications off");
