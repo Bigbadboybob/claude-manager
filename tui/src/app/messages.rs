@@ -2603,6 +2603,15 @@ mod tests {
             }
             assert!(lines[header + 3].contains("Inbox"), "pinned above Inbox");
         }
+        // A relayed alert carries when it was raised (B5b): that wins over
+        // first-seen, so it sorts first and shows its real age.
+        let mut old = alert("a0", "ts-old", "Old-Worker", "Waiting since forever");
+        old.created_at = Some("2026-01-01T00:00:00Z".into());
+        app.owner_alerts.insert((sessions.clone(), "ts-old".into()), old);
+        let rows = app.open_owner_alerts();
+        assert_eq!(rows[0].label, "Old-Worker");
+        assert!(super::short_age(rows[0].since).ends_with('d'), "aged from created_at");
+        app.owner_alerts.remove(&(sessions.clone(), "ts-old".to_string()));
         // Enter on the Perf row: jump to the session and mark it seen.
         app.messages.pane = 0;
         app.messages.menu = 1;

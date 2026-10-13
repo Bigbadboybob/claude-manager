@@ -1050,7 +1050,7 @@ fn now_unix() -> i64 {
 
 /// RFC 3339 → Unix seconds (`2026-10-07T19:40:00Z`, fractional seconds and
 /// numeric offsets accepted). The TUI carries no date crate.
-fn parse_rfc3339(s: &str) -> Option<i64> {
+pub(super) fn parse_rfc3339(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
         return None;
