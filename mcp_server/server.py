@@ -1311,11 +1311,10 @@ def ping() -> dict:
          workspace_id: str | null,  # ← the workspace you live in
          owner_availability: {level, set, changed_at, age_s, ...}}
 
-    `owner_availability.level` is how reachable Owner is right now:
-    away (emergencies only), around (decisions and above), focused
-    (everything), on-call (everything), or null when unset
-    (every alert is delivered). Check it before asking Owner anything;
-    chat_open reports the same value.
+    `owner_availability.level` is informational: away, around, focused,
+    on-call, or null when unset. All notifications deliver at every level;
+    explicit conversation mutes, DND and read state still apply. chat_open
+    reports the same value.
 
     `global_perms` is the one to check before you try to drive another
     task's sessions: when true, you can prompt / read / kill / spawn
@@ -2191,12 +2190,11 @@ def notify_user(message: str = "", urgency: str = "decision") -> dict:
     urgency is honest: "fyi" (no action needed soon), "decision" (default:
     Owner must choose something), "blocking" (you or others cannot proceed),
     "emergency" (harm or loss is happening now; also pushed to Owner's phone).
-    Owner's availability (ping().owner_availability.level) decides delivery:
-    away delivers emergencies only, around decision+, focused everything,
-    on-call everything; unset delivers everything. The result says
-    delivery="immediate" or delivery="held" with release_when (the level that
-    will deliver it). Held is not lost: keep working, and you are woken when a
-    level change releases it. Repeated held requests keep the latest text.
+    Owner's availability (ping().owner_availability.level) is informational.
+    All urgencies deliver at every level, including unset; availability never
+    holds, drops or downgrades notifications. The result says
+    delivery="immediate" for acceptance into the normal queue. Explicit chat
+    mutes, DND, read state and device notification settings still apply.
 
     A delivered alert stays until Owner selects the session. A connected
     updated TUI submits the normal desktop notification and blinks the sidebar;

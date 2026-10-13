@@ -274,8 +274,7 @@ pub fn outbox_pass(
                 task_id: None,
             };
             match crate::owner_attention::escalate(&s, e) {
-                Ok(crate::owner_attention::GateOutcome::Delivered { alert_id })
-                | Ok(crate::owner_attention::GateOutcome::Held { alert_id, .. }) => {
+                Ok(crate::owner_attention::GateOutcome::Delivered { alert_id }) => {
                     eprintln!("cm messaging: outbox alarm: {} sender(s), oldest pending {oldest}s", stalled.len());
                     ep.alert_id = Some(alert_id);
                 }

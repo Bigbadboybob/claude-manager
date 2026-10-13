@@ -1235,7 +1235,7 @@ fn messaging_sync_owner_alert_relay_offline_seen_restart_newer_id_and_scope() {
             .unwrap()
             .is_empty()
     });
-    // Held requests never enter the relay; release keeps original request time.
+    // Away is informational: alerts immediately enter the cross-host relay.
     let source_root = a.lock().unwrap().messaging_root.clone();
     let projection = crate::owner_availability::projection_path(&source_root);
     fs::create_dir_all(projection.parent().unwrap()).unwrap();
@@ -1245,37 +1245,23 @@ fn messaging_sync_owner_alert_relay_offline_seen_restart_newer_id_and_scope() {
             .to_string(),
     )
     .unwrap();
-    let held = notify(a, "Held review");
+    let away = notify(a, "Review while away");
     let source_runtime = { a.lock().unwrap().messaging_sync.clone().unwrap() };
-    assert!(source_runtime.alert_snapshot().unwrap().alerts.is_empty());
-    assert!(list()["items"].as_array().unwrap().is_empty());
-    let original = crate::owner_attention::held_snapshot(&a.lock().unwrap()).unwrap()["client-0"]
-        .alert
-        .created_at
-        .clone();
-    fs::write(
-        &projection,
-        json!({"level":"focused","event_id":"release-test","changed_at":"2026-10-12T23:00:00Z"})
-            .to_string(),
-    )
-    .unwrap();
-    crate::owner_attention::release_for_level(
-        &a.lock().unwrap(),
-        Some(crate::owner_availability::Level::Focused),
-    )
-    .unwrap();
+    assert_eq!(source_runtime.alert_snapshot().unwrap().alerts.len(), 1);
+    assert!(crate::owner_attention::held_snapshot(&a.lock().unwrap()).unwrap().is_empty());
+    let original = crate::owner_attention::snapshot(&a.lock().unwrap()).unwrap()["client-0"].created_at.clone();
     wait_for(|| {
         list()["items"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v["id"] == held)
+            .any(|v| v["id"] == away)
     });
     assert_eq!(
         crate::owner_attention::snapshot(&a.lock().unwrap()).unwrap()["client-0"].created_at,
         original
     );
-    crate::owner_attention::withdraw(&a.lock().unwrap(), "client-0", &held).unwrap();
+    crate::owner_attention::withdraw(&a.lock().unwrap(), "client-0", &away).unwrap();
     wait_for(|| list()["items"].as_array().unwrap().is_empty());
     let third = notify(a, "Check enrollment scope");
     wait_for(|| {

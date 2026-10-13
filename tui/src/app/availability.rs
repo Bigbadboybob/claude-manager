@@ -14,11 +14,11 @@ use std::sync::mpsc;
 
 /// Picker rows: (level sent to the daemon, what it means).
 const CHOICES: [(&str, &str); 5] = [
-    ("away", "emergencies only"),
-    ("around", "decisions and above"),
-    ("focused", "everything"),
-    ("on-call", "everything"),
-    ("unset", "default: everything, no extra pushes"),
+    ("away", "not available"),
+    ("around", "intermittently available"),
+    ("focused", "concentrating on work"),
+    ("on-call", "available for requests"),
+    ("unset", "no availability information"),
 ];
 /// How often the status bar re-reads the projection.
 const REFRESH: Duration = Duration::from_secs(5);
@@ -257,7 +257,7 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let current = self.availability.current["level"].as_str().unwrap_or("unset");
-        let mut lines = vec![Line::from("What reaches you now. Agents see it in ping."), Line::from("")];
+        let mut lines = vec![Line::from("For agents. Notifications arrive at every level."), Line::from("")];
         for (i, (level, meaning)) in CHOICES.iter().enumerate() {
             let selected = i == dialog.cursor;
             let marker = if *level == current { "\u{25cf}" } else { " " };
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn f7_opens_over_every_view_consumes_keys_and_shows_the_bar_level() {
+    fn f7_opens_over_every_view_consumes_keys_and_shows_the_level() {
         use crossterm::event::{Event, KeyEvent, KeyModifiers};
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());

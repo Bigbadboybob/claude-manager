@@ -323,8 +323,8 @@ impl Recipient {
     }
 }
 pub fn tick(state: &Arc<Mutex<DaemonState>>) {
-    // Owner availability changes (local or replicated) release held Owner
-    // requests and wake coordinators; independent of the store lock below.
+    // Release legacy held Owner requests after upgrade, independently of
+    // the messaging store lock below. Availability no longer filters them.
     crate::owner_availability::tick(state);
     let (handle, root, gate, recipients) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());

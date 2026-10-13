@@ -118,9 +118,9 @@ remains supported by the daemon RPC. There is no remote session-control access.
 `GET /api/availability` returns `{owner_availability:{level,set,changed_at,
 age_s,previous?,owner_note?}}`. `POST /api/availability` takes
 `{level,request_id,note?}` and returns that shape plus `event_id`.
-Levels: `away`, `around`, `focused`, `on-call`, `unset`. The existing daemon policy
-is authoritative: away = emergencies; around = decisions and above;
-focused/on-call = everything; unset = legacy delivery. Notes are optional,
+Levels: `away`, `around`, `focused`, `on-call`, `unset`. Availability is
+informational: Owner alerts, DMs and mentions deliver at every level. Explicit
+conversation mutes, DND and read state still apply. Notes are optional,
 single-line, at most 200 characters.
 
 ## Web Push

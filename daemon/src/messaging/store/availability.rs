@@ -38,8 +38,8 @@ impl Store {
     }
 
     /// `{action:"get"}` for anyone; `{action:"set", level, note?, source?,
-    /// request_id}` for Owner only. `level:"unset"` clears it (legacy
-    /// deliver-everything behavior).
+    /// request_id}` for Owner only. `level:"unset"` clears the informational
+    /// status; notification delivery is independent of this value.
     pub fn availability(&mut self, actor: &str, p: &Value) -> Result<Value> {
         let exposure = |s: &Store| availability::exposure_at(&s.owner_availability, Utc::now());
         match p["action"].as_str().unwrap_or("get") {

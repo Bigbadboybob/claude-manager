@@ -688,15 +688,15 @@ function closeSheet() {
 function availabilitySheet() {
   const current = state.availability?.level || "unset";
   const what = {
-    away: "Emergencies only",
-    around: "Decisions and above",
-    focused: "Everything",
-    "on-call": "Everything",
+    away: "Not available",
+    around: "Intermittently available",
+    focused: "Concentrating on work",
+    "on-call": "Available for requests",
   };
   openSheet("Availability", [
     ...LEVELS.map((l) => h("button", { class: `opt${l === current ? " on" : ""}`, onclick: () => setLevel(l) },
       h("span", {}, l), h("span", { class: "sub" }, what[l]))),
-    h("p", {}, "Push notifications follow this level, as on the desktop (F7)."),
+    h("p", {}, "Availability is shared with agents. Notifications arrive at every level."),
   ]);
 }
 

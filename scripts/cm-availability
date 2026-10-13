@@ -6,10 +6,9 @@
     cm-availability away --note "back 08:00Z"
     cm-availability --ssh cm-manager away
 
-Levels, least to most reachable: away (emergencies only), around (blocking and
-above), focused (decisions and above), on-call (everything). `unset` returns to
-the default, where every Owner alert is delivered. Agents read the level from
-`ping` and `chat_open`.
+Levels: away, around, focused, on-call, or unset. Agents read this information
+from `ping` and `chat_open`. All Owner notifications deliver at every level;
+explicit conversation mutes, DND and read state still apply.
 
 The level is an Owner-only messaging event published on the messaging hub and
 replicated to every enrolled host, so set it on any host whose daemon serves

@@ -183,11 +183,12 @@ Use **iOS 16.4+**. A headless desktop browser cannot establish this acceptance.
 3. Tap **Enable notifications** inside the installed app; allow the iOS prompt.
    Tap **Send test notification**, background the app and confirm a real system
    notification appears. Tap it; confirm the installed app opens.
-4. With Owner availability focused/on-call, send a controlled DM and @mention
-   from an agent and create a `notify_user` alert. Confirm push title/short
-   preview, conversation/alert tap target, and badge = unread DMs + mentions.
-   Repeat with away (only emergency alerts) and around (decision+ alerts).
-   Ordinary chat has FYI urgency and is suppressed at those two levels.
+4. At each Owner availability level (away, around, focused, on-call and unset),
+   send a controlled DM and @mention from an agent and create a `notify_user`
+   alert. Every level should deliver them. Confirm push title/short preview,
+   conversation/alert tap target, and badge = unread DMs + mentions. Check all
+   alert urgencies, including FYI. Verify explicit conversation mute/DND still
+   suppresses chat pushes and read messages do not re-notify.
    Restore the previous availability and mark only test messages read.
 5. Verify replies, reactions, pagination, per-channel clear mentions and stale
    seen acknowledgements. With B5b on both hosts, verify distinct host labels and
@@ -219,17 +220,18 @@ from 10 seconds up to 15 minutes, respecting a longer `Retry-After` (seconds or
 HTTP date). Four endpoint requests can run concurrently, one message per
 endpoint per sweep; the queue is saved once per sweep. Retry jobs expire one
 hour after the decision. VAPID's public contact is the board origin, not Owner's
-email. Explicit test pushes bypass availability, with a 30-second test rate limit.
+email. Explicit test pushes have a 30-second test rate limit.
 
 The manager daemon retains at most 256 decisions / 512 KiB in
 `~/.cm/owner-notifications.json`. Producers only enqueue to a bounded queue;
 its writer does disk I/O outside the daemon/store locks. The web process
 long-polls the feed (25s) and checkpoints its cursor with queued jobs. No message-history polling or second
-availability table. The hook reuses Owner inbox, mute/DND and read decisions;
+availability filter. The hook reuses Owner inbox, mute/DND and read decisions;
 it emits on the coordinator for replicated messages only after publication
 durability, and does not replay the store's entire history on daemon startup.
-Held alerts push when the existing availability gate releases them. Chat
-suppressed by availability does not generate a later catch-up push.
+Availability is informational: alerts, DMs and mentions deliver at every level.
+Upgraded daemons release legacy held alerts without requiring a level change.
+Previously suppressed chat is not replayed as catch-up pushes.
 
 Delivery is **best effort**, not exactly-once: a push send accepted before a
 checkpoint crash can repeat (stable notification tags replace duplicates).
@@ -243,7 +245,7 @@ counts, the last error and recovery path. Keep quarantine evidence until the
 incident is understood, then remove it. Malformed individual feed events are
 logged/skipped without stalling the cursor. Decisions older than one hour expire. Recent queued notifications may be shown after a message
 was read or an alert seen; the app always loads authoritative current state on
-tap. Availability gates at the daemon's decision time, not at each retry.
+tap. Availability does not filter notification decisions or retries.
 
 For incident checks use `systemctl status cm-board-web`,
 `journalctl -u cm-board-web`, nginx error logs, and daemon notification checkpoint
@@ -302,7 +304,7 @@ the daemon registry nor the messaging store lock. Cached alerts remain visible
 offline and `alert_hosts[].connected` reports connection status. Revoking host
 Owner access immediately excludes its cached rows and blocks Seen routing.
 
-Only alerts already delivered by the source's availability gate enter snapshots.
+All pending source alerts enter snapshots regardless of availability.
 Remote new IDs enqueue one hub Web Push decision after the snapshot is persisted;
 replayed snapshots do not repush. This retains the core best-effort crash gap and
 bounded feed behavior. A source alert created and removed entirely while offline
