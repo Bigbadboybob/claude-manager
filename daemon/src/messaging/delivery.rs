@@ -178,6 +178,7 @@ thread_local! {
     static QUEUE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUEUE_SAVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FAIL_QUEUE_SAVE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static AFTER_RECONCILE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 pub(super) fn queue_load_count() -> usize {
@@ -370,6 +371,8 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
             };
             (ids, store.root.clone(), queue)
         };
+        #[cfg(test)]
+        if let Some(hook) = AFTER_RECONCILE.with(|hook| hook.borrow_mut().take()) { hook(); }
         // Lock order matches the RPC path: delivery gate, then store.
         let lookup = |id: &str| {
             let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -940,6 +943,107 @@ mod tests {
         assert_eq!(save_calls() - writes, 0);
         assert_eq!(fs::read(&path).unwrap(), bytes, "all dedup history remains intact");
         assert_eq!(q.batches.len(), 7745);
+    }
+
+    #[test]
+    fn messaging_settled_ids_becoming_eligible_again_do_not_rewake_or_read_native() {
+        for status in ["confirmed", "cancelled"] {
+            let (tmp, store, _, _) = fixture();
+            let path = queue_path(&store.root, "b");
+            save(&path, &Queue {
+                batches: vec![Batch {
+                    wake_id: "settled".into(), ids: vec!["eligible-again".into()],
+                    status: status.into(), released: true, ..Batch::default()
+                }], ..Queue::default()
+            }).unwrap();
+            fs::write(tmp.path().join("notifications"), "no native I/O allowed").unwrap();
+            let intents = vec![WakeIntent {
+                key: "eligible-again".into(), event_id: "eligible-again".into(), monitor: None,
+            }];
+            let writes = save_calls();
+            let mut queue = reconcile_intents(tmp.path(), &store, "b", &intents).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &intents, &recipient("codex"),
+                1_000_000, &no_preview, &mut queue).unwrap();
+            assert_eq!(save_calls() - writes, 0);
+            assert_eq!(queue.batches.len(), 1);
+            assert_eq!(queue.batches[0].wake_id, "settled");
+            assert_eq!(queue.batches[0].status, status);
+            assert!(queue.batches[0].released);
+        }
+    }
+
+    #[test]
+    fn messaging_shared_queue_tick_serializes_cancel_against_native_claim() {
+        use std::os::fd::AsRawFd;
+        // Simulate the adapter's pending -> submitting transition under the
+        // actual native queue flock, independently of the daemon delivery gate.
+        fn claim(root: &Path, wake: &str) -> bool {
+            let dir = crate::notifications::directory(root, "b");
+            let lock = fs::OpenOptions::new().read(true).write(true).open(dir.join("queue.lock")).unwrap();
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+            let path = dir.join(format!("{}.json", digest(&format!("chat:{wake}"))));
+            let mut event: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if event["status"] != "pending" { return false; }
+            event["status"] = json!("submitting");
+            atomic_replace(&path, &event).unwrap();
+            true
+        }
+        let _env = crate::test_support::env_lock();
+        for claim_first in [true, false] {
+            let (tmp, mut store, actor, people) = fixture();
+            dm(&mut store, &actor, &people, "claim-race");
+            let path = queue_path(&store.root, "b");
+            let mut daemon = DaemonState::default();
+            daemon.messaging_root = tmp.path().into();
+            *daemon.messaging.lock().unwrap() = Some(store);
+            let mut params = crate::session::SpawnParams::new("b", "delivery-race", "/bin/cat");
+            params.session_type = "codex".into();
+            daemon.sessions.insert("b".into(), crate::session::DaemonSession::spawn(params).unwrap());
+            let gate = daemon.messaging_delivery.clone();
+            let slot = daemon.messaging.clone();
+            let state = Arc::new(Mutex::new(daemon));
+            tick(&state);
+            let queue = load(&path).unwrap();
+            let wake = queue.batches[0].wake_id.clone();
+            let (go, start) = std::sync::mpsc::channel();
+            let (started, trying) = std::sync::mpsc::channel();
+            let (done, cancelled) = std::sync::mpsc::channel();
+            let root = tmp.path().to_owned();
+            let canceller = std::thread::spawn(move || {
+                start.recv().unwrap();
+                started.send(()).unwrap();
+                let _guard = gate.lock().unwrap();
+                let mut slot = slot.lock().unwrap();
+                let store = slot.as_mut().unwrap();
+                store.follow(&actor, &json!({"action":"set","dnd":true,"request_id":"race-cancel"}), &people).unwrap();
+                reconcile_session(&root, store, "b").unwrap();
+                let _ = done.send(());
+            });
+            let root = tmp.path().to_owned();
+            let hook_wake = wake.clone();
+            AFTER_RECONCILE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                go.send(()).unwrap();
+                trying.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(cancelled.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "cancellation must wait for the recipient gate through shared-queue delivery");
+                if claim_first {
+                    assert!(claim(&root, &hook_wake), "adapter can claim after reconcile before deliver");
+                }
+            })));
+            let loads = queue_load_count();
+            tick(&state);
+            assert_eq!(queue_load_count() - loads, 1, "deliver must reuse reconcile's snapshot");
+            canceller.join().unwrap();
+            let final_queue = load(&path).unwrap();
+            assert_eq!(final_queue.batches.len(), 1);
+            assert!(final_queue.batches[0].released);
+            if claim_first {
+                assert_eq!(final_queue.batches[0].status, "submitting", "claimed native work cannot be recalled");
+            } else {
+                assert_eq!(final_queue.batches[0].status, "cancelled");
+                assert!(!claim(tmp.path(), &wake), "cancelled work cannot be claimed later");
+            }
+        }
     }
 
     #[test]
