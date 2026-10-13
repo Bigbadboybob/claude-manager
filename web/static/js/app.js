@@ -4,6 +4,7 @@ import { api, allPages, newRequestId, ApiError } from "./api.js";
 import {
   REACTIONS, LEVELS, renderBody, formatTime, dayLabel, sortConversations, filterConversations,
   badgeCount, reactionList, truncate, parseRoute, routeHash, groupAlerts, age, withoutSeenAlerts,
+  learnNames, nameFor,
 } from "./format.js";
 import * as push from "./push.js";
 
@@ -14,7 +15,8 @@ const state = {
   me: null,
   channels: [],
   dms: [],
-  people: new Map(), // id -> name
+  people: new Map(), // id -> name (present participants only)
+  knownNames: new Map(), // id -> name seen in DM rows and messages (incl. departed)
   counts: { conversations: {}, unread: 0, dms: 0, mentions: 0 },
   availability: null,
   alerts: [],
@@ -87,8 +89,7 @@ function saveDraft(id, draft) {
 
 // ---------- directory ----------
 function personName(id) {
-  if (id === "owner") return "Owner";
-  return state.people.get(id) || String(id).split(":").pop();
+  return nameFor(id, state.people, state.knownNames);
 }
 
 function convCounts(id) {
@@ -137,6 +138,7 @@ async function loadDirectory() {
   ]);
   state.channels = channels;
   state.dms = dms;
+  learnNames(state.knownNames, { dms });
   state.people = new Map(people.map((p) => [p.id, p.name]));
 }
 
@@ -167,6 +169,7 @@ async function openConversation(id, messageId = null) {
     const page = await api.read({ conversation: id, newest_first: true, limit: PAGE });
     if (state.conv?.id !== id) return;
     state.conv.items = newestAtBottom(page.items || []);
+    learnNames(state.knownNames, { messages: state.conv.items });
     state.conv.next = page.next_cursor || null;
     // A push opened a specific message: page back until it is loaded.
     for (let i = 0; messageId && i < 10 && state.conv.next && !state.conv.items.some((m) => m.id === messageId); i += 1) {
@@ -191,6 +194,7 @@ async function loadOlder(rerender = true) {
     const scroller = document.querySelector(".conv .scroll");
     const before = scroller ? scroller.scrollHeight - scroller.scrollTop : 0;
     c.items = mergeItems(c.items, page.items || []);
+    learnNames(state.knownNames, { messages: page.items || [] });
     c.next = page.next_cursor || null;
     if (rerender) {
       renderConversation();
@@ -214,6 +218,7 @@ async function refreshConversation() {
     if (state.conv !== c) return;
     const had = c.items.length;
     c.items = mergeItems(c.items, page.items || []);
+    learnNames(state.knownNames, { messages: page.items || [] });
     if (c.items.length !== had || (page.items || []).length) {
       const stick = c.atBottom;
       renderConversation();

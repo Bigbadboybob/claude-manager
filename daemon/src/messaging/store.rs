@@ -1957,7 +1957,17 @@ impl Store {
                 continue;
             }
             let last=last_event.map(|e|json!({"id":e.event["id"],"actor":e.event["actor"],"created_at":e.event["created_at"],"preview":strv(&e.event,"body").chars().take(180).collect::<String>()}));
-            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"group":m.len()>2,"unread":count,"mentions":mentions,"last":last}));
+            // Display names for every member, departed agents included (the
+            // people directory lists only present ones), so clients can
+            // label a DM without it. Additive: ids without a name are omitted.
+            let member_names: serde_json::Map<String, Value> = m
+                .iter()
+                .filter_map(|id| {
+                    let name = if id == "owner" { Some("Owner".to_owned()) } else { self.names.get(id).map(|n| n.name.clone()) };
+                    name.map(|n| (id.clone(), json!(n)))
+                })
+                .collect();
+            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"member_names":member_names,"group":m.len()>2,"unread":count,"mentions":mentions,"last":last}));
         }
         self.directory_page(actor, p, out)
     }

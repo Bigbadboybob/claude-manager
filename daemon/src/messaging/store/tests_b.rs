@@ -516,3 +516,20 @@ fn thread_watch_interest_is_its_own_conversation_only() {
         "only the thread's conversation"
     );
 }
+
+/// DM rows name every member, including agents that have since left the
+/// people directory (which lists only present participants): the board
+/// showed a departed peer's raw uid as the DM label (2026-10-13).
+#[test]
+fn dm_rows_carry_member_names_including_departed_agents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    post(&mut s, &a, json!({"dm":"owner"}), "hello", &[a.clone()]);
+    // The agent departs: nothing below passes a people list.
+    let page = s.dms_page("owner", &json!({})).unwrap();
+    let row = &page["items"][0];
+    assert_eq!(row["member_names"][&a.id], "a-builder", "{row}");
+    assert_eq!(row["member_names"]["owner"], "Owner");
+    assert_eq!(row["peer"], json!(a.id), "existing fields unchanged");
+}
