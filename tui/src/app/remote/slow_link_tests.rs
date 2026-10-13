@@ -455,12 +455,21 @@ fn a_dropped_link_resumes_each_pane_with_only_the_bytes_it_missed() {
     assert_eq!(fx.link.resumes.load(Ordering::SeqCst), 5, "every reconnect asked to resume");
     let resent = fx.link.delivered.load(Ordering::SeqCst) - before;
     assert!(resent < 2_000, "resuming 5 panes sent {resent} bytes");
-    for (i, ts) in fx.app.workspaces[0].sessions.iter().enumerate() {
+    // Panes join the workspace in attach-completion order, not uid order.
+    for ts in &fx.app.workspaces[0].sessions {
+        let i = fx.uids.iter().position(|u| *u == ts.uid).unwrap();
         assert!(ts.session.resumed, "{} resumed", ts.uid);
         assert!(ts.session.history_deferred, "{} keeps its scrollback state", ts.uid);
         let wait = Instant::now() + Duration::from_secs(5);
         while !screen_text(ts).contains(&format!("missed while away {i}")) {
-            assert!(Instant::now() < wait, "{}: {}", ts.uid, screen_text(ts));
+            assert!(
+                Instant::now() < wait,
+                "{}: pane position {:?}, daemon cursor {}: {}",
+                ts.uid,
+                ts.session.stream.as_ref().map(|c| c.position.load(Ordering::SeqCst)),
+                fx.state.lock().unwrap().sessions[&ts.uid].fanout.snapshot_since(None).cursor,
+                screen_text(ts).lines().last().unwrap_or(""),
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(screen_text(ts).contains("xxxx"), "the earlier screen is still there");
