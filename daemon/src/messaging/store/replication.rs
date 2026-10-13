@@ -1720,7 +1720,7 @@ impl Store {
     }
     /// Messages of `scope` in `(after, through]`, for backfill progress.
     pub fn scope_message_count(&self, scope: &str, after: u64, through: u64) -> u64 {
-        self.read_model.conversations.get(scope).map_or(0,|c| c.arrivals.partition_point(|p| *p <= through).saturating_sub(c.arrivals.partition_point(|p| *p <= after))) as u64
+        self.read_model.conversations.get(scope).map_or(0,|c| c.arrivals.partition_point(|(p, _)| *p <= through).saturating_sub(c.arrivals.partition_point(|(p, _)| *p <= after))) as u64
     }
     /// Per-scope coverage this replica holds in `generation`; a hub uses it to
     /// start a re-added scope's backfill where the earlier coverage ended.

@@ -272,6 +272,8 @@ pub struct Store {
     /// page's event files and directories are durable (see `ingest_replica_page`).
     ingest_batch: Option<replication::IngestBatch>,
     channels: BTreeMap<String, String>,
+    // Reverse index retains the first lexical path even if legacy IDs have aliases.
+    channel_paths: HashMap<String, BTreeSet<String>>,
     memberships: BTreeMap<String, BTreeSet<String>>,
     membership_revisions: BTreeMap<String, String>,
     enrolled: BTreeSet<String>,
@@ -365,6 +367,7 @@ impl Store {
             ingest_batch: None,
             compactor: None,
             channels: BTreeMap::new(),
+            channel_paths: HashMap::new(),
             memberships: BTreeMap::new(),
             membership_revisions: BTreeMap::new(),
             enrolled: BTreeSet::new(),
@@ -662,7 +665,16 @@ impl Store {
             for item in items {
                 let path = required(item, "path")?;
                 channel_path(&path)?;
-                self.channels.insert(path, required(item, "id")?);
+                let id = required(item, "id")?;
+                if let Some(old) = self.channels.insert(path.clone(), id.clone()) {
+                    if let Some(paths) = self.channel_paths.get_mut(&old) {
+                        paths.remove(&path);
+                        if paths.is_empty() {
+                            self.channel_paths.remove(&old);
+                        }
+                    }
+                }
+                self.channel_paths.entry(id).or_default().insert(path);
             }
         }
         self.reduce_membership(e)?;
@@ -1145,7 +1157,7 @@ impl Store {
         Ok(())
     }
     fn visible(&self, actor: &str, conv: &str) -> bool {
-        self.channels.values().any(|c| c == conv)
+        self.channel_paths.contains_key(conv)
             || self
                 .conversations
                 .get(conv)
@@ -1604,10 +1616,7 @@ impl Store {
     }
     /// Path of a channel id, if the channel exists.
     pub fn channel_path_of(&self, id: &str) -> Option<&str> {
-        self.channels
-            .iter()
-            .find(|(_, cid)| cid.as_str() == id)
-            .map(|(p, _)| p.as_str())
+        self.channel_paths.get(id)?.first().map(String::as_str)
     }
     /// Current joined membership without building the per-channel view.
     pub fn is_member(&self, channel_id: &str, actor: &str) -> bool {
