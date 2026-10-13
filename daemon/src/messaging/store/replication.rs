@@ -1867,7 +1867,7 @@ mod tests {
         }
     }
     #[test]
-    fn owner_push_is_coordinator_only_and_respects_dm_mute_and_frozen_here() {
+    fn owner_push_at_every_level_preserves_mutes_dnd_reads_and_coordinator_routing() {
         let mut p = pair();
         let hub_feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
         let replica_feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
@@ -1875,18 +1875,38 @@ mod tests {
         p.replica.owner_notifications = Some(replica_feed.clone());
         let host = p.replica.daemon_id.clone();
         let actor = p.people[0].id.clone();
-        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"DM for Owner","request_id":"owner-dm"})).unwrap();
-        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Everyone","mention_here":true,"request_id":"owner-here"})).unwrap();
-        hub_feed.flush();
-        let first = hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0})).unwrap();
-        assert_eq!(first["events"].as_array().unwrap().len(), 2);
+        let mut last_dm = Value::Null;
+        for (i, level) in [None, Some("away"), Some("around"), Some("focused"), Some("on-call")].into_iter().enumerate() {
+            p.hub.availability("owner", &json!({"action":"set","level":level.unwrap_or("unset"),"request_id":format!("level-{i}")})).unwrap();
+            last_dm = p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"DM for Owner","request_id":format!("owner-dm-{i}")})).unwrap();
+            p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":["owner",p.people[1].id],"body":"Group DM for Owner","request_id":format!("owner-group-{i}")})).unwrap();
+            p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"For Owner","mentions":["owner"],"request_id":format!("owner-mention-{i}")})).unwrap();
+            p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Everyone","mention_here":true,"request_id":format!("owner-here-{i}")})).unwrap();
+            // Unmentioned channel traffic is still not a push subscription.
+            p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Ordinary traffic","request_id":format!("ordinary-{i}")})).unwrap();
+            hub_feed.flush();
+            let page = hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0})).unwrap();
+            assert_eq!(page["events"].as_array().unwrap().len(), (i + 1) * 4, "{level:?}");
+        }
         catch_up(&mut p);
         replica_feed.flush();
         assert!(replica_feed.next(p.replica.cm_root(), &json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
-        p.hub.follow("owner", &json!({"action":"set","dnd":true,"request_id":"quiet"}), &[]).unwrap();
-        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"Muted","request_id":"owner-muted"})).unwrap();
+        let cid = last_dm["event"]["conversation_id"].clone();
+        let event_id = last_dm["event_id"].as_str().unwrap();
+        assert!(p.hub.owner_message_notification(p.hub.published(event_id).unwrap()).is_some());
+        let page = p.hub.read("owner", &json!({"conversation":cid}), &[]).unwrap();
+        p.hub.read("owner", &json!({"conversation":cid,"ack_receipt":page["receipt"]}), &[]).unwrap();
+        assert!(p.hub.owner_message_notification(p.hub.published(event_id).unwrap()).is_none(), "read messages stay read");
         hub_feed.flush();
-        assert!(hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0,"cursor":first["cursor"]})).unwrap()["events"].as_array().unwrap().is_empty());
+        let before_quiet = hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0})).unwrap();
+        assert_eq!(p.hub.follow("owner", &json!({"action":"set","scope":{"conversation":cid},"muted":true,"request_id":"quiet-dm"}), &[]).unwrap()["revision"], 1);
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"Muted DM","request_id":"owner-muted"})).unwrap();
+        assert_eq!(p.hub.follow("owner", &json!({"action":"set","scope":{"channel":"general"},"muted":true,"expected_revision":1,"request_id":"quiet-channel"}), &[]).unwrap()["revision"], 2);
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Muted mention","mentions":["owner"],"request_id":"owner-muted-mention"})).unwrap();
+        assert_eq!(p.hub.follow("owner", &json!({"action":"set","dnd":true,"expected_revision":2,"request_id":"quiet-all"}), &[]).unwrap()["revision"], 3);
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":["owner",p.people[1].id],"body":"DND group","request_id":"owner-dnd"})).unwrap();
+        hub_feed.flush();
+        assert!(hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0,"cursor":before_quiet["cursor"]})).unwrap()["events"].as_array().unwrap().is_empty());
     }
     #[test]
     fn self_rename_preserves_identity_history_and_routing_across_replication_and_restart() {

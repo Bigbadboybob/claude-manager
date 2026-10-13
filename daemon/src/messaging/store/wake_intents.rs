@@ -16,7 +16,6 @@ impl Store {
     }
 
     pub(super) fn owner_message_notification(&self, e: &Published) -> Option<crate::owner_notifications::Notification> {
-        use crate::owner_availability::{self, Level, Urgency};
         if self.owner_notifications.is_none() || self.sync_enabled() && !self.is_coordinator()
             || !self.owner_inbox_notification(e) {
             return None;
@@ -27,8 +26,6 @@ impl Store {
         if !self.conversations.contains_key(cid) && !mention_recipients(&e.event).contains(&"owner") {
             return None;
         }
-        let level = self.owner_availability["level"].as_str().and_then(Level::parse);
-        if !owner_availability::delivers(level, Urgency::Fyi) { return None; }
         let place = self.channel_path_of(cid).map(|p| format!("#{p}")).unwrap_or_else(|| "DM".into());
         let sender = self.names.get(strv(&e.event["actor"], "id"))
             .map(|n| n.name.as_str()).unwrap_or_else(|| strv(&e.event["actor"], "name"));

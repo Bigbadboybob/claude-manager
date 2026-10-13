@@ -25,7 +25,7 @@ fn post(s: &mut Store, p: &Person, key: &str, extra: Value) -> Value {
         .clone()
 }
 #[test]
-fn scoped_mentions_stop_at_mention_and_owner_push_uses_shared_gate() {
+fn scoped_mentions_stop_at_mention_and_owner_push_ignores_availability() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut s, a, b) = setup(tmp.path());
     let feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
@@ -46,14 +46,14 @@ fn scoped_mentions_stop_at_mention_and_owner_push_uses_shared_gate() {
     let first = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap();
     assert_eq!(first["events"].as_array().unwrap().len(),1);
     assert!(first["events"][0]["url"].as_str().unwrap().starts_with("/#conversation="));
-    for (level, expected) in [("away",0),("around",0),("focused",1),("on-call",1)] {
+    for level in ["away", "around", "focused", "on-call", "unset"] {
         s.availability("owner",&json!({"action":"set","level":level,"request_id":level})).unwrap();
         feed.flush();
         let before = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap()["cursor"].clone();
         send(&mut s,level,json!({"mentions":["owner"]}));
         feed.flush();
         let result = feed.next(tmp.path(),&json!({"wait_ms":0,"cursor":before})).unwrap();
-        assert_eq!(result["events"].as_array().unwrap().len(),expected,"{level}");
+        assert_eq!(result["events"].as_array().unwrap().len(),1,"{level}");
     }
     feed.flush();
     let cursor = feed.next(tmp.path(),&json!({"wait_ms":0})).unwrap()["cursor"].clone();

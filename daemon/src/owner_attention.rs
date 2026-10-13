@@ -1,16 +1,13 @@
 //! Owner attention is separate from agent messaging and out-of-band escalation.
 //! Persist before broadcasting; manifest.watch replays pending alerts on reconnect.
 //!
-//! Every request is gated by Owner's availability level
-//! (`crate::owner_availability`): an alert whose urgency meets the level's bar
-//! is delivered as before; a lower one is HELD in a separate file (old viewers
-//! never see it, since `manifest.watch` snapshots only the delivered map) and
-//! released when Owner becomes more reachable. Unset delivers everything.
+//! Every request is delivered regardless of Owner's informational availability
+//! level. The legacy held queue is drained after upgrade.
 //! `escalate()`/`withdraw()` is the one interface daemon-side sources (the
 //! notification stall alarm, the outbox alarm, the work-item board) use.
 use crate::control::protocol::{Caller, ErrorCode, Request, Response};
 use crate::manifest::ManifestDiff;
-use crate::owner_availability::{self as availability, Level, Urgency};
+use crate::owner_availability::{self as availability, Urgency};
 use crate::state::DaemonState;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,7 +28,7 @@ pub struct Alert {
     /// When the request was held because Owner's level was below its urgency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_since: Option<String>,
-    /// Set when a level change released a held request into delivery.
+    /// Set when a legacy held request was released into delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<String>,
     /// Original request time; absent for alerts created before this field.
@@ -39,7 +36,7 @@ pub struct Alert {
     pub created_at: Option<String>,
 }
 
-/// A held request: the latest per key, plus how many were held in total.
+/// A legacy held request: the latest per key, plus the original count.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Held {
     pub alert: Alert,
@@ -117,16 +114,12 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn level_now(state: &DaemonState) -> Option<Level> {
-    availability::current(&state.messaging_root).0
-}
-
 fn broadcast(state: &DaemonState, key: &str, alert: Option<&Alert>) {
     if let Some(sync) = &state.messaging_sync {
         sync.signal_owner_alerts();
     }
-    // This boundary is reached only for delivered alerts (including releases
-    // from the existing availability gate). Web Push is a separate subscriber:
+    // This boundary includes newly delivered and legacy released alerts.
+    // Web Push is a separate subscriber:
     // it must not count as an attached viewer or change Telegram's policy.
     if let Some(alert) = alert {
         if let Err(e) = state.owner_notifications.publish(&state.messaging_root,
@@ -141,15 +134,12 @@ fn broadcast(state: &DaemonState, key: &str, alert: Option<&Alert>) {
     });
 }
 
-/// Out-of-band push (`notify_command`, e.g. Telegram) for an emergency, or —
-/// once Owner has set an availability level — for a delivered blocking
-/// request when no viewer is connected to show it. While the level is unset
-/// nothing but emergencies pushes, so behavior is unchanged until Owner opts
-/// in. Rate-limited per key so a misused `emergency` cannot spam the phone.
-fn maybe_push(state: &DaemonState, key: &str, alert: &Alert, urgency: Urgency, delivered: bool) {
+/// Out-of-band push (`notify_command`, e.g. Telegram): every emergency, and
+/// blocking requests when no viewer is connected. Availability is informational.
+/// Rate-limited per key so repeated requests cannot spam the phone.
+fn maybe_push(state: &DaemonState, key: &str, alert: &Alert, urgency: Urgency) {
     let viewer = state.manifest_watcher.subscriber_count() > 0;
-    let level_set = level_now(state).is_some();
-    if !(urgency == Urgency::Emergency || level_set && delivered && urgency >= Urgency::Blocking && !viewer) {
+    if !(urgency == Urgency::Emergency || urgency >= Urgency::Blocking && !viewer) {
         return;
     }
     static LAST: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
@@ -169,11 +159,10 @@ fn maybe_push(state: &DaemonState, key: &str, alert: &Alert, urgency: Urgency, d
     );
 }
 
-/// What happened to one gated request.
+/// What happened to one request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateOutcome {
     Delivered { alert_id: String },
-    Held { alert_id: String, release_when: Level },
     /// An alert is already pending under this key (an agent's own request is
     /// never displaced); retry after Owner acknowledges it.
     Coalesced { alert_id: String },
@@ -206,11 +195,11 @@ fn session_context(state: &DaemonState, uid: &str) -> (String, Option<String>, O
     }
 }
 
-/// Deliver or hold `alert` under `key` against the current level. A daemon
+/// Deliver `alert` under `key`, at every availability level. A daemon
 /// escalation (`replace = false`) never displaces a pending alert; an agent's
 /// own `notify_user` (`replace = true`) replaces its earlier pending one, as
 /// it always has.
-fn gate(
+fn deliver(
     state: &DaemonState,
     key: &str,
     mut alert: Alert,
@@ -224,40 +213,14 @@ fn gate(
     alert.urgency = Some(urgency.as_str().into());
     alert.label = truncate(&alert.label);
     alert.created_at.get_or_insert_with(now_rfc3339);
-    if availability::delivers(level_now(state), urgency) {
-        if alerts.len() >= MAX_ENTRIES && !alerts.contains_key(key) {
-            return Err("Owner alert queue is full; pending alerts were retained".into());
-        }
-        alerts.insert(key.to_owned(), alert.clone());
-        save(state, &alerts)?;
-        broadcast(state, key, Some(&alert));
-        maybe_push(state, key, &alert, urgency, true);
-        return Ok(GateOutcome::Delivered { alert_id: alert.id });
+    if alerts.len() >= MAX_ENTRIES && !alerts.contains_key(key) {
+        return Err("Owner alert queue is full; pending alerts were retained".into());
     }
-    let mut held = held_snapshot(state)?;
-    if let Some(h) = held.get(key).filter(|h| h.alert.message == alert.message) {
-        return Ok(GateOutcome::Held {
-            alert_id: h.alert.id.clone(),
-            release_when: availability::release_level(urgency),
-        });
-    }
-    if held.len() >= MAX_ENTRIES && !held.contains_key(key) {
-        return Err("Held Owner request store is full; existing requests were retained".into());
-    }
-    alert.held_since = Some(now_rfc3339());
-    let count = held.get(key).map_or(1, |h| h.count.saturating_add(1));
-    // Keep the most urgent pending urgency for the key, so a later fyi never
-    // downgrades a held blocking request.
-    if let Some(prev) = held.get(key).and_then(|h| h.alert.urgency.as_deref()).and_then(Urgency::parse) {
-        if prev > urgency {
-            alert.urgency = Some(prev.as_str().into());
-        }
-    }
-    let id = alert.id.clone();
-    held.insert(key.to_owned(), Held { alert, count });
-    save_held(state, &held)?;
-    maybe_push(state, key, &held[key].alert, urgency, false);
-    Ok(GateOutcome::Held { alert_id: id, release_when: availability::release_level(urgency) })
+    alerts.insert(key.to_owned(), alert.clone());
+    save(state, &alerts)?;
+    broadcast(state, key, Some(&alert));
+    maybe_push(state, key, &alert, urgency);
+    Ok(GateOutcome::Delivered { alert_id: alert.id })
 }
 
 /// The shared escalation interface (stall alarm, outbox alarm, board).
@@ -275,7 +238,7 @@ pub fn escalate(state: &DaemonState, e: Escalation) -> Result<GateOutcome, Strin
         continuous_task_id,
         ..Alert::default()
     };
-    gate(state, &e.dedupe_key, alert, e.urgency, false)
+    deliver(state, &e.dedupe_key, alert, e.urgency, false)
 }
 
 /// Withdraw an escalation once its condition cleared, delivered or held. The
@@ -385,7 +348,7 @@ pub fn notify(state: &DaemonState, req: &Request) -> Response {
         continuous_task_id,
         ..Alert::default()
     };
-    let outcome = match gate(state, uid, alert, urgency, true) {
+    let outcome = match deliver(state, uid, alert, urgency, true) {
         Ok(o) => o,
         Err(e) => return Response::err(req.id.clone(), ErrorCode::Internal, e),
     };
@@ -393,12 +356,6 @@ pub fn notify(state: &DaemonState, req: &Request) -> Response {
         GateOutcome::Delivered { alert_id } | GateOutcome::Coalesced { alert_id } => json!({
             "ok": true, "status": "queued", "delivery": "immediate", "alert_id": alert_id,
             "urgency": urgency.as_str(), "owner_availability": availability_json(state),
-        }),
-        GateOutcome::Held { alert_id, release_when } => json!({
-            "ok": true, "status": "queued", "delivery": "held", "alert_id": alert_id,
-            "urgency": urgency.as_str(), "release_when": release_when.as_str(),
-            "owner_availability": availability_json(state),
-            "note": format!("Owner's availability is below this urgency, so the request is held, not lost. Keep working; you will be woken when Owner reaches '{}' or above and it is delivered.", release_when.as_str()),
         }),
     };
     Response::ok(req.id.clone(), result)
@@ -418,7 +375,7 @@ pub fn raise_system(state: &DaemonState, uid: &str, message: &str) -> Result<Opt
         task_id: None,
     };
     Ok(match escalate(state, e)? {
-        GateOutcome::Delivered { alert_id } | GateOutcome::Held { alert_id, .. } => Some(alert_id),
+        GateOutcome::Delivered { alert_id } => Some(alert_id),
         GateOutcome::Coalesced { .. } => None,
     })
 }
@@ -428,18 +385,16 @@ pub fn clear_system(state: &DaemonState, uid: &str, alert_id: &str) -> Result<bo
     withdraw(state, uid, alert_id)
 }
 
-/// Per-key result of a level change: requests released into delivery, and
-/// requests still held.
+/// Per-session counts of legacy requests released into delivery.
 #[derive(Default, Debug)]
 pub struct ReleaseOutcome {
     pub released: BTreeMap<String, usize>,
-    pub still_held: BTreeMap<String, usize>,
 }
 
-/// Move held requests the level now delivers into the delivered map, marked
-/// `released_at`. A key with a pending alert gets the held text merged in (a
-/// new alert ID, so the viewer notices) up to the 4096-byte limit.
-pub fn release_for_level(state: &DaemonState, level: Option<Level>) -> Result<ReleaseOutcome, String> {
+/// Move all legacy held requests into the delivered map, marked `released_at`.
+/// A key with a pending alert keeps its ID and gets the held text merged in,
+/// up to the 4096-byte limit.
+pub fn release_held(state: &DaemonState) -> Result<ReleaseOutcome, String> {
     let mut held = held_snapshot(state)?;
     let mut out = ReleaseOutcome::default();
     if held.is_empty() {
@@ -449,11 +404,6 @@ pub fn release_for_level(state: &DaemonState, level: Option<Level>) -> Result<Re
     let now = now_rfc3339();
     let mut changed = Vec::new();
     held.retain(|key, h| {
-        let urgency = h.alert.urgency.as_deref().and_then(Urgency::parse).unwrap_or(Urgency::Decision);
-        if !availability::delivers(level, urgency) {
-            out.still_held.insert(h.alert.session_uid.clone(), h.count as usize);
-            return true;
-        }
         let mut released = h.alert.clone();
         released.released_at = Some(now.clone());
         if h.count > 1 {
@@ -488,7 +438,7 @@ pub fn release_for_level(state: &DaemonState, level: Option<Level>) -> Result<Re
     for key in &changed {
         broadcast(state, key, alerts.get(key));
         let urgency = alerts[key].urgency.as_deref().and_then(Urgency::parse).unwrap_or(Urgency::Decision);
-        maybe_push(state, key, &alerts[key], urgency, true);
+        maybe_push(state, key, &alerts[key], urgency);
     }
     Ok(out)
 }
@@ -506,7 +456,7 @@ struct EscalateParams {
 
 /// `owner_attention.escalate` (Operator-only, gated in dispatch): lets an
 /// evaluator outside this daemon (the planning API's board, another host)
-/// use the same gate.
+/// use the same delivery path.
 pub fn escalate_rpc(state: &DaemonState, req: &Request) -> Response {
     let p: EscalateParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
@@ -554,9 +504,6 @@ pub fn withdraw_rpc(state: &DaemonState, req: &Request) -> Response {
 fn outcome_json(o: &GateOutcome) -> serde_json::Value {
     match o {
         GateOutcome::Delivered { alert_id } => json!({"delivery":"immediate","alert_id":alert_id}),
-        GateOutcome::Held { alert_id, release_when } => {
-            json!({"delivery":"held","alert_id":alert_id,"release_when":release_when.as_str()})
-        }
         GateOutcome::Coalesced { alert_id } => json!({"delivery":"coalesced","alert_id":alert_id}),
     }
 }
@@ -633,16 +580,28 @@ mod tests {
     fn held(state: &Arc<Mutex<DaemonState>>) -> BTreeMap<String, Held> {
         held_snapshot(&state.lock().unwrap()).unwrap()
     }
+    // Model the exact on-disk format written by pre-upgrade daemons.
+    fn seed_held(state: &Arc<Mutex<DaemonState>>, uid: &str, message: &str, urgency: &str, count: u32) -> String {
+        let s = state.lock().unwrap();
+        let id = format!("legacy-{uid}");
+        let mut old = held_snapshot(&s).unwrap();
+        old.insert(uid.into(), Held { alert: Alert {
+            id: id.clone(), session_uid: uid.into(), label: uid.into(),
+            message: message.into(), urgency: Some(urgency.into()),
+            held_since: Some("2026-10-12T12:00:00Z".into()),
+            created_at: Some("2026-10-12T12:00:00Z".into()),
+            ..Alert::default()
+        }, count });
+        save_held(&s, &old).unwrap();
+        id
+    }
     #[test]
-    fn web_feed_receives_delivered_and_released_alerts_but_not_held_or_seen() {
+    fn web_feed_receives_alerts_while_away_without_replaying_seen_alerts() {
         let _guard = crate::test_support::env_lock();
         let (dir,state) = fixture(); local(&state);
         let feed = state.lock().unwrap().owner_notifications.clone();
         set_level(&state,Some("away"),"away");
         notify_with(&state,"local","please decide","decision");
-        feed.flush();
-        assert!(feed.next(dir.path(),&json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
-        release_for_level(&state.lock().unwrap(),Some(Level::Around)).unwrap();
         feed.flush();
         let page = feed.next(dir.path(),&json!({"wait_ms":0})).unwrap();
         assert_eq!(page["events"].as_array().unwrap().len(),1);
@@ -660,34 +619,29 @@ mod tests {
         }
     }
     #[test]
-    fn gate_matrix_delivers_or_holds_per_level_and_urgency() {
+    fn every_level_delivers_every_urgency_to_viewers_and_web_without_holding() {
         let _guard = crate::test_support::env_lock();
-        let (_dir, state) = fixture();
+        let (dir, state) = fixture();
         local(&state);
-        for (level, delivered) in [
-            (None, ["fyi", "decision", "blocking", "emergency"].as_slice()),
-            (Some("on-call"), &["fyi", "decision", "blocking", "emergency"]),
-            (Some("focused"), &["fyi", "decision", "blocking", "emergency"]),
-            (Some("around"), &["decision", "blocking", "emergency"]),
-            (Some("away"), &["emergency"]),
-        ] {
+        let (watcher, _subscription) = state.lock().unwrap().manifest_watcher.subscribe();
+        let feed = state.lock().unwrap().owner_notifications.clone();
+        for level in [None, Some("on-call"), Some("focused"), Some("around"), Some("away")] {
             set_level(&state, level, "rev");
             for urgency in ["fyi", "decision", "blocking", "emergency"] {
-                let p = path(&state.lock().unwrap());
-                let _ = std::fs::remove_file(&p);
-                let _ = std::fs::remove_file(p.with_file_name("owner-attention-held.json"));
-                let r = notify_with(&state, "local", &format!("{level:?} {urgency}"), urgency);
-                let expect = if delivered.contains(&urgency) { "immediate" } else { "held" };
-                assert_eq!(r["delivery"], expect, "{level:?} {urgency}");
+                let message = format!("{level:?} {urgency}");
+                let r = notify_with(&state, "local", &message, urgency);
+                assert_eq!(r["delivery"], "immediate", "{level:?} {urgency}");
                 assert_eq!(r["urgency"], urgency);
                 assert_eq!(r["status"], "queued");
-                if expect == "held" {
-                    assert!(r["release_when"].is_string());
-                    assert!(snapshot(&state.lock().unwrap()).unwrap().is_empty(), "held alerts never reach the viewer map");
-                    assert_eq!(held(&state)["local"].alert.message, format!("{level:?} {urgency}"));
-                }
+                assert_eq!(r["owner_availability"]["level"], json!(level));
+                assert!(r.get("release_when").is_none());
+                assert_eq!(snapshot(&state.lock().unwrap()).unwrap()["local"].message, message);
+                assert!(held(&state).is_empty());
+                assert!(watcher.try_recv().is_ok(), "viewer receives {message}");
             }
         }
+        feed.flush();
+        assert_eq!(feed.next(dir.path(), &json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().len(), 20);
         // Default urgency is decision; an unknown one is refused.
         set_level(&state, Some("focused"), "rev2");
         let r = dispatch_request(&state, &request("notify_user", Caller::session("local"), serde_json::json!({"message":"x"}))).into_response();
@@ -696,37 +650,28 @@ mod tests {
         assert_eq!(r.error.unwrap().code, ErrorCode::InvalidParams);
     }
     #[test]
-    fn held_requests_coalesce_count_and_release_merged_on_a_level_change() {
+    fn legacy_held_requests_release_while_away_and_preserve_pending_identity_and_urgency() {
         let _guard = crate::test_support::env_lock();
         let (_dir, state) = fixture();
         local(&state);
         set_level(&state, Some("away"), "r1");
-        let first = notify_with(&state, "local", "pick a schema", "decision");
-        assert_eq!(notify_with(&state, "local", "pick a schema", "decision")["alert_id"], first["alert_id"]);
-        notify_with(&state, "local", "also: rename?", "fyi");
-        let h = held(&state);
-        assert_eq!(h["local"].count, 2);
-        assert_eq!(h["local"].alert.urgency.as_deref(), Some("decision"), "a later fyi never downgrades");
-        // An emergency still gets through, and stays pending for the merge.
+        seed_held(&state, "local", "also: rename?", "decision", 2);
         let emergency = notify_with(&state, "local", "prod down", "emergency");
-        // away: decision still held.
-        let out = release_for_level(&state.lock().unwrap(), Some(Level::Away)).unwrap();
-        assert!(out.released.is_empty());
-        assert_eq!(out.still_held["local"], 2);
-        // around: released into the delivered map, merged with the pending one.
-        let out = release_for_level(&state.lock().unwrap(), Some(Level::Around)).unwrap();
+        let out = release_held(&state.lock().unwrap()).unwrap();
         assert_eq!(out.released["local"], 2);
         let alerts = snapshot(&state.lock().unwrap()).unwrap();
         let a = &alerts["local"];
         assert!(a.released_at.is_some());
-        assert_eq!(a.urgency.as_deref(), Some("emergency"), "the newer, higher urgency is kept");
-        assert_eq!(serde_json::json!(a.id), emergency["alert_id"], "a merge keeps the pending alert's id");
+        assert_eq!(a.urgency.as_deref(), Some("emergency"));
+        assert_eq!(json!(a.id), emergency["alert_id"], "a merge keeps the pending alert's id");
         assert!(a.message.starts_with("prod down") && a.message.contains("[released] also: rename?"), "{}", a.message);
         assert!(a.message.contains("2 requests held"));
         assert!(held(&state).is_empty());
+        assert!(release_held(&state.lock().unwrap()).unwrap().released.is_empty());
+        assert_eq!(snapshot(&state.lock().unwrap()).unwrap(), alerts, "retries do not append again");
     }
     #[test]
-    fn escalate_holds_coalesces_and_withdraws() {
+    fn escalate_delivers_coalesces_and_withdraws_while_away() {
         let _guard = crate::test_support::env_lock();
         let (_dir, state) = fixture();
         local(&state);
@@ -739,13 +684,6 @@ mod tests {
             task_id: Some("t".into()),
         };
         set_level(&state, Some("away"), "r1");
-        let s = state.lock().unwrap();
-        let GateOutcome::Held { alert_id, release_when } = escalate(&s, esc(Urgency::Blocking)).unwrap() else { panic!() };
-        assert_eq!(release_when, Level::Around);
-        assert!(withdraw(&s, "board:b1", &alert_id).unwrap());
-        assert!(held_snapshot(&s).unwrap().is_empty());
-        drop(s);
-        set_level(&state, None, "r2");
         let s = state.lock().unwrap();
         let GateOutcome::Delivered { alert_id } = escalate(&s, esc(Urgency::Decision)).unwrap() else { panic!() };
         assert_eq!(snapshot(&s).unwrap()["board:b1"].label, "board:b1");
@@ -790,51 +728,85 @@ mod tests {
             state.lock().unwrap().tui_sessions.insert(uid.into(),
                 serde_json::from_value(serde_json::json!({"uid":uid,"label":"Blocker"})).unwrap());
         }
-        // Unset level: no new pushes beyond emergencies (behavior unchanged).
+        // Unset and away have the same no-viewer blocking fallback as on-call.
         set_level(&state, None, "r2");
         notify_with(&state, "push-b", "need creds", "blocking");
-        assert!(!pushes().contains("need creds"));
-        // Once Owner set a level, an unwatched delivered blocking request pushes.
-        set_level(&state, Some("on-call"), "r3");
+        assert!(pushes().contains("need creds"));
+        set_level(&state, Some("away"), "r3");
         notify_with(&state, "push-c", "need keys", "blocking");
         assert!(pushes().contains("[blocking] Blocker: need keys"));
+        let (_receiver, _subscription) = state.lock().unwrap().manifest_watcher.subscribe();
+        state.lock().unwrap().tui_sessions.insert("push-viewer".into(),
+            serde_json::from_value(json!({"uid":"push-viewer","label":"Watched"})).unwrap());
+        notify_with(&state, "push-viewer", "viewer handles blocking", "blocking");
+        assert!(!pushes().contains("viewer handles blocking"));
+        notify_with(&state, "push-viewer", "emergency despite viewer", "emergency");
+        assert!(pushes().contains("emergency despite viewer"));
+
     }
     #[test]
-    fn level_change_releases_and_wakes_holders_once_per_revision() {
+    fn legacy_release_keeps_requests_when_the_delivered_store_is_unavailable() {
         let _guard = crate::test_support::env_lock();
-        let (dir, state) = fixture();
-        cloud(&state, false);
-        set_level(&state, Some("away"), "r1");
-        // First run adopts the current level silently.
-        crate::owner_availability::tick(&state);
-        let root = dir.path().to_path_buf();
-        let wakes = || crate::notifications::snapshot(&root, "cloud").map(|(e, _)| e).unwrap_or_default();
-        assert!(wakes().is_empty());
-        let r = notify_with(&state, "cloud", "which region?", "decision");
-        assert_eq!(r["delivery"], "held");
-        set_level(&state, Some("focused"), "r2");
-        crate::owner_availability::tick(&state);
-        assert_eq!(snapshot(&state.lock().unwrap()).unwrap()["cloud"].message, "which region?");
-        let events = wakes();
-        assert_eq!(events.len(), 1);
-        let text = events[0]["text"].as_str().unwrap();
-        assert!(text.contains("away→focused") && text.contains("1 of your requests were released"), "{text}");
-        // The marker is in the text, so the consumer can confirm delivery
-        // (without it the notice stayed `submitted` and paged Owner).
-        let marker = events[0]["marker"].as_str().unwrap();
-        assert!(marker.starts_with("[cm-owner-availability ") && text.starts_with(marker), "{text}");
-        // Unchanged revision: no second wake.
-        crate::owner_availability::tick(&state);
-        assert_eq!(wakes().len(), 1);
-        // Re-setting the same level is a new revision but no change: no wake.
-        set_level(&state, Some("focused"), "r3");
-        crate::owner_availability::tick(&state);
-        assert_eq!(wakes().len(), 1);
-        // A real change with nothing held or released wakes nobody: agents
-        // read the level from ping() when they need it.
-        set_level(&state, Some("on-call"), "r4");
-        crate::owner_availability::tick(&state);
-        assert_eq!(wakes().len(), 1);
+        let (_dir, state) = fixture();
+        set_level(&state, Some("away"), "same-revision");
+        for urgency in ["fyi", "decision", "blocking", "emergency"] {
+            seed_held(&state, urgency, &format!("old {urgency}"), urgency, 1);
+        }
+        let s = state.lock().unwrap();
+        let before = std::fs::read(held_path(&s)).unwrap();
+        std::fs::create_dir(path(&s)).unwrap();
+        assert!(release_held(&s).is_err());
+        assert_eq!(std::fs::read(held_path(&s)).unwrap(), before);
+        std::fs::remove_dir(path(&s)).unwrap();
+        let released = release_held(&s).unwrap();
+        assert_eq!(released.released.len(), 4);
+        assert!(held_snapshot(&s).unwrap().is_empty());
+        for (key, alert) in snapshot(&s).unwrap() {
+            assert_eq!(alert.urgency.as_deref(), Some(key.as_str()));
+            assert!(alert.released_at.is_some());
+        }
+    }
+    #[test]
+    fn upgrade_releases_held_on_an_unchanged_revision_once_and_level_changes_never_wake() {
+        let _guard = crate::test_support::env_lock();
+        // Both a previous daemon's applied checkpoint and a missing checkpoint
+        // must drain the old file; neither requires a new availability event.
+        for prior_checkpoint in [false, true] {
+            let (dir, state) = fixture();
+            cloud(&state, false);
+            set_level(&state, Some("away"), "r1");
+            if prior_checkpoint {
+                std::fs::write(dir.path().join("owner-availability-applied.json"),
+                    json!({"level":"away","event_id":"r1"}).to_string()).unwrap();
+            }
+            let id = seed_held(&state, "cloud", "which region?", "decision", 1);
+            let root = dir.path().to_path_buf();
+            let wakes = || crate::notifications::snapshot(&root, "cloud").map(|(e, _)| e).unwrap_or_default();
+            let feed = state.lock().unwrap().owner_notifications.clone();
+            crate::owner_availability::tick(&state);
+            let alerts = snapshot(&state.lock().unwrap()).unwrap();
+            assert_eq!(alerts["cloud"].id, id);
+            assert_eq!(alerts["cloud"].message, "which region?");
+            assert_eq!(alerts["cloud"].created_at.as_deref(), Some("2026-10-12T12:00:00Z"));
+            assert!(alerts["cloud"].released_at.is_some());
+            assert!(held(&state).is_empty());
+            feed.flush();
+            assert_eq!(feed.next(dir.path(), &json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().len(), 1);
+            let events = wakes();
+            assert_eq!(events.len(), 1);
+            let text = events[0]["text"].as_str().unwrap();
+            assert!(text.contains("1 of your previously held requests were released"), "{text}");
+            let marker = events[0]["marker"].as_str().unwrap();
+            assert_eq!(marker, "[cm-owner-alerts-unfiltered]");
+            assert!(text.starts_with(marker));
+            crate::owner_availability::tick(&state);
+            set_level(&state, Some("focused"), "r2");
+            crate::owner_availability::tick(&state);
+            assert_eq!(wakes().len(), 1);
+            assert_eq!(snapshot(&state.lock().unwrap()).unwrap(), alerts);
+            let applied: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("owner-availability-applied.json")).unwrap()).unwrap();
+            assert_eq!(applied["unfiltered_notifications"], true);
+        }
     }
     fn request(method: &str, caller: Caller, params: serde_json::Value) -> Request {
         Request {

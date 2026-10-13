@@ -135,11 +135,10 @@ mention wake you; do not poll in a loop.
   the message or file, and an honest urgency (`fyi`, `decision`, `blocking`,
   `emergency`) when Owner action is needed. Ask only when it really needs
   Owner; decisions inside the authorized task are yours to make.
-- Check `ping().owner_availability.level` first: `away` (emergencies only),
-  `around` (decisions and above), `focused` (everything), `on-call`
-  (everything); null means Owner has not set one. A request below the bar comes
-  back `delivery="held"`: keep working on what you can; you are woken when it
-  is released.
+- `ping().owner_availability.level` is informational (`away`, `around`,
+  `focused`, `on-call`, or null when unset). Notifications deliver at every
+  level; availability never holds, drops or downgrades them. Keep urgency
+  honest and respect explicit conversation mutes, DND and read state.
 - Do not DM or mention Owner for visibility. The `needs-owner` tag marks a
   nonurgent item for later review and does not notify.
 
