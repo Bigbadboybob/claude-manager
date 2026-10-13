@@ -21,6 +21,7 @@ import time
 from mcp_server import control_client
 from mcp_server.transcripts import claude_code as transcripts_claude
 from mcp_server.transcripts import codex as transcripts_codex
+from mcp_server.transcripts import stream as transcript_stream
 from mcp_server.transcripts.types import Role
 
 
@@ -394,6 +395,12 @@ def _read_all_messages(engine: str, path: str, generation: int):
     )
 
 
+def last_assistant_message(engine: str, path: str | None) -> dict | None:
+    """The transcript's last assistant message with visible text, read
+    backwards in bounded chunks."""
+    return transcript_stream.last_assistant(path, _parser_for(engine).render_message)
+
+
 def _last_assistant(messages) -> dict | None:
     """The last assistant message with visible text in `messages` as a
     dict, or None. Whitespace-only messages are skipped so an empty
@@ -456,8 +463,10 @@ def _monitor_completed_entry(
     last_message = None
     if include_message and transcript_path is not None and not no_turn:
         try:
-            msgs, _ = _read_all_messages(engine, transcript_path, generation)
-            last_message = _last_assistant(msgs)
+            # Backward scan, not a full parse: completions run in executor
+            # threads, and a whole large transcript per completion grew the
+            # MCP server to GBs (2026-10-13).
+            last_message = last_assistant_message(engine, transcript_path)
         except OSError:
             last_message = None
     entry = {

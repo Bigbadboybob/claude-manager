@@ -44,13 +44,11 @@ def read_messages(
     since: Optional[str],
     limit: int = 20,
 ) -> tuple[list[Message], str]:
-    start_offset, gen = resolve_offset(generation, since)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            contents = f.read()
-    except (OSError, FileNotFoundError):
-        return [], format_cursor(gen, start_offset)
-    return parse_lines(contents, start_offset, limit, gen)
+    # Streams line by line (see transcripts/stream.py): a whole-file read
+    # of a large transcript pinned hundreds of MB per MCP worker thread.
+    from . import stream
+
+    return stream.read_messages(path, generation, since, limit, render_message)
 
 
 def render_message(v: dict) -> Optional[Message]:
