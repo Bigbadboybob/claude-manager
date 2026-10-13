@@ -157,7 +157,17 @@ fn expire_latches(q: &mut Queue, now: u64) -> bool {
 fn queue_path(root: &Path, uid: &str) -> PathBuf {
     root.join("_delivery").join(format!("{}.json", digest(uid)))
 }
+#[cfg(test)]
+thread_local! {
+    static QUEUE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(super) fn queue_load_count() -> usize {
+    QUEUE_LOADS.with(|count| count.get())
+}
 fn load(path: &Path) -> io::Result<Queue> {
+    #[cfg(test)]
+    QUEUE_LOADS.with(|count| count.set(count.get() + 1));
     match fs::read(path) {
         Ok(b) => {
             let mut value: Value = serde_json::from_slice(&b)?;
