@@ -287,8 +287,10 @@ UUID and queue key are returned separately; web `key` is opaque and namespaced.
 Each host keeps `~/.cm/owner-alert-relay.json` (private atomic checkpoint). It
 holds a durable source snapshot generation/revision, plus (on the hub) cached
 origin snapshots and pending exact-ID Seen requests. Bound: 16 origins, 4096
-alerts / 600 KiB per snapshot, 8 MiB total checkpoint; oversize or corrupt data
-fails with an error and retains prior state. Do not delete this file to clear an
+alerts / 600 KiB per snapshot, and a total checkpoint budget for 16 full
+snapshots plus their full Seen maps and the local source (about 20 MiB).
+Oversize or corrupt data retains prior state; the alert lane logs and backs
+off 10–120 seconds while ordinary chat synchronization continues. Do not delete this file to clear an
 alert: use Seen at the hub or the existing local acknowledgement. Restore it
 with the host's matching identity/state during disaster recovery.
 
@@ -306,3 +308,23 @@ replayed snapshots do not repush. This retains the core best-effort crash gap an
 bounded feed behavior. A source alert created and removed entirely while offline
 will not reach the hub. Telegram and per-host TUI manifests are unchanged. Legacy
 alerts keep unknown creation times rather than receiving misleading new ages.
+
+
+Alert snapshots now receive accepted/retry/resync results. A lower or conflicting
+revision asks the source to persist a new generation; duplicate requests for an
+old generation are harmless. Local snapshot failures, invalid incoming alerts,
+Seen application failures and hub checkpoint errors are confined to the alert
+lane and retry with capped backoff. An actual socket write failure still closes
+the unusable shared connection. Pending Seen is resent until the source removes
+its exact ID. Hub alert work runs on alert-version changes or bounded ten-second
+reconciliation, not on each chat signal. Snapshot file reads happen after the
+daemon registry lock is released. Removed Owner-authorized origins are pruned
+when the hub lists or ingests alerts, freeing their cache slots.
+
+On an origin's first ingest, pending alerts older than 15 minutes (or without a
+known creation time) populate the list without sending a burst of old pushes.
+Recent first-ingest alerts and new IDs on established origins retain normal
+push behavior. Labels are capped at 4096 UTF-8 bytes at the source, including
+legacy queued labels when projecting a snapshot. If alert metadata is unavailable,
+bootstrap returns `features.alert_hosts: []` while chat and availability remain
+usable; the dedicated alerts view still reports its own error.

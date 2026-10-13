@@ -1353,3 +1353,121 @@ fn messaging_sync_owner_alert_feature_requires_owner_access_and_rejects_unnegoti
         }
     }
 }
+
+#[test]
+fn messaging_sync_bad_alert_frame_does_not_disconnect_or_block_chat_upload() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    b.lock().unwrap().messaging_sync.take().unwrap().stop();
+    let local_root = b.lock().unwrap().messaging_root.clone();
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let config = Config::load(&local_root).unwrap().unwrap();
+    let token = fs::read_to_string(config.token_file.unwrap()).unwrap();
+    let (host, space) = with_store(b, |s| (s.daemon_id.clone(), s.space_id.clone()));
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(root.join("messaging-sync.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_frame(
+        &mut socket,
+        &json!({"kind":"hello","daemon_id":host,"space_id":space,"token":token,
+        "people":[],"interests":["general"],"resume":null,"features":[transport::FEATURE_ALERTS]}),
+    );
+    assert_eq!(
+        receive_frame(&mut socket)["features"],
+        json!([transport::FEATURE_ALERTS])
+    );
+    // Oversized label is a real review failure, not a malformed outer transport.
+    send_frame(
+        &mut socket,
+        &json!({"kind":"owner_alert_snapshot","snapshot":{
+        "version":1,"generation":uuid::Uuid::new_v4().to_string(),"revision":1,"host_label":"sessions",
+        "alerts":{"bad":{"id":"bad","session_uid":"client-1","label":"x".repeat(4097),"message":"bad",
+            "task_id":null,"continuous_task_id":null}}}}),
+    );
+    let sent = call(
+        b,
+        "client-1",
+        "send",
+        json!({"channel":"general","body":"Chat survives bad alert","request_id":"after-bad-alert"}),
+    );
+    let id = sent["event_id"].as_str().unwrap();
+    let wire = with_store(b, |s| {
+        s.pending_uploads(64)
+            .unwrap()
+            .into_iter()
+            .find(|v| {
+                serde_json::from_str::<Value>(v["event"].as_str().unwrap()).unwrap()["id"] == id
+            })
+            .unwrap()
+    });
+    send_frame(&mut socket, &json!({"kind":"upload","id":id,"wire":wire}));
+    let (mut retry, mut receipt) = (false, false);
+    while !retry || !receipt {
+        let frame = receive_frame(&mut socket);
+        match frame["kind"].as_str() {
+            Some("owner_alert_result") => {
+                assert_eq!(frame["status"], "retry");
+                retry = true;
+            }
+            Some("receipt") => {
+                assert_eq!(frame["id"], id);
+                receipt = true;
+            }
+            Some("batch") => send_frame(
+                &mut socket,
+                &json!({"kind":"ack","revision":frame["revision"],"cursor":frame["page"]["cursor"],"dependency_offset":frame["page"]["dependency_offset"]}),
+            ),
+            _ => {}
+        }
+    }
+    wait_for(|| with_store(&n.clients[0], |s| s.wire_event(id).is_ok()));
+    // The same socket still answers after the bad frame and successful upload.
+    send_frame(&mut socket, &json!({"kind":"ping","people":[]}));
+    loop {
+        let frame = receive_frame(&mut socket);
+        if frame["kind"] == "pong" {
+            break;
+        }
+    }
+}
+
+#[test]
+fn messaging_sync_alert_rollback_resync_and_source_storage_failure_leave_chat_alive() {
+    let n = Network::new();
+    let a = &n.clients[0];
+    let runtime = { a.lock().unwrap().messaging_sync.clone().unwrap() };
+    let source_root = a.lock().unwrap().messaging_root.clone();
+    let origin = with_store(a, |s| s.daemon_id.clone());
+    let mut newer = runtime.alert_snapshot().unwrap();
+    let generation = newer.generation.clone();
+    newer.revision += 2;
+    let (relay, root) = {
+        let hub = n.hub.lock().unwrap();
+        (hub.owner_alert_relay.clone(), hub.messaging_root.clone())
+    };
+    relay.ingest(&root, &origin, newer).unwrap();
+    a.lock().unwrap().messaging_sync.take().unwrap().stop();
+    start(a);
+    let runtime = { a.lock().unwrap().messaging_sync.clone().unwrap() };
+    wait_for(|| runtime.alert_snapshot().unwrap().generation != generation);
+    assert!(runtime.connected.load(Ordering::Acquire));
+    // Local alert-file corruption must not poison the normal upload loop.
+    fs::write(
+        source_root.join("owner-attention.json"),
+        b"broken-alert-json",
+    )
+    .unwrap();
+    runtime.signal_owner_alerts();
+    let sent = call(
+        a,
+        "client-0",
+        "send",
+        json!({"channel":"general","body":"Chat survives alert file error","request_id":"after-alert-file-error"}),
+    );
+    let id = sent["event_id"].as_str().unwrap();
+    wait_for(|| with_store(&n.clients[1], |s| s.wire_event(id).is_ok()));
+    assert!(runtime.connected.load(Ordering::Acquire));
+    fs::write(source_root.join("owner-attention.json"), b"{}").unwrap();
+}

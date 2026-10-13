@@ -462,6 +462,48 @@ pub(super) fn serve(runtime: Arc<Runtime>) -> Result<()> {
         })?;
     Ok(())
 }
+// Alert failures never terminate chat. Transport write failures still do:
+// the shared byte stream itself is unusable in that case.
+#[derive(Default)]
+struct AlertBackoff {
+    failures: u32,
+    until: Option<Instant>,
+}
+impl AlertBackoff {
+    fn ready(&self) -> bool {
+        self.until.is_none_or(|t| Instant::now() >= t)
+    }
+    fn failed(&mut self, message: &str) {
+        self.failures = self.failures.saturating_add(1);
+        let secs = (10u64 << self.failures.saturating_sub(1).min(4)).min(120);
+        self.until = Some(Instant::now() + Duration::from_secs(secs));
+        eprintln!("cm Owner alert relay (retry in {secs}s): {message}");
+    }
+    fn succeeded(&mut self) {
+        self.failures = 0;
+        self.until = None;
+    }
+}
+#[derive(Default)]
+struct AlertProgress {
+    accepted: Option<(String, u64)>,
+    reset: Option<String>,
+    retry: AlertBackoff,
+}
+fn alert_marker(frame: &Value) -> Option<(String, u64)> {
+    let generation = frame["generation"].as_str()?;
+    uuid::Uuid::parse_str(generation).ok()?;
+    let revision = frame["revision"].as_u64().filter(|n| *n > 0)?;
+    Some((generation.into(), revision))
+}
+#[derive(Default)]
+struct AlertPush {
+    version: Option<u64>,
+    checked: Option<Instant>,
+    last: Value,
+    retry: AlertBackoff,
+}
+
 fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
     let timer = stream.try_clone()?;
     let mut link = unix_link(stream)?;
@@ -608,6 +650,7 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
             cloned.signal.signal();
         })?;
     let result = (|| {
+        let mut alert_retry = AlertBackoff::default();
         while !runtime.stopped.load(Ordering::Acquire)
             && !link.connection.closed.load(Ordering::Acquire)
         {
@@ -619,7 +662,18 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                     if !current {
                         return Err(error("stale_connection", "Replaced alert peer connection"));
                     }
-                    runtime.accept_alert_snapshot(&host, &frame)?;
+                    let status = if !alert_retry.ready() { "retry" } else {
+                        match runtime.accept_alert_snapshot(&host, &frame) {
+                            Ok(()) => { alert_retry.succeeded(); "accepted" }
+                            Err(e) => {
+                                alert_retry.failed(&format!("Snapshot rejected ({})", e.code));
+                                if e.code == "alert_resync" { "resync" } else { "retry" }
+                            }
+                        }
+                    };
+                    write_frame(&link.connection.writer, &json!({"kind":"owner_alert_result",
+                        "generation":frame["snapshot"]["generation"],
+                        "revision":frame["snapshot"]["revision"],"status":status}))?;
                 }
                 "ack" => {
                     let cursor = frame["cursor"]
@@ -911,16 +965,34 @@ fn push_alert_seen(
     runtime: &Runtime,
     host: &str,
     conn: &PeerConnection,
-    last: &mut Value,
+    push: &mut AlertPush,
 ) -> Result<()> {
-    let items = json!(runtime.alert_seen_pending(host)?);
-    if *last != items {
+    let version = runtime.owner_alert_version.load(Ordering::Acquire);
+    let periodic = push
+        .checked
+        .is_none_or(|t| t.elapsed() >= Duration::from_secs(10));
+    if !push.retry.ready() || (push.version == Some(version) && !periodic) {
+        return Ok(());
+    }
+    // One read on alert changes, otherwise bounded reconciliation/retry. A
+    // busy chat stream cannot make this take registry/store/relay locks again.
+    push.version = Some(version);
+    push.checked = Some(Instant::now());
+    let items = match runtime.alert_seen_pending(host) {
+        Ok(items) => json!(items),
+        Err(e) => {
+            push.retry.failed(&format!("Seen relay unavailable ({})", e.code));
+            return Ok(());
+        }
+    };
+    if push.last != items || periodic && items.as_array().is_some_and(|v| !v.is_empty()) {
         write_frame(
             &conn.writer,
             &json!({"kind":"owner_alert_seen","items":items}),
         )?;
-        *last = items;
+        push.last = items;
     }
+    push.retry.succeeded();
     Ok(())
 }
 
@@ -940,11 +1012,11 @@ fn push_loop(
         return push_loop_scoped(runtime, host, conn, subscription, live_cursor, alerts);
     }
     let mut last_owner = Value::Null;
-    let mut last_seen = Value::Null;
+    let mut alert_push = AlertPush::default();
     while !conn.closed.load(Ordering::Acquire) && !runtime.stopped.load(Ordering::Acquire) {
         let signal = runtime.signal.version();
         if alerts {
-            push_alert_seen(runtime, host, conn, &mut last_seen)?;
+            push_alert_seen(runtime, host, conn, &mut alert_push)?;
         }
         let (interests, previous_resolved, revision, cursor, dependency_offset, inflight) = {
             let sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
@@ -1047,11 +1119,11 @@ fn push_loop_scoped(
     alerts: bool,
 ) -> Result<()> {
     let mut last_owner = Value::Null;
-    let mut last_seen = Value::Null;
+    let mut alert_push = AlertPush::default();
     while !conn.closed.load(Ordering::Acquire) && !runtime.stopped.load(Ordering::Acquire) {
         let signal = runtime.signal.version();
         if alerts {
-            push_alert_seen(runtime, host, conn, &mut last_seen)?;
+            push_alert_seen(runtime, host, conn, &mut alert_push)?;
         }
         let mut frames = Vec::new();
         let idle = {
@@ -1315,6 +1387,8 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
     let cloned = runtime.clone();
     let conn = link.connection.clone();
     let uploading = inflight.clone();
+    let alert_progress = Arc::new(Mutex::new(AlertProgress::default()));
+    let reader_alert_progress = alert_progress.clone();
     let reader_failure = Arc::new(Mutex::new(None));
     let failed = reader_failure.clone();
     thread::Builder::new()
@@ -1328,6 +1402,7 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
                 &generation,
                 initial_cursor,
                 alerts,
+                &reader_alert_progress,
             );
             if let Err(e) = result {
                 if !cloned.stopped.load(Ordering::Acquire) {
@@ -1356,20 +1431,39 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
         let mut last_interests = interests;
         let mut last_ping = Instant::now();
         let mut last_alert_version = None;
-        let mut last_alert_snapshot = None;
+        let mut last_alert_sent = None;
+        let mut last_alert_send = None::<Instant>;
         let mut last_alert_check = Instant::now();
         while !runtime.stopped.load(Ordering::Acquire) && !connection.closed.load(Ordering::Acquire)
         {
             let version = runtime.signal.version();
             let alert_version = runtime.owner_alert_version.load(Ordering::Acquire);
-            if alerts && (last_alert_version != Some(alert_version)
-                || last_alert_check.elapsed() >= Duration::from_secs(10))
+            let (ready, reset, accepted) = {
+                let progress = alert_progress.lock().unwrap_or_else(|p| p.into_inner());
+                (progress.retry.ready(), progress.reset.clone(), progress.accepted.clone())
+            };
+            if alerts && ready && (last_alert_version != Some(alert_version)
+                || reset.is_some() || last_alert_check.elapsed() >= Duration::from_secs(10))
             {
-                let snapshot = runtime.alert_snapshot()?;
-                if last_alert_snapshot.as_ref() != Some(&snapshot) {
-                    write_frame(&connection.writer,
-                        &json!({"kind":"owner_alert_snapshot","snapshot":snapshot}))?;
-                    last_alert_snapshot = Some(snapshot);
+                let snapshot = (|| {
+                    if let Some(generation) = &reset { runtime.remint_alert_generation(generation)?; }
+                    runtime.alert_snapshot()
+                })();
+                match snapshot {
+                    Ok(snapshot) => {
+                        let marker = (snapshot.generation.clone(), snapshot.revision);
+                        if accepted.as_ref() != Some(&marker) && (last_alert_sent.as_ref() != Some(&marker)
+                            || last_alert_send.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)))
+                        {
+                            write_frame(&connection.writer, &json!({"kind":"owner_alert_snapshot","snapshot":snapshot}))?;
+                            last_alert_sent = Some(marker);
+                            last_alert_send = Some(Instant::now());
+                        }
+                        let mut progress = alert_progress.lock().unwrap_or_else(|p| p.into_inner());
+                        if progress.reset == reset { progress.reset = None; }
+                        // Receipt, not merely local serialization, resets retry backoff.
+                    }
+                    Err(e) => alert_progress.lock().unwrap_or_else(|p| p.into_inner()).retry.failed(&format!("Alert state unavailable ({})", e.code)),
                 }
                 last_alert_version = Some(alert_version);
                 last_alert_check = Instant::now();
@@ -1471,7 +1565,9 @@ fn client_reader(
     generation: &str,
     initial_cursor: u64,
     alerts: bool,
+    alert_progress: &Arc<Mutex<AlertProgress>>,
 ) -> Result<()> {
+    let mut seen_retry = AlertBackoff::default();
     let mut cursor = initial_cursor;
     let mut revision = 1;
     while !connection.closed.load(Ordering::Acquire) && !runtime.stopped.load(Ordering::Acquire) {
@@ -1481,7 +1577,30 @@ fn client_reader(
         }
         match frame["kind"].as_str().unwrap_or("") {
             "owner_alert_seen" if alerts => {
-                runtime.apply_alert_seen(&frame)?;
+                if seen_retry.ready() {
+                    match runtime.apply_alert_seen(&frame) {
+                        Ok(()) => seen_retry.succeeded(),
+                        Err(e) => seen_retry.failed(&format!("Alert state unavailable ({})", e.code)),
+                    }
+                }
+            }
+            "owner_alert_result" if alerts => {
+                let mut progress = alert_progress.lock().unwrap_or_else(|p| p.into_inner());
+                match (alert_marker(&frame), frame["status"].as_str()) {
+                    (Some(marker), Some("accepted")) => {
+                        progress.accepted = Some(marker); progress.retry.succeeded();
+                    }
+                    (Some((generation, _)), Some("resync")) => {
+                        progress.reset = Some(generation);
+                        progress.retry.failed("Hub requested a new alert generation");
+                    }
+                    (_, Some("retry")) => {
+                        progress.retry.failed("Hub could not accept the alert snapshot");
+                    }
+                    _ => { if progress.retry.ready() { progress.retry.failed("Invalid alert receipt"); } }
+                }
+                drop(progress);
+                runtime.signal.signal();
             }
             "live" => {
                 let items = frame["items"]

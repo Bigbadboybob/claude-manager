@@ -15,17 +15,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SNAPSHOT: usize = 600 * 1024;
 const MAX_HOSTS: usize = 16;
+// Every origin can retain its full snapshot and a Seen map no larger than
+// that snapshot, plus the local source snapshot and JSON envelope overhead.
+const MAX_BYTES: usize = (2 * MAX_HOSTS + 1) * MAX_SNAPSHOT + 64 * 1024;
+pub(crate) const RESYNC_REQUIRED: &str = "Owner alert snapshot needs a new generation";
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Snapshot {
     version: u32,
-    generation: String,
-    revision: u64,
+    pub generation: String,
+    pub revision: u64,
     pub host_label: String,
     pub alerts: BTreeMap<String, Alert>,
 }
@@ -144,8 +147,18 @@ impl Relay {
         &self,
         root: &Path,
         host_label: String,
-        alerts: BTreeMap<String, Alert>,
+        mut alerts: BTreeMap<String, Alert>,
     ) -> Result<Snapshot> {
+        for alert in alerts.values_mut() {
+            // Legacy local queues can contain labels predating the source cap.
+            if alert.label.len() > 4096 {
+                let mut end = 4096;
+                while !alert.label.is_char_boundary(end) {
+                    end -= 1;
+                }
+                alert.label.truncate(end);
+            }
+        }
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let disk = self.load(&mut guard, root)?;
         if let Some(s) = disk
@@ -177,6 +190,49 @@ impl Relay {
         *disk = next;
         Ok(snapshot)
     }
+    pub(crate) fn remint(&self, root: &Path, expected: &str) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let disk = self.load(&mut guard, root)?;
+        if disk
+            .source
+            .as_ref()
+            .is_none_or(|s| s.generation != expected)
+        {
+            return Ok(());
+        }
+        let mut next = disk.clone();
+        let source = next.source.as_mut().unwrap();
+        source.generation = uuid::Uuid::new_v4().to_string();
+        source.revision = 1;
+        Self::save(root, &next)?;
+        *disk = next;
+        Ok(())
+    }
+    pub(crate) fn origins(&self, root: &Path) -> Result<Vec<String>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(self
+            .load(&mut guard, root)?
+            .origins
+            .keys()
+            .cloned()
+            .collect())
+    }
+    pub(crate) fn prune(
+        &self,
+        root: &Path,
+        revoked: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let disk = self.load(&mut guard, root)?;
+        if !disk.origins.keys().any(|k| revoked.contains(k)) {
+            return Ok(());
+        }
+        let mut next = disk.clone();
+        next.origins.retain(|k, _| !revoked.contains(k));
+        Self::save(root, &next)?;
+        *disk = next;
+        Ok(())
+    }
     /// Caller authenticates origin independently; it is never taken from wire data.
     pub(crate) fn ingest(
         &self,
@@ -191,11 +247,11 @@ impl Relay {
         let old = disk.origins.get(origin);
         if let Some(old) = old.filter(|r| r.snapshot.generation == snapshot.generation) {
             if old.snapshot.revision > snapshot.revision {
-                return Ok(Vec::new());
+                return Err(RESYNC_REQUIRED.into());
             }
             if old.snapshot.revision == snapshot.revision {
                 if old.snapshot != snapshot {
-                    return Err("Conflicting Owner alert snapshot revision".into());
+                    return Err(RESYNC_REQUIRED.into());
                 }
                 return Ok(Vec::new());
             }
@@ -210,6 +266,11 @@ impl Relay {
             .iter()
             .filter(|(k, a)| {
                 pending.get(*k) != Some(&a.id)
+                    && (old.is_some()
+                        || a.created_at
+                            .as_deref()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .is_some_and(|t| t.timestamp() >= chrono::Utc::now().timestamp() - 900))
                     && old.is_none_or(|r| {
                         r.snapshot.alerts.get(*k).is_none_or(|prev| prev.id != a.id)
                     })
@@ -310,15 +371,16 @@ fn row(host: &str, label: &str, key: &str, alert: Alert) -> Value {
 }
 pub fn list(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     let result = (|| -> Result<Value> {
-        let (root, relay, sync, local) = {
+        let (root, relay, sync, path) = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             (
                 s.messaging_root.clone(),
                 s.owner_alert_relay.clone(),
                 s.messaging_sync.clone(),
-                owner_attention::snapshot(&s)?,
+                owner_attention::path(&s),
             )
         };
+        let local = owner_attention::snapshot_at(&path)?;
         let id = local_id(&root)?;
         let label = crate::items::heartbeat::host_label().unwrap_or_else(|| id.clone());
         let mut items: Vec<Value> = local
@@ -326,8 +388,9 @@ pub fn list(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             .map(|(k, a)| row(&id, &label, &k, a))
             .collect();
         let mut hosts = vec![json!({"id":id,"label":label,"local":true,"connected":true})];
-        let remotes = relay.remotes(&root)?;
         if let Some(sync) = sync {
+            sync.prune_owner_alerts(&relay).map_err(|e| e.to_string())?;
+            let remotes = relay.remotes(&root)?;
             let allowed = sync.owner_alert_hosts(remotes.keys());
             for (host, r) in remotes
                 .into_iter()
@@ -428,7 +491,7 @@ mod tests {
             session_uid: "agent".into(),
             label: "lane".into(),
             message: "review".into(),
-            created_at: Some("2026-10-12T23:00:00Z".into()),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
             ..Default::default()
         }
     }
@@ -488,7 +551,10 @@ mod tests {
             1
         );
         assert!(cache.pending(hub.path(), &host).unwrap().is_empty());
-        assert!(cache.ingest(hub.path(), &host, first).unwrap().is_empty());
+        assert_eq!(
+            cache.ingest(hub.path(), &host, first).unwrap_err(),
+            RESYNC_REQUIRED
+        );
         assert!(!cache.seen(hub.path(), &host, "key", "a").unwrap());
         assert_eq!(
             cache.remotes(hub.path()).unwrap()[&host].snapshot.alerts["key"].id,
@@ -542,5 +608,155 @@ mod tests {
         std::fs::create_dir(hub.path().join("owner-alert-relay.json")).unwrap();
         assert!(cache.seen(hub.path(), &host, key, "a").is_err());
         assert!(cache.pending(hub.path(), &host).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    fn alerts() -> BTreeMap<String, Alert> {
+        [
+            ("fresh", Some(chrono::Utc::now().to_rfc3339())),
+            (
+                "old",
+                Some((chrono::Utc::now() - chrono::Duration::minutes(16)).to_rfc3339()),
+            ),
+            ("legacy", None),
+        ]
+        .into_iter()
+        .map(|(id, created_at)| {
+            (
+                id.into(),
+                Alert {
+                    id: id.into(),
+                    label: "雪".repeat(2000),
+                    message: "Review".into(),
+                    created_at,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+    }
+    #[test]
+    fn owner_relay_source_label_cap_initial_push_age_and_generation_resync() {
+        let source = tempfile::tempdir().unwrap();
+        let hub = tempfile::tempdir().unwrap();
+        let host = uuid::Uuid::new_v4().to_string();
+        let relay = Relay::default();
+        let cache = Relay::default();
+        let snapshot = relay
+            .source(source.path(), "sessions".into(), alerts())
+            .unwrap();
+        assert_eq!(snapshot.alerts["fresh"].label.len(), 4095);
+        let pushed = cache.ingest(hub.path(), &host, snapshot.clone()).unwrap();
+        assert_eq!(
+            pushed.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["fresh"]
+        );
+        assert_eq!(
+            cache.remotes(hub.path()).unwrap()[&host]
+                .snapshot
+                .alerts
+                .len(),
+            3
+        );
+        assert!(cache.seen(hub.path(), &host, "fresh", "fresh").unwrap());
+        let mut rollback = snapshot.clone();
+        rollback.alerts.remove("old");
+        assert_eq!(
+            cache.ingest(hub.path(), &host, rollback).unwrap_err(),
+            RESYNC_REQUIRED
+        );
+        relay.remint(source.path(), &snapshot.generation).unwrap();
+        let reset = relay
+            .source(source.path(), "sessions".into(), alerts())
+            .unwrap();
+        assert_ne!(reset.generation, snapshot.generation);
+        // A delayed request for the old generation must not mint another one.
+        relay.remint(source.path(), &snapshot.generation).unwrap();
+        assert_eq!(
+            relay
+                .source(source.path(), "sessions".into(), reset.alerts.clone())
+                .unwrap()
+                .generation,
+            reset.generation
+        );
+        assert!(cache
+            .ingest(hub.path(), &host, reset.clone())
+            .unwrap()
+            .is_empty());
+        assert_eq!(cache.pending(hub.path(), &host).unwrap().len(), 1);
+        drop(relay);
+        assert_eq!(
+            Relay::default()
+                .source(source.path(), "sessions".into(), reset.alerts)
+                .unwrap()
+                .generation,
+            reset.generation
+        );
+    }
+    #[test]
+    fn owner_relay_capacity_covers_all_origins_and_pruning_preserves_other_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut disk = Disk::default();
+        let big = (0..140)
+            .map(|i| {
+                let id = format!("id-{i}");
+                (
+                    id.clone(),
+                    Alert {
+                        id,
+                        label: "Agent".into(),
+                        message: "x".repeat(4000),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let snapshot = Snapshot {
+            version: 1,
+            generation: uuid::Uuid::new_v4().to_string(),
+            revision: 1,
+            host_label: "sessions".into(),
+            alerts: big,
+        };
+        snapshot.validate().unwrap();
+        let pending = snapshot
+            .alerts
+            .iter()
+            .map(|(k, a)| (k.clone(), a.id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let ids = (0..MAX_HOSTS)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+        for host in &ids {
+            disk.origins.insert(
+                host.clone(),
+                Remote {
+                    snapshot: snapshot.clone(),
+                    pending: pending.clone(),
+                },
+            );
+        }
+        disk.source = Some(snapshot.clone());
+        assert!(serde_json::to_vec(&disk).unwrap().len() > 8 * 1024 * 1024);
+        Relay::save(tmp.path(), &disk).unwrap();
+        let cache = Relay::default();
+        assert_eq!(cache.origins(tmp.path()).unwrap().len(), MAX_HOSTS);
+        cache
+            .prune(
+                tmp.path(),
+                &std::collections::BTreeSet::from([ids[0].clone()]),
+            )
+            .unwrap();
+        assert_eq!(cache.origins(tmp.path()).unwrap().len(), MAX_HOSTS - 1);
+        cache
+            .ingest(tmp.path(), &uuid::Uuid::new_v4().to_string(), snapshot)
+            .unwrap();
+        assert_eq!(
+            Relay::default().origins(tmp.path()).unwrap().len(),
+            MAX_HOSTS
+        );
     }
 }

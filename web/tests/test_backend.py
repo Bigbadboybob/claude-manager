@@ -158,6 +158,17 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen.status_code, 200)
         self.assertTrue(seen.json()["pending_origin"])
 
+    async def test_bootstrap_survives_alert_metadata_failure(self):
+        from unittest.mock import AsyncMock
+        async def call(method, params):
+            if method == "owner_attention.list": raise DaemonError("alert_storage", "Unavailable")
+            return {"owner_availability": {"level": "focused"}}
+        self.daemon.call = AsyncMock(side_effect=call)
+        response = await self.client.get("/api/bootstrap", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["features"]["alert_hosts"], [])
+        self.assertEqual(response.json()["owner_availability"]["level"], "focused")
+
     async def test_everything_except_health_requires_access(self):
         self.assertEqual((await self.client.get("/healthz")).status_code, 200)
         for path in ["/", "/sw.js", "/manifest.webmanifest", "/api/counts", "/api/push/vapid-public-key"]:

@@ -225,21 +225,52 @@ impl Runtime {
             .state
             .upgrade()
             .ok_or_else(|| error("stopped", "Daemon stopped"))?;
-        let (relay, alerts) = {
+        let (relay, path) = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             (
                 s.owner_alert_relay.clone(),
-                crate::owner_attention::snapshot(&s).map_err(|e| error("alert_storage", e))?,
+                crate::owner_attention::path(&s),
             )
         };
         relay
             .source(
                 &self.root,
                 crate::items::heartbeat::host_label().unwrap_or_else(|| self.daemon_id.clone()),
-                alerts,
+                crate::owner_attention::snapshot_at(&path).map_err(|e| error("alert_storage", e))?,
             )
             .map_err(|e| error("alert_storage", e))
     }
+    pub(crate) fn prune_owner_alerts(&self, relay: &crate::owner_alert_relay::Relay) -> Result<()> {
+        if self.daemon_id != self.config.coordinator_id {
+            return Ok(());
+        }
+        let origins = relay
+            .origins(&self.root)
+            .map_err(|e| error("alert_storage", e))?;
+        let allowed = self.owner_alert_hosts(&origins);
+        let revoked = origins
+            .into_iter()
+            .filter(|host| !allowed.contains(host))
+            .collect();
+        relay
+            .prune(&self.root, &revoked)
+            .map_err(|e| error("alert_storage", e))
+    }
+    fn remint_alert_generation(&self, expected: &str) -> Result<()> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| error("stopped", "Daemon stopped"))?;
+        let relay = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .owner_alert_relay
+            .clone();
+        relay
+            .remint(&self.root, expected)
+            .map_err(|e| error("alert_storage", e))
+    }
+
     fn accept_alert_snapshot(&self, host: &str, frame: &Value) -> Result<()> {
         if !self.owner_alert_hosts([&host.to_string()]).contains(host) {
             return Err(error("unauthorized", "Peer cannot relay Owner alerts"));
@@ -254,9 +285,10 @@ impl Runtime {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             (s.owner_alert_relay.clone(), s.owner_notifications.clone())
         };
-        let added = relay
-            .ingest(&self.root, host, snapshot)
-            .map_err(|e| error("alert_storage", e))?;
+        self.prune_owner_alerts(&relay)?;
+        let added = relay.ingest(&self.root, host, snapshot).map_err(|e| {
+            error(if e == crate::owner_alert_relay::RESYNC_REQUIRED { "alert_resync" } else { "alert_storage" }, e)
+        })?;
         for alert in added {
             // The source's delivered queue is the authoritative availability
             // decision. Never feed held alerts or invent a second gate here.
@@ -273,7 +305,7 @@ impl Runtime {
                 eprintln!("cm relayed Owner notification: {e}");
             }
         }
-        self.signal.signal();
+        self.signal_owner_alerts();
         Ok(())
     }
     fn alert_seen_pending(&self, host: &str) -> Result<Vec<crate::owner_alert_relay::Seen>> {

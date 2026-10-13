@@ -100,7 +100,8 @@ queue with snapshots from enrolled, Owner-authorized hosts using the negotiated
 `host` is its display hostname. Group by `(origin_host, session_uid)`, display
 host/label/reason, and sort by the original RFC3339 `created_at`. Legacy alerts
 without a timestamp keep it absent; receiving a snapshot does not invent an age.
-`alert_hosts` (also in bootstrap `features`) lists `{id,label,local,connected}`
+`alert_hosts` (also in bootstrap `features`, with `[]` on an alert-metadata
+failure so chat stays usable) lists `{id,label,local,connected}`
 for the local host and authorized origins with a received snapshot, including
 an empty snapshot. Cached alerts remain visible while a host is offline;
 `connected:false` reports that fact. Revoked origins are excluded.

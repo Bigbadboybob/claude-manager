@@ -52,7 +52,7 @@ const MAX_MESSAGE: usize = 4096;
 /// Minimum spacing of `notify_command` pushes per alert key.
 const PUSH_INTERVAL_SECS: u64 = 600;
 
-fn path(state: &DaemonState) -> PathBuf {
+pub(crate) fn path(state: &DaemonState) -> PathBuf {
     state
         .daemon_sessions_path
         .clone()
@@ -65,7 +65,11 @@ fn held_path(state: &DaemonState) -> PathBuf {
 }
 
 pub fn snapshot(state: &DaemonState) -> Result<BTreeMap<String, Alert>, String> {
-    match std::fs::read(path(state)) {
+    snapshot_at(&path(state))
+}
+
+pub(crate) fn snapshot_at(path: &std::path::Path) -> Result<BTreeMap<String, Alert>, String> {
+    match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("read Owner alerts: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
         Err(e) => Err(format!("read Owner alerts: {e}")),
@@ -218,6 +222,7 @@ fn gate(
         return Ok(GateOutcome::Coalesced { alert_id: old.id.clone() });
     }
     alert.urgency = Some(urgency.as_str().into());
+    alert.label = truncate(&alert.label);
     alert.created_at.get_or_insert_with(now_rfc3339);
     if availability::delivers(level_now(state), urgency) {
         if alerts.len() >= MAX_ENTRIES && !alerts.contains_key(key) {
