@@ -1136,6 +1136,10 @@ impl App {
             // Idempotent per uid inside the helper (the dead EventLoop emits one
             // exit, but guard anyway). Shared with the stale-generation watchdog.
             for (wi, si) in remote_reconnect_requeue {
+                let uid = self.workspaces[wi].sessions[si].uid.clone();
+                if !self.reconnecting_sessions.contains(&uid) {
+                    self.note_stream_lost(&uid);
+                }
                 self.requeue_remote_reconnect(wi, si, "transport EOF");
             }
             self.needs_redraw = true;

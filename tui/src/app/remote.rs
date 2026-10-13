@@ -86,6 +86,48 @@ const REMOTE_REATTACH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// session settles instead of spinning "⟳ reconnecting" forever.
 const REMOTE_REATTACH_MAX_ATTEMPTS: u32 = 15;
 
+/// Ceiling of the per-session reconnect backoff. On a congested link every
+/// reattach replays the session's whole output ring, so a flat retry turned a
+/// slow tunnel into a loop: an abandoned attach was retried with a fresh full
+/// replay, which slowed the link further (32 attaches a minute, the same uid
+/// 3-4 times, measured 2026-10-13).
+const REMOTE_REATTACH_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// A stream that stayed up this long before dying was healthy: its session
+/// reattaches at once and its backoff resets. One that died sooner (abandoned
+/// mid-replay, cut off as a slow viewer) counts as a strike.
+const REMOTE_STREAM_STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// The pane Owner is looking at never waits longer than this between attempts.
+const REMOTE_REATTACH_FOCUSED_MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// Per-uid reconnect history behind the backoff. In memory only.
+#[derive(Default)]
+pub(super) struct ReattachBackoff {
+    /// Consecutive failed attaches and short-lived streams.
+    strikes: u32,
+    /// When the current stream attached; `None` before the first queued
+    /// attach (a stream that predates this tracking counts as healthy).
+    attached_at: Option<Instant>,
+}
+
+/// Wait before the next attempt after `strikes` consecutive failures: 2 s,
+/// then doubling to [`REMOTE_REATTACH_MAX_BACKOFF`], plus up to 25% spread by
+/// uid so sessions that failed together (one tunnel) don't retry together.
+pub(super) fn reattach_backoff_delay(uid: &str, strikes: u32) -> Duration {
+    if strikes == 0 {
+        return REMOTE_REATTACH_RETRY_INTERVAL;
+    }
+    let base = REMOTE_REATTACH_RETRY_INTERVAL
+        .saturating_mul(1 << strikes.min(5))
+        .min(REMOTE_REATTACH_MAX_BACKOFF);
+    let spread = uid
+        .bytes()
+        .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)))
+        % 26;
+    base + base * spread / 100
+}
+
 impl App {
     /// Phase 4 (remote-session-execution): reattach a single REMOTE manifest
     /// entry to its live session on `entry.host_id`, ungated. Routes the
@@ -271,7 +313,7 @@ impl App {
             // attach dispatch every tick. First attempt has `last_attempt_at`
             // None → not throttled.
             if let Some(last) = p.last_attempt_at {
-                if now.duration_since(last) < REMOTE_REATTACH_RETRY_INTERVAL {
+                if now.duration_since(last) < self.reattach_retry_interval(&p.entry.uid) {
                     still_pending.push(p);
                     continue;
                 }
@@ -358,6 +400,7 @@ impl App {
                     });
                     self.attached_tunnel_generation
                         .insert(result.entry.uid.clone(), gen);
+                    self.note_reattached(&result.entry.uid);
                     // Bind by uid across ALL workspaces, not just `result.ws_id`.
                     // A daemon session is unique by uid, so if a slot for it
                     // already exists ANYWHERE (a reconnect, or a stray duplicate
@@ -407,6 +450,7 @@ impl App {
                             Some(crate::attach_worker::AttachFailureKind::SessionGone)
                         );
                         if !session_gone {
+                            self.note_reattach_failed(&result.entry.uid);
                             self.pending_remote_reattach.push(p);
                             continue;
                         }
@@ -465,6 +509,41 @@ impl App {
         }
     }
 
+    /// How long `uid` waits between reattach attempts (see
+    /// [`reattach_backoff_delay`]); the focused pane is capped lower.
+    pub(super) fn reattach_retry_interval(&self, uid: &str) -> Duration {
+        let strikes = self.reattach_backoff.get(uid).map_or(0, |b| b.strikes);
+        let wait = reattach_backoff_delay(uid, strikes);
+        if self.cursor_session_uid().as_deref() == Some(uid) {
+            wait.min(REMOTE_REATTACH_FOCUSED_MAX_WAIT)
+        } else {
+            wait
+        }
+    }
+
+    /// A reattach attempt failed without reaching the session.
+    pub(super) fn note_reattach_failed(&mut self, uid: &str) {
+        let b = self.reattach_backoff.entry(uid.to_string()).or_default();
+        b.strikes = b.strikes.saturating_add(1);
+    }
+
+    /// A reattach produced a live stream.
+    pub(super) fn note_reattached(&mut self, uid: &str) {
+        self.reattach_backoff.entry(uid.to_string()).or_default().attached_at =
+            Some(Instant::now());
+    }
+
+    /// An attached stream died on its own (EOF, hangup, tunnel replaced).
+    /// A short-lived stream is a strike; a long-lived one resets the backoff.
+    pub(super) fn note_stream_lost(&mut self, uid: &str) {
+        let b = self.reattach_backoff.entry(uid.to_string()).or_default();
+        let healthy = b
+            .attached_at
+            .take()
+            .map_or(true, |at| at.elapsed() >= REMOTE_STREAM_STABLE_AFTER);
+        b.strikes = if healthy { 0 } else { b.strikes.saturating_add(1) };
+    }
+
     /// Mark a daemon-attached session's slot `reconnecting` and enqueue it
     /// into the deferred-reattach flow (idempotent per uid). Host-agnostic
     /// since DESIGN_SEAMLESS_RESTART phase 5: LOCAL rows arrive here when the
@@ -491,16 +570,26 @@ impl App {
         {
             return false;
         }
+        let strikes = self.reattach_backoff.get(&entry.uid).map_or(0, |b| b.strikes);
         eprintln!(
             "cm-tui: remote session {} ({}) on host {} lost its attach stream \
-             ({}) — marking reconnecting and requeuing for reattach",
+             ({}) — marking reconnecting and requeuing for reattach{}",
             entry.uid,
             entry.label,
             entry.host_id.as_str(),
             reason,
+            if strikes > 0 {
+                format!(" in {:?} (strike {strikes})", self.reattach_retry_interval(&entry.uid))
+            } else {
+                String::new()
+            },
         );
-        self.pending_remote_reattach
-            .push(PendingRemoteReattach::new(ws_id, entry));
+        let mut pending = PendingRemoteReattach::new(ws_id, entry);
+        if strikes > 0 {
+            // Back off: the stream died soon after attaching.
+            pending.last_attempt_at = Some(Instant::now());
+        }
+        self.pending_remote_reattach.push(pending);
         true
     }
 
@@ -590,6 +679,10 @@ impl App {
         }
         let mut changed = false;
         for (wi, si, reason) in dead {
+            let uid = self.workspaces[wi].sessions[si].uid.clone();
+            if !self.reconnecting_sessions.contains(&uid) {
+                self.note_stream_lost(&uid);
+            }
             // S5: stop the spinning EventLoop NOW (it's burning a core on the
             // dead fd's POLLHUP) rather than waiting for the reattach to drop
             // it. request_shutdown leaves the slot intact for the rebind.
@@ -695,7 +788,7 @@ impl App {
                     // since the last attempt.
                     if let Some(last) = p.last_attempt_at {
                         if now.duration_since(last)
-                            < REMOTE_REATTACH_RETRY_INTERVAL
+                            < self.reattach_retry_interval(&p.entry.uid)
                         {
                             still_pending.push(p);
                             continue;
@@ -725,6 +818,7 @@ impl App {
                                 p.entry.uid.clone(),
                                 self.host_pool.tunnel_generation(&p.entry.host_id),
                             );
+                            self.note_reattached(&p.entry.uid);
                             reattached_any = true;
                             eprintln!(
                                 "cm-tui: remote session {} ({}) on host {} \
@@ -751,6 +845,7 @@ impl App {
                                 p.entry.label,
                                 p.entry.host_id.as_str(),
                             );
+                            self.note_reattach_failed(&p.entry.uid);
                             still_pending.push(PendingRemoteReattach {
                                 last_attempt_at: Some(now),
                                 ..p
@@ -988,6 +1083,7 @@ impl App {
         self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
         self.attaching.remove(uid);
         self.attached_tunnel_generation.remove(uid);
+        self.reattach_backoff.remove(uid);
     }
 
     /// Manual "reconnect now" lever, invoked by `A-r` (refresh). The auto-
@@ -1024,6 +1120,7 @@ impl App {
         for p in self.pending_remote_reattach.iter_mut() {
             p.last_attempt_at = None;
             p.attempts = 0;
+            self.reattach_backoff.remove(&p.entry.uid);
         }
         let accelerated = self.pending_remote_reattach.len();
 
@@ -1083,6 +1180,8 @@ impl App {
                     // and enqueues the rebind).
                     self.workspaces[wi].sessions[si].session.exited = false;
                     self.workspaces[wi].sessions[si].set_status(SessionStatus::Idle);
+                    let uid = self.workspaces[wi].sessions[si].uid.clone();
+                    self.reattach_backoff.remove(&uid);
                     if self.requeue_remote_reconnect(wi, si, "A-r force reconnect") {
                         forced = 1;
                         self.needs_redraw = true;
@@ -1115,6 +1214,7 @@ impl App {
         {
             p.last_attempt_at = None;
             p.attempts = 0;
+            self.reattach_backoff.remove(&p.entry.uid);
             armed += 1;
         }
         // (2) Re-queue stranded skipped entries (preserved on disk but no
@@ -4231,3 +4331,6 @@ mod hosts_malformed_fallback_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod slow_link_tests;

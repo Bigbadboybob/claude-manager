@@ -99,6 +99,7 @@ impl AttachWorker {
                         let Ok(req) = request else { return };
                         // Blocking is fine HERE — off the main thread. The attach
                         // RPCs route through the entry's own host socket.
+                        let started = std::time::Instant::now();
                         let generation = host_pool
                             .for_host(&req.entry.host_id)
                             .map(|_| host_pool.tunnel_generation(&req.entry.host_id));
@@ -123,9 +124,17 @@ impl AttachWorker {
                                         // don't push a wrong-for-remote local path over it.
                                         None,
                                     )?;
-                                    if host_pool.tunnel_generation(&req.entry.host_id) != generation
-                                    {
-                                        anyhow::bail!("tunnel changed during attach");
+                                    let now = host_pool.tunnel_generation(&req.entry.host_id);
+                                    if now != generation {
+                                        // Replacing a tunnel kills its ssh, which
+                                        // hangs up every stream through it. A
+                                        // stream that is still open was dialed
+                                        // through the new tunnel: keep it rather
+                                        // than paying for another full replay.
+                                        if session.attach_socket_hung_up() {
+                                            anyhow::bail!("tunnel changed during attach");
+                                        }
+                                        return Ok((session, now));
                                     }
                                     Ok((session, generation))
                                 });
@@ -138,6 +147,15 @@ impl AttachWorker {
                                     } else {
                                         AttachFailureKind::TransportDown
                                     };
+                                eprintln!(
+                                    "cm-tui: attach of session {} on host {} failed after \
+                                     {:.1?} (attempt {}, {:?}): {e:#}",
+                                    req.entry.uid,
+                                    req.entry.host_id.as_str(),
+                                    started.elapsed(),
+                                    req.attempts + 1,
+                                    kind,
+                                );
                                 (None, Some(kind), None)
                             }
                         };

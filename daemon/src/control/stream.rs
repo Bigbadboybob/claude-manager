@@ -67,6 +67,10 @@ const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::
 /// disconnect is observed promptly, long enough not to busy-spin.
 const FANOUT_RECV_TICK: Duration = Duration::from_millis(250);
 
+/// A blocked write to an attach viewer gives up after this long without
+/// progress. Long enough for a slow-but-alive viewer, bounded for a dead one.
+pub const ATTACH_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Run the bidirectional attach stream on `stream`.
 ///
 /// Preconditions:
@@ -99,9 +103,14 @@ pub fn handle_attach_stream(
 
     // Attach streams are long-lived. Clear the read timeout the
     // RPC path set (30s by default) — an idle client typing
-    // shouldn't drop the stream. A write timeout is fine: it
-    // catches stuck clients without false-positive disconnects.
+    // shouldn't drop the stream. Lengthen the RPC path's 10s write
+    // timeout: a viewer behind a congested SSH link can make no
+    // progress for longer than that while still alive, and cutting
+    // it off made the TUI reattach with another full replay
+    // (2026-10-13). A viewer that falls far behind is still dropped
+    // by the bounded output queue (`RecvError::Overflow`).
     let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(Some(ATTACH_STREAM_WRITE_TIMEOUT));
 
     // Clone the socket for the outbound thread to write through.
     // try_clone returns a separate handle on the same underlying

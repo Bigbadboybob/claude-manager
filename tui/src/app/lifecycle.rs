@@ -2428,6 +2428,8 @@ impl App {
                 ts.set_status(SessionStatus::Idle);
                 ts.preserved_last_exit = None;
             }
+            let uid = self.workspaces[wi].sessions[si].uid.clone();
+            self.reattach_backoff.remove(&uid);
             self.requeue_remote_reconnect(wi, si, "A-R revive");
             self.save_session_manifest();
             self.set_status_msg(&format!(
