@@ -304,6 +304,14 @@ pub struct ClientSession {
     /// Attached screen-first: the terminal holds the visible screen only,
     /// and the session's scrollback has not been loaded.
     pub history_deferred: bool,
+    /// Where `term` is in the daemon's output stream (absent on older
+    /// daemons).
+    pub stream: Option<StreamCursor>,
+    /// The events proxy `term` sends through (retargeted on resume).
+    pub term_events: EventProxy,
+    /// `term` came from [`AttachHow::resume`] and the daemon sent only the
+    /// bytes it had missed.
+    pub resumed: bool,
 }
 
 // Post-review #15 (deferred): a `Drop` impl that calls
@@ -334,7 +342,7 @@ impl ClientSession {
         let start_result = rpc_start_session_full(&config)
             .context("RPC start_session")?;
 
-        match Self::build_after_start(&config, &start_result, false, false) {
+        match Self::build_after_start(&config, &start_result, false, &AttachHow::default()) {
             Ok(session) => Ok(session),
             Err(e) => {
                 // Best-effort cleanup. We log the cleanup error
@@ -372,15 +380,13 @@ impl ClientSession {
     /// don't own it. The pre-fix `new()` cleanup arm only fires
     /// on `start_session`-driven failures.
     pub fn attach_existing(config: ClientSessionConfig) -> anyhow::Result<Self> {
-        Self::attach_existing_with_context(config, false, false)
+        Self::attach_existing_with_context(config, false, AttachHow::default())
     }
 
-    /// `screen`: ask for a screen-first attach (the visible screen instead of
-    /// the whole output ring); see [`ClientSession::history_deferred`].
     pub(crate) fn attach_existing_with_context(
         config: ClientSessionConfig,
         restore_context: bool,
-        screen: bool,
+        how: AttachHow,
     ) -> anyhow::Result<Self> {
         // Step 1 skipped: the daemon already has the session.
         // The wire shape for steps 2–6 is identical to `new()`
@@ -392,7 +398,7 @@ impl ClientSession {
             session_uid: config.uid.to_string(),
             cgroup_path: None,
         };
-        Self::build_after_start(&config, &synthetic_start, restore_context, screen)
+        Self::build_after_start(&config, &synthetic_start, restore_context, &how)
     }
 
     /// Steps 2–6 of the dance. Factored out so the outer `new`
@@ -401,11 +407,11 @@ impl ClientSession {
         config: &ClientSessionConfig,
         start_result: &StartSessionResult,
         restore_context: bool,
-        screen: bool,
+        how: &AttachHow,
     ) -> anyhow::Result<Self> {
         let session_uid = &start_result.session_uid;
         let (attach_socket, open_resp) =
-            open_attach_socket(config, session_uid, restore_context, screen)
+            open_attach_socket(config, session_uid, restore_context, how)
             .context("open daemon attach stream")?;
         if &open_resp.session_uid != session_uid {
             anyhow::bail!(
@@ -431,8 +437,16 @@ impl ClientSession {
             format!("attach-{}", session_uid),
         )
         .context("wrap attach socket as AttachedPty")?;
+        // A resumed stream continues `how.resume`'s terminal: its replay is
+        // output that terminal never saw, so queries in it are answered.
+        let resume = how.resume.as_ref().filter(|_| open_resp.resumed);
+        let stream = open_resp.offset.zip(open_resp.stream_id).map(|(offset, stream_id)| {
+            let position = Arc::new(std::sync::atomic::AtomicU64::new(offset));
+            pty.set_position_tracker(position.clone(), open_resp.replay_bytes.unwrap_or(0));
+            StreamCursor { stream_id, position }
+        });
         let graphics = crate::graphics::for_attached_pane(
-            open_resp.replay_bytes,
+            if resume.is_some() { Some(0) } else { open_resp.replay_bytes },
             config.daemon_socket.to_path_buf(),
             config.operator_token_id.to_string(),
         )
@@ -462,15 +476,25 @@ impl ClientSession {
         // either ClientSession or Session without rewiring
         // downstream callers.
         let (event_tx, event_rx) = mpsc::channel();
-        let event_proxy = EventProxy::new(event_tx);
-        let term_config = crate::session::terminal_config();
-
-        let size = TermSize {
-            columns: config.cols as usize,
-            screen_lines: config.rows as usize,
+        let (term, term_events) = match resume {
+            Some(r) => {
+                r.term_events.retarget(event_tx.clone());
+                (r.term.clone(), r.term_events.clone())
+            }
+            None => {
+                let term_events = EventProxy::new(event_tx.clone());
+                let size = TermSize {
+                    columns: config.cols as usize,
+                    screen_lines: config.rows as usize,
+                };
+                let term = Term::new(crate::session::terminal_config(), &size, term_events.clone());
+                (Arc::new(FairMutex::new(term)), term_events)
+            }
         };
-        let term = Term::new(term_config, &size, event_proxy.clone());
-        let term = Arc::new(FairMutex::new(term));
+        // The loop's own proxy is not shared with `term`: a later resume
+        // retargets the terminal, and this loop's last events (it is dead by
+        // then) must stay on this session's channel.
+        let event_proxy = EventProxy::new(event_tx);
 
         let _window_size = WindowSize {
             num_lines: config.rows,
@@ -507,6 +531,9 @@ impl ClientSession {
             output_control,
             graphics,
             history_deferred: open_resp.screen,
+            stream,
+            term_events,
+            resumed: resume.is_some(),
         })
     }
 
@@ -1200,8 +1227,9 @@ fn open_attach_socket(
     config: &ClientSessionConfig,
     uid: &str,
     restore_context: bool,
-    screen: bool,
+    how: &AttachHow,
 ) -> anyhow::Result<(UnixStream, AttachOpenResp)> {
+    let screen = how.screen;
     let mut socket = dial_attach_socket(config.daemon_socket)?;
     let mut params = serde_json::json!({ "uid": uid, "cols": config.cols, "rows": config.rows });
     if screen {
@@ -1209,6 +1237,12 @@ fn open_attach_socket(
         params["replay"] = serde_json::json!("screen");
         // With passthrough on, a pane showing images gets its ring instead.
         params["graphics"] = serde_json::json!(crate::graphics::outer::enabled());
+    }
+    if let Some(resume) = &how.resume {
+        // Older daemons ignore these; the daemon falls back to `screen` (or
+        // the ring) when the position is gone or from another stream.
+        params["since"] = serde_json::json!(resume.position);
+        params["stream_id"] = serde_json::json!(resume.stream_id);
     }
     if restore_context {
         params["context"] = serde_json::json!({
@@ -1235,6 +1269,9 @@ fn open_attach_socket(
             output_flow: result["output_flow"].as_bool().unwrap_or(false),
             replay_bytes: result["replay_bytes"].as_u64(),
             screen: result["replay"] == "screen",
+            resumed: result["replay"] == "resume",
+            offset: result["offset"].as_u64(),
+            stream_id: result["stream_id"].as_u64(),
             session_uid: result["session_uid"].as_str()
                 .context("attach.direct result missing session_uid")?.to_string(),
         }
@@ -1278,6 +1315,38 @@ struct AttachOpenResp {
     replay_bytes: Option<u64>,
     /// The daemon sent the visible screen only, not the output ring.
     screen: bool,
+    /// The daemon sent only the bytes after the requested `since`.
+    resumed: bool,
+    /// Stream offset of the first live byte, and the stream's id.
+    offset: Option<u64>,
+    stream_id: Option<u64>,
+}
+
+/// How to attach to an existing daemon session.
+#[derive(Clone, Default)]
+pub struct AttachHow {
+    /// Ask for the visible screen instead of the whole output ring.
+    pub screen: bool,
+    /// Continue this terminal from where its stream stopped, if the daemon
+    /// still has the bytes it missed.
+    pub resume: Option<ResumeFrom>,
+}
+
+/// A pane's terminal and how far into its session's output stream it got.
+#[derive(Clone)]
+pub struct ResumeFrom {
+    pub stream_id: u64,
+    pub position: u64,
+    pub term: Arc<FairMutex<Term<EventProxy>>>,
+    /// The proxy `term` sends its events through.
+    pub term_events: EventProxy,
+}
+
+/// Position of a daemon-attached terminal in its session's output stream.
+pub struct StreamCursor {
+    pub stream_id: u64,
+    /// Offset of the next live byte; advanced by the attach reader.
+    pub position: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// `attach.open` over an *already-dialed* `UnixStream`. The same
@@ -1326,6 +1395,9 @@ fn rpc_attach_open(
         output_flow: result["output_flow"].as_bool().unwrap_or(false),
         replay_bytes: result["replay_bytes"].as_u64(),
         screen: false,
+        resumed: false,
+        offset: None,
+        stream_id: None,
         session_uid: result["session_uid"]
             .as_str()
             .context("attach.open result missing session_uid")?
@@ -2725,7 +2797,7 @@ time.sleep(60)
         config.transcript_path = Some("/tmp/cm-test-transcript.jsonl");
         config.workflow_run_id = Some("wf-context");
         config.workflow_role = Some("worker");
-        let (stream, _) = open_attach_socket(&config, &uid, true, false).unwrap();
+        let (stream, _) = open_attach_socket(&config, &uid, true, &AttachHow::default()).unwrap();
         drop(stream);
         {
             let s = state.lock().unwrap();
@@ -2734,7 +2806,7 @@ time.sleep(60)
         config.workflow_run_id = None;
         config.workflow_role = None;
         config.transcript_path = None;
-        let (stream, _) = open_attach_socket(&config, &uid, true, false).unwrap();
+        let (stream, _) = open_attach_socket(&config, &uid, true, &AttachHow::default()).unwrap();
         assert_eq!(stream.read_timeout().unwrap(), None);
         assert_eq!(stream.write_timeout().unwrap(), None);
         assert!(state.lock().unwrap().sessions[&uid].workflow_run_id.is_none());
@@ -2769,7 +2841,7 @@ time.sleep(60)
                     serde_json::json!({"session_uid": "test"}))).unwrap();
             });
             let config = bash_config(&path, dir.path(), "token", "test", "ws", "test", &[], 80, 24);
-            let result = open_attach_socket(&config, "test", false, false);
+            let result = open_attach_socket(&config, "test", false, &AttachHow::default());
             assert_eq!(result.is_ok(), code == ErrorCode::UnknownMethod);
             server.join().unwrap();
         }

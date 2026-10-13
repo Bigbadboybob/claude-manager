@@ -174,6 +174,36 @@ struct FanoutInner {
     /// `buf_start = bytes_written - buffer.len()` and the caller's
     /// cursor.
     bytes_written: u64,
+    /// Random identity of this byte stream. Offsets (`bytes_written`) are
+    /// only comparable within one stream: a respawn or a brain restart
+    /// builds a new fanout, whose offsets restart.
+    stream_id: u64,
+}
+
+/// What [`PtyByteFanout::subscribe_output_for`] queued for a viewer.
+pub struct OutputAttach {
+    pub rx: crate::attach_output::OutputSubscription,
+    /// Bytes queued ahead of live output (ring or resume tail).
+    pub replay_len: usize,
+    /// The ring, for a screen-first attach to render; nothing was queued.
+    pub screen_ring: Option<Vec<u8>>,
+    /// Stream offset of the first live byte.
+    pub offset: u64,
+    pub stream_id: u64,
+    /// The viewer's `since` was in this stream's ring: only the bytes after
+    /// it were queued, for the viewer's existing terminal.
+    pub resumed: bool,
+}
+
+fn new_stream_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
 }
 
 impl PtyByteFanout {
@@ -203,6 +233,7 @@ impl PtyByteFanout {
                 output_subscribers: Vec::new(),
                 closed: false,
                 bytes_written: 0,
+                stream_id: new_stream_id(),
             }),
             last_activity_at,
         }
@@ -422,19 +453,36 @@ impl PtyByteFanout {
         (rx, replay.len())
     }
 
-    /// A bounded subscription with NO replay queued, plus a copy of the ring
-    /// and the stream offset where live output starts (`bytes_written`).
-    /// Ring copy and subscription share one lock, so live output continues
-    /// exactly where the ring ends.
-    pub fn subscribe_output_without_replay(
-        &self,
-    ) -> (crate::attach_output::OutputSubscription, Vec<u8>, u64) {
+    /// A bounded viewer subscription. `resume` = `(stream_id, since)`: when
+    /// `since` lies within this stream's ring, queue only the bytes after it.
+    /// Otherwise `screen` returns the ring for the caller to render and
+    /// queues nothing; else the whole ring is queued. One lock covers the
+    /// ring and the subscription, so live output continues exactly at
+    /// `offset`.
+    pub fn subscribe_output_for(&self, screen: bool, resume: Option<(u64, u64)>) -> OutputAttach {
         let (tx, rx) = crate::attach_output::channel();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let ring: Vec<u8> = inner.buffer.iter().copied().collect();
         let offset = inner.bytes_written;
+        let buf_start = offset - inner.buffer.len() as u64;
+        let tail_from = resume
+            .filter(|&(id, since)| id == inner.stream_id && (buf_start..=offset).contains(&since))
+            .map(|(_, since)| (since - buf_start) as usize);
+        let (replay_len, screen_ring) = match tail_from {
+            Some(from) => {
+                let tail: Vec<u8> = inner.buffer.iter().skip(from).copied().collect();
+                tx.push(&tail);
+                (tail.len(), None)
+            }
+            None if screen => (0, Some(inner.buffer.iter().copied().collect())),
+            None => {
+                let ring: Vec<u8> = inner.buffer.iter().copied().collect();
+                tx.push(&ring);
+                (ring.len(), None)
+            }
+        };
+        let stream_id = inner.stream_id;
         if inner.closed { tx.close(); } else { inner.output_subscribers.push(tx); }
-        (rx, ring, offset)
+        OutputAttach { rx, replay_len, screen_ring, offset, stream_id, resumed: tail_from.is_some() }
     }
 
     /// Test helper: number of buffered bytes.

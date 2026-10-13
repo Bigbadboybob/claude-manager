@@ -2533,6 +2533,11 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         /// no images, so a ring holding image commands is replayed in full.
         #[serde(default)]
         graphics: bool,
+        /// Resume: the stream offset the viewer's terminal has reached and
+        /// that stream's id (both from an earlier reply). When the ring
+        /// still holds it, only the missing bytes are sent.
+        since: Option<u64>,
+        stream_id: Option<u64>,
     }
     #[derive(serde::Deserialize)]
     struct Context {
@@ -2572,9 +2577,10 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         }
     }
     let screen = params.replay.as_deref() == Some("screen");
+    let resume = params.stream_id.zip(params.since);
     let (mut outcome, ring) = {
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-        bind_attach_stream_with(&mut s, req, params.uid, params.cols, params.rows, screen)
+        bind_attach_stream_with(&mut s, req, params.uid, params.cols, params.rows, screen, resume)
     };
     if let DispatchOutcome::AttachStream { response, handle } = &mut outcome {
         let result = response.result.as_mut().expect("attach result");
@@ -2585,7 +2591,6 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
             let images = params.graphics && ring.windows(3).any(|w| w == b"\x1b_G");
             let replay = if images {
                 result.as_object_mut().expect("attach result").remove("replay");
-                result.as_object_mut().expect("attach result").remove("offset");
                 ring
             } else {
                 crate::screen_replay::render(
@@ -2608,7 +2613,7 @@ fn bind_attach_stream(
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> DispatchOutcome {
-    bind_attach_stream_with(state, req, session_uid, cols, rows, false).0
+    bind_attach_stream_with(state, req, session_uid, cols, rows, false, None).0
 }
 
 /// [`bind_attach_stream`]; with `screen`, queues no replay and returns the
@@ -2621,6 +2626,7 @@ fn bind_attach_stream_with(
     cols: Option<u16>,
     rows: Option<u16>,
     screen: bool,
+    resume: Option<(u64, u64)>,
 ) -> (DispatchOutcome, Option<Vec<u8>>) {
     // Subscribe + clone last_exit inside the same critical
     // section as the ticket consume above (`state` is &mut and
@@ -2653,13 +2659,15 @@ fn bind_attach_stream_with(
                     );
                 }
             }
-            if screen {
-                let (rx, ring, offset) = session.fanout.subscribe_output_without_replay();
-                (rx, session.last_exit.clone(), 0, offset, Some(ring))
+            let a = session.fanout.subscribe_output_for(screen, resume);
+            let kind = if a.resumed {
+                Some("resume")
+            } else if a.screen_ring.is_some() {
+                Some("screen")
             } else {
-                let (rx, replay_bytes) = session.fanout.subscribe_output_with_replay_len();
-                (rx, session.last_exit.clone(), replay_bytes, 0, None)
-            }
+                None
+            };
+            (a.rx, session.last_exit.clone(), a.replay_len, (a.offset, a.stream_id, kind), a.screen_ring)
         }
         None => {
             return (DispatchOutcome::Done(Response::err(
@@ -2673,16 +2681,20 @@ fn bind_attach_stream_with(
         }
     };
 
+    let (offset, stream_id, kind) = offset;
     let mut result = serde_json::json!({
         "session_uid": session_uid.clone(),
         "output_flow": true,
-        // Bytes of ring replay that precede live output on this stream.
+        // Bytes of replay that precede live output on this stream (for a
+        // screen attach, filled in by the caller once the repaint exists).
         "replay_bytes": replay_bytes,
+        // Where live output starts in this stream; a viewer resumes from
+        // here plus the live bytes it has consumed.
+        "offset": offset,
+        "stream_id": stream_id,
     });
-    if ring.is_some() {
-        // Filled in by the caller once the repaint is rendered.
-        result["replay"] = serde_json::json!("screen");
-        result["offset"] = serde_json::json!(offset);
+    if let Some(kind) = kind {
+        result["replay"] = serde_json::json!(kind);
     }
     let response = Response::ok(req.id.clone(), result);
     let handle = AttachStreamHandle {
@@ -4205,6 +4217,45 @@ mod tests {
         assert!(result["replay_bytes"].as_u64().unwrap() >= ring_len);
         assert!(!text.contains("history line 100\r"), "but not old history");
         assert_eq!(&got[repaint_len..], b"live after attach");
+    }
+
+    #[test]
+    fn direct_attach_resumes_from_the_viewers_offset_within_one_stream() {
+        let state = state_with_session("ts-live");
+        let push = |bytes: &[u8]| state.lock().unwrap().sessions["ts-live"].fanout.push(bytes);
+        push(b"before the drop\r\n");
+        let attach = |extra: serde_json::Value| {
+            let mut params = serde_json::json!({"uid": "ts-live", "cols": 80, "rows": 24, "replay": "screen"});
+            for (k, v) in extra.as_object().unwrap() {
+                params[k] = v.clone();
+            }
+            let DispatchOutcome::AttachStream { response, handle } =
+                dispatch_request(&state, &operator_request("attach.direct", params))
+            else {
+                panic!("expected live stream");
+            };
+            (response.result.unwrap(), handle)
+        };
+        let (first, first_handle) = attach(serde_json::json!({}));
+        let (offset, stream) = (first["offset"].as_u64().unwrap(), first["stream_id"].as_u64().unwrap());
+        drop(first_handle);
+        push(b"missed while disconnected");
+
+        // Same stream, offset still in the ring: only the missed bytes.
+        let (resumed, handle) = attach(serde_json::json!({"since": offset, "stream_id": stream}));
+        assert_eq!(resumed["replay"], "resume");
+        assert_eq!(resumed["replay_bytes"], 25);
+        assert_eq!(resumed["offset"].as_u64().unwrap(), offset + 25);
+        assert_eq!(handle.fanout_rx.recv().unwrap(), b"missed while disconnected");
+        drop(handle);
+
+        // Another stream's offset (a respawn or brain restart) or an evicted
+        // one falls back to the requested screen repaint.
+        let (other, _h) = attach(serde_json::json!({"since": offset, "stream_id": stream ^ 1}));
+        assert_eq!(other["replay"], "screen");
+        push(&vec![b'x'; 2 * 1024 * 1024]);
+        let (evicted, _h) = attach(serde_json::json!({"since": offset, "stream_id": stream}));
+        assert_eq!(evicted["replay"], "screen");
     }
 
     #[test]

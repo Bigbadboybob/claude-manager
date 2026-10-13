@@ -33,8 +33,8 @@ pub struct AttachRequest {
     /// Reconnect attempt count, echoed back so the result handler can apply the
     /// retry/cap policy without re-deriving it.
     pub attempts: u32,
-    /// Ask for a screen-first attach (visible screen, no output ring).
-    pub screen: bool,
+    /// Screen-first and/or resume (see `client_session::AttachHow`).
+    pub how: crate::client_session::AttachHow,
 }
 
 /// Why an attach attempt failed, so the main loop can pick a recovery policy
@@ -125,7 +125,7 @@ impl AttachWorker {
                                         // Transcript binding survived on the remote daemon —
                                         // don't push a wrong-for-remote local path over it.
                                         None,
-                                        req.screen,
+                                        req.how.clone(),
                                     )?;
                                     let now = host_pool.tunnel_generation(&req.entry.host_id);
                                     if now != generation {
@@ -270,7 +270,7 @@ mod tests {
         let worker = AttachWorker::spawn(Arc::new(HostPool::from_config(&hosts).unwrap()));
         let request = |id, host| {
             AttachRequest {
-            request_id: id, ws_id: "test".into(), worktree: dir.path().to_path_buf(), cols: 80, rows: 24, attempts: 0, screen: false,
+            request_id: id, ws_id: "test".into(), worktree: dir.path().to_path_buf(), cols: 80, rows: 24, attempts: 0, how: Default::default(),
             entry: serde_json::from_value(serde_json::json!({
                 "uid": format!("test-{id}"), "label": "test", "session_type": "bash", "host_id": host,
             })).unwrap(),

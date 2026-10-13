@@ -339,11 +339,7 @@ impl App {
                 cols,
                 rows,
                 attempts: p.attempts,
-                // Remote panes attach with the visible screen only; their
-                // scrollback loads when Owner scrolls up (`load_deferred_history`).
-                // Local attaches cost nothing and keep the whole ring.
-                screen: p.entry.host_id != cm_daemon::host_id::HostId::local()
-                    && !self.full_history_wanted.contains(&p.entry.uid),
+                how: self.attach_how(&p.entry),
             };
             let dispatched = self
                 .attach_worker
@@ -406,7 +402,7 @@ impl App {
                     self.attached_tunnel_generation
                         .insert(result.entry.uid.clone(), gen);
                     self.note_reattached(&result.entry.uid);
-                    if !session.history_deferred {
+                    if !session.history_deferred && !session.resumed {
                         self.full_history_wanted.remove(&result.entry.uid);
                     }
                     // Bind by uid across ALL workspaces, not just `result.ws_id`.
@@ -421,11 +417,20 @@ impl App {
                                 .position(|s| s.uid == result.entry.uid)
                                 .map(|si| (wi, si))
                         });
+                    if session.resumed && existing.is_none() {
+                        // It continues a pane's terminal that is gone.
+                        continue;
+                    }
                     if let Some((wi, si)) = existing {
                         // Reconnect: rebind the PTY in place, preserving slot
                         // metadata. Dropping the old dead `Session` only sends
                         // `Msg::Shutdown` — it does NOT kill the daemon session.
                         let slot = &mut self.workspaces[wi].sessions[si];
+                        let mut session = session;
+                        if session.resumed {
+                            // Same terminal, same scrollback state.
+                            session.history_deferred = slot.session.history_deferred;
+                        }
                         slot.session = session;
                         slot.set_status(SessionStatus::Running);
                         self.reconnecting_sessions.remove(&result.entry.uid);
@@ -514,6 +519,28 @@ impl App {
         if changed {
             self.needs_redraw = true;
             self.save_session_manifest();
+        }
+    }
+
+    /// How to attach `entry`. Remote panes ask for the visible screen only;
+    /// their scrollback loads when Owner scrolls up (`load_deferred_history`),
+    /// and local attaches cost nothing and keep the whole ring. A pane that
+    /// still has its terminal resumes it from where its stream stopped, so a
+    /// brief drop costs only the bytes it missed.
+    fn attach_how(&self, entry: &ManifestEntry) -> crate::client_session::AttachHow {
+        let full = self.full_history_wanted.contains(&entry.uid);
+        let resume = (!full)
+            .then(|| {
+                self.workspaces
+                    .iter()
+                    .flat_map(|w| w.sessions.iter())
+                    .find(|s| s.uid == entry.uid)
+                    .and_then(|s| s.session.resume_from())
+            })
+            .flatten();
+        crate::client_session::AttachHow {
+            screen: entry.host_id != cm_daemon::host_id::HostId::local() && !full,
+            resume,
         }
     }
 

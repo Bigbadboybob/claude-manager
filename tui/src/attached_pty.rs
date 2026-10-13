@@ -38,7 +38,7 @@
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use alacritty_terminal::event::{OnResize, WindowSize};
@@ -166,6 +166,9 @@ pub struct ReaderHalf {
     /// Kitty graphics passthrough: strips graphics commands out of the
     /// stream before Alacritty parses it. `None` when passthrough is off.
     graphics: Option<crate::graphics::Tap>,
+    /// Stream position of the next live byte, and how many replay bytes
+    /// still come first (they are not stream bytes past the position).
+    position: Option<(Arc<AtomicU64>, u64)>,
 }
 
 impl ReaderHalf {
@@ -193,6 +196,11 @@ impl Read for ReaderHalf {
 impl ReaderHalf {
     fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let result = self.inner.read(buf);
+        if let (Ok(n), Some((position, replay_left))) = (&result, self.position.as_mut()) {
+            let replayed = (*n as u64).min(*replay_left);
+            *replay_left -= replayed;
+            position.fetch_add(*n as u64 - replayed, Ordering::SeqCst);
+        }
         // After every read, drain any cached child event. The
         // signal is one-shot per stream: once we've written to
         // the pipe, repeat reads don't write again. The EventLoop
@@ -294,6 +302,7 @@ impl AttachedPty {
             memory_cap_kill: memory_cap_kill.clone(),
             transport_eof: transport_eof.clone(),
             graphics: None,
+            position: None,
         };
         let writer = AttachWriter::new(writer_socket, stream_id)?;
 
@@ -320,6 +329,12 @@ impl AttachedPty {
     pub fn took_memory_cap_kill(&self) -> bool {
         // swap-with-false: atomic read-and-clear.
         self.memory_cap_kill.swap(false, Ordering::SeqCst)
+    }
+
+    /// Advance `position` by every live byte read, after `replay_bytes` of
+    /// replay. Call before the EventLoop takes ownership.
+    pub fn set_position_tracker(&mut self, position: Arc<AtomicU64>, replay_bytes: u64) {
+        self.reader.position = Some((position, replay_bytes));
     }
 
     /// Route this pane's stream through kitty graphics passthrough. Call
