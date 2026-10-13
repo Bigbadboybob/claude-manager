@@ -97,6 +97,11 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "ping",
     "notify_user",
     "owner_attention.ack",
+    # Owner-only surfaces (TUI / web board), daemon-routed for correctness.
+    # No MCP tool calls them, and dispatch rejects Session callers: the
+    # first three require the Operator, owner.board_token the strong one.
+    "owner_attention.list", "owner.notifications.next", "session.viewed",
+    "owner.board_token",
     "sidebar.list",
     "sidebar.assign",
     "sidebar.publish",

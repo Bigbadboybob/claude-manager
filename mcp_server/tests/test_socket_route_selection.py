@@ -862,6 +862,24 @@ class LoudFailureOnUnreachableTargetTests(unittest.TestCase):
                     )
 
 
+class OwnerOnlyMethodsTests(unittest.TestCase):
+    """Owner-only daemon methods are routed but never called by MCP tools:
+    reaching them takes the Operator token, which agents do not hold."""
+
+    OWNER_ONLY = ("owner_attention.list", "owner.notifications.next", "session.viewed", "owner.board_token")
+
+    def test_owner_only_methods_route_to_daemon_but_no_mcp_code_calls_them(self):
+        from mcp_server.control_client import DAEMON_METHODS
+
+        here = Path(__file__).resolve().parent.parent
+        for method in self.OWNER_ONLY:
+            self.assertIn(method, DAEMON_METHODS)
+            for source in here.glob("*.py"):
+                if source.name == "control_client.py":
+                    continue
+                self.assertNotIn(f'"{method}"', source.read_text(), f"{source.name} must not call {method}")
+
+
 class DaemonMethodsAlignmentTests(unittest.TestCase):
     """Sub-2c: snapshot test that `DAEMON_METHODS` matches the
     daemon's actual dispatch arms in
