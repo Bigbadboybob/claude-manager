@@ -1558,7 +1558,7 @@ pub fn rpc_list_daemon_sessions(
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
         method: "list_sessions".into(),
-        params: serde_json::json!({ "daemon_owned_only": true }),
+        params: serde_json::json!({ "daemon_owned_only": true, "fields": SUMMARY_FIELDS }),
     };
     let resp = rpc_round_trip(daemon_socket, &req)?;
     let result = resp
@@ -1568,6 +1568,54 @@ pub fn rpc_list_daemon_sessions(
         .as_array()
         .context("list_sessions result not an array")?;
     Ok(arr.iter().filter_map(parse_daemon_session_summary).collect())
+}
+
+/// The `list_sessions` row fields [`parse_daemon_session_summary`] reads.
+/// Asking for only these drops `agent_state` (three quarters of the reply;
+/// the TUI gets it from `manifest.watch`). Older daemons ignore the list.
+const SUMMARY_FIELDS: [&str; 13] = [
+    "session_uid", "label", "type", "managed_by_uid", "workspace_id", "task_id",
+    "workflow_run_id", "workflow_role", "worktree_path", "continuous_task_id", "cols",
+    "rows", "global_perms",
+];
+
+/// [`rpc_list_daemon_sessions`] for a poller: pass the etag of the list it
+/// already has and get `(None, etag)` when nothing changed, so a 5 s poll
+/// costs a few bytes instead of the whole list. An older daemon answers the
+/// plain array: `(Some(list), None)`.
+pub fn rpc_list_daemon_sessions_since(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    etag: Option<&str>,
+) -> anyhow::Result<(Option<Vec<DaemonSessionSummary>>, Option<String>)> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "list_sessions".into(),
+        params: serde_json::json!({
+            "daemon_owned_only": true,
+            "fields": SUMMARY_FIELDS,
+            "etag": etag.unwrap_or(""),
+        }),
+    };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let result = resp.result.context("list_sessions response missing result")?;
+    let parse = |rows: &serde_json::Value| -> anyhow::Result<Vec<DaemonSessionSummary>> {
+        Ok(rows
+            .as_array()
+            .context("list_sessions result not an array")?
+            .iter()
+            .filter_map(parse_daemon_session_summary)
+            .collect())
+    };
+    let tag = result.get("etag").and_then(|e| e.as_str()).map(str::to_string);
+    if result.get("unchanged").and_then(|u| u.as_bool()) == Some(true) {
+        return Ok((None, tag));
+    }
+    match result.get("sessions") {
+        Some(rows) => Ok((Some(parse(rows)?), tag)),
+        None => Ok((Some(parse(&result)?), None)),
+    }
 }
 
 /// Background per-host session-list poller. One thread per configured
@@ -1602,18 +1650,30 @@ pub fn spawn_session_pollers(
         let tx = tx.clone();
         let thread = std::thread::Builder::new()
             .name(format!("cm-tui-session-poll-{}", host_id.as_str()))
-            .spawn(move || loop {
-                if let Some(socket) = pool.live_socket_path(&host_id) {
-                    if let Ok(summaries) =
-                        rpc_list_daemon_sessions(&socket, &pool.operator_token_for(&host_id))
-                    {
-                        // App dropped the receiver → shut the thread down.
-                        if tx.send((host_id.clone(), summaries)).is_err() {
-                            return;
+            .spawn(move || {
+                // The last list and its etag: an unchanged reply re-posts it.
+                let mut last: Option<(Vec<DaemonSessionSummary>, Option<String>)> = None;
+                loop {
+                    if let Some(socket) = pool.live_socket_path(&host_id) {
+                        let etag = last.as_ref().and_then(|(_, e)| e.as_deref());
+                        match rpc_list_daemon_sessions_since(
+                            &socket,
+                            &pool.operator_token_for(&host_id),
+                            etag,
+                        ) {
+                            Ok((Some(summaries), etag)) => last = Some((summaries, etag)),
+                            Ok((None, _)) => {}
+                            Err(_) => last = None,
+                        }
+                        if let Some((summaries, _)) = &last {
+                            // App dropped the receiver → shut the thread down.
+                            if tx.send((host_id.clone(), summaries.clone())).is_err() {
+                                return;
+                            }
                         }
                     }
+                    std::thread::sleep(SESSION_POLL_INTERVAL);
                 }
-                std::thread::sleep(SESSION_POLL_INTERVAL);
             })
             .expect("spawn session-poll thread");
         threads.push(thread);
@@ -2845,6 +2905,38 @@ time.sleep(60)
             assert_eq!(result.is_ok(), code == ErrorCode::UnknownMethod);
             server.join().unwrap();
         }
+    }
+
+    /// The 5 s session poll: the first call carries the projected list and
+    /// an etag; repeating that etag gets "unchanged" until the list changes.
+    #[test]
+    fn session_poll_sends_the_list_once_then_unchanged_until_it_changes() {
+        let (socket, working_dir, _state, stop, handle) = start_test_daemon("ws-poll");
+        let argv = vec!["/bin/bash".to_string()];
+        let uid = test_uid();
+        let config = bash_config(&socket, &working_dir, "op-test", &uid, "ws-poll", "poll", &argv, 80, 24);
+        rpc_start_session(&config).expect("start_session rpc ok");
+
+        let (list, etag) = rpc_list_daemon_sessions_since(&socket, "op-test", None).unwrap();
+        let list = list.expect("first poll carries the list");
+        assert!(list.iter().any(|s| s.session_uid == uid && s.label == "poll"));
+        let etag = etag.expect("a current daemon tags the list");
+        let (again, same) = rpc_list_daemon_sessions_since(&socket, "op-test", Some(&etag)).unwrap();
+        assert!(again.is_none(), "nothing changed");
+        assert_eq!(same.as_deref(), Some(etag.as_str()));
+
+        let _ = rpc_kill_session(&socket, "op-test", &uid);
+        let wait = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (list, _) = rpc_list_daemon_sessions_since(&socket, "op-test", Some(&etag)).unwrap();
+            if let Some(list) = list {
+                assert!(list.iter().all(|s| s.session_uid != uid));
+                break;
+            }
+            assert!(Instant::now() < wait, "the kill never changed the list");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop_test_daemon(&socket, stop, handle);
     }
 
     #[test]

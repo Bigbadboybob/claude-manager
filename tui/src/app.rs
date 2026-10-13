@@ -547,6 +547,12 @@ pub struct App {
     /// Last `session.viewed` report: which session, and when. See
     /// `report_viewed_session`.
     pub(crate) viewed_report: Option<(String, std::time::Instant)>,
+    /// `session.viewed` reports waiting per host. A host present here has a
+    /// sender thread running, which sends the latest uid (if any) and exits
+    /// when none is left, so quick selection changes cost one RPC at a time.
+    viewed_pending: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<cm_daemon::host_id::HostId, Option<String>>>,
+    >,
     /// 12a (Phase 3): parsed `~/.cm/hosts.toml`. Synthesized
     /// local-default when the file is missing (A1 in the Phase 3
     /// plan). No consumer yet — 12b adds the field to manifest
@@ -1015,6 +1021,7 @@ impl App {
             restart_suppressed_exit_uids: std::collections::HashSet::new(),
             revive_failed: HashMap::new(),
             viewed_report: None,
+            viewed_pending: Default::default(),
             hosts,
             host_pool,
             skipped_manifest_entries: HashMap::new(),

@@ -1043,8 +1043,60 @@ fn dispatch_list_sessions(
         }
     }
     match methods::list_sessions(state, &req.params, caller_uid.as_deref()) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => Response::ok(req.id.clone(), shape_session_list(value, &req.params)),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// Optional `list_sessions` shaping for pollers on slow links (the TUI asks
+/// every 5 s; the full list was ~90 KB, three quarters of it `agent_state`,
+/// whose `observed_at` stamps change on every poll).
+///
+/// - `fields: [..]` keeps only those keys in each row (`session_uid` always).
+/// - `etag: "<previous>"` (any string, `""` the first time) turns the reply
+///   into `{etag, unchanged: true}` when the shaped list is the same as the
+///   one that etag names, else `{etag, sessions: [..]}`.
+///
+/// Without either parameter the reply is the plain array callers expect.
+fn shape_session_list(value: serde_json::Value, params: &serde_json::Value) -> serde_json::Value {
+    let fields: Option<Vec<&str>> = params
+        .get("fields")
+        .and_then(|f| f.as_array())
+        .map(|f| f.iter().filter_map(|v| v.as_str()).collect());
+    let value = match (fields, value) {
+        (Some(fields), serde_json::Value::Array(rows)) => serde_json::Value::Array(
+            rows.into_iter()
+                .map(|row| match row {
+                    serde_json::Value::Object(mut row) => {
+                        row.retain(|k, _| k == "session_uid" || fields.contains(&k.as_str()));
+                        serde_json::Value::Object(row)
+                    }
+                    other => other,
+                })
+                .collect(),
+        ),
+        (_, value) => value,
+    };
+    let Some(previous) = params.get("etag").and_then(|e| e.as_str()) else {
+        return value;
+    };
+    // Rows are hashed in uid order so registry iteration order cannot
+    // change the tag.
+    let mut rows: Vec<String> = value
+        .as_array()
+        .map(|rows| rows.iter().map(|r| r.to_string()).collect())
+        .unwrap_or_default();
+    rows.sort();
+    let etag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rows.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    if etag == previous {
+        serde_json::json!({ "etag": etag, "unchanged": true })
+    } else {
+        serde_json::json!({ "etag": etag, "sessions": value })
     }
 }
 
@@ -5124,6 +5176,36 @@ mod tests {
         let s2 = &sessions2.as_array().expect("array")[0];
         assert_eq!(s2["cols"].as_u64(), Some(200));
         assert_eq!(s2["rows"].as_u64(), Some(50));
+    }
+
+    #[test]
+    fn list_sessions_projects_fields_and_answers_unchanged_for_a_matching_etag() {
+        let state = state_with_session("ts-live");
+        let list = |params: serde_json::Value| {
+            let resp = dispatch_request(&state, &operator_request("list_sessions", params)).into_response();
+            assert!(resp.ok, "{:?}", resp.error);
+            resp.result.unwrap()
+        };
+        assert!(list(serde_json::json!({})).is_array(), "no shaping without fields/etag");
+        let fields = serde_json::json!(["label", "cols", "rows"]);
+
+        let first = list(serde_json::json!({"fields": fields, "etag": ""}));
+        let row = first["sessions"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["cols", "label", "rows", "session_uid"]);
+        let etag = first["etag"].as_str().unwrap().to_string();
+
+        let again = list(serde_json::json!({"fields": fields, "etag": etag}));
+        assert_eq!(again, serde_json::json!({"etag": etag, "unchanged": true}));
+
+        let _ = dispatch_request(&state, &operator_request(
+            "session.resize",
+            serde_json::json!({ "session_uid": "ts-live", "cols": 120, "rows": 40 }),
+        ));
+        let changed = list(serde_json::json!({"fields": fields, "etag": etag}));
+        assert_ne!(changed["etag"], etag);
+        assert_eq!(changed["sessions"][0]["cols"], 120);
     }
 
     /// 5d: TUI-owned rows carry `workspace_id` + `worktree_path` so an
