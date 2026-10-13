@@ -116,6 +116,31 @@ pub(crate) fn try_attach_via_daemon_with_deps(
     host_id: &cm_daemon::host_id::HostId,
     transcript_path: Option<&str>,
 ) -> anyhow::Result<Session> {
+    attach_via_daemon(
+        host_pool, session_uid, workspace_id, worktree_path, session_type, label, cols, rows,
+        task_id, workflow_run_id, workflow_role, host_id, transcript_path, false,
+    )
+}
+
+/// [`try_attach_via_daemon_with_deps`]; `screen` asks for a screen-first
+/// attach (see `Session::history_deferred`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_via_daemon(
+    host_pool: &crate::host_pool::HostPool,
+    session_uid: &str,
+    workspace_id: &str,
+    worktree_path: &Path,
+    session_type: &str,
+    label: &str,
+    cols: u16,
+    rows: u16,
+    task_id: Option<&str>,
+    workflow_run_id: Option<&str>,
+    workflow_role: Option<&str>,
+    host_id: &cm_daemon::host_id::HostId,
+    transcript_path: Option<&str>,
+    screen: bool,
+) -> anyhow::Result<Session> {
     let internal_session_type = normalize_session_type_to_internal(session_type);
     let wire_session_type = match internal_session_type {
         "claude" => "claude-code",
@@ -168,7 +193,8 @@ pub(crate) fn try_attach_via_daemon_with_deps(
         // grant; nothing is spawned here so the field is inert.
         global_perms: false,
     };
-    let session = crate::session::Session::new_attached_existing_with_context(cs_config, true)?;
+    let session =
+        crate::session::Session::new_attached_existing_with_context(cs_config, true, screen)?;
     // Legacy daemons may ignore attach dimensions; keep the asynchronous kick.
     session.resize(cols, rows);
 

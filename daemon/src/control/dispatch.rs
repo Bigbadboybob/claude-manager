@@ -2526,6 +2526,13 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         cols: Option<u16>,
         rows: Option<u16>,
         context: Option<Context>,
+        /// `"screen"`: send the visible screen instead of the whole ring
+        /// (`crate::screen_replay`). Anything else, or absent: full ring.
+        replay: Option<String>,
+        /// The viewer passes kitty graphics through. A screen repaint carries
+        /// no images, so a ring holding image commands is replayed in full.
+        #[serde(default)]
+        graphics: bool,
     }
     #[derive(serde::Deserialize)]
     struct Context {
@@ -2564,11 +2571,32 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
             context_errors.push(message);
         }
     }
-    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-    let mut outcome = bind_attach_stream(&mut s, req, params.uid, params.cols, params.rows);
-    if let DispatchOutcome::AttachStream { response, .. } = &mut outcome {
-        response.result.as_mut().expect("attach result")["context_errors"] =
-            serde_json::json!(context_errors);
+    let screen = params.replay.as_deref() == Some("screen");
+    let (mut outcome, ring) = {
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        bind_attach_stream_with(&mut s, req, params.uid, params.cols, params.rows, screen)
+    };
+    if let DispatchOutcome::AttachStream { response, handle } = &mut outcome {
+        let result = response.result.as_mut().expect("attach result");
+        result["context_errors"] = serde_json::json!(context_errors);
+        if let Some(ring) = ring {
+            // Built outside the state lock; output that arrived meanwhile is
+            // queued behind it.
+            let images = params.graphics && ring.windows(3).any(|w| w == b"\x1b_G");
+            let replay = if images {
+                result.as_object_mut().expect("attach result").remove("replay");
+                result.as_object_mut().expect("attach result").remove("offset");
+                ring
+            } else {
+                crate::screen_replay::render(
+                    &ring,
+                    params.cols.unwrap_or(80),
+                    params.rows.unwrap_or(24),
+                )
+            };
+            handle.fanout_rx.flow_control().push_front(&replay);
+            result["replay_bytes"] = serde_json::json!(replay.len());
+        }
     }
     outcome
 }
@@ -2580,6 +2608,20 @@ fn bind_attach_stream(
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> DispatchOutcome {
+    bind_attach_stream_with(state, req, session_uid, cols, rows, false).0
+}
+
+/// [`bind_attach_stream`]; with `screen`, queues no replay and returns the
+/// ring for the caller to render (outside the state lock) and put in front
+/// of the queued live output.
+fn bind_attach_stream_with(
+    state: &mut DaemonState,
+    req: &Request,
+    session_uid: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    screen: bool,
+) -> (DispatchOutcome, Option<Vec<u8>>) {
     // Subscribe + clone last_exit inside the same critical
     // section as the ticket consume above (`state` is &mut and
     // we still hold the dispatch-arm lock from `dispatch_request`).
@@ -2587,7 +2629,7 @@ fn bind_attach_stream(
     // session.attach already minted a ticket for a uid that has
     // since exited — surface as Conflict so the client knows the
     // attach can't proceed.
-    let (fanout_rx, last_exit, replay_bytes) = match state.sessions.get_mut(&session_uid) {
+    let (fanout_rx, last_exit, replay_bytes, offset, ring) = match state.sessions.get_mut(&session_uid) {
         Some(session) => {
             // Apply the client's terminal size server-side, in the
             // same locked critical section that binds the stream.
@@ -2611,37 +2653,45 @@ fn bind_attach_stream(
                     );
                 }
             }
-            let (rx, replay_bytes) = session.fanout.subscribe_output_with_replay_len();
-            (rx, session.last_exit.clone(), replay_bytes)
+            if screen {
+                let (rx, ring, offset) = session.fanout.subscribe_output_without_replay();
+                (rx, session.last_exit.clone(), 0, offset, Some(ring))
+            } else {
+                let (rx, replay_bytes) = session.fanout.subscribe_output_with_replay_len();
+                (rx, session.last_exit.clone(), replay_bytes, 0, None)
+            }
         }
         None => {
-            return DispatchOutcome::Done(Response::err(
+            return (DispatchOutcome::Done(Response::err(
                 req.id.clone(),
                 ErrorCode::Conflict,
                 format!(
                     "session '{}' exited between session.attach and attach.open",
                     session_uid
                 ),
-            ));
+            )), None);
         }
     };
 
-    let response = Response::ok(
-        req.id.clone(),
-        serde_json::json!({
-            "session_uid": session_uid.clone(),
-            "output_flow": true,
-            // Bytes of ring replay that precede live output on this stream.
-            "replay_bytes": replay_bytes,
-        }),
-    );
+    let mut result = serde_json::json!({
+        "session_uid": session_uid.clone(),
+        "output_flow": true,
+        // Bytes of ring replay that precede live output on this stream.
+        "replay_bytes": replay_bytes,
+    });
+    if ring.is_some() {
+        // Filled in by the caller once the repaint is rendered.
+        result["replay"] = serde_json::json!("screen");
+        result["offset"] = serde_json::json!(offset);
+    }
+    let response = Response::ok(req.id.clone(), result);
     let handle = AttachStreamHandle {
         session_uid,
         fanout_rx,
         last_exit,
         request_id: req.id.clone(),
     };
-    DispatchOutcome::AttachStream { response, handle }
+    (DispatchOutcome::AttachStream { response, handle }, ring)
 }
 
 /// 10e-b: `manifest.watch` dispatch arm. Operator-only.
@@ -4105,6 +4155,56 @@ mod tests {
             session.fanout.push(b"stream survives context update");
             assert_eq!(handle.fanout_rx.recv().unwrap(), b"stream survives context update");
         }
+    }
+
+    #[test]
+    fn direct_attach_screen_mode_sends_a_repaint_then_live_output() {
+        let state = state_with_session("ts-live");
+        let history: Vec<u8> = (0..20_000)
+            .flat_map(|n| format!("history line {n}\r\n").into_bytes())
+            .collect();
+        state.lock().unwrap().sessions["ts-live"].fanout.push(&history);
+        let attach = |replay: serde_json::Value| {
+            let outcome = dispatch_request(&state, &operator_request("attach.direct", serde_json::json!({
+                "uid": "ts-live", "cols": 80, "rows": 24, "replay": replay,
+            })));
+            let DispatchOutcome::AttachStream { response, handle } = outcome else {
+                panic!("expected live stream");
+            };
+            (response.result.unwrap(), handle)
+        };
+
+        let (full, _full_handle) = attach(serde_json::Value::Null);
+        assert!(full.get("replay").is_none(), "absent replay keeps the full ring");
+        let ring_len = full["replay_bytes"].as_u64().unwrap();
+        assert!(ring_len >= 300_000);
+
+        let (screen, handle) = attach(serde_json::json!("screen"));
+        assert_eq!(screen["replay"], "screen");
+        let repaint_len = screen["replay_bytes"].as_u64().unwrap() as usize;
+        assert!(repaint_len > 0 && repaint_len < 4_000, "repaint was {repaint_len} bytes");
+        assert!(screen["offset"].as_u64().unwrap() >= ring_len);
+        state.lock().unwrap().sessions["ts-live"].fanout.push(b"live after attach");
+        let mut got = Vec::new();
+        while got.len() < repaint_len + 17 {
+            got.extend(handle.fanout_rx.recv().unwrap());
+        }
+        let text = String::from_utf8_lossy(&got[..repaint_len]);
+        assert!(text.contains("history line 19999"), "repaint shows the latest screen");
+        drop(handle);
+
+        // A ring holding kitty image commands is replayed in full to a viewer
+        // that passes graphics through, so its images come back.
+        state.lock().unwrap().sessions["ts-live"].fanout.push(b"\x1b_Ga=T,f=100;AAAA\x1b\\");
+        let outcome = dispatch_request(&state, &operator_request("attach.direct", serde_json::json!({
+            "uid": "ts-live", "cols": 80, "rows": 24, "replay": "screen", "graphics": true,
+        })));
+        let DispatchOutcome::AttachStream { response, .. } = outcome else { panic!("stream") };
+        let result = response.result.unwrap();
+        assert!(result.get("replay").is_none());
+        assert!(result["replay_bytes"].as_u64().unwrap() >= ring_len);
+        assert!(!text.contains("history line 100\r"), "but not old history");
+        assert_eq!(&got[repaint_len..], b"live after attach");
     }
 
     #[test]

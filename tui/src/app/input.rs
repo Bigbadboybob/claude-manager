@@ -3475,6 +3475,7 @@ impl App {
                             use alacritty_terminal::grid::Scroll;
                             ts.session.term.lock().scroll_display(Scroll::PageUp);
                         }
+                        self.load_deferred_history();
                         return true;
                     }
                     KeyCode::PageDown => {
@@ -3506,6 +3507,7 @@ impl App {
                             use alacritty_terminal::grid::Scroll;
                             ts.session.term.lock().scroll_display(Scroll::PageUp);
                         }
+                        self.load_deferred_history();
                         return true;
                     }
                     KeyCode::PageDown if key.modifiers.is_empty() => {
@@ -3703,6 +3705,7 @@ impl App {
         match me.kind {
             MouseEventKind::ScrollUp => {
                 ts.session.term.lock().scroll_display(Scroll::Delta(3));
+                self.load_deferred_history();
                 true
             }
             MouseEventKind::ScrollDown => {

@@ -422,6 +422,21 @@ impl PtyByteFanout {
         (rx, replay.len())
     }
 
+    /// A bounded subscription with NO replay queued, plus a copy of the ring
+    /// and the stream offset where live output starts (`bytes_written`).
+    /// Ring copy and subscription share one lock, so live output continues
+    /// exactly where the ring ends.
+    pub fn subscribe_output_without_replay(
+        &self,
+    ) -> (crate::attach_output::OutputSubscription, Vec<u8>, u64) {
+        let (tx, rx) = crate::attach_output::channel();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let ring: Vec<u8> = inner.buffer.iter().copied().collect();
+        let offset = inner.bytes_written;
+        if inner.closed { tx.close(); } else { inner.output_subscribers.push(tx); }
+        (rx, ring, offset)
+    }
+
     /// Test helper: number of buffered bytes.
     #[cfg(test)]
     fn buffered_len(&self) -> usize {

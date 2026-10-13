@@ -89,6 +89,7 @@ pub mod reaper;
 pub mod reexec;
 pub mod reexec_manifest;
 pub mod restart_coordinator;
+pub mod screen_replay;
 pub mod session;
 pub mod terminal_sweep;
 pub mod session_watch;

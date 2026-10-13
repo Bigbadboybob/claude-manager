@@ -146,6 +146,10 @@ pub struct Session {
     /// Kitty graphics passthrough for daemon-attached panes; `None` when it
     /// is off or for local PTYs. See doc/kitty-graphics-passthrough.md.
     pub graphics: Option<crate::graphics::PaneGraphics>,
+    /// Attached screen-first (remote panes): only the visible screen was
+    /// sent, so scrolling up has nothing to show until the full output ring
+    /// is fetched. The app re-attaches with the ring on the first scroll up.
+    pub history_deferred: bool,
 }
 
 #[derive(Default)]
@@ -320,6 +324,7 @@ impl Session {
             attach_hup_fd: None,
             output_control: None,
             graphics: None,
+            history_deferred: false,
         })
     }
 
@@ -346,12 +351,13 @@ impl Session {
     pub fn new_attached_existing(
         config: crate::client_session::ClientSessionConfig,
     ) -> anyhow::Result<Self> {
-        Self::new_attached_existing_with_context(config, false)
+        Self::new_attached_existing_with_context(config, false, false)
     }
 
     pub(crate) fn new_attached_existing_with_context(
         config: crate::client_session::ClientSessionConfig,
         restore_context: bool,
+        screen: bool,
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
         // A bounded raw replay can start after the application's last complete
@@ -362,7 +368,7 @@ impl Session {
         } else {
             Repaint::None
         };
-        let cs = crate::client_session::ClientSession::attach_existing_with_context(config, restore_context)?;
+        let cs = crate::client_session::ClientSession::attach_existing_with_context(config, restore_context, screen)?;
         let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
         Ok(Session {
             repaint,
@@ -384,6 +390,7 @@ impl Session {
             attach_hup_fd: cs.hup_fd,
             output_control: cs.output_control,
             graphics: cs.graphics,
+            history_deferred: cs.history_deferred,
         })
     }
 
@@ -439,6 +446,7 @@ impl Session {
             attach_hup_fd: cs.hup_fd,
             output_control: cs.output_control,
             graphics: cs.graphics,
+            history_deferred: cs.history_deferred,
         })
     }
 

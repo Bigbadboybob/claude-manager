@@ -307,3 +307,41 @@ This is a TUI-only change: no daemon or session restart is needed. The cloud
 controller currently has only a read-only laptop export, so preparing a release
 here does not install it on the laptop. Do not duplicate-launch the recovered
 `predictionTrading/openai-and-consistently-recency-filters` session.
+
+## Slow links: reconnect loop, compression, screen-first attach
+
+2026-10-13. On a bad link Owner's TUI was near-unusable and slow to start.
+Every attach replayed the session's whole 1 MiB output ring (1.4 MB as
+base64 frames) through the one SSH connection the host shares. Attaches that
+waited behind other panes' replays were abandoned and retried with another
+full replay: 32 attaches a minute, the same session 3–4 times.
+
+- **Reconnect loop** (merged d163de1).
+  - The attach handshake waits 30 s, up from 5 s.
+  - Reconnects back off per session: 2 s doubling to 60 s for failed attaches
+    and for streams that die within a minute of attaching. The focused pane
+    waits at most 10 s, and A-r / A-R retry at once.
+  - The daemon gives a slow viewer 120 s without progress, up from 10 s, and
+    a 4 MiB queue, up from 2 MiB.
+  - The SSH keepalive allows 30 s of silence.
+- **Compression** (merged ef94266). The tunnel runs with
+  `Compression=yes`. Replays compress about 5.7× (1.4 MB to about 220 KB
+  per pane, measured on 36 live sessions).
+- **Screen-first attach.** Remote panes attach with
+  `attach.direct {replay: "screen"}`.
+  - The daemon parses the ring into a throwaway terminal at the viewer's
+    size (`daemon/src/screen_replay.rs`, same alacritty parser as the TUI).
+    It sends only the visible screen with its colors, cursor, alt screen,
+    input modes and scroll region: a few KB instead of the ring. Live output
+    continues from the reply's `offset`.
+  - The pane then has no scrollback. The first scroll up (wheel, PageUp,
+    Shift+PageUp) re-attaches that one pane with its full ring, and the
+    status line says "Loading scrollback…". Scroll up again once it lands.
+  - When kitty graphics passthrough is on and the ring holds image commands,
+    the daemon replays the full ring so the images come back.
+  - Local panes keep the full replay. An older daemon ignores the parameter
+    and replays the ring as before.
+
+Five 300 KB panes over a modelled 120 KB/s link
+(`tui/src/app/remote/slow_link_tests.rs`): a cold start sends 15 KB with
+screen-first attach, against 2.0 MB with full replays.

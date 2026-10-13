@@ -301,6 +301,9 @@ pub struct ClientSession {
     pub output_control: Option<crate::attach_writer::OutputControl>,
     /// Kitty graphics passthrough state; `None` when it is off.
     pub graphics: Option<crate::graphics::PaneGraphics>,
+    /// Attached screen-first: the terminal holds the visible screen only,
+    /// and the session's scrollback has not been loaded.
+    pub history_deferred: bool,
 }
 
 // Post-review #15 (deferred): a `Drop` impl that calls
@@ -331,7 +334,7 @@ impl ClientSession {
         let start_result = rpc_start_session_full(&config)
             .context("RPC start_session")?;
 
-        match Self::build_after_start(&config, &start_result, false) {
+        match Self::build_after_start(&config, &start_result, false, false) {
             Ok(session) => Ok(session),
             Err(e) => {
                 // Best-effort cleanup. We log the cleanup error
@@ -369,12 +372,15 @@ impl ClientSession {
     /// don't own it. The pre-fix `new()` cleanup arm only fires
     /// on `start_session`-driven failures.
     pub fn attach_existing(config: ClientSessionConfig) -> anyhow::Result<Self> {
-        Self::attach_existing_with_context(config, false)
+        Self::attach_existing_with_context(config, false, false)
     }
 
+    /// `screen`: ask for a screen-first attach (the visible screen instead of
+    /// the whole output ring); see [`ClientSession::history_deferred`].
     pub(crate) fn attach_existing_with_context(
         config: ClientSessionConfig,
         restore_context: bool,
+        screen: bool,
     ) -> anyhow::Result<Self> {
         // Step 1 skipped: the daemon already has the session.
         // The wire shape for steps 2–6 is identical to `new()`
@@ -386,7 +392,7 @@ impl ClientSession {
             session_uid: config.uid.to_string(),
             cgroup_path: None,
         };
-        Self::build_after_start(&config, &synthetic_start, restore_context)
+        Self::build_after_start(&config, &synthetic_start, restore_context, screen)
     }
 
     /// Steps 2–6 of the dance. Factored out so the outer `new`
@@ -395,9 +401,11 @@ impl ClientSession {
         config: &ClientSessionConfig,
         start_result: &StartSessionResult,
         restore_context: bool,
+        screen: bool,
     ) -> anyhow::Result<Self> {
         let session_uid = &start_result.session_uid;
-        let (attach_socket, open_resp) = open_attach_socket(config, session_uid, restore_context)
+        let (attach_socket, open_resp) =
+            open_attach_socket(config, session_uid, restore_context, screen)
             .context("open daemon attach stream")?;
         if &open_resp.session_uid != session_uid {
             anyhow::bail!(
@@ -498,6 +506,7 @@ impl ClientSession {
             hup_fd,
             output_control,
             graphics,
+            history_deferred: open_resp.screen,
         })
     }
 
@@ -1191,9 +1200,16 @@ fn open_attach_socket(
     config: &ClientSessionConfig,
     uid: &str,
     restore_context: bool,
+    screen: bool,
 ) -> anyhow::Result<(UnixStream, AttachOpenResp)> {
     let mut socket = dial_attach_socket(config.daemon_socket)?;
     let mut params = serde_json::json!({ "uid": uid, "cols": config.cols, "rows": config.rows });
+    if screen {
+        // Older daemons ignore it and replay the whole ring.
+        params["replay"] = serde_json::json!("screen");
+        // With passthrough on, a pane showing images gets its ring instead.
+        params["graphics"] = serde_json::json!(crate::graphics::outer::enabled());
+    }
     if restore_context {
         params["context"] = serde_json::json!({
             "transcript_path": config.transcript_path,
@@ -1218,6 +1234,7 @@ fn open_attach_socket(
         AttachOpenResp {
             output_flow: result["output_flow"].as_bool().unwrap_or(false),
             replay_bytes: result["replay_bytes"].as_u64(),
+            screen: result["replay"] == "screen",
             session_uid: result["session_uid"].as_str()
                 .context("attach.direct result missing session_uid")?.to_string(),
         }
@@ -1259,6 +1276,8 @@ struct AttachOpenResp {
     output_flow: bool,
     /// Replayed ring bytes ahead of live output; absent on older daemons.
     replay_bytes: Option<u64>,
+    /// The daemon sent the visible screen only, not the output ring.
+    screen: bool,
 }
 
 /// `attach.open` over an *already-dialed* `UnixStream`. The same
@@ -1306,6 +1325,7 @@ fn rpc_attach_open(
     Ok(AttachOpenResp {
         output_flow: result["output_flow"].as_bool().unwrap_or(false),
         replay_bytes: result["replay_bytes"].as_u64(),
+        screen: false,
         session_uid: result["session_uid"]
             .as_str()
             .context("attach.open result missing session_uid")?
@@ -2705,7 +2725,7 @@ time.sleep(60)
         config.transcript_path = Some("/tmp/cm-test-transcript.jsonl");
         config.workflow_run_id = Some("wf-context");
         config.workflow_role = Some("worker");
-        let (stream, _) = open_attach_socket(&config, &uid, true).unwrap();
+        let (stream, _) = open_attach_socket(&config, &uid, true, false).unwrap();
         drop(stream);
         {
             let s = state.lock().unwrap();
@@ -2714,7 +2734,7 @@ time.sleep(60)
         config.workflow_run_id = None;
         config.workflow_role = None;
         config.transcript_path = None;
-        let (stream, _) = open_attach_socket(&config, &uid, true).unwrap();
+        let (stream, _) = open_attach_socket(&config, &uid, true, false).unwrap();
         assert_eq!(stream.read_timeout().unwrap(), None);
         assert_eq!(stream.write_timeout().unwrap(), None);
         assert!(state.lock().unwrap().sessions[&uid].workflow_run_id.is_none());
@@ -2749,7 +2769,7 @@ time.sleep(60)
                     serde_json::json!({"session_uid": "test"}))).unwrap();
             });
             let config = bash_config(&path, dir.path(), "token", "test", "ws", "test", &[], 80, 24);
-            let result = open_attach_socket(&config, "test", false);
+            let result = open_attach_socket(&config, "test", false, false);
             assert_eq!(result.is_ok(), code == ErrorCode::UnknownMethod);
             server.join().unwrap();
         }
