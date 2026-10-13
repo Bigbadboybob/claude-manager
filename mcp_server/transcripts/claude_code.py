@@ -65,13 +65,11 @@ def read_messages(
     """Read up to `limit` messages from the transcript file at `path`,
     starting after the cursor `since` (or from the beginning if None).
     Returns (messages, next_cursor_raw)."""
-    start_offset, gen = resolve_offset(generation, since)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            contents = f.read()
-    except (OSError, FileNotFoundError):
-        return [], format_cursor(gen, start_offset)
-    return parse_lines(contents, start_offset, limit, gen)
+    # Streams line by line (see transcripts/stream.py): a whole-file read
+    # of a large transcript pinned hundreds of MB per MCP worker thread.
+    from . import stream
+
+    return stream.read_messages(path, generation, since, limit, render_message)
 
 
 def render_message(v: dict) -> Optional[Message]:

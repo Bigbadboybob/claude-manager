@@ -54,7 +54,9 @@ from mcp_server.transcripts.types import Role
 # without pulling in the MCP server's deps). Imported into this namespace
 # so the tools below — and `from mcp_server.server import _session_status`
 # in the tests — keep working unchanged.
+from mcp_server.transcripts import stream as transcript_stream
 from mcp_server.monitor import (
+    last_assistant_message,
     _last_assistant,
     _monitor_sessions,
     _parser_for,
@@ -2453,10 +2455,14 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
         }, resolved)
 
     n = max(0, min(context_messages, 100))
-    messages, cursor = _read_all_messages(engine, transcript_path, generation)
-    tail = messages[-n:] if n else []
+    # Bounded: the last n messages and the last reply come from a backward
+    # scan; the cursor from a line count. A full parse of a large transcript
+    # pinned hundreds of MB in the worker thread's arena.
+    tail, last, cursor = transcript_stream.tail(
+        transcript_path, generation, n, _parser_for(engine).render_message,
+    )
     return _with_outcome({
-        "last_assistant": _last_assistant(messages),
+        "last_assistant": last,
         "messages": [m.to_dict() for m in tail],
         "status": status,
         "state": state,
@@ -3097,10 +3103,9 @@ async def _await_reply(
         if transcript_path is None:
             return last_message
         try:
-            msgs, _ = _read_all_messages(engine, transcript_path, generation)
+            return last_assistant_message(engine, transcript_path) or last_message
         except OSError:
             return last_message
-        return _last_assistant(msgs) or last_message
 
     while True:
         try:
@@ -3279,8 +3284,9 @@ async def _send_and_await(
         transcript_path = pre.get("transcript_path")
         generation = int(pre.get("generation", 0))
         if transcript_path is not None:
-            _pre_msgs, anchor_cursor = await asyncio.to_thread(
-                _read_all_messages, engine, transcript_path, generation
+            # Only the end cursor is needed: count lines, parse nothing.
+            anchor_cursor = await asyncio.to_thread(
+                transcript_stream.end_cursor, transcript_path, generation
             )
     except control_client.ControlError as e:
         return {"error": e.code, "message": e.message}
