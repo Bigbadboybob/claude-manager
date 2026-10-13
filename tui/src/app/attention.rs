@@ -101,7 +101,16 @@ impl App {
                 host: host.clone(),
                 label: label_of(self, host, uid).unwrap_or_else(|| alert.label.clone()),
                 reason: alert.message.lines().next().unwrap_or("").to_owned(),
-                since: self.owner_alert_since.get(&alert.id).copied().unwrap_or_else(SystemTime::now),
+                // When the agent raised it (B5b); older daemons omit it, so
+                // fall back to when this viewer first saw the alert.
+                since: alert
+                    .created_at
+                    .as_deref()
+                    .and_then(super::board::parse_rfc3339)
+                    .and_then(|s| u64::try_from(s).ok())
+                    .map(|s| UNIX_EPOCH + Duration::from_secs(s))
+                    .or_else(|| self.owner_alert_since.get(&alert.id).copied())
+                    .unwrap_or_else(SystemTime::now),
             });
         }
         let legacy: Vec<(String, String)> = self
