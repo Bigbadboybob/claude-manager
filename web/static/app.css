@@ -166,3 +166,4 @@ main { flex: 1; min-height: 0; display: flex; }
 button.wide { width: 100%; }
 .gap-top { margin-top: 8px; }
 .gap-bottom { margin-bottom: 8px; }
+.who-link { color: inherit; text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 3px; }

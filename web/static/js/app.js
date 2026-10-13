@@ -4,7 +4,7 @@ import { api, allPages, newRequestId, ApiError } from "./api.js";
 import {
   REACTIONS, LEVELS, renderBody, formatTime, dayLabel, sortConversations, filterConversations,
   badgeCount, reactionList, truncate, parseRoute, routeHash, groupAlerts, age, withoutSeenAlerts,
-  learnNames, nameFor,
+  learnNames, nameFor, alertParticipant, directDm, hasIdentity,
 } from "./format.js";
 import * as push from "./push.js";
 
@@ -20,6 +20,7 @@ const state = {
   counts: { conversations: {}, unread: 0, dms: 0, mentions: 0 },
   availability: null,
   alerts: [],
+  alertHosts: [],
   // Alert ids acknowledged here: hidden at once and kept hidden even if a
   // refresh that raced the acknowledgement still returns them.
   seenAlerts: new Map(), // id -> time acknowledged
@@ -71,6 +72,9 @@ function fail(e) {
 
 // ---------- drafts (survive errors, reloads and Access expiry) ----------
 const draftKey = (id) => `cm-board:draft:${id}`;
+/** Drafts of a DM that does not exist yet are kept under the participant. */
+const draftId = (c) => c.id || `dm:${c.dmTo}`;
+
 function loadDraft(id) {
   try {
     return JSON.parse(localStorage.getItem(draftKey(id)) || "null") || { body: "", request_id: null, reply_to: null };
@@ -186,7 +190,7 @@ async function openConversation(id, messageId = null) {
 
 async function loadOlder(rerender = true) {
   const c = state.conv;
-  if (!c || !c.next || c.loadingOlder) return;
+  if (!c || !c.id || !c.next || c.loadingOlder) return;
   c.loadingOlder = true;
   try {
     const page = await api.read({ conversation: c.id, newest_first: true, limit: PAGE, cursor: c.next, mark_read: false });
@@ -211,7 +215,7 @@ async function loadOlder(rerender = true) {
 
 async function refreshConversation() {
   const c = state.conv;
-  if (!c) return;
+  if (!c || !c.id) return;
   try {
     // Only mark read while the newest message is on screen.
     const page = await api.read({ conversation: c.id, newest_first: true, limit: PAGE, mark_read: c.atBottom });
@@ -252,7 +256,7 @@ async function send() {
   const c = state.conv;
   if (!c) return;
   const box = document.querySelector(".composer textarea");
-  const draft = loadDraft(c.id);
+  const draft = loadDraft(draftId(c));
   draft.body = box ? box.value : draft.body;
   if (!draft.body.trim()) return;
   if (draft.body.length > 3000) {
@@ -263,17 +267,17 @@ async function send() {
   // timeout must not post twice.
   draft.request_id = draft.request_id || newRequestId();
   draft.reply_to = c.replyTo?.id || draft.reply_to || null;
-  saveDraft(c.id, draft);
+  saveDraft(draftId(c), draft);
   state.busy.add("send");
   renderComposer();
   try {
-    await sendDraft(c.id, draft);
+    await sendDraft(c, draft);
   } catch (e) {
-    if (e instanceof ApiError && e.code === "join_required") {
+    if (e instanceof ApiError && e.code === "join_required" && c.id) {
       if (confirm("Join this channel to post?")) {
         try {
           await api.join(c.id, newRequestId());
-          await sendDraft(c.id, draft);
+          await sendDraft(c, draft);
         } catch (e2) {
           fail(e2);
         }
@@ -287,11 +291,20 @@ async function send() {
   }
 }
 
-async function sendDraft(id, draft) {
-  const params = { conversation: id, body: draft.body, request_id: draft.request_id };
+async function sendDraft(c, draft) {
+  const id = c.id;
+  // A DM that does not exist yet is created by its first message.
+  const params = id ? { conversation: id } : { dm: c.dmTo };
+  Object.assign(params, { body: draft.body, request_id: draft.request_id });
   if (draft.reply_to) params.reply_to = draft.reply_to;
-  await api.send(params);
-  saveDraft(id, { body: "", request_id: null, reply_to: null });
+  const res = await api.send(params);
+  saveDraft(draftId(c), { body: "", request_id: null, reply_to: null });
+  if (!id) {
+    const created = res?.event?.conversation_id;
+    await loadDirectory().catch(() => {});
+    if (created) go({ view: "conversation", id: created });
+    return;
+  }
   if (state.conv?.id === id) {
     state.conv.replyTo = null;
     state.conv.atBottom = true;
@@ -332,7 +345,7 @@ async function markRead(params, label) {
 
 async function openThread(root) {
   const c = state.conv;
-  if (!c) return;
+  if (!c || !c.id) return;
   c.thread = { root, items: [] };
   renderThread();
   try {
@@ -350,6 +363,7 @@ async function loadAlerts() {
   try {
     const res = await api.alerts();
     state.alerts = visibleAlerts(res.items || []);
+    state.alertHosts = res.alert_hosts || state.me?.features?.alert_hosts || [];
   } catch (e) {
     fail(e);
   }
@@ -398,8 +412,9 @@ function renderHeader() {
   if (!el) return;
   const level = state.availability?.level || "unset";
   const route = state.route;
-  const inConv = route.view === "conversation";
-  const title = inConv ? conversationTitle(route.id) : route.view === "alerts" ? "Alerts" : "CM Board";
+  const inConv = route.view === "conversation" || route.view === "newdm";
+  const title = route.view === "newdm" ? personName(route.pid)
+    : inConv ? conversationTitle(route.id) : route.view === "alerts" ? "Alerts" : "CM Board";
   put(el, h("div", { class: "bar" },
     inConv || route.view === "alerts"
       ? h("button", { class: "ghost back", "aria-label": "Back", onclick: () => go({ view: "list" }) }, "‹")
@@ -420,7 +435,7 @@ function renderMain() {
   const listPane = h("section", { class: `list-pane pane${view === "list" ? "" : " hidden-narrow"}`, id: "list" });
   put(main, listPane);
   renderList();
-  if (view === "conversation") {
+  if (view === "conversation" || view === "newdm") {
     main.append(h("section", { class: "pane conv", id: "conv" }));
     renderConversation();
   } else if (view === "alerts") {
@@ -512,8 +527,9 @@ function renderConversation(keepScroll = false) {
   if (!el || !c) return;
   const prev = el.querySelector(".scroll");
   const prevTop = prev?.scrollTop;
-  const counts = convCounts(c.id);
-  const tools = h("div", { class: "bar toolbar" },
+  const counts = c.id ? convCounts(c.id) : {};
+  const tools = !c.id ? h("div", { class: "bar toolbar" },
+    h("span", { class: "sub" }, `New conversation with ${personName(c.dmTo)}: your first message starts it`)) : h("div", { class: "bar toolbar" },
     h("span", { class: "sub" }, c.items.length ? `${c.items.length} loaded` : ""),
     h("span", { class: "spacer" }),
     counts.mentions
@@ -554,9 +570,9 @@ function onConversationScroll(e) {
 function startReply(m) {
   if (!state.conv) return;
   state.conv.replyTo = m;
-  const draft = loadDraft(state.conv.id);
+  const draft = loadDraft(draftId(state.conv));
   draft.reply_to = m.id;
-  saveDraft(state.conv.id, draft);
+  saveDraft(draftId(state.conv), draft);
   renderComposer();
   document.querySelector(".composer textarea")?.focus();
 }
@@ -565,14 +581,14 @@ function renderComposer() {
   const el = document.getElementById("composer");
   const c = state.conv;
   if (!el || !c) return;
-  const draft = loadDraft(c.id);
+  const draft = loadDraft(draftId(c));
   const replyTo = c.replyTo || (draft.reply_to ? c.items.find((m) => m.id === draft.reply_to) : null);
   const box = h("textarea", {
-    rows: 1, placeholder: `Message ${conversationTitle(c.id)}`, "aria-label": "Message",
+    rows: 1, placeholder: `Message ${c.id ? conversationTitle(c.id) : personName(c.dmTo)}`, "aria-label": "Message",
     oninput: (e) => {
-      const d = loadDraft(c.id);
+      const d = loadDraft(draftId(c));
       d.body = e.target.value;
-      saveDraft(c.id, d);
+      saveDraft(draftId(c), d);
       autosize(e.target);
     },
     onkeydown: (e) => {
@@ -588,9 +604,9 @@ function renderComposer() {
       `Replying to ${replyTo ? `${replyTo.actor?.name}: ${truncate(replyTo.body, 60)}` : "a message"}`,
       h("button", { class: "ghost", "aria-label": "Cancel reply", onclick: () => {
         c.replyTo = null;
-        const d = loadDraft(c.id);
+        const d = loadDraft(draftId(c));
         d.reply_to = null;
-        saveDraft(c.id, d);
+        saveDraft(draftId(c), d);
         renderComposer();
       } }, "✕")) : null,
     h("div", { class: "composer" }, box,
@@ -616,6 +632,19 @@ function renderThread() {
       startReply(t.root);
     } }, "Reply in thread"),
   ], () => { if (state.conv) state.conv.thread = null; });
+}
+
+/** The alerting agent's name: a link to Owner's DM with it (an empty DM
+ *  composer when there is none yet), or plain text when it has no messaging
+ *  identity to write to. */
+function alertNameEl(row) {
+  const pid = alertParticipant(row.alerts[0], state.alertHosts);
+  if (!hasIdentity(pid, state.people, state.knownNames, state.dms)) {
+    return h("strong", {}, row.label);
+  }
+  const dm = directDm(pid, state.dms);
+  const href = routeHash(dm ? { view: "conversation", id: dm.id } : { view: "newdm", pid });
+  return h("a", { class: "who-link", href, title: dm ? "Open your DM" : "Start a DM" }, h("strong", {}, row.label));
 }
 
 function renderAlerts() {
@@ -656,7 +685,7 @@ function renderAlerts() {
       class: "alert", id: `alert-row-${row.key}`, "data-alerts": row.alerts.map((a) => a.id).join(" "),
     },
     h("div", { class: "meta" },
-      h("strong", {}, row.label),
+      alertNameEl(row),
       row.host ? h("span", { class: "sub" }, ` · ${row.host}`) : null,
       h("span", { class: "spacer" }),
       row.count > 1 ? h("span", { class: "badge at" }, row.count) : null,
@@ -768,6 +797,16 @@ function onRoute() {
   if (route.view === "conversation" && (prev.view !== "conversation" || prev.id !== route.id || route.message || !state.conv)) {
     openConversation(route.id, route.message);
   } else if (route.view === "conversation") {
+    renderConversation();
+  } else if (route.view === "newdm") {
+    // Owner's DM with the agent: open it when it exists, else an empty
+    // composer; nothing is created until the first send.
+    const existing = directDm(route.pid, state.dms);
+    if (existing) {
+      go({ view: "conversation", id: existing.id });
+      return;
+    }
+    state.conv = { id: null, dmTo: route.pid, items: [], next: null, loadingOlder: false, replyTo: null, thread: null, atBottom: true };
     renderConversation();
   } else {
     state.conv = null;

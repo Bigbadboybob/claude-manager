@@ -101,6 +101,7 @@ export function parseRoute(hash) {
   if (params.get("conversation")) {
     return { view: "conversation", id: params.get("conversation"), message: params.get("message") || null };
   }
+  if (params.get("dm")) return { view: "newdm", pid: params.get("dm") };
   if (params.has("alerts")) return { view: "alerts", alert: params.get("alert") || null };
   if (params.has("settings")) return { view: "settings" };
   return { view: "list" };
@@ -112,6 +113,7 @@ export function routeHash(route) {
     if (route.message) p.set("message", route.message);
     return `#${p.toString()}`;
   }
+  if (route.view === "newdm") return `#${new URLSearchParams({ dm: route.pid }).toString()}`;
   if (route.view === "alerts") return route.alert ? `#alerts&alert=${encodeURIComponent(route.alert)}` : "#alerts";
   if (route.view === "settings") return "#settings";
   return "#";
@@ -187,4 +189,26 @@ export function learnNames(known, { dms = [], messages = [] } = {}) {
 export function nameFor(id, people, known) {
   if (id === "owner") return "Owner";
   return people?.get(id) || known?.get(id) || String(id).split(":").pop();
+}
+
+/** The messaging participant behind an alert: `agent:<host daemon>:<uid>`,
+ *  using the alert's own origin host (relayed alerts come from other
+ *  daemons), else the local host for older alerts. Null when unknown. */
+export function alertParticipant(alert, alertHosts) {
+  const host = alert?.origin_host || (alertHosts || []).find((h) => h.local)?.id;
+  return host && alert?.session_uid ? `agent:${host}:${alert.session_uid}` : null;
+}
+
+/** Owner's one-to-one DM with `pid`, if it exists. */
+export function directDm(pid, dms) {
+  return (dms || []).find((d) => {
+    const m = d.members || [];
+    return m.length === 2 && m.includes("owner") && m.includes(pid);
+  }) || null;
+}
+
+/** Whether `pid` has a messaging identity this client knows of: present in
+ *  the people directory, named elsewhere, or a member of some DM. */
+export function hasIdentity(pid, people, known, dms) {
+  return !!pid && (people?.has(pid) || known?.has(pid) || (dms || []).some((d) => (d.members || []).includes(pid)));
 }
