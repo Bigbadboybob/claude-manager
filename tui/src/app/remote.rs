@@ -339,6 +339,11 @@ impl App {
                 cols,
                 rows,
                 attempts: p.attempts,
+                // Remote panes attach with the visible screen only; their
+                // scrollback loads when Owner scrolls up (`load_deferred_history`).
+                // Local attaches cost nothing and keep the whole ring.
+                screen: p.entry.host_id != cm_daemon::host_id::HostId::local()
+                    && !self.full_history_wanted.contains(&p.entry.uid),
             };
             let dispatched = self
                 .attach_worker
@@ -401,6 +406,9 @@ impl App {
                     self.attached_tunnel_generation
                         .insert(result.entry.uid.clone(), gen);
                     self.note_reattached(&result.entry.uid);
+                    if !session.history_deferred {
+                        self.full_history_wanted.remove(&result.entry.uid);
+                    }
                     // Bind by uid across ALL workspaces, not just `result.ws_id`.
                     // A daemon session is unique by uid, so if a slot for it
                     // already exists ANYWHERE (a reconnect, or a stray duplicate
@@ -1084,6 +1092,29 @@ impl App {
         self.attaching.remove(uid);
         self.attached_tunnel_generation.remove(uid);
         self.reattach_backoff.remove(uid);
+        self.full_history_wanted.remove(uid);
+    }
+
+    /// Owner scrolled up in a pane that attached screen-first, which holds no
+    /// scrollback yet: re-attach it with the full output ring. The pane keeps
+    /// showing its live stream until the new one binds in place.
+    pub(super) fn load_deferred_history(&mut self) {
+        let Some(ts) = self.active_session_mut() else { return };
+        if !ts.session.history_deferred || ts.session.exited {
+            return;
+        }
+        let uid = ts.uid.clone();
+        if !self.full_history_wanted.insert(uid.clone()) {
+            return; // already loading
+        }
+        let found = self.workspaces.iter().enumerate().find_map(|(wi, w)| {
+            w.sessions.iter().position(|s| s.uid == uid).map(|si| (wi, si))
+        });
+        let Some((wi, si)) = found else { return };
+        self.reattach_backoff.remove(&uid);
+        self.requeue_remote_reconnect(wi, si, "loading scrollback");
+        self.set_status_msg("Loading scrollback…");
+        self.needs_redraw = true;
     }
 
     /// Manual "reconnect now" lever, invoked by `A-r` (refresh). The auto-

@@ -33,6 +33,8 @@ pub struct AttachRequest {
     /// Reconnect attempt count, echoed back so the result handler can apply the
     /// retry/cap policy without re-deriving it.
     pub attempts: u32,
+    /// Ask for a screen-first attach (visible screen, no output ring).
+    pub screen: bool,
 }
 
 /// Why an attach attempt failed, so the main loop can pick a recovery policy
@@ -107,7 +109,7 @@ impl AttachWorker {
                             generation
                                 .map_err(anyhow::Error::from)
                                 .and_then(|generation| {
-                                    let session = crate::app::try_attach_via_daemon_with_deps(
+                                    let session = crate::app::attach_via_daemon(
                                         &host_pool,
                                         &req.entry.uid,
                                         &req.ws_id,
@@ -123,6 +125,7 @@ impl AttachWorker {
                                         // Transcript binding survived on the remote daemon —
                                         // don't push a wrong-for-remote local path over it.
                                         None,
+                                        req.screen,
                                     )?;
                                     let now = host_pool.tunnel_generation(&req.entry.host_id);
                                     if now != generation {
@@ -267,7 +270,7 @@ mod tests {
         let worker = AttachWorker::spawn(Arc::new(HostPool::from_config(&hosts).unwrap()));
         let request = |id, host| {
             AttachRequest {
-            request_id: id, ws_id: "test".into(), worktree: dir.path().to_path_buf(), cols: 80, rows: 24, attempts: 0,
+            request_id: id, ws_id: "test".into(), worktree: dir.path().to_path_buf(), cols: 80, rows: 24, attempts: 0, screen: false,
             entry: serde_json::from_value(serde_json::json!({
                 "uid": format!("test-{id}"), "label": "test", "session_type": "bash", "host_id": host,
             })).unwrap(),

@@ -66,7 +66,7 @@ mod board;
 mod owner_blocked;
 mod unread;
 
-pub(crate) use lifecycle::try_attach_via_daemon_with_deps;
+pub(crate) use lifecycle::{attach_via_daemon, try_attach_via_daemon_with_deps};
 
 pub(crate) use model::{
     new_workspace_id, parse_worktree_mode, PendingWrite, SessionStatus, TaskEntry, TaskStatus,
@@ -664,6 +664,9 @@ pub struct App {
     attached_tunnel_generation: std::collections::HashMap<String, u64>,
     /// Per-uid reconnect backoff (`remote::ReattachBackoff`).
     reattach_backoff: std::collections::HashMap<String, remote::ReattachBackoff>,
+    /// Screen-first panes whose full output ring was requested by scrolling
+    /// up (`load_deferred_history`); their next attach replays the ring.
+    full_history_wanted: std::collections::HashSet<String>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -1037,6 +1040,7 @@ impl App {
             reconnecting_sessions: std::collections::HashSet::new(),
             attached_tunnel_generation: std::collections::HashMap::new(),
             reattach_backoff: std::collections::HashMap::new(),
+            full_history_wanted: std::collections::HashSet::new(),
         }
     }
 

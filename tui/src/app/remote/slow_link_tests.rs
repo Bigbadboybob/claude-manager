@@ -27,6 +27,8 @@ struct SlowLink {
     queued: Arc<AtomicU64>,
     /// When the last byte was delivered (ms since `epoch`).
     last_delivery_ms: Arc<AtomicU64>,
+    /// Daemon bytes delivered to clients in total.
+    delivered: Arc<AtomicU64>,
     epoch: Instant,
     stop: Arc<AtomicBool>,
 }
@@ -41,6 +43,7 @@ impl SlowLink {
         let attaches = Arc::new(Mutex::new(HashMap::new()));
         let queued = Arc::new(AtomicU64::new(0));
         let last_delivery_ms = Arc::new(AtomicU64::new(0));
+        let delivered = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
         let (link_tx, link_rx) = mpsc::sync_channel::<(UnixStream, Vec<u8>)>(window / CHUNK);
@@ -49,6 +52,7 @@ impl SlowLink {
         {
             let queued = queued.clone();
             let last = last_delivery_ms.clone();
+            let delivered = delivered.clone();
             std::thread::spawn(move || {
                 let mut next = Instant::now();
                 for (mut client, bytes) in link_rx {
@@ -60,6 +64,7 @@ impl SlowLink {
                         + Duration::from_secs_f64(bytes.len() as f64 / rate as f64);
                     let _ = client.write_all(&bytes); // a client that left drops its bytes
                     queued.fetch_sub(bytes.len() as u64, Ordering::SeqCst);
+                    delivered.fetch_add(bytes.len() as u64, Ordering::SeqCst);
                     last.store(epoch.elapsed().as_millis() as u64, Ordering::SeqCst);
                 }
             });
@@ -124,7 +129,7 @@ impl SlowLink {
                 }
             });
         }
-        SlowLink { socket, attaches, queued, last_delivery_ms, epoch, stop }
+        SlowLink { socket, attaches, queued, last_delivery_ms, delivered, epoch, stop }
     }
 
     /// True once nothing is queued and nothing moved for `quiet`.
@@ -150,130 +155,212 @@ fn attach_uid(head: &[u8]) -> Option<String> {
     Some(text[start..end].to_string())
 }
 
+/// A real daemon with five ~300 KB panes on host "sessions", reached through
+/// a [`SlowLink`] (120 KB/s, 1 MB window), and an App with their attaches
+/// queued. ~2 MB of full replay: ~17 s on this link, so with full replays
+/// later attach replies wait well past the old 5 s handshake.
+struct Fixture {
+    app: App,
+    link: SlowLink,
+    uids: Vec<String>,
+    state: StdArc<Mutex<cm_daemon::state::DaemonState>>,
+    daemon_socket: PathBuf,
+    daemon_stop: StdArc<AtomicBool>,
+    old_home: Option<std::ffi::OsString>,
+    _home: tempfile::TempDir,
+}
+
+use std::sync::Arc as StdArc;
+use alacritty_terminal::grid::Dimensions as _;
+
+impl Fixture {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let (daemon_socket, worktree, state, daemon_stop, _daemon) =
+            crate::client_session::tests::start_test_daemon("ws-slow");
+        let uids: Vec<String> = (0..5).map(|i| format!("ts-slow-{i}")).collect();
+        for uid in &uids {
+            let mut params = cm_daemon::session::SpawnParams::new(uid, uid, "/bin/sh");
+            params.workspace_id = "ws-slow".into();
+            params.args = vec![
+                "-c".into(),
+                "head -c 300000 /dev/zero | tr '\\0' x; exec sleep 600".into(),
+            ];
+            let session = cm_daemon::session::DaemonSession::spawn(params).expect("spawn");
+            state.lock().unwrap().sessions.insert(uid.clone(), session);
+        }
+        std::thread::sleep(Duration::from_secs(2)); // let the history land in each ring
+
+        let link = SlowLink::start(home.path(), daemon_socket.clone(), 120 * 1024, 1024 * 1024);
+        let host = cm_daemon::host_id::HostId::new("sessions");
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: home.path().join("unused-local.sock"),
+                    },
+                    default: false,
+                    operator_token: None,
+                    operator_token_file: None,
+                },
+                crate::hosts::HostConfig {
+                    id: host.clone(),
+                    transport: crate::hosts::HostTransport::Unix { socket: link.socket.clone() },
+                    default: true,
+                    operator_token: None,
+                    operator_token_file: None,
+                },
+            ],
+        };
+        app.host_pool = Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
+        app.attach_worker = Some(crate::attach_worker::AttachWorker::spawn(app.host_pool.clone()));
+        app.workspaces = vec![Workspace {
+            color: None,
+            pinned: false,
+            id: "ws-slow".into(),
+            name: "slow".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(worktree),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            host_id: host.clone(),
+            sessions: Vec::new(),
+            tombstones: Vec::new(),
+        }];
+        for uid in &uids {
+            let entry: cm_daemon::manifest::ManifestEntry = serde_json::from_value(serde_json::json!({
+                "uid": uid, "label": uid, "session_type": "bash",
+                "transcript_id": null, "host_id": host.as_str(),
+            }))
+            .unwrap();
+            app.pending_remote_reattach
+                .push(PendingRemoteReattach::new("ws-slow".into(), entry));
+        }
+        Fixture { app, link, uids, state, daemon_socket, daemon_stop, old_home, _home: home }
+    }
+
+    /// Run the main loop's attach phases until every pane is bound and the
+    /// link has been idle for 2 s.
+    fn settle(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let app = &mut self.app;
+            app.drain_terminal_events();
+            app.requeue_stale_generation_remote_sessions();
+            app.drain_deferred_remote_reattach();
+            app.drain_attach_results();
+            let bound = app.workspaces[0]
+                .sessions
+                .iter()
+                .filter(|s| !s.session.exited && !app.reconnecting_sessions.contains(&s.uid))
+                .count();
+            if bound == self.uids.len()
+                && app.pending_remote_reattach.is_empty()
+                && app.attaching.is_empty()
+                && self.link.drained(Duration::from_secs(2))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replays never settled: {bound}/{} bound, attaches {:?}",
+                self.uids.len(),
+                self.link.attaches.lock().unwrap(),
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn attaches(&self) -> HashMap<String, usize> {
+        self.link.attaches.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.daemon_stop.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&self.daemon_socket);
+        self.app.workspaces.clear();
+        for uid in &self.uids {
+            if let Some(mut s) = self.state.lock().unwrap().sessions.remove(uid) {
+                let _ = s.kill();
+            }
+        }
+        match self.old_home.take() {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
 #[test]
 fn slow_link_attaches_each_session_once() {
     let _guard = crate::test_support::home_lock();
-    let home = tempfile::tempdir().unwrap();
-    let old_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", home.path());
-
-    let (daemon_socket, worktree, state, daemon_stop, _daemon) =
-        crate::client_session::tests::start_test_daemon("ws-slow");
-    // Five panes with ~300 KB of history each: ~2 MB of replay, ~17 s at
-    // 120 KB/s. With a 1 MB window, later attach replies wait well past the
-    // old 5 s handshake behind earlier replays.
-    let uids: Vec<String> = (0..5).map(|i| format!("ts-slow-{i}")).collect();
-    for uid in &uids {
-        let mut params = cm_daemon::session::SpawnParams::new(uid, uid, "/bin/sh");
-        params.workspace_id = "ws-slow".into();
-        params.args = vec![
-            "-c".into(),
-            "head -c 300000 /dev/zero | tr '\\0' x; exec sleep 600".into(),
-        ];
-        let session = cm_daemon::session::DaemonSession::spawn(params).expect("spawn");
-        state.lock().unwrap().sessions.insert(uid.clone(), session);
+    let mut fx = Fixture::new();
+    // Full replays: the congested shape stage 1 had to survive.
+    for uid in &fx.uids {
+        fx.app.full_history_wanted.insert(uid.clone());
     }
-    std::thread::sleep(Duration::from_secs(2)); // let the history land in each ring
-
-    let link = SlowLink::start(home.path(), daemon_socket.clone(), 120 * 1024, 1024 * 1024);
-    let host = cm_daemon::host_id::HostId::new("sessions");
-    let mut app = App::new(crate::config::Config {
-        api_url: String::new(),
-        api_token: String::new(),
-        gcp_project: String::new(),
-        gcp_zone: String::new(),
-        repos: HashMap::new(),
-    });
-    let hosts = crate::hosts::HostsConfig {
-        hosts: vec![
-            crate::hosts::HostConfig {
-                id: cm_daemon::host_id::HostId::local(),
-                transport: crate::hosts::HostTransport::Unix {
-                    socket: home.path().join("unused-local.sock"),
-                },
-                default: false,
-                operator_token: None,
-                operator_token_file: None,
-            },
-            crate::hosts::HostConfig {
-                id: host.clone(),
-                transport: crate::hosts::HostTransport::Unix { socket: link.socket.clone() },
-                default: true,
-                operator_token: None,
-                operator_token_file: None,
-            },
-        ],
-    };
-    app.host_pool = Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
-    app.attach_worker = Some(crate::attach_worker::AttachWorker::spawn(app.host_pool.clone()));
-    app.workspaces = vec![Workspace {
-        color: None,
-        pinned: false,
-        id: "ws-slow".into(),
-        name: "slow".into(),
-        is_closed: false,
-        is_cloud: false,
-        repo_url: None,
-        worktree_path: Some(worktree),
-        main_repo_path: None,
-        worker_vm: None,
-        worker_zone: None,
-        host_id: host.clone(),
-        sessions: Vec::new(),
-        tombstones: Vec::new(),
-    }];
-    for uid in &uids {
-        let entry: cm_daemon::manifest::ManifestEntry = serde_json::from_value(serde_json::json!({
-            "uid": uid, "label": uid, "session_type": "bash",
-            "transcript_id": null, "host_id": host.as_str(),
-        }))
-        .unwrap();
-        app.pending_remote_reattach
-            .push(PendingRemoteReattach::new("ws-slow".into(), entry));
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        app.drain_terminal_events();
-        app.requeue_stale_generation_remote_sessions();
-        app.drain_deferred_remote_reattach();
-        app.drain_attach_results();
-        let bound = app.workspaces[0]
-            .sessions
-            .iter()
-            .filter(|s| !s.session.exited && !app.reconnecting_sessions.contains(&s.uid))
-            .count();
-        if bound == uids.len()
-            && app.pending_remote_reattach.is_empty()
-            && app.attaching.is_empty()
-            && link.drained(Duration::from_secs(2))
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "replays never settled: {bound}/{} bound, attaches {:?}",
-            uids.len(),
-            link.attaches.lock().unwrap(),
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let attaches = link.attaches.lock().unwrap().clone();
-    for uid in &uids {
+    fx.settle();
+    let attaches = fx.attaches();
+    for uid in &fx.uids {
         assert_eq!(attaches.get(uid), Some(&1), "{uid} re-attached: {attaches:?}");
     }
+    let delivered = fx.link.delivered.load(Ordering::SeqCst);
+    eprintln!("full-ring cold start: {delivered} bytes");
+    assert!(delivered > 1_500_000, "full rings were replayed");
+}
 
-    daemon_stop.store(true, Ordering::SeqCst);
-    let _ = UnixStream::connect(&daemon_socket);
-    drop(app);
-    for uid in &uids {
-        if let Some(mut s) = state.lock().unwrap().sessions.remove(uid) {
-            let _ = s.kill();
-        }
+#[test]
+fn remote_panes_attach_screen_first_and_load_history_on_scroll_up() {
+    let _guard = crate::test_support::home_lock();
+    let mut fx = Fixture::new();
+    let started = Instant::now();
+    fx.settle();
+    let delivered = fx.link.delivered.load(Ordering::SeqCst);
+    eprintln!("screen-first cold start: {delivered} bytes, bound in {:?}", started.elapsed());
+    assert!(
+        delivered < 100_000,
+        "5 screen-first attaches sent {delivered} bytes (full rings are ~2 MB)",
+    );
+    assert!(started.elapsed() < Duration::from_secs(10), "cold start took {:?}", started.elapsed());
+    for ts in &fx.app.workspaces[0].sessions {
+        assert!(ts.session.history_deferred, "{} has no history yet", ts.uid);
+        let term = ts.session.term.lock();
+        assert_eq!(term.grid().history_size(), 0);
     }
-    match old_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
+
+    // Owner scrolls up in one pane: that pane, and only it, fetches its ring.
+    let si = fx.app.workspaces[0].sessions.iter().position(|s| s.uid == "ts-slow-2").unwrap();
+    fx.app.cursor = Cursor::Session(0, si);
+    fx.app.load_deferred_history();
+    fx.app.load_deferred_history(); // a second scroll while loading is a no-op
+    fx.settle();
+    let attaches = fx.attaches();
+    assert_eq!(attaches.get("ts-slow-2"), Some(&2), "{attaches:?}");
+    for uid in fx.uids.iter().filter(|u| *u != "ts-slow-2") {
+        assert_eq!(attaches.get(uid), Some(&1), "{uid}: {attaches:?}");
+    }
+    let ts = fx.app.workspaces[0].sessions.iter().find(|s| s.uid == "ts-slow-2").unwrap();
+    assert!(!ts.session.history_deferred);
+    assert!(!fx.app.full_history_wanted.contains("ts-slow-2"));
+    let wait = Instant::now() + Duration::from_secs(5);
+    while ts.session.term.lock().grid().history_size() == 0 {
+        assert!(Instant::now() < wait, "the ring never reached the pane");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
