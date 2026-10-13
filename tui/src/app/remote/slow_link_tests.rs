@@ -29,6 +29,10 @@ struct SlowLink {
     last_delivery_ms: Arc<AtomicU64>,
     /// Daemon bytes delivered to clients in total.
     delivered: Arc<AtomicU64>,
+    /// Every client connection, so a test can cut them all (a link drop).
+    clients: Arc<Mutex<Vec<UnixStream>>>,
+    /// Attach requests that asked to resume (`since`).
+    resumes: Arc<AtomicU64>,
     epoch: Instant,
     stop: Arc<AtomicBool>,
 }
@@ -44,6 +48,8 @@ impl SlowLink {
         let queued = Arc::new(AtomicU64::new(0));
         let last_delivery_ms = Arc::new(AtomicU64::new(0));
         let delivered = Arc::new(AtomicU64::new(0));
+        let clients: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let resumes = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
         let (link_tx, link_rx) = mpsc::sync_channel::<(UnixStream, Vec<u8>)>(window / CHUNK);
@@ -73,6 +79,8 @@ impl SlowLink {
             let attaches = attaches.clone();
             let queued = queued.clone();
             let stop = stop.clone();
+            let clients = clients.clone();
+            let resumes = resumes.clone();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let client = match listener.accept() {
@@ -83,11 +91,13 @@ impl SlowLink {
                         }
                     };
                     client.set_nonblocking(false).unwrap();
+                    clients.lock().unwrap().push(client.try_clone().unwrap());
                     let Ok(daemon) = UnixStream::connect(&upstream) else { continue };
                     // Client → daemon, sniffing the request for attach.direct.
                     let (mut from_client, mut to_daemon) =
                         (client.try_clone().unwrap(), daemon.try_clone().unwrap());
                     let attaches = attaches.clone();
+                    let resumes = resumes.clone();
                     std::thread::spawn(move || {
                         let mut head = Vec::new();
                         let mut buf = [0u8; CHUNK];
@@ -100,6 +110,9 @@ impl SlowLink {
                                 head.extend_from_slice(&buf[..n]);
                                 if let Some(uid) = attach_uid(&head) {
                                     *attaches.lock().unwrap().entry(uid).or_insert(0) += 1;
+                                    if String::from_utf8_lossy(&head).contains("\"since\"") {
+                                        resumes.fetch_add(1, Ordering::SeqCst);
+                                    }
                                     head = vec![0; 64 * 1024]; // counted; stop sniffing
                                 }
                             }
@@ -129,7 +142,14 @@ impl SlowLink {
                 }
             });
         }
-        SlowLink { socket, attaches, queued, last_delivery_ms, delivered, epoch, stop }
+        SlowLink { socket, attaches, queued, last_delivery_ms, delivered, clients, resumes, epoch, stop }
+    }
+
+    /// Drop every connection, as a link failure does.
+    fn cut(&self) {
+        for client in self.clients.lock().unwrap().drain(..) {
+            let _ = client.shutdown(std::net::Shutdown::Both);
+        }
     }
 
     /// True once nothing is queued and nothing moved for `quiet`.
@@ -397,4 +417,61 @@ fn backoff_grows_for_short_lived_streams_and_resets_after_a_stable_one() {
     // A stream this session never tracked (attached before) counts as healthy.
     app.note_stream_lost("ts-new");
     assert_eq!(app.reattach_backoff["ts-new"].strikes, 0);
+}
+
+fn screen_text(ts: &TerminalSession) -> String {
+    use alacritty_terminal::index::{Column, Line};
+    let term = ts.session.term.lock();
+    let grid = term.grid();
+    (0..grid.screen_lines())
+        .map(|l| {
+            let row = &grid[Line(l as i32)];
+            (0..grid.columns()).map(|c| row[Column(c)].c).collect::<String>().trim_end().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_dropped_link_resumes_each_pane_with_only_the_bytes_it_missed() {
+    let _guard = crate::test_support::home_lock();
+    let mut fx = Fixture::new();
+    fx.settle();
+    let screens: Vec<String> = fx.app.workspaces[0].sessions.iter().map(screen_text).collect();
+    assert!(screens.iter().all(|s| s.contains("xxxx")), "panes show their output");
+    let before = fx.link.delivered.load(Ordering::SeqCst);
+
+    fx.link.cut();
+    for (i, uid) in fx.uids.iter().enumerate() {
+        let fanout = fx.state.lock().unwrap().sessions[uid].fanout.clone();
+        fanout.push(format!("\r\nmissed while away {i}").as_bytes());
+    }
+    fx.settle();
+
+    let attaches = fx.attaches();
+    for uid in &fx.uids {
+        assert_eq!(attaches.get(uid), Some(&2), "{uid}: {attaches:?}");
+    }
+    assert_eq!(fx.link.resumes.load(Ordering::SeqCst), 5, "every reconnect asked to resume");
+    let resent = fx.link.delivered.load(Ordering::SeqCst) - before;
+    assert!(resent < 2_000, "resuming 5 panes sent {resent} bytes");
+    // Panes join the workspace in attach-completion order, not uid order.
+    for ts in &fx.app.workspaces[0].sessions {
+        let i = fx.uids.iter().position(|u| *u == ts.uid).unwrap();
+        assert!(ts.session.resumed, "{} resumed", ts.uid);
+        assert!(ts.session.history_deferred, "{} keeps its scrollback state", ts.uid);
+        let wait = Instant::now() + Duration::from_secs(5);
+        while !screen_text(ts).contains(&format!("missed while away {i}")) {
+            assert!(
+                Instant::now() < wait,
+                "{}: pane position {:?}, daemon cursor {}: {}",
+                ts.uid,
+                ts.session.stream.as_ref().map(|c| c.position.load(Ordering::SeqCst)),
+                fx.state.lock().unwrap().sessions[&ts.uid].fanout.snapshot_since(None).cursor,
+                screen_text(ts).lines().last().unwrap_or(""),
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(screen_text(ts).contains("xxxx"), "the earlier screen is still there");
+    }
 }

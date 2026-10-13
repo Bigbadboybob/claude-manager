@@ -118,12 +118,12 @@ pub(crate) fn try_attach_via_daemon_with_deps(
 ) -> anyhow::Result<Session> {
     attach_via_daemon(
         host_pool, session_uid, workspace_id, worktree_path, session_type, label, cols, rows,
-        task_id, workflow_run_id, workflow_role, host_id, transcript_path, false,
+        task_id, workflow_run_id, workflow_role, host_id, transcript_path, Default::default(),
     )
 }
 
-/// [`try_attach_via_daemon_with_deps`]; `screen` asks for a screen-first
-/// attach (see `Session::history_deferred`).
+/// [`try_attach_via_daemon_with_deps`]; `how` can ask for a screen-first
+/// attach (see `Session::history_deferred`) or resume a pane's terminal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attach_via_daemon(
     host_pool: &crate::host_pool::HostPool,
@@ -139,7 +139,7 @@ pub(crate) fn attach_via_daemon(
     workflow_role: Option<&str>,
     host_id: &cm_daemon::host_id::HostId,
     transcript_path: Option<&str>,
-    screen: bool,
+    how: crate::client_session::AttachHow,
 ) -> anyhow::Result<Session> {
     let internal_session_type = normalize_session_type_to_internal(session_type);
     let wire_session_type = match internal_session_type {
@@ -194,7 +194,7 @@ pub(crate) fn attach_via_daemon(
         global_perms: false,
     };
     let session =
-        crate::session::Session::new_attached_existing_with_context(cs_config, true, screen)?;
+        crate::session::Session::new_attached_existing_with_context(cs_config, true, how)?;
     // Legacy daemons may ignore attach dimensions; keep the asynchronous kick.
     session.resize(cols, rows);
 

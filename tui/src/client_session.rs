@@ -304,6 +304,14 @@ pub struct ClientSession {
     /// Attached screen-first: the terminal holds the visible screen only,
     /// and the session's scrollback has not been loaded.
     pub history_deferred: bool,
+    /// Where `term` is in the daemon's output stream (absent on older
+    /// daemons).
+    pub stream: Option<StreamCursor>,
+    /// The events proxy `term` sends through (retargeted on resume).
+    pub term_events: EventProxy,
+    /// `term` came from [`AttachHow::resume`] and the daemon sent only the
+    /// bytes it had missed.
+    pub resumed: bool,
 }
 
 // Post-review #15 (deferred): a `Drop` impl that calls
@@ -334,7 +342,7 @@ impl ClientSession {
         let start_result = rpc_start_session_full(&config)
             .context("RPC start_session")?;
 
-        match Self::build_after_start(&config, &start_result, false, false) {
+        match Self::build_after_start(&config, &start_result, false, &AttachHow::default()) {
             Ok(session) => Ok(session),
             Err(e) => {
                 // Best-effort cleanup. We log the cleanup error
@@ -372,15 +380,13 @@ impl ClientSession {
     /// don't own it. The pre-fix `new()` cleanup arm only fires
     /// on `start_session`-driven failures.
     pub fn attach_existing(config: ClientSessionConfig) -> anyhow::Result<Self> {
-        Self::attach_existing_with_context(config, false, false)
+        Self::attach_existing_with_context(config, false, AttachHow::default())
     }
 
-    /// `screen`: ask for a screen-first attach (the visible screen instead of
-    /// the whole output ring); see [`ClientSession::history_deferred`].
     pub(crate) fn attach_existing_with_context(
         config: ClientSessionConfig,
         restore_context: bool,
-        screen: bool,
+        how: AttachHow,
     ) -> anyhow::Result<Self> {
         // Step 1 skipped: the daemon already has the session.
         // The wire shape for steps 2–6 is identical to `new()`
@@ -392,7 +398,7 @@ impl ClientSession {
             session_uid: config.uid.to_string(),
             cgroup_path: None,
         };
-        Self::build_after_start(&config, &synthetic_start, restore_context, screen)
+        Self::build_after_start(&config, &synthetic_start, restore_context, &how)
     }
 
     /// Steps 2–6 of the dance. Factored out so the outer `new`
@@ -401,11 +407,11 @@ impl ClientSession {
         config: &ClientSessionConfig,
         start_result: &StartSessionResult,
         restore_context: bool,
-        screen: bool,
+        how: &AttachHow,
     ) -> anyhow::Result<Self> {
         let session_uid = &start_result.session_uid;
         let (attach_socket, open_resp) =
-            open_attach_socket(config, session_uid, restore_context, screen)
+            open_attach_socket(config, session_uid, restore_context, how)
             .context("open daemon attach stream")?;
         if &open_resp.session_uid != session_uid {
             anyhow::bail!(
@@ -431,8 +437,16 @@ impl ClientSession {
             format!("attach-{}", session_uid),
         )
         .context("wrap attach socket as AttachedPty")?;
+        // A resumed stream continues `how.resume`'s terminal: its replay is
+        // output that terminal never saw, so queries in it are answered.
+        let resume = how.resume.as_ref().filter(|_| open_resp.resumed);
+        let stream = open_resp.offset.zip(open_resp.stream_id).map(|(offset, stream_id)| {
+            let position = Arc::new(std::sync::atomic::AtomicU64::new(offset));
+            pty.set_position_tracker(position.clone(), open_resp.replay_bytes.unwrap_or(0));
+            StreamCursor { stream_id, position }
+        });
         let graphics = crate::graphics::for_attached_pane(
-            open_resp.replay_bytes,
+            if resume.is_some() { Some(0) } else { open_resp.replay_bytes },
             config.daemon_socket.to_path_buf(),
             config.operator_token_id.to_string(),
         )
@@ -462,15 +476,25 @@ impl ClientSession {
         // either ClientSession or Session without rewiring
         // downstream callers.
         let (event_tx, event_rx) = mpsc::channel();
-        let event_proxy = EventProxy::new(event_tx);
-        let term_config = crate::session::terminal_config();
-
-        let size = TermSize {
-            columns: config.cols as usize,
-            screen_lines: config.rows as usize,
+        let (term, term_events) = match resume {
+            Some(r) => {
+                r.term_events.retarget(event_tx.clone());
+                (r.term.clone(), r.term_events.clone())
+            }
+            None => {
+                let term_events = EventProxy::new(event_tx.clone());
+                let size = TermSize {
+                    columns: config.cols as usize,
+                    screen_lines: config.rows as usize,
+                };
+                let term = Term::new(crate::session::terminal_config(), &size, term_events.clone());
+                (Arc::new(FairMutex::new(term)), term_events)
+            }
         };
-        let term = Term::new(term_config, &size, event_proxy.clone());
-        let term = Arc::new(FairMutex::new(term));
+        // The loop's own proxy is not shared with `term`: a later resume
+        // retargets the terminal, and this loop's last events (it is dead by
+        // then) must stay on this session's channel.
+        let event_proxy = EventProxy::new(event_tx);
 
         let _window_size = WindowSize {
             num_lines: config.rows,
@@ -507,6 +531,9 @@ impl ClientSession {
             output_control,
             graphics,
             history_deferred: open_resp.screen,
+            stream,
+            term_events,
+            resumed: resume.is_some(),
         })
     }
 
@@ -1200,8 +1227,9 @@ fn open_attach_socket(
     config: &ClientSessionConfig,
     uid: &str,
     restore_context: bool,
-    screen: bool,
+    how: &AttachHow,
 ) -> anyhow::Result<(UnixStream, AttachOpenResp)> {
+    let screen = how.screen;
     let mut socket = dial_attach_socket(config.daemon_socket)?;
     let mut params = serde_json::json!({ "uid": uid, "cols": config.cols, "rows": config.rows });
     if screen {
@@ -1209,6 +1237,12 @@ fn open_attach_socket(
         params["replay"] = serde_json::json!("screen");
         // With passthrough on, a pane showing images gets its ring instead.
         params["graphics"] = serde_json::json!(crate::graphics::outer::enabled());
+    }
+    if let Some(resume) = &how.resume {
+        // Older daemons ignore these; the daemon falls back to `screen` (or
+        // the ring) when the position is gone or from another stream.
+        params["since"] = serde_json::json!(resume.position);
+        params["stream_id"] = serde_json::json!(resume.stream_id);
     }
     if restore_context {
         params["context"] = serde_json::json!({
@@ -1235,6 +1269,9 @@ fn open_attach_socket(
             output_flow: result["output_flow"].as_bool().unwrap_or(false),
             replay_bytes: result["replay_bytes"].as_u64(),
             screen: result["replay"] == "screen",
+            resumed: result["replay"] == "resume",
+            offset: result["offset"].as_u64(),
+            stream_id: result["stream_id"].as_u64(),
             session_uid: result["session_uid"].as_str()
                 .context("attach.direct result missing session_uid")?.to_string(),
         }
@@ -1278,6 +1315,38 @@ struct AttachOpenResp {
     replay_bytes: Option<u64>,
     /// The daemon sent the visible screen only, not the output ring.
     screen: bool,
+    /// The daemon sent only the bytes after the requested `since`.
+    resumed: bool,
+    /// Stream offset of the first live byte, and the stream's id.
+    offset: Option<u64>,
+    stream_id: Option<u64>,
+}
+
+/// How to attach to an existing daemon session.
+#[derive(Clone, Default)]
+pub struct AttachHow {
+    /// Ask for the visible screen instead of the whole output ring.
+    pub screen: bool,
+    /// Continue this terminal from where its stream stopped, if the daemon
+    /// still has the bytes it missed.
+    pub resume: Option<ResumeFrom>,
+}
+
+/// A pane's terminal and how far into its session's output stream it got.
+#[derive(Clone)]
+pub struct ResumeFrom {
+    pub stream_id: u64,
+    pub position: u64,
+    pub term: Arc<FairMutex<Term<EventProxy>>>,
+    /// The proxy `term` sends its events through.
+    pub term_events: EventProxy,
+}
+
+/// Position of a daemon-attached terminal in its session's output stream.
+pub struct StreamCursor {
+    pub stream_id: u64,
+    /// Offset of the next live byte; advanced by the attach reader.
+    pub position: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// `attach.open` over an *already-dialed* `UnixStream`. The same
@@ -1326,6 +1395,9 @@ fn rpc_attach_open(
         output_flow: result["output_flow"].as_bool().unwrap_or(false),
         replay_bytes: result["replay_bytes"].as_u64(),
         screen: false,
+        resumed: false,
+        offset: None,
+        stream_id: None,
         session_uid: result["session_uid"]
             .as_str()
             .context("attach.open result missing session_uid")?
@@ -1486,7 +1558,7 @@ pub fn rpc_list_daemon_sessions(
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
         method: "list_sessions".into(),
-        params: serde_json::json!({ "daemon_owned_only": true }),
+        params: serde_json::json!({ "daemon_owned_only": true, "fields": SUMMARY_FIELDS }),
     };
     let resp = rpc_round_trip(daemon_socket, &req)?;
     let result = resp
@@ -1496,6 +1568,54 @@ pub fn rpc_list_daemon_sessions(
         .as_array()
         .context("list_sessions result not an array")?;
     Ok(arr.iter().filter_map(parse_daemon_session_summary).collect())
+}
+
+/// The `list_sessions` row fields [`parse_daemon_session_summary`] reads.
+/// Asking for only these drops `agent_state` (three quarters of the reply;
+/// the TUI gets it from `manifest.watch`). Older daemons ignore the list.
+const SUMMARY_FIELDS: [&str; 13] = [
+    "session_uid", "label", "type", "managed_by_uid", "workspace_id", "task_id",
+    "workflow_run_id", "workflow_role", "worktree_path", "continuous_task_id", "cols",
+    "rows", "global_perms",
+];
+
+/// [`rpc_list_daemon_sessions`] for a poller: pass the etag of the list it
+/// already has and get `(None, etag)` when nothing changed, so a 5 s poll
+/// costs a few bytes instead of the whole list. An older daemon answers the
+/// plain array: `(Some(list), None)`.
+pub fn rpc_list_daemon_sessions_since(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    etag: Option<&str>,
+) -> anyhow::Result<(Option<Vec<DaemonSessionSummary>>, Option<String>)> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "list_sessions".into(),
+        params: serde_json::json!({
+            "daemon_owned_only": true,
+            "fields": SUMMARY_FIELDS,
+            "etag": etag.unwrap_or(""),
+        }),
+    };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let result = resp.result.context("list_sessions response missing result")?;
+    let parse = |rows: &serde_json::Value| -> anyhow::Result<Vec<DaemonSessionSummary>> {
+        Ok(rows
+            .as_array()
+            .context("list_sessions result not an array")?
+            .iter()
+            .filter_map(parse_daemon_session_summary)
+            .collect())
+    };
+    let tag = result.get("etag").and_then(|e| e.as_str()).map(str::to_string);
+    if result.get("unchanged").and_then(|u| u.as_bool()) == Some(true) {
+        return Ok((None, tag));
+    }
+    match result.get("sessions") {
+        Some(rows) => Ok((Some(parse(rows)?), tag)),
+        None => Ok((Some(parse(&result)?), None)),
+    }
 }
 
 /// Background per-host session-list poller. One thread per configured
@@ -1530,18 +1650,30 @@ pub fn spawn_session_pollers(
         let tx = tx.clone();
         let thread = std::thread::Builder::new()
             .name(format!("cm-tui-session-poll-{}", host_id.as_str()))
-            .spawn(move || loop {
-                if let Some(socket) = pool.live_socket_path(&host_id) {
-                    if let Ok(summaries) =
-                        rpc_list_daemon_sessions(&socket, &pool.operator_token_for(&host_id))
-                    {
-                        // App dropped the receiver → shut the thread down.
-                        if tx.send((host_id.clone(), summaries)).is_err() {
-                            return;
+            .spawn(move || {
+                // The last list and its etag: an unchanged reply re-posts it.
+                let mut last: Option<(Vec<DaemonSessionSummary>, Option<String>)> = None;
+                loop {
+                    if let Some(socket) = pool.live_socket_path(&host_id) {
+                        let etag = last.as_ref().and_then(|(_, e)| e.as_deref());
+                        match rpc_list_daemon_sessions_since(
+                            &socket,
+                            &pool.operator_token_for(&host_id),
+                            etag,
+                        ) {
+                            Ok((Some(summaries), etag)) => last = Some((summaries, etag)),
+                            Ok((None, _)) => {}
+                            Err(_) => last = None,
+                        }
+                        if let Some((summaries, _)) = &last {
+                            // App dropped the receiver → shut the thread down.
+                            if tx.send((host_id.clone(), summaries.clone())).is_err() {
+                                return;
+                            }
                         }
                     }
+                    std::thread::sleep(SESSION_POLL_INTERVAL);
                 }
-                std::thread::sleep(SESSION_POLL_INTERVAL);
             })
             .expect("spawn session-poll thread");
         threads.push(thread);
@@ -2725,7 +2857,7 @@ time.sleep(60)
         config.transcript_path = Some("/tmp/cm-test-transcript.jsonl");
         config.workflow_run_id = Some("wf-context");
         config.workflow_role = Some("worker");
-        let (stream, _) = open_attach_socket(&config, &uid, true, false).unwrap();
+        let (stream, _) = open_attach_socket(&config, &uid, true, &AttachHow::default()).unwrap();
         drop(stream);
         {
             let s = state.lock().unwrap();
@@ -2734,7 +2866,7 @@ time.sleep(60)
         config.workflow_run_id = None;
         config.workflow_role = None;
         config.transcript_path = None;
-        let (stream, _) = open_attach_socket(&config, &uid, true, false).unwrap();
+        let (stream, _) = open_attach_socket(&config, &uid, true, &AttachHow::default()).unwrap();
         assert_eq!(stream.read_timeout().unwrap(), None);
         assert_eq!(stream.write_timeout().unwrap(), None);
         assert!(state.lock().unwrap().sessions[&uid].workflow_run_id.is_none());
@@ -2769,10 +2901,42 @@ time.sleep(60)
                     serde_json::json!({"session_uid": "test"}))).unwrap();
             });
             let config = bash_config(&path, dir.path(), "token", "test", "ws", "test", &[], 80, 24);
-            let result = open_attach_socket(&config, "test", false, false);
+            let result = open_attach_socket(&config, "test", false, &AttachHow::default());
             assert_eq!(result.is_ok(), code == ErrorCode::UnknownMethod);
             server.join().unwrap();
         }
+    }
+
+    /// The 5 s session poll: the first call carries the projected list and
+    /// an etag; repeating that etag gets "unchanged" until the list changes.
+    #[test]
+    fn session_poll_sends_the_list_once_then_unchanged_until_it_changes() {
+        let (socket, working_dir, _state, stop, handle) = start_test_daemon("ws-poll");
+        let argv = vec!["/bin/bash".to_string()];
+        let uid = test_uid();
+        let config = bash_config(&socket, &working_dir, "op-test", &uid, "ws-poll", "poll", &argv, 80, 24);
+        rpc_start_session(&config).expect("start_session rpc ok");
+
+        let (list, etag) = rpc_list_daemon_sessions_since(&socket, "op-test", None).unwrap();
+        let list = list.expect("first poll carries the list");
+        assert!(list.iter().any(|s| s.session_uid == uid && s.label == "poll"));
+        let etag = etag.expect("a current daemon tags the list");
+        let (again, same) = rpc_list_daemon_sessions_since(&socket, "op-test", Some(&etag)).unwrap();
+        assert!(again.is_none(), "nothing changed");
+        assert_eq!(same.as_deref(), Some(etag.as_str()));
+
+        let _ = rpc_kill_session(&socket, "op-test", &uid);
+        let wait = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (list, _) = rpc_list_daemon_sessions_since(&socket, "op-test", Some(&etag)).unwrap();
+            if let Some(list) = list {
+                assert!(list.iter().all(|s| s.session_uid != uid));
+                break;
+            }
+            assert!(Instant::now() < wait, "the kill never changed the list");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop_test_daemon(&socket, stop, handle);
     }
 
     #[test]

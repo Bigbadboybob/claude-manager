@@ -1043,8 +1043,60 @@ fn dispatch_list_sessions(
         }
     }
     match methods::list_sessions(state, &req.params, caller_uid.as_deref()) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => Response::ok(req.id.clone(), shape_session_list(value, &req.params)),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// Optional `list_sessions` shaping for pollers on slow links (the TUI asks
+/// every 5 s; the full list was ~90 KB, three quarters of it `agent_state`,
+/// whose `observed_at` stamps change on every poll).
+///
+/// - `fields: [..]` keeps only those keys in each row (`session_uid` always).
+/// - `etag: "<previous>"` (any string, `""` the first time) turns the reply
+///   into `{etag, unchanged: true}` when the shaped list is the same as the
+///   one that etag names, else `{etag, sessions: [..]}`.
+///
+/// Without either parameter the reply is the plain array callers expect.
+fn shape_session_list(value: serde_json::Value, params: &serde_json::Value) -> serde_json::Value {
+    let fields: Option<Vec<&str>> = params
+        .get("fields")
+        .and_then(|f| f.as_array())
+        .map(|f| f.iter().filter_map(|v| v.as_str()).collect());
+    let value = match (fields, value) {
+        (Some(fields), serde_json::Value::Array(rows)) => serde_json::Value::Array(
+            rows.into_iter()
+                .map(|row| match row {
+                    serde_json::Value::Object(mut row) => {
+                        row.retain(|k, _| k == "session_uid" || fields.contains(&k.as_str()));
+                        serde_json::Value::Object(row)
+                    }
+                    other => other,
+                })
+                .collect(),
+        ),
+        (_, value) => value,
+    };
+    let Some(previous) = params.get("etag").and_then(|e| e.as_str()) else {
+        return value;
+    };
+    // Rows are hashed in uid order so registry iteration order cannot
+    // change the tag.
+    let mut rows: Vec<String> = value
+        .as_array()
+        .map(|rows| rows.iter().map(|r| r.to_string()).collect())
+        .unwrap_or_default();
+    rows.sort();
+    let etag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rows.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    if etag == previous {
+        serde_json::json!({ "etag": etag, "unchanged": true })
+    } else {
+        serde_json::json!({ "etag": etag, "sessions": value })
     }
 }
 
@@ -2533,6 +2585,11 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         /// no images, so a ring holding image commands is replayed in full.
         #[serde(default)]
         graphics: bool,
+        /// Resume: the stream offset the viewer's terminal has reached and
+        /// that stream's id (both from an earlier reply). When the ring
+        /// still holds it, only the missing bytes are sent.
+        since: Option<u64>,
+        stream_id: Option<u64>,
     }
     #[derive(serde::Deserialize)]
     struct Context {
@@ -2572,9 +2629,10 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         }
     }
     let screen = params.replay.as_deref() == Some("screen");
+    let resume = params.stream_id.zip(params.since);
     let (mut outcome, ring) = {
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-        bind_attach_stream_with(&mut s, req, params.uid, params.cols, params.rows, screen)
+        bind_attach_stream_with(&mut s, req, params.uid, params.cols, params.rows, screen, resume)
     };
     if let DispatchOutcome::AttachStream { response, handle } = &mut outcome {
         let result = response.result.as_mut().expect("attach result");
@@ -2585,7 +2643,6 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
             let images = params.graphics && ring.windows(3).any(|w| w == b"\x1b_G");
             let replay = if images {
                 result.as_object_mut().expect("attach result").remove("replay");
-                result.as_object_mut().expect("attach result").remove("offset");
                 ring
             } else {
                 crate::screen_replay::render(
@@ -2608,7 +2665,7 @@ fn bind_attach_stream(
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> DispatchOutcome {
-    bind_attach_stream_with(state, req, session_uid, cols, rows, false).0
+    bind_attach_stream_with(state, req, session_uid, cols, rows, false, None).0
 }
 
 /// [`bind_attach_stream`]; with `screen`, queues no replay and returns the
@@ -2621,6 +2678,7 @@ fn bind_attach_stream_with(
     cols: Option<u16>,
     rows: Option<u16>,
     screen: bool,
+    resume: Option<(u64, u64)>,
 ) -> (DispatchOutcome, Option<Vec<u8>>) {
     // Subscribe + clone last_exit inside the same critical
     // section as the ticket consume above (`state` is &mut and
@@ -2653,13 +2711,15 @@ fn bind_attach_stream_with(
                     );
                 }
             }
-            if screen {
-                let (rx, ring, offset) = session.fanout.subscribe_output_without_replay();
-                (rx, session.last_exit.clone(), 0, offset, Some(ring))
+            let a = session.fanout.subscribe_output_for(screen, resume);
+            let kind = if a.resumed {
+                Some("resume")
+            } else if a.screen_ring.is_some() {
+                Some("screen")
             } else {
-                let (rx, replay_bytes) = session.fanout.subscribe_output_with_replay_len();
-                (rx, session.last_exit.clone(), replay_bytes, 0, None)
-            }
+                None
+            };
+            (a.rx, session.last_exit.clone(), a.replay_len, (a.offset, a.stream_id, kind), a.screen_ring)
         }
         None => {
             return (DispatchOutcome::Done(Response::err(
@@ -2673,16 +2733,20 @@ fn bind_attach_stream_with(
         }
     };
 
+    let (offset, stream_id, kind) = offset;
     let mut result = serde_json::json!({
         "session_uid": session_uid.clone(),
         "output_flow": true,
-        // Bytes of ring replay that precede live output on this stream.
+        // Bytes of replay that precede live output on this stream (for a
+        // screen attach, filled in by the caller once the repaint exists).
         "replay_bytes": replay_bytes,
+        // Where live output starts in this stream; a viewer resumes from
+        // here plus the live bytes it has consumed.
+        "offset": offset,
+        "stream_id": stream_id,
     });
-    if ring.is_some() {
-        // Filled in by the caller once the repaint is rendered.
-        result["replay"] = serde_json::json!("screen");
-        result["offset"] = serde_json::json!(offset);
+    if let Some(kind) = kind {
+        result["replay"] = serde_json::json!(kind);
     }
     let response = Response::ok(req.id.clone(), result);
     let handle = AttachStreamHandle {
@@ -4208,6 +4272,45 @@ mod tests {
     }
 
     #[test]
+    fn direct_attach_resumes_from_the_viewers_offset_within_one_stream() {
+        let state = state_with_session("ts-live");
+        let push = |bytes: &[u8]| state.lock().unwrap().sessions["ts-live"].fanout.push(bytes);
+        push(b"before the drop\r\n");
+        let attach = |extra: serde_json::Value| {
+            let mut params = serde_json::json!({"uid": "ts-live", "cols": 80, "rows": 24, "replay": "screen"});
+            for (k, v) in extra.as_object().unwrap() {
+                params[k] = v.clone();
+            }
+            let DispatchOutcome::AttachStream { response, handle } =
+                dispatch_request(&state, &operator_request("attach.direct", params))
+            else {
+                panic!("expected live stream");
+            };
+            (response.result.unwrap(), handle)
+        };
+        let (first, first_handle) = attach(serde_json::json!({}));
+        let (offset, stream) = (first["offset"].as_u64().unwrap(), first["stream_id"].as_u64().unwrap());
+        drop(first_handle);
+        push(b"missed while disconnected");
+
+        // Same stream, offset still in the ring: only the missed bytes.
+        let (resumed, handle) = attach(serde_json::json!({"since": offset, "stream_id": stream}));
+        assert_eq!(resumed["replay"], "resume");
+        assert_eq!(resumed["replay_bytes"], 25);
+        assert_eq!(resumed["offset"].as_u64().unwrap(), offset + 25);
+        assert_eq!(handle.fanout_rx.recv().unwrap(), b"missed while disconnected");
+        drop(handle);
+
+        // Another stream's offset (a respawn or brain restart) or an evicted
+        // one falls back to the requested screen repaint.
+        let (other, _h) = attach(serde_json::json!({"since": offset, "stream_id": stream ^ 1}));
+        assert_eq!(other["replay"], "screen");
+        push(&vec![b'x'; 2 * 1024 * 1024]);
+        let (evicted, _h) = attach(serde_json::json!({"since": offset, "stream_id": stream}));
+        assert_eq!(evicted["replay"], "screen");
+    }
+
+    #[test]
     fn direct_attach_rejects_partial_context_without_clearing_existing_tags() {
         let state = state_with_session("ts-live");
         {
@@ -5073,6 +5176,36 @@ mod tests {
         let s2 = &sessions2.as_array().expect("array")[0];
         assert_eq!(s2["cols"].as_u64(), Some(200));
         assert_eq!(s2["rows"].as_u64(), Some(50));
+    }
+
+    #[test]
+    fn list_sessions_projects_fields_and_answers_unchanged_for_a_matching_etag() {
+        let state = state_with_session("ts-live");
+        let list = |params: serde_json::Value| {
+            let resp = dispatch_request(&state, &operator_request("list_sessions", params)).into_response();
+            assert!(resp.ok, "{:?}", resp.error);
+            resp.result.unwrap()
+        };
+        assert!(list(serde_json::json!({})).is_array(), "no shaping without fields/etag");
+        let fields = serde_json::json!(["label", "cols", "rows"]);
+
+        let first = list(serde_json::json!({"fields": fields, "etag": ""}));
+        let row = first["sessions"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["cols", "label", "rows", "session_uid"]);
+        let etag = first["etag"].as_str().unwrap().to_string();
+
+        let again = list(serde_json::json!({"fields": fields, "etag": etag}));
+        assert_eq!(again, serde_json::json!({"etag": etag, "unchanged": true}));
+
+        let _ = dispatch_request(&state, &operator_request(
+            "session.resize",
+            serde_json::json!({ "session_uid": "ts-live", "cols": 120, "rows": 40 }),
+        ));
+        let changed = list(serde_json::json!({"fields": fields, "etag": etag}));
+        assert_ne!(changed["etag"], etag);
+        assert_eq!(changed["sessions"][0]["cols"], 120);
     }
 
     /// 5d: TUI-owned rows carry `workspace_id` + `worktree_path` so an

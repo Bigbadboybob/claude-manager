@@ -342,6 +342,22 @@ full replay: 32 attaches a minute, the same session 3–4 times.
   - Local panes keep the full replay. An older daemon ignores the parameter
     and replays the ring as before.
 
+- **Resume after a drop.**
+  - Every attach reply carries the stream's `offset` and `stream_id`, and
+    the TUI counts the live bytes each pane has consumed.
+  - On a reconnect the pane sends `since` and `stream_id`. If the ring
+    still holds that position in the same stream, the daemon replies
+    `replay: "resume"` with only the missing bytes. The new stream then
+    drives the pane's existing terminal, so screen and scrollback stay and
+    nothing is repainted.
+  - Another stream's id (a respawn or brain restart) or an evicted position
+    falls back to a screen-first attach.
+  - The terminal's event proxy is retargeted to the new session's channel.
+    The new event loop has its own proxy, so a late exit from the dead loop
+    cannot reach the pane.
+
 Five 300 KB panes over a modelled 120 KB/s link
-(`tui/src/app/remote/slow_link_tests.rs`): a cold start sends 15 KB with
-screen-first attach, against 2.0 MB with full replays.
+(`tui/src/app/remote/slow_link_tests.rs`):
+- A cold start sends 15 KB with screen-first attach, against 2.0 MB with
+  full replays.
+- After the link drops, all five resume with under 2 KB in total.
