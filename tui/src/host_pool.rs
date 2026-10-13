@@ -835,6 +835,12 @@ impl SshTunnel {
                     "ServerAliveInterval=10".into(),
                     "-o".into(),
                     "ServerAliveCountMax=3".into(),
+                    // zlib on the whole connection. Attach replays are base64
+                    // terminal output in JSON and compress 4-12x (5.7x across
+                    // 36 live sessions on cm-sessions, 2026-10-13: 1.4 MB per
+                    // pane down to ~220 KB); RPCs and live output shrink too.
+                    "-o".into(),
+                    "Compression=yes".into(),
                     // Exit immediately if the forward can't be established
                     // (don't linger with a useless connection the readiness
                     // probe would still pass once the socket binds).
