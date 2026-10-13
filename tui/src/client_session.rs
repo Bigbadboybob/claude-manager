@@ -1232,6 +1232,9 @@ fn open_attach_socket(
     let screen = how.screen;
     let mut socket = dial_attach_socket(config.daemon_socket)?;
     let mut params = serde_json::json!({ "uid": uid, "cols": config.cols, "rows": config.rows });
+    // Raw output frames instead of base64 JSON; older daemons ignore it and
+    // the reader takes either.
+    params["binary"] = serde_json::json!(true);
     if screen {
         // Older daemons ignore it and replay the whole ring.
         params["replay"] = serde_json::json!("screen");

@@ -341,7 +341,9 @@ fn slow_link_attaches_each_session_once() {
     }
     let delivered = fx.link.delivered.load(Ordering::SeqCst);
     eprintln!("full-ring cold start: {delivered} bytes");
-    assert!(delivered > 1_500_000, "full rings were replayed");
+    // 5 x 300 KB rings, sent as raw frames (base64 JSON was 2.0 MB).
+    assert!(delivered > 1_400_000, "full rings were replayed");
+    assert!(delivered < 1_700_000, "rings went as raw frames, not base64");
 }
 
 #[test]

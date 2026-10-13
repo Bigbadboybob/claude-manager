@@ -356,8 +356,20 @@ full replay: 32 attaches a minute, the same session 3–4 times.
     The new event loop has its own proxy, so a late exit from the dead loop
     cannot reach the pane.
 
+- **Smaller polls** (merged f6b5feb). The 5 s session poll asks
+  `list_sessions` only for the 13 fields it reads, and sends the previous
+  `etag`. On cm-sessions that brought it from 108 KB to 4.6 KB, and 80 B
+  when nothing changed. `session.viewed` keeps one report in flight per
+  host, sending only the latest.
+- **Raw output frames.** With `attach.direct {binary: true}` the daemon
+  sends output as a raw data frame (the usual length prefix, a `0x00` tag,
+  then the bytes) instead of base64 inside JSON. That cuts a third before
+  compression, and about 2.3× after zlib on the live rings. Input frames
+  stay JSON. An older daemon ignores the flag, and the TUI's reader takes
+  either kind.
+
 Five 300 KB panes over a modelled 120 KB/s link
 (`tui/src/app/remote/slow_link_tests.rs`):
-- A cold start sends 15 KB with screen-first attach, against 2.0 MB with
-  full replays.
+- A cold start sends 12 KB with screen-first attach. Full replays send
+  1.5 MB as raw frames, against 2.0 MB as base64.
 - After the link drops, all five resume with under 2 KB in total.

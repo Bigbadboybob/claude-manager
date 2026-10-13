@@ -109,6 +109,13 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// at build time so a drift is impossible to miss.
 pub(crate) const MAX_INPUT_FRAME_BYTES: usize = 64 * 1024;
 
+/// One frame off an attach stream: JSON, or a raw data frame (output bytes
+/// as-is, sent when the attach asked for `binary`).
+enum Frame {
+    Json(StreamFrame),
+    Raw(Vec<u8>),
+}
+
 /// Reader FSM state. Persists across `next_frame` calls so a
 /// `WouldBlock` partway through a frame doesn't lose bytes.
 enum ReadState {
@@ -233,7 +240,7 @@ impl<R: Read> StreamReader<R> {
     ///     preserves state for resumption; `UnexpectedEof` with
     ///     `filled > 0` is the torn-frame signal; other errors are
     ///     forwarded as-is.
-    fn next_frame(&mut self) -> io::Result<Option<StreamFrame>> {
+    fn next_frame(&mut self) -> io::Result<Option<Frame>> {
         // Drive state out of `self` so we can mutably borrow
         // `self.inner` alongside the state without aliasing.
         let mut state = std::mem::replace(&mut self.state, ReadState::fresh());
@@ -250,7 +257,7 @@ impl<R: Read> StreamReader<R> {
 fn drive_read_fsm<R: Read>(
     state: &mut ReadState,
     inner: &mut R,
-) -> io::Result<Option<StreamFrame>> {
+) -> io::Result<Option<Frame>> {
     loop {
         match state {
             ReadState::ReadingPrefix { buf, filled } => {
@@ -322,11 +329,15 @@ fn drive_read_fsm<R: Read>(
                     }
                 }
                 // Body complete — parse, reset state, and return.
-                let body_owned = std::mem::take(body);
+                let mut body_owned = std::mem::take(body);
                 *state = ReadState::fresh();
+                if body_owned.first() == Some(&cm_daemon::control::wire::RAW_DATA_TAG) {
+                    body_owned.drain(..1);
+                    return Ok(Some(Frame::Raw(body_owned)));
+                }
                 let frame: StreamFrame = serde_json::from_slice(&body_owned)
                     .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-                return Ok(Some(frame));
+                return Ok(Some(Frame::Json(frame)));
             }
         }
     }
@@ -406,6 +417,20 @@ impl<R: Read> Read for StreamReader<R> {
                     // misclassified as transport death.)
                     self.synthesize_transport_death_eof();
                     return Ok(0);
+                }
+            };
+            let frame = match frame {
+                Frame::Json(frame) => frame,
+                Frame::Raw(bytes) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    self.pending = bytes;
+                    self.pending_pos = 0;
+                    let to_copy = self.pending.len().min(buf.len());
+                    buf[..to_copy].copy_from_slice(&self.pending[..to_copy]);
+                    self.pending_pos = to_copy;
+                    return Ok(to_copy);
                 }
             };
             match frame.kind {
@@ -903,6 +928,34 @@ mod tests {
     }
 
     // --- StreamReader: blocking-style happy path -------------------
+
+    #[test]
+    fn reader_takes_raw_and_json_data_frames_in_order_across_partial_reads() {
+        let mut wire = Vec::new();
+        cm_daemon::control::wire::write_raw_data_frame(&mut wire, b"raw one ").unwrap();
+        wire.extend(data_frame(b"json two "));
+        cm_daemon::control::wire::write_raw_data_frame(&mut wire, b"").unwrap();
+        cm_daemon::control::wire::write_raw_data_frame(&mut wire, &[b'{'; 70_000]).unwrap();
+        let mut scripted = ScriptedReader::new();
+        // Split every frame boundary and body across tiny reads.
+        for chunk in wire.chunks(3) {
+            scripted.push_bytes(chunk.to_vec());
+        }
+        let mut r = StreamReader::new(scripted);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let mut expected = b"raw one json two ".to_vec();
+        expected.extend([b'{'; 70_000]);
+        assert_eq!(got, expected, "a raw body starting with '{{' is still raw");
+    }
 
     #[test]
     fn reader_zero_length_buf_returns_zero_without_consuming() {
