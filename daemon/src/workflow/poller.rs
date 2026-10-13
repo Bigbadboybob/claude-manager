@@ -46,6 +46,8 @@
 //! This is enforced by code structure: `collect_snapshots` returns
 //! `Vec<TickSnapshot>` only, no guard.
 
+mod snapshots;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -208,11 +210,8 @@ struct TickSnapshot {
     workflow_name: String,
     active_role: Option<String>,
     paused: bool,
-    /// Cloned `WorkflowRun` for the resolver to read (role_baselines,
-    /// role_plans, goal, history). Cheap clone — `WorkflowRun` is
-    /// small and the poller fires at most one transition per run
-    /// per tick.
-    run: WorkflowRun,
+    /// Share the disk-validated run; histories can be large even when idle.
+    run: Arc<WorkflowRun>,
     /// Worktree path for the run's workspace, if known.
     /// `state.workspaces.get(&run.task_key).worktree_path`. None
     /// during sub-2b-3's async-detector window (R8 from prior
@@ -295,6 +294,8 @@ pub struct WorkflowPoller {
     /// Phase 3: PTY-quiet window (ms) the delivery drainer requires before
     /// writing a body. Production = 2000; tests set 0 to bypass the gate.
     finalize_quiet_ms: AtomicU64,
+    /// Metadata is refreshed outside the registry lock at every read phase.
+    file_snapshots: Mutex<snapshots::RunSnapshots>,
     /// P-A (criterion #4): per-run hash of the last broadcast snapshot. The
     /// poller reads every run from disk each tick, so broadcasting a fresh
     /// snapshot whenever a run's serialized form changes makes ALL daemon-driven
@@ -357,6 +358,7 @@ impl WorkflowPoller {
             finalize_trackers: Mutex::new(std::collections::HashMap::new()),
             finalize_gap_ms: AtomicU64::new(crate::workflow::finalize::DEFAULT_ENTER_GAP_MS),
             finalize_quiet_ms: AtomicU64::new(2_000),
+            file_snapshots: Mutex::new(snapshots::RunSnapshots::default()),
             last_broadcast_hashes: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -482,10 +484,12 @@ impl WorkflowPoller {
         // `resolve_authorized_session` can serve it.
         self.sync_participant_transcript_paths();
 
-        // Phase 1: collect snapshots under the lock. Pure read.
+        // Refresh disk before taking the registry lock, including SID changes
+        // made by the preceding phase. Only join to session state under lock.
+        let runs = self.refresh_runs();
         let snapshots = {
             let s = self.state.lock().unwrap();
-            collect_snapshots(&s)
+            collect_snapshots(&s, &runs)
         }; // lock dropped here — transcript I/O happens lock-free
 
         // Phase 2: evaluate each snapshot lock-free.
@@ -602,19 +606,21 @@ impl WorkflowPoller {
         decisions
     }
 
+    fn refresh_runs(&self) -> Vec<snapshots::Snapshot> {
+        self.file_snapshots.lock().unwrap_or_else(|p| p.into_inner())
+            .refresh(&crate::workflow::run::runs_dir())
+    }
+
     /// Broadcast a state snapshot for every run whose serialized form changed
-    /// since the last broadcast. Single chokepoint: the poller re-reads all
-    /// runs from disk each tick, so this captures BOTH poller-driven advances
+    /// since the last broadcast. Refresh disk metadata here, after all writes
+    /// earlier in this tick, so this captures BOTH poller-driven advances
     /// (transitions, finalization) AND handler-driven mutations
     /// (`workflow_transition` / `workflow_done` writing state.json). Dedup by
     /// hash keeps the steady state quiet — a run that didn't change isn't
     /// re-broadcast. A run that vanished from disk has its hash reaped so a
     /// future re-creation with the same id still broadcasts.
     fn broadcast_changed_snapshots(&self) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let runs = crate::workflow::run::load_all();
+        let runs = self.refresh_runs();
         let watcher = {
             let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             s.workflow_event_watcher.clone()
@@ -624,23 +630,15 @@ impl WorkflowPoller {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut seen = std::collections::HashSet::new();
-        for run in runs {
+        for snapshot in runs {
+            let run = snapshot.run;
             seen.insert(run.run_id.clone());
-            // Hash the serialized run; serialization is deterministic for an
-            // unchanged on-disk run (the poller doesn't rewrite unchanged runs),
-            // so the hash is stable until a real state change.
-            let serialized = match serde_json::to_string(&run) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let mut hasher = DefaultHasher::new();
-            serialized.hash(&mut hasher);
-            let h = hasher.finish();
+            let Some(h) = snapshot.broadcast_hash else { continue; };
             if hashes.get(&run.run_id) == Some(&h) {
                 continue; // unchanged — already broadcast
             }
             hashes.insert(run.run_id.clone(), h);
-            watcher.broadcast_snapshot(run);
+            watcher.broadcast_snapshot((*run).clone());
         }
         hashes.retain(|id, _| seen.contains(id));
     }
@@ -666,10 +664,11 @@ impl WorkflowPoller {
     /// `transcript_path` would rebind to the wrong file). Persistent roles never
     /// `/clear`, so their `transcript_path` stays valid for the whole run.
     fn sync_role_session_ids(&self) {
+        let runs = self.refresh_runs();
         let candidates = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let mut out = Vec::new();
-            for run in crate::workflow::run::load_all().iter().filter(|r| r.is_active()) {
+            for run in runs.iter().map(|r| &r.run).filter(|r| r.is_active()) {
                 for (role, b) in &run.role_sessions {
                     // Let the fresh-reset RebindPending path own a fresh role's sid.
                     let fresh_in_flight = run
@@ -755,10 +754,10 @@ impl WorkflowPoller {
     /// skipped: its detector still runs at spawn and owns the rollout path.
     /// Idempotent; never overwrites an already-set path.
     fn sync_participant_transcript_paths(&self) {
-        let runs = crate::workflow::run::load_all();
+        let runs = self.refresh_runs();
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let crate::state::DaemonState { sessions, workspaces, .. } = &mut *state;
-        for run in runs.iter().filter(|r| r.is_active()) {
+        for run in runs.iter().map(|r| &r.run).filter(|r| r.is_active()) {
             for b in run.role_sessions.values() {
                 let (Some(sid), Some(uid)) =
                     (b.current_session_id.as_deref(), b.daemon_session_uid.as_deref())
@@ -793,10 +792,10 @@ impl WorkflowPoller {
             role_engines: BTreeMap<String, Engine>,
         }
         // Collect work + resolve session/worktree under the lock (pure read).
+        let runs = self.refresh_runs();
         let work: Vec<Work> = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            crate::workflow::run::load_all()
-                .into_iter()
+            runs.iter().map(|r| &r.run)
                 // Running AND not paused — NOT `is_active()`, which also
                 // matches Paused. A paused run (e.g. the user typed into the
                 // participant session) must NOT get /clear/body/Enter shoved
@@ -1376,27 +1375,23 @@ fn workflow_engine_blocks(state: &DaemonState, run: &WorkflowRun) -> bool {
 ///      poller returns `Skip{NoHistoryEntry}` forever even after
 ///      disk has the entry.
 ///
-/// Both make the daemon poller functionally inert for actual
-/// workflows. Fix: read disk on every `poll_once` via `load_all()`
-/// (which the TUI's controller already uses for the same reason).
-/// The cost is 1 readdir + N `state.json` reads per tick (~250ms
-/// production interval, typically 1-5 active runs); negligible.
-///
-/// Lock contention: `load_all`'s deserialize takes its own
-/// per-file flocks via the file-system layer (state.json.lock).
-/// If a handler-side `modify` is mid-flight, the disk read sees
-/// the pre-modify or post-modify state but never torn — flock
-/// guarantees atomic visibility.
+/// Both make the daemon poller functionally inert for actual workflows.
+/// The caller refreshes a poller-owned file snapshot cache at every phase
+/// boundary. Unchanged files reuse parsed history, while external launches,
+/// history appends and transitions remain visible. Disk discovery/parsing is
+/// outside the registry lock. Supported writers atomically replace state.json;
+/// unlike load_one/modify, load_all never took the per-run flock. Mutation
+/// helpers still reload authoritative state under flock and check preconditions.
 ///
 /// The `state` parameter is still needed for the read-side gate
 /// inputs (`state.sessions`, `state.workspaces`,
 /// `state.workflow_definitions`, `state.tui_sessions`) — those
 /// ARE properly daemon-owned. Only `workflow_runs` was the
 /// non-authoritative cache.
-fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
-    let runs = crate::workflow::run::load_all();
+fn collect_snapshots(state: &DaemonState, runs: &[snapshots::Snapshot]) -> Vec<TickSnapshot> {
     runs
         .iter()
+        .map(|snapshot| &snapshot.run)
         .filter(|run| run.is_active())
         .map(|run| {
             // Per-role session_type, derived by walking BOTH
@@ -3576,6 +3571,110 @@ mod tests {
             }
             WorkflowWatchMsg::Event(_) => panic!("expected Snapshot"),
         }
+    }
+
+    fn with_cache_test_home(test: impl FnOnce(&Path)) {
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let _restore = RestoreHome(std::env::var_os("HOME"));
+        std::env::set_var("HOME", tmp.path());
+        test(tmp.path());
+    }
+
+    #[test]
+    fn poller_cache_refreshes_each_phase_outside_state_and_sees_same_tick_writes() {
+        with_cache_test_home(|root| {
+            use crate::workflow::events::WorkflowWatchMsg;
+            let state = make_state_with_one_active_run("cache-phases");
+            let mut session = crate::session::DaemonSession::spawn(
+                crate::session::SpawnParams::new("cache-worker", "cache-test", "/bin/cat")
+            ).unwrap();
+            session.transcript_path = Some(root.join("sid-cache.jsonl").to_string_lossy().into_owned());
+            state.lock().unwrap().sessions.insert("cache-worker".into(), session);
+            crate::workflow::run::modify("cache-phases", |run| {
+                let worker = run.role_sessions.get_mut("worker").unwrap();
+                worker.daemon_session_uid = Some("cache-worker".into());
+                worker.current_session_id = None;
+            }).unwrap();
+            let (rx, _sub) = state.lock().unwrap().workflow_event_watcher.subscribe();
+            let poller = WorkflowPoller::new(state.clone());
+            let phases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = phases.clone();
+            let registry = state.clone();
+            poller.file_snapshots.lock().unwrap().before_refresh = Some(Box::new(move || {
+                assert!(registry.try_lock().is_ok(), "disk refresh must not hold the registry mutex");
+                count.fetch_add(1, Ordering::SeqCst);
+            }));
+            poller.set_pre_apply_hook_for_test(|_| {
+                // Phase one wrote the sid. A transition between snapshot and
+                // apply must then be seen by finalization and broadcasting.
+                crate::workflow::run::modify("cache-phases", |run| {
+                    assert_eq!(run.role_sessions["worker"].current_session_id.as_deref(), Some("sid-cache"));
+                    run.activate_role("reviewer".into(),
+                        crate::workflow::run::TriggerKind::StaticIdle { from_role: "worker".into() }, 0, 0);
+                }).unwrap();
+            });
+            poller.poll_once();
+            assert_eq!(phases.load(Ordering::SeqCst), 5);
+            let cache = poller.file_snapshots.lock().unwrap();
+            assert_eq!((cache.parses, cache.fingerprints), (3, 3), "initial, SID write, transition");
+            match rx.try_recv().unwrap() {
+                WorkflowWatchMsg::Snapshot(run) => {
+                    assert_eq!(run.active_role.as_deref(), Some("reviewer"));
+                    assert_eq!(run.history.len(), 2);
+                    assert_eq!(run.role_sessions["worker"].current_session_id.as_deref(), Some("sid-cache"));
+                }
+                _ => panic!("expected snapshot after same-tick mutations"),
+            }
+        });
+    }
+
+    #[test]
+    fn poller_cache_broadcasts_reactivation_and_recreation_not_formatting_changes() {
+        with_cache_test_home(|_| {
+            use crate::workflow::{events::WorkflowWatchMsg, run::RunStatus};
+            let state = make_state_with_one_active_run("cache-broadcast");
+            crate::workflow::run::modify("cache-broadcast", |run| run.status = RunStatus::Done).unwrap();
+            let (rx, _sub) = state.lock().unwrap().workflow_event_watcher.subscribe();
+            let poller = WorkflowPoller::new(state);
+            assert!(poller.poll_once().is_empty());
+            assert!(matches!(rx.try_recv().unwrap(), WorkflowWatchMsg::Snapshot(_)));
+            assert!(poller.poll_once().is_empty());
+            assert!(rx.try_recv().is_err());
+            assert_eq!(poller.file_snapshots.lock().unwrap().parses, 1);
+            let path = crate::workflow::run::run_dir("cache-broadcast").join("state.json");
+            let terminal = crate::workflow::run::load_one("cache-broadcast").unwrap();
+            std::fs::write(&path, serde_json::to_vec(&terminal).unwrap()).unwrap();
+            poller.poll_once();
+            assert!(rx.try_recv().is_err(), "semantically identical JSON does not broadcast");
+            for terminal_status in [RunStatus::Done, RunStatus::Detached] {
+                crate::workflow::run::modify("cache-broadcast", |run| run.status = terminal_status.clone()).unwrap();
+                poller.poll_once();
+                while rx.try_recv().is_ok() {}
+                let active = crate::workflow::run::modify("cache-broadcast", |run| run.status = RunStatus::Running).unwrap();
+                assert!(!poller.poll_once().is_empty(), "a reactivated terminal run must become visible");
+                match rx.try_recv().unwrap() {
+                    WorkflowWatchMsg::Snapshot(run) => assert_eq!(run.status, RunStatus::Running),
+                    _ => panic!("expected active snapshot"),
+                }
+                std::fs::remove_file(&path).unwrap();
+                assert!(poller.poll_once().is_empty());
+                assert!(poller.last_broadcast_hashes.lock().unwrap().is_empty());
+                crate::workflow::run::save(&active).unwrap();
+                assert!(!poller.poll_once().is_empty());
+                assert!(matches!(rx.try_recv().unwrap(), WorkflowWatchMsg::Snapshot(_)),
+                    "recreation broadcasts even with the same semantic hash");
+            }
+        });
     }
 
     /// Phase 4 acceptance #3 — the RESTART-RESUME leg. After a mid-run daemon
