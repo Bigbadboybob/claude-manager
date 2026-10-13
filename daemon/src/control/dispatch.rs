@@ -134,6 +134,8 @@ pub struct AttachStreamHandle {
     /// Echoed back on every outbound `StreamFrame`. Matches the
     /// `attach.open` request id so the client can demux.
     pub request_id: String,
+    /// The client asked for raw data frames (`wire::write_raw_data_frame`).
+    pub binary: bool,
 }
 
 /// What `dispatch_request` returns. Most arms produce `Done` with
@@ -2590,6 +2592,8 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         /// still holds it, only the missing bytes are sent.
         since: Option<u64>,
         stream_id: Option<u64>,
+        /// Send output as raw data frames instead of base64 JSON.
+        binary: Option<bool>,
     }
     #[derive(serde::Deserialize)]
     struct Context {
@@ -2637,6 +2641,10 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
     if let DispatchOutcome::AttachStream { response, handle } = &mut outcome {
         let result = response.result.as_mut().expect("attach result");
         result["context_errors"] = serde_json::json!(context_errors);
+        if params.binary == Some(true) {
+            handle.binary = true;
+            result["binary"] = serde_json::json!(true);
+        }
         if let Some(ring) = ring {
             // Built outside the state lock; output that arrived meanwhile is
             // queued behind it.
@@ -2754,6 +2762,7 @@ fn bind_attach_stream_with(
         fanout_rx,
         last_exit,
         request_id: req.id.clone(),
+        binary: false,
     };
     (DispatchOutcome::AttachStream { response, handle }, ring)
 }
@@ -4269,6 +4278,21 @@ mod tests {
         assert!(result["replay_bytes"].as_u64().unwrap() >= ring_len);
         assert!(!text.contains("history line 100\r"), "but not old history");
         assert_eq!(&got[repaint_len..], b"live after attach");
+    }
+
+    #[test]
+    fn direct_attach_binary_is_negotiated_per_stream() {
+        let state = state_with_session("ts-live");
+        for (binary, expected) in [(serde_json::json!(true), true), (serde_json::Value::Null, false)] {
+            let DispatchOutcome::AttachStream { response, handle } = dispatch_request(
+                &state,
+                &operator_request("attach.direct", serde_json::json!({"uid": "ts-live", "binary": binary})),
+            ) else {
+                panic!("expected live stream");
+            };
+            assert_eq!(handle.binary, expected);
+            assert_eq!(response.result.unwrap().get("binary").is_some(), expected);
+        }
     }
 
     #[test]

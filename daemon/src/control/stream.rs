@@ -99,6 +99,7 @@ pub fn handle_attach_stream(
         fanout_rx,
         last_exit,
         request_id,
+        binary,
     } = handle;
 
     // Attach streams are long-lived. Clear the read timeout the
@@ -146,6 +147,7 @@ pub fn handle_attach_stream(
                 &writer_session_uid,
                 writer_stop,
                 writer_last_exit,
+                binary,
             );
         });
     let writer_handle = match writer_handle {
@@ -476,6 +478,7 @@ fn run_outbound(
     session_uid: &str,
     stop: Arc<AtomicBool>,
     last_exit: SharedLastExit,
+    binary: bool,
 ) {
     loop {
         // Check the stop flag every iteration so the writer
@@ -487,15 +490,18 @@ fn run_outbound(
         }
         match rx.recv_timeout(FANOUT_RECV_TICK) {
             Ok(chunk) => {
-                let frame = StreamFrame::data(
-                    request_id,
-                    serde_json::json!({
-                        "bytes": BASE64.encode(&chunk),
-                    }),
-                );
-                if let Err(e) =
+                let written = if binary {
+                    wire::write_raw_data_frame(&mut write_socket, &chunk)
+                } else {
+                    let frame = StreamFrame::data(
+                        request_id,
+                        serde_json::json!({
+                            "bytes": BASE64.encode(&chunk),
+                        }),
+                    );
                     wire::write_stream_frame(&mut write_socket, &frame)
-                {
+                };
+                if let Err(e) = written {
                     eprintln!(
                         "cm-daemon: attach stream {} outbound write error: {} (client disconnected)",
                         session_uid, e,
@@ -790,6 +796,7 @@ mod tests {
             fanout_rx: session.fanout.subscribe_output(),
             last_exit: session.last_exit.clone(),
             request_id: request_id.to_string(),
+            binary: false,
         }
     }
 
@@ -810,7 +817,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker = std::thread::spawn(move || run_outbound(writer, rx, "request", "session",
-            worker_stop, Arc::new(crate::session::LastExitProbe::new("session".into(), None, 0))));
+            worker_stop, Arc::new(crate::session::LastExitProbe::new("session".into(), None, 0)), false));
         // Leave the peer unread so the writer exhausts the kernel send buffer.
         worker.join().unwrap();
         assert!(stop.load(Ordering::SeqCst), "writer failure must stop the connection");

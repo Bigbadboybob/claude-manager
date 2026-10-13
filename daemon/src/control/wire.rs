@@ -233,6 +233,28 @@ pub fn write_stream_frame<W: Write>(
     write_json_frame(writer, frame, "stream frame")
 }
 
+/// First body byte of a raw data frame. A JSON frame body always starts
+/// with `{`, so a reader tells the two apart by this byte.
+pub const RAW_DATA_TAG: u8 = 0;
+
+/// Write PTY output as a raw data frame: the usual length prefix, then
+/// [`RAW_DATA_TAG`] and the bytes themselves. Only for attach streams whose
+/// client asked for `binary` (a JSON `Data` frame base64-encodes the same
+/// bytes, a third larger and harder to compress).
+pub fn write_raw_data_frame<W: Write>(writer: &mut W, data: &[u8]) -> std::io::Result<()> {
+    let len = data.len() + 1;
+    if len > MAX_REQUEST_BYTES as usize {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("raw data frame length {len} exceeds cap of {MAX_REQUEST_BYTES} bytes")));
+    }
+    let mut bytes = Vec::with_capacity(4 + len);
+    bytes.extend_from_slice(&(len as u32).to_be_bytes());
+    bytes.push(RAW_DATA_TAG);
+    bytes.extend_from_slice(data);
+    writer.write_all(&bytes)?;
+    writer.flush()
+}
+
 /// Serialize directly behind the prefix. A single write avoids a separate
 /// four-byte SSH packet/wakeup for every small terminal update or RPC.
 fn write_json_frame<W: Write, T: serde::Serialize>(
@@ -253,6 +275,13 @@ fn write_json_frame<W: Write, T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_data_frame_is_prefix_tag_and_bytes() {
+        let mut out = Vec::new();
+        write_raw_data_frame(&mut out, b"{abc").unwrap();
+        assert_eq!(out, [&[0, 0, 0, 5, RAW_DATA_TAG][..], b"{abc"].concat());
+    }
     use crate::control::protocol::{Caller, ErrorCode};
     use std::io::Cursor;
 
