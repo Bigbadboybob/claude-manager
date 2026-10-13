@@ -166,3 +166,25 @@ export function withoutSeenAlerts(items, seen, nowMs, ttlMs = 120_000) {
   }
   return (items || []).filter((a) => !seen.has(a.id));
 }
+
+/** Remember display names seen in DM rows (`member_names`, the last
+ *  message's actor) and in loaded messages, so departed agents (absent from
+ *  the people directory) keep their names. Mutates and returns `known`. */
+export function learnNames(known, { dms = [], messages = [] } = {}) {
+  for (const d of dms) {
+    for (const [id, name] of Object.entries(d.member_names || {})) if (name) known.set(id, name);
+    const a = d.last?.actor;
+    if (a?.id && a.name) known.set(a.id, a.name);
+  }
+  for (const m of messages) {
+    if (m.actor?.id && m.actor.name) known.set(m.actor.id, m.actor.name);
+  }
+  return known;
+}
+
+/** Display name: Owner, the people directory, names seen elsewhere, and
+ *  only then the bare id's last segment. */
+export function nameFor(id, people, known) {
+  if (id === "owner") return "Owner";
+  return people?.get(id) || known?.get(id) || String(id).split(":").pop();
+}

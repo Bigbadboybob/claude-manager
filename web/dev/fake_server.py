@@ -53,9 +53,15 @@ class Board:
              "name": "Swarm Focused Design · claude-manager", "joined": True},
             {"id": "c-gpu", "path": "gpu-utilization", "name": "gpu-utilization", "joined": True},
         ]
-        self.dms = [{"id": "d-scout", "members": ["owner", "agent:scout"]}]
+        self.dms = [
+            {"id": "d-scout", "members": ["owner", "agent:scout"]},
+            # A departed agent: not in self.people, named only by member_names.
+            {"id": "d-sejd", "members": ["owner", "agent:ts-18d28e6057a24116-5"],
+             "member_names": {"owner": "Owner", "agent:ts-18d28e6057a24116-5": "SEJD Coordinator"}},
+        ]
         self.messages: dict[str, list[dict]] = {c["id"]: [] for c in self.channels}
         self.messages["d-scout"] = []
+        self.messages["d-sejd"] = []
         self.read_through: dict[str, int] = {}
         self.requests: dict[str, dict] = {}
         self.subscriptions: dict[str, dict] = {}

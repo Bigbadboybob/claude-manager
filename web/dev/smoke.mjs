@@ -101,6 +101,23 @@ test("an alert seen here stays hidden through a racing refresh, then is forgotte
   assert.deepEqual(f.withoutSeenAlerts([{ id: "a3" }], seen, 200_000).map((a) => a.id), ["a3"], "an ack that never landed reappears after the ttl");
 });
 
+test("departed agents keep their names (member_names, last actor, loaded messages)", () => {
+  const people = new Map([["agent:x:present", "Present"]]);
+  const known = f.learnNames(new Map(), {
+    dms: [
+      { id: "d1", members: ["owner", "agent:x:ts-1"], member_names: { "agent:x:ts-1": "SEJD Coordinator", owner: "Owner" } },
+      { id: "d2", members: ["owner", "agent:x:ts-2"], last: { actor: { id: "agent:x:ts-2", name: "Old Worker" } } },
+    ],
+    messages: [{ actor: { id: "agent:x:ts-3", name: "Scout" } }],
+  });
+  assert.equal(f.nameFor("agent:x:ts-1", people, known), "SEJD Coordinator");
+  assert.equal(f.nameFor("agent:x:ts-2", people, known), "Old Worker");
+  assert.equal(f.nameFor("agent:x:ts-3", people, known), "Scout");
+  assert.equal(f.nameFor("agent:x:present", people, known), "Present", "the directory still wins");
+  assert.equal(f.nameFor("agent:x:ts-9", people, known), "ts-9", "uid only as the last resort");
+  assert.equal(f.nameFor("owner", people, known), "Owner");
+});
+
 // ---------- against the fake backend ----------
 async function withServer(fn) {
   const port = 18000 + Math.floor(Math.random() * 2000);
