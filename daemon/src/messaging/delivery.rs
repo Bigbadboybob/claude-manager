@@ -91,6 +91,9 @@ fn digest(s: &str) -> String {
 struct Queue {
     batches: Vec<Batch>,
     last_attempt: u64,
+    // In-memory checkpoint state, including migrations applied during load.
+    #[serde(skip)]
+    dirty: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -118,6 +121,19 @@ struct Batch {
     // mention for good).
     #[serde(default)]
     delivered_at: u64,
+}
+impl Batch {
+    fn settled_history(&self) -> bool {
+        self.released && matches!(self.status.as_str(), "confirmed" | "cancelled")
+    }
+
+    fn set_status(&mut self, status: &str) -> bool {
+        if self.status == status {
+            return false;
+        }
+        self.status = status.into();
+        true
+    }
 }
 /// How long a delivered-but-unread wake batch keeps coalescing new arrivals.
 const LATCH_HORIZON_SECS: u64 = 120;
@@ -160,6 +176,8 @@ fn queue_path(root: &Path, uid: &str) -> PathBuf {
 #[cfg(test)]
 thread_local! {
     static QUEUE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static QUEUE_SAVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_QUEUE_SAVE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 #[cfg(test)]
 pub(super) fn queue_load_count() -> usize {
@@ -171,22 +189,43 @@ fn load(path: &Path) -> io::Result<Queue> {
     match fs::read(path) {
         Ok(b) => {
             let mut value: Value = serde_json::from_slice(&b)?;
+            let mut migrated = false;
             for batch in value["batches"].as_array_mut().into_iter().flatten() {
                 if batch.get("released").is_none() {
                     let status = batch["status"].as_str().unwrap_or("pending");
                     // Keep old unsubmitted work live. Delivered/ambiguous old
                     // receipts have no fetch history and cannot own a new latch.
                     batch["released"] = json!(!pending(status) && status != "native_pending");
+                    migrated = true;
                 }
             }
-            Ok(serde_json::from_value(value)?)
+            let mut queue: Queue = serde_json::from_value(value)?;
+            queue.dirty = migrated;
+            Ok(queue)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Queue::default()),
         Err(e) => Err(e),
     }
 }
 fn save(path: &Path, q: &Queue) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let calls = QUEUE_SAVE_CALLS.with(|count| {
+            count.set(count.get() + 1);
+            count.get()
+        });
+        if FAIL_QUEUE_SAVE_AT.with(|at| at.get() == Some(calls)) {
+            return Err(io::Error::other("injected delivery checkpoint failure"));
+        }
+    }
     atomic_replace(path, &serde_json::to_value(q)?)
+}
+fn checkpoint(path: &Path, q: &mut Queue) -> io::Result<()> {
+    if q.dirty {
+        save(path, q)?;
+        q.dirty = false;
+    }
+    Ok(())
 }
 fn pending(status: &str) -> bool {
     matches!(status, "pending" | "deferred" | "deferred_unsupported")
@@ -317,30 +356,34 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
                 })
         };
         let Some(recipient) = recipient else { continue; };
-        let (ids, store_root) = {
+        let (ids, store_root, mut queue) = {
             let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
             let Some(store) = slot.as_mut() else { return; };
             if store.degraded.is_some() { return; }
             let ids = store.wake_intents_for_session(&uid);
-            if let Err(e) = reconcile_intents(&root, store, &uid, &ids) {
-                eprintln!("cm messaging: wake reconciliation for {uid}: {e}");
-                return;
-            }
-            (ids, store.root.clone())
+            let queue = match reconcile_intents(&root, store, &uid, &ids) {
+                Ok(queue) => queue,
+                Err(e) => {
+                    eprintln!("cm messaging: wake reconciliation for {uid}: {e}");
+                    return;
+                }
+            };
+            (ids, store.root.clone(), queue)
         };
         // Lock order matches the RPC path: delivery gate, then store.
         let lookup = |id: &str| {
             let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
             slot.as_ref().and_then(|store| preview(store, id))
         };
-        if let Err(e) = deliver_intents_previewed(
+        if let Err(e) = deliver_queue(
             &root,
             &store_root,
             &uid,
-            ids,
+            &ids,
             &recipient,
             crate::continuous::task::now_unix(),
             &lookup,
+            &mut queue,
         ) {
             eprintln!("cm messaging: wake for {uid} pending: {e}");
         }
@@ -417,6 +460,7 @@ fn deliver_intents_at(
 ) -> io::Result<()> {
     deliver_intents_previewed(cm_root, store_root, uid, intents, r, now, &no_preview)
 }
+#[cfg(test)]
 fn deliver_intents_previewed(
     cm_root: &Path,
     store_root: &Path,
@@ -428,20 +472,42 @@ fn deliver_intents_previewed(
 ) -> io::Result<()> {
     let path = queue_path(store_root, uid);
     let mut q = load(&path)?;
-    let expired = expire_latches(&mut q, now);
-    if collect(&mut q, &intents) || expired {
-        save(&path, &q)?;
-    }
+    deliver_queue(cm_root, store_root, uid, &intents, r, now, preview, &mut q)
+}
+
+// The production caller retains the recipient delivery gate across reconcile
+// and delivery, so the checkpointed queue can be reused without a second load.
+fn deliver_queue(
+    cm_root: &Path,
+    store_root: &Path,
+    uid: &str,
+    intents: &[WakeIntent],
+    r: &Recipient,
+    now: u64,
+    preview: PreviewFn,
+    q: &mut Queue,
+) -> io::Result<()> {
+    let path = queue_path(store_root, uid);
+    q.dirty |= expire_latches(q, now);
+    q.dirty |= collect(q, intents);
+    checkpoint(&path, q)?;
     let first = q
         .batches
         .iter()
         .position(|b| !b.released && b.status != "cancelled");
-    for (index, batch) in q.batches.iter_mut().enumerate() {
+    for index in 0..q.batches.len() {
+        let batch = &mut q.batches[index];
+        // Released ambiguous submissions still need late native/transcript
+        // confirmation. Only final receipts are safe to leave as history.
+        if batch.settled_history() {
+            continue;
+        }
         let id = format!("chat:{}", batch.wake_id);
         if let Some(event) = crate::notifications::get(cm_root, uid, &id)? {
-            batch.status = native_status(&event).into();
+            q.dirty |= batch.set_status(native_status(&event));
             if delivered(&batch.status) && batch.delivered_at == 0 {
                 batch.delivered_at = now;
+                q.dirty = true;
             }
             continue;
         }
@@ -456,9 +522,9 @@ fn deliver_intents_previewed(
                     .join(uid)
                     .join(format!("chat-{}.json", batch.wake_id));
                 match fs::rename(&inbox, inbox.with_extension("json.retired")) {
-                    Ok(()) => batch.status = "pending".into(),
+                    Ok(()) => q.dirty |= batch.set_status("pending"),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        batch.status = "uncertain".into()
+                        q.dirty |= batch.set_status("uncertain")
                     }
                     Err(e) => return Err(e),
                 }
@@ -466,6 +532,7 @@ fn deliver_intents_previewed(
             if !pending(&batch.status) {
                 if matches!(batch.status.as_str(), "submitted_unverified" | "uncertain") {
                     let current = r.current_binding();
+                    let before = batch.scan.clone();
                     if marker::inspect(
                         &mut batch.scan,
                         batch.original.as_ref(),
@@ -474,8 +541,9 @@ fn deliver_intents_previewed(
                         &batch.wake_id,
                     ) == Evidence::Found
                     {
-                        batch.status = "confirmed".into();
+                        q.dirty |= batch.set_status("confirmed");
                     }
+                    q.dirty |= batch.scan != before;
                 }
                 continue;
             }
@@ -486,23 +554,28 @@ fn deliver_intents_previewed(
             continue;
         }
         if !["claude-code", "codex"].contains(&r.engine.as_str()) {
-            batch.status = "deferred_unsupported".into();
+            q.dirty |= batch.set_status("deferred_unsupported");
             continue;
         }
         if !r.still_current() {
             continue;
         }
+        let text = wake_text(batch, intents, preview);
+        let marker = format!("[cm-chat {}]", batch.wake_id);
+        // Also checkpoint a legacy retirement before its replacement can be
+        // claimed. A failed pre-publication save must leave no new native wake.
+        checkpoint(&path, q)?;
         let event = crate::notifications::publish(
             cm_root,
             uid,
             &id,
             "chat",
-            &wake_text(batch, &intents, preview),
-            &format!("[cm-chat {}]", batch.wake_id),
+            &text,
+            &marker,
         )?;
-        batch.status = native_status(&event).into();
+        q.dirty |= q.batches[index].set_status(native_status(&event));
     }
-    save(&path, &q)
+    checkpoint(&path, q)
 }
 
 fn settle(q: &mut Queue, intents: &[WakeIntent]) -> bool {
@@ -575,7 +648,7 @@ pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()>
     let path = queue_path(&store.root, uid);
     let mut q = load(&path)?;
     // Include arrivals not yet visited by the delivery worker before sealing.
-    collect(&mut q, &intents);
+    q.dirty |= collect(&mut q, &intents);
     let checked: BTreeSet<_> = intents
         .iter()
         .filter(|i| ids.contains(i.event_id.as_str()))
@@ -584,13 +657,16 @@ pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()>
     for batch in &mut q.batches {
         for id in &batch.ids {
             if checked.contains(id) {
-                batch.checked.insert(id.clone());
-                batch.sealed = true;
+                q.dirty |= batch.checked.insert(id.clone());
+                if !batch.sealed {
+                    batch.sealed = true;
+                    q.dirty = true;
+                }
             }
         }
     }
-    settle(&mut q, &intents);
-    save(&path, &q)
+    q.dirty |= settle(&mut q, &intents);
+    checkpoint(&path, &mut q)
 }
 fn native_status(event: &Value) -> &str {
     match event["status"].as_str() {
@@ -678,16 +754,18 @@ pub fn reconcile(cm_root: &Path, store: &Store) -> io::Result<()> {
 /// Agent read receipts, follows and monitor changes affect only that actor.
 /// Keep offline actors' durable queues until they resume or explicitly cancel.
 pub fn reconcile_session(cm_root: &Path, store: &Store, uid: &str) -> io::Result<()> {
-    reconcile_intents(cm_root, store, uid, &store.wake_intents_for_session(uid))
+    reconcile_intents(cm_root, store, uid, &store.wake_intents_for_session(uid)).map(|_| ())
 }
 
-fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIntent]) -> io::Result<()> {
+fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIntent]) -> io::Result<Queue> {
     let path = queue_path(&store.root, uid);
     let mut q = load(&path)?;
-    let before = serde_json::to_value(&q)?;
-    settle(&mut q, intents);
+    q.dirty |= settle(&mut q, intents);
     let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
     for batch in &mut q.batches {
+        if batch.settled_history() {
+            continue;
+        }
         let active = batch
             .ids
             .iter()
@@ -705,9 +783,9 @@ fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIn
         if let Some(event) =
             crate::notifications::update_pending(cm_root, uid, &id, text.as_deref())?
         {
-            batch.status = native_status(&event).into();
+            q.dirty |= batch.set_status(native_status(&event));
         } else if !active && pending(&batch.status) {
-            batch.status = "cancelled".into();
+            q.dirty |= batch.set_status("cancelled");
         } else if !active
             && matches!(
                 batch.status.as_str(),
@@ -723,19 +801,17 @@ fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIn
                 Ok(()) => {
                     fs::remove_file(&claim)?;
                     fs::File::open(inbox.parent().unwrap())?.sync_all()?;
-                    batch.status = "cancelled".into();
+                    q.dirty |= batch.set_status("cancelled");
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    batch.status = "submitted_no_retry".into()
+                    q.dirty |= batch.set_status("submitted_no_retry")
                 }
                 Err(e) => return Err(e),
             }
         }
     }
-    if serde_json::to_value(&q)? != before {
-        save(&path, &q)?;
-    }
-    Ok(())
+    checkpoint(&path, &mut q)?;
+    Ok(q)
 }
 
 #[cfg(test)]
@@ -802,6 +878,197 @@ mod tests {
         )
         .unwrap();
     }
+
+    fn save_calls() -> usize {
+        QUEUE_SAVE_CALLS.with(|count| count.get())
+    }
+
+    #[test]
+    fn messaging_unchanged_live_tick_loads_once_and_writes_zero_queues() {
+        let _env = crate::test_support::env_lock();
+        let (tmp, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "tick-once");
+        let path = queue_path(&store.root, "b");
+        let mut daemon = DaemonState::default();
+        daemon.messaging_root = tmp.path().into();
+        *daemon.messaging.lock().unwrap() = Some(store);
+        let mut params = crate::session::SpawnParams::new("b", "delivery-test", "/bin/cat");
+        params.session_type = "codex".into();
+        daemon.sessions.insert("b".into(), crate::session::DaemonSession::spawn(params).unwrap());
+        let state = Arc::new(Mutex::new(daemon));
+        let loads = queue_load_count();
+        tick(&state);
+        assert_eq!(queue_load_count() - loads, 1, "reconcile and deliver share a queue");
+        let q = load(&path).unwrap();
+        assert_eq!(q.batches[0].status, "native_pending");
+        let bytes = fs::read(&path).unwrap();
+        let native = native_event(tmp.path(), &q.batches[0]).unwrap();
+        let (loads, writes) = (queue_load_count(), save_calls());
+        tick(&state);
+        assert_eq!(queue_load_count() - loads, 1);
+        assert_eq!(save_calls() - writes, 0, "count writes, not merely equal saved content");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(native_event(tmp.path(), &q.batches[0]).unwrap(), native);
+    }
+
+    #[test]
+    fn messaging_large_settled_history_needs_no_native_io_or_queue_writes() {
+        let (tmp, store, _, _) = fixture();
+        let path = queue_path(&store.root, "b");
+        let q = Queue {
+            batches: (0..7745).map(|i| Batch {
+                wake_id: format!("history-{i}"),
+                ids: vec![format!("message-{i}")],
+                status: if i % 2 == 0 { "confirmed" } else { "cancelled" }.into(),
+                released: true,
+                ..Batch::default()
+            }).collect(),
+            ..Queue::default()
+        };
+        save(&path, &q).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        // Any native lookup/lock would fail: settled history must not touch it.
+        fs::write(tmp.path().join("notifications"), "not a directory").unwrap();
+        let (loads, writes) = (queue_load_count(), save_calls());
+        let started = std::time::Instant::now();
+        let mut q = reconcile_intents(tmp.path(), &store, "b", &[]).unwrap();
+        deliver_queue(tmp.path(), &store.root, "b", &[], &recipient("codex"),
+            1_000_000, &no_preview, &mut q).unwrap();
+        eprintln!("P2 synthetic history: 7745 batches, {} bytes, {:.3} ms, one load, zero writes/native reads",
+            bytes.len(), started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(queue_load_count() - loads, 1);
+        assert_eq!(save_calls() - writes, 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes, "all dedup history remains intact");
+        assert_eq!(q.batches.len(), 7745);
+    }
+
+    #[test]
+    fn messaging_released_ambiguous_native_receipts_still_confirm_late() {
+        for status in ["submitted", "uncertain"] {
+            let (tmp, mut store, actor, people) = fixture();
+            dm(&mut store, &actor, &people, "late");
+            let mut q = deliver(&store, tmp.path(), "codex");
+            set_native_status(tmp.path(), &q.batches[0], status);
+            q.batches[0].status = native_status(&json!({"status":status})).into();
+            q.batches[0].released = true;
+            q.batches[0].delivered_at = 1;
+            save(&queue_path(&store.root, "b"), &q).unwrap();
+            let writes = save_calls();
+            reconcile_session(tmp.path(), &store, "b").unwrap();
+            deliver(&store, tmp.path(), "codex");
+            assert_eq!(save_calls() - writes, 0, "unchanged ambiguous receipts do not rewrite");
+            set_native_status(tmp.path(), &q.batches[0], "observed");
+            let writes = save_calls();
+            reconcile_session(tmp.path(), &store, "b").unwrap();
+            let confirmed = deliver(&store, tmp.path(), "codex");
+            assert_eq!(save_calls() - writes, 1);
+            assert_eq!(confirmed.batches[0].status, "confirmed");
+            assert!(confirmed.batches[0].released);
+        }
+    }
+
+    #[test]
+    fn messaging_marker_scan_progress_is_checkpointed_without_status_change() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        fs::write(&transcript, "{}\n".repeat(700_000)).unwrap();
+        let mut r = recipient("codex");
+        r.binding = marker::binding(transcript.to_str(), 1);
+        let path = queue_path(tmp.path(), "b");
+        save(&path, &Queue {
+            batches: vec![Batch {
+                wake_id: "scan-progress".into(), ids: vec!["old".into()],
+                status: "uncertain".into(), released: true,
+                original: r.binding.clone(), ..Batch::default()
+            }], ..Queue::default()
+        }).unwrap();
+        let writes = save_calls();
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        let first = load(&path).unwrap();
+        assert_eq!(save_calls() - writes, 1);
+        let offset = serde_json::to_value(&first.batches[0].scan).unwrap()["offset"].as_u64().unwrap();
+        assert!(offset > 0 && offset < fs::metadata(&transcript).unwrap().len());
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        let scanned = load(&path).unwrap();
+        assert_eq!(scanned.batches[0].status, "uncertain");
+        assert_eq!(serde_json::to_value(&scanned.batches[0].scan).unwrap()["offset"], 2_100_000);
+        let writes = save_calls();
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        assert_eq!(save_calls() - writes, 0);
+        writeln!(fs::OpenOptions::new().append(true).open(&transcript).unwrap(),
+            "{}", json!({"type":"event_msg","payload":{"type":"user_message","message":"[cm-chat scan-progress]"}})).unwrap();
+        // Changed transcript resets the scan, then the next bounded pass sees
+        // the late inbound marker beyond the first 2 MiB.
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        assert_eq!(load(&path).unwrap().batches[0].status, "confirmed");
+        assert!(crate::notifications::get(tmp.path(), "b", "chat:scan-progress").unwrap().is_none());
+    }
+
+    #[test]
+    fn messaging_checkpoint_failures_recover_without_duplicate_publication() {
+        for checkpoint_number in [1, 2] {
+            let (tmp, mut store, actor, people) = fixture();
+            dm(&mut store, &actor, &people, "durable");
+            let path = queue_path(&store.root, "b");
+            FAIL_QUEUE_SAVE_AT.with(|at| at.set(Some(save_calls() + checkpoint_number)));
+            let result = deliver_intents(tmp.path(), &store.root, "b",
+                store.wake_intents_for_session("b"), &recipient("codex"));
+            FAIL_QUEUE_SAVE_AT.with(|at| at.set(None));
+            assert!(result.is_err());
+            let before = load(&path).unwrap();
+            let events = crate::notifications::snapshot(tmp.path(), "b").unwrap().0;
+            if checkpoint_number == 1 {
+                assert!(before.batches.is_empty());
+                assert!(events.is_empty(), "a failed initial checkpoint must not publish");
+            } else {
+                assert_eq!(before.batches[0].status, "pending");
+                assert_eq!(events.len(), 1, "publication precedes the receipt checkpoint");
+            }
+            drop(store);
+            let store = Store::open(tmp.path()).unwrap();
+            let intents = store.wake_intents_for_session("b");
+            let mut q = reconcile_intents(tmp.path(), &store, "b", &intents).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &intents, &recipient("codex"),
+                1_000_000, &no_preview, &mut q).unwrap();
+            assert_eq!(q.batches.len(), 1);
+            assert_eq!(q.batches[0].status, "native_pending");
+            if checkpoint_number == 2 {
+                assert_eq!(q.batches[0].wake_id, before.batches[0].wake_id);
+            }
+            assert_eq!(crate::notifications::snapshot(tmp.path(), "b").unwrap().0.len(), 1);
+            let writes = save_calls();
+            reconcile_session(tmp.path(), &store, "b").unwrap();
+            deliver(&store, tmp.path(), "codex");
+            assert_eq!(save_calls() - writes, 0);
+        }
+    }
+
+    #[test]
+    fn messaging_legacy_migration_and_repeated_read_checkpoint_only_changes() {
+        let (tmp, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "legacy");
+        let q = deliver(&store, tmp.path(), "codex");
+        let path = queue_path(&store.root, "b");
+        set_native_status(tmp.path(), &q.batches[0], "observed");
+        let mut old = serde_json::to_value(&q).unwrap();
+        old["batches"][0]["status"] = json!("confirmed");
+        old["batches"][0].as_object_mut().unwrap().remove("released");
+        atomic_replace(&path, &old).unwrap();
+        let writes = save_calls();
+        reconcile_session(tmp.path(), &store, "b").unwrap();
+        assert_eq!(save_calls() - writes, 1, "persist the legacy migration even without other changes");
+        assert!(load(&path).unwrap().batches[0].released);
+        let writes = save_calls();
+        reconcile_session(tmp.path(), &store, "b").unwrap();
+        assert_eq!(save_calls() - writes, 0);
+        let page = read_page(&mut store, &actor, &json!({"dm":"owner"}));
+        let writes = save_calls();
+        read_boundary(&store, "b", &page).unwrap();
+        assert_eq!(save_calls() - writes, 0, "a repeated full-message fetch adds no persistent change");
+    }
+
     #[test]
     fn messaging_legacy_unsubmitted_work_stays_live_and_coalesces_after_upgrade() {
         for initial_engine in ["codex", "bash"] {
