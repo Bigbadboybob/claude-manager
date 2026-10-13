@@ -1170,12 +1170,20 @@ fn rpc_session_attach(
     })
 }
 
+/// How long an attach handshake may wait for the daemon's reply. Every
+/// attach on a host shares one SSH connection, so on a slow link the reply
+/// queues behind other panes' output. At 5 s, attaches were abandoned while
+/// their reply was in flight and retried with another full replay, which
+/// congested the link further (2026-10-13). ServerAlive still catches a dead
+/// link sooner.
+const ATTACH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Bound every handshake, including the legacy attach.open read. An SSH
 /// listener can stay alive while the remote daemon stops answering.
 fn dial_attach_socket(path: &Path) -> anyhow::Result<UnixStream> {
     let socket = UnixStream::connect(path)?;
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    socket.set_read_timeout(Some(ATTACH_HANDSHAKE_TIMEOUT))?;
+    socket.set_write_timeout(Some(ATTACH_HANDSHAKE_TIMEOUT))?;
     Ok(socket)
 }
 

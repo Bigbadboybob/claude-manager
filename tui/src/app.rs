@@ -662,6 +662,8 @@ pub struct App {
     /// Transient + in-memory only. Cleared when the session is re-queued (and
     /// re-inserted on the next successful attach).
     attached_tunnel_generation: std::collections::HashMap<String, u64>,
+    /// Per-uid reconnect backoff (`remote::ReattachBackoff`).
+    reattach_backoff: std::collections::HashMap<String, remote::ReattachBackoff>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -1034,6 +1036,7 @@ impl App {
             last_idle_bucket_check: None,
             reconnecting_sessions: std::collections::HashSet::new(),
             attached_tunnel_generation: std::collections::HashMap::new(),
+            reattach_backoff: std::collections::HashMap::new(),
         }
     }
 

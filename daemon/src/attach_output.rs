@@ -5,7 +5,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const CAPACITY: usize = 2 * 1024 * 1024;
+/// Room for the 1 MiB replay plus live output while a slow viewer catches
+/// up. Overflow forces a reattach (another full replay), so on a slow link a
+/// little more queue is cheaper than a reconnect.
+const CAPACITY: usize = 4 * 1024 * 1024;
 const BATCH_BYTES: usize = 64 * 1024;
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(250);
 
