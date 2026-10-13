@@ -118,6 +118,26 @@ test("departed agents keep their names (member_names, last actor, loaded message
   assert.equal(f.nameFor("owner", people, known), "Owner");
 });
 
+test("an alert's agent maps to its DM on its own host", () => {
+  const hosts = [{ id: "hub", local: true }, { id: "sessions-uuid", local: false }];
+  assert.equal(f.alertParticipant({ origin_host: "sessions-uuid", session_uid: "ts-perf" }, hosts), "agent:sessions-uuid:ts-perf",
+    "relayed alerts use their origin host, not the hub");
+  assert.equal(f.alertParticipant({ session_uid: "ts-old" }, hosts), "agent:hub:ts-old", "legacy: the local host");
+  assert.equal(f.alertParticipant({ session_uid: "x" }, []), null);
+  const dms = [
+    { id: "d1", members: ["owner", "agent:hub:a"] },
+    { id: "g1", members: ["owner", "agent:hub:a", "agent:hub:b"] },
+  ];
+  assert.equal(f.directDm("agent:hub:a", dms).id, "d1", "the one-to-one DM, not a group");
+  assert.equal(f.directDm("agent:hub:b", dms), null, "only a group: no direct DM yet");
+  assert.ok(f.hasIdentity("agent:hub:b", new Map(), new Map(), dms), "a group member has an identity");
+  assert.ok(f.hasIdentity("agent:x:p", new Map([["agent:x:p", "P"]]), new Map(), []));
+  assert.ok(!f.hasIdentity("agent:x:ghost", new Map(), new Map(), dms));
+  const r = f.parseRoute("#dm=agent%3Asessions-uuid%3Ats-perf");
+  assert.deepEqual(r, { view: "newdm", pid: "agent:sessions-uuid:ts-perf" });
+  assert.equal(f.routeHash(r), "#dm=agent%3Asessions-uuid%3Ats-perf");
+});
+
 // ---------- against the fake backend ----------
 async function withServer(fn) {
   const port = 18000 + Math.floor(Math.random() * 2000);
@@ -203,6 +223,16 @@ test("API flows the app uses: open, page back, send, react, clear mentions, avai
     assert.equal((await write(base, "POST", "/api/push/subscribe", sub)).json.subscribed, true);
     assert.equal((await write(base, "POST", "/api/push/test", { endpoint: sub.endpoint })).json.accepted, true);
     assert.equal((await write(base, "DELETE", "/api/push/subscribe", { endpoint: sub.endpoint })).json.removed, true);
+
+    // The first message to a participant without a DM creates it.
+    const pid = "agent:sessions-uuid:ts-perf";
+    const before = (await get("/api/dms")).items;
+    assert.ok(!before.some((d) => d.members.includes(pid)));
+    const opened = await write(base, "POST", "/api/send", { dm: pid, body: "about that bench", request_id: "dm-1" });
+    assert.equal(opened.status, 200);
+    const created = opened.json.event.conversation_id;
+    const afterDms = (await get("/api/dms")).items;
+    assert.ok(afterDms.some((d) => d.id === created && d.members.includes(pid)));
 
     // Alerts: seen removes only the matching alert.
     const alerts = await get("/api/alerts");
