@@ -18,7 +18,7 @@ timeout can mean that the daemon committed the operation.
 
 | Method/path | Input | Result |
 |---|---|---|
-| `GET /api/bootstrap` | — | `{actor:"owner", user:{email}, features:{alerts_seen:true,push:true}, owner_availability:{…}}` |
+| `GET /api/bootstrap` | — | `{actor:"owner", user:{email}, features:{alerts_seen:true,push:true,alert_hosts:[{id,label,local,connected}]}, owner_availability:{…}}` |
 | `GET /api/channels` | `query?`, `cursor?`, `limit?` (1–200, default 100) | `{items:[channel,…],next_cursor:object|null,…}` from `messaging.channels` |
 | `GET /api/dms` | `cursor?`, `limit?` | `{items:[dm,…],next_cursor:object|null,…}` from `messaging.dms` |
 | `GET /api/people` | `query?`, `cursor?`, `limit?` | `{items:[person,…],next_cursor:object|null,…}` from `messaging.people` |
@@ -91,15 +91,29 @@ message mentioning Owner also advances the read cursor.
 
 ## Alerts and availability
 
-`GET /api/alerts` returns `{items:[{key,id,session_uid,label,message,task_id,
-continuous_task_id,urgency?,held_since?,released_at?},…],seen_supported:true}`.
-Only delivered, pending Owner alerts appear. Core B5 is explicitly limited to
-cm-manager alerts (`scope:"local", scope_label:"cm-manager alerts only"`);
-B5b adds the approved cross-host relay and `features.alert_hosts` in bootstrap.
-`key` is the daemon queue key.
-`POST /api/alerts/seen {key,alert_id}` acknowledges only the matching alert ID,
-returning `{ok:true,acknowledged:bool}`. A stale acknowledgement cannot clear a
-newer alert. The list is read-only apart from this seen action.
+`GET /api/alerts` returns `{items:[{key,id,origin_host,origin_key,host,
+session_uid,label,message,task_id,continuous_task_id,created_at?,urgency?,
+held_since?,released_at?},…],seen_supported:true,scope,alert_hosts}`.
+Only delivered, pending Owner alerts appear. The manager combines its own
+queue with snapshots from enrolled, Owner-authorized hosts using the negotiated
+`owner_alerts_v1` messaging transport. `origin_host` is the stable daemon UUID;
+`host` is its display hostname. Group by `(origin_host, session_uid)`, display
+host/label/reason, and sort by the original RFC3339 `created_at`. Legacy alerts
+without a timestamp keep it absent; receiving a snapshot does not invent an age.
+`alert_hosts` (also in bootstrap `features`, with `[]` on an alert-metadata
+failure so chat stays usable) lists `{id,label,local,connected}`
+for the local host and authorized origins with a received snapshot, including
+an empty snapshot. Cached alerts remain visible while a host is offline;
+`connected:false` reports that fact. Revoked origins are excluded.
+
+`key` is an opaque namespaced token: pass it back unchanged. `origin_key` and
+`id` preserve the source queue key and original alert ID. `POST /api/alerts/seen
+{key,alert_id}` returns `{ok:true,acknowledged:bool,pending_origin?:bool}`.
+Remote Seen is persisted at the manager and hides exactly that origin/key/ID
+before delivery to the source (`pending_origin:true`); it is retried through
+reconnects until a source snapshot omits that ID. A stale Seen or older source
+snapshot cannot remove a newer alert. The TUI's existing raw local queue key
+remains supported by the daemon RPC. There is no remote session-control access.
 
 `GET /api/availability` returns `{owner_availability:{level,set,changed_at,
 age_s,previous?,owner_note?}}`. `POST /api/availability` takes

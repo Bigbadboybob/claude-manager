@@ -54,7 +54,7 @@ fn unmarshal_error(v: &Value) -> ChatError {
 #[derive(Clone)]
 pub(super) struct PeerConnection {
     writer: Writer,
-    closed: Arc<AtomicBool>,
+    pub(super) closed: Arc<AtomicBool>,
     shutdown: Arc<dyn Fn() + Send + Sync>,
 }
 impl PeerConnection {
@@ -219,6 +219,8 @@ fn authenticate(runtime: &Runtime, hello: &Value) -> Result<(String, bool, bool)
 /// on; the main stream carries that scope only after the backfill's fixed
 /// `through` position. Shrinking the set never replays anything.
 pub(super) const FEATURE_SCOPED: &str = "scoped_backfill";
+/// Optional delivered-alert snapshot and exact-ID Seen frames; Owner hosts only.
+pub(super) const FEATURE_ALERTS: &str = "owner_alerts_v1";
 /// Bulk page bounds `(records, bytes)` on scoped connections. Each page costs
 /// an acknowledgement round trip over SSH; a 4 MiB frame comfortably carries
 /// 2 MiB of records plus framing.
@@ -460,6 +462,48 @@ pub(super) fn serve(runtime: Arc<Runtime>) -> Result<()> {
         })?;
     Ok(())
 }
+// Alert failures never terminate chat. Transport write failures still do:
+// the shared byte stream itself is unusable in that case.
+#[derive(Default)]
+struct AlertBackoff {
+    failures: u32,
+    until: Option<Instant>,
+}
+impl AlertBackoff {
+    fn ready(&self) -> bool {
+        self.until.is_none_or(|t| Instant::now() >= t)
+    }
+    fn failed(&mut self, message: &str) {
+        self.failures = self.failures.saturating_add(1);
+        let secs = (10u64 << self.failures.saturating_sub(1).min(4)).min(120);
+        self.until = Some(Instant::now() + Duration::from_secs(secs));
+        eprintln!("cm Owner alert relay (retry in {secs}s): {message}");
+    }
+    fn succeeded(&mut self) {
+        self.failures = 0;
+        self.until = None;
+    }
+}
+#[derive(Default)]
+struct AlertProgress {
+    accepted: Option<(String, u64)>,
+    reset: Option<String>,
+    retry: AlertBackoff,
+}
+fn alert_marker(frame: &Value) -> Option<(String, u64)> {
+    let generation = frame["generation"].as_str()?;
+    uuid::Uuid::parse_str(generation).ok()?;
+    let revision = frame["revision"].as_u64().filter(|n| *n > 0)?;
+    Some((generation.into(), revision))
+}
+#[derive(Default)]
+struct AlertPush {
+    version: Option<u64>,
+    checked: Option<Instant>,
+    last: Value,
+    retry: AlertBackoff,
+}
+
 fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
     let timer = stream.try_clone()?;
     let mut link = unix_link(stream)?;
@@ -516,6 +560,7 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
     }
     let initial: BTreeSet<String> = serde_json::from_value(hello["interests"].clone())?;
     let scoped = has_feature(&hello, FEATURE_SCOPED);
+    let alerts = owner_access && has_feature(&hello, FEATURE_ALERTS);
     let (generation, subscription, live_start) = {
         let slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
         let store = slot.as_ref().unwrap();
@@ -572,8 +617,15 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
         .unwrap_or_else(|p| p.into_inner())
         .cursor;
     let mut reply = json!({"kind":"hello","coordinator_id":runtime.daemon_id,"space_id":runtime.config.space_id,"generation":generation,"cursor":cursor,"revision":1});
+    let mut features = Vec::new();
     if scoped {
-        reply["features"] = json!([FEATURE_SCOPED]);
+        features.push(FEATURE_SCOPED);
+    }
+    if alerts {
+        features.push(FEATURE_ALERTS);
+    }
+    if !features.is_empty() {
+        reply["features"] = json!(features);
     }
     write_frame(&link.connection.writer, &reply)?;
     if let Some(old) = runtime
@@ -591,18 +643,38 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
     thread::Builder::new()
         .name("cm-chat-peer-push".into())
         .spawn(move || {
-            if let Err(e) = push_loop(&cloned, &peer, &conn, &sub, live_start) {
+            if let Err(e) = push_loop(&cloned, &peer, &conn, &sub, live_start, alerts) {
                 eprintln!("cm messaging push: {e}");
             }
             conn.close();
             cloned.signal.signal();
         })?;
     let result = (|| {
+        let mut alert_retry = AlertBackoff::default();
         while !runtime.stopped.load(Ordering::Acquire)
             && !link.connection.closed.load(Ordering::Acquire)
         {
             let frame = read_frame(link.reader.as_mut())?;
             match frame["kind"].as_str().unwrap_or("") {
+                "owner_alert_snapshot" if alerts => {
+                    let current = runtime.peers.lock().unwrap_or_else(|p| p.into_inner())
+                        .get(&host).is_some_and(|c| Arc::ptr_eq(&c.closed, &link.connection.closed));
+                    if !current {
+                        return Err(error("stale_connection", "Replaced alert peer connection"));
+                    }
+                    let status = if !alert_retry.ready() { "retry" } else {
+                        match runtime.accept_alert_snapshot(&host, &frame) {
+                            Ok(()) => { alert_retry.succeeded(); "accepted" }
+                            Err(e) => {
+                                alert_retry.failed(&format!("Snapshot rejected ({})", e.code));
+                                if e.code == "alert_resync" { "resync" } else { "retry" }
+                            }
+                        }
+                    };
+                    write_frame(&link.connection.writer, &json!({"kind":"owner_alert_result",
+                        "generation":frame["snapshot"]["generation"],
+                        "revision":frame["snapshot"]["revision"],"status":status}))?;
+                }
                 "ack" => {
                     let cursor = frame["cursor"]
                         .as_u64()
@@ -889,23 +961,63 @@ fn serve_revoked(runtime: &Arc<Runtime>, host: &str, owner: bool, link: &mut Lin
     }
     Ok(())
 }
+fn push_alert_seen(
+    runtime: &Runtime,
+    host: &str,
+    conn: &PeerConnection,
+    push: &mut AlertPush,
+) -> Result<()> {
+    let version = runtime.owner_alert_version.load(Ordering::Acquire);
+    let periodic = push
+        .checked
+        .is_none_or(|t| t.elapsed() >= Duration::from_secs(10));
+    if !push.retry.ready() || (push.version == Some(version) && !periodic) {
+        return Ok(());
+    }
+    // One read on alert changes, otherwise bounded reconciliation/retry. A
+    // busy chat stream cannot make this take registry/store/relay locks again.
+    push.version = Some(version);
+    push.checked = Some(Instant::now());
+    let items = match runtime.alert_seen_pending(host) {
+        Ok(items) => json!(items),
+        Err(e) => {
+            push.retry.failed(&format!("Seen relay unavailable ({})", e.code));
+            return Ok(());
+        }
+    };
+    if push.last != items || periodic && items.as_array().is_some_and(|v| !v.is_empty()) {
+        write_frame(
+            &conn.writer,
+            &json!({"kind":"owner_alert_seen","items":items}),
+        )?;
+        push.last = items;
+    }
+    push.retry.succeeded();
+    Ok(())
+}
+
 fn push_loop(
     runtime: &Arc<Runtime>,
     host: &str,
     conn: &PeerConnection,
     subscription: &Arc<Mutex<Subscription>>,
     mut live_cursor: u64,
+    alerts: bool,
 ) -> Result<()> {
     if subscription
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .scoped
     {
-        return push_loop_scoped(runtime, host, conn, subscription, live_cursor);
+        return push_loop_scoped(runtime, host, conn, subscription, live_cursor, alerts);
     }
     let mut last_owner = Value::Null;
+    let mut alert_push = AlertPush::default();
     while !conn.closed.load(Ordering::Acquire) && !runtime.stopped.load(Ordering::Acquire) {
         let signal = runtime.signal.version();
+        if alerts {
+            push_alert_seen(runtime, host, conn, &mut alert_push)?;
+        }
         let (interests, previous_resolved, revision, cursor, dependency_offset, inflight) = {
             let sub = subscription.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -1004,10 +1116,15 @@ fn push_loop_scoped(
     conn: &PeerConnection,
     subscription: &Arc<Mutex<Subscription>>,
     mut live_cursor: u64,
+    alerts: bool,
 ) -> Result<()> {
     let mut last_owner = Value::Null;
+    let mut alert_push = AlertPush::default();
     while !conn.closed.load(Ordering::Acquire) && !runtime.stopped.load(Ordering::Acquire) {
         let signal = runtime.signal.version();
+        if alerts {
+            push_alert_seen(runtime, host, conn, &mut alert_push)?;
+        }
         let mut frames = Vec::new();
         let idle = {
             let slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -1209,7 +1326,7 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
     runtime.scoped.store(false, Ordering::Release);
     write_frame(
         &link.connection.writer,
-        &json!({"kind":"hello","daemon_id":runtime.daemon_id,"space_id":runtime.config.space_id,"token":token.trim(),"people":runtime.local_people(),"interests":interests,"resume":resume,"features":[FEATURE_SCOPED],"coverage_generation":coverage_generation,"coverage":coverage}),
+        &json!({"kind":"hello","daemon_id":runtime.daemon_id,"space_id":runtime.config.space_id,"token":token.trim(),"people":runtime.local_people(),"interests":interests,"resume":resume,"features":[FEATURE_SCOPED,FEATURE_ALERTS],"coverage_generation":coverage_generation,"coverage":coverage}),
     )?;
     let hello = read_frame(link.reader.as_mut())?;
     if hello["kind"] == "error" {
@@ -1233,6 +1350,7 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
         .map_err(|_| error("invalid_cursor", "Invalid hub generation"))?;
     drop(handshake_done);
     let scoped = has_feature(&hello, FEATURE_SCOPED);
+    let alerts = has_feature(&hello, FEATURE_ALERTS) && hello["revoked"] != true;
     runtime.scoped.store(scoped, Ordering::Release);
     let inflight = Arc::new(Mutex::new(BTreeSet::<String>::new()));
     runtime
@@ -1269,6 +1387,8 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
     let cloned = runtime.clone();
     let conn = link.connection.clone();
     let uploading = inflight.clone();
+    let alert_progress = Arc::new(Mutex::new(AlertProgress::default()));
+    let reader_alert_progress = alert_progress.clone();
     let reader_failure = Arc::new(Mutex::new(None));
     let failed = reader_failure.clone();
     thread::Builder::new()
@@ -1281,6 +1401,8 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
                 &uploading,
                 &generation,
                 initial_cursor,
+                alerts,
+                &reader_alert_progress,
             );
             if let Err(e) = result {
                 if !cloned.stopped.load(Ordering::Acquire) {
@@ -1308,9 +1430,44 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
     let result = (|| {
         let mut last_interests = interests;
         let mut last_ping = Instant::now();
+        let mut last_alert_version = None;
+        let mut last_alert_sent = None;
+        let mut last_alert_send = None::<Instant>;
+        let mut last_alert_check = Instant::now();
         while !runtime.stopped.load(Ordering::Acquire) && !connection.closed.load(Ordering::Acquire)
         {
             let version = runtime.signal.version();
+            let alert_version = runtime.owner_alert_version.load(Ordering::Acquire);
+            let (ready, reset, accepted) = {
+                let progress = alert_progress.lock().unwrap_or_else(|p| p.into_inner());
+                (progress.retry.ready(), progress.reset.clone(), progress.accepted.clone())
+            };
+            if alerts && ready && (last_alert_version != Some(alert_version)
+                || reset.is_some() || last_alert_check.elapsed() >= Duration::from_secs(10))
+            {
+                let snapshot = (|| {
+                    if let Some(generation) = &reset { runtime.remint_alert_generation(generation)?; }
+                    runtime.alert_snapshot()
+                })();
+                match snapshot {
+                    Ok(snapshot) => {
+                        let marker = (snapshot.generation.clone(), snapshot.revision);
+                        if accepted.as_ref() != Some(&marker) && (last_alert_sent.as_ref() != Some(&marker)
+                            || last_alert_send.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)))
+                        {
+                            write_frame(&connection.writer, &json!({"kind":"owner_alert_snapshot","snapshot":snapshot}))?;
+                            last_alert_sent = Some(marker);
+                            last_alert_send = Some(Instant::now());
+                        }
+                        let mut progress = alert_progress.lock().unwrap_or_else(|p| p.into_inner());
+                        if progress.reset == reset { progress.reset = None; }
+                        // Receipt, not merely local serialization, resets retry backoff.
+                    }
+                    Err(e) => alert_progress.lock().unwrap_or_else(|p| p.into_inner()).retry.failed(&format!("Alert state unavailable ({})", e.code)),
+                }
+                last_alert_version = Some(alert_version);
+                last_alert_check = Instant::now();
+            }
             let interests = runtime.interests();
             if interests != last_interests {
                 let mut frame = json!({"kind":"interests","interests":interests});
@@ -1407,7 +1564,10 @@ fn client_reader(
     inflight: &Arc<Mutex<BTreeSet<String>>>,
     generation: &str,
     initial_cursor: u64,
+    alerts: bool,
+    alert_progress: &Arc<Mutex<AlertProgress>>,
 ) -> Result<()> {
+    let mut seen_retry = AlertBackoff::default();
     let mut cursor = initial_cursor;
     let mut revision = 1;
     while !connection.closed.load(Ordering::Acquire) && !runtime.stopped.load(Ordering::Acquire) {
@@ -1416,6 +1576,32 @@ fn client_reader(
             return Ok(());
         }
         match frame["kind"].as_str().unwrap_or("") {
+            "owner_alert_seen" if alerts => {
+                if seen_retry.ready() {
+                    match runtime.apply_alert_seen(&frame) {
+                        Ok(()) => seen_retry.succeeded(),
+                        Err(e) => seen_retry.failed(&format!("Alert state unavailable ({})", e.code)),
+                    }
+                }
+            }
+            "owner_alert_result" if alerts => {
+                let mut progress = alert_progress.lock().unwrap_or_else(|p| p.into_inner());
+                match (alert_marker(&frame), frame["status"].as_str()) {
+                    (Some(marker), Some("accepted")) => {
+                        progress.accepted = Some(marker); progress.retry.succeeded();
+                    }
+                    (Some((generation, _)), Some("resync")) => {
+                        progress.reset = Some(generation);
+                        progress.retry.failed("Hub requested a new alert generation");
+                    }
+                    (_, Some("retry")) => {
+                        progress.retry.failed("Hub could not accept the alert snapshot");
+                    }
+                    _ => { if progress.retry.ready() { progress.retry.failed("Invalid alert receipt"); } }
+                }
+                drop(progress);
+                runtime.signal.signal();
+            }
             "live" => {
                 let items = frame["items"]
                     .as_array()

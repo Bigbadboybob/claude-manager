@@ -473,15 +473,13 @@ pub fn dispatch_request(
             if let Err(resp) = require_operator(req, "Owner alerts are Operator-only") {
                 return DispatchOutcome::Done(resp);
             }
-            let s = state.lock().unwrap_or_else(|p| p.into_inner());
-            DispatchOutcome::Done(crate::owner_attention::list(&s, req))
+            DispatchOutcome::Done(crate::owner_alert_relay::list(state, req))
         }
         "owner_attention.ack" => {
             if let Err(resp) = require_operator(req, "Owner attention acknowledgement is Operator-only") {
                 return DispatchOutcome::Done(resp);
             }
-            let s = state.lock().unwrap_or_else(|p| p.into_inner());
-            DispatchOutcome::Done(crate::owner_attention::acknowledge(&s, req))
+            DispatchOutcome::Done(crate::owner_alert_relay::acknowledge(state, req))
         }
         "owner_attention.escalate" => {
             if let Err(resp) = require_operator(req, "Owner attention escalation is Operator-only") {

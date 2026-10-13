@@ -3,8 +3,9 @@
 Target: **cm-manager**, `board.latentoracle.xyz` → `35.186.186.160`, Cloudflare
 proxied. This is a deployment recipe, not evidence that the service is deployed.
 Swarm-Coord deploys the reviewed backend and frontend together; lanes do not.
-Core B5 lists **cm-manager alerts only**. The approved B5b relay adds alerts from
-cm-sessions separately. Channels, DMs and availability use the manager hub.
+B5b lists local and enrolled **cm-sessions** alerts through the existing authenticated
+messaging connection. Deploy the brain changes on both hosts; older peers keep
+local-only alert behavior. Channels, DMs and availability use the manager hub.
 
 ## Owner: Cloudflare setup
 
@@ -66,7 +67,7 @@ policies before changing them. Preserve all other services and SSH rules.
    Operator-only `owner.notifications.next` and `owner_attention.list`, plus
    per-conversation `messaging.mark_read {mentions:true}`. It needs a manager
    brain restart, no holder upgrade, A-R, planning API restart or MCP payload
-   change. B5b later needs the origin/relay changes on both hosts.
+   change. B5b needs the origin/relay changes on both hosts (manager and sessions).
 2. Stage the reviewed combined `web/` tree under `/opt/cm-board-web/web` and
    create `/opt/cm-board-web/OWNER.md` identifying the reviewed SHA, purpose,
    keep files and retirement condition. Install the Python environment:
@@ -189,7 +190,8 @@ Use **iOS 16.4+**. A headless desktop browser cannot establish this acceptance.
    Ordinary chat has FYI urgency and is suppressed at those two levels.
    Restore the previous availability and mark only test messages read.
 5. Verify replies, reactions, pagination, per-channel clear mentions and stale
-   seen acknowledgements. Core v1 explicitly labels manager-only alerts.
+   seen acknowledgements. With B5b on both hosts, verify distinct host labels and
+   that Seen clears the source alert after reconnect; legacy peers remain local-only.
    Confirm Telegram still follows its existing policy; web has no manifest
    viewer subscription and therefore does not suppress Telegram's no-viewer
    behavior. Do not assume every alert is supposed to create Telegram output.
@@ -270,3 +272,59 @@ or send real push. Rust checks use `scripts/cm-test-isolated` with a private
 target; run the Owner notification and messaging read-model/replication tests,
 then `cargo build --workspace`. Delete disposable venvs/builds after validation;
 keep logs under review with an OWNER.md and report their size at handoff.
+
+
+## B5b alert relay operations
+
+Both brains negotiate `owner_alerts_v1` on their existing paired messaging link.
+No new listener, SSH session, remote operator credential or MCP payload is added.
+Only active enrolled hosts with `owner_access` can relay snapshots or receive
+Seen. Deploy both brains through their usual brain-only procedure; older peers
+continue normal messaging without alert frames. Confirm `/api/bootstrap` lists
+manager and sessions in `features.alert_hosts` after both connect. Source host
+UUID and queue key are returned separately; web `key` is opaque and namespaced.
+
+Each host keeps `~/.cm/owner-alert-relay.json` (private atomic checkpoint). It
+holds a durable source snapshot generation/revision, plus (on the hub) cached
+origin snapshots and pending exact-ID Seen requests. Bound: 16 origins, 4096
+alerts / 600 KiB per snapshot, and a total checkpoint budget for 16 full
+snapshots plus their full Seen maps and the local source (about 20 MiB).
+Oversize or corrupt data retains prior state; the alert lane logs and backs
+off 10–120 seconds while ordinary chat synchronization continues. Do not delete this file to clear an
+alert: use Seen at the hub or the existing local acknowledgement. Restore it
+with the host's matching identity/state during disaster recovery.
+
+Source notify/withdraw/Seen/release signals the existing sync loop; unchanged
+queues are reconciled every 10 seconds and on reconnect. Changed snapshots alone
+are sent. Hub Seen also signals the peer push loop and survives an offline source.
+One source Seen batch makes one queue write. Relay checkpoint writes hold neither
+the daemon registry nor the messaging store lock. Cached alerts remain visible
+offline and `alert_hosts[].connected` reports connection status. Revoking host
+Owner access immediately excludes its cached rows and blocks Seen routing.
+
+Only alerts already delivered by the source's availability gate enter snapshots.
+Remote new IDs enqueue one hub Web Push decision after the snapshot is persisted;
+replayed snapshots do not repush. This retains the core best-effort crash gap and
+bounded feed behavior. A source alert created and removed entirely while offline
+will not reach the hub. Telegram and per-host TUI manifests are unchanged. Legacy
+alerts keep unknown creation times rather than receiving misleading new ages.
+
+
+Alert snapshots now receive accepted/retry/resync results. A lower or conflicting
+revision asks the source to persist a new generation; duplicate requests for an
+old generation are harmless. Local snapshot failures, invalid incoming alerts,
+Seen application failures and hub checkpoint errors are confined to the alert
+lane and retry with capped backoff. An actual socket write failure still closes
+the unusable shared connection. Pending Seen is resent until the source removes
+its exact ID. Hub alert work runs on alert-version changes or bounded ten-second
+reconciliation, not on each chat signal. Snapshot file reads happen after the
+daemon registry lock is released. Removed Owner-authorized origins are pruned
+when the hub lists or ingests alerts, freeing their cache slots.
+
+On an origin's first ingest, pending alerts older than 15 minutes (or without a
+known creation time) populate the list without sending a burst of old pushes.
+Recent first-ingest alerts and new IDs on established origins retain normal
+push behavior. Labels are capped at 4096 UTF-8 bytes at the source, including
+legacy queued labels when projecting a snapshot. If alert metadata is unavailable,
+bootstrap returns `features.alert_hosts: []` while chat and availability remain
+usable; the dedicated alerts view still reports its own error.

@@ -395,6 +395,7 @@ pub struct DaemonState {
     pub messaging_wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
     pub messaging_root: PathBuf,
     pub owner_notifications: Arc<crate::owner_notifications::Feed>,
+    pub owner_alert_relay: Arc<crate::owner_alert_relay::Relay>,
     pub messaging_sync: Option<Arc<crate::messaging::sync::Runtime>>,
     pub messaging_names: std::collections::BTreeMap<String, crate::messaging::Name>,
     /// Daemon-owned per-session state (PTY, fanout, memory cap).
@@ -836,6 +837,7 @@ impl Default for DaemonState {
             messaging_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             messaging_root: crate::messaging::rpc::default_root(),
             owner_notifications: Arc::new(crate::owner_notifications::Feed::default()),
+            owner_alert_relay: Arc::new(crate::owner_alert_relay::Relay::default()),
             messaging_sync: None,
             messaging_names: Default::default(),
             manifest_watcher: Arc::new(crate::manifest::ManifestWatcher::new()),

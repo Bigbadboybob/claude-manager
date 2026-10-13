@@ -2580,7 +2580,7 @@ mod tests {
         let alert = |id: &str, uid: &str, label: &str, message: &str| cm_daemon::owner_attention::Alert {
             id: id.into(), session_uid: uid.into(), label: label.into(), message: message.into(),
             task_id: None, continuous_task_id: None, urgency: Some("decision".into()),
-            held_since: None, released_at: None,
+            held_since: None, released_at: None, created_at: None,
         };
         let now = SystemTime::now();
         app.owner_alerts.insert((sessions.clone(), "ts-perf".into()), alert("a1", "ts-perf", "perf", "Bench done: merge?\nmore"));
