@@ -160,11 +160,21 @@ impl Store {
         if !self.visible(actor, cid) {
             return false;
         }
+        if !self.scope_matches_conversation(actor, scope, cid) {
+            return false;
+        }
+        if let Some(root) = &scope.thread {
+            if event["id"] != *root && event["data"]["thread_root"] != *root {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Caller has already established visibility for this conversation.
+    pub(super) fn scope_matches_conversation(&self, actor: &str, scope: &Scope, cid: &str) -> bool {
         if let Some(path) = &scope.channel {
-            let actual = self
-                .channels
-                .iter()
-                .find_map(|(p, id)| (id == cid).then_some(p));
+            let actual = self.channel_path_of(cid);
             if !actual.is_some_and(|actual| {
                 path == "*"
                     || actual == path
@@ -183,11 +193,6 @@ impl Store {
             if !self.conversations.get(cid).is_some_and(|members| {
                 members.len() == 2 && members.contains(peer) && members.iter().any(|m| m == actor)
             }) {
-                return false;
-            }
-        }
-        if let Some(root) = &scope.thread {
-            if event["id"] != *root && event["data"]["thread_root"] != *root {
                 return false;
             }
         }
