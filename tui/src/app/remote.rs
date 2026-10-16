@@ -510,7 +510,7 @@ impl App {
                                     }
                                 }
                                 self.reconnecting_sessions.remove(&result.entry.uid);
-                            } else {
+                            } else if !self.retire_gone_skipped_entry(&p.ws_id, &p.entry) {
                                 eprintln!(
                                     "cm-tui: deferred remote reattach of session {} \
                                      on host {} gave up after {} attempts (session \
@@ -997,6 +997,10 @@ impl App {
                             reattached_any = true;
                             continue;
                         }
+                        if self.retire_gone_skipped_entry(&p.ws_id, &p.entry) {
+                            reattached_any = true;
+                            continue;
+                        }
                         eprintln!(
                             "cm-tui: deferred remote reattach of session {} ({}) \
                              on host {} gave up after {} attempts (session gone; \
@@ -1043,8 +1047,63 @@ impl App {
     /// header on the sidebar after a TUI restart (the daemon had long
     /// dropped it; nothing could ever reattach). Also settle scheduler-owned
     /// incarnations and saved exits of Done tasks: these can lack managed_by.
-    /// Other user-owned and workflow entries keep the preserve behavior.
+    /// Other user-owned entries are retired to a closed session by
+    /// `retire_gone_skipped_entry`; workflow entries keep the preserve
+    /// behavior.
     /// Returns true when the entry was settled.
+    fn push_entry_tombstone(ws: &mut Workspace, entry: &cm_daemon::manifest::ManifestEntry) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        ws.tombstones.retain(|t| t.uid != entry.uid);
+        ws.tombstones.push(cm_daemon::manifest::SessionTombstone {
+            entry: Some(entry.clone()),
+            uid: entry.uid.clone(),
+            managed_by_uid: entry.managed_by_uid.clone(),
+            label: entry.label.clone(),
+            session_type: entry.session_type.clone(),
+            task_id: entry.task_id.clone(),
+            last_transcript_id: entry.transcript_id.clone(),
+            worktree_path: ws.worktree_path.clone(),
+            generation: entry.generation,
+            exited_at: entry.last_exit.as_ref().map_or(now, |exit| exit.exited_at),
+        });
+    }
+
+    /// A restore-deferred entry (no pane) that a reachable daemon has
+    /// answered NotFound for through the whole give-up budget. Before
+    /// 2026-10-16 it stayed in `skipped_manifest_entries` and gave up again
+    /// on every TUI start: 13 such entries cost ~200 attach RPCs per start
+    /// and most of the log. Retire it to a closed session in its workspace
+    /// instead — A-O still restores it. Workflow entries keep the preserve
+    /// behavior (the workflow engine owns them).
+    fn retire_gone_skipped_entry(
+        &mut self,
+        ws_id: &str,
+        entry: &cm_daemon::manifest::ManifestEntry,
+    ) -> bool {
+        if entry.workflow_run_id.is_some() {
+            return false;
+        }
+        let Some(ws_idx) = self.workspaces.iter().position(|w| w.id == ws_id) else {
+            return false;
+        };
+        if self.workspaces[ws_idx].sessions.iter().any(|s| s.uid == entry.uid) {
+            return false;
+        }
+        Self::push_entry_tombstone(&mut self.workspaces[ws_idx], entry);
+        self.remove_skipped_entry(ws_id, &entry.uid);
+        eprintln!(
+            "cm-tui: session {} ({}) on host {} is gone on the daemon — retired to a \
+             closed session (A-O restores it)",
+            entry.uid,
+            entry.label,
+            entry.host_id.as_str(),
+        );
+        true
+    }
+
     fn settle_gone_agent_entry(
         &mut self,
         ws_id: &str,
@@ -1073,23 +1132,7 @@ impl App {
             let target = uid.clone();
             self.tombstone_and_remove(ws_idx, |ts| ts.uid == target);
         } else {
-            let ws = &mut self.workspaces[ws_idx];
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            ws.tombstones.push(cm_daemon::manifest::SessionTombstone {
-                entry: Some(entry.clone()),
-                uid: uid.clone(),
-                managed_by_uid: entry.managed_by_uid.clone(),
-                label: entry.label.clone(),
-                session_type: entry.session_type.clone(),
-                task_id: entry.task_id.clone(),
-                last_transcript_id: entry.transcript_id.clone(),
-                worktree_path: ws.worktree_path.clone(),
-                generation: entry.generation,
-                exited_at: entry.last_exit.as_ref().map_or(now, |exit| exit.exited_at),
-            });
+            Self::push_entry_tombstone(&mut self.workspaces[ws_idx], entry);
         }
         self.remove_skipped_entry(ws_id, &uid);
         self.reconnecting_sessions.remove(&uid);
@@ -3830,8 +3873,9 @@ mod remote_reconnect_tests {
         );
 
         // Jump to one short of the bound + clear the throttle so this drain
-        // makes the FINAL attempt → give up (dropped from pending, still
-        // preserved in skipped).
+        // makes the FINAL attempt → give up: dropped from pending and retired
+        // to a closed session (A-O restores it), so the next TUI start does
+        // not retry it all over again.
         app.pending_remote_reattach[0].attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
         app.pending_remote_reattach[0].last_attempt_at = None;
         app.drain_deferred_remote_reattach();
@@ -3840,8 +3884,16 @@ mod remote_reconnect_tests {
             "after the sustained-failure bound the fresh entry stops retrying",
         );
         assert!(
-            app.skipped_manifest_entries.contains_key("ws-remote"),
-            "giving up PRESERVES the raw entry in skipped (no data loss)",
+            !app.skipped_manifest_entries.contains_key("ws-remote"),
+            "a given-up entry leaves skipped, so restarts stop retrying it",
+        );
+        let ws = app.workspaces.iter().find(|w| w.id == "ws-remote").unwrap();
+        assert_eq!(ws.tombstones.len(), 1, "retired to a closed session (no data loss)");
+        assert_eq!(ws.tombstones[0].uid, "uid-gone");
+        assert_eq!(
+            ws.tombstones[0].entry.as_ref().map(|e| e.uid.as_str()),
+            Some("uid-gone"),
+            "the full entry rides on the tombstone, so A-O can revive it",
         );
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3938,10 +3990,14 @@ mod remote_reconnect_tests {
         );
         assert_eq!(app.workspaces[0].tombstones[0].uid, "uid-agent");
         assert!(
-            app.skipped_manifest_entries.contains_key("ws-user"),
-            "a user-owned entry keeps the preserve-in-skipped behavior",
+            !app.skipped_manifest_entries.contains_key("ws-user"),
+            "a gone user-owned entry leaves skipped too",
         );
-        assert!(app.workspaces[1].tombstones.is_empty());
+        assert_eq!(
+            app.workspaces[1].tombstones.len(),
+            1,
+            "…retired to a closed session in its own workspace (A-O restores it)",
+        );
         assert!(
             app.workspaces[0].is_closed,
             "the empty `agent:` marker is closed AT SETTLE TIME (kill-time \
@@ -3951,8 +4007,10 @@ mod remote_reconnect_tests {
         app.reap_spent_workspaces();
         assert!(app.workspaces[0].is_closed);
         assert!(
-            !app.workspaces[1].is_closed,
-            "the user-owned marker stays attach-pending-exempt (unchanged)",
+            app.workspaces[1].is_closed,
+            "with its entry retired the user-owned marker holds only a closed \
+             session, so the sweep closes it like any spent workspace (A-O \
+             reopens it and restores the session)",
         );
 
         // September 12 stragglers: scheduler roots and manually resumed
@@ -3985,8 +4043,11 @@ mod remote_reconnect_tests {
             app.drain_deferred_remote_reattach();
             assert!(app.pending_remote_reattach.is_empty());
             assert_eq!(app.workspaces[wi].is_closed, should_settle, "{id}");
-            assert_eq!(!app.skipped_manifest_entries.contains_key(id), should_settle, "{id}");
-            if should_settle {
+            // Unsettled user rows are retired to a closed session instead
+            // (their workspace stays open); workflow rows stay in skipped.
+            assert_eq!(app.skipped_manifest_entries.contains_key(id), workflow, "{id}");
+            assert_eq!(app.workspaces[wi].tombstones.len(), usize::from(!workflow), "{id}");
+            if !workflow {
                 let tomb = &app.workspaces[wi].tombstones[0];
                 assert_eq!(tomb.last_transcript_id.as_deref(), Some("preserved-conversation"));
                 assert_eq!(tomb.exited_at, 1789099687.5);
