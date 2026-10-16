@@ -335,8 +335,15 @@ full replay: 32 attaches a minute, the same session 3–4 times.
     input modes and scroll region: a few KB instead of the ring. Live output
     continues from the reply's `offset`.
   - The pane then has no scrollback. The first scroll up (wheel, PageUp,
-    Shift+PageUp) re-attaches that one pane with its full ring, and the
-    status line says "Loading scrollback…". Scroll up again once it lands.
+    Shift+PageUp) loads that one pane's full ring. The pane keeps its live
+    stream meanwhile, without ⟳. The status line says "Loading
+    scrollback…" and then "Scrollback loaded", and the pane scrolls up a
+    page once the ring has been read.
+  - A failed load says "Scrollback load failed — retrying (n)". After three
+    attempts it gives up with "scroll up again or press A-r to retry".
+  - In an app that tracks the mouse, wheel events go to the app, so only
+    Shift+PageUp starts the load there. Wheel handling there is unchanged
+    from before screen-first.
   - When kitty graphics passthrough is on and the ring holds image commands,
     the daemon replays the full ring so the images come back.
   - Local panes keep the full replay. An older daemon ignores the parameter
