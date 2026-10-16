@@ -761,35 +761,44 @@ impl App {
         // unreachable; the TUI then observes the run via the existing
         // workflow event / manifest streams. Local A-f is unchanged
         // (host_id == local → the local socket, exactly as before).
-        let daemon_socket = match self.host_pool.for_host(&host_id) {
-            Ok(h) => match h.socket_path() {
-                Some(p) => p,
-                None => {
-                    self.set_status_msg("launch: daemon has no socket path");
-                    return;
+        // Resolving the socket can warm a cold tunnel and `start_workflow`
+        // has a 150 s budget, so both run on a worker (`background.rs`).
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let size = self.last_term_size;
+        let name = workflow_name.to_owned();
+        let started = self.run_in_background(Some(format!("start_workflow:{workspace_id}")), move || {
+            let socket = match pool.for_host(&host_id) {
+                Ok(h) => match h.socket_path() {
+                    Some(p) => p,
+                    None => {
+                        return Box::new(|app: &mut App| app.set_status_msg("launch: daemon has no socket path"))
+                            as super::background::Apply;
+                    }
+                },
+                Err(e) => {
+                    let msg = format!("launch: daemon unavailable: {e}");
+                    return Box::new(move |app: &mut App| app.set_status_msg(&msg));
                 }
-            },
-            Err(e) => {
-                self.set_status_msg(&format!("launch: daemon unavailable: {e}"));
-                return;
-            }
-        };
-        match crate::client_session::rpc_start_workflow(
-            &daemon_socket,
-            &self.host_pool.operator_token_for(&host_id),
-            workflow_name,
-            &worktree,
-            &workspace_id,
-            goal.as_deref(),
-            task_id.as_deref(),
-            &role_sessions,
-            &role_engines,
-            self.last_term_size,
-        ) {
-            Ok(run_id) => {
-                self.set_status_msg(&format!("Launched {} ({})", workflow_name, run_id))
-            }
-            Err(e) => self.set_status_msg(&format!("launch failed: {e}")),
+            };
+            let msg = match crate::client_session::rpc_start_workflow(
+                &socket,
+                &pool.operator_token_for(&host_id),
+                &name,
+                &worktree,
+                &workspace_id,
+                goal.as_deref(),
+                task_id.as_deref(),
+                &role_sessions,
+                &role_engines,
+                size,
+            ) {
+                Ok(run_id) => format!("Launched {} ({})", name, run_id),
+                Err(e) => format!("launch failed: {e}"),
+            };
+            Box::new(move |app: &mut App| app.set_status_msg(&msg))
+        });
+        if started {
+            self.set_status_msg(&format!("Launching {workflow_name}…"));
         }
     }
 

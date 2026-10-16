@@ -577,3 +577,60 @@ fn scroll_up_during_an_in_flight_reconnect_still_loads_history() {
     );
     assert!(!ts.session.history_deferred, "scrollback never loaded");
 }
+
+/// 2026-10-16 investigation: the link stays down for longer than the
+/// give-up window. Every failure is a transport failure, which never counts
+/// toward the cap, so no pane gives up; when the link returns every pane
+/// reattaches on its own (no A-r) and takes keystrokes again.
+#[test]
+fn a_long_outage_never_gives_up_and_every_pane_takes_input_when_the_link_returns() {
+    let _guard = crate::test_support::home_lock();
+    let mut fx = Fixture::new();
+    fx.settle();
+
+    fx.link.refuse.store(true, Ordering::SeqCst);
+    fx.link.cut();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let app = &mut fx.app;
+        // Hold every pane at the edge of the cap: one counted failure
+        // would give it up.
+        for p in app.pending_remote_reattach.iter_mut() {
+            p.attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
+        }
+        for p in app.attaching.values_mut() {
+            p.attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
+        }
+        app.drain_terminal_events();
+        app.requeue_stale_generation_remote_sessions();
+        app.drain_deferred_remote_reattach();
+        app.drain_attach_results();
+        for ts in &app.workspaces[0].sessions {
+            assert!(!ts.session.exited, "{} gave up during the outage", ts.uid);
+        }
+        let failed_enough = fx.uids.iter().all(|uid| {
+            app.reattach_backoff.get(uid).is_some_and(|b| b.strikes >= 3)
+        });
+        if failed_enough {
+            break;
+        }
+        assert!(Instant::now() < deadline, "panes did not keep retrying: {:?}", app.reattach_backoff.keys());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(fx.app.workspaces[0].sessions.len(), fx.uids.len(), "every row is still there");
+
+    fx.link.refuse.store(false, Ordering::SeqCst);
+    fx.settle();
+    for (i, ts) in fx.app.workspaces[0].sessions.iter_mut().enumerate() {
+        ts.session.write(format!("typed-after-outage-{i}").as_bytes()).expect("input");
+    }
+    for (i, ts) in fx.app.workspaces[0].sessions.iter().enumerate() {
+        let want = format!("typed-after-outage-{i}");
+        let wait = Instant::now() + Duration::from_secs(10);
+        // The PTY echoes what reaches it, so the pane shows it.
+        while !screen_text(ts).contains(&want) {
+            assert!(Instant::now() < wait, "{}: input never reached the PTY", ts.uid);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

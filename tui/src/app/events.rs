@@ -1662,33 +1662,79 @@ impl App {
     /// A host whose socket isn't live right now is an ERROR, not a
     /// silent local-only update: claiming "granted" while the daemon
     /// never heard it is exactly the divergence this guards against.
-    pub fn set_session_global_perms(
+    ///
+    /// The push runs on a worker (`background.rs`): over a slow link it
+    /// held keyboard input for its whole RPC budget. The row and manifest
+    /// change only once the daemon accepts (`finish_global_perms`).
+    pub fn set_session_global_perms(&mut self, uid: &str, value: bool, local_changed: bool) {
+        let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid) else {
+            self.set_status_msg(&format!(
+                "Settings saved, but global-perms change failed: session {} not found",
+                uid
+            ));
+            return;
+        };
+        let host = self.workspaces[wi].sessions[si].host_id.clone();
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let uid = uid.to_owned();
+        let key = format!("global_perms:{uid}");
+        let started = self.run_in_background(Some(key), move || {
+            // Push to the daemon first so a failed RPC doesn't leave the
+            // TUI's view diverged from the daemon's auth state.
+            let pushed = pool
+                .live_socket_path(&host)
+                .ok_or_else(|| {
+                    format!(
+                        "host `{}` socket not live — grant NOT applied (daemon never heard it); \
+                         retry once the host reconnects",
+                        host.as_str(),
+                    )
+                })
+                .and_then(|socket| {
+                    crate::client_session::rpc_set_global_perms(
+                        &socket,
+                        &pool.operator_token_for(&host),
+                        &uid,
+                        value,
+                    )
+                    .map_err(|e| format!("daemon rejected global-perms change: {}", e))
+                });
+            Box::new(move |app: &mut App| app.finish_global_perms(&uid, value, local_changed, pushed))
+        });
+        if started {
+            self.set_status_msg("Settings saved — applying global permissions…");
+        }
+    }
+
+    fn finish_global_perms(
         &mut self,
         uid: &str,
         value: bool,
-    ) -> Result<crate::client_session::GlobalPermsAck, String> {
-        let (wi, si) = crate::control::methods::find_live_session(&self.workspaces, uid)
-            .ok_or_else(|| format!("session {} not found", uid))?;
-        let host = self.workspaces[wi].sessions[si].host_id.clone();
-        // Push to the daemon first so a failed RPC doesn't leave the
-        // TUI's view diverged from the daemon's auth state.
-        let socket = self.host_pool.live_socket_path(&host).ok_or_else(|| {
-            format!(
-                "host `{}` socket not live — grant NOT applied (daemon never heard it); \
-                 retry once the host reconnects",
-                host.as_str(),
-            )
-        })?;
-        let ack = crate::client_session::rpc_set_global_perms(
-            &socket,
-            &self.host_pool.operator_token_for(&host),
-            uid,
-            value,
-        )
-        .map_err(|e| format!("daemon rejected global-perms change: {}", e))?;
-        self.workspaces[wi].sessions[si].global_perms = value;
-        self.save_session_manifest();
-        Ok(ack)
+        local_changed: bool,
+        pushed: Result<crate::client_session::GlobalPermsAck, String>,
+    ) {
+        let ack = match pushed {
+            Ok(ack) => ack,
+            Err(e) => {
+                self.set_status_msg(&format!("Settings saved, but global-perms change failed: {}", e));
+                return;
+            }
+        };
+        if let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid) {
+            self.workspaces[wi].sessions[si].global_perms = value;
+            self.save_session_manifest();
+        }
+        // `changed` = the DAEMON moved; a re-assert that converged a drifted
+        // daemon reads as a grant/revoke too, so the operator sees it took
+        // effect.
+        let daemon_moved = ack.changed.unwrap_or(local_changed);
+        let msg = match (value, daemon_moved || local_changed) {
+            (true, true) => "Settings saved — global permissions GRANTED",
+            (false, true) => "Settings saved — global permissions revoked",
+            (true, false) => "Settings saved — global permissions re-asserted (already granted)",
+            (false, false) => "Settings saved",
+        };
+        self.set_status_msg(msg);
     }
 
     /// Process planning editor events (non-blocking).
@@ -7474,6 +7520,7 @@ pub(super) mod pending_workflow_events_tests {
         // recording listener doesn't run the real spawn).
         app.launch_workflow_via_daemon("ws-local", "feedback", &[], Some("goal-l".into()), None);
         app.launch_workflow_via_daemon("ws-remote", "feedback", &[], Some("goal-r".into()), None);
+        app.settle_background();
 
         let find_sw = |caps: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>|
          -> Option<serde_json::Value> {
