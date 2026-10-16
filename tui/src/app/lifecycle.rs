@@ -3007,56 +3007,41 @@ impl App {
         seed_from: Option<&str>,
         resume_from: Option<&str>,
     ) {
-        let socket = match self
-            .host_pool
-            .for_host(host)
-            .ok()
-            .and_then(|h| h.socket_path())
-        {
-            Some(s) => s,
-            None => {
-                self.set_status_msg(&format!(
-                    "Remote host `{}` not reachable (no live socket)",
-                    host.as_str()
-                ));
-                return;
-            }
-        };
-
+        // An unconfigured host fails now. Warming its tunnel, the add RPC
+        // and the attach run on a worker (`restart.rs`): over a slow link
+        // they held keyboard input to every pane.
+        if let Err(e) = self.host_pool.for_host(host) {
+            self.set_status_msg(&format!("Remote host `{}` not reachable ({e})", host.as_str()));
+            return;
+        }
         let (cols, rows) = self.last_term_size;
-        let workspace_id = self.workspaces[ws_index].id.clone();
-        let session_uid = new_session_uid();
-        let op_token_owned = self.host_pool.operator_token_for(host);
-        let op_token = op_token_owned.as_str();
-        // Daemon WIRE engine ("claude" → "claude-code").
-        let wire_engine = match session_type {
-            "claude" => "claude-code",
-            other => other,
-        };
-
-        let res = match crate::client_session::rpc_add_session_with_resume(
-            &socket,
-            op_token,
-            &session_uid,
-            &workspace_id,
-            session_type,
-            wire_engine,
-            task_id.as_deref(),
+        self.start_remote_add(super::restart::RemoteAdd {
+            host: host.clone(),
+            workspace_id: self.workspaces[ws_index].id.clone(),
+            uid: new_session_uid(),
+            session_type: session_type.to_owned(),
+            task_id,
+            seed_from: seed_from.map(str::to_owned),
+            resume_from: resume_from.map(str::to_owned),
             cols,
             rows,
-            resume_from,
-            seed_from,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                self.set_status_msg(&format!("Remote add_session failed: {}", e));
-                return;
-            }
-        };
+        });
+    }
 
+    /// The UI-thread half of remote A-s: bind the attached session (or
+    /// queue the reattach of a resumed one) into its workspace.
+    pub(super) fn finish_remote_add(
+        &mut self,
+        job: super::restart::RemoteAdd,
+        res: crate::client_session::AddSessionResult,
+        restored_entry: Option<cm_daemon::manifest::ManifestEntry>,
+        session: Result<Session, String>,
+    ) {
+        let host = &job.host;
+        let session_type = job.session_type.as_str();
         // The original identity may belong to another workspace/task. A picker
         // selection must not reparent it to the row that opened the dialog.
-        let workspace_id = res.workspace_id.clone().unwrap_or(workspace_id);
+        let workspace_id = res.workspace_id.clone().unwrap_or_else(|| job.workspace_id.clone());
         let ws_index = match self.workspaces.iter().position(|w| w.id == workspace_id && w.host_id == *host) {
             Some(i) => i,
             None => {
@@ -3073,70 +3058,30 @@ impl App {
                 i
             }
         };
-        let mut restored_entry = res.entry;
-        if let Some(e) = restored_entry.as_mut() {
-            e.host_id = host.clone();
-            e.session_type = normalize_session_type_to_internal(&e.session_type).to_string();
-        }
-        let task_id = restored_entry.as_ref().map(|e| e.task_id.clone()).unwrap_or(task_id);
-        let label = restored_entry.as_ref().map(|e| e.label.as_str()).unwrap_or(session_type);
-        let worktree_path = PathBuf::from(&res.worktree_path);
-        let session = match try_attach_via_daemon_with_deps(
-            &self.host_pool,
-            &res.session_uid,
-            &workspace_id,
-            &worktree_path,
-            session_type,
-            label,
-            cols,
-            rows,
-            task_id.as_deref(),
-            restored_entry.as_ref().and_then(|e| e.workflow_run_id.as_deref()),
-            restored_entry.as_ref().and_then(|e| e.workflow_role.as_deref()),
-            host,
-            None,
-        ) {
+        let session = match session {
             Ok(s) => s,
             Err(e) => {
-                if resume_from.is_some() {
-                    self.set_status_msg(&format!("Session resumed; attach will retry: {}", e));
-                    if let Some(entry) = restored_entry {
-                        self.forget_reconnect_state(&entry.uid);
-                        self.pending_remote_reattach.push(super::remote::PendingRemoteReattach::new(workspace_id.clone(), entry.clone()));
-                        self.skipped_manifest_entries.entry(workspace_id.clone()).or_default().push(entry);
-                        self.workspaces[ws_index].is_closed = false;
-                    }
-                    self.save_session_manifest();
-                    return;
+                // Only a resume reaches here: the worker kills a fresh
+                // session whose attach failed.
+                self.set_status_msg(&format!("Session resumed; attach will retry: {}", e));
+                if let Some(entry) = restored_entry {
+                    self.forget_reconnect_state(&entry.uid);
+                    self.pending_remote_reattach.push(super::remote::PendingRemoteReattach::new(workspace_id.clone(), entry.clone()));
+                    self.skipped_manifest_entries.entry(workspace_id.clone()).or_default().push(entry);
+                    self.workspaces[ws_index].is_closed = false;
                 }
-                // The daemon already started the session into the existing
-                // worktree. Mirror `ClientSession::new`'s cleanup contract:
-                // best-effort kill before bubbling so we don't leak a live,
-                // headless, unattached session on the remote host. Log the
-                // cleanup error separately; the original attach error wins.
-                if let Err(cleanup_err) = crate::client_session::rpc_kill_session(
-                    &socket,
-                    op_token,
-                    &res.session_uid,
-                ) {
-                    eprintln!(
-                        "add_remote_session cleanup: kill_session({}) failed \
-                         after attach error: {}",
-                        res.session_uid, cleanup_err,
-                    );
-                }
-                self.set_status_msg(&format!("Remote attach failed: {}", e));
+                self.save_session_manifest();
                 return;
             }
         };
-
+        let task_id = restored_entry.as_ref().map(|e| e.task_id.clone()).unwrap_or(job.task_id.clone());
         let ts = if let Some(entry) = restored_entry {
             Self::build_remote_terminal_session(&entry, session)
         } else {
             let mut ts = make_simple_session_with_uid(res.session_uid, session_type, session_type, session, None);
             ts.task_id = task_id;
-            ts.transcript_id = if session_type == "claude" || seed_from.is_none() { res.resume_id } else { None };
-            ts.seeded_from_snapshot = seed_from.map(str::to_owned);
+            ts.transcript_id = if session_type == "claude" || job.seed_from.is_none() { res.resume_id } else { None };
+            ts.seeded_from_snapshot = job.seed_from.clone();
             ts.host_id = host.clone();
             ts
         };
@@ -3155,7 +3100,7 @@ impl App {
         self.workspaces[ws_index].sessions.push(ts);
         self.cursor = Cursor::Session(ws_index, si);
         self.save_session_manifest();
-        let action = if resume_from.is_some() { "Resumed" } else { "Started" };
+        let action = if job.resume_from.is_some() { "Resumed" } else { "Started" };
         self.set_status_msg(&format!("{} {} on `{}`", action, label, host.as_str()));
     }
 
@@ -8133,6 +8078,25 @@ pub(crate) mod revive_session_tests {
         assert!(started.elapsed() < Duration::from_millis(500), "A-w blocked input for {:?}", started.elapsed());
         assert!(app.workspaces[0].sessions.is_empty());
         assert_eq!(app.workspaces[0].tombstones.len(), 1);
+    }
+
+    /// Remote A-s: the add RPC and the attach run on a worker.
+    #[test]
+    fn adding_a_session_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0e-0");
+        let host = app.workspaces[0].host_id.clone();
+        let started = Instant::now();
+        app.add_remote_session(&host, 0, "codex", None, None, None);
+        assert!(started.elapsed() < Duration::from_millis(500), "A-s blocked input for {:?}", started.elapsed());
+        assert!(status_text(&app).starts_with("Starting codex on `slow`"), "{}", status_text(&app));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !app.remote_adds.is_empty() {
+            assert!(Instant::now() < deadline, "add worker never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            app.drain_restarts();
+        }
+        assert!(status_text(&app).starts_with("Remote add_session failed"), "{}", status_text(&app));
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "no row for a failed add");
     }
 
     /// The same for A-O on a remote workspace: its revives run serially,

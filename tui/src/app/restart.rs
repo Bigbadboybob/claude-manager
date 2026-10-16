@@ -1,6 +1,7 @@
-//! A-R restart/revive and A-O remote restore, off the input thread.
+//! A-R restart/revive, A-O remote restore and remote A-s, off the input
+//! thread.
 //!
-//! Both used to run their daemon RPCs on the UI thread: an A-R on a live
+//! All three used to run their daemon RPCs on the UI thread: an A-R on a live
 //! session was a kill (5 s budget), then up to 40 registry polls (5 s budget
 //! each) waiting for the reaper, then the revive. Over a slow link (Owner's,
 //! under 1 Mbps on 2026-10-16) that froze keyboard input to every pane for
@@ -94,6 +95,97 @@ pub(super) struct RestoreFlight {
     result: Receiver<Result<Vec<(RestoreJob, Result<(), String>)>, String>>,
 }
 
+/// Remote A-s: everything the worker needs, captured at keypress time.
+pub(super) struct RemoteAdd {
+    pub host: HostId,
+    pub workspace_id: String,
+    pub uid: String,
+    pub session_type: String,
+    pub task_id: Option<String>,
+    pub seed_from: Option<String>,
+    pub resume_from: Option<String>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+type AddOutcome = Result<
+    (crate::client_session::AddSessionResult, Option<ManifestEntry>, Result<Session, String>),
+    String,
+>;
+
+pub(super) struct AddFlight {
+    job: RemoteAdd,
+    result: Receiver<AddOutcome>,
+}
+
+/// `add_session`, then attach. A fresh session whose attach fails is killed
+/// (an unattached session would run unseen); a resumed one is handed back
+/// for the deferred reattach.
+fn run_remote_add(pool: &crate::host_pool::HostPool, job: &RemoteAdd) -> AddOutcome {
+    let host = &job.host;
+    let Some(socket) = pool.for_host(host).ok().and_then(|h| h.socket_path()) else {
+        return Err(format!("Remote host `{}` not reachable (no live socket)", host.as_str()));
+    };
+    let token = pool.operator_token_for(host);
+    // Daemon WIRE engine ("claude" → "claude-code").
+    let wire_engine = match job.session_type.as_str() {
+        "claude" => "claude-code",
+        other => other,
+    };
+    let res = crate::client_session::rpc_add_session_with_resume(
+        &socket,
+        &token,
+        &job.uid,
+        &job.workspace_id,
+        &job.session_type,
+        wire_engine,
+        job.task_id.as_deref(),
+        job.cols,
+        job.rows,
+        job.resume_from.as_deref(),
+        job.seed_from.as_deref(),
+    )
+    .map_err(|e| format!("Remote add_session failed: {e}"))?;
+    let workspace_id = res.workspace_id.clone().unwrap_or_else(|| job.workspace_id.clone());
+    let mut restored_entry = res.entry.clone();
+    if let Some(e) = restored_entry.as_mut() {
+        e.host_id = host.clone();
+        e.session_type = normalize_session_type_to_internal(&e.session_type).to_string();
+    }
+    let task_id = restored_entry.as_ref().map(|e| e.task_id.clone()).unwrap_or(job.task_id.clone());
+    let label = restored_entry.as_ref().map(|e| e.label.clone()).unwrap_or(job.session_type.clone());
+    let attached = super::lifecycle::try_attach_via_daemon_with_deps(
+        pool,
+        &res.session_uid,
+        &workspace_id,
+        &PathBuf::from(&res.worktree_path),
+        &job.session_type,
+        &label,
+        job.cols,
+        job.rows,
+        task_id.as_deref(),
+        restored_entry.as_ref().and_then(|e| e.workflow_run_id.as_deref()),
+        restored_entry.as_ref().and_then(|e| e.workflow_role.as_deref()),
+        host,
+        None,
+    );
+    match attached {
+        Ok(session) => Ok((res, restored_entry, Ok(session))),
+        Err(e) if job.resume_from.is_some() => Ok((res, restored_entry, Err(e.to_string()))),
+        Err(e) => {
+            // Mirror `ClientSession::new`'s cleanup contract; the attach
+            // error wins.
+            if let Err(cleanup_err) = crate::client_session::rpc_kill_session(&socket, &token, &res.session_uid) {
+                eprintln!(
+                    "add_remote_session cleanup: kill_session({}) failed after attach error: {}",
+                    res.session_uid, cleanup_err,
+                );
+            }
+            Err(format!("Remote attach failed: {e}"))
+        }
+    }
+}
+
 impl App {
     pub(super) fn restart_in_flight(&self, uid: &str) -> bool {
         self.restarts.iter().any(|f| f.uid == uid)
@@ -161,6 +253,58 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub(super) fn start_remote_add(&mut self, job: RemoteAdd) {
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let (tx, result) = mpsc::channel();
+        let request = RemoteAdd {
+            host: job.host.clone(),
+            workspace_id: job.workspace_id.clone(),
+            uid: job.uid.clone(),
+            session_type: job.session_type.clone(),
+            task_id: job.task_id.clone(),
+            seed_from: job.seed_from.clone(),
+            resume_from: job.resume_from.clone(),
+            cols: job.cols,
+            rows: job.rows,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("cm-remote-add".into())
+            .spawn(move || {
+                let _ = tx.send(run_remote_add(&pool, &request));
+            });
+        if let Err(e) = spawned {
+            self.set_status_msg(&format!("Could not start the add-session worker: {e}"));
+            return;
+        }
+        self.set_status_msg(&format!(
+            "{} {} on `{}`…",
+            if job.resume_from.is_some() { "Resuming" } else { "Starting" },
+            job.session_type,
+            job.host.as_str()
+        ));
+        self.remote_adds.push(AddFlight { job, result });
+    }
+
+    fn drain_remote_adds(&mut self) {
+        let mut i = 0;
+        while i < self.remote_adds.len() {
+            let outcome = match self.remote_adds[i].result.try_recv() {
+                Ok(outcome) => outcome,
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err("add-session worker stopped".into()),
+            };
+            let flight = self.remote_adds.remove(i);
+            match outcome {
+                Ok((res, entry, session)) => self.finish_remote_add(flight.job, res, entry, session),
+                Err(e) => self.set_status_msg(&e),
+            }
+            self.needs_redraw = true;
+        }
+    }
+
     pub(crate) fn drain_restarts(&mut self) {
         let mut i = 0;
         while i < self.restarts.len() {
@@ -177,6 +321,7 @@ impl App {
             self.needs_redraw = true;
         }
         self.drain_restores();
+        self.drain_remote_adds();
     }
 
     fn finish_restart(&mut self, flight: RestartFlight, outcome: RestartOutcome) {

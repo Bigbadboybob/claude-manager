@@ -521,6 +521,8 @@ pub struct App {
     restarts: Vec<restart::RestartFlight>,
     /// A-O remote restores in flight.
     restores: Vec<restart::RestoreFlight>,
+    /// Remote A-s adds in flight.
+    remote_adds: Vec<restart::AddFlight>,
     /// A-F forks in flight (the host provisions a worktree before replying).
     fork_flights: Vec<fork::ForkFlight>,
     image_pastes: Vec<image_paste::ImagePasteFlight>,
@@ -1041,6 +1043,7 @@ impl App {
             remote_creates: Vec::new(),
             restarts: Vec::new(),
             restores: Vec::new(),
+            remote_adds: Vec::new(),
             fork_flights: Vec::new(),
             image_pastes: Vec::new(),
             push_worker,
