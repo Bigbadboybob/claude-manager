@@ -166,9 +166,10 @@ pub struct ReaderHalf {
     /// Kitty graphics passthrough: strips graphics commands out of the
     /// stream before Alacritty parses it. `None` when passthrough is off.
     graphics: Option<crate::graphics::Tap>,
-    /// Stream position of the next live byte, and how many replay bytes
-    /// still come first (they are not stream bytes past the position).
-    position: Option<(Arc<AtomicU64>, u64)>,
+    /// Stream position of the next live byte, how many replay bytes still
+    /// come first (they are not stream bytes past the position), and a flag
+    /// set once they have all been read.
+    position: Option<(Arc<AtomicU64>, u64, Arc<AtomicBool>)>,
 }
 
 impl ReaderHalf {
@@ -196,10 +197,13 @@ impl Read for ReaderHalf {
 impl ReaderHalf {
     fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let result = self.inner.read(buf);
-        if let (Ok(n), Some((position, replay_left))) = (&result, self.position.as_mut()) {
+        if let (Ok(n), Some((position, replay_left, done))) = (&result, self.position.as_mut()) {
             let replayed = (*n as u64).min(*replay_left);
             *replay_left -= replayed;
             position.fetch_add(*n as u64 - replayed, Ordering::SeqCst);
+            if *replay_left == 0 {
+                done.store(true, Ordering::SeqCst);
+            }
         }
         // After every read, drain any cached child event. The
         // signal is one-shot per stream: once we've written to
@@ -333,8 +337,16 @@ impl AttachedPty {
 
     /// Advance `position` by every live byte read, after `replay_bytes` of
     /// replay. Call before the EventLoop takes ownership.
-    pub fn set_position_tracker(&mut self, position: Arc<AtomicU64>, replay_bytes: u64) {
-        self.reader.position = Some((position, replay_bytes));
+    pub fn set_position_tracker(
+        &mut self,
+        position: Arc<AtomicU64>,
+        replay_bytes: u64,
+        replay_done: Arc<AtomicBool>,
+    ) {
+        if replay_bytes == 0 {
+            replay_done.store(true, Ordering::SeqCst);
+        }
+        self.reader.position = Some((position, replay_bytes, replay_done));
     }
 
     /// Route this pane's stream through kitty graphics passthrough. Call

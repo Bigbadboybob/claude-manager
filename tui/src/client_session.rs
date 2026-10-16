@@ -442,8 +442,13 @@ impl ClientSession {
         let resume = how.resume.as_ref().filter(|_| open_resp.resumed);
         let stream = open_resp.offset.zip(open_resp.stream_id).map(|(offset, stream_id)| {
             let position = Arc::new(std::sync::atomic::AtomicU64::new(offset));
-            pty.set_position_tracker(position.clone(), open_resp.replay_bytes.unwrap_or(0));
-            StreamCursor { stream_id, position }
+            let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            pty.set_position_tracker(
+                position.clone(),
+                open_resp.replay_bytes.unwrap_or(0),
+                replay_done.clone(),
+            );
+            StreamCursor { stream_id, position, replay_done }
         });
         let graphics = crate::graphics::for_attached_pane(
             if resume.is_some() { Some(0) } else { open_resp.replay_bytes },
@@ -1350,6 +1355,8 @@ pub struct StreamCursor {
     pub stream_id: u64,
     /// Offset of the next live byte; advanced by the attach reader.
     pub position: Arc<std::sync::atomic::AtomicU64>,
+    /// Set once the reader has read past the replay.
+    pub replay_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// `attach.open` over an *already-dialed* `UnixStream`. The same

@@ -670,9 +670,13 @@ pub struct App {
     attached_tunnel_generation: std::collections::HashMap<String, u64>,
     /// Per-uid reconnect backoff (`remote::ReattachBackoff`).
     reattach_backoff: std::collections::HashMap<String, remote::ReattachBackoff>,
-    /// Screen-first panes whose full output ring was requested by scrolling
-    /// up (`load_deferred_history`); their next attach replays the ring.
-    full_history_wanted: std::collections::HashSet<String>,
+    /// Scrollback loads Owner asked for by scrolling up in a screen-first
+    /// pane (`load_deferred_history`); that pane's next attach replays the
+    /// whole ring.
+    pub(crate) history_fetches: std::collections::HashMap<String, remote::HistoryFetch>,
+    /// Panes whose scrollback just loaded: scroll them up a page once the
+    /// replay has been read, so the gesture that asked for it takes effect.
+    scroll_after_load: std::collections::HashMap<String, Instant>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -1047,7 +1051,8 @@ impl App {
             reconnecting_sessions: std::collections::HashSet::new(),
             attached_tunnel_generation: std::collections::HashMap::new(),
             reattach_backoff: std::collections::HashMap::new(),
-            full_history_wanted: std::collections::HashSet::new(),
+            history_fetches: std::collections::HashMap::new(),
+            scroll_after_load: std::collections::HashMap::new(),
         }
     }
 
