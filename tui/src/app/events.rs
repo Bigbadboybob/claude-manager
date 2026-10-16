@@ -1152,6 +1152,7 @@ impl App {
         if !agent_exit_prunes.is_empty() {
             for (wi, uid) in agent_exit_prunes {
                 if self.restart_suppressed_exit_uids.contains(&uid)
+                    || self.restart_in_flight(&uid)
                     || self.revive_failed.contains_key(&uid)
                 {
                     continue;
@@ -2031,6 +2032,7 @@ impl App {
                     || ts.managed_by_uid.is_none()
                     || ts.workflow_run_id.is_some()
                     || self.restart_suppressed_exit_uids.contains(&ts.uid)
+                    || self.restarts.iter().any(|f| f.uid == ts.uid)
                     || self.revive_failed.contains_key(&ts.uid)
                 {
                     continue;
@@ -2114,11 +2116,10 @@ impl App {
         match diff {
             ManifestDiff::Exited { uid, last_exit } => {
                 // A-R force-restart: this exit is the restart's own
-                // kill. The revive ran synchronously before this diff
-                // could be applied, so the row under this uid is
-                // already the NEW live incarnation — stamping
-                // `preserved_last_exit` or pruning it here would hit
-                // the wrong session. Consume the one-shot marker and
+                // kill. The row under this uid is (or, while the restart
+                // worker finishes, is about to be) the NEW incarnation —
+                // stamping `preserved_last_exit` or pruning it here would
+                // hit the wrong session. Consume the one-shot marker and
                 // drop the diff.
                 if self.restart_suppressed_exit_uids.remove(&uid) {
                     return;
