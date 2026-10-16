@@ -680,12 +680,14 @@ fn run_inbound(
                 // sessions) didn't bump idle, and
                 // `wait_for_session_idle` returned immediately
                 // after typing.
+                let lock_started = std::time::Instant::now();
                 let handle = {
                     let s = state.lock().unwrap_or_else(|p| p.into_inner());
                     s.sessions
                         .get(session_uid)
                         .map(|sess| sess.input_handle())
                 };
+                let lock_wait = lock_started.elapsed();
                 let Some(handle) = handle else {
                     // Session removed mid-stream. Drop this
                     // input; the outbound side will see the
@@ -701,7 +703,10 @@ fn run_inbound(
                 // stream is the OPERATOR's input path, so use the
                 // operator-stamping variant — the delivery threads'
                 // typing-quiet gate keys off it.
-                if let Err(e) = handle.write_and_stamp_operator(&decoded) {
+                let write_started = std::time::Instant::now();
+                let written = handle.write_and_stamp_operator(&decoded);
+                crate::health::note_input(session_uid, decoded.len(), lock_wait, write_started.elapsed());
+                if let Err(e) = written {
                     eprintln!(
                         "cm-daemon: attach stream {} send_input failed: {} (session may have exited)",
                         session_uid, e,
