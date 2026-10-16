@@ -2649,6 +2649,7 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
             // Built outside the state lock; output that arrived meanwhile is
             // queued behind it.
             let images = params.graphics && ring.windows(3).any(|w| w == b"\x1b_G");
+            let started = std::time::Instant::now();
             let replay = if images {
                 result.as_object_mut().expect("attach result").remove("replay");
                 ring
@@ -2659,8 +2660,15 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
                     params.rows.unwrap_or(24),
                 )
             };
+            let render = (!images).then(|| started.elapsed());
             handle.fanout_rx.flow_control().push_front(&replay);
             result["replay_bytes"] = serde_json::json!(replay.len());
+            let kind = if images { "ring" } else { "screen" };
+            crate::health::note_attach(&handle.session_uid, kind, replay.len(), render);
+        } else {
+            let kind = if result["replay"] == "resume" { "resume" } else { "ring" };
+            let bytes = result["replay_bytes"].as_u64().unwrap_or(0) as usize;
+            crate::health::note_attach(&handle.session_uid, kind, bytes, None);
         }
     }
     outcome

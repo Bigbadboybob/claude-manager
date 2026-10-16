@@ -373,3 +373,26 @@ Five 300 KB panes over a modelled 120 KB/s link
 - A cold start sends 12 KB with screen-first attach. Full replays send
   1.5 MB as raw frames, against 2.0 MB as base64.
 - After the link drops, all five resume with under 2 KB in total.
+
+### Diagnosing slow input and reconnects
+
+Added 2026-10-16, after keypresses took minutes to arrive and the log could
+not say when anything happened.
+
+- **Timestamps.** Every `daemon.log` line starts with an RFC3339 UTC
+  timestamp in milliseconds. A child process (`cm-daemon --log-pump <path>`)
+  stamps the brain's stdout/stderr, so the last lines of a crashing brain
+  are still written. If the pump cannot start or dies, the brain writes to
+  the file directly, unstamped.
+- **`slow input:`** An attach input frame took over 1 s to reach the PTY.
+  The line splits the time into the state-lock wait and the write itself.
+- **`brain stall:`** The brain's 250 ms health tick ran over 1 s late: the
+  whole process was not scheduled, or was blocked in the kernel (disk
+  pressure, swap).
+- **`slow attach render:`** A screen-first repaint took over 250 ms.
+  **`attach burst:`** is one line per burst of attaches (less than 5 s
+  apart). It gives the count, the replay kinds, the replay bytes, and the
+  render times.
+- **Disk.** When `/` or `/home` reaches 90%, Owner gets one Emergency alert
+  through Owner attention, which also sends `notify_command`. It re-arms
+  once usage drops below 85%. The level is checked every minute.
