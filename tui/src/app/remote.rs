@@ -101,6 +101,16 @@ const REMOTE_STREAM_STABLE_AFTER: Duration = Duration::from_secs(60);
 /// The pane Owner is looking at never waits longer than this between attempts.
 const REMOTE_REATTACH_FOCUSED_MAX_WAIT: Duration = Duration::from_secs(10);
 
+/// Give up a scrollback load after this many failed attempts; the next
+/// scroll up starts a new one.
+const HISTORY_FETCH_ATTEMPTS: u32 = 3;
+
+/// A scrollback load in progress (`App::load_deferred_history`).
+#[derive(Default)]
+pub(crate) struct HistoryFetch {
+    failures: u32,
+}
+
 /// Per-uid reconnect history behind the backoff. In memory only.
 #[derive(Default)]
 pub(super) struct ReattachBackoff {
@@ -361,6 +371,7 @@ impl App {
     /// (reconnecting) slot in place, or create a new slot. On failure: re-queue
     /// for retry, or — past the reconnect cap — mark the slot exited.
     pub fn drain_attach_results(&mut self) {
+        self.apply_scroll_after_load();
         let results: Vec<crate::attach_worker::AttachResult> = match self.attach_worker.as_ref()
         {
             Some(w) => w.result_rx.try_iter().collect(),
@@ -402,9 +413,7 @@ impl App {
                     self.attached_tunnel_generation
                         .insert(result.entry.uid.clone(), gen);
                     self.note_reattached(&result.entry.uid);
-                    if !session.history_deferred && !session.resumed {
-                        self.full_history_wanted.remove(&result.entry.uid);
-                    }
+                    let full_ring = !session.history_deferred && !session.resumed;
                     // Bind by uid across ALL workspaces, not just `result.ws_id`.
                     // A daemon session is unique by uid, so if a slot for it
                     // already exists ANYWHERE (a reconnect, or a stray duplicate
@@ -435,6 +444,7 @@ impl App {
                         slot.set_status(SessionStatus::Running);
                         self.reconnecting_sessions.remove(&result.entry.uid);
                         self.remove_skipped_entry(&result.ws_id, &result.entry.uid);
+                        self.history_fetch_bound(&result.entry.uid, full_ring);
                         changed = true;
                     } else if let Some(ws_idx) =
                         self.workspaces.iter().position(|w| w.id == result.ws_id)
@@ -464,7 +474,9 @@ impl App {
                         );
                         if !session_gone {
                             self.note_reattach_failed(&result.entry.uid);
-                            self.pending_remote_reattach.push(p);
+                            if self.history_fetch_failed(&result.entry.uid) {
+                                self.pending_remote_reattach.push(p);
+                            }
                             continue;
                         }
                         p.attempts = p.attempts.saturating_add(1);
@@ -528,7 +540,7 @@ impl App {
     /// still has its terminal resumes it from where its stream stopped, so a
     /// brief drop costs only the bytes it missed.
     fn attach_how(&self, entry: &ManifestEntry) -> crate::client_session::AttachHow {
-        let full = self.full_history_wanted.contains(&entry.uid);
+        let full = self.history_fetches.contains_key(&entry.uid);
         let resume = (!full)
             .then(|| {
                 self.workspaces
@@ -1119,29 +1131,126 @@ impl App {
         self.attaching.remove(uid);
         self.attached_tunnel_generation.remove(uid);
         self.reattach_backoff.remove(uid);
-        self.full_history_wanted.remove(uid);
+        self.history_fetches.remove(uid);
+        self.scroll_after_load.remove(uid);
     }
 
     /// Owner scrolled up in a pane that attached screen-first, which holds no
-    /// scrollback yet: re-attach it with the full output ring. The pane keeps
-    /// showing its live stream until the new one binds in place.
+    /// scrollback yet: attach it again with the full output ring. This is
+    /// not a reconnect: the pane keeps its live stream (no ⟳) until the new
+    /// one binds in place.
     pub(super) fn load_deferred_history(&mut self) {
         let Some(ts) = self.active_session_mut() else { return };
         if !ts.session.history_deferred || ts.session.exited {
             return;
         }
         let uid = ts.uid.clone();
-        if !self.full_history_wanted.insert(uid.clone()) {
-            return; // already loading
+        let loading = self.history_fetches.contains_key(&uid);
+        let queued = self.pending_remote_reattach.iter().any(|p| p.entry.uid == uid)
+            || self.attaching.contains_key(&uid);
+        if loading && queued {
+            return; // still on its way
         }
-        let found = self.workspaces.iter().enumerate().find_map(|(wi, w)| {
-            w.sessions.iter().position(|s| s.uid == uid).map(|si| (wi, si))
-        });
-        let Some((wi, si)) = found else { return };
-        self.reattach_backoff.remove(&uid);
-        self.requeue_remote_reconnect(wi, si, "loading scrollback");
+        self.history_fetches.entry(uid.clone()).or_default();
+        // A pending attach picks up the full ring when it is dispatched; one
+        // already in flight was dispatched without it, and its result
+        // re-queues the load (`history_fetch_bound`).
+        if !queued {
+            self.reattach_backoff.remove(&uid);
+            self.queue_history_fetch(&uid);
+        }
         self.set_status_msg("Loading scrollback…");
         self.needs_redraw = true;
+    }
+
+    /// Queue an attach for `uid`'s pane unless one is already queued or in
+    /// flight. Unlike `requeue_remote_reconnect` the pane is not marked
+    /// reconnecting: its stream is fine.
+    fn queue_history_fetch(&mut self, uid: &str) {
+        if self.pending_remote_reattach.iter().any(|p| p.entry.uid == uid)
+            || self.attaching.contains_key(uid)
+        {
+            return;
+        }
+        let slot = self.workspaces.iter().filter(|w| !w.is_closed).find_map(|w| {
+            w.sessions
+                .iter()
+                .find(|s| s.uid == uid && !s.session.exited)
+                .map(|s| (w.id.clone(), s.to_manifest_entry()))
+        });
+        match slot {
+            Some((ws_id, entry)) => {
+                self.pending_remote_reattach.push(PendingRemoteReattach::new(ws_id, entry));
+            }
+            None => {
+                self.history_fetches.remove(uid);
+            }
+        }
+    }
+
+    /// An attach for `uid` bound. With a scrollback load pending, a full ring
+    /// completes it; any other attach (a reconnect dispatched before Owner
+    /// scrolled) leaves the pane without history, so the load is queued again.
+    fn history_fetch_bound(&mut self, uid: &str, full_ring: bool) {
+        if !self.history_fetches.contains_key(uid) {
+            return;
+        }
+        if full_ring {
+            self.history_fetches.remove(uid);
+            self.scroll_after_load.insert(uid.to_string(), Instant::now());
+            self.set_status_msg("Scrollback loaded");
+        } else {
+            self.queue_history_fetch(uid);
+        }
+    }
+
+    /// An attach for `uid` failed without reaching the session. Returns
+    /// whether to retry it. A pane whose stream is fine stops after
+    /// [`HISTORY_FETCH_ATTEMPTS`]; a reconnecting pane keeps retrying as a
+    /// reconnect, without the ring.
+    fn history_fetch_failed(&mut self, uid: &str) -> bool {
+        let reconnecting = self.reconnecting_sessions.contains(uid);
+        let Some(fetch) = self.history_fetches.get_mut(uid) else { return true };
+        fetch.failures += 1;
+        let failures = fetch.failures;
+        if failures < HISTORY_FETCH_ATTEMPTS {
+            self.set_status_msg(&format!("Scrollback load failed — retrying ({failures})"));
+            return true;
+        }
+        self.history_fetches.remove(uid);
+        self.set_status_msg("Scrollback load failed — scroll up again or press A-r to retry");
+        reconnecting
+    }
+
+    /// Scroll panes whose scrollback just loaded up a page once their replay
+    /// has been read. Called every tick; gives up after 15 s.
+    pub(super) fn apply_scroll_after_load(&mut self) {
+        use alacritty_terminal::grid::Dimensions as _;
+        if self.scroll_after_load.is_empty() {
+            return;
+        }
+        let pending: Vec<(String, Instant)> =
+            self.scroll_after_load.iter().map(|(u, t)| (u.clone(), *t)).collect();
+        for (uid, at) in pending {
+            let ready = self.workspaces.iter().flat_map(|w| w.sessions.iter()).find(|s| s.uid == uid).map(|s| {
+                let read = s.session.stream.as_ref().map_or_else(
+                    || s.session.term.lock().grid().history_size() > 0,
+                    |c| c.replay_done.load(std::sync::atomic::Ordering::SeqCst),
+                );
+                (read, s)
+            });
+            match ready {
+                Some((true, ts)) => {
+                    ts.session.term.lock().scroll_display(alacritty_terminal::grid::Scroll::PageUp);
+                    self.scroll_after_load.remove(&uid);
+                    self.needs_redraw = true;
+                }
+                Some((false, _)) if at.elapsed() < Duration::from_secs(15) => {}
+                _ => {
+                    self.scroll_after_load.remove(&uid);
+                }
+            }
+        }
     }
 
     /// Manual "reconnect now" lever, invoked by `A-r` (refresh). The auto-

@@ -33,6 +33,8 @@ struct SlowLink {
     clients: Arc<Mutex<Vec<UnixStream>>>,
     /// Attach requests that asked to resume (`since`).
     resumes: Arc<AtomicU64>,
+    /// While set, new connections are closed at once (a link that is down).
+    refuse: Arc<AtomicBool>,
     epoch: Instant,
     stop: Arc<AtomicBool>,
 }
@@ -50,6 +52,7 @@ impl SlowLink {
         let delivered = Arc::new(AtomicU64::new(0));
         let clients: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
         let resumes = Arc::new(AtomicU64::new(0));
+        let refuse = Arc::new(AtomicBool::new(false));
         let epoch = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
         let (link_tx, link_rx) = mpsc::sync_channel::<(UnixStream, Vec<u8>)>(window / CHUNK);
@@ -81,6 +84,7 @@ impl SlowLink {
             let stop = stop.clone();
             let clients = clients.clone();
             let resumes = resumes.clone();
+            let refuse = refuse.clone();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let client = match listener.accept() {
@@ -91,6 +95,9 @@ impl SlowLink {
                         }
                     };
                     client.set_nonblocking(false).unwrap();
+                    if refuse.load(Ordering::SeqCst) {
+                        continue; // dropped: the client sees EOF
+                    }
                     clients.lock().unwrap().push(client.try_clone().unwrap());
                     let Ok(daemon) = UnixStream::connect(&upstream) else { continue };
                     // Client → daemon, sniffing the request for attach.direct.
@@ -142,7 +149,7 @@ impl SlowLink {
                 }
             });
         }
-        SlowLink { socket, attaches, queued, last_delivery_ms, delivered, clients, resumes, epoch, stop }
+        SlowLink { socket, attaches, queued, last_delivery_ms, delivered, clients, resumes, refuse, epoch, stop }
     }
 
     /// Drop every connection, as a link failure does.
@@ -332,7 +339,7 @@ fn slow_link_attaches_each_session_once() {
     let mut fx = Fixture::new();
     // Full replays: the congested shape stage 1 had to survive.
     for uid in &fx.uids {
-        fx.app.full_history_wanted.insert(uid.clone());
+        fx.app.history_fetches.insert(uid.clone(), Default::default());
     }
     fx.settle();
     let attaches = fx.attaches();
@@ -370,7 +377,11 @@ fn remote_panes_attach_screen_first_and_load_history_on_scroll_up() {
     fx.app.cursor = Cursor::Session(0, si);
     fx.app.load_deferred_history();
     fx.app.load_deferred_history(); // a second scroll while loading is a no-op
+    assert!(!fx.app.reconnecting_sessions.contains("ts-slow-2"), "a scrollback load is no reconnect (no ⟳)");
+    assert!(!fx.app.workspaces[0].sessions[si].session.exited, "the live stream stays until the ring binds");
+    assert_eq!(fx.app.status_msg.as_ref().map(|m| m.0.as_str()), Some("Loading scrollback…"));
     fx.settle();
+    assert_eq!(fx.app.status_msg.as_ref().map(|m| m.0.as_str()), Some("Scrollback loaded"));
     let attaches = fx.attaches();
     assert_eq!(attaches.get("ts-slow-2"), Some(&2), "{attaches:?}");
     for uid in fx.uids.iter().filter(|u| *u != "ts-slow-2") {
@@ -378,12 +389,67 @@ fn remote_panes_attach_screen_first_and_load_history_on_scroll_up() {
     }
     let ts = fx.app.workspaces[0].sessions.iter().find(|s| s.uid == "ts-slow-2").unwrap();
     assert!(!ts.session.history_deferred);
-    assert!(!fx.app.full_history_wanted.contains("ts-slow-2"));
+    assert!(!fx.app.history_fetches.contains_key("ts-slow-2"));
     let wait = Instant::now() + Duration::from_secs(5);
     while ts.session.term.lock().grid().history_size() == 0 {
         assert!(Instant::now() < wait, "the ring never reached the pane");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The scroll that asked for it takes effect once the replay is read.
+    let wait = Instant::now() + Duration::from_secs(5);
+    loop {
+        fx.app.apply_scroll_after_load();
+        let ts = fx.app.workspaces[0].sessions.iter().find(|s| s.uid == "ts-slow-2").unwrap();
+        if ts.session.term.lock().grid().display_offset() > 0 {
+            break;
+        }
+        assert!(Instant::now() < wait, "the pane was never scrolled up");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_failing_scrollback_load_retries_then_gives_up_and_a_new_scroll_starts_over() {
+    let _guard = crate::test_support::home_lock();
+    let mut fx = Fixture::new();
+    fx.settle();
+    let si = fx.app.workspaces[0].sessions.iter().position(|s| s.uid == "ts-slow-3").unwrap();
+    fx.app.cursor = Cursor::Session(0, si);
+    fx.link.refuse.store(true, Ordering::SeqCst);
+    fx.app.load_deferred_history();
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while fx.app.history_fetches.contains_key("ts-slow-3") {
+        assert!(Instant::now() < deadline, "never gave up: {seen:?}");
+        fx.app.drain_terminal_events();
+        fx.app.drain_deferred_remote_reattach();
+        fx.app.drain_attach_results();
+        if let Some((msg, _)) = &fx.app.status_msg {
+            if seen.last() != Some(msg) {
+                seen.push(msg.clone());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(seen, [
+        "Loading scrollback…",
+        "Scrollback load failed — retrying (1)",
+        "Scrollback load failed — retrying (2)",
+        "Scrollback load failed — scroll up again or press A-r to retry",
+    ]);
+    assert!(
+        !fx.app.pending_remote_reattach.iter().any(|p| p.entry.uid == "ts-slow-3"),
+        "nothing left retrying",
+    );
+    let ts = &fx.app.workspaces[0].sessions[si];
+    assert!(!ts.session.exited && ts.session.history_deferred, "the live pane is untouched");
+    assert!(!fx.app.reconnecting_sessions.contains("ts-slow-3"));
+
+    fx.link.refuse.store(false, Ordering::SeqCst);
+    fx.app.load_deferred_history();
+    fx.settle();
+    let ts = fx.app.workspaces[0].sessions.iter().find(|s| s.uid == "ts-slow-3").unwrap();
+    assert!(!ts.session.history_deferred, "a new scroll loads it");
 }
 
 #[test]
@@ -476,4 +542,38 @@ fn a_dropped_link_resumes_each_pane_with_only_the_bytes_it_missed() {
         }
         assert!(screen_text(ts).contains("xxxx"), "the earlier screen is still there");
     }
+}
+
+/// Investigation (2026-10-16): Owner scrolls up while a reconnect for that
+/// pane is already in flight.
+#[test]
+fn scroll_up_during_an_in_flight_reconnect_still_loads_history() {
+    let _guard = crate::test_support::home_lock();
+    let mut fx = Fixture::new();
+    fx.settle();
+    let si = fx.app.workspaces[0].sessions.iter().position(|s| s.uid == "ts-slow-2").unwrap();
+    fx.app.cursor = Cursor::Session(0, si);
+    // Drop the pane's stream and drive the loop until its reconnect is in
+    // flight on the attach worker.
+    fx.app.nudge_remote_reconnects();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !fx.app.attaching.contains_key("ts-slow-2") {
+        assert!(Instant::now() < deadline, "the reconnect never started");
+        fx.app.drain_terminal_events();
+        fx.app.drain_deferred_remote_reattach();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    fx.app.load_deferred_history();
+    fx.settle();
+    // A later scroll, as Owner would after seeing nothing.
+    fx.app.load_deferred_history();
+    fx.settle();
+    let ts = fx.app.workspaces[0].sessions.iter().find(|s| s.uid == "ts-slow-2").unwrap();
+    eprintln!(
+        "history_deferred={} fetch pending={} attaches={:?}",
+        ts.session.history_deferred,
+        fx.app.history_fetches.contains_key("ts-slow-2"),
+        fx.attaches(),
+    );
+    assert!(!ts.session.history_deferred, "scrollback never loaded");
 }
