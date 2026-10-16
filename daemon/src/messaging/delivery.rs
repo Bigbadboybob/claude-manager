@@ -322,6 +322,39 @@ impl Recipient {
         })
     }
 }
+const SKIP_OUTPUT_CLOSED: &str =
+    "its terminal output has ended (PTY reader closed) but the session is still registered";
+
+/// Sessions currently skipped with wakes waiting, and why. One log line when
+/// a session starts being skipped, one when it is reachable again.
+static SKIPPED: Mutex<BTreeMap<String, &'static str>> = Mutex::new(BTreeMap::new());
+
+/// Record whether `uid` was skipped this tick. Returns true when a line was
+/// logged.
+fn note_skip(uid: &str, reason: Option<&'static str>, waiting: usize) -> bool {
+    let mut skipped = SKIPPED.lock().unwrap_or_else(|p| p.into_inner());
+    match reason.filter(|_| waiting > 0) {
+        Some(reason) => {
+            if skipped.get(uid) == Some(&reason) {
+                return false;
+            }
+            skipped.insert(uid.to_owned(), reason);
+            eprintln!(
+                "cm messaging: not waking {uid} ({waiting} wake(s) waiting): {reason}; \
+                 its messages wait until the session is restarted (A-R) or exits"
+            );
+            true
+        }
+        None => {
+            if skipped.remove(uid).is_none() {
+                return false;
+            }
+            eprintln!("cm messaging: {uid} is reachable again; delivering its waiting wakes");
+            true
+        }
+    }
+}
+
 pub fn tick(state: &Arc<Mutex<DaemonState>>) {
     // Release legacy held Owner requests after upgrade, independently of
     // the messaging store lock below. Availability no longer filters them.
@@ -347,16 +380,36 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
         let recipient = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             if s.draining { return; }
-            s.sessions.get(&uid)
-                .filter(|s| !s.fanout.snapshot_since(None).closed)
-                .map(|s| Recipient {
+            let Some(s) = s.sessions.get(&uid) else { continue; };
+            if s.fanout.snapshot_since(None).closed {
+                Err(SKIP_OUTPUT_CLOSED)
+            } else {
+                Ok(Recipient {
                     engine: s.session_type.clone(),
                     fanout: s.fanout.clone(),
                     binding: marker::binding(s.transcript_path.as_deref(), s.generation),
                     live: Some((Arc::downgrade(state), uid.clone())),
                 })
+            }
         };
-        let Some(recipient) = recipient else { continue; };
+        let recipient = match recipient {
+            Ok(recipient) => {
+                note_skip(&uid, None, 0);
+                recipient
+            }
+            Err(reason) => {
+                // Still registered, so it looks live, but nothing can reach it.
+                // Say so once, while it has wakes waiting (2026-10-16: an
+                // orchestrator missed 5 minutes of Owner DMs with no log line).
+                let waiting = handle
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .map_or(0, |store| store.wake_intents_for_session(&uid).len());
+                note_skip(&uid, Some(reason), waiting);
+                continue;
+            }
+        };
         let (ids, store_root, mut queue) = {
             let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
             let Some(store) = slot.as_mut() else { return; };
@@ -912,6 +965,54 @@ mod tests {
         assert_eq!(save_calls() - writes, 0, "count writes, not merely equal saved content");
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(native_event(tmp.path(), &q.batches[0]).unwrap(), native);
+    }
+
+    /// 2026-10-16: Owner's DMs to an orchestrator waited 5 minutes for its
+    /// restart and the log said nothing. A registered session whose output
+    /// has ended gets one line naming why it is skipped, not one per tick.
+    #[test]
+    fn a_registered_session_with_closed_output_and_waiting_wakes_is_logged_once() {
+        let uid = "skip-closed-output";
+        let t = tempfile::tempdir().unwrap();
+        let mut store = Store::open(t.path()).unwrap();
+        let actor = store.participant_id(uid);
+        let people = vec![super::super::Person {
+            id: actor.clone(),
+            name: "Stuck".into(),
+            session_uid: uid.into(),
+            kind: "agent".into(),
+            present: true,
+            task: None,
+        }];
+        store.enroll_participants(&people).unwrap();
+        dm(&mut store, &actor, &people, "are-you-there");
+        let mut daemon = DaemonState::default();
+        daemon.messaging_root = t.path().into();
+        *daemon.messaging.lock().unwrap() = Some(store);
+        let mut params = crate::session::SpawnParams::new(uid, "delivery-test", "/bin/true");
+        params.session_type = "claude-code".into();
+        let session = crate::session::DaemonSession::spawn(params).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !session.fanout.snapshot_since(None).closed {
+            assert!(std::time::Instant::now() < deadline, "the child's output never ended");
+            thread::sleep(Duration::from_millis(20));
+        }
+        daemon.sessions.insert(uid.into(), session);
+        let state = Arc::new(Mutex::new(daemon));
+
+        tick(&state);
+        assert_eq!(
+            SKIPPED.lock().unwrap().get(uid).copied(),
+            Some(SKIP_OUTPUT_CLOSED),
+            "the skip and its reason are recorded",
+        );
+        assert!(!note_skip(uid, Some(SKIP_OUTPUT_CLOSED), 1), "the next tick logs nothing new");
+        let published = crate::notifications::directory(t.path(), uid)
+            .read_dir()
+            .map_or(0, |d| d.count());
+        assert_eq!(published, 0, "nothing was published for a session that cannot read it");
+        assert!(note_skip(uid, None, 0), "recovery is logged once");
+        assert!(SKIPPED.lock().unwrap().get(uid).is_none());
     }
 
     #[test]

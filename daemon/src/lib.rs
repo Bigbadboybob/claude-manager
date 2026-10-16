@@ -82,6 +82,7 @@ pub mod owner_availability;
 pub mod sidebar;
 pub mod path;
 pub mod planning_client;
+pub mod pty_input;
 pub mod reader_gate;
 pub mod reap_gate;
 pub mod resume_identity;

@@ -48,6 +48,7 @@ use events::*;
 mod lifecycle;
 mod plan_launch;
 mod remote_create;
+mod restart;
 mod fork;
 mod image_paste;
 use lifecycle::*;
@@ -516,6 +517,12 @@ pub struct App {
     pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
     plan_launches: Vec<plan_launch::PlanLaunchFlight>,
     remote_creates: Vec<remote_create::RemoteCreateFlight>,
+    /// A-R restarts/revives whose daemon RPCs are in flight (`restart.rs`).
+    restarts: Vec<restart::RestartFlight>,
+    /// A-O remote restores in flight.
+    restores: Vec<restart::RestoreFlight>,
+    /// Remote A-s adds in flight.
+    remote_adds: Vec<restart::AddFlight>,
     /// A-F forks in flight (the host provisions a worktree before replying).
     fork_flights: Vec<fork::ForkFlight>,
     image_pastes: Vec<image_paste::ImagePasteFlight>,
@@ -537,8 +544,8 @@ pub struct App {
     /// that diff is applied, the slot already holds the revived
     /// incarnation, so the normal exit handling (stamping
     /// `preserved_last_exit`, pruning agent-spawned rows) would act on
-    /// the wrong session. Inserted by `kill_live_session_for_restart`
-    /// once the reap is confirmed; consumed one-shot in
+    /// the wrong session. Inserted by `start_restart` before the kill is
+    /// sent (removed again if the kill fails); consumed one-shot in
     /// `apply_manifest_diff_from_host`.
     pub(crate) restart_suppressed_exit_uids: std::collections::HashSet<String>,
     /// Sessions whose last A-R failed, with the error: the row stays (no
@@ -1034,6 +1041,9 @@ impl App {
             attaching: HashMap::new(),
             plan_launches: Vec::new(),
             remote_creates: Vec::new(),
+            restarts: Vec::new(),
+            restores: Vec::new(),
+            remote_adds: Vec::new(),
             fork_flights: Vec::new(),
             image_pastes: Vec::new(),
             push_worker,
