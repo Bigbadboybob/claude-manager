@@ -1801,8 +1801,14 @@ impl PendingSession {
                 return Err(anyhow::anyhow!("dup master fd for reader poll: {}", e));
             }
         };
-        let writer: SessionWriter = match pair.master.take_writer() {
-            Ok(w) => Arc::new(Mutex::new(w)),
+        // Bounded: a child that stops reading its input fails that
+        // session's writes instead of parking the writer (crate::pty_input).
+        let writer: SessionWriter = match pair
+            .master
+            .take_writer()
+            .and_then(|w| Ok(crate::pty_input::BoundedWriter::new(&params.uid, w)?))
+        {
+            Ok(w) => Arc::new(Mutex::new(Box::new(w))),
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -2665,11 +2671,15 @@ impl DaemonSession {
             .map_err(|e| anyhow::anyhow!("adopt {}: try_clone_reader: {}", uid, e))?;
         let poll_fd = dup_master_fd_for_poll(&master)
             .map_err(|e| anyhow::anyhow!("adopt {}: dup master fd for reader poll: {}", uid, e))?;
-        let writer: SessionWriter = Arc::new(Mutex::new(
-            master
-                .take_writer()
-                .map_err(|e| anyhow::anyhow!("adopt {}: take_writer: {}", uid, e))?,
-        ));
+        let writer: SessionWriter = Arc::new(Mutex::new(Box::new(
+            crate::pty_input::BoundedWriter::new(
+                &uid,
+                master
+                    .take_writer()
+                    .map_err(|e| anyhow::anyhow!("adopt {}: take_writer: {}", uid, e))?,
+            )
+            .map_err(|e| anyhow::anyhow!("adopt {}: PTY input worker: {}", uid, e))?,
+        )));
 
         // Activity cell: the carried pre-swap value when the record
         // has one (an idle-for-40-minutes session must still read
