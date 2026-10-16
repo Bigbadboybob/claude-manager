@@ -49,6 +49,7 @@ mod lifecycle;
 mod plan_launch;
 mod remote_create;
 mod restart;
+mod background;
 mod fork;
 mod image_paste;
 use lifecycle::*;
@@ -523,6 +524,8 @@ pub struct App {
     restores: Vec<restart::RestoreFlight>,
     /// Remote A-s adds in flight.
     remote_adds: Vec<restart::AddFlight>,
+    /// Keypress-triggered daemon RPCs in flight (`background.rs`).
+    background_jobs: Vec<background::BackgroundJob>,
     /// A-F forks in flight (the host provisions a worktree before replying).
     fork_flights: Vec<fork::ForkFlight>,
     image_pastes: Vec<image_paste::ImagePasteFlight>,
@@ -1044,6 +1047,7 @@ impl App {
             restarts: Vec::new(),
             restores: Vec::new(),
             remote_adds: Vec::new(),
+            background_jobs: Vec::new(),
             fork_flights: Vec::new(),
             image_pastes: Vec::new(),
             push_worker,

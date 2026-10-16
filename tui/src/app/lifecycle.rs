@@ -3788,52 +3788,76 @@ impl App {
     /// and cloud workspaces (those have no worktree to share).
     /// Explicit cross-host launches create a separate checkout and session.
     /// No files, task binding, or running conversation are moved by this action.
-    pub(super) fn new_workspace_on_host(&mut self, source_id: &str, host: &cm_daemon::host_id::HostId, engine: &str, seed_from: Option<&str>) -> Option<String> {
-        let source = self.workspaces.iter().find(|ws| ws.id == source_id)?;
+    /// The create RPC (it provisions a checkout) and the attach run on a
+    /// worker (`background.rs`); `then` runs with the new workspace id once
+    /// it is in the sidebar (A-f uses it to launch the workflow there).
+    pub(super) fn new_workspace_on_host(
+        &mut self,
+        source_id: &str,
+        host: &cm_daemon::host_id::HostId,
+        engine: &str,
+        seed_from: Option<&str>,
+        then: Option<Box<dyn FnOnce(&mut App, String) + Send>>,
+    ) {
+        let Some(source) = self.workspaces.iter().find(|ws| ws.id == source_id) else { return };
         let Some(repo) = source.repo_url.clone() else {
-            self.set_status_msg("Workspace has no repository configured"); return None;
+            self.set_status_msg("Workspace has no repository configured"); return;
         };
         let name = format!("{}-{}", source.name, host);
         let section = self.workspace_sections.get(source_id).cloned();
         let uid = new_session_uid();
         let ws_id = new_workspace_id();
         let slug = format!("{}-{}", worktree::slugify(&name), ws_id.trim_start_matches("ws-"));
-        let Some(socket) = self.host_pool.live_socket_path(host) else {
-            self.set_status_msg(&format!("Host `{}` is unavailable", host)); return None;
-        };
-        let token = self.host_pool.operator_token_for(host);
         let (cols, rows) = self.last_term_size;
-        let result = match crate::client_session::rpc_create_session_with_options(&socket, &token,
-            &uid, &ws_id, engine, if engine == "claude" { "claude-code" } else { engine },
-            &repo, None, &slug, None, cols, rows, false, seed_from) {
-            Ok(result) => result,
-            Err(e) => { self.set_status_msg(&format!("New workspace: {}", e)); return None; }
-        };
-        let path = PathBuf::from(&result.worktree_path);
-        let session = match try_attach_via_daemon_with_deps(&self.host_pool, &uid, &ws_id,
-            &path, engine, engine, cols, rows, None, None, None, host, None) {
-            Ok(session) => session,
-            Err(e) => {
-                let _ = crate::client_session::rpc_kill_session(&socket, &token, &uid);
-                self.set_status_msg(&format!("Attach: {}", e)); return None;
-            }
-        };
-        let mut ts = make_simple_session_with_uid(uid, engine, engine, session, None);
-        ts.host_id = host.clone();
-        ts.seeded_from_snapshot = seed_from.map(str::to_owned);
-        if engine == "claude" { ts.transcript_id = result.resume_id; }
-        let wi = self.workspaces.len();
-        self.workspaces.push(Workspace {
-            id: ws_id.clone(), name, color: None, pinned: false, is_closed: false,
-            is_cloud: false, repo_url: Some(repo), worktree_path: Some(path),
-            main_repo_path: result.main_repo_path.map(PathBuf::from), worker_vm: None,
-            worker_zone: None, host_id: host.clone(), sessions: vec![ts], tombstones: vec![],
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let host = host.clone();
+        let engine = engine.to_owned();
+        let seed_from = seed_from.map(str::to_owned);
+        let started = self.run_in_background(Some(format!("new_workspace:{source_id}:{host}")), move || {
+            let fail = |msg: String| -> super::background::Apply { Box::new(move |app: &mut App| app.set_status_msg(&msg)) };
+            let Some(socket) = pool.live_socket_path(&host) else {
+                return fail(format!("Host `{}` is unavailable", host));
+            };
+            let token = pool.operator_token_for(&host);
+            let result = match crate::client_session::rpc_create_session_with_options(&socket, &token,
+                &uid, &ws_id, &engine, if engine == "claude" { "claude-code" } else { &engine },
+                &repo, None, &slug, None, cols, rows, false, seed_from.as_deref()) {
+                Ok(result) => result,
+                Err(e) => return fail(format!("New workspace: {}", e)),
+            };
+            let path = PathBuf::from(&result.worktree_path);
+            let session = match try_attach_via_daemon_with_deps(&pool, &uid, &ws_id,
+                &path, &engine, &engine, cols, rows, None, None, None, &host, None) {
+                Ok(session) => session,
+                Err(e) => {
+                    let _ = crate::client_session::rpc_kill_session(&socket, &token, &uid);
+                    return fail(format!("Attach: {}", e));
+                }
+            };
+            Box::new(move |app: &mut App| {
+                let mut ts = make_simple_session_with_uid(uid, &engine, &engine, session, None);
+                ts.host_id = host.clone();
+                ts.seeded_from_snapshot = seed_from;
+                if engine == "claude" { ts.transcript_id = result.resume_id; }
+                let wi = app.workspaces.len();
+                app.workspaces.push(Workspace {
+                    id: ws_id.clone(), name, color: None, pinned: false, is_closed: false,
+                    is_cloud: false, repo_url: Some(repo), worktree_path: Some(path),
+                    main_repo_path: result.main_repo_path.map(PathBuf::from), worker_vm: None,
+                    worker_zone: None, host_id: host.clone(), sessions: vec![ts], tombstones: vec![],
+                });
+                if let Some(section) = section { app.workspace_sections.insert(ws_id.clone(), section); }
+                app.cursor = Cursor::Session(wi, 0);
+                app.save_session_manifest();
+                app.set_status_msg(&format!("Created new workspace on {}", host));
+                if let Some(then) = then {
+                    then(app, ws_id);
+                }
+            })
         });
-        if let Some(section) = section { self.workspace_sections.insert(ws_id.clone(), section); }
-        self.cursor = Cursor::Session(wi, 0);
-        self.save_session_manifest();
-        self.set_status_msg(&format!("Created new workspace on {}", host));
-        Some(ws_id)
+        if started {
+            self.set_status_msg("Creating the workspace…");
+        }
     }
 
     pub(super) fn alternate_form_host(&self, workspace_id: &str) -> Option<cm_daemon::host_id::HostId> {
@@ -7226,32 +7250,33 @@ mod migrate_tui_local_tests {
             "the pre-fix diff-gated `perms_change` path must be gone; arm:\n{arm}",
         );
         assert!(
-            arm.contains("self.set_session_global_perms(&uid, value)"),
+            arm.contains("self.set_session_global_perms(&uid, value, local_changed)"),
             "the settings save must call set_session_global_perms; arm:\n{arm}",
         );
 
         // (4) no silent local-only success when the host isn't live.
         let setter = fn_body("fn set_session_global_perms(");
         assert!(
-            !setter.contains("if let Some(socket) = self.host_pool.live_socket_path("),
+            !setter.contains("if let Some(socket) = pool.live_socket_path("),
             "set_session_global_perms must not silently skip the daemon when the \
              socket isn't live; body:\n{setter}",
         );
         assert!(
-            setter.contains("self.host_pool.live_socket_path(&host).ok_or_else("),
+            setter.contains("pool\n                .live_socket_path(&host)\n                .ok_or_else("),
             "a not-live host socket must be an error; body:\n{setter}",
         );
-        // And the push precedes the local mutation (a failed RPC must
-        // not leave the TUI's view diverged from the daemon's).
-        let push_idx = setter
-            .find("rpc_set_global_perms(")
-            .expect("setter pushes to the daemon");
-        let local_idx = setter
+        assert!(setter.contains("rpc_set_global_perms("), "setter pushes to the daemon");
+        // And the local row changes only after the daemon accepted (a failed
+        // RPC must not leave the TUI's view diverged from the daemon's).
+        let finish = fn_body("fn finish_global_perms(");
+        let accepted_idx = finish.find("Ok(ack) => ack").expect("finish matches the push result");
+        let local_idx = finish
             .find(".global_perms = value;")
-            .expect("setter updates the local row");
+            .expect("finish updates the local row");
+        assert!(accepted_idx < local_idx, "the local row update follows an accepted push");
         assert!(
-            push_idx < local_idx,
-            "daemon push must precede the local row update",
+            !setter.contains(".global_perms = value;"),
+            "the setter itself never touches the row before the daemon answers",
         );
     }
 
@@ -8097,6 +8122,79 @@ pub(crate) mod revive_session_tests {
         }
         assert!(status_text(&app).starts_with("Remote add_session failed"), "{}", status_text(&app));
         assert_eq!(app.workspaces[0].sessions.len(), 1, "no row for a failed add");
+    }
+
+    fn assert_prompt(started: Instant, what: &str) {
+        assert!(started.elapsed() < Duration::from_millis(500), "{what} blocked input for {:?}", started.elapsed());
+    }
+
+    /// A-f's `start_workflow` has a 150 s budget; on a silent host it used
+    /// to hold input for all of it.
+    #[test]
+    fn a_f_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0f-0");
+        app.workspaces[0].sessions[0].session.exited = false;
+        let id = app.workspaces[0].id.clone();
+        let started = Instant::now();
+        app.launch_workflow_via_daemon(&id, "feedback", &[], None, None);
+        assert_prompt(started, "A-f");
+        assert!(status_text(&app).starts_with("Launching feedback"), "{}", status_text(&app));
+        app.launch_workflow_via_daemon(&id, "feedback", &[], None, None);
+        assert!(status_text(&app).contains("Already in progress"), "{}", status_text(&app));
+    }
+
+    /// A-e's global-perms save: the row changes only after the daemon
+    /// answers, and a failure says so.
+    #[test]
+    fn global_perms_save_on_a_silent_host_returns_at_once_and_leaves_the_row_unchanged() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa10-0");
+        app.workspaces[0].sessions[0].session.exited = false;
+        let started = Instant::now();
+        app.set_session_global_perms("ts-aaaaaaaaaaaaaa10-0", true, true);
+        assert_prompt(started, "global-perms save");
+        assert!(status_text(&app).contains("applying global permissions"), "{}", status_text(&app));
+        assert!(!app.workspaces[0].sessions[0].global_perms, "not granted before the daemon answers");
+        app.settle_background();
+        assert!(status_text(&app).contains("global-perms change failed"), "{}", status_text(&app));
+        assert!(!app.workspaces[0].sessions[0].global_perms, "a failed push leaves the row as it was");
+    }
+
+    /// A-s → Resume on a remote workspace lists its transcripts over the
+    /// link; a failure returns to the form with what was typed.
+    #[test]
+    fn transcript_picker_on_a_silent_host_returns_at_once_and_restores_the_form() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa11-0");
+        let id = app.workspaces[0].id.clone();
+        let started = Instant::now();
+        app.open_transcript_picker(TranscriptPickTarget::NewTerminalSession {
+            workspace_id: id.clone(),
+            session_type: "claude".into(),
+            task_id: None,
+            existing_seed_from: None,
+            existing_resume_from: None,
+        });
+        assert_prompt(started, "the transcript picker");
+        assert!(status_text(&app).starts_with("Loading transcripts"), "{}", status_text(&app));
+        app.settle_background();
+        assert!(status_text(&app).starts_with("Transcript catalog"), "{}", status_text(&app));
+        assert!(
+            matches!(&app.input_mode, InputMode::NewTerminalSession { workspace_id, .. } if *workspace_id == id),
+            "back on the A-s form",
+        );
+    }
+
+    /// A cross-host new workspace provisions a checkout before replying.
+    #[test]
+    fn new_workspace_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa12-0");
+        app.workspaces[0].repo_url = Some("https://example.invalid/repo".into());
+        let id = app.workspaces[0].id.clone();
+        let host = app.workspaces[0].host_id.clone();
+        let started = Instant::now();
+        app.new_workspace_on_host(&id, &host, "bash", None, None);
+        assert_prompt(started, "new workspace on host");
+        assert!(status_text(&app).starts_with("Creating the workspace"), "{}", status_text(&app));
+        assert_eq!(app.workspaces.len(), 1, "nothing added until the host answers");
     }
 
     /// The same for A-O on a remote workspace: its revives run serially,

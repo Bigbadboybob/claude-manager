@@ -384,6 +384,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.drain_plan_launches();
         app.drain_remote_creates();
         app.drain_restarts();
+        app.drain_background();
         app.drain_fork_flights();
         app.drain_image_pastes();
         app.drain_attach_results();

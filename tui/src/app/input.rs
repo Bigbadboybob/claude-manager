@@ -4177,7 +4177,7 @@ impl App {
                 resume_from,
             } => {
                 if let Some(host) = self.alternate_form_host(&workspace_id) {
-                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref());
+                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref(), None);
                     return;
                 }
                 self.spawn_session_on_workspace(
@@ -4291,32 +4291,7 @@ impl App {
                 self.save_session_manifest();
                 match perms_push {
                     Some((uid, value, local_changed)) => {
-                        match self.set_session_global_perms(&uid, value) {
-                            Ok(ack) => {
-                                // `changed` = the DAEMON moved; a re-assert
-                                // that converged a drifted daemon reads as
-                                // a grant/revoke too, so the operator sees
-                                // it took effect.
-                                let daemon_moved = ack.changed.unwrap_or(local_changed);
-                                let msg = match (value, daemon_moved || local_changed) {
-                                    (true, true) => {
-                                        "Settings saved — global permissions GRANTED"
-                                    }
-                                    (false, true) => {
-                                        "Settings saved — global permissions revoked"
-                                    }
-                                    (true, false) => {
-                                        "Settings saved — global permissions re-asserted (already granted)"
-                                    }
-                                    (false, false) => "Settings saved",
-                                };
-                                self.set_status_msg(msg);
-                            }
-                            Err(e) => self.set_status_msg(&format!(
-                                "Settings saved, but global-perms change failed: {}",
-                                e,
-                            )),
-                        }
+                        self.set_session_global_perms(&uid, value, local_changed);
                     }
                     None => self.set_status_msg("Settings saved"),
                 }
@@ -4431,9 +4406,10 @@ impl App {
                 cursor_task_id,
             } => {
                 if let Some(host) = self.alternate_form_host(&ws_id) {
-                    if let Some(new_id) = self.new_workspace_on_host(&ws_id, &host, "bash", None) {
-                        self.launch_workflow_via_daemon(&new_id, &workflow_name, &slots, goal, None);
-                    }
+                    let launch: Box<dyn FnOnce(&mut App, String) + Send> = Box::new(move |app, new_id| {
+                        app.launch_workflow_via_daemon(&new_id, &workflow_name, &slots, goal, None);
+                    });
+                    self.new_workspace_on_host(&ws_id, &host, "bash", None, Some(launch));
                     return;
                 }
 
