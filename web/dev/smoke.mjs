@@ -138,6 +138,22 @@ test("an alert's agent maps to its DM on its own host", () => {
   assert.equal(f.routeHash(r), "#dm=agent%3Asessions-uuid%3Ats-perf");
 });
 
+test("New DM candidates: everyone but Owner, searchable by name or id, prefix first", () => {
+  const people = new Map([
+    ["owner", "Owner"],
+    ["agent:hub:scout", "Scout"],
+    ["agent:hub:coord", "Swarm-Coord"],
+    ["agent:sessions-uuid:ts-perf", "Native-Rollout-Perf"],
+    ["agent:hub:ts-noname", ""],
+  ]);
+  assert.deepEqual(f.dmCandidates(people, "").map((p) => p.name), ["Native-Rollout-Perf", "Scout", "Swarm-Coord", "ts-noname"]);
+  assert.deepEqual(f.dmCandidates(people, "s").map((p) => p.name), ["Scout", "Swarm-Coord", "Native-Rollout-Perf", "ts-noname"],
+    "name-prefix matches rank first");
+  assert.deepEqual(f.dmCandidates(people, "SESSIONS-uuid").map((p) => p.id), ["agent:sessions-uuid:ts-perf"], "ids match too");
+  assert.deepEqual(f.dmCandidates(people, "owner"), [], "Owner never DMs themselves");
+  assert.deepEqual(f.dmCandidates(null, "x"), []);
+});
+
 // ---------- against the fake backend ----------
 async function withServer(fn) {
   const port = 18000 + Math.floor(Math.random() * 2000);
@@ -223,6 +239,15 @@ test("API flows the app uses: open, page back, send, react, clear mentions, avai
     assert.equal((await write(base, "POST", "/api/push/subscribe", sub)).json.subscribed, true);
     assert.equal((await write(base, "POST", "/api/push/test", { endpoint: sub.endpoint })).json.accepted, true);
     assert.equal((await write(base, "DELETE", "/api/push/subscribe", { endpoint: sub.endpoint })).json.removed, true);
+
+    // New DM picker: the directory lists everyone; a pick with a DM opens
+    // it, one without goes to the empty composer.
+    const people = new Map((await get("/api/people")).items.map((p) => [p.id, p.name]));
+    const choices = f.dmCandidates(people, "");
+    assert.ok(choices.length >= 3 && !choices.some((p) => p.id === "owner"));
+    const dmsNow = (await get("/api/dms")).items;
+    assert.equal(f.directDm(f.dmCandidates(people, "scout")[0].id, dmsNow).id, "d-scout");
+    assert.equal(f.directDm(f.dmCandidates(people, "rollout")[0].id, dmsNow), null);
 
     // The first message to a participant without a DM creates it.
     const pid = "agent:sessions-uuid:ts-perf";
