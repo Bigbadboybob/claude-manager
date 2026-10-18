@@ -82,14 +82,7 @@ impl Ctx {
                     }
                 }
             };
-            let live: Vec<(String, String, Option<String>)> = s
-                .sessions
-                .values()
-                .map(|v| (v.uid.clone(), v.title.clone(), v.task_id.clone()))
-                .chain(s.tui_sessions.values().filter(|t| !s.sessions.contains_key(&t.uid)).map(
-                    |t| (t.uid.clone(), t.label.clone().unwrap_or_else(|| t.uid.clone()), t.task_id.clone()),
-                ))
-                .collect();
+            let live = crate::messaging::live_sessions(&s);
             (me, live, s.messaging.clone(), s.config.api_url.clone(), s.config.api_token.clone())
         };
         let (daemon_id, people, my_name) = {
@@ -103,15 +96,8 @@ impl Ctx {
                 )
             })?;
             let mut persons: Vec<Person> = live
-                .iter()
-                .map(|(uid, name, task)| Person {
-                    id: store.participant_id(uid),
-                    name: name.clone(),
-                    session_uid: uid.clone(),
-                    task: task.clone(),
-                    present: true,
-                    kind: "agent".into(),
-                })
+                .into_iter()
+                .map(|live| Person::present_agent(store.participant_id(&live.uid), live))
                 .collect();
             persons.extend(store.remote_people());
             let people = store.people(&persons).as_array().cloned().unwrap_or_default();

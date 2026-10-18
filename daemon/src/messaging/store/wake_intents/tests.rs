@@ -619,6 +619,7 @@ fn p4_replication_live_before_bulk_frozen_here_and_restart() {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         })
         .into();
     let host = replica.daemon_id.clone();

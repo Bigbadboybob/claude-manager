@@ -721,6 +721,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         }];
         let sent = source.send(&actor, "writer", "agent", &json!({"channel":"general","name":"Writer","body":"Already read","request_id":"read"}), &people).unwrap();
         let id = sent["event_id"].as_str().unwrap().to_owned();
@@ -773,6 +774,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         };
         let request = json!({"channel":"general","name":"Builder","body":"Retained history","request_id":"original"});
         let sent = source

@@ -890,6 +890,7 @@ mod tests {
             name: "Reader".into(),
             session_uid: "b".into(),
             kind: "agent".into(),
+            engine: None,
             present: true,
             task: None,
         }];
@@ -981,6 +982,7 @@ mod tests {
             name: "Stuck".into(),
             session_uid: uid.into(),
             kind: "agent".into(),
+            engine: None,
             present: true,
             task: None,
         }];
@@ -1552,6 +1554,7 @@ mod tests {
                 name: engine.into(),
                 session_uid: engine.into(),
                 kind: "agent".into(),
+                engine: None,
                 present: true,
                 task: None,
             }];
@@ -1686,6 +1689,7 @@ mod tests {
         let offline = super::super::Person {
             id: other.clone(), name: "Offline".into(), session_uid: "offline".into(),
             kind: "agent".into(), present: false, task: None,
+            engine: None,
         };
         store.enroll_participants(&[offline.clone()]).unwrap();
         dm(&mut store, &other, &[offline], "offline-pending");

@@ -16,6 +16,7 @@ const state = {
   channels: [],
   dms: [],
   people: new Map(), // id -> name (present participants only)
+  engines: new Map(), // id -> engine (claude-code, codex, bash) when reported
   knownNames: new Map(), // id -> name seen in DM rows and messages (incl. departed)
   counts: { conversations: {}, unread: 0, dms: 0, mentions: 0 },
   availability: null,
@@ -144,6 +145,7 @@ async function loadDirectory() {
   state.dms = dms;
   learnNames(state.knownNames, { dms });
   state.people = new Map(people.map((p) => [p.id, p.name]));
+  state.engines = new Map(people.filter((p) => p.engine).map((p) => [p.id, p.engine]));
 }
 
 async function loadCounts() {
@@ -699,10 +701,17 @@ function renderAlerts() {
   }
 }
 
+/** A bottom sheet. It closes from its Close button, Escape or a tap on the
+ *  backdrop, which stays visible: the sheet is height-capped and its body
+ *  scrolls under a fixed header. */
 function openSheet(title, children, onClose) {
   closeSheet();
   const back = h("div", { class: "sheet-back", onclick: (e) => { if (e.target === back) closeSheet(); } },
-    h("div", { class: "sheet", role: "dialog", "aria-label": title }, h("h2", {}, title), ...children));
+    h("div", { class: "sheet", role: "dialog", "aria-label": title },
+      h("div", { class: "sheet-head" },
+        h("h2", {}, title),
+        h("button", { class: "ghost close", "aria-label": "Close", onclick: closeSheet }, "Close")),
+      h("div", { class: "sheet-body" }, ...children)));
   back.onCloseSheet = onClose;
   document.body.append(back);
 }
@@ -714,12 +723,19 @@ function closeSheet() {
   back.onCloseSheet?.();
 }
 
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && document.querySelector(".sheet-back")) {
+    e.preventDefault();
+    closeSheet();
+  }
+});
+
 /** Start a DM with anyone in the directory: their existing DM opens, else
  *  an empty composer that creates it on the first message. */
 function newDmSheet() {
   const rows = h("div", { class: "people" });
   const fill = (query) => {
-    const people = dmCandidates(state.people, query);
+    const people = dmCandidates(state.people, query, state.engines);
     put(rows, ...people.map((p) => h("button", { class: "opt", onclick: () => startDm(p.id) },
       h("span", {}, p.name),
       directDm(p.id, state.dms) ? h("span", { class: "sub" }, "open DM") : null)),
@@ -730,7 +746,7 @@ function newDmSheet() {
     oninput: (e) => fill(e.target.value),
     onkeydown: (e) => {
       if (e.key !== "Enter") return;
-      const [first] = dmCandidates(state.people, e.target.value);
+      const [first] = dmCandidates(state.people, e.target.value, state.engines);
       if (first) startDm(first.id);
     },
   });

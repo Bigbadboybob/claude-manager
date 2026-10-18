@@ -539,29 +539,9 @@ impl Runtime {
             return Vec::new();
         };
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        s.sessions
-            .values()
-            .map(|p| (p.uid.clone(), p.title.clone(), p.task_id.clone()))
-            .chain(
-                s.tui_sessions
-                    .values()
-                    .filter(|t| !s.sessions.contains_key(&t.uid))
-                    .map(|t| {
-                        (
-                            t.uid.clone(),
-                            t.label.clone().unwrap_or_else(|| t.uid.clone()),
-                            t.task_id.clone(),
-                        )
-                    }),
-            )
-            .map(|(uid, name, task)| Person {
-                id: format!("agent:{}:{uid}", self.daemon_id),
-                name,
-                session_uid: uid,
-                task,
-                present: true,
-                kind: "agent".into(),
-            })
+        super::live_sessions(&s)
+            .into_iter()
+            .map(|live| Person::present_agent(format!("agent:{}:{}", self.daemon_id, live.uid), live))
             .collect()
     }
     fn fail_pending(&self, reason: &str) {

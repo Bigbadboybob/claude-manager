@@ -41,12 +41,20 @@ class Board:
         self.lock = threading.Lock()
         self.seq = itertools.count(1)
         self.people = [
-            {"id": "owner", "name": "Owner"},
-            {"id": "agent:hub:scout", "name": "Scout"},
-            {"id": "agent:swarm-coord", "name": "Swarm-Coord"},
-            {"id": "agent:state-core", "name": "state-core"},
+            {"id": "owner", "name": "Owner", "kind": "owner"},
+            {"id": "agent:hub:scout", "name": "Scout", "engine": "codex"},
+            {"id": "agent:swarm-coord", "name": "Swarm-Coord", "engine": "claude-code"},
+            {"id": "agent:state-core", "name": "state-core", "engine": "claude-code"},
             # A cm-sessions agent with no DM yet (its alert links to a new DM).
-            {"id": "agent:sessions-uuid:ts-perf", "name": "Native-Rollout-Perf"},
+            {"id": "agent:sessions-uuid:ts-perf", "name": "Native-Rollout-Perf", "engine": "codex"},
+            # A bash session: in the directory, but no agent reads its DMs.
+            {"id": "agent:hub:ts-shell", "name": "bash", "engine": "bash"},
+            # From a peer that predates `engine`.
+            {"id": "agent:old-peer:ts-legacy", "name": "Legacy-Worker"},
+        ] + [
+            # Enough people that the New DM list outgrows a phone screen.
+            {"id": f"agent:hub:ts-worker-{n:02}", "name": f"Worker-{n:02}", "engine": "codex"}
+            for n in range(1, 21)
         ]
         self.alert_hosts = [
             {"id": "hub", "label": "cm-manager", "local": True, "connected": True},
