@@ -54,16 +54,22 @@ fn run_restart(
     };
     let token = pool.operator_token_for(host);
     if let Some(uid) = kill_uid {
-        if let Err(e) = crate::client_session::rpc_kill_session(&socket, &token, uid) {
-            return RestartOutcome::KillFailed(e.to_string());
-        }
+        // A failed kill is not the last word: over a slow link the kill can
+        // land with its reply lost, and a second A-R then finds the session
+        // already exited (2026-10-18, Swarm-Coord). The registry decides.
+        let kill_error = crate::client_session::rpc_kill_session(&socket, &token, uid).err();
         // `kill_session` SIGKILLs and returns before the reaper runs; the
         // revive is refused while the uid is still registered.
         let deadline = Instant::now() + REAP_WAIT;
         loop {
             match crate::client_session::rpc_list_session_uids(&socket, &token) {
                 Ok(uids) if !uids.contains(uid) => break,
-                _ if Instant::now() >= deadline => return RestartOutcome::StillRunning,
+                _ if Instant::now() >= deadline => {
+                    return match kill_error {
+                        Some(e) => RestartOutcome::KillFailed(e.to_string()),
+                        None => RestartOutcome::StillRunning,
+                    };
+                }
                 _ => std::thread::sleep(REAP_POLL),
             }
         }
@@ -325,9 +331,21 @@ impl App {
     }
 
     fn finish_restart(&mut self, flight: RestartFlight, outcome: RestartOutcome) {
+        // Drops this restart's exit marker. When the marker is already gone
+        // the session's exit arrived and was suppressed, so a restart that
+        // gives up must show the row as exited: it would otherwise look
+        // live while nothing runs behind it.
         let unmark = |app: &mut App| {
-            if let Some(d) = &flight.daemon_uid {
-                app.restart_suppressed_exit_uids.remove(d);
+            let Some(d) = &flight.daemon_uid else { return };
+            if app.restart_suppressed_exit_uids.remove(d) {
+                return;
+            }
+            for ws in &mut app.workspaces {
+                for ts in &mut ws.sessions {
+                    if ts.uid == flight.uid {
+                        ts.session.exited = true;
+                    }
+                }
             }
         };
         let verb = if flight.was_live { "restart" } else { "revive" };
@@ -351,7 +369,10 @@ impl App {
                 unmark(self);
                 self.set_status_msg("Killed the session but it hasn't exited yet — press A-R again");
             }
-            RestartOutcome::ReviveFailed(e) => self.note_revive_failure(&flight.uid, &e),
+            RestartOutcome::ReviveFailed(e) => {
+                unmark(self);
+                self.note_revive_failure(&flight.uid, &e);
+            }
             RestartOutcome::Revived => {
                 self.revive_failed.remove(&flight.uid);
                 let Some((wi, si)) = found else { return };
