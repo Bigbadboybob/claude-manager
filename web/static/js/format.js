@@ -212,3 +212,15 @@ export function directDm(pid, dms) {
 export function hasIdentity(pid, people, known, dms) {
   return !!pid && (people?.has(pid) || known?.has(pid) || (dms || []).some((d) => (d.members || []).includes(pid)));
 }
+
+/** People Owner can start a DM with, matching `query` on name or id
+ *  (case-insensitive): name-prefix matches first, then by name. */
+export function dmCandidates(people, query) {
+  const q = String(query || "").trim().toLowerCase();
+  const rows = [...(people || new Map())]
+    .filter(([id]) => id !== "owner")
+    .map(([id, name]) => ({ id, name: name || String(id).split(":").pop() }))
+    .filter((p) => !q || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q));
+  const rank = (p) => (q && p.name.toLowerCase().startsWith(q) ? 0 : 1);
+  return rows.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}

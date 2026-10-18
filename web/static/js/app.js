@@ -4,7 +4,7 @@ import { api, allPages, newRequestId, ApiError } from "./api.js";
 import {
   REACTIONS, LEVELS, renderBody, formatTime, dayLabel, sortConversations, filterConversations,
   badgeCount, reactionList, truncate, parseRoute, routeHash, groupAlerts, age, withoutSeenAlerts,
-  learnNames, nameFor, alertParticipant, directDm, hasIdentity,
+  learnNames, nameFor, alertParticipant, directDm, hasIdentity, dmCandidates,
 } from "./format.js";
 import * as push from "./push.js";
 
@@ -454,7 +454,7 @@ function renderList() {
     type: "search", placeholder: "Filter conversations", value: state.query, "aria-label": "Filter",
     // Only the rows re-render, so the input keeps focus while typing.
     oninput: (e) => { state.query = e.target.value; renderListRows(); },
-  }));
+  }), h("button", { class: "new-dm", "aria-label": "New DM", onclick: newDmSheet }, "New DM"));
   put(el, search, h("div", { class: "scroll", id: "list-rows" }));
   renderListRows();
 }
@@ -712,6 +712,37 @@ function closeSheet() {
   if (!back) return;
   back.remove();
   back.onCloseSheet?.();
+}
+
+/** Start a DM with anyone in the directory: their existing DM opens, else
+ *  an empty composer that creates it on the first message. */
+function newDmSheet() {
+  const rows = h("div", { class: "people" });
+  const fill = (query) => {
+    const people = dmCandidates(state.people, query);
+    put(rows, ...people.map((p) => h("button", { class: "opt", onclick: () => startDm(p.id) },
+      h("span", {}, p.name),
+      directDm(p.id, state.dms) ? h("span", { class: "sub" }, "open DM") : null)),
+    people.length ? null : h("div", { class: "empty" }, state.people.size ? "No match" : "Loading…"));
+  };
+  const input = h("input", {
+    type: "search", placeholder: "Search people", "aria-label": "Search people",
+    oninput: (e) => fill(e.target.value),
+    onkeydown: (e) => {
+      if (e.key !== "Enter") return;
+      const [first] = dmCandidates(state.people, e.target.value);
+      if (first) startDm(first.id);
+    },
+  });
+  fill("");
+  openSheet("New DM", [h("div", { class: "search" }, input), rows]);
+  input.focus();
+}
+
+function startDm(pid) {
+  closeSheet();
+  const dm = directDm(pid, state.dms);
+  go(dm ? { view: "conversation", id: dm.id } : { view: "newdm", pid });
 }
 
 function availabilitySheet() {
