@@ -8,6 +8,7 @@ fn setup(root: &Path) -> (Store, Person, Person) {
         task: None,
         present: true,
         kind: "agent".into(),
+        engine: None,
     });
     for p in &people {
         s.send(&p.id,&p.session_uid,"agent",&json!({"channel":"general","body":"hello","name":format!("Scout-{}",p.session_uid),"request_id":"claim"}),&people).unwrap();
@@ -30,7 +31,7 @@ fn scoped_mentions_stop_at_mention_and_owner_push_ignores_availability() {
     let (mut s, a, b) = setup(tmp.path());
     let feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
     s.owner_notifications = Some(feed.clone());
-    let owner = Person { id:"owner".into(),name:"Owner".into(),session_uid:String::new(),task:None,present:true,kind:"owner".into() };
+    let owner = Person { id:"owner".into(),name:"Owner".into(),session_uid:String::new(),task:None,present:true,kind:"owner".into(),engine:None };
     let send = |s: &mut Store, key: &str, extra: Value| {
         let mut p = json!({"channel":"general","body":key,"request_id":key});
         p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());

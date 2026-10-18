@@ -152,6 +152,9 @@ test("New DM candidates: everyone but Owner, searchable by name or id, prefix fi
   assert.deepEqual(f.dmCandidates(people, "SESSIONS-uuid").map((p) => p.id), ["agent:sessions-uuid:ts-perf"], "ids match too");
   assert.deepEqual(f.dmCandidates(people, "owner"), [], "Owner never DMs themselves");
   assert.deepEqual(f.dmCandidates(null, "x"), []);
+  const engines = new Map([["agent:hub:scout", "codex"], ["agent:hub:coord", "claude-code"], ["agent:hub:ts-noname", "bash"]]);
+  assert.deepEqual(f.dmCandidates(people, "", engines).map((p) => p.name), ["Native-Rollout-Perf", "Scout", "Swarm-Coord"],
+    "bash sessions are left out; an unknown engine is kept");
 });
 
 // ---------- against the fake backend ----------
@@ -242,9 +245,13 @@ test("API flows the app uses: open, page back, send, react, clear mentions, avai
 
     // New DM picker: the directory lists everyone; a pick with a DM opens
     // it, one without goes to the empty composer.
-    const people = new Map((await get("/api/people")).items.map((p) => [p.id, p.name]));
-    const choices = f.dmCandidates(people, "");
+    const directory = (await get("/api/people")).items;
+    const people = new Map(directory.map((p) => [p.id, p.name]));
+    const engines = new Map(directory.filter((p) => p.engine).map((p) => [p.id, p.engine]));
+    const choices = f.dmCandidates(people, "", engines);
     assert.ok(choices.length >= 3 && !choices.some((p) => p.id === "owner"));
+    assert.ok(!choices.some((p) => p.id === "agent:hub:ts-shell"), "no bash sessions");
+    assert.ok(choices.some((p) => p.id === "agent:old-peer:ts-legacy"), "an older peer's agents stay");
     const dmsNow = (await get("/api/dms")).items;
     assert.equal(f.directDm(f.dmCandidates(people, "scout")[0].id, dmsNow).id, "d-scout");
     assert.equal(f.directDm(f.dmCandidates(people, "rollout")[0].id, dmsNow), null);

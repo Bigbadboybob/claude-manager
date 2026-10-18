@@ -73,8 +73,8 @@ main { flex: 1; min-height: 0; display: flex; }
 /* Conversation list. */
 .search { padding: 8px calc(var(--right) + 10px) 8px calc(var(--left) + 10px); display: flex; gap: 8px; }
 .search .new-dm { flex: none; min-height: 40px; white-space: nowrap; }
-.sheet .search { padding: 0 0 6px; }
-.sheet .people .opt { text-align: left; align-items: center; }
+.sheet .search { padding: 0 0 6px; position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.sheet .people .opt { text-align: left; }
 .search input {
   flex: 1; min-width: 0; width: 100%; min-height: 40px; border-radius: 10px; border: 1px solid var(--line);
   background: var(--raised); padding: 0 12px;
@@ -133,10 +133,15 @@ main { flex: 1; min-height: 0; display: flex; }
 .sheet {
   width: 100%; background: var(--panel); border-radius: 16px 16px 0 0;
   padding: 12px calc(var(--right) + 16px) calc(var(--bottom) + 16px) calc(var(--left) + 16px);
-  max-height: 85vh; overflow-y: auto;
+  /* Capped so the backdrop stays visible to tap; the body scrolls. */
+  max-height: 70vh; display: flex; flex-direction: column; overflow: hidden;
 }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: none; }
+.sheet-head .close { flex: none; }
+/* The 2px inset keeps focus outlines inside the scroll clip. */
+.sheet-body { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 2px; margin: 0 -2px; }
 .sheet h2 { font-size: 16px; margin: 6px 0 12px; }
-.sheet .opt { display: flex; width: 100%; justify-content: space-between; margin: 6px 0; }
+.sheet .opt { display: flex; width: 100%; justify-content: space-between; align-items: center; margin: 6px 0; }
 .sheet .opt.on { outline: 2px solid var(--accent); }
 .sheet p { color: var(--muted); font-size: 14px; }
 .toast {

@@ -225,6 +225,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         }
     }
 
@@ -360,6 +361,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         });
         s.enroll_participants(&people).unwrap();
         s.send(

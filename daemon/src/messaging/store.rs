@@ -241,6 +241,55 @@ pub struct Person {
     pub task: Option<String>,
     pub present: bool,
     pub kind: String,
+    /// The session's engine (`claude-code`, `codex`, `bash`) when known.
+    /// Bash sessions have no agent to read messages; clients use this to
+    /// leave them out of DM pickers. Absent for remote participants from
+    /// a peer that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+}
+
+/// A live local session, before it becomes a [`Person`].
+pub struct LiveSession {
+    pub uid: String,
+    pub name: String,
+    pub task: Option<String>,
+    pub engine: Option<String>,
+}
+
+/// Every live local session: the daemon's own, then TUI rows it does not hold.
+pub fn live_sessions(s: &crate::state::DaemonState) -> Vec<LiveSession> {
+    s.sessions
+        .values()
+        .map(|v| LiveSession {
+            uid: v.uid.clone(),
+            name: v.title.clone(),
+            task: v.task_id.clone(),
+            engine: Some(v.session_type.clone()),
+        })
+        .chain(s.tui_sessions.values().filter(|t| !s.sessions.contains_key(&t.uid)).map(|t| LiveSession {
+            uid: t.uid.clone(),
+            name: t.label.clone().unwrap_or_else(|| t.uid.clone()),
+            task: t.task_id.clone(),
+            // The TUI says `claude` where the daemon says `claude-code`.
+            engine: t.session_type.as_deref().map(|e| if e == "claude" { "claude-code" } else { e }.to_owned()),
+        }))
+        .collect()
+}
+
+impl Person {
+    /// A present agent participant for a live session.
+    pub fn present_agent(id: String, live: LiveSession) -> Person {
+        Person {
+            id,
+            name: live.name,
+            session_uid: live.uid,
+            task: live.task,
+            present: true,
+            kind: "agent".into(),
+            engine: live.engine,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 struct Published {
@@ -1576,6 +1625,7 @@ impl Store {
                     task: None,
                     present: false,
                     kind: "agent".into(),
+                    engine: None,
                 });
             }
         }
@@ -2125,6 +2175,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         }
     }
     fn send(s: &mut Store, p: &Person, body: &str, key: &str, name: &str) -> Value {

@@ -1100,6 +1100,7 @@ impl Store {
                 task: None,
                 present: true,
                 kind: "owner".into(),
+                engine: None,
             }))
             .collect::<Vec<_>>();
         if p["origin_daemon_id"].as_str().is_some_and(|o| o != host) {
@@ -1833,6 +1834,7 @@ mod tests {
                 task: None,
                 present: true,
                 kind: "agent".into(),
+                engine: None,
             })
             .to_vec();
         hub.register_host(&replica.daemon_id, true, true, &people)
@@ -2322,6 +2324,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         };
         p.people.push(newcomer.clone());
         p.hub
@@ -2511,6 +2514,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         };
         p.hub
             .register_host(&receiver, true, false, std::slice::from_ref(&person))

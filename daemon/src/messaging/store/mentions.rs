@@ -280,6 +280,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         }
     }
     /// Enroll every person under a chosen name with a first #general post.

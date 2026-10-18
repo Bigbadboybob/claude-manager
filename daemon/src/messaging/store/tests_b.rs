@@ -7,6 +7,7 @@ fn person(s: &Store, uid: &str) -> Person {
         task: None,
         present: true,
         kind: "agent".into(),
+        engine: None,
     }
 }
 fn post(s: &mut Store, p: &Person, target: Value, key: &str, people: &[Person]) -> Value {

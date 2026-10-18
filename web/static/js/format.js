@@ -214,11 +214,13 @@ export function hasIdentity(pid, people, known, dms) {
 }
 
 /** People Owner can start a DM with, matching `query` on name or id
- *  (case-insensitive): name-prefix matches first, then by name. */
-export function dmCandidates(people, query) {
+ *  (case-insensitive): name-prefix matches first, then by name. Bash
+ *  sessions are left out: no agent reads their messages. `engines` maps id
+ *  to the directory's `engine`; an unknown engine (older peer) is kept. */
+export function dmCandidates(people, query, engines = new Map()) {
   const q = String(query || "").trim().toLowerCase();
   const rows = [...(people || new Map())]
-    .filter(([id]) => id !== "owner")
+    .filter(([id]) => id !== "owner" && engines?.get(id) !== "bash")
     .map(([id, name]) => ({ id, name: name || String(id).split(":").pop() }))
     .filter((p) => !q || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q));
   const rank = (p) => (q && p.name.toLowerCase().startsWith(q) ? 0 : 1);

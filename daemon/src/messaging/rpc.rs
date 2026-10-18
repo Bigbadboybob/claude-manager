@@ -237,22 +237,7 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         (
             s.messaging.clone(),
-            s.sessions
-                .values()
-                .map(|s| (s.uid.clone(), s.title.clone(), s.task_id.clone()))
-                .chain(
-                    s.tui_sessions
-                        .values()
-                        .filter(|t| !s.sessions.contains_key(&t.uid))
-                        .map(|t| {
-                            (
-                                t.uid.clone(),
-                                t.label.clone().unwrap_or_else(|| t.uid.clone()),
-                                t.task_id.clone(),
-                            )
-                        }),
-                )
-                .collect::<Vec<_>>(),
+            super::live_sessions(&s),
         )
     };
     let result = {
@@ -260,14 +245,7 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
         let store = slot.as_mut().unwrap();
         let people = people
             .into_iter()
-            .map(|(uid, name, task)| Person {
-                id: store.participant_id(&uid),
-                name,
-                session_uid: uid,
-                task,
-                present: true,
-                kind: "agent".into(),
-            })
+            .map(|live| Person::present_agent(store.participant_id(&live.uid), live))
             .collect::<Vec<_>>();
         store.sync_admin(&req.params, &people)
     };
@@ -316,23 +294,7 @@ fn execute_with_freshness(
                 (c.session_uid.clone(), "agent")
             }
         };
-        let live = s
-            .sessions
-            .values()
-            .map(|s| (s.uid.clone(), s.title.clone(), s.task_id.clone()))
-            .chain(
-                s.tui_sessions
-                    .values()
-                    .filter(|t| !s.sessions.contains_key(&t.uid))
-                    .map(|t| {
-                        (
-                            t.uid.clone(),
-                            t.label.clone().unwrap_or_else(|| t.uid.clone()),
-                            t.task_id.clone(),
-                        )
-                    }),
-            )
-            .collect::<Vec<_>>();
+        let live = super::live_sessions(&s);
         (
             s.messaging.clone(),
             s.messaging_root.clone(),
@@ -380,14 +342,7 @@ fn execute_with_freshness(
     };
     let mut people = live
         .into_iter()
-        .map(|(uid, name, task)| Person {
-            id: store.participant_id(&uid),
-            name,
-            session_uid: uid,
-            task,
-            present: true,
-            kind: "agent".into(),
-        })
+        .map(|live| Person::present_agent(store.participant_id(&live.uid), live))
         .collect::<Vec<_>>();
     people.push(Person {
         id: "owner".into(),
@@ -396,6 +351,7 @@ fn execute_with_freshness(
         task: None,
         present: true,
         kind: "owner".into(),
+        engine: None,
     });
     people.extend(store.remote_people());
     let p = &req.params;
@@ -835,6 +791,33 @@ mod tests {
                 params: p,
             },
         )
+    }
+    /// The board's New DM picker leaves out bash sessions, which have no
+    /// agent to read a DM, so the directory reports each session's engine.
+    #[test]
+    fn people_report_each_live_sessions_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        {
+            let mut s = state.lock().unwrap();
+            for (uid, engine) in [("a", "claude"), ("b", "codex"), ("sh", "bash")] {
+                s.tui_sessions.insert(
+                    uid.into(),
+                    serde_json::from_value(json!({"uid":uid,"label":uid,"type":engine})).unwrap(),
+                );
+            }
+        }
+        let page = call(&state, "a", "people", json!({})).unwrap();
+        let engine = |uid: &str| {
+            page["items"].as_array().unwrap().iter()
+                .find(|p| p["session_uid"] == uid)
+                .map(|p| p["engine"].clone())
+                .unwrap()
+        };
+        assert_eq!(engine("a"), "claude-code", "the TUI's `claude` is the daemon's `claude-code`");
+        assert_eq!(engine("b"), "codex");
+        assert_eq!(engine("sh"), "bash");
+        assert_eq!(engine("outsider"), Value::Null, "an unknown engine is omitted, not guessed");
     }
     #[test]
     fn cursor_and_reaction_rpcs_use_the_authenticated_reader_and_return_counts() {
