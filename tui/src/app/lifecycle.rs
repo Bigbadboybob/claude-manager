@@ -8091,6 +8091,103 @@ pub(crate) mod revive_session_tests {
         assert!(app.pending_remote_reattach.is_empty());
     }
 
+    /// How the scripted host answers `kill_session`.
+    #[derive(Clone, Copy)]
+    enum KillReply {
+        /// The kill lands but the reply never arrives (Owner's slow link).
+        Lost,
+        /// A second A-R: the first one's kill already landed.
+        AlreadyExited,
+    }
+
+    /// A host that kills, lists nothing, and answers `session.revive` with
+    /// `revive_ok`. Returns how many revives it served.
+    fn scripted_host(
+        kill: KillReply,
+        revive_ok: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use cm_daemon::control::protocol::{ErrorBody, ErrorCode, Response};
+        use cm_daemon::control::wire;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("scripted.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let revives = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = std::sync::Arc::clone(&revives);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { return };
+                let Ok(Some(req)) = wire::read_request(&mut stream) else { continue };
+                let error = |message: &str| Response {
+                    id: req.id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(ErrorBody { code: ErrorCode::NotFound, message: message.into() }),
+                };
+                let ok = |result| Response { id: req.id.clone(), ok: true, result: Some(result), error: None };
+                let resp = match (req.method.as_str(), kill) {
+                    ("kill_session", KillReply::Lost) => continue,
+                    ("kill_session", KillReply::AlreadyExited) => error("session already exited"),
+                    ("list_sessions", _) => ok(serde_json::json!([])),
+                    ("session.revive", _) => {
+                        served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if revive_ok { ok(serde_json::json!({})) } else { error("no transcript") }
+                    }
+                    _ => error("unexpected method"),
+                };
+                let _ = wire::write_response(&mut stream, &resp);
+            }
+        });
+        (dir, socket, revives)
+    }
+
+    fn live_app_on(socket: std::path::PathBuf, uid: &str) -> App {
+        let host = cm_daemon::host_id::HostId::new("scripted");
+        let mut app = app_with_session(dummy_ts(uid, false, host.clone()));
+        app.workspaces[0].host_id = host.clone();
+        app.workspaces[0].sessions[0].session.daemon_session_uid = Some(uid.into());
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(&host, socket)).expect("pool"),
+        );
+        app
+    }
+
+    /// 2026-10-18, Swarm-Coord: A-R's kill landed but its reply was lost, so
+    /// the restart gave up with the session dead behind a live-looking row,
+    /// and every later A-R failed on "already exited". Both now revive.
+    #[test]
+    fn a_r_revives_when_the_kill_reply_is_lost_or_the_session_already_exited() {
+        for (kill, uid) in [
+            (KillReply::Lost, "ts-aaaaaaaaaaaaaa13-0"),
+            (KillReply::AlreadyExited, "ts-aaaaaaaaaaaaaa14-0"),
+        ] {
+            let (_dir, socket, revives) = scripted_host(kill, true);
+            let mut app = live_app_on(socket, uid);
+            app.revive_active_session();
+            assert!(status_text(&app).starts_with("Restarting"), "{}", status_text(&app));
+            settle_restarts(&mut app);
+            assert!(status_text(&app).contains("restarted"), "{}", status_text(&app));
+            assert_eq!(revives.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(!app.workspaces[0].sessions[0].session.exited);
+        }
+    }
+
+    /// A restart that gives up after its exit was suppressed shows the row
+    /// as exited, so the next A-R revives instead of killing a dead uid.
+    #[test]
+    fn a_failed_restart_whose_exit_was_suppressed_leaves_the_row_exited() {
+        let uid = "ts-aaaaaaaaaaaaaa15-0";
+        let (_dir, socket, revives) = scripted_host(KillReply::AlreadyExited, false);
+        let mut app = live_app_on(socket, uid);
+        app.revive_active_session();
+        // The Exited diff consumed the marker while the worker ran.
+        assert!(app.restart_suppressed_exit_uids.remove(uid));
+        settle_restarts(&mut app);
+        assert!(status_text(&app).starts_with("Revive failed"), "{}", status_text(&app));
+        assert_eq!(revives.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(app.workspaces[0].sessions[0].session.exited);
+        assert!(app.restart_suppressed_exit_uids.is_empty());
+    }
+
     /// A-w on a remote session: the row closes at once; the kill RPC runs
     /// on a worker.
     #[test]
