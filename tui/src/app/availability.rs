@@ -2,11 +2,14 @@
 //!
 //! The level is a replicated messaging event (see
 //! `cm_daemon::owner_availability`). The status bar reads the local daemon's
-//! projection file (no RPC); the picker sets the level through the local
-//! daemon's `messaging.availability`, which forwards to the messaging hub.
-//! A local daemon that predates availability (or does not serve Owner) is
-//! skipped for the next configured host, so F7 works before the laptop
-//! daemon is upgraded; the bar then shows the value that host returned.
+//! projection file, and every [`POLL`] asks each configured host for the
+//! level off the input thread; it shows whichever changed last. The
+//! projection alone can be absent (a laptop daemon that predates
+//! availability) or stale (a replica that stopped syncing), and then a level
+//! set from the board or another host never showed (2026-10-18). The picker
+//! sets the level through the local daemon's `messaging.availability`, which
+//! forwards to the messaging hub; a local daemon that predates availability
+//! (or does not serve Owner) is skipped for the next configured host.
 
 use super::*;
 use serde_json::{json, Value};
@@ -22,6 +25,8 @@ const CHOICES: [(&str, &str); 5] = [
 ];
 /// How often the status bar re-reads the projection.
 const REFRESH: Duration = Duration::from_secs(5);
+/// How often the status bar asks the hosts for the level.
+const POLL: Duration = Duration::from_secs(30);
 
 struct Dialog {
     cursor: usize,
@@ -32,12 +37,15 @@ struct Dialog {
 pub(super) struct Availability {
     root: PathBuf,
     current: Value,
-    /// `current` came from a save reply and the local projection is absent
-    /// (local daemon predates availability): keep it, refreshing its age.
-    from_reply: bool,
+    /// The newest level a host returned: a save reply or a poll.
+    remote: Value,
     read_at: Option<Instant>,
+    polled_at: Option<Instant>,
+    poll: Option<mpsc::Receiver<Vec<Value>>>,
     dialog: Option<Dialog>,
 }
+
+use cm_daemon::owner_availability::changed_at_ms as changed_at;
 
 impl Availability {
     pub(super) fn load() -> Self {
@@ -48,8 +56,10 @@ impl Availability {
         let mut a = Self {
             root,
             current: Value::Null,
-            from_reply: false,
+            remote: Value::Null,
             read_at: None,
+            polled_at: None,
+            poll: None,
             dialog: None,
         };
         a.refresh(true);
@@ -67,11 +77,13 @@ impl Availability {
             return false;
         }
         self.read_at = Some(Instant::now());
-        let next = if self.from_reply && !cm_daemon::owner_availability::projection_path(&self.root).exists() {
-            cm_daemon::owner_availability::with_current_age(&self.current)
-        } else {
-            self.from_reply = false;
-            cm_daemon::owner_availability::exposure(&self.root)
+        let local = cm_daemon::owner_availability::projection_path(&self.root)
+            .exists()
+            .then(|| cm_daemon::owner_availability::exposure(&self.root));
+        let next = match local {
+            Some(local) if self.remote.is_null() || changed_at(&local) >= changed_at(&self.remote) => local,
+            _ if self.remote.is_object() => cm_daemon::owner_availability::with_current_age(&self.remote),
+            _ => cm_daemon::owner_availability::exposure(&self.root),
         };
         let changed = next["level"] != self.current["level"] || next["changed_at"] != self.current["changed_at"];
         self.current = next;
@@ -103,6 +115,56 @@ impl Availability {
         ))
     }
 
+    /// Keep `v` (an exposure from a host) when it changed after the newest
+    /// one seen so far.
+    fn absorb(&mut self, v: &Value) {
+        if v.is_object() && (self.remote.is_null() || changed_at(v) > changed_at(&self.remote)) {
+            self.remote = v.clone();
+        }
+    }
+
+    fn poll_due(&self) -> bool {
+        self.poll.is_none() && self.polled_at.is_none_or(|t| t.elapsed() >= POLL)
+    }
+
+    /// Ask every host for the level on a worker. `targets` as
+    /// [`App::owner_rpc_targets`]; a host that fails is skipped.
+    fn start_poll(&mut self, targets: Vec<(String, PathBuf, String)>) {
+        self.polled_at = Some(Instant::now());
+        if targets.is_empty() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new().name("cm-availability".into()).spawn(move || {
+            let replies = targets
+                .iter()
+                .filter_map(|(_, socket, token)| {
+                    crate::client_session::rpc_messaging_board(socket, token, "messaging.availability", json!({"action": "get"}))
+                        .ok()
+                })
+                .map(|v| v["owner_availability"].clone())
+                .collect();
+            let _ = tx.send(replies);
+        });
+        if spawned.is_ok() {
+            self.poll = Some(rx);
+        }
+    }
+
+    /// Apply a finished poll. Returns true when the visible value changed.
+    fn finish_poll(&mut self) -> bool {
+        let replies = match self.poll.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(replies)) => replies,
+            Some(Err(mpsc::TryRecvError::Empty)) | None => return false,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Vec::new(),
+        };
+        self.poll = None;
+        for v in &replies {
+            self.absorb(v);
+        }
+        self.refresh(true)
+    }
+
     fn cursor_for_current(&self) -> usize {
         let level = self.current["level"].as_str().unwrap_or("unset");
         CHOICES.iter().position(|(l, _)| *l == level).unwrap_or(4)
@@ -110,10 +172,18 @@ impl Availability {
 }
 
 impl App {
-    /// Status-bar refresh and the result of an in-flight save. Cheap: one
-    /// small file read every few seconds.
+    /// Status-bar refresh, the host poll and the result of an in-flight
+    /// save. Cheap on this thread: a small file read every few seconds; the
+    /// RPCs run on a worker.
     pub fn availability_tick(&mut self) {
         if self.availability.refresh(false) {
+            self.needs_redraw = true;
+        }
+        if self.availability.poll_due() {
+            let targets = self.owner_rpc_targets();
+            self.availability.start_poll(targets);
+        }
+        if self.availability.finish_poll() {
             self.needs_redraw = true;
         }
         let Some(dialog) = self.availability.dialog.as_mut() else {
@@ -127,8 +197,8 @@ impl App {
         match result {
             Ok(v) => {
                 if v["owner_availability"].is_object() {
-                    self.availability.current = v["owner_availability"].clone();
-                    self.availability.from_reply = true;
+                    self.availability.absorb(&v["owner_availability"]);
+                    self.availability.refresh(true);
                 }
                 self.availability.dialog = None;
                 let level = self.availability.current["level"].as_str().unwrap_or("unset").to_owned();
@@ -351,7 +421,14 @@ mod tests {
         };
         reply(&mut app, Err("coordinator_unavailable: hub offline".into()));
         assert_eq!(app.availability.dialog.as_ref().unwrap().error.as_deref(), Some("coordinator_unavailable: hub offline"));
-        reply(&mut app, Ok(json!({"owner_availability":{"level":"focused","set":true,"age_s":0}})));
+        // A real reply: a daemon store's answer to the set, stamped now, so
+        // it is newer than the January projection above.
+        let hub = tempfile::tempdir().unwrap();
+        let saved = cm_daemon::messaging::Store::open(hub.path())
+            .unwrap()
+            .availability("owner", &json!({"action":"set","level":"focused","request_id":"f7","source":"tui"}))
+            .unwrap();
+        reply(&mut app, Ok(saved));
         assert!(!app.availability.is_open());
         assert!(screen(&mut app).contains("\u{25cf} focused 0m"));
     }
@@ -374,17 +451,68 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_from_another_host_stands_in_until_the_local_projection_exists() {
+    fn a_host_reply_shows_until_a_newer_local_projection_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let mut a = Availability::at(tmp.path().to_path_buf());
-        a.current = json!({"level":"away","set":true,"changed_at":"2026-01-01T00:00:00Z","age_s":0});
-        a.from_reply = true;
+        a.absorb(&json!({"level":"away","set":true,"changed_at":"2026-01-01T00:00:00Z","age_s":0}));
         a.refresh(true);
-        assert_eq!(a.current["level"], "away", "no local projection: keep the reply");
+        assert_eq!(a.current["level"], "away", "no local projection: show the host's value");
         assert!(a.current["age_s"].as_i64().unwrap() > 86_400, "age recomputed from changed_at");
-        write(tmp.path(), Some("on-call"), "2026-01-01T00:00:00Z");
+        write(tmp.path(), Some("on-call"), "2025-12-31T00:00:00Z");
         a.refresh(true);
-        assert_eq!(a.current["level"], "on-call", "the local projection wins once it exists");
-        assert!(!a.from_reply);
+        assert_eq!(a.current["level"], "away", "an older (stale) projection does not win");
+        write(tmp.path(), Some("on-call"), "2026-01-02T00:00:00Z");
+        a.refresh(true);
+        assert_eq!(a.current["level"], "on-call", "a newer projection wins");
+        a.absorb(&json!({"level":"focused","set":true,"changed_at":"2025-06-01T00:00:00Z"}));
+        assert_eq!(a.remote["level"], "away", "an older host reply never replaces a newer one");
+    }
+
+    /// A host that answers `messaging.availability` with `level`.
+    fn availability_host(dir: &Path, level: &str, changed_at: &str) -> PathBuf {
+        use cm_daemon::control::protocol::Response;
+        use cm_daemon::control::wire;
+        let socket = dir.join(format!("{level}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let reply = json!({"owner_availability":{"level":level,"set":true,"changed_at":changed_at}});
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { return };
+                let Ok(Some(req)) = wire::read_request(&mut stream) else { continue };
+                assert_eq!(req.method, "messaging.availability");
+                assert_eq!(req.params["action"], "get");
+                let resp = Response { id: req.id, ok: true, result: Some(reply.clone()), error: None };
+                let _ = wire::write_response(&mut stream, &resp);
+            }
+        });
+        socket
+    }
+
+    /// 2026-10-18: with no local projection (laptop daemon predating
+    /// availability) a level Owner set on the board never reached the bar.
+    /// The bar now polls the hosts off the input thread and shows the newest;
+    /// a host that fails is skipped.
+    #[test]
+    fn with_no_local_projection_the_bar_polls_the_hosts_and_shows_the_newest_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut a = Availability::at(tmp.path().join(".cm"));
+        assert!(a.poll_due());
+        let target = |name: &str, socket: PathBuf| (name.to_owned(), socket, "token".to_owned());
+        let started = Instant::now();
+        a.start_poll(vec![
+            target("gone", tmp.path().join("missing.sock")),
+            target("manager", availability_host(tmp.path(), "focused", "2026-10-18T17:40:00Z")),
+            target("sessions", availability_host(tmp.path(), "away", "2026-10-18T23:22:00Z")),
+        ]);
+        assert!(started.elapsed() < Duration::from_millis(500), "the poll never blocks the caller");
+        assert!(!a.poll_due(), "one poll at a time");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !a.finish_poll() {
+            assert!(Instant::now() < deadline, "the poll never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(a.current["level"], "away", "the newest change wins across hosts");
+        assert!(a.status_span().unwrap().content.starts_with("\u{25cf} away"));
+        assert!(a.poll.is_none() && !a.poll_due(), "the next poll waits for its interval");
     }
 }

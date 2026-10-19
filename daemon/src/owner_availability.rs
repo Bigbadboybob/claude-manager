@@ -220,6 +220,15 @@ pub fn with_current_age(exposure: &Value) -> Value {
     v
 }
 
+/// When an exposure's level last changed, in Unix milliseconds; None when
+/// it was never set. Viewers compare values from different hosts with it.
+pub fn changed_at_ms(exposure: &Value) -> Option<i64> {
+    exposure["changed_at"]
+        .as_str()
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.timestamp_millis())
+}
+
 /// Read the projected level for `ping`: lock-free and network-free. A missing
 /// or unreadable projection reads as unset.
 pub fn exposure(cm_root: &Path) -> Value {
