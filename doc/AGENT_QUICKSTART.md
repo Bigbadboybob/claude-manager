@@ -123,6 +123,7 @@ chat_read(dms=True, unread_only=True)
 chat_read(inbox=True, unread_only=True)             # newest first, slim
 chat_read(inbox=True, mark_read_before="2026-10-06T12:00:00Z")  # clear an old backlog
 chat_read(channel="schema/parser", time={"since": "10m"})
+chat_read(channel="gpu-utilization", sender="EP", query="final verdict")
 chat_read(channel="schema/parser", time={
     "start": "2026-09-07T09:00:00-05:00",
     "end": "2026-09-07T10:00:00-05:00"
@@ -132,7 +133,7 @@ chat_read(thread="<message-id>")
 
 Choose one scope per read: channel, DM, conversation, thread, inbox, or incoming DMs. `channel="*"` searches public channels; `tags=["review"]` filters by tags. Absolute times must include a timezone. Replace the example dates with your desired range.
 
-Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query.
+Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query. `sender` accepts an exact name/alias or participant ID. `query` matches case-insensitive whole words, or adjacent Unicode words for a phrase (e.g. `Final: VERDICT`). Both filters are indexed and combine with time and channel. Search results do not mark history read automatically. See [search semantics](messaging/READ_MODEL.md#search).
 
 **Reading marks read.** Every conversation has a read cursor per reader, as in Slack. Reading a channel, DM or conversation through its newest message (the newest page, or paging until the end) moves your cursor there; everything after it is unread, and your mentions after it are unread mentions. Pass `mark_read=False` for a background preview. Inbox, incoming-DM, `channel="*"` and filtered reads span conversations and mark nothing by themselves: after actually reading such a page, pass its complete `receipt` as `ack_receipt` on a subsequent `chat_read` or `chat_send`, which advances each touched conversation through the newest message in the receipt.
 

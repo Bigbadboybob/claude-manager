@@ -82,6 +82,12 @@ pub struct Messages {
     cache: Value,
     norms: String,
     filter: Value,
+    search_target: Value,
+    search_request_target: Value,
+    search_waiting: bool,
+    search_retry_at: Option<Instant>,
+    search_retry_count: u8,
+    search_retry_params: Value,
     next: Value,
     rx: Option<Receiver<(String, Result<Value, String>)>>,
     busy: bool,
@@ -225,6 +231,51 @@ fn rfc3339_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 impl Messages {
+    fn search_scope_key(&self) -> Value {
+        let mut key = json!({});
+        for field in ["channel", "conversation", "dm", "inbox", "dms", "mentions", "norms", "norms_scope", "monitors", "preferences"] {
+            if let Some(value) = self.target.get(field) { key[field] = value.clone(); }
+        }
+        key
+    }
+    fn set_target(&mut self, target: Value) {
+        self.target = target;
+        self.synchronize_search_target();
+    }
+    fn reset_search_retry(&mut self) {
+        self.search_waiting = false;
+        self.search_retry_at = None;
+        self.search_retry_count = 0;
+        self.search_retry_params = Value::Null;
+    }
+    fn synchronize_search_target(&mut self) -> bool {
+        let key = self.search_scope_key();
+        if self.search_target == key { return false; }
+        if let Some(filter) = self.filter.as_object_mut() {
+            filter.remove("sender"); filter.remove("query");
+        }
+        self.search_target = key;
+        self.page_cursor = Value::Null;
+        self.reset_search_retry();
+        true
+    }
+    fn search_response(&mut self, value: &Value) {
+        if self.search_request_target != self.search_target { self.reset_search_retry(); return; }
+        if value["indexing"] != true { self.reset_search_retry(); return; }
+        self.search_waiting = true;
+        self.search_retry_params = self.management.request.clone();
+        // Respect the server's minimum delay, then back off so five retries
+        // can cover a large cold index without polling forever.
+        if self.search_retry_count < 5 {
+            let seconds = value["retry_after"].as_u64().unwrap_or(1).clamp(1, 60);
+            let delay = seconds.saturating_mul(1 << self.search_retry_count).min(300);
+            self.search_retry_at = Some(Instant::now() + Duration::from_secs(delay));
+            self.status = format!("Search indexing · retry {} of 5 in {delay}s", self.search_retry_count + 1);
+        } else {
+            self.search_retry_at = None;
+            self.status = "Search still indexing · reapply / filters to retry".into();
+        }
+    }
     pub fn load() -> Self {
         let saved = std::fs::read(Self::path())
             .ok()
@@ -650,7 +701,7 @@ impl App {
             return;
         }
         self.messages.menu = 0;
-        self.messages.target = json!({"inbox": true});
+        self.messages.set_target(json!({"inbox": true}));
         self.messages.filter = json!({});
         self.messages.page_cursor = Value::Null;
         self.messages.pane = 1;
@@ -682,6 +733,11 @@ impl App {
             self.needs_redraw = true;
             match result {
                 Err(e) => {
+                    if method == "messaging.read" && self.messages.search_request_target == self.messages.search_target
+                        && (e.contains("search_index_failed") || e.contains("search_disabled")) {
+                        self.messages.search_waiting = true;
+                        self.messages.search_retry_at = None;
+                    }
                     self.messaging_management_error(&method, &e);
                     if method == "messaging.send" {
                         if let Some((key, request)) = self.messages.pending_send.take() {
@@ -768,6 +824,7 @@ impl App {
                             }
                             self.messages.status =
                                 read_status(self.messages.items.len(), &v);
+                            self.messages.search_response(&v);
                         }
                         "messaging.send" => {
                             if let Some((key, request)) = self.messages.pending_send.take() {
@@ -794,7 +851,7 @@ impl App {
                             }
                             .into();
                             if let Some(cid) = v["event"]["conversation_id"].as_str() {
-                                self.messages.target = json!({"conversation":cid});
+                                self.messages.set_target(json!({"conversation":cid}));
                             }
                             self.messages.page_cursor = Value::Null;
                             self.messages.loaded_target = Value::Null;
@@ -845,8 +902,16 @@ impl App {
                 }
             }
         }
+        if self.messages.visible && !self.messages.busy && self.messages.mode.is_empty()
+            && self.messages.search_retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.messages.search_retry_at = None;
+            self.messages.search_retry_count += 1;
+            self.messaging_request("messaging.read", self.messages.search_retry_params.clone());
+            return;
+        }
         if self.messages.visible
             && !self.messages.busy
+            && !self.messages.search_waiting
             && (self.messages.want_older || self.messages.near_top)
             && !self.messages.next.is_null()
             // A failed page waits for the regular refresh, not every tick.
@@ -860,6 +925,7 @@ impl App {
         }
         if self.messages.visible
             && !self.messages.busy
+            && !self.messages.search_waiting
             && self.messages.mode.is_empty()
             && (self.messages.page_cursor.is_null() || self.messages.live_conversation())
             && self
@@ -871,6 +937,11 @@ impl App {
         }
     }
     fn messaging_request(&mut self, method: &str, mut params: Value) {
+        if self.messages.synchronize_search_target() {
+            if let Some(p) = params.as_object_mut() {
+                p.remove("sender"); p.remove("query"); p.remove("cursor");
+            }
+        }
         if matches!(method, "messaging.norms" | "norms_document") && params.get("scope").is_none() {
             params["scope"] = json!(self.messages.norms_scope());
         }
@@ -884,6 +955,9 @@ impl App {
         };
         let token = self.host_pool.operator_token_for(&host);
         self.messages.management.request = params.clone();
+        if matches!(method, "messaging.read" | "hub_refresh") {
+            self.messages.search_request_target = self.messages.search_scope_key();
+        }
         let refresh = matches!(method, "messaging.read" | "hub_refresh")
             && self.messages.live_conversation()
             && self.messages.loaded_target == self.messages.query()
@@ -1359,7 +1433,7 @@ impl App {
                             self.messages.persist();
                             return true;
                         }
-                        self.messages.target = target;
+                        self.messages.set_target(target);
                         self.messages.filter = json!({});
                         self.messages.page_cursor = Value::Null;
                         self.messages.seek_mention = (0, 0);
@@ -1399,7 +1473,7 @@ impl App {
             }
             KeyCode::Char('r') => {
                 if let Some(v) = self.messages.items.get(self.messages.selected).cloned() {
-                    self.messages.target = json!({"conversation":v["conversation_id"]});
+                    self.messages.set_target(json!({"conversation":v["conversation_id"]}));
                     if !self.messages.can_post() || !self.messages.can_edit() {
                         return true;
                     }
@@ -1413,7 +1487,7 @@ impl App {
             }
             KeyCode::Char('t') => {
                 if let Some(v) = self.messages.items.get(self.messages.selected).cloned() {
-                    self.messages.target = json!({"conversation":v["conversation_id"]});
+                    self.messages.set_target(json!({"conversation":v["conversation_id"]}));
                     self.messages.filter = json!({"thread":v["data"]["thread_root"].as_str().unwrap_or(v["id"].as_str().unwrap_or(""))});
                     self.messaging_request("messaging.read", self.messages.query());
                 }
@@ -1438,6 +1512,8 @@ impl App {
                         })
                         .unwrap_or_default(),
                     f["time_basis"].as_str().unwrap_or("created").into(),
+                    f["sender"].as_str().unwrap_or("").into(),
+                    f["query"].as_str().unwrap_or("").into(),
                 ];
                 self.messages.start_form("filter", fields);
             }
@@ -1482,7 +1558,7 @@ impl App {
                         .iter()
                         .find(|p| p["session_uid"] == uid)
                     {
-                        self.messages.target = json!({"dm":p["id"]});
+                        self.messages.set_target(json!({"dm":p["id"]}));
                         self.messaging_request("messaging.read", self.messages.query());
                     }
                 }
@@ -1578,6 +1654,13 @@ impl App {
                     }
                 }
                 self.messages.filter = json!({"time":if time.as_object().is_some_and(|v|v.is_empty()){Value::Null}else{time},"tags":split(&fields[3]),"time_basis":fields[4].trim()});
+                for (i, key) in [(5, "sender"), (6, "query")] {
+                    if !fields[i].trim().is_empty() {
+                        self.messages.filter[key] = json!(fields[i].trim());
+                    }
+                }
+                self.messages.search_target = self.messages.search_scope_key();
+                self.messages.reset_search_retry();
                 self.messages.page_cursor = Value::Null;
                 self.messaging_request("messaging.read", self.messages.query());
             }
@@ -1678,7 +1761,7 @@ impl App {
         let Some(m) = self.messages.items.get(self.messages.selected).cloned() else {
             return;
         };
-        self.messages.target = json!({"conversation": m["conversation_id"]});
+        self.messages.set_target(json!({"conversation": m["conversation_id"]}));
         self.messages.filter = json!({});
         self.messages.page_cursor = Value::Null;
         self.messages.pane = 1;
@@ -2037,6 +2120,8 @@ impl App {
                             "Until (date/time + zone)",
                             "Tags, comma separated",
                             "Time basis (created / received)",
+                            "Sender name or participant ID",
+                            "Words / phrase (case-insensitive)",
                         ],
                         "metadata" => vec![
                             "Tags, comma separated",
@@ -2357,6 +2442,35 @@ mod tests {
             "read":true,"data":{"tags":[],"links":[],"mention_recipients": if mention { json!(["owner"]) } else { json!([]) }}})
     }
 
+    #[test]
+    fn messaging_search_retry_is_bounded_and_target_change_clears_search() {
+        let mut m = Messages::default();
+        m.target = json!({"channel":"one"});
+        m.search_target = m.target.clone();
+        m.search_request_target = m.search_target.clone();
+        m.filter = json!({"sender":"Scout","query":"verdict","tags":["keep"]});
+        m.management.request = json!({"channel":"one","sender":"Scout","query":"verdict"});
+        for attempt in 0..=5 {
+            m.search_retry_count = attempt;
+            let before = Instant::now();
+            m.search_response(&json!({"indexing":true,"retry_after":2}));
+            assert!(m.search_waiting);
+            if attempt < 5 {
+                assert!(m.search_retry_at.unwrap() >= before + Duration::from_secs(2));
+                assert_eq!(m.search_retry_params,m.management.request);
+            } else { assert!(m.search_retry_at.is_none()); }
+        }
+        m.target["pinned_only"] = json!(true);
+        assert!(!m.synchronize_search_target());
+        assert_eq!(m.filter["query"], "verdict");
+        m.set_target(json!({"channel":"two"}));
+        assert!(m.filter["sender"].is_null() && m.filter["query"].is_null());
+        assert_eq!(m.filter["tags"],json!(["keep"]));
+        assert!(!m.search_waiting);
+        assert_eq!(m.search_retry_count,0);
+        m.search_response(&json!({"indexing":true,"retry_after":1}));
+        assert!(!m.search_waiting,"old-target responses must not restart retries");
+    }
     #[test]
     fn messages_sidebar_counts_lead_names_truncate_in_the_middle_and_resize_persists() {
         let _lock = crate::test_support::home_lock();
@@ -2732,16 +2846,32 @@ mod tests {
             KeyCode::Char('/'),
             KeyModifiers::NONE,
         )));
-        assert_eq!(app.messages.fields.len(), 5);
+        assert_eq!(app.messages.fields.len(), 7);
         app.messages.fields = vec![
             "10m".into(),
             "".into(),
             "".into(),
             "needs-owner".into(),
             "received".into(),
+            "Scout".into(),
+            "final verdict".into(),
         ];
+        app.messages.page_cursor = json!({"old":"cursor"});
         app.messaging_submit_form();
         assert_eq!(app.messages.filter["time"]["since"], "10m");
+        assert_eq!(app.messages.query()["sender"], "Scout");
+        assert_eq!(app.messages.query()["query"], "final verdict");
+        assert!(app.messages.page_cursor.is_null());
+        // The submitted read owns the busy state until its reply arrives.
+        app.messages.busy = false;
+        app.messaging_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('/'), KeyModifiers::NONE,
+        )));
+        app.messages.fields[5].clear();
+        app.messages.fields[6].clear();
+        app.messaging_submit_form();
+        assert!(app.messages.filter.get("sender").is_none());
+        assert!(app.messages.filter.get("query").is_none());
     }
     #[test]
     fn messaging_settings_and_reconnect_preserve_newer_names_and_grouping() {

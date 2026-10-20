@@ -10081,6 +10081,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                chat_search_budget_bytes: 512 * 1024 * 1024,
                 presence_idle_enabled: true,
                 workflow_state_gate: false,
                 mcp_server_path: String::new(),
@@ -10181,6 +10182,7 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+            chat_search_budget_bytes: 512 * 1024 * 1024,
             presence_idle_enabled: true,
             workflow_state_gate: false,
             mcp_server_path: String::new(),

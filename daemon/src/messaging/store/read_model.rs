@@ -44,6 +44,7 @@ pub(super) struct ConversationIndex {
 }
 #[derive(Default)]
 pub(super) struct ReadModel {
+    pub search: super::search::SearchIndex,
     pub conversations: BTreeMap<String, ConversationIndex>,
     pub metadata: Vec<usize>,
     pub pending_local: BTreeSet<usize>,
@@ -69,6 +70,10 @@ impl Store {
             )
     }
     pub(super) fn index_read_model(&mut self, e: &Published, index: usize) {
+        #[cfg(not(test))]
+        self.read_model.search.index(e, index);
+        #[cfg(test)]
+        if !super::search::skip_index_for_test() { self.read_model.search.index(e, index); }
         if e.event["origin_daemon_id"] == self.daemon_id
             && !self.replication.receipts.contains_key(strv(&e.event, "id"))
             && !self

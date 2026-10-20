@@ -406,6 +406,10 @@ impl Default for SchedulerConfig {
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Accounted search-cache bytes, including an in-progress build. Zero
+    /// disables search. Applied on the next messaging RPC after config reload.
+    #[serde(default = "default_chat_search_budget_bytes")]
+    pub chat_search_budget_bytes: usize,
     /// Project Claude presence into the legacy idle boolean. Disable and call
     /// daemon.reload_config to restore PTY-based idle while keeping agent_state.
     #[serde(default = "default_presence_idle_enabled")]
@@ -497,6 +501,7 @@ pub struct DaemonConfig {
 }
 
 fn default_presence_idle_enabled() -> bool { true }
+fn default_chat_search_budget_bytes() -> usize { 512 * 1024 * 1024 }
 fn default_codex_inline_scrollback() -> bool { true }
 
 impl DaemonConfig {
@@ -517,6 +522,7 @@ impl DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            chat_search_budget_bytes: default_chat_search_budget_bytes(),
             presence_idle_enabled: default_presence_idle_enabled(),
             workflow_state_gate: false,
             mcp_server_path: String::new(),
@@ -806,6 +812,7 @@ mode = "ssh-trust"
     #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            chat_search_budget_bytes: 128 * 1024 * 1024,
             presence_idle_enabled: false,
             workflow_state_gate: true,
             mcp_server_path: "/opt/x.py".into(),

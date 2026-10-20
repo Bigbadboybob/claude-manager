@@ -278,7 +278,7 @@ fn execute_with_freshness(
             message: e.into(),
         })?;
     }
-    let (handle, root, uid, kind, live, draining, graph) = {
+    let (handle, root, uid, kind, live, draining, graph, search_budget) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let (uid, kind) = match &req.caller {
             Caller::Operator(_) => (String::new(), "owner"),
@@ -303,6 +303,7 @@ fn execute_with_freshness(
             live,
             s.draining,
             super::tasks::SessionGraph::capture(&s),
+            s.config.chat_search_budget_bytes,
         )
     };
     if draining {
@@ -335,6 +336,7 @@ fn execute_with_freshness(
         coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
     let store = slot.as_mut().ok_or_else(super::startup::starting)?;
+    store.configure_search(&handle, search_budget);
     let actor = if kind == "owner" {
         "owner".into()
     } else {
@@ -585,6 +587,19 @@ fn execute_with_freshness(
             code: "unsupported_feature".into(),
             message: "Messaging method not implemented".into(),
         }),
+    };
+    if req.method == "messaging.read"
+        && ["sender", "query"].iter().any(|key| p.get(key).is_some_and(|v| !v.is_null()))
+    {
+        if let Err(error) = store.start_search_worker(&handle) {
+            eprintln!("cm messaging: could not start search worker: {error}");
+        }
+    }
+    let result = match result {
+        Err(e) if e.code == "search_indexing" => Ok(json!({"items":[], "indexing":true,
+            "retry_after":1,"partial_scope":p["channel"] == "*" || p["inbox"] == true || p["dms"] == true,
+            "next_cursor":p["cursor"], "search_truncated":false})),
+        result => result,
     };
     project_names(state, store, true);
     let mut retraction_note = None;
@@ -991,6 +1006,69 @@ mod tests {
         let opened = call(&state, "b", "open", json!({"channel":"roles"})).unwrap();
         assert_eq!(opened["target"]["can_edit"], false);
         assert_eq!(opened["target"]["created_by"], channel["created_by"]);
+    }
+    #[test]
+    fn messaging_search_spawn_failure_never_fails_or_restarts_on_ordinary_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let handle = state.lock().unwrap().messaging.clone();
+        handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(true);
+        call(&state, "a", "send", json!({"channel":"general","name":"Search Builder","body":"first verdict","request_id":"first"})).unwrap();
+        let q = json!({"channel":"general","query":"verdict"});
+        assert_eq!(call(&state, "b", "read", q.clone()).unwrap()["indexing"], true);
+        assert_eq!(handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(true), 1);
+        let sent = call(&state, "a", "send", json!({"channel":"general","body":"second verdict","request_id":"second"})).unwrap();
+        let page = call(&state, "b", "read", json!({"channel":"general"})).unwrap();
+        assert!(page["items"].as_array().unwrap().iter().any(|e| e["id"] == sent["event_id"]));
+        assert_eq!(handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(false), 1,
+            "non-search RPCs must not even attempt to start the queued worker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let page = call(&state, "b", "read", q.clone()).unwrap();
+            if page["indexing"] != true {
+                assert_eq!(page["items"].as_array().unwrap().len(), 2);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn messaging_search_build_keeps_sends_and_retry_responsive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        call(&state, "a", "send", json!({"channel":"general","name":"Search Builder","body":"first verdict","request_id":"first"})).unwrap();
+        let handle = state.lock().unwrap().messaging.clone();
+        let (entered, release) = handle.lock().unwrap().as_mut().unwrap().pause_search_for_test();
+        let q = json!({"channel":"general","query":"verdict"});
+        let pending = call(&state, "b", "read", q.clone()).unwrap();
+        assert_eq!(pending["indexing"], true);
+        assert_eq!(pending["retry_after"], 1);
+        entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        // The worker is suspended mid-build until release, making this a
+        // deterministic concurrency check rather than a race with a tiny index.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clone = state.clone();
+        let sender = std::thread::spawn(move || {
+            tx.send(call(&clone, "a", "send", json!({"channel":"general","body":"delta verdict","request_id":"delta"}))).unwrap();
+        });
+        let sent = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("send blocked on cold search").unwrap();
+        sender.join().unwrap();
+        assert_eq!(call(&state, "b", "read", q.clone()).unwrap()["indexing"], true);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let page = loop {
+            match call(&state, "b", "read", q.clone()) {
+                Ok(page) if page["indexing"] == true => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(page) => break page,
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(page["items"].as_array().unwrap().len(), 2);
+        assert!(page["items"].as_array().unwrap().iter().any(|e| e["id"] == sent["event_id"]));
     }
     #[test]
     fn messaging_reads_and_cancellation_serialize_with_wake_publication_but_sends_do_not() {

@@ -23,6 +23,7 @@ mod private_sync;
 mod replication;
 mod rebuild;
 mod read_model;
+mod search;
 mod reactions;
 use read_model::{ReadState, ReadModel, ReadCursor};
 mod task_subscriptions;
@@ -1731,6 +1732,9 @@ impl Store {
             return Err(err("invalid_params", "Expected an object"));
         }
         if p.get("mark_read_before").is_some_and(|v| !v.is_null()) {
+            if ["sender", "query"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+                return Err(err("invalid_params", "Search filters cannot be combined with mark_read_before"));
+            }
             return self.mark_read_before(actor, p, people);
         }
         let mut normalized;
@@ -1779,6 +1783,7 @@ impl Store {
         } else {
             Some(self.resolve(actor, p, people, false)?.0)
         };
+        let search = self.search_filter(p, people)?;
         let mut filter = p.clone();
         for k in ["cursor", "ack_receipt", "limit", "mark_read"] {
             filter.as_object_mut().unwrap().remove(k);
@@ -1826,6 +1831,8 @@ impl Store {
         let newest = p["newest_first"] == true && p.get("after").is_none();
         let anchor = last_id.map(|id|self.published(id).map(|e|ReadCursor::of(&e.event))
             .ok_or_else(||err("invalid_cursor","Missing page anchor"))).transpose()?;
+        let search_scope = if search.active() { self.search_scope(actor, conv.as_deref(), public, p["dms"] == true, cursor)? }
+            else { search::SearchScope::default() };
         let matches = |e: &&Published| {
                 let v = &e.event;
                 let cid = strv(v, "conversation_id");
@@ -1888,7 +1895,16 @@ impl Store {
                 start_dt.is_none_or(|s| t >= s) && end_dt.is_none_or(|end| t < end)
         };
         let default_inbox = p["inbox"] == true && self.personal.get(actor).is_none_or(|s|s.preferences.rules.is_empty() && s.monitors.is_empty());
-        let mut items: Vec<_> = if p.get("after").is_some() {
+        let mut search_scanned = None;
+        let mut search_truncated = false;
+        let mut items: Vec<_> = if search.active() {
+            let arrival_after = p.get("after").map(|_| last_id.and_then(|id| self.published(id))
+                .map_or(after, |e| after.max(e.position)));
+            let page = self.search_page(&search_scope.ids, &search, anchor.as_ref(), newest, arrival_after, high, limit, matches);
+            search_scanned = page.scanned;
+            search_truncated = page.truncated;
+            page.items
+        } else if p.get("after").is_some() {
             self.events_between(last_id.and_then(|id|self.published(id)).map_or(after,|e|after.max(e.position)),high).iter().filter(|e|Self::readable_event(&e.event))
                 .filter(matches).take(limit+1).collect()
         } else {
@@ -1941,8 +1957,15 @@ impl Store {
             out.push(v);
             index += 1;
         }
-        let next = if index < items.len() {
-            json!({"filter":digest,"snapshot":self.position_token(high),"last_id":out.last().map(|v|&v["id"]),"start":start,"end":end})
+        let next = if index < items.len() || search_truncated {
+            let mut next = json!({"filter":digest,"snapshot":self.position_token(high),"last_id":out.last().map(|v|&v["id"]),"start":start,"end":end});
+            if let Some(sender) = &search.sender { next["search_sender"] = json!(sender); }
+            if search.active() {
+                next["search_scope"] = json!(search_scope.ids);
+                next["search_partial_scope"] = json!(search_scope.partial);
+            }
+            if search_truncated && index == items.len() { next["last_id"] = json!(search_scanned); }
+            next
         } else {
             Value::Null
         };
@@ -1983,7 +2006,7 @@ impl Store {
         // through its newest supplied message; reaching the chronological end
         // does the same, without consuming messages arriving after this snapshot.
         if self.degraded.is_none() && !self.messaging_frozen() && p["mark_read"] != false && !broad && !public && p["mentions_only"] != true
-            && p["thread"].is_null() && p["time"].is_null() && p["tags"].is_null()
+            && !search.active() && p["thread"].is_null() && p["time"].is_null() && p["tags"].is_null()
             && p["pinned_only"] != true && p["after"].is_null()
             && ((newest && cursor.is_none()) || (!newest && next.is_null())) {
             if let Some(v) = out.iter().max_by_key(|v| ReadCursor::of(v)) {
@@ -1991,9 +2014,13 @@ impl Store {
             }
         }
         let read_cursor = conv.as_deref().map(|cid|self.read_cursor(actor,cid));
-        Ok(
-            json!({"read_cursor":read_cursor,"target":target,"pins_revision":pins_revision,"pins":pins,"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded}),
-        )
+        let mut result = json!({"read_cursor":read_cursor,"target":target,"pins_revision":pins_revision,"pins":pins,"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded});
+        if search.active() {
+            result["search_truncated"] = json!(search_truncated);
+            result["partial_scope"] = json!(search_scope.partial);
+            if search_scope.indexing { result["indexing"] = json!(true); result["retry_after"] = json!(1); }
+        }
+        Ok(result)
     }
     pub fn dms(&mut self, actor: &str, unread: bool) -> Result<Value> {
         self.dms_page(actor, &json!({"unread_only":unread}))
