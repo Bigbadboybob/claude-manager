@@ -95,10 +95,13 @@ pub(crate) const ALERT_RAINBOW: &[Color] = &[
     Color::Rgb(225, 90, 230),  // magenta
 ];
 
-/// Named accent colors a user can assign to sessions, workspaces, and
-/// tasks via the A-e settings forms. Persisted by NAME (first tuple
+/// Named accent colors a user can assign to sessions, workspaces, tasks
+/// and sections via the A-e settings forms. Persisted by NAME (first tuple
 /// field) so the palette can be retuned later without migrating saved
-/// manifests. Order is the ←/→ cycle order in the forms.
+/// manifests. The eight base names (`red` … `pink`) are the original
+/// palette with their original values, so stored choices look the same;
+/// each hue gained a `light-` and a `dark-` shade, plus neutrals
+/// (2026-10-20). Layout in the picker: [`COLOR_GRID`].
 pub(crate) const USER_COLORS: &[(&str, Color)] = &[
     ("red", Color::Rgb(255, 105, 105)),
     ("orange", Color::Rgb(255, 160, 70)),
@@ -108,7 +111,78 @@ pub(crate) const USER_COLORS: &[(&str, Color)] = &[
     ("blue", Color::Rgb(110, 160, 255)),
     ("magenta", Color::Rgb(215, 110, 235)),
     ("pink", Color::Rgb(255, 130, 180)),
+    ("light-red", Color::Rgb(255, 170, 170)),
+    ("light-orange", Color::Rgb(255, 200, 145)),
+    ("light-yellow", Color::Rgb(250, 235, 150)),
+    ("light-green", Color::Rgb(175, 240, 175)),
+    ("light-cyan", Color::Rgb(160, 235, 235)),
+    ("light-blue", Color::Rgb(170, 200, 255)),
+    ("light-magenta", Color::Rgb(235, 175, 245)),
+    ("light-pink", Color::Rgb(255, 185, 215)),
+    ("dark-red", Color::Rgb(190, 55, 55)),
+    ("dark-orange", Color::Rgb(200, 110, 30)),
+    ("dark-yellow", Color::Rgb(180, 150, 30)),
+    ("dark-green", Color::Rgb(55, 160, 65)),
+    ("dark-cyan", Color::Rgb(30, 150, 155)),
+    ("dark-blue", Color::Rgb(60, 100, 210)),
+    ("dark-magenta", Color::Rgb(155, 60, 180)),
+    ("dark-pink", Color::Rgb(200, 75, 130)),
+    ("white", Color::Rgb(235, 235, 235)),
+    ("silver", Color::Rgb(185, 190, 200)),
+    ("grey", Color::Rgb(135, 140, 150)),
+    ("slate", Color::Rgb(100, 115, 140)),
 ];
+
+/// The picker's grid: one column per hue, rows light / base / dark, then a
+/// neutrals row led by "none" (default styling). `Some(None)` is the none
+/// cell, `None` an empty cell.
+pub(crate) const COLOR_GRID: [[Option<Option<&str>>; 8]; 4] = [
+    [Some(Some("light-red")), Some(Some("light-orange")), Some(Some("light-yellow")), Some(Some("light-green")),
+     Some(Some("light-cyan")), Some(Some("light-blue")), Some(Some("light-magenta")), Some(Some("light-pink"))],
+    [Some(Some("red")), Some(Some("orange")), Some(Some("yellow")), Some(Some("green")),
+     Some(Some("cyan")), Some(Some("blue")), Some(Some("magenta")), Some(Some("pink"))],
+    [Some(Some("dark-red")), Some(Some("dark-orange")), Some(Some("dark-yellow")), Some(Some("dark-green")),
+     Some(Some("dark-cyan")), Some(Some("dark-blue")), Some(Some("dark-magenta")), Some(Some("dark-pink"))],
+    [Some(None), Some(Some("white")), Some(Some("silver")), Some(Some("grey")), Some(Some("slate")), None, None, None],
+];
+
+/// Grid cell of a stored color; `None` and unknown names sit on "none".
+pub(crate) fn color_grid_position(current: Option<&str>) -> (usize, usize) {
+    for (r, row) in COLOR_GRID.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if *cell == Some(current) {
+                return (r, c);
+            }
+        }
+    }
+    (3, 0)
+}
+
+/// Move one step in the grid, skipping empty cells and clamping at edges.
+pub(crate) fn color_grid_step((row, col): (usize, usize), dr: i32, dc: i32) -> (usize, usize) {
+    let (mut r, mut c) = (row as i32, col as i32);
+    loop {
+        let (nr, nc) = (r + dr, c + dc);
+        if !(0..COLOR_GRID.len() as i32).contains(&nr) || !(0..8).contains(&nc) {
+            return (row, col);
+        }
+        (r, c) = (nr, nc);
+        if COLOR_GRID[r as usize][c as usize].is_some() {
+            return (r as usize, c as usize);
+        }
+        if dr != 0 {
+            // Moving down into a short row: land on its last filled cell.
+            if let Some(last) = COLOR_GRID[r as usize].iter().rposition(Option::is_some) {
+                return (r as usize, last);
+            }
+        }
+    }
+}
+
+/// The stored value a grid cell picks.
+pub(crate) fn color_grid_value((row, col): (usize, usize)) -> Option<String> {
+    COLOR_GRID[row][col].flatten().map(str::to_string)
+}
 
 /// Resolve a stored palette name to its `Color`. Unknown names (palette
 /// drift, hand-edited manifest) resolve to `None` = default styling.
@@ -125,29 +199,6 @@ pub(crate) fn faded(color: Color) -> Color {
             Color::Rgb(f(r), f(g), f(b))
         }
         _ => DIM,
-    }
-}
-
-/// Step an `Option<palette name>` one slot through `USER_COLORS`,
-/// treating `None` (default) as an extra slot in the cycle so the same
-/// key both sets and clears a color.
-pub(crate) fn cycle_user_color(current: Option<&str>, forward: bool) -> Option<String> {
-    let len = USER_COLORS.len();
-    // Positions: 0 = None, 1..=len = palette entries. An unknown stored
-    // name behaves like None so cycling recovers from palette drift.
-    let pos = match current {
-        None => 0,
-        Some(name) => USER_COLORS
-            .iter()
-            .position(|(n, _)| *n == name)
-            .map(|i| i + 1)
-            .unwrap_or(0),
-    };
-    let next = if forward { (pos + 1) % (len + 1) } else { (pos + len) % (len + 1) };
-    if next == 0 {
-        None
-    } else {
-        Some(USER_COLORS[next - 1].0.to_string())
     }
 }
 
@@ -179,5 +230,48 @@ mod tests {
         let Color::Rgb(_, _, b0) = blue else { unreachable!() };
         assert!(b < b0, "dimmer than the full accent");
         assert_eq!(faded(Color::Blue), DIM, "non-rgb falls back to the stale grey");
+    }
+
+    /// The original eight names keep resolving to their original values,
+    /// so manifests saved before the larger palette look the same.
+    #[test]
+    fn old_color_names_resolve_unchanged() {
+        for (name, rgb) in [
+            ("red", (255, 105, 105)), ("orange", (255, 160, 70)), ("yellow", (240, 210, 70)),
+            ("green", (110, 220, 110)), ("cyan", (80, 210, 210)), ("blue", (110, 160, 255)),
+            ("magenta", (215, 110, 235)), ("pink", (255, 130, 180)),
+        ] {
+            assert_eq!(user_color(name), Some(Color::Rgb(rgb.0, rgb.1, rgb.2)), "{name}");
+        }
+        assert!(USER_COLORS.len() >= 24);
+        assert_eq!(user_color("mauve-nonexistent"), None);
+    }
+
+    /// Every palette entry is reachable in the grid exactly once, and every
+    /// grid name is in the palette.
+    #[test]
+    fn the_grid_covers_the_palette_exactly() {
+        let mut seen = std::collections::HashSet::new();
+        for row in COLOR_GRID {
+            for name in row.into_iter().flatten().flatten() {
+                assert!(user_color(name).is_some(), "{name}");
+                assert!(seen.insert(name), "{name} twice");
+            }
+        }
+        assert_eq!(seen.len(), USER_COLORS.len());
+    }
+
+    #[test]
+    fn grid_moves_clamp_and_skip_empty_cells() {
+        assert_eq!(color_grid_position(Some("blue")), (1, 5));
+        assert_eq!(color_grid_position(None), (3, 0));
+        assert_eq!(color_grid_position(Some("gone")), (3, 0));
+        assert_eq!(color_grid_step((1, 5), -1, 0), (0, 5));
+        assert_eq!(color_grid_step((0, 5), -1, 0), (0, 5), "top edge");
+        assert_eq!(color_grid_step((1, 7), 0, 1), (1, 7), "right edge");
+        assert_eq!(color_grid_step((2, 7), 1, 0), (3, 4), "down into the short neutrals row");
+        assert_eq!(color_grid_step((3, 4), 0, 1), (3, 4), "no cells right of slate");
+        assert_eq!(color_grid_value((3, 0)), None);
+        assert_eq!(color_grid_value((2, 0)).as_deref(), Some("dark-red"));
     }
 }

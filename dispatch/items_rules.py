@@ -101,6 +101,7 @@ class Item:
     created_by: str | None = None
     created_at: datetime | None = None
     stale_nudged_at: datetime | None = None
+    flag_pushed: dict = field(default_factory=dict)   # kind -> fingerprint at last push
     holders: list = field(default_factory=list)       # [{pid, name, session_uid, daemon_id}]
     blocked_by: set = field(default_factory=set)      # item numbers
     open_flags: dict = field(default_factory=dict)    # kind -> {raised_at, detail}
@@ -502,14 +503,21 @@ class BoardTx:
                 "from idle/stale flags"
             )
 
-        # Waiting needs an ETA (rule 4); leaving waiting clears it.
+        # Waiting needs an ETA (rule 4). An active item may carry one too
+        # (explicit status active with eta): inside it the item is not
+        # idle or stale (§5). Leaving both clears it.
+        keeps_eta = status == "active" and it.eta_at is not None and (
+            eta_given or prev_status == "active")
         if status == "waiting":
             if not eta_given and (prev_status != "waiting" or it.eta_at is None):
                 raise invalid("eta_required", "waiting requires eta (e.g. 40m, 2h, or a time)",
                               field="eta")
+        elif keeps_eta:
+            pass
         elif it.eta_at is not None or it.waiting_set_at is not None:
             if eta_given:
-                raise invalid("invalid_field", "eta requires status waiting", field="eta")
+                raise invalid("invalid_field", "eta requires status waiting or active",
+                              field="eta")
             it.eta_at = None
             it.waiting_set_at = None
 
@@ -593,10 +601,13 @@ class BoardTx:
             self.dirty.add(dep.n)
 
     def touch(self, ns: list[int], *, source: str, message_id: str | None = None,
-              excerpt: str | None = None) -> tuple[list[int], list[dict]]:
+              excerpt: str | None = None, any_item: bool = False) -> tuple[list[int], list[dict]]:
         """Observed activity on items (a holder's chat post naming `#N`):
         reset the stale clock and append history. Never changes status or
-        note. Only open items the actor holds are touched."""
+        note. Only open items the actor holds are touched. With `any_item`
+        (the board's steward or orchestrator) a post about someone else's
+        item is recorded in history but resets no clock: only a holder's
+        touch counts as progress, so nagging never hides a stall."""
         touched, skipped = [], []
         for n in dict.fromkeys(ns):
             it = self.items.get(n)
@@ -604,11 +615,12 @@ class BoardTx:
                 skipped.append({"n": n, "reason": "not_found"})
             elif it.status in CLOSED:
                 skipped.append({"n": n, "reason": "closed"})
-            elif self.actor["pid"] not in [h["pid"] for h in it.holders]:
+            elif not any_item and self.actor["pid"] not in [h["pid"] for h in it.holders]:
                 skipped.append({"n": n, "reason": "not_holder"})
             else:
-                it.touched_at = self.now
-                self.dirty.add(n)
+                if self.actor["pid"] in [h["pid"] for h in it.holders]:
+                    it.touched_at = self.now
+                    self.dirty.add(n)
                 self._event(it, f"{source}_ref", new={
                     "message_id": message_id,
                     "excerpt": (excerpt or "")[:200] or None,

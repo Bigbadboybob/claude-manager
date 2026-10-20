@@ -299,7 +299,7 @@ impl Menu {
             lines.push(Line::from(if self.mark_done {
                 "Marks the selected task done, then closes its sessions."
             } else {
-                "Closes workspace sessions. Task status stays unchanged; Alt+d finishes a task."
+                "Closes workspace sessions. Task status stays unchanged; Alt+D finishes a task."
             }));
         }
         lines.push(Line::from(
@@ -383,7 +383,7 @@ fn reason_text(reason: &str, mark_done: bool) -> &str {
     match reason {
         "shared_with_another_task" => "Shared with a task outside this cleanup scope",
         "task_not_terminal" if mark_done => "Task is still open; rechecked after marking done",
-        "task_not_terminal" => "Task is still open; use Alt+d to finish it before reaping",
+        "task_not_terminal" => "Task is still open; use Alt+D to finish it before reaping",
         "live_session" => "Session is active; rechecked after closing",
         "live_process_reference" => "A process is still using this checkout",
         other => other,
@@ -433,7 +433,7 @@ impl App {
                 .count()
                 > 1
         {
-            self.set_status_msg("Multiple tasks bound — pick one (A-d on its header)");
+            self.set_status_msg("Multiple tasks bound — pick one (A-D on its header)");
             return;
         }
         // A workspace shared by several tasks cannot acquire one task's scope
@@ -751,7 +751,7 @@ mod tests {
             menu.key(key(KeyCode::Enter)),
             InputOutcome::Status(_)
         ));
-        assert!(reason_text("task_not_terminal", false).contains("Alt+d"));
+        assert!(reason_text("task_not_terminal", false).contains("Alt+D"));
         assert!(reason_text("task_not_terminal", true).contains("after marking done"));
     }
 

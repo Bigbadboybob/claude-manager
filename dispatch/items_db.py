@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import asyncpg
 
-from dispatch.items_rules import CLOSED, OWNER_BLOCKED, BoardTx, Item, ItemsError, iso
+from dispatch.items_rules import CLOSED, OWNER_BLOCKED, OWNER_PID, BoardTx, Item, ItemsError, iso
 
 STATE_FRESH_S = 90
 BOARD_SETTINGS = (
@@ -43,6 +43,8 @@ def _board_settings(board: dict) -> dict:
     out = {k: board[k] for k in BOARD_SETTINGS}
     out["holder_idle_enabled"] = board["holder_idle_enabled"]
     out["orchestrator_pid"] = board["orchestrator_pid"]
+    out["steward_pid"] = board.get("steward_pid")
+    out["channel"] = board.get("channel")
     return out
 
 
@@ -148,6 +150,7 @@ def _item_from_row(row) -> Item:
         closed_at=row["closed_at"], archived_at=row["archived_at"],
         created_by=row["created_by"], created_at=row["created_at"],
         stale_nudged_at=row["stale_nudged_at"],
+        flag_pushed=dict(row.get("flag_pushed") or {}),
     )
 
 
@@ -218,12 +221,12 @@ async def _apply(conn, tx: BoardTx) -> None:
                       blocked_on = $6, check_back_at = $7, eta_at = $8,
                       waiting_set_at = $9, links = $10, touched_at = $11,
                       clock_reset_at = $12, closed_at = $13, archived_at = $14,
-                      updated_at = $15, stale_nudged_at = $16
+                      updated_at = $15, stale_nudged_at = $16, flag_pushed = flag_pushed || $17::jsonb
                 WHERE id = $1""",
             it.id, it.title, it.status, it.note, it.group, it.blocked_on,
             it.check_back_at, it.eta_at, it.waiting_set_at, list(it.links),
             it.touched_at, it.clock_reset_at, it.closed_at, it.archived_at, now,
-            it.stale_nudged_at,
+            it.stale_nudged_at, dict(it.flag_pushed),
         )
     for n in sorted(tx.holders_changed):
         it = tx.items[n]
@@ -408,6 +411,69 @@ async def touch_items(pool, ref: str, actor: dict, ns: list[int], *, source: str
             "touched": touched, "skipped": skipped}
 
 
+async def _stewards(conn, board: dict, pid: str, now: datetime) -> bool:
+    """`pid` is the board's steward or orchestrator (explicit or picked)."""
+    if pid in (board.get("steward_pid"), board.get("orchestrator_pid")):
+        return True
+    if board.get("orchestrator_pid"):
+        return False
+    row = await _orchestrator_row(conn, board, now)
+    return bool(row) and row.get("pid") == pid
+
+
+async def chat_touch(pool, actor: dict, ns: list[int], *, channel: str | None,
+                     source: str = "chat", message_id: str | None = None,
+                     excerpt: str | None = None) -> dict:
+    """A chat post naming `#N` (doc §4): refresh item N when the sender holds
+    it or is the board's steward or orchestrator. N is resolved on the board
+    bound to `channel`, else on the only board where it is open and the
+    sender holds it or stewards/orchestrates that board; an ambiguous number
+    is skipped. The daemon has already applied the thread and quote rules."""
+    if not actor or not actor.get("pid"):
+        raise ItemsError(422, "invalid_field", "actor.pid is required", field="actor")
+    pid = actor["pid"]
+    channel = (channel or "").strip().lstrip("#") or None
+    now = utcnow()
+    plan: dict[str, list[int]] = {}
+    skipped: list[dict] = []
+    async with pool.acquire() as conn:
+        bound = []
+        if channel:
+            bound = [str(r["id"]) for r in await conn.fetch(
+                "SELECT id FROM boards WHERE channel = $1", channel)]
+        if len(bound) == 1:
+            plan[bound[0]] = list(dict.fromkeys(ns))
+        else:
+            for n in dict.fromkeys(ns):
+                rows = await conn.fetch(
+                    """SELECT DISTINCT b.id FROM boards b JOIN items i ON i.board_id = b.id
+                        WHERE i.number = $1 AND i.archived_at IS NULL
+                          AND i.status NOT IN ('done', 'dropped')
+                          AND (EXISTS (SELECT 1 FROM item_holders h
+                                        WHERE h.item_id = i.id AND h.pid = $2)
+                               OR b.steward_pid = $2 OR b.orchestrator_pid = $2)""",
+                    n, pid)
+                if len(rows) == 1:
+                    plan.setdefault(str(rows[0]["id"]), []).append(n)
+                else:
+                    skipped.append({"n": n, "reason": "ambiguous" if rows else "not_found"})
+        privileged = {}
+        for board_id in plan:
+            board = await _board_by_ref(conn, board_id)
+            privileged[board_id] = await _stewards(conn, board, pid, now)
+    touched: dict[str, list[int]] = {}
+    for board_id, board_ns in plan.items():
+        tx, (done, skip) = await _write(
+            pool, board_id, actor, board_ns,
+            lambda tx, any_item=privileged[board_id], board_ns=board_ns: tx.touch(
+                board_ns, source=source, message_id=message_id, excerpt=excerpt,
+                any_item=any_item))
+        if done:
+            touched[tx.board["slug"]] = done
+        skipped += [{**s, "board": tx.board["slug"]} for s in skip]
+    return {"touched": touched, "skipped": skipped}
+
+
 async def resolve_item(pool, ref: str, actor: dict, n: int, action: str, **kwargs) -> dict:
     tx, flags = await _write(pool, ref, actor, [n],
                              lambda tx: tx.resolve(n, action, **kwargs))
@@ -439,6 +505,12 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
                 raise ItemsError(422, "invalid_field", "orchestrator_pid is at most 200 characters",
                                  field=key)
             sets[key] = value or None
+        elif key in ("steward_pid", "channel"):
+            if value is not None and (not isinstance(value, str) or len(value) > 200):
+                raise ItemsError(422, "invalid_field", f"{key} is at most 200 characters",
+                                 field=key)
+            text = (value or "").strip()
+            sets[key] = (text.lstrip("#") if key == "channel" else text) or None
         elif key == "name":
             if not isinstance(value, str) or not value.strip() or len(value) > 200:
                 raise ItemsError(422, "invalid_field", "name must be 1-200 characters",
@@ -450,6 +522,13 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
     async with pool.acquire() as conn:
         async with conn.transaction():
             board = await _board_by_ref(conn, ref, lock=True)
+            # Naming a steward gives it chat-activity rights on every item:
+            # only Owner or the board's current orchestrator may.
+            if "steward_pid" in sets and actor["pid"] != OWNER_PID:
+                orch = await _orchestrator_row(conn, board, now)
+                if not orch or orch.get("pid") != actor["pid"]:
+                    raise ItemsError(403, "forbidden",
+                                     "only Owner or the board's orchestrator sets steward_pid")
             prev = {k: board[k] for k in sets}
             changed = {k: v for k, v in sets.items() if board[k] != v}
             if changed:

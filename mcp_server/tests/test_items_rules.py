@@ -319,9 +319,22 @@ class Waiting(unittest.TestCase):
         self.assertIsNone(self.b[1].eta_at)
         self.assertIsNone(self.b[1].waiting_set_at)
 
-    def test_eta_with_other_status_refused(self):
-        with self.assertRaises(ItemsError):
-            self.b.set(1, status="active", eta="40m")
+    def test_an_active_item_may_carry_an_eta_other_statuses_may_not(self):
+        # 2026-10-20 (Board-Steward): active + eta = working, expected by then.
+        self.b.set(1, status="active", eta="40m")
+        it = self.b[1]
+        self.assertEqual((it.status, it.eta_at), ("active", NOW + timedelta(minutes=40)))
+        self.b.set(1, note="halfway")
+        self.assertEqual(self.b[1].eta_at, NOW + timedelta(minutes=40), "kept on later edits")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, status="blocked", blocked_on="GPU", eta="1h")
+        self.assertEqual(cm.exception.code, "invalid_field")
+        self.b.set(1, status="blocked", blocked_on="GPU")
+        self.assertIsNone(self.b[1].eta_at, "leaving active clears it")
+        # waiting -> active without a new eta drops the waiting eta.
+        self.b.set(1, status="waiting", eta="1h")
+        self.b.set(1, status="active")
+        self.assertIsNone(self.b[1].eta_at)
 
     def test_parse_when_forms(self):
         self.assertEqual(parse_when("2h", NOW, "eta"), NOW + timedelta(hours=2))

@@ -3762,6 +3762,68 @@ mod apply_manifest_diff_tests {
         assert_eq!(super::model::exit_note(Some(&other)), None);
     }
 
+    fn app_with_sessions(n: usize) -> App {
+        let mut app = build_app_with_session("ts-page-0");
+        for i in 1..n {
+            let session = crate::session::Session::new(
+                "/bin/true", &[], 80, 24, None, std::collections::HashMap::new(), None,
+            )
+            .expect("test PTY");
+            let ts = make_simple_session_with_uid(format!("ts-page-{i}"), "test-label", "claude", session, None);
+            app.workspaces[0].sessions.push(ts);
+        }
+        app.sidebar_view = SidebarView::Status;
+        app.cursor = Cursor::Session(0, 0);
+        app
+    }
+
+    fn alt(c: char) -> CrosstermEvent {
+        let mods = if c.is_ascii_uppercase() { KeyModifiers::ALT | KeyModifiers::SHIFT } else { KeyModifiers::ALT };
+        CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Char(c), mods))
+    }
+
+    /// 2026-10-20: A-u / A-d page by half the visible rows (vim Ctrl-u /
+    /// Ctrl-d) and stop at the ends instead of wrapping.
+    #[test]
+    fn alt_d_and_alt_u_page_half_the_visible_rows_without_wrapping() {
+        let mut app = app_with_sessions(12);
+        app.sidebar_page_rows = 8;
+        app.handle_event(&alt('d'));
+        assert_eq!(app.cursor, Cursor::Session(0, 4));
+        app.handle_event(&alt('d'));
+        app.handle_event(&alt('d'));
+        assert_eq!(app.cursor, Cursor::Session(0, 11), "clamped at the last row");
+        app.handle_event(&alt('u'));
+        assert_eq!(app.cursor, Cursor::Session(0, 7));
+        app.handle_event(&alt('u'));
+        app.handle_event(&alt('u'));
+        assert_eq!(app.cursor, Cursor::Session(0, 0), "clamped at the first row");
+        // A tiny pane still moves one row.
+        app.sidebar_page_rows = 1;
+        app.handle_event(&alt('d'));
+        assert_eq!(app.cursor, Cursor::Session(0, 1));
+        // A-j still wraps.
+        app.cursor = Cursor::Session(0, 11);
+        app.handle_event(&alt('j'));
+        assert_eq!(app.cursor, Cursor::Session(0, 0));
+    }
+
+    /// Mark-done moved to A-D and workflow resume to A-U; plain A-d / A-u
+    /// only page. Both Shift encodings reach the moved actions.
+    #[test]
+    fn mark_done_is_alt_shift_d_and_plain_alt_d_does_not_open_it() {
+        let mut app = app_with_sessions(3);
+        app.sidebar_page_rows = 4;
+        app.handle_event(&alt('d'));
+        assert!(!matches!(app.input_mode, InputMode::WorktreeCleanup(_)), "A-d pages");
+        app.handle_event(&alt('D'));
+        assert!(app.is_input_mode(), "A-D opens the completion dialog");
+        app.input_mode = InputMode::Normal;
+        let folded = CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Char('D'), KeyModifiers::ALT));
+        app.handle_event(&folded);
+        assert!(app.is_input_mode(), "Shift folded into the char also works");
+    }
+
     /// The shown session is reported once, then not again until the
     /// interval passes or the selection changes.
     #[test]

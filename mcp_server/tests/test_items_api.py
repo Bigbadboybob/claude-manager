@@ -544,6 +544,78 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         bad = await self.post(f"/boards/{self.ref}/items/touch", {"actor": LANE, "ns": [1], "source": "Chat!"})
         self.assertEqual(bad.status_code, 422)
 
+    async def test_chat_touch_resolves_the_board_and_applies_the_sender_rules(self):
+        # 2026-10-20 (Board-Steward via Swarm-Coord): holders, the steward and
+        # the orchestrator refresh #N; #N resolves on the channel's board,
+        # else on the one board the sender may refresh it on.
+        steward = {"pid": "agent:d1:steward", "name": "steward"}
+        other_root = await self._task("other")
+        other = (await self.post("/boards/resolve", {"task_id": other_root})).json()
+        await self.create({"title": "a", "holders": [LANE]}, {"title": "b"})
+        r = await self.post(f"/boards/{other['slug']}/items",
+                            {"actor": ORCH, "items": [{"title": "x", "holders": [LANE]}]})
+        self.assertEqual(r.status_code, 200, r.text)
+
+        async def touch(actor, ns, channel=None):
+            r = await self.post("/items/chat-touch", {"actor": actor, "ns": ns, "channel": channel,
+                                                      "message_id": "m", "excerpt": "e"})
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()
+
+        # LANE holds #1 on both boards: ambiguous without a bound channel.
+        got = await touch(LANE, [1])
+        self.assertEqual((got["touched"], got["skipped"]), ({}, [{"n": 1, "reason": "ambiguous"}]))
+        refused = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": LANE, "steward_pid": LANE["pid"]})
+        self.assertEqual(refused.status_code, 403, refused.text)
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "steward_pid": steward["pid"], "channel": "#proj/sfd"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["settings"]["channel"], "proj/sfd")
+        self.assertEqual(r.json()["settings"]["steward_pid"], steward["pid"])
+        got = await touch(LANE, [1, 2], channel="proj/sfd")
+        self.assertEqual(got["touched"], {self.ref: [1]})
+        self.assertEqual(got["skipped"], [{"n": 2, "reason": "not_holder", "board": self.ref}])
+        # The steward's post about any item of its board is history, but only
+        # a holder's touch resets the clock (review of f24e170).
+        before = (await self.fetch("SELECT touched_at FROM items WHERE number = 2"))[0]["touched_at"]
+        got = await touch(steward, [2])
+        self.assertEqual(got["touched"], {self.ref: [2]})
+        after = (await self.fetch("SELECT touched_at FROM items WHERE number = 2"))[0]["touched_at"]
+        self.assertEqual(after, before, "no clock reset")
+        # Anyone else's mention is only a reference.
+        stranger = {"pid": "agent:d1:stranger", "name": "s"}
+        got = await touch(stranger, [2], channel="proj/sfd")
+        self.assertEqual(got["touched"], {})
+        got = await touch(stranger, [2])
+        self.assertEqual(got["skipped"], [{"n": 2, "reason": "not_found"}])
+        events = await self.fetch("SELECT item_number, actor_pid FROM item_events WHERE type = 'chat_ref' ORDER BY id")
+        self.assertEqual([(e["item_number"], e["actor_pid"]) for e in events],
+                         [(1, LANE["pid"]), (2, steward["pid"])])
+
+    async def test_chat_touch_counts_the_picked_orchestrator(self):
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO session_states (pid, daemon_id, session_uid, task_id, name, engine,
+                                               state, state_since, reported_at)
+                   VALUES ('agent:d1:coord', 'd1', 'coord', $1, 'coord', 'codex', 'idle', $2, $2)""",
+                uuid.UUID(self.root), now)
+        await self.create({"title": "a"})
+        coord = {"pid": "agent:d1:coord", "name": "coord", "task_id": self.root}
+        # Not a candidate without a bound channel: the candidate set is the
+        # explicit holder, steward or orchestrator only.
+        r = await self.post("/items/chat-touch", {"actor": coord, "ns": [1]})
+        self.assertEqual(r.json()["skipped"], [{"n": 1, "reason": "not_found"}], r.text)
+        # Through the bound channel the picked orchestrator counts, and may
+        # name the steward.
+        r = await self.http.patch(f"/boards/{self.ref}", json={"actor": coord, "channel": "c"})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.post("/items/chat-touch", {"actor": coord, "ns": [1], "channel": "c"})
+        self.assertEqual(r.json()["touched"], {self.ref: [1]}, r.text)
+        r = await self.http.patch(f"/boards/{self.ref}", json={"actor": coord, "steward_pid": "agent:d1:s"})
+        self.assertEqual(r.status_code, 200, r.text)
+
     async def test_answer_resolves_blocked_on_owner(self):
         await self.create({"title": "gpu", "holders": [LANE]})
         await self.patch(1, actor=LANE, status="blocked_on_owner", blocked_on="approve?")

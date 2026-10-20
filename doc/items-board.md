@@ -70,20 +70,34 @@ re-read fully every ~30 s.
 2. **Touch.** Every write by a board member (any `item_set`, even one that
    changes nothing, recorded as a `touched` event; `item_resolve`, including
    `nudge`) sets `touched_at`, so the orchestrator parking or checking an item
-   resets its stale clock too. Observed activity also touches: a holder's chat
-   post naming `#N`, or a reply in a thread whose root names `#N`, touches
-   that open item on every board where the sender holds it (event `chat_ref`
-   with the message id and a 200-character excerpt; status and note never
-   change). The sender's daemon does this after the send, on one bounded
-   background worker, through `POST /boards/{ref}/items/touch`.
+   resets its stale clock too. Observed activity also touches (2026-10-20): a
+   chat post refreshes open item N when **all** hold — the sender holds N or
+   is the board's `steward_pid` or orchestrator (explicit or picked); N
+   resolves on the board whose `channel` is the post's channel, else on the
+   only board where N is open and the sender holds it or is that board's
+   explicit `steward_pid` / `orchestrator_pid` (several → skipped
+   `ambiguous`); and the post is a
+   top-level post naming `#N` or a reply in a thread whose root names `#N`.
+   A reply naming some other `#M`, anyone else's mention, and quoted (`>`)
+   lines are references only. Event `chat_ref` with the message id and a
+   200-character excerpt; status and note never change. Only a holder's post
+   resets the stale clock: a steward's or orchestrator's post about someone
+   else's item is history only, so an item that keeps being nagged still
+   goes stale and escalates. The sender's daemon
+   does this after the send, on one bounded background worker, through
+   `POST /items/chat-touch` (falling back to the holder-only
+   `POST /boards/{ref}/items/touch` against an older API).
 3. **`blocked_by`.** Every blocker must exist on the same board and be neither
    `done` nor `dropped` → else `422 invalid_blocker`. An item cannot block
    itself. A new edge that closes a cycle → `409 cycle` with the path, e.g.
    `cycle: 14→15→14`. Passing `blocked_by=[]` removes all edges.
 4. **`waiting`** requires `eta` → else `422 eta_required`. `eta` is a duration
    (`40m`, `2h`, `1h30m`) or an RFC 3339 time; stores `eta_at` and
-   `waiting_set_at=now`; leaving `waiting` clears both, and `eta` with another
-   explicit status is refused. `check_back` takes the same forms.
+   `waiting_set_at=now`; leaving `waiting` clears both. An `active` item may
+   carry an ETA too (explicit `status="active"` with `eta`: working, expected
+   done by then; kept on later edits while it stays `active`); `eta` with any
+   other explicit status is refused. `waiting` stays for parked work.
+   `check_back` takes the same forms.
 5. **Done.** Remove edges where the item is a blocker. Each dependent left with
    no blockers, status `blocked` and no `blocked_on` returns to `active` with
    `clock_reset_at=now` and an `unblocked` push to its holders. Set
@@ -141,13 +155,15 @@ also raised by the write path. Thresholds are per board:
 | `idle_s` | 1200 (20 min) |
 | `stale_s` | 7200 (2 h) |
 | `unassigned_s` | 300 |
-| `repush_s` | 1800 |
+| `repush_s` | 1800 (how long the holder alone hears about `overdue` / `eta_passed`) |
 | `escalate_s` | 3600 |
 | `digest_s` | 300 |
 | `stale_background_s` | 21600 (6 h) |
 | `nudge_grace_s` | 1800 (30 min) |
 | `holder_idle_enabled` | **false** until engine state is live on all hosts |
 | `orchestrator_pid` | null = auto (below) |
+| `steward_pid` | null; its `#N` posts are recorded on any item (§2). Set only by Owner or the board's current orchestrator (else `403`) |
+| `channel` | null; the conversation path whose `#N` means this board's item N |
 
 | Kind | Raised when |
 |---|---|
@@ -158,6 +174,7 @@ also raised by the write path. Thresholds are per board:
 | `stale_background` | held, a holder is busy in background work (state `working-background`, or a live `agent_state.background` job with `wakes_agent`), and untouched for `stale_background_s` (default 6 h) |
 | `stale` | held, no holder busy in background work, not parked (`blocked_on` + a future `check_back_at`), `now − max(touched_at, clock_reset_at) ≥ stale_s`; for `waiting` the threshold is `max(stale_s, eta_at − waiting_set_at)` |
 | `overdue` | `waiting` and `now > eta_at + 0.25·(eta_at − waiting_set_at)` |
+| `eta_passed` | `active` with an ETA (capped at `stale_background_s` after it was set, so a far ETA cannot silence an item for weeks), `now ≥ eta_at`, and no activity since (`max(touched_at, clock_reset_at) ≤ eta_at`); `ETA_STALE_GRACE_S` (1800, fixed) after the ETA, still without activity, `stale` too (detail `{eta_at}`, no nudge round). New activity or a new ETA clears both |
 | `check_back` | `blocked_on` set and `check_back_at` passed |
 | `blocker_dropped` | a blocker of this item was dropped |
 
@@ -169,7 +186,10 @@ also raised by the write path. Thresholds are per board:
 (`holder_gone` still applies). An item blocked only by open items (`blocked_by` non-empty,
 `blocked_on` empty) is exempt from `holder_idle` and `stale`. Free-text
 `blocked_on` earns no exemption. `waiting` before its overdue point is exempt
-from `holder_idle`. Nothing exempts `holder_gone`. Since `blocked_by` cannot
+from `holder_idle`. An `active` item before its ETA gets no `holder_idle`,
+`stale`, `stale_background` or `check_back`; errored, waiting-on-human and
+blocker flags still apply, and a holder that is gone or errored ends the
+window at once. Nothing exempts `holder_gone`. Since `blocked_by` cannot
 form a cycle, every waiting chain ends at an unexempt item.
 
 **Nudge before flag.** When `stale` first holds, the engine pushes the holder
@@ -212,9 +232,21 @@ ids are acked on the next beat; unacked rows are re-sent.
 | `stale_nudge` | holder | `stale` first holds (the orchestrator hears only after `nudge_grace_s`) |
 | `owner_blocked` | orchestrator | an item enters or leaves `blocked_on_owner` (immediately, not batched) |
 | `nudge` | holders | `item_resolve(nudge)` |
-| `overdue` | holder when raised; orchestrator once the flag is `repush_s` old | flag |
-| `board` | orchestrator | new flags immediately; unresolved flags every `repush_s` — whenever any flag is new or due, the push carries every open flag and their re-push clocks align, so k flags are one wake per window; done/dropped/blocked events by others than the orchestrator, batched over a `digest_s` window. One row per orchestrator per tick; no push without a live orchestrator |
-| `escalation` (`owner_alert`) | Owner via the orchestrator's daemon (else the coordinator's most recent session, live or not) | no orchestrator, or it is `idle`/`unknown`/gone/`errored`/`waiting-on-human`, and flags unresolved for `escalate_s`; once per flag (`escalated_at`) |
+| `overdue` / `eta_passed` | holder when raised; orchestrator once the flag is `repush_s` old | flag |
+| `board` | orchestrator | flags that are news: raised, or open while their item changed since they last reached the orchestrator (below); done/dropped/blocked events by others than the orchestrator, batched over a `digest_s` window. One row per orchestrator per tick, carrying only the news; no push without a live orchestrator |
+| `escalation` (`owner_alert`) | Owner via the orchestrator's daemon (else the coordinator's most recent session, live or not) | no orchestrator, or it is `idle`/`unknown`/gone/`errored`/`waiting-on-human`, and flags unresolved for `escalate_s`; once per flag and item state |
+
+**Change-only pushes (2026-10-20).** A flag reaches each audience (holder,
+orchestrator, Owner) again only when its item changed since it last did: a
+different status, holders or flag detail, or any activity (every member
+write touches the item, so ETA, blocker and note changes count). Never on a
+timer, and never just because the flag cleared and came back — except
+`holder_errored`, `holder_waiting_on_human`, `holder_gone` and
+`blocker_dropped`, where each new raise is a new episode (another prompt,
+error, exit or drop) and is pushed again. A holder
+flickering between background work and idle used to re-raise
+`stale_background` and push the same flags over and over (EP). The engine
+keeps `items.flag_pushed = {"<kind>[:holder|:escalated]": {fp, at}}`.
 
 Text stays under ~1 KB, e.g.
 `[cm-board sfd] 2 flags: #14 holder_idle (rl-scale-out idle 24m); #9 stale 2h10m · 3 done (#3,#5,#6). board() / item_resolve(n, action)`.
@@ -245,6 +277,7 @@ FastAPI's standard 422.
 | `POST /boards/{ref}/items/{n}/resolve` | `{actor, action, kind?, holders?, blocked_by?, blocked_on?, check_back?, reason?, message?}` | `{board, item, flags_resolved: [kind], unblocked, warnings}` |
 | `GET /items` | `?holder_pid=&open=true` | `[{board, n, title, status}]` |
 | `POST /boards/{ref}/items/touch` | `{actor, ns: [n], source: "chat", message_id?, excerpt?}` | `{board, touched: [n], skipped: [{n, reason: not_found|closed|not_holder}]}`; only open items the actor holds; never changes status or note |
+| `POST /items/chat-touch` | `{actor (with task_id), ns: [n], channel?, source?, message_id?, excerpt?}` | `{touched: {slug: [n]}, skipped: [{n, reason: not_found|ambiguous|closed|not_holder, board?}]}`; the chat rules of §2 |
 | `GET /items/owner-blocked` | (none) | `[{board, board_name, n, title, decision, since, holders: [{pid, session_uid, daemon_id, name}]}]`, oldest first, across boards |
 | `POST /hosts/{daemon_id}/heartbeat` | `{host_label, sessions: [state row], exited: [pid], acked_push_ids: [id]}` | `{pushes: [{id, session_uid, pid, kind, text, owner_alert, board_id, board}], server_time}` (≤ 100 per beat) |
 

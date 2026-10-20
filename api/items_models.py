@@ -62,12 +62,16 @@ class BoardPatchBody(_Strict):
     actor: Actor
     name: Short | None = None
     orchestrator_pid: Short | None = None
+    steward_pid: Short | None = None
+    channel: Short | None = None
     idle_s: Seconds | None = None
     stale_s: Seconds | None = None
     unassigned_s: Seconds | None = None
     repush_s: Seconds | None = None
     escalate_s: Seconds | None = None
     digest_s: Seconds | None = None
+    stale_background_s: Seconds | None = None
+    nudge_grace_s: Seconds | None = None
     holder_idle_enabled: bool | None = None
 
 
@@ -89,6 +93,15 @@ class ItemsPatchBody(_Strict):
 class ItemsTouchBody(_Strict):
     actor: Actor
     ns: list[ItemNumber] = Field(min_length=1, max_length=50)
+    source: str = Field(default="chat", pattern="^[a-z_]{1,32}$")
+    message_id: Short | None = None
+    excerpt: str | None = Field(default=None, max_length=1000)
+
+
+class ItemsChatTouchBody(_Strict):
+    actor: Actor
+    ns: list[ItemNumber] = Field(min_length=1, max_length=50)
+    channel: Short | None = None
     source: str = Field(default="chat", pattern="^[a-z_]{1,32}$")
     message_id: Short | None = None
     excerpt: str | None = Field(default=None, max_length=1000)

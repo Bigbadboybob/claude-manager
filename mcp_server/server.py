@@ -266,7 +266,8 @@ def item(
     session uid or participant id, or holder="none" to leave it unassigned.
     status: open/active/waiting/blocked/blocked_on_owner/done/dropped (default active).
     eta ("40m", "2h" or a time) marks a long job as waiting, which keeps it
-    from being flagged idle. blocked_by takes open item numbers on the same
+    from being flagged idle; with status="active" it means "working, expected
+    done by then": no idle/stale flags before it, eta_passed after it. blocked_by takes open item numbers on the same
     board (no cycles); blocked_on is free text ("EP GO") and gets no idle or
     stale exemption.
 
@@ -301,7 +302,8 @@ def item_set(
 ) -> dict:
     """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
     note="needs EP GO"), item_set(15, blocked_by=[14]),
-    item_set(14, "waiting", eta="40m", note="full C2 run").
+    item_set(14, "waiting", eta="40m", note="full C2 run"),
+    item_set(14, "active", eta="2h", note="training; back by then").
 
     Waiting on a decision only Owner can make: item_set(14, "blocked_on_owner",
     blocked_on="approve 8xH100 for SEJD?") (you must hold the item and name the

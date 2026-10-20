@@ -76,7 +76,7 @@ pub(super) enum InputMode {
         /// can prompt/read/control ANY session, not just descendants.
         global_perms: bool,
         /// Accent color for this session's sidebar row — a `USER_COLORS`
-        /// name, cycled with Space/←/→. `None` = inherit workspace color.
+        /// name, picked in the color grid. `None` = inherit workspace color.
         color: Option<String>,
         /// Read-only provenance: name of the agent-memory snapshot this
         /// session was cloned from, if any. Surfaced at the bottom of the
@@ -269,7 +269,7 @@ pub(super) enum InputMode {
         max_scroll: u16,
     },
     /// Generic y/N confirmation overlay. The action runs only on `y`/`Y`/Enter;
-    /// `n`/`N`/Esc cancels. Used to gate destructive keys (A-d, A-x).
+    /// `n`/`N`/Esc cancels. Used to gate destructive keys (A-D, A-x).
     Confirm {
         prompt: String,
         action: ConfirmAction,
@@ -1362,14 +1362,6 @@ pub(crate) fn handle_session_settings(
             *state.global_perms = !*state.global_perms;
             InputOutcome::Consumed
         }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 6 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 6 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
-            InputOutcome::Consumed
-        }
         KeyCode::Enter => {
             let new_timeout = state
                 .idle_timeout
@@ -1450,14 +1442,6 @@ pub(crate) fn handle_workspace_settings(
         KeyCode::Left if *state.active_field == 3 => {
             *state.section =
                 cycle_section_choice(state.section.as_deref(), ctx.section_ids, false);
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
             InputOutcome::Consumed
         }
         KeyCode::Char(' ') if *state.active_field == 2 => {
@@ -1906,14 +1890,6 @@ pub(crate) fn handle_task_settings(
                 cycle_section_choice(state.section.as_deref(), ctx.section_ids, false);
             InputOutcome::Consumed
         }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
-            InputOutcome::Consumed
-        }
         KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveTaskName {
             task_id: state.task_id.to_string(),
             workspace_id: state.workspace_id.to_string(),
@@ -1948,14 +1924,6 @@ pub(crate) fn handle_section_settings(
         KeyCode::Esc => InputOutcome::Cancel,
         KeyCode::Tab | KeyCode::BackTab => {
             *state.active_field = (*state.active_field + 1) % 2;
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
             InputOutcome::Consumed
         }
         KeyCode::Enter => {
@@ -3209,8 +3177,12 @@ impl App {
             }
         }
 
-        // If in input mode, handle input events.
+        // If in input mode, handle input events. The color grid sits over
+        // an A-e form and takes its keys first.
         if self.is_input_mode() {
+            if let Some(handled) = self.color_grid_event(event) {
+                return handled;
+            }
             return self.handle_input_event(event);
         }
 
@@ -3323,12 +3295,26 @@ impl App {
                         self.attach_active();
                         return true;
                     }
-                    KeyCode::Char('d') => {
+                    // A-D: mark the task done (offers worktree cleanup).
+                    // Terminals report Shift either in the char case or as
+                    // a modifier — accept both. Plain A-d pages down.
+                    KeyCode::Char('D') | KeyCode::Char('d')
+                        if key.code == KeyCode::Char('D')
+                            || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
                         if matches!(self.cursor, Cursor::Section(_)) {
                             self.set_status_msg("A section is not a task — nothing to mark done");
                             return true;
                         }
                         self.open_worktree_completion(true);
+                        return true;
+                    }
+                    // A-u / A-d: page the focused sidebar column by half its
+                    // visible rows (vim Ctrl-u / Ctrl-d).
+                    KeyCode::Char('d') => {
+                        let prev = self.cursor_session_uid();
+                        self.page_sidebar(1);
+                        self.note_session_focus_change(prev);
                         return true;
                     }
                     KeyCode::Char('x') => {
@@ -3483,8 +3469,19 @@ impl App {
                         self.open_workflow_launch();
                         return true;
                     }
-                    KeyCode::Char('u') => {
+                    // A-U: resume a paused workflow (Shift as char case or
+                    // modifier).
+                    KeyCode::Char('U') | KeyCode::Char('u')
+                        if key.code == KeyCode::Char('U')
+                            || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
                         self.resume_workflow_for_cursor();
+                        return true;
+                    }
+                    KeyCode::Char('u') => {
+                        let prev = self.cursor_session_uid();
+                        self.page_sidebar(-1);
+                        self.note_session_focus_change(prev);
                         return true;
                     }
                     // A-O (Alt+Shift+O): open the past-workspaces picker.
@@ -7925,12 +7922,15 @@ mod input_handler_tests {
     }
 
     #[test]
-    fn task_settings_space_cycles_color_on_color_field() {
+    fn task_settings_space_on_color_field_is_left_to_the_grid() {
+        // The App-level color grid opens on this key before the form
+        // handler sees it (`color_grid.rs`); the handler itself must neither
+        // cycle the color nor type the space into the name.
         let task_id = "task-id-1".to_string();
         let mut name = "abc".to_string();
         let (mut color, mut active) = (None::<String>, 1u8);
         let mut section: Option<String> = None;
-        let outcome = handle_task_settings(
+        let _ = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
                 workspace_id: "ws-task",
@@ -7942,32 +7942,8 @@ mod input_handler_tests {
             ctx_no_repos(),
             &key(KeyCode::Char(' ')),
         );
-        assert_consumed(&outcome);
-        // First cycle step lands on the first palette entry; name untouched
-        // (the space must NOT be typed into the name field).
-        assert_eq!(color.as_deref(), Some(theme::USER_COLORS[0].0));
+        assert_eq!(color, None);
         assert_eq!(name, "abc");
-    }
-
-    #[test]
-    fn user_color_cycle_roundtrips_through_none() {
-        // Forward through every palette slot and back to None.
-        let mut cur: Option<String> = None;
-        for (name, _) in theme::USER_COLORS {
-            cur = theme::cycle_user_color(cur.as_deref(), true);
-            assert_eq!(cur.as_deref(), Some(*name));
-        }
-        cur = theme::cycle_user_color(cur.as_deref(), true);
-        assert_eq!(cur, None);
-        // One step back from None lands on the last palette entry.
-        cur = theme::cycle_user_color(cur.as_deref(), false);
-        assert_eq!(cur.as_deref(), Some(theme::USER_COLORS[theme::USER_COLORS.len() - 1].0));
-        // Unknown stored names behave like None (palette drift recovery).
-        assert_eq!(
-            theme::cycle_user_color(Some("mauve-nonexistent"), true).as_deref(),
-            Some(theme::USER_COLORS[0].0)
-        );
-        assert_eq!(theme::user_color("mauve-nonexistent"), None);
     }
 
     // ── WorkflowLaunchConfirm ─────────────────────────────────────

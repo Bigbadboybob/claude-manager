@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from api.auth import verify_token
 from api.items_models import (
     BoardPatchBody,
+    ItemsChatTouchBody,
     HeartbeatBody,
     BoardResolveBody,
     ItemResolveBody,
@@ -94,6 +95,13 @@ async def touch_items(ref: str, body: ItemsTouchBody, request: Request):
     return await _call(items_db.touch_items(
         _pool(request), ref, body.actor.model_dump(), body.ns, source=body.source,
         message_id=body.message_id, excerpt=body.excerpt))
+
+
+@router.post("/items/chat-touch")
+async def chat_touch(body: ItemsChatTouchBody, request: Request):
+    return await _call(items_db.chat_touch(
+        _pool(request), body.actor.model_dump(), body.ns, channel=body.channel,
+        source=body.source, message_id=body.message_id, excerpt=body.excerpt))
 
 
 @router.post("/boards/{ref}/items/{n}/resolve")
