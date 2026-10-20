@@ -444,7 +444,7 @@ impl App {
             self.messages.channel_selection_pending = true;
             // Joining/leaving must preserve the draft's address (path or ID).
             if value.get("membership").is_none() {
-                self.messages.target = json!({"conversation":value["channel"]["id"]});
+                self.messages.set_target(json!({"conversation":value["channel"]["id"]}));
             }
             self.messages.filter = json!({});
             self.messages.loaded_target = Value::Null;

@@ -278,7 +278,7 @@ fn execute_with_freshness(
             message: e.into(),
         })?;
     }
-    let (handle, root, uid, kind, live, draining, graph) = {
+    let (handle, root, uid, kind, live, draining, graph, search_budget) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let (uid, kind) = match &req.caller {
             Caller::Operator(_) => (String::new(), "owner"),
@@ -303,6 +303,7 @@ fn execute_with_freshness(
             live,
             s.draining,
             super::tasks::SessionGraph::capture(&s),
+            s.config.chat_search_budget_bytes,
         )
     };
     if draining {
@@ -335,6 +336,7 @@ fn execute_with_freshness(
         coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
     let store = slot.as_mut().ok_or_else(super::startup::starting)?;
+    store.configure_search(&handle, search_budget)?;
     let actor = if kind == "owner" {
         "owner".into()
     } else {
@@ -586,9 +588,13 @@ fn execute_with_freshness(
             message: "Messaging method not implemented".into(),
         }),
     };
-    if result.as_ref().is_err_and(|e| e.code == "search_indexing") {
-        store.start_search_worker(&handle)?;
-    }
+    store.start_search_worker(&handle)?;
+    let result = match result {
+        Err(e) if e.code == "search_indexing" => Ok(json!({"items":[], "indexing":true,
+            "retry_after":1,"partial_scope":p["channel"] == "*" || p["inbox"] == true || p["dms"] == true,
+            "next_cursor":p["cursor"], "search_truncated":false})),
+        result => result,
+    };
     project_names(state, store, true);
     let mut retraction_note = None;
     // A bulk mark settles pending wakes for every message it marked, exactly
@@ -1003,9 +1009,9 @@ mod tests {
         let handle = state.lock().unwrap().messaging.clone();
         let (entered, release) = handle.lock().unwrap().as_mut().unwrap().pause_search_for_test();
         let q = json!({"channel":"general","query":"verdict"});
-        let error = call(&state, "b", "read", q.clone()).unwrap_err();
-        assert_eq!(error.code, "search_indexing");
-        assert!(error.message.contains("after 1 second"));
+        let pending = call(&state, "b", "read", q.clone()).unwrap();
+        assert_eq!(pending["indexing"], true);
+        assert_eq!(pending["retry_after"], 1);
         entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         // The worker is suspended mid-build until release, making this a
         // deterministic concurrency check rather than a race with a tiny index.
@@ -1016,16 +1022,16 @@ mod tests {
         });
         let sent = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("send blocked on cold search").unwrap();
         sender.join().unwrap();
-        assert_eq!(call(&state, "b", "read", q.clone()).unwrap_err().code, "search_indexing");
+        assert_eq!(call(&state, "b", "read", q.clone()).unwrap()["indexing"], true);
         release.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let page = loop {
             match call(&state, "b", "read", q.clone()) {
-                Ok(page) => break page,
-                Err(e) if e.code == "search_indexing" => {
+                Ok(page) if page["indexing"] == true => {
                     assert!(std::time::Instant::now() < deadline);
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
+                Ok(page) => break page,
                 Err(e) => panic!("{e}"),
             }
         };

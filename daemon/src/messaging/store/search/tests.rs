@@ -642,6 +642,280 @@ fn chat_search_background_catches_backfill_behind_snapshot_cursor() {
     );
 }
 
+#[test]
+fn chat_search_budget_truncates_and_resumes_empty_cross_channel_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, people) = setup(tmp.path());
+    s.create_channel("owner", &json!({"path":"second","request_id":"second"}))
+        .unwrap();
+    let cids = [
+        s.channel_id_at_path("general").unwrap().to_owned(),
+        s.channel_id_at_path("second").unwrap().to_owned(),
+    ];
+    let mut expected = Vec::new();
+    for i in 0..12_000 {
+        let hit = [4_100, 8_300, 11_999].contains(&i);
+        let id = indexed(
+            &mut s,
+            &cids[i as usize % 2],
+            &people[0].id,
+            if hit {
+                "needle target"
+            } else {
+                "needle unrelated target"
+            },
+            i + 100,
+            "2026-10-20T20:00:00Z",
+        );
+        if hit {
+            expected.push(id);
+        }
+    }
+    assert_eq!(
+        s.prepare_search("owner", None, true, false)
+            .unwrap_err()
+            .code,
+        "search_indexing"
+    );
+    s.finish_search_for_test();
+    for newest in [false, true] {
+        let mut q =
+            json!({"channel":"*","query":"needle target","newest_first":newest,"limit":100});
+        let mut actual = Vec::new();
+        let mut truncated = 0;
+        for n in 0..1000 {
+            VISITS.with(|v| v.set(0));
+            let page = s.read("owner", &q, &[]).unwrap();
+            assert!(VISITS.with(Cell::get) <= 10_000);
+            actual.extend(ids(&page));
+            if page["search_truncated"] == true {
+                truncated += 1;
+            }
+            if page["next_cursor"].is_null() {
+                break;
+            }
+            assert!(n < 999, "cursor failed to make progress");
+            assert_ne!(q["cursor"], page["next_cursor"]);
+            q["cursor"] = page["next_cursor"].clone();
+        }
+        assert!(truncated > 0);
+        let mut want = expected.clone();
+        if newest {
+            want.reverse();
+        }
+        assert_eq!(actual, want);
+    }
+    // A filter rejecting every candidate must also yield bounded empty pages.
+    let page = s
+        .read(
+            "owner",
+            &json!({"channel":"*","query":"needle",
+        "time":{"start":"2020-01-01T00:00:00Z","end":"2020-01-02T00:00:00Z"}}),
+            &[],
+        )
+        .unwrap();
+    assert!(ids(&page).is_empty());
+    assert_eq!(page["search_truncated"], true);
+    assert!(page["next_cursor"]["last_id"].is_string());
+}
+
+#[test]
+fn chat_search_recent_broad_scope_and_requested_build_priority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, people) = setup(tmp.path());
+    let mut cids = Vec::new();
+    for n in 0..25 {
+        let path = format!("scope-{n}");
+        s.create_channel("owner", &json!({"path":path,"request_id":path}))
+            .unwrap();
+        let cid = s.channel_id_at_path(&path).unwrap().to_owned();
+        indexed(
+            &mut s,
+            &cid,
+            &people[0].id,
+            "verdict",
+            100 + n,
+            "2026-10-20T20:00:00Z",
+        );
+        cids.push(cid);
+    }
+    assert_eq!(
+        s.prepare_search("owner", None, true, false)
+            .unwrap_err()
+            .code,
+        "search_indexing"
+    );
+    assert_eq!(s.read_model.search.pending.len(), 20);
+    assert_eq!(s.read_model.search.pending.front(), cids.last());
+    assert_eq!(
+        s.prepare_search("owner", Some(&cids[0]), false, false)
+            .unwrap_err()
+            .code,
+        "search_indexing"
+    );
+    assert_eq!(s.read_model.search.pending.front(), Some(&cids[0]));
+    s.finish_search_for_test();
+    let page = s
+        .read("owner", &json!({"channel":"*","query":"verdict"}), &[])
+        .unwrap();
+    assert_eq!(page["partial_scope"], true);
+    assert_eq!(ids(&page).len(), 20);
+    let mut q = json!({"channel":"*","query":"verdict","newest_first":true,"limit":1});
+    let first = s.read("owner", &q, &[]).unwrap();
+    q["cursor"] = first["next_cursor"].clone();
+    indexed(
+        &mut s,
+        &cids[0],
+        &people[0].id,
+        "verdict",
+        900,
+        "2026-10-20T20:00:00Z",
+    );
+    let mut expected = ids(&page);
+    expected.reverse();
+    expected.remove(0);
+    assert_eq!(
+        all(&mut s, "owner", q),
+        expected,
+        "activity must not change a continuation's exposed scope"
+    );
+}
+
+#[test]
+fn chat_search_byte_budget_lru_and_failure_backoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, _) = setup(tmp.path());
+    let cid = s.channel_id_at_path("general").unwrap().to_owned();
+    s.prepare_search("owner", Some(&cid), false, false)
+        .unwrap_err();
+    s.finish_search_for_test();
+    let mut other = ConversationSearch::default();
+    other.document(ReadCursor::default(), 0, "owner", "another token", false);
+    s.read_model.search.install("other".into(), other);
+    let keep_bytes = s.read_model.search.conversations[&cid].bytes;
+    s.read_model.search.touch(&cid);
+    s.read_model.search.budget = keep_bytes;
+    s.read_model.search.enforce_budget();
+    assert!(s.read_model.search.conversations.contains_key(&cid));
+    assert!(!s.read_model.search.conversations.contains_key("other"));
+    assert_eq!(s.read_model.search.total_bytes, keep_bytes);
+    assert!(!s.read_model.search.retired.is_empty());
+    s.read_model.search.conversations.clear();
+    s.read_model.search.total_bytes = 0;
+    s.read_model.search.fail(cid.clone(), "test failure");
+    assert_eq!(
+        s.prepare_search("owner", Some(&cid), false, false)
+            .unwrap_err()
+            .code,
+        "search_index_failed"
+    );
+    assert!(s.read_model.search.pending.is_empty());
+    s.read_model.search.failed.get_mut(&cid).unwrap().until = Instant::now();
+    assert_eq!(
+        s.prepare_search("owner", Some(&cid), false, false)
+            .unwrap_err()
+            .code,
+        "search_indexing"
+    );
+}
+
+#[test]
+fn chat_search_worker_panic_has_backoff_then_recovers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, _) = setup(tmp.path());
+    let cid = s.channel_id_at_path("general").unwrap().to_owned();
+    let (entered, release) = s.pause_search_for_test();
+    s.prepare_search("owner", Some(&cid), false, false)
+        .unwrap_err();
+    let handle = Arc::new(Mutex::new(Some(s)));
+    handle
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .start_search_worker(&handle)
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    drop(release); // Inject a panic in the off-lock test hook.
+    let wait = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .read_model
+            .search
+            .worker
+            .is_some()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    wait();
+    {
+        let mut slot = handle.lock().unwrap();
+        let s = slot.as_mut().unwrap();
+        assert_eq!(
+            s.prepare_search("owner", Some(&cid), false, false)
+                .unwrap_err()
+                .code,
+            "search_index_failed"
+        );
+        assert!(s.read_model.search.pending.is_empty());
+        s.read_model.search.failed.get_mut(&cid).unwrap().until = Instant::now();
+        s.read_model.search.probe = Default::default();
+        s.prepare_search("owner", Some(&cid), false, false)
+            .unwrap_err();
+        s.start_search_worker(&handle).unwrap();
+    }
+    wait();
+    let slot = handle.lock().unwrap();
+    let search = &slot.as_ref().unwrap().read_model.search;
+    assert!(search.worker.is_none() && search.pending.is_empty());
+    assert!(search.conversations.contains_key(&cid));
+    assert!(!search.failed.contains_key(&cid));
+}
+
+#[test]
+fn chat_search_warm_growth_evicts_by_search_not_publication_recency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, people) = setup(tmp.path());
+    s.create_channel("owner", &json!({"path":"other","request_id":"other"}))
+        .unwrap();
+    let cid = s.channel_id_at_path("general").unwrap().to_owned();
+    let other = s.channel_id_at_path("other").unwrap().to_owned();
+    indexed(
+        &mut s,
+        &other,
+        &people[0].id,
+        "other verdict",
+        100,
+        "2026-10-20T20:00:00Z",
+    );
+    s.prepare_search("owner", Some(&cid), false, false)
+        .unwrap_err();
+    s.finish_search_for_test();
+    s.prepare_search("owner", Some(&other), false, false)
+        .unwrap_err();
+    s.finish_search_for_test();
+    s.read_model.search.budget = s.read_model.search.total_bytes;
+    indexed(
+        &mut s,
+        &cid,
+        &people[0].id,
+        "brand new words in verdict",
+        200,
+        "2026-10-20T20:00:00Z",
+    );
+    let search = &s.read_model.search;
+    assert!(!search.conversations.contains_key(&cid));
+    assert!(search.conversations.contains_key(&other));
+    assert!(search.total_bytes <= search.budget);
+    assert!(!search.retired.is_empty());
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn rss_bytes() -> u64 {
     fs::read_to_string("/proc/self/status")
@@ -815,6 +1089,11 @@ fn chat_search_startup_and_resident_bench() {
         cold_request.as_micros(),
         max_lock_ns / 1000
     );
+    println!(
+        "SEARCH_BENCH accounted_cache_bytes={} cache_budget_bytes={}",
+        s.read_model.search.total_bytes, s.read_model.search.budget
+    );
+    assert!(s.read_model.search.total_bytes <= s.read_model.search.budget);
     println!("SEARCH_BENCH startup_without_hook_median_ms={:.3} startup_lazy_hook_median_ms={:.3} cold_build_ms={:.3} rss_before={} rss_after={} rss_delta={} allocated_before={} allocated_after={} allocated_delta={} unique_words={} senders={} posting_entries={} warm_query_us={} warm_visits={} returned={}",
         disabled[1].as_secs_f64()*1000.,enabled[1].as_secs_f64()*1000.,cold.as_secs_f64()*1000.,
         rss_before,rss_after,rss_after.saturating_sub(rss_before),alloc_before,alloc_after,alloc_after.saturating_sub(alloc_before),

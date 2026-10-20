@@ -248,7 +248,8 @@ class MessagingToolsTests(unittest.TestCase):
     def test_search_filters_and_cursor_pass_through_in_both_views(self):
         cursor = {"snapshot": {"position": 42}, "filter": "f", "search_sender": "agent:h:a"}
         result = {"items": [{"id": "m", "actor": {"name": "Scout"}, "body": "final verdict"}],
-                  "next_cursor": cursor, "receipt": {"ids": ["m"]}}
+                  "next_cursor": cursor, "receipt": {"ids": ["m"]},
+                  "search_truncated": True, "partial_scope": True, "indexing": True, "retry_after": 2}
         with patch.object(control_client, "call", return_value=result) as call:
             server.chat_read(channel="general")
             self.assertNotIn("sender", call.call_args.args[1])
@@ -263,6 +264,8 @@ class MessagingToolsTests(unittest.TestCase):
                 self.assertEqual(params["cursor"], cursor)
                 self.assertEqual(page["next_cursor"], cursor)
                 self.assertEqual(page["receipt"], result["receipt"])
+                for key in ("search_truncated", "partial_scope", "indexing", "retry_after"):
+                    self.assertEqual(page[key], result[key])
 
     def test_channel_admin_and_pin_tools_preserve_intent_and_use_daemon(self):
         with patch.object(control_client, "call", return_value={}) as call:

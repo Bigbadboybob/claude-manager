@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 mod build;
+mod cache;
+mod page;
+mod scope;
+pub(super) use scope::SearchScope;
 
 #[cfg(test)]
 mod tests;
@@ -17,6 +21,9 @@ struct Posting {
     arrivals: Vec<usize>,
 }
 impl Posting {
+    fn bytes(&self) -> usize {
+        (self.canonical.capacity() + self.arrivals.capacity()) * std::mem::size_of::<usize>()
+    }
     fn insert(&mut self, index: usize, documents: &[(ReadCursor, usize)]) {
         if self
             .canonical
@@ -50,12 +57,22 @@ struct ConversationSearch {
     documents: Vec<(ReadCursor, usize)>,
     senders: HashMap<String, Posting>,
     words: HashMap<String, Posting>,
+    bytes: usize,
+    last_search: u64,
 }
-#[derive(Default)]
 pub(super) struct SearchIndex {
     conversations: HashMap<String, ConversationSearch>,
-    pending: BTreeSet<String>,
+    pending: std::collections::VecDeque<String>,
     worker: Option<String>,
+    active: Option<String>,
+    failed: HashMap<String, cache::Failure>,
+    requested: HashMap<String, u64>,
+    budget: usize,
+    total_bytes: usize,
+    building_bytes: usize,
+    clock: u64,
+    retired: Vec<ConversationSearch>,
+    handle: Weak<Mutex<Option<Store>>>,
     #[cfg(test)]
     probe: build::Probe,
 }
@@ -63,6 +80,12 @@ fn words(text: &str) -> Vec<String> {
     normalize(text).unicode_words().map(str::to_owned).collect()
 }
 impl ConversationSearch {
+    fn header_bytes(&self) -> usize {
+        self.documents.capacity() * std::mem::size_of::<(ReadCursor, usize)>()
+            + (self.words.capacity() + self.senders.capacity())
+                * 2
+                * std::mem::size_of::<(String, Posting)>()
+    }
     fn index(&mut self, e: &Published, event_index: usize) {
         self.document(
             ReadCursor::of(&e.event),
@@ -80,16 +103,24 @@ impl ConversationSearch {
         body: &str,
         sorted: bool,
     ) {
+        let before_header = self.header_bytes();
+        let mut added = key.event_id.capacity();
         let index = self.documents.len();
         self.documents.push((key, event_index));
-        let insert = |posting: &mut Posting| {
+        let mut posting_added = 0;
+        let mut insert = |posting: &mut Posting| {
+            let before = posting.bytes();
             if sorted {
                 posting.insert(index, &self.documents);
             } else {
                 posting.canonical.push(index);
                 posting.arrivals.push(index);
             }
+            posting_added += posting.bytes() - before;
         };
+        if !self.senders.contains_key(sender) {
+            added += sender.len();
+        }
         insert(self.senders.entry(sender.into()).or_default());
         // Borrow words from one normalized body. Only new dictionary entries
         // allocate strings; sorting/dedup replaces a per-message BTreeSet.
@@ -101,9 +132,11 @@ impl ConversationSearch {
             if let Some(posting) = self.words.get_mut(word) {
                 insert(posting);
             } else {
+                added += word.len();
                 insert(self.words.entry(word.into()).or_default());
             }
         }
+        self.bytes += added + posting_added + self.header_bytes() - before_header;
     }
     fn sort(&mut self) {
         for p in self.senders.values_mut().chain(self.words.values_mut()) {
@@ -124,8 +157,14 @@ impl SearchIndex {
             .get_mut(strv(&e.event, "conversation_id"))
         {
             if Store::readable_event(&e.event) {
+                let before = c.bytes;
                 c.index(e, index);
+                self.total_bytes += c.bytes - before;
             }
+        }
+        self.enforce_budget();
+        if !self.retired.is_empty() {
+            let _ = self.launch_worker();
         }
     }
 }
@@ -153,27 +192,8 @@ impl Store {
         public: bool,
         dms: bool,
     ) -> Result<()> {
-        let missing: Vec<_> = self
-            .read_model
-            .conversations
-            .keys()
-            .filter(|cid| {
-                conv.is_none_or(|wanted| *cid == wanted)
-                    && self.visible(actor, cid)
-                    && (!dms || self.conversations.contains_key(*cid))
-                    && (!public || self.channel_paths.contains_key(*cid))
-                    && !self.read_model.search.conversations.contains_key(*cid)
-            })
-            .cloned()
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        self.read_model.search.pending.extend(missing);
-        Err(err(
-            "search_indexing",
-            "Search index is building in the background; retry the same query after 1 second",
-        ))
+        self.search_scope(actor, conv, public, dms, None)
+            .map(|_| ())
     }
 
     pub(super) fn search_filter(&self, p: &Value, people: &[Person]) -> Result<SearchFilter> {
@@ -237,9 +257,9 @@ impl Store {
         Ok(SearchFilter { sender, words })
     }
 
-    /// Start with the smallest sender/word posting, seek the page anchor in its
-    /// appropriate order, then intersect postings. Only phrase candidates need
-    /// body decoding; unrelated history is never visited by a search call.
+    /// Seek the smallest posting and expose every candidate before filtering.
+    /// The page merger budgets visits across all conversations, including
+    /// rejected intersections, phrase checks, time windows and other filters.
     pub(super) fn search_candidates<'a>(
         &'a self,
         cid: &str,
@@ -248,7 +268,7 @@ impl Store {
         newest: bool,
         after: Option<u64>,
         high: u64,
-    ) -> Box<dyn Iterator<Item = &'a Published> + 'a> {
+    ) -> Box<dyn Iterator<Item = (&'a Published, bool)> + 'a> {
         let index = &self.read_model.search;
         let Some(c) = index.conversations.get(cid) else {
             return Box::new(std::iter::empty());
@@ -297,23 +317,14 @@ impl Store {
             });
             Box::new(primary.canonical[lo..].iter())
         };
-        Box::new(
-            candidates
-                .filter(move |&&i| {
-                    #[cfg(test)]
-                    tests::visit();
-                    self.events[c.documents[i].1].position <= high
-                        && lists.iter().all(|p| {
-                            p.arrivals
-                                .binary_search_by_key(&c.documents[i].1, |j| c.documents[*j].1)
-                                .is_ok()
-                        })
-                        && (search.words.len() <= 1
-                            || words(strv(&self.events[c.documents[i].1].event, "body"))
-                                .windows(search.words.len())
-                                .any(|w| w == search.words))
-                })
-                .map(|i| &self.events[c.documents[*i].1]),
-        )
+        Box::new(candidates.map(move |&i| {
+            let eligible = self.events[c.documents[i].1].position <= high
+                && lists.iter().all(|p| {
+                    p.arrivals
+                        .binary_search_by_key(&c.documents[i].1, |j| c.documents[*j].1)
+                        .is_ok()
+                });
+            (&self.events[c.documents[i].1], eligible)
+        }))
     }
 }

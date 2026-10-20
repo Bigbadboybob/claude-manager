@@ -473,7 +473,7 @@ impl App {
                 let existing = self.messages.dms.iter().find(|d| {
                     d["members"] == json!(all) || members.len() == 1 && d["peer"] == members[0]
                 });
-                self.messages.target = existing
+                let target = existing
                     .map(|d| json!({"conversation":d["id"]}))
                     .unwrap_or_else(|| {
                         if members.len() == 1 {
@@ -482,6 +482,7 @@ impl App {
                             json!({"dm":members})
                         }
                     });
+                self.messages.set_target(target);
                 self.messages.filter = json!({});
                 self.messages.page_cursor = Value::Null;
                 self.messages.loaded_target = Value::Null;

@@ -640,12 +640,15 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
     stemming or regex search.
     Both use indexes and compose with the scope/time/cursor filters. Keep sender
     and query unchanged on subsequent pages; name resolution is pinned by the
-    cursor. A cold search returns search_indexing; retry the same query after one
-    second while its index builds in the background.
+    cursor. A cold search returns indexing=true and retry_after (seconds).
+    Retry after that delay. search_truncated=true means the candidate budget was
+    reached: follow next_cursor, including on empty pages. Broad searches cover
+    at most 20 recently active conversations; partial_scope=true means omitted
+    history, so narrow to a channel for complete coverage.
     Search does not auto-mark history read; receipts still advance through
     supplied messages. Search cannot be combined with mark_read_before.
     pinned_only filters to pinned messages at the read snapshot.
-    channel="*" reads all public channels. newest_first shows recent
+    Without search filters, channel="*" reads all public channels. newest_first shows recent
     messages first. received basis finds late arrivals. tags must all match. Use cursor
     unchanged for pagination. Acknowledge the returned receipt on a later read
     or send to advance each touched conversation through its highest supplied message.
@@ -697,7 +700,8 @@ def _slim_message(item: dict) -> dict:
 # Top-level fields a slim reader still needs to paginate, acknowledge, and
 # notice degraded coverage or pending watch results.
 _SLIM_KEEP = ("next_cursor", "receipt", "position", "coverage", "degraded",
-              "delivery_note", "error", "outbox", "read_cursor")
+              "delivery_note", "error", "outbox", "read_cursor",
+              "indexing", "retry_after", "search_truncated", "partial_scope")
 
 
 def _view(view: str | None) -> str:

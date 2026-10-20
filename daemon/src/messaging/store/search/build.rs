@@ -107,9 +107,7 @@ impl Build {
         store
             .read_model
             .search
-            .conversations
-            .insert(self.cid.clone(), std::mem::take(&mut self.index));
-        store.read_model.search.pending.remove(&self.cid);
+            .install(self.cid.clone(), std::mem::take(&mut self.index));
     }
 }
 
@@ -159,21 +157,25 @@ fn with_store<T>(
         return None;
     }
     let result = f(store);
+    let retired = std::mem::take(&mut store.read_model.search.retired);
     let elapsed = start.elapsed();
     drop(slot);
     probe.record(elapsed);
+    drop(retired);
     Some(result)
 }
 
 fn run(handle: &Weak<Handle>, token: &str, mut probe: Probe) {
     loop {
         let Some(Some(mut build)) = with_store(handle, token, &probe, |s| {
-            s.read_model
-                .search
-                .pending
-                .first()
-                .cloned()
-                .map(|cid| Build::new(s, cid))
+            let search = &mut s.read_model.search;
+            if let Some(cid) = search.pending.pop_front() {
+                search.active = Some(cid.clone());
+                Some(Build::new(s, cid))
+            } else {
+                search.worker = None; // atomic with observing the empty queue
+                None
+            }
         }) else {
             return;
         };
@@ -185,6 +187,22 @@ fn run(handle: &Weak<Handle>, token: &str, mut probe: Probe) {
             probe.pause(); // test barrier: deliberately outside every store/delivery lock
             for doc in batch {
                 doc.index(&mut build.index, false);
+            }
+            let reserved = with_store(handle, token, &probe, |s| {
+                if s.read_model.search.reserve(build.index.bytes) {
+                    true
+                } else {
+                    s.read_model.search.fail(
+                        build.cid.clone(),
+                        "Conversation exceeds the search byte budget",
+                    );
+                    s.read_model.search.active = None;
+                    s.read_model.search.building_bytes = 0;
+                    false
+                }
+            });
+            if reserved != Some(true) {
+                return;
             }
             if done {
                 break;
@@ -209,19 +227,43 @@ fn run(handle: &Weak<Handle>, token: &str, mut probe: Probe) {
             for doc in batch {
                 doc.index(&mut build.index, true);
             }
+            let reserved = with_store(handle, token, &probe, |s| {
+                s.read_model.search.reserve(build.index.bytes)
+            });
+            if reserved != Some(true) {
+                with_store(handle, token, &probe, |s| {
+                    s.read_model.search.fail(
+                        build.cid.clone(),
+                        "Conversation exceeds the search byte budget",
+                    );
+                    s.read_model.search.active = None;
+                    s.read_model.search.building_bytes = 0;
+                });
+                return;
+            }
         }
     }
 }
 
 impl Store {
     pub(crate) fn start_search_worker(&mut self, handle: &Arc<Handle>) -> Result<()> {
-        let search = &mut self.read_model.search;
-        if search.worker.is_some() || search.pending.is_empty() {
+        self.read_model.search.handle = Arc::downgrade(handle);
+        self.read_model.search.launch_worker()
+    }
+}
+
+impl SearchIndex {
+    pub(super) fn launch_worker(&mut self) -> Result<()> {
+        let search = self;
+        if search.worker.is_some()
+            || (search.pending.is_empty() && search.retired.is_empty())
+            || search.handle.strong_count() == 0
+        {
             return Ok(());
         }
         let token = uuid();
         search.worker = Some(token.clone());
-        let handle = Arc::downgrade(handle);
+        let handle = search.handle.clone();
         #[cfg(test)]
         let probe = search.probe.clone();
         #[cfg(not(test))]
@@ -241,6 +283,12 @@ impl Store {
                     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(s) = slot.as_mut() {
                         if s.read_model.search.worker.as_deref() == Some(&token) {
+                            if result.is_err() {
+                                if let Some(cid) = s.read_model.search.active.take() {
+                                    s.read_model.search.fail(cid, "Search construction failed");
+                                }
+                                s.read_model.search.building_bytes = 0;
+                            }
                             s.read_model.search.worker = None;
                         }
                     }
@@ -252,7 +300,9 @@ impl Store {
         }
         Ok(())
     }
+}
 
+impl Store {
     #[cfg(test)]
     pub(crate) fn pause_search_for_test(
         &mut self,
@@ -269,7 +319,7 @@ impl Store {
     // production scheduling and concurrent sends.
     #[cfg(test)]
     pub(super) fn finish_search_for_test(&mut self) {
-        while let Some(cid) = self.read_model.search.pending.first().cloned() {
+        while let Some(cid) = self.read_model.search.pending.front().cloned() {
             let mut build = Build::new(self, cid);
             loop {
                 let (batch, done) = build.snapshot(self);

@@ -20832,6 +20832,7 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                chat_search_budget_bytes: 512 * 1024 * 1024,
                 presence_idle_enabled: true,
                 workflow_state_gate: false,
                 mcp_server_path:

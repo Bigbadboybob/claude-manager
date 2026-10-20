@@ -498,7 +498,7 @@ impl App {
             }
         } else if method == "messaging.monitor" {
             self.messages.mode.clear();
-            self.messages.target = json!({"monitors":true});
+            self.messages.set_target(json!({"monitors":true}));
             self.messages.management.view = "monitors".into();
             self.messages.saved.management.forms.remove("monitor_form");
             self.messages.persist();
@@ -718,7 +718,7 @@ impl App {
             if let Some(p) = self.messages.saved.management.pending.clone() {
                 if p.method == "messaging.norms" {
                     let scope = p.params["scope"].as_str().unwrap_or("global");
-                    self.messages.target = json!({"norms":true,"norms_scope":scope});
+                    self.messages.set_target(json!({"norms":true,"norms_scope":scope}));
                     if let Some(id) = scope.strip_prefix("channel:") {
                         self.messages.target["norms_channel"] = json!(id);
                         self.messages.target["norms_label"] = json!(format!("{} norms", self.messages.conversation_label(&json!(id))));
@@ -841,7 +841,7 @@ impl App {
         }
         if key.code == KeyCode::Char('N') {
             if let Some(channel) = self.messages.current_channel().cloned() {
-                self.messages.target = json!({"norms":true,"norms_scope":format!("channel:{}", channel["id"].as_str().unwrap()),"norms_label":format!("#{} norms",channel["path"].as_str().unwrap()),"norms_channel":channel["id"]});
+                self.messages.set_target(json!({"norms":true,"norms_scope":format!("channel:{}", channel["id"].as_str().unwrap()),"norms_label":format!("#{} norms",channel["path"].as_str().unwrap()),"norms_channel":channel["id"]}));
                 self.messages.pane = 1;
                 self.messages.page_cursor = Value::Null;
                 self.messaging_refresh_target();
@@ -849,7 +849,7 @@ impl App {
             }
         }
         if key.code == KeyCode::Char('b') && self.messages.target["norms_channel"].is_string() {
-            self.messages.target = json!({"conversation":self.messages.target["norms_channel"]});
+            self.messages.set_target(json!({"conversation":self.messages.target["norms_channel"]}));
             self.messages.page_cursor = Value::Null;
             self.messaging_refresh_target();
             return true;
@@ -874,7 +874,7 @@ impl App {
         if key.code == KeyCode::Char('f') {
             self.messages.management.paging = false;
             self.messages.management.scope = self.messages.scope_input();
-            self.messages.target = json!({"preferences":true});
+            self.messages.set_target(json!({"preferences":true}));
             self.messages.pane = 1;
             self.messaging_refresh_target();
             return true;
@@ -986,7 +986,7 @@ impl App {
                         .get(self.messages.management.selected)
                         .cloned()
                     {
-                        self.messages.target = json!({"conversation":hit["conversation_id"]});
+                        self.messages.set_target(json!({"conversation":hit["conversation_id"]}));
                         self.messages.filter = json!({"thread":hit["id"]});
                         self.messages.page_cursor = Value::Null;
                         self.messaging_refresh_target();

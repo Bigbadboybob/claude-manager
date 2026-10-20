@@ -176,7 +176,7 @@ impl App {
             }
             KeyCode::Enter if self.messages.mode == "channel_browser" => {
                 if let Some(c) = matches.get(self.messages.picker_selected) {
-                    self.messages.target = json!({"channel": c["path"]});
+                    self.messages.set_target(json!({"channel": c["path"]}));
                     self.messages.mode.clear();
                     self.messages.filter = json!({});
                     self.messages.page_cursor = Value::Null;

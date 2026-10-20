@@ -48,15 +48,35 @@ Search filters cannot be combined with the bulk `mark_read_before` operation.
 
 Per-conversation sender and word postings are built lazily in a background worker
 on the first search, then maintained on publication and replica ingest. While
-pending, reads return `search_indexing` with a request to retry after one second;
-no partial page or read receipt is returned. TUI refreshes retry automatically.
+pending, RPC reads return `indexing:true,retry_after:1`. A direct cold search
+returns no messages or receipt. Broad reads may already return warm results.
+The TUI retries at most five times, respecting `retry_after` with exponential
+backoff; reapply `/` filters to retry after that. Changing targets clears sender
+and query filters. Build failures return `search_index_failed` with a 30-second
+backoff instead of an endless indexing response.
 The worker copies small batches from the existing timeline under short store
 locks and tokenizes/sorts outside the lock. It catches up publications and
 backfill that arrived during construction before atomically installing the index.
 Startup/restart does not tokenize bodies, allocate search postings, or replay
-additional files. Only searched conversations retain an index.
-Reads seek within the smallest posting and intersect the others; phrase
-verification only examines candidates. Canonical and arrival
+additional files. `daemon.toml`'s `chat_search_budget_bytes` defaults to 512 MiB;
+zero disables search. Config reload applies it on the next messaging RPC.
+Accounting includes vector capacities, string storage and a conservative hash
+table allowance, across cached indexes and the worker's in-progress index;
+it is not a bound on whole-process RSS. Least-recently-searched indexes are
+evicted and freed outside the store lock. A conversation exceeding the budget
+fails with backoff. A direct request takes priority over queued broad builds.
+
+Broad searches select at most 20 recently active conversations and initially
+search their warm indexes while queuing the cold ones. `partial_scope:true`
+means some visible conversations are omitted; narrow to a channel for complete
+coverage. Continuations pin the exposed conversation set as well as the read
+snapshot, so later activity cannot silently change page scope.
+
+Reads seek within the smallest posting and intersect the others. Across the
+whole page, candidate work stops at 10,000 visits or about 20 ms (checked between
+candidates), including failed phrase checks and other filters. Budget exhaustion
+returns `search_truncated:true` and a continuation cursor. Even an empty page
+can have a cursor: keep paging until it is null. Canonical and arrival
 postings preserve both ordinary history and `after` pagination without scanning
 the journal. No on-disk index or migration is needed. Cache coverage still applies:
 search cannot find history that the replica has not received.
