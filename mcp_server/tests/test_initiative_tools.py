@@ -68,7 +68,7 @@ class InitiativeToolsTests(unittest.TestCase):
             self.assertEqual(call.call_args.args[1]["kind"], "division")
 
     def test_migration_adds_division_kind_idempotently(self):
-        migration = (Path(__file__).parents[2] / "sql" / "021_initiative_kind.sql").read_text()
+        migration = (Path(__file__).parents[2] / "sql" / "022_initiative_kind.sql").read_text()
         self.assertIn("ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'initiative'", migration)
         self.assertIn("IF NOT EXISTS", migration.split("initiatives_kind_check")[0])
 

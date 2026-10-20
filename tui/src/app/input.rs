@@ -477,6 +477,18 @@ pub(crate) enum SubmitAction {
     /// Submit attempted but the inputs produced no work to do (e.g.
     /// empty workspace name, no workflow selected). Modal still closes.
     None,
+    /// A-n with "Reports to" set: create the workspace's task under
+    /// `parent`, then launch it like a planning launch (see
+    /// `App::create_reporting_workspace`).
+    CreateReportingWorkspace {
+        engine: LaunchEngine,
+        repo_url: String,
+        label: String,
+        branch: Option<String>,
+        in_place: bool,
+        host_id: cm_daemon::host_id::HostId,
+        parent: crate::task_picker::TaskChoice,
+    },
     CreateLocalSession {
         engine: LaunchEngine,
         repo_url: String,
@@ -646,6 +658,10 @@ pub(crate) struct NewSessionMut<'a> {
     pub seed_from: &'a mut Option<String>,
     pub host_id: &'a mut cm_daemon::host_id::HostId,
     pub active_field: &'a mut u8,
+    /// Field 7. `report_tasks` are the picker's candidates.
+    pub reports_to: &'a mut crate::task_picker::ReportsTo,
+    pub picker: &'a mut Option<crate::task_picker::TaskPicker>,
+    pub report_tasks: &'a [crate::task_picker::TaskChoice],
 }
 
 pub(crate) struct NewTerminalSessionMut<'a> {
@@ -1005,7 +1021,43 @@ pub(crate) fn handle_new_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    const FIELD_COUNT: u8 = 7; // repo, label, branch, idle, seed-from, host, engine
+    const FIELD_COUNT: u8 = 8; // repo, label, branch, idle, seed-from, host, engine, reports-to
+    use crate::task_picker::{PickerKey, ReportsTo, TaskPicker};
+    if let Some(picker) = state.picker.as_mut() {
+        match picker.key(*key) {
+            PickerKey::Open => {}
+            PickerKey::Cancelled => *state.picker = None,
+            PickerKey::Picked(choice) => {
+                *state.reports_to = ReportsTo::Task(choice);
+                *state.picker = None;
+            }
+        }
+        return InputOutcome::Consumed;
+    }
+    if *state.active_field == 7 {
+        let plain = !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => {
+                *state.picker =
+                    Some(TaskPicker::new(" Reports to ", state.report_tasks.to_vec(), String::new()));
+                return InputOutcome::Consumed;
+            }
+            KeyCode::Char(c) if plain => {
+                *state.picker =
+                    Some(TaskPicker::new(" Reports to ", state.report_tasks.to_vec(), c.to_string()));
+                return InputOutcome::Consumed;
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                *state.reports_to = ReportsTo::Standalone;
+                return InputOutcome::Consumed;
+            }
+            KeyCode::Esc if *state.reports_to != ReportsTo::Standalone => {
+                *state.reports_to = ReportsTo::Standalone;
+                return InputOutcome::Consumed;
+            }
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Esc => {
             // Esc on the seed-from field with a value clears the
@@ -1103,6 +1155,26 @@ pub(crate) fn handle_new_session(
                     .idle_timeout_text
                     .parse::<u16>()
                     .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+                if let ReportsTo::Task(parent) = state.reports_to.clone() {
+                    // The reporting workspace launches as a planning task
+                    // (task row first, then a task-bound spawn), which has no
+                    // snapshot seeding.
+                    if state.seed_from.is_some() {
+                        return InputOutcome::Status(
+                            "Seed from and Reports to can't be combined; clear one (Esc on the field)"
+                                .into(),
+                        );
+                    }
+                    return InputOutcome::Submit(SubmitAction::CreateReportingWorkspace {
+                        engine: *state.engine,
+                        repo_url: state.repo_url.clone(),
+                        label: state.label_text.clone(),
+                        branch,
+                        in_place,
+                        host_id: state.host_id.clone(),
+                        parent,
+                    });
+                }
                 InputOutcome::Submit(SubmitAction::CreateLocalSession {
                     engine: *state.engine,
                     repo_url: state.repo_url.clone(),
@@ -3013,7 +3085,11 @@ impl App {
                     in_place,
                     engine,
                     host_id,
+                    reparent,
                 } => {
+                    if reparent {
+                        self.set_task_parent(&task_id, parent_task_id.as_deref());
+                    }
                     self.launch_from_plan(
                         &project,
                         &slug,
@@ -3037,7 +3113,11 @@ impl App {
                     prompt,
                     parent_task_id,
                     engine,
+                    reparent,
                 } => {
+                    if reparent {
+                        self.set_task_parent(&task_id, parent_task_id.as_deref());
+                    }
                     self.launch_into_workspace(
                         &workspace_id,
                         &task_id,
@@ -3799,6 +3879,11 @@ impl App {
         }
         // Section ids for the workspace / task settings pickers.
         let section_ids: Vec<String> = self.section_ids();
+        let report_tasks = if matches!(self.input_mode, InputMode::NewSession { .. }) {
+            self.reports_to_choices()
+        } else {
+            Vec::new()
+        };
         let outcome = match &mut self.input_mode {
             InputMode::WorktreeCleanup(menu) => match event {
                 CrosstermEvent::Key(key) => menu.key(*key),
@@ -3832,6 +3917,9 @@ impl App {
                     seed_from,
                     host_id,
                     active_field,
+                    reports_to: &mut self.new_session_reports_to,
+                    picker: &mut self.new_session_picker,
+                    report_tasks: &report_tasks,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
@@ -4148,6 +4236,19 @@ impl App {
     pub(super) fn apply_submit_action(&mut self, action: SubmitAction) {
         match action {
             SubmitAction::None => {}
+            SubmitAction::CreateReportingWorkspace {
+                engine,
+                repo_url,
+                label,
+                branch,
+                in_place,
+                host_id,
+                parent,
+            } => {
+                self.create_reporting_workspace(
+                    engine, &repo_url, &label, branch, in_place, host_id, parent,
+                );
+            }
             SubmitAction::CreateLocalSession {
                 engine,
                 repo_url,
@@ -5019,6 +5120,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
@@ -5042,6 +5146,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Backspace),
@@ -5064,6 +5171,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5111,6 +5221,9 @@ mod input_handler_tests {
                     seed_from: &mut None,
                     host_id: &mut host,
                     active_field: &mut active,
+                    reports_to: &mut Default::default(),
+                    picker: &mut None,
+                    report_tasks: &[],
                 },
                 ctx_no_repos(),
                 &key(KeyCode::Enter),
@@ -5139,6 +5252,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5171,6 +5287,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5199,6 +5318,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Char('x')),
@@ -5223,6 +5345,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             InputCtx { repo_urls: &urls, host_ids: &[], section_ids: &[] },
             &key(KeyCode::Right),
@@ -5233,17 +5358,90 @@ mod input_handler_tests {
 
     // ── NewSession seed-from (chunk 5) ────────────────────────────
 
+    /// Field 7 "Reports to": Enter (or typing) opens the task picker, a pick
+    /// sets the parent, and the submit becomes a reporting-workspace create.
     #[test]
-    fn new_session_tab_cycles_through_seven_fields() {
-        // The engine picker is field 6; both directions wrap through every field.
+    fn new_session_reports_to_picks_a_parent_and_submits_it() {
+        use crate::task_picker::{ReportsTo, TaskChoice, TaskPicker};
+        let tasks = vec![
+            TaskChoice { task_id: "t-cto".into(), name: "Execution policy".into() },
+            TaskChoice { task_id: "t-doc".into(), name: "Docs".into() },
+        ];
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
+            new_session_state("probe", "", "2", "git@x:r.git", 7);
+        let mut seed: Option<String> = None;
+        let mut reports_to = ReportsTo::Standalone;
+        let mut picker: Option<TaskPicker> = None;
+        let mut press = |code: KeyCode,
+                         active: &mut u8,
+                         seed: &mut Option<String>,
+                         reports_to: &mut ReportsTo,
+                         picker: &mut Option<TaskPicker>| {
+            handle_new_session(
+                NewSessionMut {
+                    engine: &mut LaunchEngine::default(),
+                    label_text: &mut label,
+                    branch_text: &mut branch,
+                    idle_timeout_text: &mut timeout,
+                    repo_url: &mut repo,
+                    seed_from: seed,
+                    host_id: &mut host,
+                    active_field: active,
+                    reports_to,
+                    picker,
+                    report_tasks: &tasks,
+                },
+                ctx_no_repos(),
+                &key(code),
+            )
+        };
+        // Typing on the field opens the picker seeded with the key.
+        assert_consumed(&press(KeyCode::Char('d'), &mut active, &mut seed, &mut reports_to, &mut picker));
+        assert_eq!(picker.as_ref().map(|p| p.query.as_str()), Some("d"));
+        assert_consumed(&press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker));
+        assert!(picker.is_none());
+        assert_eq!(reports_to.parent_task_id(), Some("t-doc"));
+        // Backspace on the field returns to Standalone; Enter reopens the picker.
+        assert_consumed(&press(KeyCode::Backspace, &mut active, &mut seed, &mut reports_to, &mut picker));
+        assert_eq!(reports_to, ReportsTo::Standalone);
+        press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker);
+        press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker);
+        assert_eq!(reports_to.parent_task_id(), Some("t-cto"));
+        // Enter on another field submits a reporting workspace.
+        active = 1;
+        match press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker) {
+            InputOutcome::Submit(SubmitAction::CreateReportingWorkspace { label, parent, .. }) => {
+                assert_eq!(label, "probe");
+                assert_eq!(parent.task_id, "t-cto");
+            }
+            other => panic!("expected CreateReportingWorkspace, got {other:?}"),
+        }
+        // A seed can't ride a reporting workspace.
+        seed = Some("snap".into());
+        assert!(matches!(
+            press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker),
+            InputOutcome::Status(_)
+        ));
+        // Standalone keeps today's create.
+        seed = None;
+        reports_to = ReportsTo::Standalone;
+        assert!(matches!(
+            press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker),
+            InputOutcome::Submit(SubmitAction::CreateLocalSession { .. })
+        ));
+    }
+
+    #[test]
+    fn new_session_tab_cycles_through_eight_fields() {
+        // Engine is field 6, Reports to field 7; both directions wrap through every field.
         let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("", "", "", "", 0);
         let mut seed: Option<String> = None;
-        for (code, expected) in [1, 2, 3, 4, 5, 6, 0]
+        for (code, expected) in [1, 2, 3, 4, 5, 6, 7, 0]
             .into_iter()
             .map(|field| (KeyCode::Tab, field))
             .chain(
-                [6, 5, 4, 3, 2, 1, 0]
+                [7, 6, 5, 4, 3, 2, 1, 0]
                     .into_iter()
                     .map(|field| (KeyCode::BackTab, field)),
             )
@@ -5258,6 +5456,9 @@ mod input_handler_tests {
                     seed_from: &mut seed,
                     host_id: &mut host,
                     active_field: &mut active,
+                    reports_to: &mut Default::default(),
+                    picker: &mut None,
+                    report_tasks: &[],
                 },
                 ctx_no_repos(),
                 &key(code),
@@ -5281,6 +5482,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5327,6 +5531,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
@@ -5351,6 +5558,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
@@ -5373,6 +5583,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5406,6 +5619,9 @@ mod input_handler_tests {
                     seed_from: &mut seed,
                     host_id: &mut host,
                     active_field: &mut active,
+                    reports_to: &mut Default::default(),
+                    picker: &mut None,
+                    report_tasks: &[],
                 },
                 ctx_no_repos(),
                 &key(code),
@@ -5424,6 +5640,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5453,6 +5672,9 @@ mod input_handler_tests {
                 seed_from: &mut Some("prior-codex-seed".into()),
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5519,6 +5741,9 @@ mod input_handler_tests {
                     seed_from: &mut None,
                     host_id: host,
                     active_field: &mut active,
+                    reports_to: &mut Default::default(),
+                    picker: &mut None,
+                    report_tasks: &[],
                 },
                 InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
                 &key(code),
@@ -5558,6 +5783,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
             &key(KeyCode::Right),
@@ -5572,6 +5800,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
             &key(KeyCode::Enter),
@@ -5600,6 +5831,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Right),

@@ -47,6 +47,7 @@ mod events;
 use events::*;
 mod lifecycle;
 mod plan_launch;
+mod reports_to;
 mod remote_create;
 mod restart;
 mod background;
@@ -286,6 +287,14 @@ pub struct App {
     input_mode: InputMode,
     snapshot_store: agent_memory::SnapshotStore,
     session_form_host: Option<cm_daemon::host_id::HostId>,
+    /// A-n "Reports to" field and its open picker. Kept beside the form
+    /// (not in `InputMode::NewSession`) so the snapshot-picker round trip
+    /// preserves it; `start_new_session` resets both.
+    new_session_reports_to: crate::task_picker::ReportsTo,
+    new_session_picker: Option<crate::task_picker::TaskPicker>,
+    /// A-n forms with a "Reports to" parent, parked until their task row
+    /// exists (`BackendEvent::ReportingTaskCreated`), keyed by request id.
+    pending_report_launches: HashMap<String, reports_to::PendingReportLaunch>,
     start_time: Instant,
     sessions_restored: bool,
     /// Task→workspace bindings loaded from the manifest at startup. Consulted
@@ -983,6 +992,9 @@ impl App {
             input_mode: InputMode::Normal,
             snapshot_store: agent_memory::SnapshotStore::Local,
             session_form_host: None,
+            new_session_reports_to: Default::default(),
+            new_session_picker: None,
+            pending_report_launches: HashMap::new(),
             start_time: Instant::now(),
             sessions_restored: false,
             manifest_bindings,

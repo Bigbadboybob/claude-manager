@@ -1278,6 +1278,8 @@ impl App {
             }
         };
 
+        self.new_session_reports_to = Default::default();
+        self.new_session_picker = None;
         self.input_mode = InputMode::NewSession {
             engine: LaunchEngine::default(),
             label_text: String::new(),
@@ -4051,6 +4053,22 @@ impl App {
         // a launch may have inserted a new TaskEntry.
         self.push_state_to_daemon();
         self.set_status_msg("Task launched into workspace");
+    }
+
+    /// Set a task's reporting line (`parent_task_id`; `None` = standalone),
+    /// from the launch forms' "Reports to" field. The API inherits the new
+    /// parent's initiative; the local entry is updated now so the next
+    /// task-tree push carries the edge.
+    pub(super) fn set_task_parent(&mut self, task_id: &str, parent_task_id: Option<&str>) {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some(task_id)) {
+            task.parent_task_id = parent_task_id.map(str::to_string);
+        }
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "parent_task_id".to_string(),
+            parent_task_id.map_or(serde_json::Value::Null, |p| serde_json::Value::String(p.into())),
+        );
+        self.backend.update_plan_task(task_id.to_string(), fields);
     }
 
     /// Clear a task's workspace binding. Task status is left alone.

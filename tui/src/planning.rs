@@ -565,6 +565,9 @@ pub enum PlanAction {
         /// Claude by default).
         engine: LaunchEngine,
         host_id: crate::hosts::HostId,
+        /// The A-f "Reports to" row changed the parent: PATCH
+        /// `parent_task_id` (to the value above) with the launch.
+        reparent: bool,
     },
     /// Bind a task to an existing workspace and spawn a session there
     /// (no new worktree, no branch input).
@@ -588,6 +591,8 @@ pub enum PlanAction {
         /// Agent to spawn into the existing workspace (picker
         /// choice, Claude by default).
         engine: LaunchEngine,
+        /// See `LaunchTask::reparent`.
+        reparent: bool,
     },
     /// Clear a task's `workspace_id`. Task status is not affected.
     UnbindTask {
@@ -1135,6 +1140,13 @@ pub struct PlanningView {
     pub launch_host: crate::hosts::HostId,
     launch_hosts: Vec<crate::hosts::HostId>,
     default_launch_host: crate::hosts::HostId,
+    /// A-f "Reports to" row: the launched task's parent. Seeded from the
+    /// row's current parent when the dialog opens; a change is PATCHed as
+    /// `parent_task_id` on launch (`reparent` on the action).
+    launch_reports_to: crate::task_picker::ReportsTo,
+    launch_reports_to_orig: crate::task_picker::ReportsTo,
+    /// Open Alt+r picker over the launch dialogs.
+    launch_picker: Option<crate::task_picker::TaskPicker>,
     projects: Vec<PlanProject>,
     project_data: Vec<ProjectData>,
     /// None = show all projects, Some(idx) = show one project.
@@ -1225,6 +1237,9 @@ impl PlanningView {
             launch_host: crate::hosts::HostId::local(),
             launch_hosts: vec![crate::hosts::HostId::local()],
             default_launch_host: crate::hosts::HostId::local(),
+            launch_reports_to: Default::default(),
+            launch_reports_to_orig: Default::default(),
+            launch_picker: None,
             projects: vec![],
             project_data: vec![],
             project_filter: None,
@@ -2713,6 +2728,9 @@ impl PlanningView {
         let total = num_candidates + 1;
 
         if let CrosstermEvent::Key(key) = event {
+            if self.launch_reports_to_key(key, project_idx, task_idx) {
+                return PlanAction::Consumed;
+            }
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
                 self.cycle_launch_host();
                 return PlanAction::Consumed;
@@ -2776,6 +2794,7 @@ impl PlanningView {
                             return PlanAction::Consumed;
                         };
                         self.input_mode = PlanInputMode::Normal;
+                        let reparent = self.apply_launch_reports_to(project_idx, task_idx);
                         if let Some(pd) = self.project_data.get_mut(project_idx) {
                             if let Some(task) = pd.tasks.get_mut(task_idx) {
                                 let prompt = compose_launch_prompt(
@@ -2797,6 +2816,7 @@ impl PlanningView {
                                     // the correct edge.
                                     parent_task_id: task.parent_task_id.clone(),
                                     engine,
+                                    reparent,
                                 };
                             }
                         }
@@ -2810,6 +2830,11 @@ impl PlanningView {
 
     fn handle_launch_confirm_event(&mut self, event: &CrosstermEvent) -> PlanAction {
         if let CrosstermEvent::Key(key) = event {
+            if let PlanInputMode::LaunchConfirm { project_idx, task_idx, .. } = self.input_mode {
+                if self.launch_reports_to_key(key, project_idx, task_idx) {
+                    return PlanAction::Consumed;
+                }
+            }
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
                 self.cycle_launch_host();
                 return PlanAction::Consumed;
@@ -2825,6 +2850,7 @@ impl PlanningView {
                 KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
                 KeyCode::Enter => {
                     self.input_mode = PlanInputMode::Normal;
+                    let reparent = self.apply_launch_reports_to(project_idx, task_idx);
                     if let Some(pd) = self.project_data.get_mut(project_idx) {
                         if let Some(task) = pd.tasks.get_mut(task_idx) {
                             let project = pd.project.name.clone();
@@ -2859,6 +2885,7 @@ impl PlanningView {
                                 in_place,
                                 engine,
                                 host_id: self.launch_host.clone(),
+                                reparent,
                             };
                         }
                     }
@@ -3688,9 +3715,126 @@ impl PlanningView {
         Line::from(Span::styled(format!("  Host: {}  (Alt+h change; new workspace)", self.launch_host), Style::default().fg(theme::MUTED)))
     }
 
+    /// Every open (not done/archived) task on the board, for "Reports to"
+    /// pickers outside the planning view.
+    pub fn open_task_choices(&self) -> Vec<crate::task_picker::TaskChoice> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| pd.tasks.iter())
+            .filter(|t| !t.id.is_empty() && !matches!(t.status, PlanStatus::Done | PlanStatus::Archived))
+            .map(|t| crate::task_picker::TaskChoice { task_id: t.id.clone(), name: t.title.clone() })
+            .collect()
+    }
+
+    /// The "Reports to" row value for the task at (pi, ti).
+    fn reports_to_of(&self, pi: usize, ti: usize) -> crate::task_picker::ReportsTo {
+        use crate::task_picker::{ReportsTo, TaskChoice};
+        let Some(parent) = self
+            .project_data
+            .get(pi)
+            .and_then(|pd| pd.tasks.get(ti))
+            .and_then(|t| t.parent_task_id.clone())
+        else {
+            return ReportsTo::Standalone;
+        };
+        let name = self
+            .project_data
+            .iter()
+            .flat_map(|pd| pd.tasks.iter())
+            .find(|t| t.id == parent)
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| parent.clone());
+        ReportsTo::Task(TaskChoice { task_id: parent, name })
+    }
+
+    /// Picker candidates for the launched task: "Standalone" first, then
+    /// every open task outside its own subtree (a cycle the API would
+    /// accept and every tree walk would then have to survive).
+    fn reports_to_candidates(&self, pi: usize, ti: usize) -> Vec<crate::task_picker::TaskChoice> {
+        use crate::task_picker::TaskChoice;
+        let Some(me) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)) else {
+            return Vec::new();
+        };
+        let all: Vec<&PlanTask> = self.project_data.iter().flat_map(|pd| pd.tasks.iter()).collect();
+        let parent_of: HashMap<&str, &str> = all
+            .iter()
+            .filter_map(|t| Some((t.id.as_str(), t.parent_task_id.as_deref()?)))
+            .collect();
+        let under_me = |id: &str| {
+            let mut cur = Some(id);
+            for _ in 0..64 {
+                match cur {
+                    Some(c) if c == me.id => return true,
+                    Some(c) => cur = parent_of.get(c).copied(),
+                    None => return false,
+                }
+            }
+            true
+        };
+        let mut out = vec![TaskChoice { task_id: String::new(), name: "Standalone".into() }];
+        out.extend(
+            all.iter()
+                .filter(|t| !matches!(t.status, PlanStatus::Done | PlanStatus::Archived))
+                .filter(|t| !t.id.is_empty() && !under_me(&t.id))
+                .map(|t| TaskChoice { task_id: t.id.clone(), name: t.title.clone() }),
+        );
+        out
+    }
+
+    /// Alt+r opens the picker; while open it takes every key. Returns true
+    /// when the key was the picker's.
+    fn launch_reports_to_key(&mut self, key: &crossterm::event::KeyEvent, pi: usize, ti: usize) -> bool {
+        use crate::task_picker::{PickerKey, ReportsTo, TaskPicker};
+        if let Some(picker) = self.launch_picker.as_mut() {
+            match picker.key(*key) {
+                PickerKey::Open => {}
+                PickerKey::Cancelled => self.launch_picker = None,
+                PickerKey::Picked(choice) => {
+                    self.launch_reports_to = if choice.task_id.is_empty() {
+                        ReportsTo::Standalone
+                    } else {
+                        ReportsTo::Task(choice)
+                    };
+                    self.launch_picker = None;
+                }
+            }
+            return true;
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('r') {
+            let tasks = self.reports_to_candidates(pi, ti);
+            self.launch_picker = Some(TaskPicker::new(" Reports to ", tasks, String::new()));
+            return true;
+        }
+        false
+    }
+
+    /// Fold the "Reports to" choice into the planning row; true when it
+    /// changed (the launch then PATCHes `parent_task_id`).
+    fn apply_launch_reports_to(&mut self, pi: usize, ti: usize) -> bool {
+        self.launch_picker = None;
+        if self.launch_reports_to == self.launch_reports_to_orig {
+            return false;
+        }
+        let parent = self.launch_reports_to.parent_task_id().map(str::to_string);
+        if let Some(task) = self.project_data.get_mut(pi).and_then(|pd| pd.tasks.get_mut(ti)) {
+            task.parent_task_id = parent;
+        }
+        true
+    }
+
+    fn reports_to_line(&self) -> Line<'static> {
+        Line::from(Span::styled(
+            format!("  Reports to: {}  (Alt+r change)", self.launch_reports_to.label()),
+            Style::default().fg(theme::MUTED),
+        ))
+    }
+
     fn start_launch(&mut self) -> PlanAction {
         self.launch_host = self.default_launch_host.clone();
+        self.launch_picker = None;
         if let Some((pi, ti)) = self.selected_task_loc() {
+            self.launch_reports_to = self.reports_to_of(pi, ti);
+            self.launch_reports_to_orig = self.launch_reports_to.clone();
             self.input_mode = PlanInputMode::WorkspacePicker {
                 project_idx: pi,
                 task_idx: ti,
@@ -4813,8 +4957,8 @@ impl PlanningView {
             .map(|t| t.title.as_str())
             .unwrap_or("?");
         let candidates = self.candidates_for(project_idx, task_idx);
-        // +2 for the engine row and its blank separator.
-        let rows = 5 + candidates.len() as u16 + 2 + 3;
+        // +2 for the engine row and its blank separator; +1 Reports to.
+        let rows = 5 + candidates.len() as u16 + 2 + 3 + 1;
         let (w, h) = (60u16.min(area.width.saturating_sub(4)), rows);
         let dialog = Rect::new(
             (area.width - w) / 2,
@@ -4869,12 +5013,16 @@ impl PlanningView {
         lines.push(Line::from(""));
         lines.push(engine_line(engine));
         lines.push(self.launch_host_line());
+        lines.push(self.reports_to_line());
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  j/k navigate \u{00b7} \u{2190}/\u{2192} engine \u{00b7} Enter select \u{00b7} Esc cancel",
             Style::default().fg(theme::DIM),
         )));
         frame.render_widget(Paragraph::new(lines), inner);
+        if let Some(picker) = &self.launch_picker {
+            picker.draw(frame, dialog);
+        }
     }
 
     fn draw_bulk_archive_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, count: usize) {
@@ -4905,8 +5053,8 @@ impl PlanningView {
             .and_then(|pd| pd.tasks.get(task_idx))
             .map(|t| t.title.as_str())
             .unwrap_or("?");
-        // +2 rows for the engine line and its blank separator.
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 12u16);
+        // +2 rows for the engine line and its blank separator; +1 Reports to.
+        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 13u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
         let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
@@ -4937,9 +5085,13 @@ impl PlanningView {
             Line::from(""),
             engine_line(engine),
             self.launch_host_line(),
+            self.reports_to_line(),
             Line::from(""),
             Line::from(Span::styled("  \u{2190}/\u{2192} engine \u{00b7} Enter launch \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);
+        if let Some(picker) = &self.launch_picker {
+            picker.draw(frame, dialog);
+        }
     }
 }
 
@@ -5686,6 +5838,62 @@ mod tests {
                 "expected LaunchTask, got {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    /// A-f "Reports to": Alt+r opens a picker of open tasks outside the
+    /// launched task's own subtree; a pick reparents on launch.
+    #[test]
+    fn launch_reports_to_reparents_through_the_picker() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let ev = |code, m| CrosstermEvent::Key(KeyEvent::new(code, m));
+        let mut view = PlanningView::new();
+        let mut pd = make_project("repo", "git@example.com:org/repo.git");
+        pd.tasks.push(make_task("boss-id", "boss", None));
+        pd.tasks.push(make_task("me-id", "me", None));
+        pd.tasks.push(make_task("kid-id", "kid", Some("me-id")));
+        view.project_data.push(pd);
+        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
+        view.launch_reports_to = view.reports_to_of(0, 1);
+        view.launch_reports_to_orig = view.launch_reports_to.clone();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 1,
+            branch_text: String::new(),
+            engine: LaunchEngine::Claude,
+        };
+        view.handle_event(&ev(KeyCode::Char('r'), KeyModifiers::ALT));
+        let names: Vec<String> = view.launch_picker.as_ref().unwrap().tasks.iter()
+            .map(|t| t.name.clone()).collect();
+        assert_eq!(names, ["Standalone", "boss"], "self and own subtree are excluded");
+        // Letters go to the picker, not the branch field.
+        view.handle_event(&ev(KeyCode::Char('b'), KeyModifiers::NONE));
+        view.handle_event(&ev(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(view.launch_picker.is_none());
+        match &view.input_mode {
+            PlanInputMode::LaunchConfirm { branch_text, .. } => assert_eq!(branch_text, ""),
+            _ => panic!("dialog stays open after a pick"),
+        }
+        match view.handle_event(&ev(KeyCode::Enter, KeyModifiers::NONE)) {
+            PlanAction::LaunchTask { parent_task_id, reparent, .. } => {
+                assert_eq!(parent_task_id.as_deref(), Some("boss-id"));
+                assert!(reparent);
+            }
+            _ => panic!("expected LaunchTask"),
+        }
+        // Unchanged → no reparent.
+        view.launch_reports_to = view.reports_to_of(0, 2);
+        view.launch_reports_to_orig = view.launch_reports_to.clone();
+        view.input_mode = PlanInputMode::WorkspacePicker {
+            project_idx: 0, task_idx: 2, selected: 0, engine: LaunchEngine::Claude,
+        };
+        view.handle_event(&ev(KeyCode::Enter, KeyModifiers::NONE));
+        match view.handle_event(&ev(KeyCode::Enter, KeyModifiers::NONE)) {
+            PlanAction::LaunchTask { parent_task_id, reparent, .. } => {
+                assert_eq!(parent_task_id.as_deref(), Some("me-id"));
+                assert!(!reparent);
+            }
+            _ => panic!("expected LaunchTask"),
         }
     }
 

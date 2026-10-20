@@ -7,7 +7,8 @@ ALTER TABLE initiatives ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'ini
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'initiatives_kind_check'
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'initiatives_kind_check' AND conrelid = 'initiatives'::regclass
     ) THEN
         ALTER TABLE initiatives ADD CONSTRAINT initiatives_kind_check
             CHECK (kind IN ('initiative', 'division'));

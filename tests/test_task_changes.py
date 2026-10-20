@@ -327,6 +327,22 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         page2 = await self.changes(page["cursor"], snap["epoch"])
         self.assertEqual(page2["changes"], [])
 
+    async def test_initiative_kind_migration_applies_twice(self):
+        coord = await self.create("pre-existing")
+        r = await self.client.post("/initiatives", json={
+            "name": "Old", "coordinator_task_id": coord["id"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        migration = (ROOT / "sql" / "022_initiative_kind.sql").read_text()
+        async with self.pool.acquire() as conn:
+            await conn.execute(migration)
+            await conn.execute(migration)
+            kinds = await conn.fetch("SELECT kind FROM initiatives")
+            constraints = await conn.fetchval(
+                "SELECT count(*) FROM pg_constraint WHERE conname = 'initiatives_kind_check' "
+                "AND conrelid = 'initiatives'::regclass")
+        self.assertEqual([k["kind"] for k in kinds], ["initiative"])
+        self.assertEqual(constraints, 1)
+
     async def test_division_kind_is_permanent_and_rides_task_rows(self):
         await db.init_db(self.pool)  # migrations re-run on every API start
         coord = await self.create("cto")
