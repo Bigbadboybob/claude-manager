@@ -336,6 +336,9 @@ pub enum Cursor {
     /// A-e / A-x / A-J / A-K edit / delete / reorder it, and A-n creates a
     /// workspace inside it. See `app/sections.rs`.
     Section(String),
+    /// Cursor is on a division header (Task sub-view), by initiative id.
+    /// Space/Enter fold it; no terminal behind it.
+    Division(String),
 }
 
 /// Which row of the `backtests` group the cursor is on. Space/Enter (which
@@ -372,7 +375,7 @@ pub enum ViewMode {
     Planning,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum VisualItem {
     WorkspaceHeader(usize),
     /// Subheader for a task inside a workspace. Sessions tagged with this
@@ -405,6 +408,10 @@ pub(super) enum VisualItem {
     /// workspaces follow until the next section header / separator unless
     /// the section is folded. See doc/sidebar-sections.md.
     SectionHeader(String),
+    /// A division's header (Task sub-view), by initiative id: groups the
+    /// top-level blocks of the division's tree. Selectable; Space/Enter
+    /// fold it. See `app/tree.rs`.
+    DivisionHeader(String),
 }
 
 /// One row in the dedicated continuous column (the two-column panel, S2 of
@@ -583,7 +590,7 @@ impl App {
             ),
             // Backtest rows live outside the workspace list — the reorder
             // can't move them, so the cursor needs no re-resolution.
-            Cursor::Backtest(_) | Cursor::Section(_) => (None, None, None),
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => (None, None, None),
         };
         self.workspaces.sort_by_key(|w| !w.pinned);
         if let Some(id) = saved_ws_id {
@@ -648,6 +655,22 @@ impl App {
             }
             return;
         }
+        // A division header that no longer draws (its blocks closed, or the
+        // initiative is no longer a division) falls back to the first row.
+        if let Cursor::Division(id) = &self.cursor {
+            let items = self.task_tree().items;
+            if !items.iter().any(|vi| matches!(vi, VisualItem::DivisionHeader(d) if d == id)) {
+                self.cursor = items
+                    .iter()
+                    .find_map(|vi| match vi {
+                        VisualItem::WorkspaceHeader(wi) => Some(Cursor::Workspace(*wi)),
+                        _ => None,
+                    })
+                    .unwrap_or(Cursor::Workspace(0));
+                self.clamp_cursor();
+            }
+            return;
+        }
         if self.workspaces.is_empty() {
             self.cursor = Cursor::Workspace(0);
             return;
@@ -680,13 +703,17 @@ impl App {
                     .tasks
                     .iter()
                     .any(|t| t.task_id.as_deref() == Some(tid.as_str()))
+                    || !self.task_tree_unfolded().items.iter().any(|vi| {
+                        matches!(vi, VisualItem::TaskHeader { ws_idx, task_id } if *ws_idx == wi && *task_id == tid)
+                    })
                 {
-                    // Task disappeared — fall back to workspace.
+                    // Task disappeared, or its header no longer draws (its
+                    // last session left) — fall back to workspace.
                     self.cursor = Cursor::Workspace(wi);
                 }
             }
             // Fully handled by the early-returns at the top of this fn.
-            Cursor::Backtest(_) | Cursor::Section(_) => {}
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => {}
         }
     }
 
@@ -694,10 +721,15 @@ impl App {
     /// are owned by the dedicated continuous column and are returned by
     /// [`continuous_backtest_items`].
     pub(super) fn visual_items(&self) -> Vec<VisualItem> {
-        let mut items = match self.sidebar_view {
+        let items = match self.sidebar_view {
             SidebarView::Status => self.visual_items_status(),
             SidebarView::Task => self.visual_items_task(),
         };
+        self.filter_visual_items(items)
+    }
+
+    /// Apply the sidebar filter (A-/) to a row list.
+    pub(super) fn filter_visual_items(&self, mut items: Vec<VisualItem>) -> Vec<VisualItem> {
         if let Some(query) = self.sidebar_filter.as_deref() {
             let query = query.to_lowercase();
             items.retain(|item| self.visual_item_matches(item, &query));
@@ -739,6 +771,7 @@ impl App {
             VisualItem::TaskHeader { task_id, .. } => self.find_task_entry(task_id).is_some_and(|t| contains(&t.name) || contains(task_id)),
             VisualItem::WorkflowHeader { run_id, .. } => contains(run_id),
             VisualItem::SectionHeader(id) => self.section_by_id(id).is_some_and(|s| contains(&s.name) || contains(id)),
+            VisualItem::DivisionHeader(id) => self.planning.division(id).is_some_and(|d| contains(&d.name)) || contains(id),
             VisualItem::BacktestHeader => contains("backtest") || self.backtest_rows.iter().any(|r| contains(&r.label)),
             VisualItem::BacktestFleet(stem) => contains(stem),
             VisualItem::BacktestRun { task_id, .. } => self.backtest_rows.iter().find(|r| r.task_id == *task_id).is_some_and(|r| contains(&r.label) || contains(task_id)),
@@ -752,6 +785,7 @@ impl App {
             (Cursor::Session(a, b), VisualItem::Session(c, d)) => a == c && b == d,
             (Cursor::Task { ws_idx, task_id }, VisualItem::TaskHeader { ws_idx: a, task_id: b }) => ws_idx == a && task_id == b,
             (Cursor::Section(a), VisualItem::SectionHeader(b)) => a == b,
+            (Cursor::Division(a), VisualItem::DivisionHeader(b)) => a == b,
             (Cursor::Backtest(BacktestCursor::Group), VisualItem::BacktestHeader) => true,
             (Cursor::Backtest(BacktestCursor::Fleet(a)), VisualItem::BacktestFleet(b)) => a == b,
             (Cursor::Backtest(BacktestCursor::Run(a)), VisualItem::BacktestRun { task_id: b, .. }) => a == b,
@@ -903,167 +937,9 @@ impl App {
     /// Sessions grouped by workflow run appear contiguously under a workflow
     /// subheader. Standalone sessions render first; each workflow group
     /// follows. Past workspaces are hidden — reachable via the A-O picker.
+    /// Task sub-view rows: the nested work tree (`app/tree.rs`).
     pub(super) fn visual_items_task(&self) -> Vec<VisualItem> {
-        let members = self.continuous_members();
-        // Visibility filter shared with the section rollup: open, not past,
-        // and not continuous-only (those render in the continuous column,
-        // never here — see `task_view_visible_workspaces`).
-        let visible = self.task_view_visible_workspaces(&members);
-        let mut items = Vec::new();
-
-        // Sections first, in display order. Each header is followed by its
-        // member workspaces (explicit assignment or inherited through the
-        // task tree — `section_of_workspace`) unless folded. An empty
-        // section still shows its header so it can be populated.
-        let mut loose: Vec<usize> = Vec::new();
-        let mut by_section: std::collections::HashMap<String, Vec<usize>> =
-            std::collections::HashMap::new();
-        for &wi in &visible {
-            match self.section_of_workspace(wi) {
-                Some(sid) => by_section.entry(sid).or_default().push(wi),
-                None => loose.push(wi),
-            }
-        }
-        for sec in &self.sections {
-            items.push(VisualItem::SectionHeader(sec.id.clone()));
-            if !sec.folded {
-                let mut first_in_section = true;
-                for wi in by_section.remove(&sec.id).unwrap_or_default() {
-                    if !first_in_section {
-                        items.push(VisualItem::Separator);
-                    }
-                    first_in_section = false;
-                    self.push_task_view_workspace(&mut items, wi, &members);
-                }
-            }
-            items.push(VisualItem::SectionEnd);
-        }
-        // Loose workspaces (no section) follow, exactly as pre-feature.
-        for wi in loose {
-            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::SectionEnd)) {
-                items.push(VisualItem::Separator);
-            }
-            self.push_task_view_workspace(&mut items, wi, &members);
-        }
-        items
-    }
-
-    /// One workspace's Task sub-view rows: the header, then its sessions
-    /// bucketed by task (subheaders) and workflow run (grouped).
-    fn push_task_view_workspace(
-        &self,
-        items: &mut Vec<VisualItem>,
-        wi: usize,
-        members: &std::collections::HashSet<(usize, usize)>,
-    ) {
-        let ws = &self.workspaces[wi];
-        {
-            items.push(VisualItem::WorkspaceHeader(wi));
-
-            // Partition sessions by task_id bucket. Unbound sessions live in
-            // the `None` bucket and render at workspace level (no subheader).
-            // Continuous members are excluded (they live in the column).
-            let mut by_task: std::collections::BTreeMap<Option<String>, Vec<usize>> =
-                std::collections::BTreeMap::new();
-            for (si, ts) in ws.sessions.iter().enumerate() {
-                if members.contains(&(wi, si)) {
-                    continue;
-                }
-                by_task.entry(ts.task_id.clone()).or_default().push(si);
-            }
-
-            // Render buckets: unbound first, then task buckets in binding order.
-            let task_order: Vec<Option<String>> = {
-                let mut ordered: Vec<Option<String>> = Vec::new();
-                if by_task.contains_key(&None) {
-                    ordered.push(None);
-                }
-                // Tasks bound to this workspace, in insertion order of self.tasks.
-                for task in &self.tasks {
-                    if task.workspace_id.as_deref() != Some(ws.id.as_str()) {
-                        continue;
-                    }
-                    let Some(tid) = task.task_id.as_deref() else { continue };
-                    let key = Some(tid.to_string());
-                    if by_task.contains_key(&key) && !ordered.contains(&key) {
-                        ordered.push(key);
-                    }
-                }
-                // Catch any orphaned task_ids tagged on sessions but not in
-                // self.tasks (stale API state) — render them too so they don't
-                // silently disappear.
-                let mut tail: Vec<Option<String>> = by_task
-                    .keys()
-                    .filter(|k| k.is_some() && !ordered.contains(k))
-                    .cloned()
-                    .collect();
-                tail.sort();
-                ordered.extend(tail);
-                ordered
-            };
-
-            for bucket_key in task_order {
-                // Emit task subheader for task-scoped buckets.
-                if let Some(tid) = bucket_key.as_deref() {
-                    items.push(VisualItem::TaskHeader {
-                        ws_idx: wi,
-                        task_id: tid.to_string(),
-                    });
-                }
-                let indices = by_task.remove(&bucket_key).unwrap_or_default();
-
-                // Split each bucket into standalone + workflow groups.
-                let mut standalone: Vec<usize> = Vec::new();
-                let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
-                    std::collections::BTreeMap::new();
-                for si in &indices {
-                    match &ws.sessions[*si].workflow_run_id {
-                        Some(run_id) => groups.entry(run_id.clone()).or_default().push(*si),
-                        None => standalone.push(*si),
-                    }
-                }
-                // Standalone: running first, then idle.
-                let (run_, other): (Vec<_>, Vec<_>) = standalone
-                    .into_iter()
-                    .partition(|si| ws.sessions[*si].status == SessionStatus::Running);
-                for si in run_ {
-                    items.push(VisualItem::Session(wi, si));
-                }
-                for si in other {
-                    items.push(VisualItem::Session(wi, si));
-                }
-                // Workflow groups.
-                for (run_id, session_indices) in groups {
-                    let is_active_run =
-                        self.workflow_runs.iter().any(|r| r.run_id == run_id);
-                    if !is_active_run {
-                        for si in session_indices {
-                            items.push(VisualItem::Session(wi, si));
-                        }
-                        continue;
-                    }
-                    items.push(VisualItem::WorkflowHeader {
-                        ws_idx: wi,
-                        run_id: run_id.clone(),
-                    });
-                    let role_order: Vec<String> = self
-                        .workflow_runs
-                        .iter()
-                        .find(|r| r.run_id == run_id)
-                        .and_then(|r| self.workflows.get(&r.workflow_name))
-                        .map(|wf| wf.role_order.clone())
-                        .unwrap_or_default();
-                    let mut ordered = session_indices.clone();
-                    ordered.sort_by_key(|si| {
-                        let role = ws.sessions[*si].workflow_role.as_deref().unwrap_or("");
-                        role_order.iter().position(|r| r == role).unwrap_or(usize::MAX)
-                    });
-                    for si in ordered {
-                        items.push(VisualItem::Session(wi, si));
-                    }
-                }
-            }
-        }
+        self.task_tree().items
     }
 
     /// Map each session task_id to its `parent_task_id`, including Done tasks.
@@ -1071,7 +947,7 @@ impl App {
     /// the orchestrator session's uid changes when it respawns (fresh context /
     /// restart), but the TASK tree doesn't, so a subtask's `parent_task_id`
     /// still points at the orchestrator's task.
-    fn task_parent_map(&self) -> std::collections::HashMap<&str, &str> {
+    pub(super) fn task_parent_map(&self) -> std::collections::HashMap<&str, &str> {
         self.sidebar_task_parents
             .iter()
             .filter_map(|(task, parent)| Some((task.as_str(), parent.as_deref()?)))
@@ -1083,7 +959,7 @@ impl App {
 
     /// Older adopted orchestrator rows sometimes lack task_id. The planning
     /// workspace binding is authoritative; labels and old manager UIDs aren't.
-    fn continuous_planning_task<'a>(&'a self, ws: &'a Workspace, ts: &'a TerminalSession) -> Option<&'a str> {
+    pub(super) fn continuous_planning_task<'a>(&'a self, ws: &'a Workspace, ts: &'a TerminalSession) -> Option<&'a str> {
         ts.task_id.as_deref().or_else(|| self.tasks.iter().find(|t|
             t.is_continuous && t.workspace_id.as_deref() == Some(ws.id.as_str()))
             .and_then(|t| t.task_id.as_deref()))
@@ -1210,6 +1086,17 @@ impl App {
     /// Closed workspaces skipped. Pure read — the render + cursor consume this;
     /// it's only drawn/navigated when the column is on.
     pub(super) fn visual_items_continuous(&self) -> Vec<ContinuousRow> {
+        let mut rows = self.continuous_rows_unfiltered();
+        if let Some(query) = self.sidebar_filter.as_deref() {
+            let query = query.to_lowercase();
+            rows.retain(|r| self.visual_item_matches(&r.visual_item(), &query));
+        }
+        rows
+    }
+
+    /// The continuous column's grouping before the sidebar filter (A-/)
+    /// applies. The org chart (F6) reuses it for its Continuous org.
+    pub(super) fn continuous_rows_unfiltered(&self) -> Vec<ContinuousRow> {
         // Orchestrators: (ws_idx, sess_idx, uid, task_id, label).
         let mut orchestrators: Vec<(usize, usize, &str, Option<&str>, &str)> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
@@ -1387,10 +1274,6 @@ impl App {
                 rows.extend(group_rows);
             }
         }
-        if let Some(query) = self.sidebar_filter.as_deref() {
-            let query = query.to_lowercase();
-            rows.retain(|r| self.visual_item_matches(&r.visual_item(), &query));
-        }
         rows
     }
 
@@ -1565,6 +1448,8 @@ impl App {
             VisualItem::BacktestRun { .. } => true,
             // Section headers fold on Space/Enter and take A-e/A-x/A-n.
             VisualItem::SectionHeader(_) => true,
+            // Division headers fold on Space/Enter.
+            VisualItem::DivisionHeader(_) => true,
         };
 
         if !items.iter().any(is_selectable) {
@@ -1595,6 +1480,7 @@ impl App {
                     VisualItem::BacktestRun { task_id: vtid, .. },
                 ) => tid == vtid,
                 (Cursor::Section(id), VisualItem::SectionHeader(vid)) => id == vid,
+                (Cursor::Division(id), VisualItem::DivisionHeader(vid)) => id == vid,
                 _ => false,
             })
             .map(|p| p as i32)
@@ -1639,6 +1525,9 @@ impl App {
             VisualItem::SectionHeader(id) => {
                 self.cursor = Cursor::Section(id.clone());
             }
+            VisualItem::DivisionHeader(id) => {
+                self.cursor = Cursor::Division(id.clone());
+            }
             _ => {}
         }
         true
@@ -1656,7 +1545,13 @@ impl App {
     pub(super) fn jump_to_next_attention(&mut self) {
         // (ws_idx, sess_idx, is_continuous_row) in sidebar visual order.
         let mut rows: Vec<(usize, usize, bool)> = Vec::new();
-        for vi in self.visual_items() {
+        // Folded sessions count: an alert inside a fold must still be
+        // reachable (the jump unfolds it).
+        let main = match self.sidebar_view {
+            SidebarView::Task => self.filter_visual_items(self.task_tree_unfolded().items),
+            SidebarView::Status => self.visual_items(),
+        };
+        for vi in main {
             if let VisualItem::Session(wi, si) = vi {
                 rows.push((wi, si, false));
             }
@@ -1702,13 +1597,14 @@ impl App {
             SidebarColumn::Main
         };
         self.cursor = Cursor::Session(wi, si);
+        self.reveal_cursor();
         self.needs_redraw = true;
     }
 
     /// uid → `(ws_idx, sess_idx)` among non-closed workspaces. `None`
     /// when the session is gone for good (workspace closed or session
     /// removed) — MRU jumps DROP such uids from the deque.
-    fn find_session_by_uid(&self, uid: &str) -> Option<(usize, usize)> {
+    pub(super) fn find_session_by_uid(&self, uid: &str) -> Option<(usize, usize)> {
         for (wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed {
                 continue;
@@ -1740,7 +1636,7 @@ impl App {
     /// `step_column` (so a later A-h/A-l lands back where you were). The
     /// terminal pane follows because it renders the cursor's session.
     /// Returns false when the uid doesn't resolve to a visible row.
-    fn jump_cursor_to_session_uid(&mut self, uid: &str) -> bool {
+    pub(super) fn jump_cursor_to_session_uid(&mut self, uid: &str) -> bool {
         let Some((wi, si, to_continuous)) = self.resolve_session_target(uid) else {
             return false;
         };
@@ -1756,6 +1652,7 @@ impl App {
             SidebarColumn::Main
         };
         self.cursor = Cursor::Session(wi, si);
+        self.reveal_cursor();
         self.needs_redraw = true;
         true
     }
@@ -1937,7 +1834,7 @@ impl App {
         }
     }
 
-    fn find_task_entry(&self, task_id: &str) -> Option<&TaskEntry> {
+    pub(super) fn find_task_entry(&self, task_id: &str) -> Option<&TaskEntry> {
         self.tasks
             .iter()
             .find(|t| t.task_id.as_deref() == Some(task_id))
@@ -2072,6 +1969,13 @@ impl App {
                         "Space fold · A-e edit · A-x delete · A-J/K reorder · A-n new ws here".into(),
                     ));
                 }
+            }
+            Cursor::Division(id) => {
+                let name = self.planning.division(id).map_or_else(|| id.clone(), |d| d.name);
+                out.push(PeekLine::Title(format!("Division: {name}")));
+                out.push(PeekLine::Field { label: "Initiative".into(), value: id.clone() });
+                out.push(PeekLine::Blank);
+                out.push(PeekLine::Text("Space/Enter fold · keys don't reach a terminal here".into()));
             }
         }
         if out.is_empty() {

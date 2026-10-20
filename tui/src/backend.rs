@@ -181,6 +181,13 @@ pub enum BackendCommand {
         id: String,
         fields: HashMap<String, serde_json::Value>,
     },
+    /// Pin or clear a task's lead session (`POST /tasks/{id}/lead`).
+    SetTaskLead {
+        id: String,
+        session_uid: Option<String>,
+        /// The pin before this change, restored if the call fails.
+        previous: Option<String>,
+    },
     /// Delete a planning task from the DB.
     DeletePlanTask {
         id: String,
@@ -220,6 +227,13 @@ pub enum BackendEvent {
     ReportingTaskCreated {
         request_id: String,
         result: Result<Task, String>,
+    },
+    /// `POST /tasks/{id}/lead` failed: undo the optimistic local pin.
+    TaskLeadFailed {
+        id: String,
+        attempted: Option<String>,
+        previous: Option<String>,
+        error: String,
     },
 }
 
@@ -329,6 +343,10 @@ impl BackendHandle {
             BackendCommand::UpdatePlanTask { id, fields },
             "update_plan_task",
         );
+    }
+
+    pub fn set_task_lead(&self, id: String, session_uid: Option<String>, previous: Option<String>) {
+        self.try_send_or_warn(BackendCommand::SetTaskLead { id, session_uid, previous }, "set_task_lead");
     }
 
     pub fn delete_plan_task(&self, id: String) {
@@ -462,6 +480,24 @@ fn backend_loop(
                     let _ = event_tx.send(BackendEvent::PlanTaskCreated(task.clone()));
                 }
                 let _ = event_tx.send(BackendEvent::ReportingTaskCreated { request_id, result });
+            }
+            Ok(BackendCommand::SetTaskLead { id, session_uid, previous }) => {
+                match client.set_task_lead(&id, session_uid.as_deref()) {
+                    Ok(task) => {
+                        if let Some(task) = task {
+                            let _ = event_tx.send(BackendEvent::PlanTaskUpdated(task));
+                        }
+                        after_write(&client);
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::TaskLeadFailed {
+                            id,
+                            attempted: session_uid,
+                            previous,
+                            error: e.to_string(),
+                        });
+                    }
+                }
             }
             Ok(BackendCommand::DeletePlanTask { id }) => {
                 match client.delete_task(&id) {

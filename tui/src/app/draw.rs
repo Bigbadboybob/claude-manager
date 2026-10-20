@@ -116,7 +116,7 @@ impl App {
     /// a bold bead that pulses small→large while its color cycles through the
     /// rainbow. Fully replaces the normal status indicator while the alert is
     /// pending — the animation *is* the signal.
-    fn alert_indicator(&self) -> (&'static str, Style) {
+    pub(super) fn alert_indicator(&self) -> (&'static str, Style) {
         let f = self.alert_frame() as usize;
         let glyph = ALERT_PULSE[f % ALERT_PULSE.len()];
         let color = theme::ALERT_RAINBOW[f % theme::ALERT_RAINBOW.len()];
@@ -124,6 +124,12 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.orgchart.visible {
+            self.draw_orgchart(frame);
+            self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
+            return;
+        }
         if self.board.visible {
             self.draw_board(frame);
             self.global_settings.draw(frame, frame.area());
@@ -312,13 +318,14 @@ impl App {
                     self.draw_transcript_picker(frame, area, candidates, *selected, target);
                 }
                 InputMode::WorkspaceSettings {
+                    workspace_id,
                     name,
                     color,
                     pinned,
                     section,
                     active_field,
-                    ..
                 } => {
+                    self.section_note = self.nested_section_label(workspace_id);
                     self.draw_workspace_settings(
                         frame,
                         area,
@@ -386,13 +393,28 @@ impl App {
                         goal,
                     );
                 }
-                InputMode::TaskSettings { name, color, section, active_field, .. } => {
+                InputMode::TaskSettings { task_id, workspace_id, name, color, section, lead, lead_choices, active_field, .. } => {
+                    self.section_note = self.nested_section_label(workspace_id);
+                    let lead_label = match lead {
+                        Some(uid) => lead_choices
+                            .iter()
+                            .find(|(u, _)| u == uid)
+                            .map_or_else(|| uid.clone(), |(_, label)| label.clone()),
+                        None => {
+                            // What the rule picks with no pin.
+                            let rule = self.task_leads().get(task_id.as_str()).and_then(|uid| {
+                                lead_choices.iter().find(|(u, _)| u == uid).map(|(_, l)| l.clone())
+                            });
+                            format!("auto ({})", rule.as_deref().unwrap_or("no live agent"))
+                        }
+                    };
                     self.draw_task_settings(
                         frame,
                         area,
                         name,
                         color.as_deref(),
                         section.as_deref(),
+                        &lead_label,
                         *active_field,
                     );
                 }
@@ -442,10 +464,11 @@ impl App {
         name: &str,
         color: Option<&str>,
         section: Option<&str>,
+        lead: &str,
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 9u16;
+        let height = 11u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -480,6 +503,13 @@ impl App {
             Line::from(""),
             self.section_picker_line("Section: ", section, active_field == 2),
             Line::from(""),
+            Line::from(vec![
+                Span::styled("   Lead: ", if active_field == 3 { white } else { dim }),
+                Span::styled("\u{2605} ", Style::default().fg(theme::LEAD)),
+                Span::styled(lead.to_string(), white),
+                Span::styled(if active_field == 3 { "  \u{2190}/\u{2192}" } else { "" }, dim),
+            ]),
+            Line::from(""),
             Line::from(Span::styled(
                 "Tab next \u{00b7} Enter save \u{00b7} Esc cancel",
                 dim,
@@ -500,6 +530,11 @@ impl App {
         let dim = Style::default().fg(theme::DIM);
         let white = Style::default().fg(theme::TEXT);
         let mut spans = vec![Span::styled(label.to_string(), if focused { white } else { dim })];
+        // A nested workspace shows the section it inherits, read-only.
+        if let Some(note) = self.section_note.clone() {
+            spans.push(Span::styled(note, white));
+            return Line::from(spans);
+        }
         let value = self.section_choice_label(section);
         let value_style = match section {
             Some(id) if !id.is_empty() => self
@@ -1837,6 +1872,7 @@ impl App {
             ("A-O    reopen ws", "A-F  fork task"),
             ("A-N    +section", "A-J/K sect order"),
             ("PgUp/Dn scroll", "A-u/d half page"),
+            ("Spc    fold hdr", ""),
             ("A-Ent  newline", "A-;  recent"),
             ("A-p    find", "A-i  info"),
             ("A-'    yank", "A-M  mouse"),
@@ -1851,8 +1887,28 @@ impl App {
         let help_entries = help_entries.into_iter().take(help_rows).collect::<Vec<_>>();
         let list_height = inner.height.saturating_sub(helper_height);
 
-        let visual = self.visual_items();
+        // Task sub-view: the nested work tree (app/tree.rs) and its row
+        // metadata, built once per frame. When the cursor has moved since
+        // the last draw (a jump, spawn, fork, restore or event) and a fold,
+        // folded section or filter hides its row, reveal it and rebuild.
+        // A draw with the cursor unmoved never undoes Owner's own filter
+        // or folds.
+        let moved = self.last_drawn_cursor.as_ref() != Some(&self.cursor);
+        self.last_drawn_cursor = Some(self.cursor.clone());
+        let mut tree = (self.sidebar_view == SidebarView::Task).then(|| self.task_tree());
+        let mut visual = match &tree {
+            Some(t) => self.filter_visual_items(t.items.clone()),
+            None => self.visual_items(),
+        };
+        if moved && tree.is_some() && self.cursor_row_hidden(&visual) && self.reveal_cursor() {
+            let t = self.task_tree();
+            visual = self.filter_visual_items(t.items.clone());
+            tree = Some(t);
+        }
+        let tree = tree;
         let mut items: Vec<ListItem> = Vec::new();
+        // A nested block renders inside its root block's section.
+        let block_root = |wi: usize| tree.as_ref().and_then(|t| t.block_root.get(&wi).copied()).unwrap_or(wi);
         // Workspaces rendered inside a section get one extra leading space
         // on every row (header, task subheaders, sessions, workflow
         // headers) so the grouping reads at a glance. Resolved once per
@@ -1867,14 +1923,74 @@ impl App {
                     VisualItem::WorkspaceHeader(wi) => Some(*wi),
                     _ => None,
                 })
-                .filter(|wi| self.section_of_workspace(*wi).is_some())
+                .filter(|wi| self.section_of_workspace(block_root(*wi)).is_some())
                 .collect()
         };
         let indent = |wi: usize| -> &'static str {
             if in_section.contains(&wi) { " " } else { "" }
         };
+        // The focused row's chain (it and its ancestors) and group.
+        let focus = tree.as_ref().zip(self.cursor_node());
+        let chain: Vec<super::tree::Node> = focus.as_ref().map(|(t, n)| t.chain(n)).unwrap_or_default();
+        let in_group = |vi: &VisualItem| -> bool {
+            let Some((t, f)) = &focus else { return false };
+            t.rows.get(vi).and_then(|r| r.node.as_ref()).is_some_and(|n| t.within(n, f))
+        };
+        // Tree rows start with a one-cell gutter (the focused chain's bar)
+        // and one guide cell per enclosing block, then the local indent.
+        let tree_prefix = |vi: &VisualItem, wi: usize| -> Vec<Span<'static>> {
+            let section = Span::raw(indent(wi));
+            let Some(row) = tree.as_ref().and_then(|t| t.rows.get(vi)) else {
+                return vec![Span::raw(" "), section];
+            };
+            // The bar marks the focused group and the headers of its
+            // ancestors (not the ancestors' own sessions).
+            let header = matches!(
+                vi,
+                VisualItem::WorkspaceHeader(_) | VisualItem::TaskHeader { .. } | VisualItem::DivisionHeader(_)
+            );
+            let on_chain = (header && row.node.as_ref().is_some_and(|n| chain.contains(n))) || in_group(vi);
+            let mut spans = vec![
+                if on_chain {
+                    Span::styled("\u{258e}", Style::default().fg(theme::TREE_FOCUS))
+                } else {
+                    Span::raw(" ")
+                },
+                section,
+            ];
+            // Three cells per level: the guide sits under the parent task
+            // header's fold glyph.
+            for cell in &row.cells {
+                spans.push(if chain.contains(cell) {
+                    Span::styled(" \u{2503} ", Style::default().fg(theme::TREE_FOCUS))
+                } else {
+                    Span::styled(" \u{2502} ", Style::default().fg(theme::TREE_GUIDE))
+                });
+            }
+            if row.local > 0 {
+                spans.push(Span::raw("  ".repeat(row.local as usize)));
+            }
+            spans
+        };
+        let fold_tail = |node: &super::tree::Node| -> String {
+            let Some((n, running, idle, alerting)) = tree.as_ref().and_then(|t| t.folded.get(node)) else {
+                return String::new();
+            };
+            let mut t = format!("  ({n})");
+            if *alerting > 0 {
+                t.push_str(&format!(" \u{2691}{alerting}"));
+            }
+            if *running > 0 {
+                t.push_str(&format!(" \u{283f}{running}"));
+            }
+            if *idle > 0 {
+                t.push_str(&format!(" \u{25cf}{idle}"));
+            }
+            t
+        };
+        let leads = if tree.is_some() { self.task_leads() } else { HashMap::new() };
 
-        let section_backgrounds = self.sidebar_section_backgrounds(&visual);
+        let section_backgrounds = self.sidebar_section_backgrounds(&visual, &block_root);
         for (vi, background) in visual.iter().zip(section_backgrounds) {
             let first_item = items.len();
             match vi {
@@ -1909,7 +2025,7 @@ impl App {
                     // name truncation sites below.
                     let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
-                    let mut header_spans = vec![Span::raw(" "), Span::raw(indent(*wi))];
+                    let mut header_spans = tree_prefix(vi, *wi);
                     if ws_owner_blocked {
                         let (glyph, style) = self.owner_indicator();
                         header_spans.push(Span::styled(format!("{glyph} "), style));
@@ -2057,20 +2173,34 @@ impl App {
                                 .is_some_and(|id| {
                                     self.workflow_runs.iter().any(|r| r.run_id == id)
                                 });
-                            if in_active_wf {
-                                format!("      {}", ts.label)
+                            let pad = if in_active_wf {
+                                "      "
                             } else if ts.task_id.is_some() {
-                                format!("    {}", ts.label)
+                                "    "
                             } else {
-                                format!("  {}", ts.label)
-                            }
+                                "  "
+                            };
+                            format!("{pad}{}", ts.label)
                         }
                     };
 
-                    let mut spans = vec![
-                        Span::raw(indent(*wi)),
-                        Span::styled(format!(" {} ", indicator), indicator_style),
-                    ];
+                    let mut spans = if tree.is_some() {
+                        let mut spans = tree_prefix(vi, *wi);
+                        spans.push(Span::styled(format!("{} ", indicator), indicator_style));
+                        spans
+                    } else {
+                        vec![
+                            Span::raw(indent(*wi)),
+                            Span::styled(format!(" {} ", indicator), indicator_style),
+                        ]
+                    };
+                    // The task's lead session (app/tree.rs) carries a star
+                    // in front of its label.
+                    let is_lead = ts.task_id.as_ref().is_some_and(|t| leads.get(t) == Some(&ts.uid));
+                    let (display, lead_mark) = match (is_lead, display.find(|c: char| c != ' ')) {
+                        (true, Some(at)) => (display[at..].to_string(), Some(display[..at].to_string())),
+                        _ => (display, None),
+                    };
                     // Vertical line prefix for sessions inside a workflow group
                     // (only in task view where grouping makes sense visually).
                     if in_active_workflow && self.sidebar_view == SidebarView::Task {
@@ -2081,6 +2211,10 @@ impl App {
                     }
                     if let Some((badge, style)) = wf_badge {
                         spans.push(Span::styled(badge, style));
+                    }
+                    if let Some(pad) = lead_mark {
+                        spans.push(Span::raw(pad));
+                        spans.push(Span::styled("\u{2605} ", Style::default().fg(theme::LEAD)));
                     }
                     spans.push(Span::raw(display));
                     if owner_blocked {
@@ -2177,14 +2311,20 @@ impl App {
                             _ => "",
                         })
                         .unwrap_or("");
-                    let line = Line::from(vec![
-                        Span::raw(indent(*ws_idx)),
-                        Span::styled(format!(" {} ", agg_indicator), agg_style),
-                        Span::styled(
+                    let mut lead_in = if tree.is_some() {
+                        let mut spans = tree_prefix(vi, *ws_idx);
+                        spans.push(Span::styled(format!("{} ", agg_indicator), agg_style));
+                        spans
+                    } else {
+                        vec![Span::raw(indent(*ws_idx)), Span::styled(format!(" {} ", agg_indicator), agg_style)]
+                    };
+                    let line = Line::from({
+                        lead_in.push(Span::styled(
                             format!("\u{256d}\u{2500} {}{}", name, paused_suffix),
                             Style::default().fg(theme::HEADER),
-                        ),
-                    ]);
+                        ));
+                        lead_in
+                    });
                     items.push(ListItem::new(line));
                 }
                 VisualItem::TaskHeader { ws_idx, task_id } => {
@@ -2201,8 +2341,14 @@ impl App {
                         .map(|t| t.name.clone())
                         .unwrap_or_else(|| "task".into());
                     let initiative_marker = self.planning.task_initiative_marker(task_id);
-                    let max_name = (inner.width as usize)
-                        .saturating_sub(4 + initiative_marker.chars().count());
+                    let node = super::tree::Node::Task(task_id.clone());
+                    let folded = self.tree_folded(&node);
+                    let tail = fold_tail(&node);
+                    let prefix = tree_prefix(vi, *ws_idx);
+                    let prefix_width: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
+                    let max_name = (inner.width as usize).saturating_sub(
+                        prefix_width + 3 + initiative_marker.chars().count() + tail.chars().count(),
+                    );
                     let name = crate::planning::truncate_with_ellipsis(&name, max_name);
                     // Style lives on the ListItem so selection highlight can
                     // override. Using Span::styled with a fixed color here
@@ -2221,13 +2367,35 @@ impl App {
                     } else {
                         Style::default().fg(theme::HEADER)
                     };
-                    let line = Line::from(vec![
-                        Span::raw(indent(*ws_idx)),
-                        Span::raw("  "),
-                        Span::raw(initiative_marker),
-                        Span::raw(name),
-                    ]);
-                    items.push(ListItem::new(line).style(base_style));
+                    let mut spans = prefix;
+                    spans.push(Span::raw(if folded { " \u{25b8} " } else { " \u{25be} " }));
+                    spans.push(Span::raw(initiative_marker));
+                    spans.push(Span::raw(name));
+                    spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
+                    items.push(ListItem::new(Line::from(spans)).style(base_style));
+                }
+                // Division header: `▾ ◆ Name`, `▸ ◆ Name (n) ⠿r ●i` folded,
+                // in the initiative's colour (else HEADER), bold.
+                VisualItem::DivisionHeader(id) => {
+                    let is_selected = matches!(&self.cursor, Cursor::Division(cid) if cid == id);
+                    let division = tree.as_ref().and_then(|t| t.divisions.get(id)).cloned();
+                    let node = super::tree::Node::Division(id.clone());
+                    let glyph = if self.tree_folded(&node) { "\u{25b8}" } else { "\u{25be}" };
+                    let tail = fold_tail(&node);
+                    let prefix = tree_prefix(vi, usize::MAX);
+                    let max_name = (inner.width as usize).saturating_sub(5 + tail.chars().count());
+                    let name = division.as_ref().map_or_else(|| "division".to_string(), |d| d.name.clone());
+                    let name = crate::planning::truncate_with_ellipsis(&name, max_name);
+                    let accent = division.as_ref().and_then(|d| d.color.as_deref()).and_then(theme::user_color);
+                    let base_style = if is_selected {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(accent.unwrap_or(theme::HEADER)).add_modifier(Modifier::BOLD)
+                    };
+                    let mut spans = prefix;
+                    spans.push(Span::raw(format!("{glyph} \u{25c6} {name}")));
+                    spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
+                    items.push(ListItem::new(Line::from(spans)).style(base_style));
                 }
                 // Sidebar section header: `▾ Name` unfolded, `▸ Name (n)`
                 // with a running/idle rollup when folded. Colored by the
@@ -2237,7 +2405,10 @@ impl App {
                     let Some(sec) = self.section_by_id(id) else {
                         continue;
                     };
-                    let (n, running, idle) = self.section_rollup(id);
+                    let (n, running, idle) = match &tree {
+                        Some(t) => self.section_rollup_in(id, &t.block_root),
+                        None => self.section_rollup(id),
+                    };
                     let glyph = if sec.folded { "\u{25b8}" } else { "\u{25be}" };
                     let tail = if sec.folded {
                         let mut t = format!("  ({})", n);
@@ -2296,6 +2467,8 @@ impl App {
             }
             // Apply the surface to the whole row, including trailing cells,
             // while retaining foreground/status colors and selection emphasis.
+            // The focused group's tint takes the place of a section's.
+            let background = if in_group(vi) { Some(theme::focus_tint(background)) } else { background };
             if let Some(bg) = background {
                 use ratatui::style::Stylize;
                 for item in &mut items[first_item..] {
@@ -2444,6 +2617,16 @@ impl App {
             }
         } else {
             String::new()
+        };
+        // A task or division header is a tree row: say so, since keys typed
+        // there reach no terminal.
+        let center = if center.is_empty()
+            && self.view_mode == ViewMode::Sessions
+            && matches!(self.cursor, Cursor::Task { .. } | Cursor::Division(_))
+        {
+            "Space/Enter fold \u{00b7} headers don't send keys to a terminal".to_string()
+        } else {
+            center
         };
 
         let mouse_off = !self.mouse_capture_enabled;

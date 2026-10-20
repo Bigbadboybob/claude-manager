@@ -2,7 +2,7 @@
 
 ## Summary
 
-Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically.
+Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically. Since 2026-10-20 the Task sub-view is a nested work tree (`tui/src/app/tree.rs`): sections group the top-level blocks, and a block nested under another task's block follows that root's section even when it was assigned elsewhere.
 
 ## Agent tools: remote subsection assignment
 
