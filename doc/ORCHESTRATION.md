@@ -172,3 +172,26 @@ file reference for anything longer. Reply when you are acknowledging actionable
 work or supplying a decision; avoid acknowledgement ping-pong. Messaging does
 not grant merge, deploy or session-control permissions; those still come from
 Owner or the task's authorization.
+
+## 10. Direct reports are subtasks
+
+Reporting lines follow the task tree. A task reports to its parent task, and the
+parent's lead session is its boss; a task with no parent is standalone. A
+division is a permanent initiative (`kind="division"`) whose root is its
+coordinator task. When you start work that reports to you, make it your subtask
+so it shows under you in the Sessions tree and the `org` tool:
+
+- `create_subtask(...)` and then `start_session(task_id=...)`, or
+  `start_session(isolated=true)`, which does both in one call;
+- `propose_task(..., reports_to="me")` when Owner should triage the draft first.
+
+A plain `propose_task` creates a standalone task, and `start_session` without
+`isolated` or `task_id` adds a co-worker on your own task. Neither creates a
+direct report.
+
+To find your boss, call `org()`. It returns your task and its lead, the parent
+task and its lead, the chain to the root, and your division. `org(view="reports")`
+lists your reports, and `org(view="division")` shows the whole tree. A task's
+lead is the session you pin with `org(action="set_lead")`. Without a pin, it is
+the earliest-spawned live Claude or Codex session on the task. Reporting lines
+say who to tell. They don't grant approval or merge authority.

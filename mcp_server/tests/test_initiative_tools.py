@@ -59,5 +59,44 @@ class InitiativeToolsTests(unittest.TestCase):
         self.assertIn("ON DELETE SET NULL", migration)
 
 
+    def test_kind_reaches_the_daemon(self):
+        with mock.patch.object(control_client, "resolve_socket_route", return_value=self.route), \
+             mock.patch.object(control_client, "call", return_value={}) as call:
+            server.propose_initiative("Trader", "coordinator-id", kind="division")
+            self.assertEqual(call.call_args.args[1]["kind"], "division")
+            server.list_initiatives(kind="division")
+            self.assertEqual(call.call_args.args[1]["kind"], "division")
+
+    def test_migration_adds_division_kind_idempotently(self):
+        migration = (Path(__file__).parents[2] / "sql" / "021_initiative_kind.sql").read_text()
+        self.assertIn("ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'initiative'", migration)
+        self.assertIn("IF NOT EXISTS", migration.split("initiatives_kind_check")[0])
+
+    def test_org_routes_to_the_daemon_with_only_given_params(self):
+        with mock.patch.object(control_client, "resolve_socket_route", return_value=self.route), \
+             mock.patch.object(control_client, "call", return_value={"view": "me"}) as call:
+            server.org()
+            call.assert_called_once_with("org", {}, socket_path=self.route.path)
+            call.reset_mock()
+            server.org(action="set_lead", session_uid="ts-1-2")
+            call.assert_called_once_with(
+                "org", {"action": "set_lead", "session_uid": "ts-1-2"},
+                socket_path=self.route.path,
+            )
+        with mock.patch.object(control_client, "resolve_socket_route",
+                               return_value=control_client.SocketRoute(Path("/tmp/tui.sock"), False)):
+            with self.assertRaises(RuntimeError):
+                server.org()
+
+    def test_propose_task_forwards_reports_to(self):
+        with mock.patch.object(control_client, "resolve_socket_route", return_value=self.route), \
+             mock.patch.object(server, "_git_origin_url", return_value="git@x:y.git"), \
+             mock.patch.object(control_client, "call", return_value={"id": "t"}) as call:
+            server.propose_task("claude-manager", "Report", reports_to="me")
+            self.assertEqual(call.call_args.args[1]["reports_to"], "me")
+            server.propose_task("claude-manager", "Standalone")
+            self.assertNotIn("reports_to", call.call_args.args[1])
+
+
 if __name__ == "__main__":
     unittest.main()

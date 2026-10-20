@@ -63,6 +63,12 @@ class TaskUpdate(BaseModel):
     metadata: dict | None = None
 
 
+class TaskLeadUpdate(BaseModel):
+    """Pin (or with null, clear) ``metadata.lead_session_uid`` on a task."""
+
+    session_uid: str | None = Field(default=None, max_length=128)
+
+
 class BacktestPhaseUpdate(BaseModel):
     """Live pipeline-phase heartbeat POSTed by a backtest worker mid-run.
 
@@ -180,6 +186,8 @@ class InitiativeCreate(BaseModel):
     docs_path: str = "cm-initiative"
     shared_channel: str | None = None
     metadata: dict | None = None
+    # 'initiative' (has a done state) or 'division' (a permanent org unit).
+    kind: str = "initiative"
 
 
 class InitiativeUpdate(BaseModel):
@@ -192,6 +200,7 @@ class InitiativeUpdate(BaseModel):
     docs_path: str | None = None
     shared_channel: str | None = None
     metadata: dict | None = None
+    kind: str | None = None
     reason: str | None = None
 
 
@@ -214,6 +223,7 @@ class InitiativeResponse(BaseModel):
     name: str
     description: str
     status: str
+    kind: str = "initiative"
     color: str | None = None
     coordinator_task_id: str
     coordinator_project: str | None = None

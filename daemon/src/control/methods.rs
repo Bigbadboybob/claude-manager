@@ -5717,6 +5717,11 @@ struct ProposeTaskParams {
     depends: Option<Vec<String>>,
     #[serde(default)]
     initiative_id: Option<String>,
+    /// Reporting line: a task id, or `"me"` for the caller's own task. Sets
+    /// the new row's `parent_task_id` (the API applies its usual initiative
+    /// inheritance/validation). Absent = a top-level draft, as before.
+    #[serde(default)]
+    reports_to: Option<String>,
 }
 
 pub fn propose_task(
@@ -5752,8 +5757,23 @@ pub fn propose_task(
     // (daemon launched from a shell with CM_API_URL /
     // CM_API_TOKEN exported, no daemon.toml on disk).
     let machine = local_machine_hostname();
-    let (metadata, api_url_cfg, api_token_cfg) = {
+    let (metadata, api_url_cfg, api_token_cfg, parent_task_id) = {
         let st = state_arc.lock().expect("state mutex");
+        let parent_task_id = match p.reports_to.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(me) if me.eq_ignore_ascii_case("me") => Some(
+                caller_uid
+                    .and_then(|cuid| st.lookup_session_any(cuid))
+                    .and_then(|view| view.task_id)
+                    .ok_or((
+                        ErrorCode::InvalidParams,
+                        "propose_task: reports_to=\"me\" needs a caller bound to a task \
+                         (ping().task_id is null); pass a task id or omit reports_to"
+                            .to_string(),
+                    ))?,
+            ),
+            Some(task) => Some(task.to_string()),
+        };
         (
             json!({
                 "filer": filer_metadata(
@@ -5765,6 +5785,7 @@ pub fn propose_task(
             }),
             st.config.api_url.clone(),
             st.config.api_token.clone(),
+            parent_task_id,
         )
     };
     let req = crate::planning_client::ProposeTaskRequest {
@@ -5776,6 +5797,7 @@ pub fn propose_task(
         difficulty: p.difficulty,
         depends: p.depends.as_deref(),
         initiative_id: p.initiative_id.as_deref(),
+        parent_task_id: parent_task_id.as_deref(),
         metadata: Some(&metadata),
     };
     let api_url_override = if api_url_cfg.is_empty() {
@@ -5794,6 +5816,16 @@ pub fn propose_task(
         api_token_override,
     ) {
         Ok(task) => {
+            // A reporting line wins: the overlay edge then mirrors the
+            // planning row's real parent instead of contradicting it.
+            if let Some(parent) = parent_task_id.as_deref() {
+                if let Some(new_task_id) = task.get("id").and_then(Value::as_str) {
+                    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    state.record_agent_task_edge(new_task_id, parent);
+                    state.persist_sessions_best_effort();
+                }
+                return Ok(task);
+            }
             // fix-start-session: a task an agent just proposed is that
             // agent's own work — record the daemon-side creator edge so a
             // follow-up `start_session(task_id=<proposed>)` (and the
@@ -15474,15 +15506,33 @@ fn api_list_initiatives(
     creds: &PlanningApiCreds,
     status: Option<&str>,
     project: Option<&str>,
+    kind: Option<&str>,
     include_archived: bool,
 ) -> Result<Vec<Value>, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
     let mut request = agent.get(&creds.url("/initiatives"));
     if let Some(status) = status { request = request.query("status", status); }
     if let Some(project) = project { request = request.query("project", project); }
+    if let Some(kind) = kind { request = request.query("kind", kind); }
     request = request.query("include_archived", if include_archived { "true" } else { "false" });
     let resp = request.header("Authorization", &creds.auth()).call().map_err(map_ureq_err)?;
     crate::planning_client::decode_json_response(resp, "list_initiatives")
+}
+
+/// POST /tasks/{id}/lead — atomically pin (or with None, clear)
+/// `metadata.lead_session_uid`; returns the updated task row.
+fn api_set_task_lead(
+    creds: &PlanningApiCreds,
+    task_id: &str,
+    session_uid: Option<&str>,
+) -> Result<Value, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let resp = agent
+        .post(&creds.url(&format!("/tasks/{}/lead", task_id)))
+        .header("Authorization", &creds.auth())
+        .send_json(json!({ "session_uid": session_uid }))
+        .map_err(map_ureq_err)?;
+    crate::planning_client::decode_json_response(resp, "set_task_lead")
 }
 
 fn api_get_initiative(
@@ -17327,6 +17377,7 @@ pub fn list_projects(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
 struct ListInitiativesParams {
     status: Option<String>,
     project: Option<String>,
+    kind: Option<String>,
     #[serde(default)]
     include_archived: bool,
 }
@@ -17344,7 +17395,7 @@ pub fn list_initiatives(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> 
     let creds = planning_creds(state_arc)?;
     Ok(Value::Array(api_list_initiatives(
         &creds, filters.status.as_deref(), filters.project.as_deref(),
-        filters.include_archived,
+        filters.kind.as_deref(), filters.include_archived,
     ).map_err(|e| e.to_method_err())?))
 }
 
@@ -17394,6 +17445,345 @@ pub fn propose_initiative_project(
     let creds = planning_creds(state_arc)?;
     api_add_initiative_project(&creds, reference, &Value::Object(body))
         .map_err(|e| e.to_method_err())
+}
+
+// ============================================================
+// org — reporting lines, leads and divisions (read-only + set_lead)
+// ============================================================
+//
+// Reporting lines follow the task tree (`parent_task_id`); a division is an
+// initiative with `kind = 'division'` rooted at its coordinator task. Leads
+// come from the shared rule in `crate::org`, the same function the TUI uses
+// for its ★. Session data is THIS daemon's registry: a lead running on
+// another host is not visible here (reported as `lead: null`, with the raw
+// pin in `pinned_lead_session_uid`). Reporting is not approval authority, so
+// every view is open to every caller and returns names and ids only.
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrgParams {
+    view: Option<String>,
+    action: Option<String>,
+    /// `view="reports"`: whose reports (default: the caller's task).
+    task_id: Option<String>,
+    /// `view="division"`: initiative UUID or slug (default: the caller's).
+    division: Option<String>,
+    /// `action="set_lead"`: the session to pin (default: the caller).
+    session_uid: Option<String>,
+}
+
+/// Upper bound on the reporting chain walk (guards a corrupt parent cycle).
+const ORG_CHAIN_MAX: usize = 32;
+
+/// The sessions bound to `task_id` on this daemon, as lead candidates
+/// (uid, engine, live). Registry rows are live by construction; exited
+/// sessions move to the tombstone list and never lead.
+fn org_lead_candidates(state: &DaemonState, task_id: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = state
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.task_id.as_deref() == Some(task_id))
+        .map(|(uid, s)| (uid.clone(), s.session_type.clone()))
+        .collect();
+    for (uid, s) in state.tui_sessions.iter() {
+        if s.task_id.as_deref() == Some(task_id) && !state.sessions.contains_key(uid) {
+            out.push((uid.clone(), s.session_type.clone().unwrap_or_default()));
+        }
+    }
+    out
+}
+
+/// `{session_uid, name, label, engine, pinned}` for the task's lead, or null.
+fn org_lead(state: &DaemonState, task: &Value) -> Value {
+    let Some(task_id) = task.get("id").and_then(Value::as_str) else {
+        return Value::Null;
+    };
+    let pinned = task.get("metadata").and_then(crate::org::pinned_lead);
+    let owned = org_lead_candidates(state, task_id);
+    let candidates: Vec<crate::org::LeadCandidate<'_>> = owned
+        .iter()
+        .map(|(uid, engine)| crate::org::LeadCandidate { uid, engine, live: true })
+        .collect();
+    let Some(uid) = crate::org::lead_session_uid(pinned, &candidates) else {
+        return Value::Null;
+    };
+    let engine = owned.iter().find(|(u, _)| *u == uid).map(|(_, e)| e.clone());
+    let label = state
+        .sessions
+        .get(&uid)
+        .map(|s| s.title.clone())
+        .or_else(|| state.tui_sessions.get(&uid).and_then(|s| s.label.clone()));
+    json!({
+        "session_uid": uid,
+        "name": state.messaging_names.get(&uid).map(|n| n.name.clone()),
+        "label": label,
+        "engine": engine,
+        "pinned": pinned == Some(uid.as_str()),
+    })
+}
+
+/// The compact task shape every org view returns.
+fn org_task(state: &DaemonState, task: &Value) -> Value {
+    let pinned = task.get("metadata").and_then(crate::org::pinned_lead);
+    json!({
+        "id": task.get("id"),
+        "name": task.get("name"),
+        "slug": task.get("slug"),
+        "project": task.get("project"),
+        "status": task.get("status"),
+        "parent_task_id": task.get("parent_task_id"),
+        "lead": org_lead(state, task),
+        "pinned_lead_session_uid": pinned,
+    })
+}
+
+/// The `initiative` object embedded in a task row, labelled by kind.
+fn org_unit(task: &Value) -> Value {
+    match task.get("initiative") {
+        Some(init) if init.is_object() => {
+            let kind = init.get("kind").and_then(Value::as_str).unwrap_or("initiative");
+            json!({
+                "id": init.get("id"),
+                "slug": init.get("slug"),
+                "name": init.get("name"),
+                "status": init.get("status"),
+                "kind": kind,
+                "root_task_id": init.get("coordinator_task_id"),
+            })
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Nest `tasks` under `root_id` by `parent_task_id`. Tasks whose parent is
+/// outside the set (and that aren't the root) come back in `unattached`.
+fn org_build_tree(
+    root_id: &str,
+    tasks: &[Value],
+    node: &dyn Fn(&Value) -> Value,
+) -> (Value, Vec<Value>) {
+    use std::collections::{HashMap, HashSet};
+    let id_of = |t: &Value| t.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let by_id: HashMap<String, &Value> = tasks.iter().map(|t| (id_of(t), t)).collect();
+    let mut children: HashMap<String, Vec<&Value>> = HashMap::new();
+    for t in tasks {
+        if let Some(parent) = t.get("parent_task_id").and_then(Value::as_str) {
+            if by_id.contains_key(parent) {
+                children.entry(parent.to_string()).or_default().push(t);
+            }
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    fn build(
+        id: &str,
+        by_id: &HashMap<String, &Value>,
+        children: &HashMap<String, Vec<&Value>>,
+        seen: &mut HashSet<String>,
+        node: &dyn Fn(&Value) -> Value,
+    ) -> Value {
+        seen.insert(id.to_string());
+        let mut out = by_id.get(id).map(|t| node(t)).unwrap_or_else(|| json!({"id": id}));
+        let reports: Vec<Value> = children
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("id").and_then(Value::as_str))
+            .filter(|cid| !seen.contains(*cid))
+            .map(|cid| cid.to_string())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|cid| build(cid, by_id, children, seen, node))
+            .collect();
+        out["reports"] = Value::Array(reports);
+        out
+    }
+    let tree = build(root_id, &by_id, &children, &mut seen, node);
+    let unattached = tasks
+        .iter()
+        .filter(|t| !seen.contains(&id_of(t)))
+        .map(node)
+        .collect();
+    (tree, unattached)
+}
+
+fn org_caller_task(state: &DaemonState, caller_uid: Option<&str>) -> Option<String> {
+    caller_uid
+        .and_then(|cuid| state.lookup_session_any(cuid))
+        .and_then(|view| view.task_id)
+}
+
+pub fn org(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: OrgParams = if params.is_null() {
+        OrgParams::default()
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| (ErrorCode::InvalidParams, format!("org params: {}", e)))?
+    };
+    let caller_task = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        org_caller_task(&state, caller_uid)
+    };
+    let creds = planning_creds(state_arc)?;
+    if let Some(action) = p.action.as_deref() {
+        if p.view.is_some() {
+            return Err((ErrorCode::InvalidParams, "org: pass view or action, not both".into()));
+        }
+        return match action {
+            "set_lead" | "clear_lead" => org_set_lead(state_arc, &creds, &p, action, caller_uid, caller_task),
+            other => Err((
+                ErrorCode::InvalidParams,
+                format!("org: unknown action '{}' (expected set_lead or clear_lead)", other),
+            )),
+        };
+    }
+    let need_task = |what: &str| {
+        caller_task.clone().ok_or((
+            ErrorCode::InvalidParams,
+            format!("org: {} needs a caller bound to a task, or an explicit id", what),
+        ))
+    };
+    match p.view.as_deref().unwrap_or("me") {
+        "me" => {
+            let own = need_task("view=\"me\"")?;
+            let mut row = api_get_task(&creds, &own).map_err(|e| e.to_method_err())?;
+            let mut chain: Vec<Value> = Vec::new();
+            let mut visited = vec![own.clone()];
+            let me = row.clone();
+            while let Some(parent) = row.get("parent_task_id").and_then(Value::as_str).map(str::to_string) {
+                if visited.contains(&parent) || chain.len() >= ORG_CHAIN_MAX {
+                    break;
+                }
+                visited.push(parent.clone());
+                row = api_get_task(&creds, &parent).map_err(|e| e.to_method_err())?;
+                chain.push(row.clone());
+            }
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let unit = org_unit(&me);
+            let is_division = unit.get("kind").and_then(Value::as_str) == Some("division");
+            Ok(json!({
+                "view": "me",
+                "session_uid": caller_uid,
+                "task": org_task(&state, &me),
+                "boss": chain.first().map(|t| org_task(&state, t)),
+                "chain": chain.iter().map(|t| org_task(&state, t)).collect::<Vec<_>>(),
+                "division": if is_division { unit.clone() } else { Value::Null },
+                "initiative": if is_division { Value::Null } else { unit },
+                "lead_scope": "sessions on this host",
+            }))
+        }
+        "reports" => {
+            let target = match p.task_id.clone() {
+                Some(t) => t,
+                None => need_task("view=\"reports\"")?,
+            };
+            let task = api_get_task(&creds, &target).map_err(|e| e.to_method_err())?;
+            let id = task.get("id").and_then(Value::as_str).unwrap_or(&target).to_string();
+            let all = api_list_tasks(&creds, None, None, None).map_err(|e| e.to_method_err())?;
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let reports: Vec<Value> = all
+                .iter()
+                .filter(|t| t.get("parent_task_id").and_then(Value::as_str) == Some(id.as_str()))
+                .map(|t| org_task(&state, t))
+                .collect();
+            Ok(json!({
+                "view": "reports",
+                "task": org_task(&state, &task),
+                "reports": reports,
+                "lead_scope": "sessions on this host",
+            }))
+        }
+        "division" => {
+            let reference = match p.division.clone() {
+                Some(d) => d,
+                None => {
+                    let own = need_task("view=\"division\"")?;
+                    let me = api_get_task(&creds, &own).map_err(|e| e.to_method_err())?;
+                    me.get("initiative_id").and_then(Value::as_str).map(str::to_string).ok_or((
+                        ErrorCode::InvalidParams,
+                        "org: your task is not in a division or initiative; pass division=<id or slug>"
+                            .to_string(),
+                    ))?
+                }
+            };
+            let init = api_get_initiative(&creds, &reference).map_err(|e| e.to_method_err())?;
+            let init_id = init.get("id").and_then(Value::as_str).unwrap_or(&reference).to_string();
+            let root = init.get("coordinator_task_id").and_then(Value::as_str).unwrap_or("").to_string();
+            let tasks = api_list_tasks(&creds, None, None, Some(&init_id)).map_err(|e| e.to_method_err())?;
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let (tree, unattached) = org_build_tree(&root, &tasks, &|t| org_task(&state, t));
+            Ok(json!({
+                "view": "division",
+                "division": {
+                    "id": init.get("id"),
+                    "slug": init.get("slug"),
+                    "name": init.get("name"),
+                    "status": init.get("status"),
+                    "kind": init.get("kind").and_then(Value::as_str).unwrap_or("initiative"),
+                    "root_task_id": root,
+                },
+                "tree": tree,
+                "unattached": unattached,
+                "lead_scope": "sessions on this host",
+            }))
+        }
+        other => Err((
+            ErrorCode::InvalidParams,
+            format!("org: unknown view '{}' (expected me, reports or division)", other),
+        )),
+    }
+}
+
+/// `org(action="set_lead" | "clear_lead")`: only on the caller's own task,
+/// and only naming a live agent session bound to it on this host.
+fn org_set_lead(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    creds: &PlanningApiCreds,
+    p: &OrgParams,
+    action: &str,
+    caller_uid: Option<&str>,
+    caller_task: Option<String>,
+) -> MethodResult {
+    let Some(caller) = caller_uid else {
+        return Err((ErrorCode::Unauthorized, "org: set_lead is for agent sessions; Owner uses A-e".into()));
+    };
+    let own = caller_task.ok_or((
+        ErrorCode::Unauthorized,
+        "org: set_lead needs a caller bound to a task".to_string(),
+    ))?;
+    if let Some(t) = p.task_id.as_deref() {
+        if t != own {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!("org: set_lead only changes your own task ({}), not {}", own, t),
+            ));
+        }
+    }
+    let uid = if action == "clear_lead" {
+        None
+    } else {
+        let uid = p.session_uid.clone().unwrap_or_else(|| caller.to_string());
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let bound = org_lead_candidates(&state, &own)
+            .into_iter()
+            .any(|(u, engine)| u == uid && crate::org::is_agent_engine(&engine));
+        if !bound {
+            return Err((
+                ErrorCode::InvalidParams,
+                format!(
+                    "org: session '{}' is not a live agent session bound to your task on this host",
+                    uid
+                ),
+            ));
+        }
+        Some(uid)
+    };
+    let task = api_set_task_lead(creds, &own, uid.as_deref()).map_err(|e| e.to_method_err())?;
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(json!({"action": action, "task": org_task(&state, &task)}))
 }
 
 #[derive(Default, Deserialize)]
@@ -36135,5 +36525,43 @@ mod orphan_prompt_tests {
             assert!(!super::deliver_agent_body(&handle, &fanout, "exited", &"abandoned prompt".repeat(3000), fresh, "test"));
         }
         assert!(writes.lock().unwrap().is_empty(), "do not fill an orphan PTY after startup failure");
+    }
+}
+
+#[cfg(test)]
+mod org_tree_tests {
+    use super::org_build_tree;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn division_tree_nests_by_parent_and_lists_strays() {
+        let tasks = vec![
+            json!({"id": "root", "parent_task_id": null}),
+            json!({"id": "a", "parent_task_id": "root"}),
+            json!({"id": "a1", "parent_task_id": "a"}),
+            json!({"id": "b", "parent_task_id": "root"}),
+            json!({"id": "stray", "parent_task_id": "elsewhere"}),
+        ];
+        let node = |t: &Value| json!({"id": t["id"]});
+        let (tree, unattached) = org_build_tree("root", &tasks, &node);
+        assert_eq!(tree["id"], "root");
+        let kids: Vec<&str> = tree["reports"].as_array().unwrap().iter()
+            .map(|n| n["id"].as_str().unwrap()).collect();
+        assert_eq!(kids, ["a", "b"]);
+        assert_eq!(tree["reports"][0]["reports"][0]["id"], "a1");
+        assert_eq!(unattached, vec![json!({"id": "stray"})]);
+    }
+
+    #[test]
+    fn division_tree_survives_a_parent_cycle() {
+        let tasks = vec![
+            json!({"id": "root", "parent_task_id": "x"}),
+            json!({"id": "x", "parent_task_id": "root"}),
+        ];
+        let node = |t: &Value| json!({"id": t["id"]});
+        let (tree, unattached) = org_build_tree("root", &tasks, &node);
+        assert_eq!(tree["reports"][0]["id"], "x");
+        assert_eq!(tree["reports"][0]["reports"], json!([]));
+        assert!(unattached.is_empty());
     }
 }
