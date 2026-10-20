@@ -3912,6 +3912,20 @@ impl App {
                 }
             }
         }
+        // A nested workspace's section comes from its root block: the A-e
+        // Section field shows that and does not cycle.
+        if let CrosstermEvent::Key(key) = event {
+            let section_field = match &self.input_mode {
+                InputMode::WorkspaceSettings { workspace_id, active_field: 3, .. }
+                | InputMode::TaskSettings { workspace_id, active_field: 2, .. } => Some(workspace_id.clone()),
+                _ => None,
+            };
+            if section_field.is_some_and(|id| self.nested_section_label(&id).is_some())
+                && matches!(key.code, KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right)
+            {
+                return true;
+            }
+        }
         // Section ids for the workspace / task settings pickers.
         let section_ids: Vec<String> = self.section_ids();
         let report_tasks = if matches!(self.input_mode, InputMode::NewSession { .. }) {
@@ -4439,7 +4453,9 @@ impl App {
             }
             SubmitAction::SaveWorkspaceSettings { workspace_id, name, color, pinned, section } => {
                 let mut pinned_changed = false;
-                if self.workspaces.iter().any(|w| w.id == workspace_id) {
+                // A nested workspace's section is its root block's.
+                let nested = self.nested_section_label(&workspace_id).is_some();
+                if !nested && self.workspaces.iter().any(|w| w.id == workspace_id) {
                     // Sidecar map, not a Workspace field — write it before
                     // the save below so one manifest write carries both.
                     match section {
@@ -4497,13 +4513,8 @@ impl App {
                 // only that metadata key. Applied locally at once so the ★
                 // moves now; the API row confirms it.
                 if let Some(pin) = lead {
-                    if let Some(task) = self.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some(task_id.as_str())) {
-                        let meta = task.metadata.get_or_insert_with(|| serde_json::json!({}));
-                        if let Some(m) = meta.as_object_mut() {
-                            m.insert("lead_session_uid".into(), pin.clone().map_or(serde_json::Value::Null, Into::into));
-                        }
-                    }
-                    self.backend.set_task_lead(task_id.clone(), pin);
+                    let previous = self.set_local_lead_pin(&task_id, pin.clone());
+                    self.backend.set_task_lead(task_id.clone(), pin, previous);
                 }
                 // Color rides the local manifest sidecar, not the API row —
                 // apply it regardless of whether the rename half is valid.
@@ -4517,7 +4528,10 @@ impl App {
                 }
                 // Capture the workspace at modal-open: neither cursor movement
                 // nor a delayed task binding may redirect the section change.
-                if self.workspaces.iter().any(|w| w.id == workspace_id) {
+                // A nested workspace's section is its root block's.
+                if self.nested_section_label(&workspace_id).is_none()
+                    && self.workspaces.iter().any(|w| w.id == workspace_id)
+                {
                     match section {
                         Some(sid) => { self.workspace_sections.insert(workspace_id, sid); }
                         None => { self.workspace_sections.remove(&workspace_id); }

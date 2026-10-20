@@ -225,8 +225,11 @@ impl App {
     pub(crate) fn cursor_section_id(&self) -> Option<String> {
         match &self.cursor {
             Cursor::Section(id) => Some(id.clone()),
-            Cursor::Workspace(wi) | Cursor::Session(wi, _) => self.section_of_workspace(*wi),
-            Cursor::Task { ws_idx, .. } => self.section_of_workspace(*ws_idx),
+            // A nested row belongs to the section its root block is drawn in.
+            Cursor::Workspace(wi) | Cursor::Session(wi, _) | Cursor::Task { ws_idx: wi, .. } => {
+                let root = self.task_tree().block_root.get(wi).copied().unwrap_or(*wi);
+                self.section_of_workspace(root)
+            }
             Cursor::Backtest(_) | Cursor::Division(_) => None,
         }
     }
@@ -335,8 +338,13 @@ impl App {
     /// Visible member workspaces of a section, for the folded header's
     /// rollup and the A-i peek.
     pub(crate) fn section_members(&self, id: &str) -> Vec<usize> {
+        self.section_members_in(id, &self.task_tree().block_root)
+    }
+
+    /// `section_members` against an already-built tree's block roots: a
+    /// nested block belongs to its root block's section.
+    pub(crate) fn section_members_in(&self, id: &str, roots: &HashMap<usize, usize>) -> Vec<usize> {
         let members = self.continuous_members();
-        let roots = self.task_tree().block_root;
         self.task_view_visible_workspaces(&members)
             .into_iter()
             .filter(|wi| self.section_of_workspace(roots.get(wi).copied().unwrap_or(*wi)).as_deref() == Some(id))
@@ -345,8 +353,13 @@ impl App {
 
     /// `(workspaces, running, idle)` counts for a section's folded header.
     pub(crate) fn section_rollup(&self, id: &str) -> (usize, usize, usize) {
-        let members = self.section_members(id);
-        let (_, running, idle) = self.rollup(members.iter().flat_map(|wi| &self.workspaces[*wi].sessions));
+        self.section_rollup_in(id, &self.task_tree().block_root)
+    }
+
+    /// `section_rollup` against an already-built tree (one per frame).
+    pub(crate) fn section_rollup_in(&self, id: &str, roots: &HashMap<usize, usize>) -> (usize, usize, usize) {
+        let members = self.section_members_in(id, roots);
+        let (_, running, idle, _) = self.rollup(members.iter().flat_map(|wi| &self.workspaces[*wi].sessions));
         (members.len(), running, idle)
     }
 }
@@ -702,7 +715,9 @@ pub(crate) mod layout_tests {
 
     #[test]
     fn workspace_section_save_survives_reorder() {
-        let mut app = sectioned_app();
+        // b top-level: a nested workspace's section is its root's (not saved).
+        let mut app = flat_sectioned_app();
+        app.workspace_sections.remove("b");
         app.cursor = Cursor::Workspace(1);
         app.open_session_settings();
         let InputMode::WorkspaceSettings { section, .. } = &mut app.input_mode else { panic!("workspace settings"); };

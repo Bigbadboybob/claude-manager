@@ -397,6 +397,9 @@ pub struct App {
     /// manifest.
     pub(crate) folded_tasks: HashSet<String>,
     pub(crate) folded_divisions: HashSet<String>,
+    /// Set per frame while an A-e form is open on a nested workspace: the
+    /// read-only Section value it inherits (`App::nested_section_label`).
+    pub(crate) section_note: Option<String>,
     /// Sidebar sections (doc/sidebar-sections.md) in display order.
     /// Persisted as `Manifest::sections`; see `app/sections.rs`.
     pub(crate) sections: Vec<SidebarSection>,
@@ -1041,6 +1044,7 @@ impl App {
             task_colors,
             folded_tasks,
             folded_divisions,
+            section_note: None,
             sections,
             workspace_sections,
             sidebar_receipts: manifest.sidebar_receipts.clone(),

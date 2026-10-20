@@ -1301,6 +1301,24 @@ impl PlanningView {
         })
     }
 
+    /// Every task in a division, mapped to that division: one pass over the
+    /// planning data, for the sidebar tree.
+    pub(crate) fn divisions_by_task(&self) -> HashMap<String, Division> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .filter(|t| t.initiative_kind.as_deref() == Some("division"))
+            .filter_map(|t| {
+                Some((t.id.clone(), Division {
+                    id: t.initiative_id.clone()?,
+                    name: t.initiative_name.clone().unwrap_or_else(|| "division".into()),
+                    color: t.initiative_color.clone(),
+                    coordinator: t.is_initiative_coordinator,
+                }))
+            })
+            .collect()
+    }
+
     /// Display data of a division, from any of its tasks.
     pub(crate) fn division(&self, id: &str) -> Option<Division> {
         let task = self

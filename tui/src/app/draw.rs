@@ -312,13 +312,14 @@ impl App {
                     self.draw_transcript_picker(frame, area, candidates, *selected, target);
                 }
                 InputMode::WorkspaceSettings {
+                    workspace_id,
                     name,
                     color,
                     pinned,
                     section,
                     active_field,
-                    ..
                 } => {
+                    self.section_note = self.nested_section_label(workspace_id);
                     self.draw_workspace_settings(
                         frame,
                         area,
@@ -386,7 +387,8 @@ impl App {
                         goal,
                     );
                 }
-                InputMode::TaskSettings { task_id, name, color, section, lead, lead_choices, active_field, .. } => {
+                InputMode::TaskSettings { task_id, workspace_id, name, color, section, lead, lead_choices, active_field, .. } => {
+                    self.section_note = self.nested_section_label(workspace_id);
                     let lead_label = match lead {
                         Some(uid) => lead_choices
                             .iter()
@@ -522,6 +524,11 @@ impl App {
         let dim = Style::default().fg(theme::DIM);
         let white = Style::default().fg(theme::TEXT);
         let mut spans = vec![Span::styled(label.to_string(), if focused { white } else { dim })];
+        // A nested workspace shows the section it inherits, read-only.
+        if let Some(note) = self.section_note.clone() {
+            spans.push(Span::styled(note, white));
+            return Line::from(spans);
+        }
         let value = self.section_choice_label(section);
         let value_style = match section {
             Some(id) if !id.is_empty() => self
@@ -1875,12 +1882,20 @@ impl App {
         let list_height = inner.height.saturating_sub(helper_height);
 
         // Task sub-view: the nested work tree (app/tree.rs) and its row
-        // metadata, built once per frame.
-        let tree = (self.sidebar_view == SidebarView::Task).then(|| self.task_tree());
-        let visual = match &tree {
+        // metadata, built once per frame. A fold, folded section or filter
+        // must never hide the cursor's row (a jump, spawn or restore can
+        // land there): reveal it, and rebuild only then.
+        let mut tree = (self.sidebar_view == SidebarView::Task).then(|| self.task_tree());
+        let mut visual = match &tree {
             Some(t) => self.filter_visual_items(t.items.clone()),
             None => self.visual_items(),
         };
+        if tree.is_some() && self.cursor_row_hidden(&visual) && self.reveal_cursor() {
+            let t = self.task_tree();
+            visual = self.filter_visual_items(t.items.clone());
+            tree = Some(t);
+        }
+        let tree = tree;
         let mut items: Vec<ListItem> = Vec::new();
         // A nested block renders inside its root block's section.
         let block_root = |wi: usize| tree.as_ref().and_then(|t| t.block_root.get(&wi).copied()).unwrap_or(wi);
@@ -1948,10 +1963,13 @@ impl App {
             spans
         };
         let fold_tail = |node: &super::tree::Node| -> String {
-            let Some((n, running, idle)) = tree.as_ref().and_then(|t| t.folded.get(node)) else {
+            let Some((n, running, idle, alerting)) = tree.as_ref().and_then(|t| t.folded.get(node)) else {
                 return String::new();
             };
             let mut t = format!("  ({n})");
+            if *alerting > 0 {
+                t.push_str(&format!(" \u{2691}{alerting}"));
+            }
             if *running > 0 {
                 t.push_str(&format!(" \u{283f}{running}"));
             }
@@ -2350,7 +2368,7 @@ impl App {
                 // in the initiative's colour (else HEADER), bold.
                 VisualItem::DivisionHeader(id) => {
                     let is_selected = matches!(&self.cursor, Cursor::Division(cid) if cid == id);
-                    let division = self.planning.division(id);
+                    let division = tree.as_ref().and_then(|t| t.divisions.get(id)).cloned();
                     let node = super::tree::Node::Division(id.clone());
                     let glyph = if self.tree_folded(&node) { "\u{25b8}" } else { "\u{25be}" };
                     let tail = fold_tail(&node);
@@ -2377,7 +2395,10 @@ impl App {
                     let Some(sec) = self.section_by_id(id) else {
                         continue;
                     };
-                    let (n, running, idle) = self.section_rollup(id);
+                    let (n, running, idle) = match &tree {
+                        Some(t) => self.section_rollup_in(id, &t.block_root),
+                        None => self.section_rollup(id),
+                    };
                     let glyph = if sec.folded { "\u{25b8}" } else { "\u{25be}" };
                     let tail = if sec.folded {
                         let mut t = format!("  ({})", n);
