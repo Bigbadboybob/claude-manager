@@ -188,7 +188,13 @@ pub(super) enum InputMode {
         /// workspaces; a task row is just the handiest place to set it).
         /// Same encoding as `WorkspaceSettings::section`.
         section: Option<String>,
-        /// 0 = name, 1 = color, 2 = section
+        /// Lead session pin: None = the rule's choice (`app/tree.rs`).
+        lead: Option<String>,
+        /// `(uid, label)` of the sessions that can be pinned.
+        lead_choices: Vec<(String, String)>,
+        /// The pin when the form opened; a save changes it only if it moved.
+        lead_pinned: Option<String>,
+        /// 0 = name, 1 = color, 2 = section, 3 = lead
         active_field: u8,
     },
     /// Picking which workflow to launch when more than one is defined.
@@ -607,6 +613,8 @@ pub(crate) enum SubmitAction {
         name: String,
         color: Option<String>,
         section: Option<String>,
+        /// `Some(pin)` when the lead pin changed (`Some(None)` clears it).
+        lead: Option<Option<String>>,
     },
     EnterWorkflowLaunchConfirm {
         ws_id: String,
@@ -987,6 +995,9 @@ pub(crate) struct TaskSettingsMut<'a> {
     pub name: &'a mut String,
     pub color: &'a mut Option<String>,
     pub section: &'a mut Option<String>,
+    pub lead: &'a mut Option<String>,
+    pub lead_choices: &'a [(String, String)],
+    pub lead_pinned: Option<&'a str>,
     pub active_field: &'a mut u8,
 }
 
@@ -1877,7 +1888,19 @@ pub(crate) fn handle_task_settings(
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
         KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 3;
+            *state.active_field = (*state.active_field + 1) % 4;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left if *state.active_field == 3 => {
+            // auto, then each pinnable session, wrapping.
+            let n = state.lead_choices.len() + 1;
+            let at = state
+                .lead
+                .as_deref()
+                .and_then(|uid| state.lead_choices.iter().position(|(u, _)| u == uid))
+                .map_or(0, |i| i + 1);
+            let next = if key.code == KeyCode::Left { (at + n - 1) % n } else { (at + 1) % n };
+            *state.lead = next.checked_sub(1).map(|i| state.lead_choices[i].0.clone());
             InputOutcome::Consumed
         }
         KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 2 => {
@@ -1896,6 +1919,7 @@ pub(crate) fn handle_task_settings(
             name: state.name.trim().to_string(),
             color: state.color.clone(),
             section: state.section.clone(),
+            lead: (state.lead.as_deref() != state.lead_pinned).then(|| state.lead.clone()),
         }),
         KeyCode::Backspace if *state.active_field == 0 => {
             state.name.pop();
@@ -2732,12 +2756,16 @@ impl App {
                 let Some(ws) = self.workspaces.get(ws_idx) else { return; };
                 let workspace_id = ws.id.clone();
                 let current_section = self.workspace_sections.get(&workspace_id).cloned();
+                let (lead_choices, lead_pinned) = self.lead_choices(&task_id);
                 self.input_mode = InputMode::TaskSettings {
                     task_id,
                     workspace_id,
                     name: current_name,
                     color: current_color,
                     section: current_section,
+                    lead: lead_pinned.clone(),
+                    lead_choices,
+                    lead_pinned,
                     active_field: 0,
                 };
             }
@@ -2755,6 +2783,9 @@ impl App {
                         active_field: 0,
                     };
                 }
+            }
+            Cursor::Division(_) => {
+                self.set_status_msg("Divisions are edited in planning (update_initiative) — Space/Enter folds");
             }
         }
     }
@@ -3529,14 +3560,21 @@ impl App {
         // Space/Enter are free to fold/unfold (matching the planning view's
         // Space-fold idiom). Guarded on the cursor so a stray Space while a
         // real session is focused still reaches its terminal below.
+        // Task and division headers of the work tree (app/tree.rs) are
+        // pure tree rows too: Space/Enter fold them, and no other key
+        // reaches a terminal from them.
         if let CrosstermEvent::Key(key) = event {
-            if matches!(self.cursor, Cursor::Backtest(_) | Cursor::Section(_))
+            let header = matches!(
+                self.cursor,
+                Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Task { .. } | Cursor::Division(_)
+            );
+            if header
                 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
                 && !key
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
             {
-                if !self.toggle_backtest_fold() {
+                if !self.toggle_backtest_fold() && !self.toggle_tree_fold() {
                     self.toggle_section_fold();
                 }
                 return true;
@@ -4038,7 +4076,9 @@ impl App {
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
-            InputMode::TaskSettings { task_id, workspace_id, name, color, section, active_field } => {
+            InputMode::TaskSettings {
+                task_id, workspace_id, name, color, section, lead, lead_choices, lead_pinned, active_field,
+            } => {
                 handle_task_settings(
                     TaskSettingsMut {
                         task_id: task_id.as_str(),
@@ -4046,6 +4086,9 @@ impl App {
                         name,
                         color,
                         section,
+                        lead,
+                        lead_choices,
+                        lead_pinned: lead_pinned.as_deref(),
                         active_field,
                     },
                     InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
@@ -4449,7 +4492,19 @@ impl App {
                 // emits it.
                 let _ = name;
             }
-            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section } => {
+            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section, lead } => {
+                // The lead pin goes through its own endpoint, which changes
+                // only that metadata key. Applied locally at once so the ★
+                // moves now; the API row confirms it.
+                if let Some(pin) = lead {
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some(task_id.as_str())) {
+                        let meta = task.metadata.get_or_insert_with(|| serde_json::json!({}));
+                        if let Some(m) = meta.as_object_mut() {
+                            m.insert("lead_session_uid".into(), pin.clone().map_or(serde_json::Value::Null, Into::into));
+                        }
+                    }
+                    self.backend.set_task_lead(task_id.clone(), pin);
+                }
                 // Color rides the local manifest sidecar, not the API row —
                 // apply it regardless of whether the rename half is valid.
                 match color {
@@ -7884,6 +7939,9 @@ mod input_handler_tests {
                 name: &mut name,
                 color: &mut color,
                 section: &mut section,
+                lead: &mut None,
+                lead_choices: &[],
+                lead_pinned: None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -7906,6 +7964,9 @@ mod input_handler_tests {
                 name: &mut name,
                 color: &mut color,
                 section: &mut section,
+                lead: &mut None,
+                lead_choices: &[],
+                lead_pinned: None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -7937,6 +7998,9 @@ mod input_handler_tests {
                 name: &mut name,
                 color: &mut color,
                 section: &mut section,
+                lead: &mut None,
+                lead_choices: &[],
+                lead_pinned: None,
                 active_field: &mut active,
             },
             ctx_no_repos(),

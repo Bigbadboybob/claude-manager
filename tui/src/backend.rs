@@ -181,6 +181,11 @@ pub enum BackendCommand {
         id: String,
         fields: HashMap<String, serde_json::Value>,
     },
+    /// Pin or clear a task's lead session (`POST /tasks/{id}/lead`).
+    SetTaskLead {
+        id: String,
+        session_uid: Option<String>,
+    },
     /// Delete a planning task from the DB.
     DeletePlanTask {
         id: String,
@@ -331,6 +336,10 @@ impl BackendHandle {
         );
     }
 
+    pub fn set_task_lead(&self, id: String, session_uid: Option<String>) {
+        self.try_send_or_warn(BackendCommand::SetTaskLead { id, session_uid }, "set_task_lead");
+    }
+
     pub fn delete_plan_task(&self, id: String) {
         self.try_send_or_warn(BackendCommand::DeletePlanTask { id }, "delete_plan_task");
     }
@@ -462,6 +471,19 @@ fn backend_loop(
                     let _ = event_tx.send(BackendEvent::PlanTaskCreated(task.clone()));
                 }
                 let _ = event_tx.send(BackendEvent::ReportingTaskCreated { request_id, result });
+            }
+            Ok(BackendCommand::SetTaskLead { id, session_uid }) => {
+                match client.set_task_lead(&id, session_uid.as_deref()) {
+                    Ok(task) => {
+                        if let Some(task) = task {
+                            let _ = event_tx.send(BackendEvent::PlanTaskUpdated(task));
+                        }
+                        after_write(&client);
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
+                    }
+                }
             }
             Ok(BackendCommand::DeletePlanTask { id }) => {
                 match client.delete_task(&id) {

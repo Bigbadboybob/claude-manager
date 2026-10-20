@@ -107,6 +107,9 @@ pub struct PlanTask {
     pub initiative_color: Option<String>,
     /// Marks the initiative's designated coordinator, not every member task.
     pub is_initiative_coordinator: bool,
+    /// The initiative's `kind`: `"division"` for a permanent division,
+    /// else an ordinary initiative (also when the API predates the field).
+    pub initiative_kind: Option<String>,
     /// Task kind from the API row ("oneshot" | "continuous" | "backtest").
     /// The `A-w` watch action fires only on `"backtest"`.
     pub kind: String,
@@ -183,6 +186,8 @@ impl PlanTask {
                 && task.initiative.as_ref()
                     .and_then(|v| v.get("coordinator_task_id"))
                     .and_then(|v| v.as_str()) == Some(task.id.as_str()),
+            initiative_kind: task.initiative.as_ref()
+                .and_then(|v| v.get("kind")).and_then(|v| v.as_str()).map(str::to_string),
             kind: task.kind.clone(),
             worker_vm: task.worker_vm.clone().filter(|s| !s.is_empty()),
             vm_project: meta_str(&task.metadata, "vm", "project"),
@@ -193,6 +198,17 @@ impl PlanTask {
             filer: FilerMetadata::from_metadata(&task.metadata),
         }
     }
+}
+
+/// A division (an initiative with `kind = "division"`), as a sidebar
+/// header shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Division {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+    /// The task asked about is the division's root (its coordinator).
+    pub coordinator: bool,
 }
 
 #[derive(Clone)]
@@ -1271,6 +1287,30 @@ impl PlanningView {
     }
 
     /// Shared with the work-panel task sidebar; filters and folds do not hide membership.
+    /// The division a task belongs to, when its initiative is one.
+    pub(crate) fn task_division(&self, task_id: &str) -> Option<Division> {
+        let task = self.project_data.iter().flat_map(|pd| &pd.tasks).find(|t| t.id == task_id)?;
+        if task.initiative_kind.as_deref() != Some("division") {
+            return None;
+        }
+        Some(Division {
+            id: task.initiative_id.clone()?,
+            name: task.initiative_name.clone().unwrap_or_else(|| "division".into()),
+            color: task.initiative_color.clone(),
+            coordinator: task.is_initiative_coordinator,
+        })
+    }
+
+    /// Display data of a division, from any of its tasks.
+    pub(crate) fn division(&self, id: &str) -> Option<Division> {
+        let task = self
+            .project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .find(|t| t.initiative_id.as_deref() == Some(id) && t.initiative_kind.as_deref() == Some("division"))?;
+        self.task_division(&task.id)
+    }
+
     pub(crate) fn task_initiative_marker(&self, task_id: &str) -> &'static str {
         self.project_data.iter().flat_map(|pd| &pd.tasks)
             .find(|task| task.id == task_id)
@@ -1376,6 +1416,7 @@ impl PlanningView {
                         local_task.initiative_status = api_task.initiative_status.clone();
                         local_task.initiative_color = api_task.initiative_color.clone();
                         local_task.is_initiative_coordinator = api_task.is_initiative_coordinator;
+                        local_task.initiative_kind = api_task.initiative_kind.clone();
                     } else {
                         // New task from API — add it.
                         pd.tasks.push(api_task.clone());
@@ -5181,6 +5222,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5751,6 +5793,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5808,6 +5851,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5929,6 +5973,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5993,6 +6038,7 @@ mod tests {
                 initiative_status: None,
                 initiative_color: None,
                 is_initiative_coordinator: false,
+                initiative_kind: None,
                 kind: "oneshot".to_string(),
                 worker_vm: None,
                 vm_project: None,
@@ -6069,6 +6115,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -6268,6 +6315,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,

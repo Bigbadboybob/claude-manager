@@ -1253,7 +1253,7 @@ impl App {
             }
             // Backtest rows have no hidden bit — the group folds instead;
             // section headers likewise.
-            Cursor::Backtest(_) | Cursor::Section(_) => return,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => return,
         };
         if let Some(ts) = self
             .workspaces
@@ -1910,6 +1910,9 @@ impl App {
             }
             Cursor::Section(_) => {
                 self.set_status_msg("A section has no session to close (A-x deletes the section)");
+            }
+            Cursor::Division(_) => {
+                self.set_status_msg("A division header has no session to close");
             }
         }
     }
@@ -3285,7 +3288,7 @@ impl App {
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => *wi,
             Cursor::Task { ws_idx, .. } => *ws_idx,
             // Not on any workspace — nothing to exempt from the sweep.
-            Cursor::Backtest(_) | Cursor::Section(_) => usize::MAX,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => usize::MAX,
         };
 
         let mut changed = false;
@@ -5857,6 +5860,8 @@ mod slice_12e_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6053,6 +6058,8 @@ remote_socket = "/remote/manager.sock"
         let on_disk = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),

@@ -416,6 +416,21 @@ impl ApiClient {
         Ok(resp)
     }
 
+    /// `POST /tasks/{id}/lead`: pin (`Some`) or clear (`None`) the task's
+    /// lead session, `metadata.lead_session_uid`, leaving the rest of the
+    /// metadata bag alone (a PATCH would replace it). Returns the updated
+    /// row when the server sends one.
+    pub fn set_task_lead(&self, task_id: &str, session_uid: Option<&str>) -> anyhow::Result<Option<Task>> {
+        let body: serde_json::Value = self
+            .agent
+            .post(&self.url(&format!("/tasks/{}/lead", task_id)))
+            .header("Authorization", &self.auth_header())
+            .send_json(serde_json::json!({ "session_uid": session_uid }))?
+            .body_mut()
+            .read_json()?;
+        Ok(serde_json::from_value(body).ok())
+    }
+
     pub fn delete_task(&self, task_id: &str) -> anyhow::Result<()> {
         self.agent
             .delete(&self.url(&format!("/tasks/{}", task_id)))

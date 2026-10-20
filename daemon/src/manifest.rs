@@ -33,7 +33,7 @@
 //!   then live diffs. That's a thin layer over `ManifestWatcher` and
 //!   doesn't change the broadcaster's contract.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -619,6 +619,13 @@ pub struct Manifest {
     /// renders under its parent's section) or renders loose.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub workspace_sections: HashMap<String, String>,
+    /// Folded task headers in the Sessions view's nested work tree, by task
+    /// id. Pure TUI display state, like `sections`.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub folded_tasks: BTreeSet<String>,
+    /// Folded division headers in the same tree, by initiative id.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub folded_divisions: BTreeSet<String>,
     /// Viewer receipts prevent replayed remote moves from undoing Owner edits.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sidebar_receipts: HashMap<String, crate::sidebar::Receipt>,
