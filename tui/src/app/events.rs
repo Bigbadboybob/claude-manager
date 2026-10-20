@@ -1234,6 +1234,9 @@ impl App {
                 BackendEvent::PlanTaskDeleted(id) => {
                     self.planning.on_task_deleted(&id);
                 }
+                BackendEvent::ReportingTaskCreated { request_id, result } => {
+                    self.on_reporting_task_created(&request_id, result);
+                }
             }
         }
     }

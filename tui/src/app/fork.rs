@@ -42,12 +42,7 @@ const F_PARENT: u8 = 2;
 const F_BASE: u8 = 3;
 const FIELDS: u8 = 4;
 
-/// A task the user can pick (from the viewer's task list).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TaskChoice {
-    pub task_id: String,
-    pub name: String,
-}
+pub(crate) use crate::task_picker::TaskChoice;
 
 /// Where a NEW task hangs.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,17 +137,7 @@ impl ForkForm {
     /// Picker candidates for `query`: prefix matches first, then substring
     /// matches (case-insensitive), each in the captured task order.
     pub(crate) fn filtered(&self, query: &str) -> Vec<usize> {
-        let q = query.trim().to_lowercase();
-        super::nav::rank_prefix_then_substring(self.tasks.len(), |i| {
-            let name = self.tasks[i].name.to_lowercase();
-            if q.is_empty() || name.starts_with(&q) {
-                Some(true)
-            } else if name.contains(&q) || self.tasks[i].task_id.starts_with(&q) {
-                Some(false)
-            } else {
-                None
-            }
-        })
+        crate::task_picker::filter(&self.tasks, query)
     }
 
     fn open_picker(&mut self, purpose: PickFor, query: String) {
@@ -161,36 +146,18 @@ impl ForkForm {
 
     fn picker_key(&mut self, key: KeyEvent) -> InputOutcome {
         let Some(mut picker) = self.picker.take() else { return InputOutcome::Consumed };
-        let plain = !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
-        let matches = self.filtered(&picker.query);
-        match key.code {
-            KeyCode::Esc => return InputOutcome::Consumed,
-            KeyCode::Up | KeyCode::BackTab => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => {
-                picker.selected = (picker.selected + 1).min(matches.len().saturating_sub(1));
-            }
-            KeyCode::Enter => {
-                if let Some(&i) = matches.get(picker.selected) {
-                    let choice = self.tasks[i].clone();
-                    match picker.purpose {
-                        PickFor::Existing => self.existing_task = Some(choice),
-                        PickFor::Parent => self.parent = ParentChoice::Task(choice),
-                    }
-                    self.error = None;
+        match crate::task_picker::step(&self.tasks, &mut picker.query, &mut picker.selected, key) {
+            None => self.picker = Some(picker),
+            Some(None) => {}
+            Some(Some(i)) => {
+                let choice = self.tasks[i].clone();
+                match picker.purpose {
+                    PickFor::Existing => self.existing_task = Some(choice),
+                    PickFor::Parent => self.parent = ParentChoice::Task(choice),
                 }
-                return InputOutcome::Consumed;
+                self.error = None;
             }
-            KeyCode::Backspace => {
-                picker.query.pop();
-                picker.selected = 0;
-            }
-            KeyCode::Char(c) if plain => {
-                picker.query.push(c);
-                picker.selected = 0;
-            }
-            _ => {}
         }
-        self.picker = Some(picker);
         InputOutcome::Consumed
     }
 
@@ -402,44 +369,11 @@ impl ForkForm {
     }
 
     fn draw_picker(&self, frame: &mut Frame, over: Rect, picker: &TaskPicker) {
-        let matches = self.filtered(&picker.query);
-        let height = (matches.len() as u16 + 4).clamp(6, 16).min(over.height);
-        let area = Rect::new(over.x + 2, over.y + 3, over.width.saturating_sub(4), height);
-        frame.render_widget(Clear, area);
         let title = match picker.purpose {
             PickFor::Existing => " Fork into task ",
             PickFor::Parent => " Parent task ",
         };
-        let block = Block::default().borders(Borders::ALL).title(title);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let dim = Style::default().fg(theme::DIM);
-        let mut lines = vec![Line::from(vec![
-            Span::styled("/ ", dim),
-            Span::styled(sanitize_for_display(&picker.query), Style::default().fg(theme::TEXT)),
-            Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
-        ])];
-        let rows = inner.height.saturating_sub(1) as usize;
-        let start = picker.selected.saturating_sub(rows.saturating_sub(1));
-        if matches.is_empty() {
-            lines.push(Line::from(Span::styled("no matching tasks", dim)));
-        }
-        for (pos, &i) in matches.iter().enumerate().skip(start).take(rows) {
-            let style = if pos == picker.selected {
-                Style::default().fg(theme::TEXT).add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default().fg(theme::TEXT)
-            };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{}  {}",
-                    sanitize_for_display(&self.tasks[i].name),
-                    transcripts::short_id(&self.tasks[i].task_id)
-                ),
-                style,
-            )));
-        }
-        frame.render_widget(Paragraph::new(lines), inner);
+        crate::task_picker::draw(frame, over, title, &self.tasks, &picker.query, picker.selected);
     }
 }
 

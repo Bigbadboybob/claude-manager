@@ -35488,6 +35488,74 @@ while True:
         kill_all_sessions(&state);
     }
 
+    /// `org`: "me" walks the reporting chain and resolves leads from this
+    /// daemon's registry; `set_lead` only pins a live agent session bound to
+    /// the caller's own task, through the atomic lead endpoint.
+    #[test]
+    fn org_me_view_and_set_lead_guards() {
+        let state = make_state_arc();
+        let stub = spawn_routed_stub(move |method, path, _body| match (method, path) {
+            ("GET", "/tasks/task-me") => (200, r#"{"id":"task-me","name":"me","parent_task_id":"task-boss",
+                "metadata":{"filer":{}},
+                "initiative":{"id":"div-1","slug":"trader","name":"Trader","status":"active",
+                              "kind":"division","coordinator_task_id":"task-boss"}}"#.to_string()),
+            ("GET", "/tasks/task-boss") => (200, r#"{"id":"task-boss","name":"boss","parent_task_id":null,
+                "metadata":{"lead_session_uid":"ts-gone-0"}}"#.to_string()),
+            ("POST", "/tasks/task-me/lead") => (200, r#"{"id":"task-me","name":"me",
+                "metadata":{"filer":{},"lead_session_uid":"ts-10-0"}}"#.to_string()),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "test-token".to_string();
+        }
+        seed_tasked_caller(&state, "ts-10-0", "ws-me", "task-me");
+        seed_tasked_caller(&state, "ts-20-0", "ws-me", "task-me");
+        seed_tasked_caller(&state, "ts-5-0", "ws-me", "task-me");
+        {
+            let mut s = state.lock().unwrap();
+            s.sessions.get_mut("ts-10-0").unwrap().session_type = "codex".to_string();
+            s.sessions.get_mut("ts-20-0").unwrap().session_type = "claude".to_string();
+            s.sessions.get_mut("ts-5-0").unwrap().session_type = "bash".to_string();
+        }
+
+        let me = org(&state, &json!({}), Some("ts-20-0")).expect("org me");
+        assert_eq!(me["task"]["id"], "task-me");
+        assert_eq!(me["task"]["lead"]["session_uid"], "ts-10-0", "earliest live agent, not bash");
+        assert_eq!(me["boss"]["id"], "task-boss");
+        assert_eq!(me["boss"]["lead"], Value::Null, "the boss's pinned lead isn't on this host");
+        assert_eq!(me["boss"]["pinned_lead_session_uid"], "ts-gone-0");
+        assert_eq!(me["chain"].as_array().unwrap().len(), 1);
+        assert_eq!(me["division"]["kind"], "division");
+        assert_eq!(me["division"]["root_task_id"], "task-boss");
+
+        // Guards: operator, another task, a bash or unbound session.
+        let set = |params: Value, caller: Option<&str>| org(&state, &params, caller);
+        assert_eq!(set(json!({"action": "set_lead"}), None).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(
+            set(json!({"action": "set_lead", "task_id": "task-boss"}), Some("ts-20-0")).unwrap_err().0,
+            ErrorCode::Unauthorized
+        );
+        for uid in ["ts-5-0", "ts-nobody"] {
+            assert_eq!(
+                set(json!({"action": "set_lead", "session_uid": uid}), Some("ts-20-0")).unwrap_err().0,
+                ErrorCode::InvalidParams
+            );
+        }
+        assert!(stub.requests.lock().unwrap().iter().all(|r| r.method == "GET"), "no write yet");
+
+        let out = set(json!({"action": "set_lead", "session_uid": "ts-10-0"}), Some("ts-20-0"))
+            .expect("set_lead");
+        assert_eq!(out["task"]["lead"]["session_uid"], "ts-10-0");
+        assert_eq!(out["task"]["lead"]["pinned"], true);
+        let requests = stub.requests.lock().unwrap();
+        let post = requests.iter().find(|r| r.method == "POST").expect("lead POST");
+        assert_eq!(serde_json::from_str::<Value>(&post.body).unwrap(), json!({"session_uid": "ts-10-0"}));
+        drop(requests);
+        kill_all_sessions(&state);
+    }
+
     /// A taskless Session caller (and an Operator caller, which resolves
     /// to `caller_uid = None`) are both rejected with Unauthorized —
     /// create_subtask needs a parent task to fork off.

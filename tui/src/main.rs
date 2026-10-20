@@ -32,6 +32,7 @@ mod terminal_widget;
 #[cfg(test)]
 mod test_support;
 mod theme;
+mod task_picker;
 mod tls_dialer;
 mod workflow;
 mod workflow_watch;

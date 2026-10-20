@@ -105,6 +105,22 @@ mod tests {
         let late = "ts-200-0";
         // No sessions → no lead.
         assert_eq!(lead_session_uid(None, &[]), None);
+        // Only (live) bash sessions → no lead.
+        assert_eq!(lead_session_uid(None, &[c(early, "bash", true)]), None);
+        // claude, claude-code and codex all count.
+        for engine in ["claude", "claude-code", "codex"] {
+            assert_eq!(lead_session_uid(None, &[c(early, engine, true)]), Some(early.into()));
+        }
+        // A uid with no counter is unparseable and sorts last.
+        assert_eq!(
+            lead_session_uid(None, &[c("ts-zz", "codex", true), c("ts-ff-0", "codex", true)]),
+            Some("ts-ff-0".into())
+        );
+        // Numeric nanos: 0x9 before 0x10.
+        assert_eq!(
+            lead_session_uid(None, &[c("ts-10-0", "codex", true), c("ts-9-0", "codex", true)]),
+            Some("ts-9-0".into())
+        );
         // Earliest-spawned live agent, regardless of list order.
         assert_eq!(
             lead_session_uid(None, &[c(late, "codex", true), c(early, "claude", true)]),

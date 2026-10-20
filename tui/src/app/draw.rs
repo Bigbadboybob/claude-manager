@@ -629,7 +629,7 @@ impl App {
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 15u16;
+        let height = 16u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -703,6 +703,13 @@ impl App {
             engine_line.spans.push(Span::styled("  ←/→ change", dim));
         }
 
+        let reports_style = if active_field == 7 { highlight } else { white };
+        let reports_hint = match (&self.new_session_reports_to, active_field == 7) {
+            (crate::task_picker::ReportsTo::Standalone, true) => "  Enter or type to pick a task",
+            (crate::task_picker::ReportsTo::Task(_), true) => "  Enter change \u{00b7} Bksp standalone",
+            _ => "",
+        };
+
         let lines = vec![
             Line::from(vec![
                 Span::styled("    Repo: ", dim),
@@ -737,6 +744,11 @@ impl App {
                 Span::styled(host_hint, dim),
             ]),
             engine_line,
+            Line::from(vec![
+                Span::styled("Reports to: ", dim),
+                Span::styled(self.new_session_reports_to.label(), reports_style),
+                Span::styled(reports_hint, dim),
+            ]),
             Line::from(""),
             Line::from(Span::styled(
                 "Tab switch field \u{00b7} Enter start \u{00b7} Esc cancel",
@@ -745,6 +757,9 @@ impl App {
         ];
 
         frame.render_widget(Paragraph::new(lines), inner);
+        if let Some(picker) = &self.new_session_picker {
+            picker.draw(frame, dialog_area);
+        }
     }
 
     fn draw_new_terminal_dialog(

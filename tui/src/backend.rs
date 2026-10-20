@@ -185,6 +185,16 @@ pub enum BackendCommand {
     DeletePlanTask {
         id: String,
     },
+    /// A-n "Reports to": create the new workspace's task under its parent.
+    /// The reply (`ReportingTaskCreated`) carries `request_id` so the App
+    /// can launch the form it parked for it.
+    CreateReportingTask {
+        request_id: String,
+        project: String,
+        repo_url: String,
+        name: String,
+        parent_task_id: String,
+    },
     /// Fetch all planning tasks (tasks that have a project set).
     RefreshPlanTasks,
     Shutdown,
@@ -206,6 +216,11 @@ pub enum BackendEvent {
     PlanTaskCreated(Task),
     /// A planning task was deleted.
     PlanTaskDeleted(String),
+    /// Reply to `CreateReportingTask`.
+    ReportingTaskCreated {
+        request_id: String,
+        result: Result<Task, String>,
+    },
 }
 
 /// Handle to the background threads.
@@ -292,6 +307,20 @@ impl BackendHandle {
                 worktree_mode,
             },
             "create_plan_task",
+        );
+    }
+
+    pub fn create_reporting_task(
+        &self,
+        request_id: String,
+        project: String,
+        repo_url: String,
+        name: String,
+        parent_task_id: String,
+    ) {
+        self.try_send_or_warn(
+            BackendCommand::CreateReportingTask { request_id, project, repo_url, name, parent_task_id },
+            "create_reporting_task",
         );
     }
 
@@ -400,6 +429,39 @@ fn backend_loop(
                         let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
                     }
                 }
+            }
+            Ok(BackendCommand::CreateReportingTask {
+                request_id,
+                project,
+                repo_url,
+                name,
+                parent_task_id,
+            }) => {
+                let body = TaskCreateBody {
+                    repo_url,
+                    repo_branch: "main".to_string(),
+                    name: Some(name),
+                    prompt: None,
+                    priority: 0,
+                    status: Some("backlog".to_string()),
+                    project: Some(project),
+                    slug: None,
+                    description: Some(String::new()),
+                    difficulty: None,
+                    depends: None,
+                    source: None,
+                    is_cloud: Some(false),
+                    parent_task_id: Some(parent_task_id),
+                    worktree_mode: None,
+                    initiative_id: None,
+                    wip_branch: None,
+                    metadata: None,
+                };
+                let result = client.create_task(&body).map_err(|e| e.to_string());
+                if let Ok(task) = &result {
+                    let _ = event_tx.send(BackendEvent::PlanTaskCreated(task.clone()));
+                }
+                let _ = event_tx.send(BackendEvent::ReportingTaskCreated { request_id, result });
             }
             Ok(BackendCommand::DeletePlanTask { id }) => {
                 match client.delete_task(&id) {
