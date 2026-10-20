@@ -65,7 +65,7 @@ impl App {
     /// first, each tagged with the sidebar row that already holds it
     /// (`bound_to = Some("")` for the row being rebound itself).
     pub(super) fn open_transcript_picker(&mut self, target: TranscriptPickTarget) {
-        let (workspace_id, engine, self_uid): (&str, String, Option<&str>) = match &target {
+        let (workspace_id, engine): (&str, String) = match &target {
             TranscriptPickTarget::BindSession { workspace_id, session_uid } => {
                 let engine = self
                     .workspaces
@@ -77,10 +77,10 @@ impl App {
                     self.set_status_msg("Session no longer in the sidebar");
                     return;
                 };
-                (workspace_id.as_str(), engine, Some(session_uid.as_str()))
+                (workspace_id.as_str(), engine)
             }
             TranscriptPickTarget::NewTerminalSession { workspace_id, session_type, .. } => {
-                (workspace_id.as_str(), session_type.clone(), None)
+                (workspace_id.as_str(), session_type.clone())
             }
         };
         if matches!(target, TranscriptPickTarget::NewTerminalSession { .. }) && self.alternate_form_host(workspace_id).is_some() {
@@ -95,26 +95,64 @@ impl App {
             self.set_status_msg("Workspace has no worktree — nothing to resume");
             return;
         };
-        let mut candidates = if ws.host_id == cm_daemon::host_id::HostId::local() {
-            list_transcript_candidates(&wt, &engine)
-        } else {
-            let Some(socket) = self.host_pool.live_socket_path(&ws.host_id) else {
-                self.set_status_msg("Workspace host is unavailable"); return;
+        if ws.host_id == cm_daemon::host_id::HostId::local() {
+            let candidates = list_transcript_candidates(&wt, &engine);
+            self.show_transcript_picker(target, candidates);
+            return;
+        }
+        // Remote: the catalog is an RPC over the host's link, so it runs on
+        // a worker (`background.rs`) and the picker opens when it answers.
+        let host = ws.host_id.clone();
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let workspace_id = workspace_id.to_owned();
+        let started = self.run_in_background(Some(format!("transcripts:{workspace_id}")), move || {
+            let listed = match pool.live_socket_path(&host) {
+                None => Err("Workspace host is unavailable".to_string()),
+                Some(socket) => crate::client_session::rpc_catalog_control(
+                    &socket,
+                    &pool.operator_token_for(&host),
+                    "session.list_transcripts",
+                    serde_json::json!({"workspace_id": workspace_id, "engine": engine}),
+                )
+                .and_then(|value| Ok(serde_json::from_value::<Vec<TranscriptCandidate>>(value)?))
+                .map_err(|e| format!("Transcript catalog: {}", e)),
             };
-            let token = self.host_pool.operator_token_for(&ws.host_id);
-            match crate::client_session::rpc_catalog_control(&socket, &token, "session.list_transcripts",
-                serde_json::json!({"workspace_id": workspace_id, "engine": engine}))
-                .and_then(|value| Ok(serde_json::from_value::<Vec<TranscriptCandidate>>(value)?)) {
-                Ok(candidates) => candidates,
-                Err(e) => { self.set_status_msg(&format!("Transcript catalog: {}", e)); return; }
+            Box::new(move |app: &mut App| {
+                if !matches!(app.input_mode, InputMode::Normal) {
+                    app.set_status_msg("Transcripts loaded, but another dialog is open — open the picker again");
+                    return;
+                }
+                match listed {
+                    Ok(candidates) => app.show_transcript_picker(target, candidates),
+                    Err(e) => {
+                        app.input_mode = rebuild_form_from_transcript_pick(target, None);
+                        app.set_status_msg(&e);
+                    }
+                }
+            })
+        });
+        if started {
+            self.set_status_msg("Loading transcripts…");
+        }
+    }
+
+    /// Tag each candidate with the sidebar row already holding it and open
+    /// the picker, starting on the row's current binding when rebinding.
+    fn show_transcript_picker(&mut self, target: TranscriptPickTarget, mut candidates: Vec<TranscriptCandidate>) {
+        let (workspace_id, self_uid) = match &target {
+            TranscriptPickTarget::BindSession { workspace_id, session_uid } => {
+                (workspace_id.clone(), Some(session_uid.clone()))
             }
+            TranscriptPickTarget::NewTerminalSession { workspace_id, .. } => (workspace_id.clone(), None),
         };
-        for cand in &mut candidates {
-            cand.bound_to = ws
-                .sessions
-                .iter()
-                .find(|s| s.transcript_id.as_deref() == Some(cand.id.as_str()))
-                .map(|s| if Some(s.uid.as_str()) == self_uid { String::new() } else { s.label.clone() });
+        if let Some(ws) = self.workspaces.iter().find(|w| w.id == workspace_id) {
+            for cand in &mut candidates {
+                cand.bound_to = ws
+                    .sessions
+                    .iter()
+                    .find(|s| s.transcript_id.as_deref() == Some(cand.id.as_str()))
+                    .map(|s| if Some(&s.uid) == self_uid.as_ref() { String::new() } else { s.label.clone() });
+            }
         }
         // Start on the row's current binding when rebinding, so Enter
         // without moving is a no-op rather than a surprise.

@@ -82,6 +82,7 @@ pub mod owner_availability;
 pub mod sidebar;
 pub mod path;
 pub mod planning_client;
+pub mod pty_input;
 pub mod reader_gate;
 pub mod reap_gate;
 pub mod resume_identity;
@@ -89,12 +90,16 @@ pub mod reaper;
 pub mod reexec;
 pub mod reexec_manifest;
 pub mod restart_coordinator;
+pub mod screen_replay;
+pub mod log_pump;
+pub mod health;
 pub mod session;
 pub mod terminal_sweep;
 pub mod session_watch;
 pub mod state;
 pub mod notifications;
 pub mod owner_notifications;
+pub mod owner_alert_relay;
 pub mod transcript_detect;
 pub mod transcript_catalog;
 pub mod workflow;
@@ -552,32 +557,8 @@ pub fn run() -> anyhow::Result<()> {
     // current stderr and keeps it. Runs AFTER config load (the path comes
     // from it) and before anything spawns.
     if !daemon_config.log_path.is_empty() {
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&daemon_config.log_path)
-        {
-            Ok(f) => {
-                use std::os::fd::AsRawFd;
-                // SAFETY: duplicating an owned, open fd onto our own
-                // stdio slots; `f` closing afterwards leaves the dups
-                // intact.
-                unsafe {
-                    libc::dup2(f.as_raw_fd(), 1);
-                    libc::dup2(f.as_raw_fd(), 2);
-                }
-                eprintln!(
-                    "cm-daemon: stdout/stderr → {} (daemon.toml log_path)",
-                    daemon_config.log_path,
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "cm-daemon: could not open log_path {}: {} — keeping current stderr",
-                    daemon_config.log_path, e,
-                );
-            }
-        }
+        // Every line gets a timestamp on the way (`log_pump`).
+        log_pump::install(&daemon_config.log_path);
     }
 
     // Arm the worktree disk guard (`[scheduler] max_worktrees`). Enforcement
@@ -886,6 +867,8 @@ pub fn run() -> anyhow::Result<()> {
         initial_state.seed_recently_exited_from_sidecar(&sidecar);
     }
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
+    // Stall ticker, attach-burst summaries, disk alert (`health`).
+    health::spawn(std::sync::Arc::clone(&state));
     if let Err(e) = messaging::startup::start(&state) {
         eprintln!("cm-daemon: messaging unavailable: {e}");
     }

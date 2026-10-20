@@ -9,7 +9,7 @@
 //! so reading it (`ping`) needs no messaging lock and no network, and the last
 //! known value survives a hub outage and restarts.
 //!
-//! Unset means legacy behavior: every Owner alert is delivered.
+//! Availability is informational; it never filters Owner notifications.
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -66,31 +66,6 @@ impl Urgency {
     }
 }
 
-/// The least urgency a level delivers immediately (Owner decision
-/// updated 2026-10-12): away → emergency, around → decision,
-/// focused/on-call → everything.
-pub fn bar(level: Level) -> Urgency {
-    match level {
-        Level::Away => Urgency::Emergency,
-        Level::Around => Urgency::Decision,
-        Level::Focused => Urgency::Fyi,
-        Level::OnCall => Urgency::Fyi,
-    }
-}
-
-/// Unset delivers everything (legacy behavior).
-pub fn delivers(level: Option<Level>, urgency: Urgency) -> bool {
-    level.is_none_or(|l| urgency >= bar(l))
-}
-
-/// The least reachable level at which `urgency` is delivered.
-pub fn release_level(urgency: Urgency) -> Level {
-    Level::ALL
-        .into_iter()
-        .find(|l| urgency >= bar(*l))
-        .unwrap_or(Level::OnCall)
-}
-
 /// `(level, event_id)` from the projection; `(None, None)` when unset or
 /// unreadable.
 pub fn current(cm_root: &Path) -> (Option<Level>, Option<String>) {
@@ -108,23 +83,18 @@ fn applied_path(cm_root: &Path) -> PathBuf {
     cm_root.join("owner-availability-applied.json")
 }
 
-/// Delivery-worker hook: when the replicated level changed since this daemon
-/// last applied it (also after restarts and for changes that arrived from
-/// the hub), release held Owner requests the new level delivers and wake the
-/// sessions that coordinate work. Runs on every host; cheap when unchanged
-/// (one small file read).
+/// Delivery-worker migration: release every request held by an older daemon,
+/// even when the availability revision has not changed. The durable marker
+/// makes later level changes informational and restarts cheap.
 pub fn tick(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>) {
     let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
-    let (level, event_id) = current(&root);
     let applied: Value = std::fs::read(applied_path(&root))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Value::Null);
-    let first_run = applied.is_null();
-    if !first_run && applied["event_id"].as_str() == event_id.as_deref() {
+    if applied["unfiltered_notifications"] == true {
         return;
     }
-    let previous = applied["level"].as_str().and_then(Level::parse);
     // A failing release (unreadable/unwritable held store) retries with
     // backoff rather than on every 2 s tick.
     static RETRY: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0)); // (next_at, delay)
@@ -137,7 +107,7 @@ pub fn tick(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>)
         if s.draining {
             return;
         }
-        crate::owner_attention::release_for_level(&s, level)
+        crate::owner_attention::release_held(&s)
     };
     let outcome = match outcome {
         Ok(o) => {
@@ -152,33 +122,23 @@ pub fn tick(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>)
             return;
         }
     };
-    // First run after an upgrade adopts the current level without waking
-    // anyone (nothing was held under the old daemon); re-setting the same
-    // level is a new revision but no change, so it wakes nobody either.
-    if !first_run && previous != level {
-        wake(state, &root, previous, level, event_id.as_deref().unwrap_or("unset"), &outcome);
-    }
-    let record = json!({"event_id": event_id, "level": level.map(Level::as_str)});
+    wake(state, &root, &outcome);
+    let (level, event_id) = current(&root);
+    let record = json!({"event_id": event_id, "level": level.map(Level::as_str),
+                        "unfiltered_notifications": true});
     if let Err(e) = crate::state::write_json_atomic(&applied_path(&root), &record.to_string(), true) {
         eprintln!("cm owner availability: record applied level: {e}");
     }
 }
 
-/// Wake only the sessions this change affects: those with requests that
-/// were released or are still held. Everyone else reads the level from
-/// `ping().owner_availability` when they next need it (waking every
-/// orchestrator per change produced notices Owner paid for in stall alerts).
+/// Notify only live sessions whose older requests were released. Merely
+/// changing the informational availability level never wakes an agent.
 fn wake(
     state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>,
     root: &Path,
-    previous: Option<Level>,
-    level: Option<Level>,
-    revision: &str,
     outcome: &crate::owner_attention::ReleaseOutcome,
 ) {
-    let name = |l: Option<Level>| l.map(Level::as_str).unwrap_or("unset");
-    let targets: std::collections::BTreeSet<&String> =
-        outcome.released.keys().chain(outcome.still_held.keys()).collect();
+    let targets = &outcome.released;
     if targets.is_empty() {
         return;
     }
@@ -186,25 +146,20 @@ fn wake(
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         s.sessions.keys().cloned().collect()
     };
-    let at = Utc::now().format("%H:%MZ");
     // The marker must be in the text: the consumer confirms delivery by
     // finding it in the agent's transcript.
-    let marker = format!("[cm-owner-availability {revision}]");
-    for uid in targets.into_iter().filter(|u| live.contains(*u)) {
-        let released = outcome.released.get(uid).copied().unwrap_or(0);
-        let held = outcome.still_held.get(uid).copied().unwrap_or(0);
+    let marker = "[cm-owner-alerts-unfiltered]";
+    for (uid, released) in targets.iter().filter(|(uid, _)| live.contains(*uid)) {
         let text = format!(
-            "{marker} Owner availability: {}\u{2192}{} at {at}. {released} of your requests were released; {held} still held. Check ping().owner_availability before asking Owner; continue your task.",
-            name(previous),
-            name(level)
+            "{marker} Owner notifications now deliver at every availability level. {released} of your previously held requests were released; continue your task."
         );
         if let Err(e) = crate::notifications::publish(
             root,
             uid,
-            &format!("owner-availability:{revision}"),
+            "owner-alerts-unfiltered-v1",
             "owner",
             &text,
-            &marker,
+            marker,
         ) {
             eprintln!("cm owner availability: wake {uid}: {e}");
         }
@@ -265,6 +220,15 @@ pub fn with_current_age(exposure: &Value) -> Value {
     v
 }
 
+/// When an exposure's level last changed, in Unix milliseconds; None when
+/// it was never set. Viewers compare values from different hosts with it.
+pub fn changed_at_ms(exposure: &Value) -> Option<i64> {
+    exposure["changed_at"]
+        .as_str()
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.timestamp_millis())
+}
+
 /// Read the projected level for `ping`: lock-free and network-free. A missing
 /// or unreadable projection reads as unset.
 pub fn exposure(cm_root: &Path) -> Value {
@@ -278,26 +242,6 @@ pub fn exposure(cm_root: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bars_follow_the_owner_mapping() {
-        use Urgency::*;
-        for (level, delivered) in [
-            (Level::Away, vec![Emergency]),
-            (Level::Around, vec![Decision, Blocking, Emergency]),
-            (Level::Focused, vec![Fyi, Decision, Blocking, Emergency]),
-            (Level::OnCall, vec![Fyi, Decision, Blocking, Emergency]),
-        ] {
-            for u in Urgency::ALL {
-                assert_eq!(delivers(Some(level), u), delivered.contains(&u), "{level:?} {u:?}");
-            }
-        }
-        assert!(Urgency::ALL.into_iter().all(|u| delivers(None, u)));
-        assert_eq!(release_level(Emergency), Level::Away);
-        assert_eq!(release_level(Blocking), Level::Around);
-        assert_eq!(release_level(Decision), Level::Around);
-        assert_eq!(release_level(Fyi), Level::Focused);
-    }
 
     #[test]
     fn levels_order_and_round_trip() {

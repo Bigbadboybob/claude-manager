@@ -241,6 +241,55 @@ pub struct Person {
     pub task: Option<String>,
     pub present: bool,
     pub kind: String,
+    /// The session's engine (`claude-code`, `codex`, `bash`) when known.
+    /// Bash sessions have no agent to read messages; clients use this to
+    /// leave them out of DM pickers. Absent for remote participants from
+    /// a peer that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+}
+
+/// A live local session, before it becomes a [`Person`].
+pub struct LiveSession {
+    pub uid: String,
+    pub name: String,
+    pub task: Option<String>,
+    pub engine: Option<String>,
+}
+
+/// Every live local session: the daemon's own, then TUI rows it does not hold.
+pub fn live_sessions(s: &crate::state::DaemonState) -> Vec<LiveSession> {
+    s.sessions
+        .values()
+        .map(|v| LiveSession {
+            uid: v.uid.clone(),
+            name: v.title.clone(),
+            task: v.task_id.clone(),
+            engine: Some(v.session_type.clone()),
+        })
+        .chain(s.tui_sessions.values().filter(|t| !s.sessions.contains_key(&t.uid)).map(|t| LiveSession {
+            uid: t.uid.clone(),
+            name: t.label.clone().unwrap_or_else(|| t.uid.clone()),
+            task: t.task_id.clone(),
+            // The TUI says `claude` where the daemon says `claude-code`.
+            engine: t.session_type.as_deref().map(|e| if e == "claude" { "claude-code" } else { e }.to_owned()),
+        }))
+        .collect()
+}
+
+impl Person {
+    /// A present agent participant for a live session.
+    pub fn present_agent(id: String, live: LiveSession) -> Person {
+        Person {
+            id,
+            name: live.name,
+            session_uid: live.uid,
+            task: live.task,
+            present: true,
+            kind: "agent".into(),
+            engine: live.engine,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 struct Published {
@@ -272,6 +321,8 @@ pub struct Store {
     /// page's event files and directories are durable (see `ingest_replica_page`).
     ingest_batch: Option<replication::IngestBatch>,
     channels: BTreeMap<String, String>,
+    // Reverse index retains the first lexical path even if legacy IDs have aliases.
+    channel_paths: HashMap<String, BTreeSet<String>>,
     memberships: BTreeMap<String, BTreeSet<String>>,
     membership_revisions: BTreeMap<String, String>,
     enrolled: BTreeSet<String>,
@@ -365,6 +416,7 @@ impl Store {
             ingest_batch: None,
             compactor: None,
             channels: BTreeMap::new(),
+            channel_paths: HashMap::new(),
             memberships: BTreeMap::new(),
             membership_revisions: BTreeMap::new(),
             enrolled: BTreeSet::new(),
@@ -662,7 +714,16 @@ impl Store {
             for item in items {
                 let path = required(item, "path")?;
                 channel_path(&path)?;
-                self.channels.insert(path, required(item, "id")?);
+                let id = required(item, "id")?;
+                if let Some(old) = self.channels.insert(path.clone(), id.clone()) {
+                    if let Some(paths) = self.channel_paths.get_mut(&old) {
+                        paths.remove(&path);
+                        if paths.is_empty() {
+                            self.channel_paths.remove(&old);
+                        }
+                    }
+                }
+                self.channel_paths.entry(id).or_default().insert(path);
             }
         }
         self.reduce_membership(e)?;
@@ -1145,7 +1206,7 @@ impl Store {
         Ok(())
     }
     fn visible(&self, actor: &str, conv: &str) -> bool {
-        self.channels.values().any(|c| c == conv)
+        self.channel_paths.contains_key(conv)
             || self
                 .conversations
                 .get(conv)
@@ -1564,6 +1625,7 @@ impl Store {
                     task: None,
                     present: false,
                     kind: "agent".into(),
+                    engine: None,
                 });
             }
         }
@@ -1604,10 +1666,7 @@ impl Store {
     }
     /// Path of a channel id, if the channel exists.
     pub fn channel_path_of(&self, id: &str) -> Option<&str> {
-        self.channels
-            .iter()
-            .find(|(_, cid)| cid.as_str() == id)
-            .map(|(p, _)| p.as_str())
+        self.channel_paths.get(id)?.first().map(String::as_str)
     }
     /// Current joined membership without building the per-channel view.
     pub fn is_member(&self, channel_id: &str, actor: &str) -> bool {
@@ -1957,7 +2016,17 @@ impl Store {
                 continue;
             }
             let last=last_event.map(|e|json!({"id":e.event["id"],"actor":e.event["actor"],"created_at":e.event["created_at"],"preview":strv(&e.event,"body").chars().take(180).collect::<String>()}));
-            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"group":m.len()>2,"unread":count,"mentions":mentions,"last":last}));
+            // Display names for every member, departed agents included (the
+            // people directory lists only present ones), so clients can
+            // label a DM without it. Additive: ids without a name are omitted.
+            let member_names: serde_json::Map<String, Value> = m
+                .iter()
+                .filter_map(|id| {
+                    let name = if id == "owner" { Some("Owner".to_owned()) } else { self.names.get(id).map(|n| n.name.clone()) };
+                    name.map(|n| (id.clone(), json!(n)))
+                })
+                .collect();
+            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"member_names":member_names,"group":m.len()>2,"unread":count,"mentions":mentions,"last":last}));
         }
         self.directory_page(actor, p, out)
     }
@@ -2106,6 +2175,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         }
     }
     fn send(s: &mut Store, p: &Person, body: &str, key: &str, name: &str) -> Value {

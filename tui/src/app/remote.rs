@@ -86,6 +86,58 @@ const REMOTE_REATTACH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// session settles instead of spinning "⟳ reconnecting" forever.
 const REMOTE_REATTACH_MAX_ATTEMPTS: u32 = 15;
 
+/// Ceiling of the per-session reconnect backoff. On a congested link every
+/// reattach replays the session's whole output ring, so a flat retry turned a
+/// slow tunnel into a loop: an abandoned attach was retried with a fresh full
+/// replay, which slowed the link further (32 attaches a minute, the same uid
+/// 3-4 times, measured 2026-10-13).
+const REMOTE_REATTACH_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// A stream that stayed up this long before dying was healthy: its session
+/// reattaches at once and its backoff resets. One that died sooner (abandoned
+/// mid-replay, cut off as a slow viewer) counts as a strike.
+const REMOTE_STREAM_STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// The pane Owner is looking at never waits longer than this between attempts.
+const REMOTE_REATTACH_FOCUSED_MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// Give up a scrollback load after this many failed attempts; the next
+/// scroll up starts a new one.
+const HISTORY_FETCH_ATTEMPTS: u32 = 3;
+
+/// A scrollback load in progress (`App::load_deferred_history`).
+#[derive(Default)]
+pub(crate) struct HistoryFetch {
+    failures: u32,
+}
+
+/// Per-uid reconnect history behind the backoff. In memory only.
+#[derive(Default)]
+pub(super) struct ReattachBackoff {
+    /// Consecutive failed attaches and short-lived streams.
+    strikes: u32,
+    /// When the current stream attached; `None` before the first queued
+    /// attach (a stream that predates this tracking counts as healthy).
+    attached_at: Option<Instant>,
+}
+
+/// Wait before the next attempt after `strikes` consecutive failures: 2 s,
+/// then doubling to [`REMOTE_REATTACH_MAX_BACKOFF`], plus up to 25% spread by
+/// uid so sessions that failed together (one tunnel) don't retry together.
+pub(super) fn reattach_backoff_delay(uid: &str, strikes: u32) -> Duration {
+    if strikes == 0 {
+        return REMOTE_REATTACH_RETRY_INTERVAL;
+    }
+    let base = REMOTE_REATTACH_RETRY_INTERVAL
+        .saturating_mul(1 << strikes.min(5))
+        .min(REMOTE_REATTACH_MAX_BACKOFF);
+    let spread = uid
+        .bytes()
+        .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)))
+        % 26;
+    base + base * spread / 100
+}
+
 impl App {
     /// Phase 4 (remote-session-execution): reattach a single REMOTE manifest
     /// entry to its live session on `entry.host_id`, ungated. Routes the
@@ -271,7 +323,7 @@ impl App {
             // attach dispatch every tick. First attempt has `last_attempt_at`
             // None → not throttled.
             if let Some(last) = p.last_attempt_at {
-                if now.duration_since(last) < REMOTE_REATTACH_RETRY_INTERVAL {
+                if now.duration_since(last) < self.reattach_retry_interval(&p.entry.uid) {
                     still_pending.push(p);
                     continue;
                 }
@@ -297,6 +349,7 @@ impl App {
                 cols,
                 rows,
                 attempts: p.attempts,
+                how: self.attach_how(&p.entry),
             };
             let dispatched = self
                 .attach_worker
@@ -318,6 +371,7 @@ impl App {
     /// (reconnecting) slot in place, or create a new slot. On failure: re-queue
     /// for retry, or — past the reconnect cap — mark the slot exited.
     pub fn drain_attach_results(&mut self) {
+        self.apply_scroll_after_load();
         let results: Vec<crate::attach_worker::AttachResult> = match self.attach_worker.as_ref()
         {
             Some(w) => w.result_rx.try_iter().collect(),
@@ -358,6 +412,8 @@ impl App {
                     });
                     self.attached_tunnel_generation
                         .insert(result.entry.uid.clone(), gen);
+                    self.note_reattached(&result.entry.uid);
+                    let full_ring = !session.history_deferred && !session.resumed;
                     // Bind by uid across ALL workspaces, not just `result.ws_id`.
                     // A daemon session is unique by uid, so if a slot for it
                     // already exists ANYWHERE (a reconnect, or a stray duplicate
@@ -370,15 +426,25 @@ impl App {
                                 .position(|s| s.uid == result.entry.uid)
                                 .map(|si| (wi, si))
                         });
+                    if session.resumed && existing.is_none() {
+                        // It continues a pane's terminal that is gone.
+                        continue;
+                    }
                     if let Some((wi, si)) = existing {
                         // Reconnect: rebind the PTY in place, preserving slot
                         // metadata. Dropping the old dead `Session` only sends
                         // `Msg::Shutdown` — it does NOT kill the daemon session.
                         let slot = &mut self.workspaces[wi].sessions[si];
+                        let mut session = session;
+                        if session.resumed {
+                            // Same terminal, same scrollback state.
+                            session.history_deferred = slot.session.history_deferred;
+                        }
                         slot.session = session;
                         slot.set_status(SessionStatus::Running);
                         self.reconnecting_sessions.remove(&result.entry.uid);
                         self.remove_skipped_entry(&result.ws_id, &result.entry.uid);
+                        self.history_fetch_bound(&result.entry.uid, full_ring);
                         changed = true;
                     } else if let Some(ws_idx) =
                         self.workspaces.iter().position(|w| w.id == result.ws_id)
@@ -407,7 +473,10 @@ impl App {
                             Some(crate::attach_worker::AttachFailureKind::SessionGone)
                         );
                         if !session_gone {
-                            self.pending_remote_reattach.push(p);
+                            self.note_reattach_failed(&result.entry.uid);
+                            if self.history_fetch_failed(&result.entry.uid) {
+                                self.pending_remote_reattach.push(p);
+                            }
                             continue;
                         }
                         p.attempts = p.attempts.saturating_add(1);
@@ -441,7 +510,7 @@ impl App {
                                     }
                                 }
                                 self.reconnecting_sessions.remove(&result.entry.uid);
-                            } else {
+                            } else if !self.retire_gone_skipped_entry(&p.ws_id, &p.entry) {
                                 eprintln!(
                                     "cm-tui: deferred remote reattach of session {} \
                                      on host {} gave up after {} attempts (session \
@@ -463,6 +532,63 @@ impl App {
             self.needs_redraw = true;
             self.save_session_manifest();
         }
+    }
+
+    /// How to attach `entry`. Remote panes ask for the visible screen only;
+    /// their scrollback loads when Owner scrolls up (`load_deferred_history`),
+    /// and local attaches cost nothing and keep the whole ring. A pane that
+    /// still has its terminal resumes it from where its stream stopped, so a
+    /// brief drop costs only the bytes it missed.
+    fn attach_how(&self, entry: &ManifestEntry) -> crate::client_session::AttachHow {
+        let full = self.history_fetches.contains_key(&entry.uid);
+        let resume = (!full)
+            .then(|| {
+                self.workspaces
+                    .iter()
+                    .flat_map(|w| w.sessions.iter())
+                    .find(|s| s.uid == entry.uid)
+                    .and_then(|s| s.session.resume_from())
+            })
+            .flatten();
+        crate::client_session::AttachHow {
+            screen: entry.host_id != cm_daemon::host_id::HostId::local() && !full,
+            resume,
+        }
+    }
+
+    /// How long `uid` waits between reattach attempts (see
+    /// [`reattach_backoff_delay`]); the focused pane is capped lower.
+    pub(super) fn reattach_retry_interval(&self, uid: &str) -> Duration {
+        let strikes = self.reattach_backoff.get(uid).map_or(0, |b| b.strikes);
+        let wait = reattach_backoff_delay(uid, strikes);
+        if self.cursor_session_uid().as_deref() == Some(uid) {
+            wait.min(REMOTE_REATTACH_FOCUSED_MAX_WAIT)
+        } else {
+            wait
+        }
+    }
+
+    /// A reattach attempt failed without reaching the session.
+    pub(super) fn note_reattach_failed(&mut self, uid: &str) {
+        let b = self.reattach_backoff.entry(uid.to_string()).or_default();
+        b.strikes = b.strikes.saturating_add(1);
+    }
+
+    /// A reattach produced a live stream.
+    pub(super) fn note_reattached(&mut self, uid: &str) {
+        self.reattach_backoff.entry(uid.to_string()).or_default().attached_at =
+            Some(Instant::now());
+    }
+
+    /// An attached stream died on its own (EOF, hangup, tunnel replaced).
+    /// A short-lived stream is a strike; a long-lived one resets the backoff.
+    pub(super) fn note_stream_lost(&mut self, uid: &str) {
+        let b = self.reattach_backoff.entry(uid.to_string()).or_default();
+        let healthy = b
+            .attached_at
+            .take()
+            .map_or(true, |at| at.elapsed() >= REMOTE_STREAM_STABLE_AFTER);
+        b.strikes = if healthy { 0 } else { b.strikes.saturating_add(1) };
     }
 
     /// Mark a daemon-attached session's slot `reconnecting` and enqueue it
@@ -491,16 +617,26 @@ impl App {
         {
             return false;
         }
+        let strikes = self.reattach_backoff.get(&entry.uid).map_or(0, |b| b.strikes);
         eprintln!(
             "cm-tui: remote session {} ({}) on host {} lost its attach stream \
-             ({}) — marking reconnecting and requeuing for reattach",
+             ({}) — marking reconnecting and requeuing for reattach{}",
             entry.uid,
             entry.label,
             entry.host_id.as_str(),
             reason,
+            if strikes > 0 {
+                format!(" in {:?} (strike {strikes})", self.reattach_retry_interval(&entry.uid))
+            } else {
+                String::new()
+            },
         );
-        self.pending_remote_reattach
-            .push(PendingRemoteReattach::new(ws_id, entry));
+        let mut pending = PendingRemoteReattach::new(ws_id, entry);
+        if strikes > 0 {
+            // Back off: the stream died soon after attaching.
+            pending.last_attempt_at = Some(Instant::now());
+        }
+        self.pending_remote_reattach.push(pending);
         true
     }
 
@@ -590,6 +726,10 @@ impl App {
         }
         let mut changed = false;
         for (wi, si, reason) in dead {
+            let uid = self.workspaces[wi].sessions[si].uid.clone();
+            if !self.reconnecting_sessions.contains(&uid) {
+                self.note_stream_lost(&uid);
+            }
             // S5: stop the spinning EventLoop NOW (it's burning a core on the
             // dead fd's POLLHUP) rather than waiting for the reattach to drop
             // it. request_shutdown leaves the slot intact for the rebind.
@@ -695,7 +835,7 @@ impl App {
                     // since the last attempt.
                     if let Some(last) = p.last_attempt_at {
                         if now.duration_since(last)
-                            < REMOTE_REATTACH_RETRY_INTERVAL
+                            < self.reattach_retry_interval(&p.entry.uid)
                         {
                             still_pending.push(p);
                             continue;
@@ -725,6 +865,7 @@ impl App {
                                 p.entry.uid.clone(),
                                 self.host_pool.tunnel_generation(&p.entry.host_id),
                             );
+                            self.note_reattached(&p.entry.uid);
                             reattached_any = true;
                             eprintln!(
                                 "cm-tui: remote session {} ({}) on host {} \
@@ -751,6 +892,7 @@ impl App {
                                 p.entry.label,
                                 p.entry.host_id.as_str(),
                             );
+                            self.note_reattach_failed(&p.entry.uid);
                             still_pending.push(PendingRemoteReattach {
                                 last_attempt_at: Some(now),
                                 ..p
@@ -855,6 +997,10 @@ impl App {
                             reattached_any = true;
                             continue;
                         }
+                        if self.retire_gone_skipped_entry(&p.ws_id, &p.entry) {
+                            reattached_any = true;
+                            continue;
+                        }
                         eprintln!(
                             "cm-tui: deferred remote reattach of session {} ({}) \
                              on host {} gave up after {} attempts (session gone; \
@@ -901,8 +1047,63 @@ impl App {
     /// header on the sidebar after a TUI restart (the daemon had long
     /// dropped it; nothing could ever reattach). Also settle scheduler-owned
     /// incarnations and saved exits of Done tasks: these can lack managed_by.
-    /// Other user-owned and workflow entries keep the preserve behavior.
+    /// Other user-owned entries are retired to a closed session by
+    /// `retire_gone_skipped_entry`; workflow entries keep the preserve
+    /// behavior.
     /// Returns true when the entry was settled.
+    fn push_entry_tombstone(ws: &mut Workspace, entry: &cm_daemon::manifest::ManifestEntry) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        ws.tombstones.retain(|t| t.uid != entry.uid);
+        ws.tombstones.push(cm_daemon::manifest::SessionTombstone {
+            entry: Some(entry.clone()),
+            uid: entry.uid.clone(),
+            managed_by_uid: entry.managed_by_uid.clone(),
+            label: entry.label.clone(),
+            session_type: entry.session_type.clone(),
+            task_id: entry.task_id.clone(),
+            last_transcript_id: entry.transcript_id.clone(),
+            worktree_path: ws.worktree_path.clone(),
+            generation: entry.generation,
+            exited_at: entry.last_exit.as_ref().map_or(now, |exit| exit.exited_at),
+        });
+    }
+
+    /// A restore-deferred entry (no pane) that a reachable daemon has
+    /// answered NotFound for through the whole give-up budget. Before
+    /// 2026-10-16 it stayed in `skipped_manifest_entries` and gave up again
+    /// on every TUI start: 13 such entries cost ~200 attach RPCs per start
+    /// and most of the log. Retire it to a closed session in its workspace
+    /// instead — A-O still restores it. Workflow entries keep the preserve
+    /// behavior (the workflow engine owns them).
+    fn retire_gone_skipped_entry(
+        &mut self,
+        ws_id: &str,
+        entry: &cm_daemon::manifest::ManifestEntry,
+    ) -> bool {
+        if entry.workflow_run_id.is_some() {
+            return false;
+        }
+        let Some(ws_idx) = self.workspaces.iter().position(|w| w.id == ws_id) else {
+            return false;
+        };
+        if self.workspaces[ws_idx].sessions.iter().any(|s| s.uid == entry.uid) {
+            return false;
+        }
+        Self::push_entry_tombstone(&mut self.workspaces[ws_idx], entry);
+        self.remove_skipped_entry(ws_id, &entry.uid);
+        eprintln!(
+            "cm-tui: session {} ({}) on host {} is gone on the daemon — retired to a \
+             closed session (A-O restores it)",
+            entry.uid,
+            entry.label,
+            entry.host_id.as_str(),
+        );
+        true
+    }
+
     fn settle_gone_agent_entry(
         &mut self,
         ws_id: &str,
@@ -931,23 +1132,7 @@ impl App {
             let target = uid.clone();
             self.tombstone_and_remove(ws_idx, |ts| ts.uid == target);
         } else {
-            let ws = &mut self.workspaces[ws_idx];
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            ws.tombstones.push(cm_daemon::manifest::SessionTombstone {
-                entry: Some(entry.clone()),
-                uid: uid.clone(),
-                managed_by_uid: entry.managed_by_uid.clone(),
-                label: entry.label.clone(),
-                session_type: entry.session_type.clone(),
-                task_id: entry.task_id.clone(),
-                last_transcript_id: entry.transcript_id.clone(),
-                worktree_path: ws.worktree_path.clone(),
-                generation: entry.generation,
-                exited_at: entry.last_exit.as_ref().map_or(now, |exit| exit.exited_at),
-            });
+            Self::push_entry_tombstone(&mut self.workspaces[ws_idx], entry);
         }
         self.remove_skipped_entry(ws_id, &uid);
         self.reconnecting_sessions.remove(&uid);
@@ -988,6 +1173,127 @@ impl App {
         self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
         self.attaching.remove(uid);
         self.attached_tunnel_generation.remove(uid);
+        self.reattach_backoff.remove(uid);
+        self.history_fetches.remove(uid);
+        self.scroll_after_load.remove(uid);
+    }
+
+    /// Owner scrolled up in a pane that attached screen-first, which holds no
+    /// scrollback yet: attach it again with the full output ring. This is
+    /// not a reconnect: the pane keeps its live stream (no ⟳) until the new
+    /// one binds in place.
+    pub(super) fn load_deferred_history(&mut self) {
+        let Some(ts) = self.active_session_mut() else { return };
+        if !ts.session.history_deferred || ts.session.exited {
+            return;
+        }
+        let uid = ts.uid.clone();
+        let loading = self.history_fetches.contains_key(&uid);
+        let queued = self.pending_remote_reattach.iter().any(|p| p.entry.uid == uid)
+            || self.attaching.contains_key(&uid);
+        if loading && queued {
+            return; // still on its way
+        }
+        self.history_fetches.entry(uid.clone()).or_default();
+        // A pending attach picks up the full ring when it is dispatched; one
+        // already in flight was dispatched without it, and its result
+        // re-queues the load (`history_fetch_bound`).
+        if !queued {
+            self.reattach_backoff.remove(&uid);
+            self.queue_history_fetch(&uid);
+        }
+        self.set_status_msg("Loading scrollback…");
+        self.needs_redraw = true;
+    }
+
+    /// Queue an attach for `uid`'s pane unless one is already queued or in
+    /// flight. Unlike `requeue_remote_reconnect` the pane is not marked
+    /// reconnecting: its stream is fine.
+    fn queue_history_fetch(&mut self, uid: &str) {
+        if self.pending_remote_reattach.iter().any(|p| p.entry.uid == uid)
+            || self.attaching.contains_key(uid)
+        {
+            return;
+        }
+        let slot = self.workspaces.iter().filter(|w| !w.is_closed).find_map(|w| {
+            w.sessions
+                .iter()
+                .find(|s| s.uid == uid && !s.session.exited)
+                .map(|s| (w.id.clone(), s.to_manifest_entry()))
+        });
+        match slot {
+            Some((ws_id, entry)) => {
+                self.pending_remote_reattach.push(PendingRemoteReattach::new(ws_id, entry));
+            }
+            None => {
+                self.history_fetches.remove(uid);
+            }
+        }
+    }
+
+    /// An attach for `uid` bound. With a scrollback load pending, a full ring
+    /// completes it; any other attach (a reconnect dispatched before Owner
+    /// scrolled) leaves the pane without history, so the load is queued again.
+    fn history_fetch_bound(&mut self, uid: &str, full_ring: bool) {
+        if !self.history_fetches.contains_key(uid) {
+            return;
+        }
+        if full_ring {
+            self.history_fetches.remove(uid);
+            self.scroll_after_load.insert(uid.to_string(), Instant::now());
+            self.set_status_msg("Scrollback loaded");
+        } else {
+            self.queue_history_fetch(uid);
+        }
+    }
+
+    /// An attach for `uid` failed without reaching the session. Returns
+    /// whether to retry it. A pane whose stream is fine stops after
+    /// [`HISTORY_FETCH_ATTEMPTS`]; a reconnecting pane keeps retrying as a
+    /// reconnect, without the ring.
+    fn history_fetch_failed(&mut self, uid: &str) -> bool {
+        let reconnecting = self.reconnecting_sessions.contains(uid);
+        let Some(fetch) = self.history_fetches.get_mut(uid) else { return true };
+        fetch.failures += 1;
+        let failures = fetch.failures;
+        if failures < HISTORY_FETCH_ATTEMPTS {
+            self.set_status_msg(&format!("Scrollback load failed — retrying ({failures})"));
+            return true;
+        }
+        self.history_fetches.remove(uid);
+        self.set_status_msg("Scrollback load failed — scroll up again or press A-r to retry");
+        reconnecting
+    }
+
+    /// Scroll panes whose scrollback just loaded up a page once their replay
+    /// has been read. Called every tick; gives up after 15 s.
+    pub(super) fn apply_scroll_after_load(&mut self) {
+        use alacritty_terminal::grid::Dimensions as _;
+        if self.scroll_after_load.is_empty() {
+            return;
+        }
+        let pending: Vec<(String, Instant)> =
+            self.scroll_after_load.iter().map(|(u, t)| (u.clone(), *t)).collect();
+        for (uid, at) in pending {
+            let ready = self.workspaces.iter().flat_map(|w| w.sessions.iter()).find(|s| s.uid == uid).map(|s| {
+                let read = s.session.stream.as_ref().map_or_else(
+                    || s.session.term.lock().grid().history_size() > 0,
+                    |c| c.replay_done.load(std::sync::atomic::Ordering::SeqCst),
+                );
+                (read, s)
+            });
+            match ready {
+                Some((true, ts)) => {
+                    ts.session.term.lock().scroll_display(alacritty_terminal::grid::Scroll::PageUp);
+                    self.scroll_after_load.remove(&uid);
+                    self.needs_redraw = true;
+                }
+                Some((false, _)) if at.elapsed() < Duration::from_secs(15) => {}
+                _ => {
+                    self.scroll_after_load.remove(&uid);
+                }
+            }
+        }
     }
 
     /// Manual "reconnect now" lever, invoked by `A-r` (refresh). The auto-
@@ -1024,6 +1330,7 @@ impl App {
         for p in self.pending_remote_reattach.iter_mut() {
             p.last_attempt_at = None;
             p.attempts = 0;
+            self.reattach_backoff.remove(&p.entry.uid);
         }
         let accelerated = self.pending_remote_reattach.len();
 
@@ -1083,6 +1390,8 @@ impl App {
                     // and enqueues the rebind).
                     self.workspaces[wi].sessions[si].session.exited = false;
                     self.workspaces[wi].sessions[si].set_status(SessionStatus::Idle);
+                    let uid = self.workspaces[wi].sessions[si].uid.clone();
+                    self.reattach_backoff.remove(&uid);
                     if self.requeue_remote_reconnect(wi, si, "A-r force reconnect") {
                         forced = 1;
                         self.needs_redraw = true;
@@ -1115,6 +1424,7 @@ impl App {
         {
             p.last_attempt_at = None;
             p.attempts = 0;
+            self.reattach_backoff.remove(&p.entry.uid);
             armed += 1;
         }
         // (2) Re-queue stranded skipped entries (preserved on disk but no
@@ -3563,8 +3873,9 @@ mod remote_reconnect_tests {
         );
 
         // Jump to one short of the bound + clear the throttle so this drain
-        // makes the FINAL attempt → give up (dropped from pending, still
-        // preserved in skipped).
+        // makes the FINAL attempt → give up: dropped from pending and retired
+        // to a closed session (A-O restores it), so the next TUI start does
+        // not retry it all over again.
         app.pending_remote_reattach[0].attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
         app.pending_remote_reattach[0].last_attempt_at = None;
         app.drain_deferred_remote_reattach();
@@ -3573,8 +3884,16 @@ mod remote_reconnect_tests {
             "after the sustained-failure bound the fresh entry stops retrying",
         );
         assert!(
-            app.skipped_manifest_entries.contains_key("ws-remote"),
-            "giving up PRESERVES the raw entry in skipped (no data loss)",
+            !app.skipped_manifest_entries.contains_key("ws-remote"),
+            "a given-up entry leaves skipped, so restarts stop retrying it",
+        );
+        let ws = app.workspaces.iter().find(|w| w.id == "ws-remote").unwrap();
+        assert_eq!(ws.tombstones.len(), 1, "retired to a closed session (no data loss)");
+        assert_eq!(ws.tombstones[0].uid, "uid-gone");
+        assert_eq!(
+            ws.tombstones[0].entry.as_ref().map(|e| e.uid.as_str()),
+            Some("uid-gone"),
+            "the full entry rides on the tombstone, so A-O can revive it",
         );
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3671,10 +3990,14 @@ mod remote_reconnect_tests {
         );
         assert_eq!(app.workspaces[0].tombstones[0].uid, "uid-agent");
         assert!(
-            app.skipped_manifest_entries.contains_key("ws-user"),
-            "a user-owned entry keeps the preserve-in-skipped behavior",
+            !app.skipped_manifest_entries.contains_key("ws-user"),
+            "a gone user-owned entry leaves skipped too",
         );
-        assert!(app.workspaces[1].tombstones.is_empty());
+        assert_eq!(
+            app.workspaces[1].tombstones.len(),
+            1,
+            "…retired to a closed session in its own workspace (A-O restores it)",
+        );
         assert!(
             app.workspaces[0].is_closed,
             "the empty `agent:` marker is closed AT SETTLE TIME (kill-time \
@@ -3684,8 +4007,10 @@ mod remote_reconnect_tests {
         app.reap_spent_workspaces();
         assert!(app.workspaces[0].is_closed);
         assert!(
-            !app.workspaces[1].is_closed,
-            "the user-owned marker stays attach-pending-exempt (unchanged)",
+            app.workspaces[1].is_closed,
+            "with its entry retired the user-owned marker holds only a closed \
+             session, so the sweep closes it like any spent workspace (A-O \
+             reopens it and restores the session)",
         );
 
         // September 12 stragglers: scheduler roots and manually resumed
@@ -3718,8 +4043,11 @@ mod remote_reconnect_tests {
             app.drain_deferred_remote_reattach();
             assert!(app.pending_remote_reattach.is_empty());
             assert_eq!(app.workspaces[wi].is_closed, should_settle, "{id}");
-            assert_eq!(!app.skipped_manifest_entries.contains_key(id), should_settle, "{id}");
-            if should_settle {
+            // Unsettled user rows are retired to a closed session instead
+            // (their workspace stays open); workflow rows stay in skipped.
+            assert_eq!(app.skipped_manifest_entries.contains_key(id), workflow, "{id}");
+            assert_eq!(app.workspaces[wi].tombstones.len(), usize::from(!workflow), "{id}");
+            if !workflow {
                 let tomb = &app.workspaces[wi].tombstones[0];
                 assert_eq!(tomb.last_transcript_id.as_deref(), Some("preserved-conversation"));
                 assert_eq!(tomb.exited_at, 1789099687.5);
@@ -4231,3 +4559,6 @@ mod hosts_malformed_fallback_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod slow_link_tests;

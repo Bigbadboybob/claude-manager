@@ -116,6 +116,31 @@ pub(crate) fn try_attach_via_daemon_with_deps(
     host_id: &cm_daemon::host_id::HostId,
     transcript_path: Option<&str>,
 ) -> anyhow::Result<Session> {
+    attach_via_daemon(
+        host_pool, session_uid, workspace_id, worktree_path, session_type, label, cols, rows,
+        task_id, workflow_run_id, workflow_role, host_id, transcript_path, Default::default(),
+    )
+}
+
+/// [`try_attach_via_daemon_with_deps`]; `how` can ask for a screen-first
+/// attach (see `Session::history_deferred`) or resume a pane's terminal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_via_daemon(
+    host_pool: &crate::host_pool::HostPool,
+    session_uid: &str,
+    workspace_id: &str,
+    worktree_path: &Path,
+    session_type: &str,
+    label: &str,
+    cols: u16,
+    rows: u16,
+    task_id: Option<&str>,
+    workflow_run_id: Option<&str>,
+    workflow_role: Option<&str>,
+    host_id: &cm_daemon::host_id::HostId,
+    transcript_path: Option<&str>,
+    how: crate::client_session::AttachHow,
+) -> anyhow::Result<Session> {
     let internal_session_type = normalize_session_type_to_internal(session_type);
     let wire_session_type = match internal_session_type {
         "claude" => "claude-code",
@@ -168,7 +193,8 @@ pub(crate) fn try_attach_via_daemon_with_deps(
         // grant; nothing is spawned here so the field is inert.
         global_perms: false,
     };
-    let session = crate::session::Session::new_attached_existing_with_context(cs_config, true)?;
+    let session =
+        crate::session::Session::new_attached_existing_with_context(cs_config, true, how)?;
     // Legacy daemons may ignore attach dimensions; keep the asynchronous kick.
     session.resize(cols, rows);
 
@@ -835,7 +861,9 @@ impl App {
         // tombstone there (same uid, label, task and transcript), as
         // remote A-R does. The local spawn below sends local-only paths.
         if active_host != cm_daemon::host_id::HostId::local() {
-            self.restore_remote_tombstones(wi);
+            self.start_remote_restore(wi);
+            self.cursor = Cursor::Workspace(wi);
+            self.clamp_cursor();
             return;
         }
         // Below this point the spawn sends local-only paths (worktree +
@@ -1003,93 +1031,6 @@ impl App {
             total,
             if total == 1 { "" } else { "s" },
         ));
-    }
-
-    /// A-O restore on a remote workspace: `session.revive {uid}` on the
-    /// owning daemon for each tombstone, then the deferred-reattach flow
-    /// binds the rows (the pending reattach also keeps the sweep away while
-    /// it is in flight). A tombstone whose revive fails stays listed and
-    /// its error is reported.
-    fn restore_remote_tombstones(&mut self, wi: usize) {
-        let ws = &self.workspaces[wi];
-        let ws_id = ws.id.clone();
-        let host_id = ws.host_id.clone();
-        let ws_worktree = ws.worktree_path.clone();
-        let Some(socket) = self.host_pool.for_host(&host_id).ok().and_then(|h| h.socket_path()) else {
-            self.set_status_msg(&format!(
-                "Host `{}` unreachable — nothing restored; the closed sessions stay listed",
-                host_id.as_str(),
-            ));
-            return;
-        };
-        let token = self.host_pool.operator_token_for(&host_id);
-        let tombstones = std::mem::take(&mut self.workspaces[wi].tombstones);
-        let total = tombstones.len();
-        let mut restored = 0;
-        let mut failed: Vec<SessionTombstone> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
-        let mut reopen_tasks: Vec<String> = Vec::new();
-        for tomb in tombstones {
-            let entry = remote_revive_entry(&tomb, &host_id);
-            let Some(worktree) = tomb.worktree_path.clone().or_else(|| ws_worktree.clone()) else {
-                errors.push(format!("{}: no worktree", tomb.label));
-                failed.push(tomb);
-                continue;
-            };
-            match crate::client_session::rpc_session_revive(
-                &socket,
-                &token,
-                &entry,
-                &ws_id,
-                &worktree.to_string_lossy(),
-            ) {
-                Ok(()) => {
-                    if let Some(task) = &entry.task_id {
-                        reopen_tasks.push(task.clone());
-                    }
-                    self.pending_remote_reattach
-                        .push(super::remote::PendingRemoteReattach::new(ws_id.clone(), entry));
-                    restored += 1;
-                }
-                Err(e) => {
-                    eprintln!("cm-tui: A-O revive of {} on {} failed: {e:#}", tomb.uid, host_id.as_str());
-                    errors.push(format!("{}: {e}", tomb.label));
-                    failed.push(tomb);
-                }
-            }
-        }
-        // A restored worker's task is work in progress again; a done task
-        // would have the terminal-task sweep close the session once more.
-        // (`self.tasks` keeps only non-terminal tasks, so reopen's bound-done
-        // flip cannot see these.)
-        reopen_tasks.sort();
-        reopen_tasks.dedup();
-        for task in reopen_tasks {
-            let active = self.tasks.iter().any(|t| {
-                t.task_id.as_deref() == Some(task.as_str()) && !matches!(t.api_status, TaskStatus::Done)
-            });
-            if !active {
-                let mut fields = HashMap::new();
-                fields.insert("status".to_string(), serde_json::Value::String("running".into()));
-                self.backend.update_task(task.clone(), fields);
-                self.planning.mark_task_running_by_id(&task);
-            }
-        }
-        self.workspaces[wi].tombstones.extend(failed);
-        self.save_session_manifest();
-        self.cursor = Cursor::Workspace(wi);
-        self.clamp_cursor();
-        let mut msg = format!(
-            "Restored {}/{} session{} on `{}` — reattaching…",
-            restored,
-            total,
-            if total == 1 { "" } else { "s" },
-            host_id.as_str(),
-        );
-        if !errors.is_empty() {
-            msg.push_str(&format!(" · failed (still listed, A-O retries): {}", errors.join("; ")));
-        }
-        self.set_status_msg(&msg);
     }
 
     /// Soft-close the workspace under the cursor: kill its session PTYs
@@ -1433,6 +1374,37 @@ impl App {
                     uid, e,
                 );
             }
+        }
+    }
+
+    /// Close-path kill. Nothing follows at the same uid, so a remote kill
+    /// runs on a worker instead of this input thread (a slow link made each
+    /// A-w wait out the 5 s RPC budget). Local kills stay synchronous: the
+    /// socket is on this machine and callers' ordering expectations hold.
+    pub(crate) fn kill_daemon_session_for_close(
+        host_pool: &std::sync::Arc<crate::host_pool::HostPool>,
+        ts: &TerminalSession,
+    ) {
+        if ts.host_id == cm_daemon::host_id::HostId::local() || ts.session.daemon_session_uid.is_none() {
+            Self::kill_daemon_session_if_attached(host_pool, ts);
+            return;
+        }
+        let pool = std::sync::Arc::clone(host_pool);
+        let host = ts.host_id.clone();
+        let uid = ts.session.daemon_session_uid.clone().unwrap_or_default();
+        let spawned = std::thread::Builder::new()
+            .name("cm-close-kill".into())
+            .spawn(move || {
+                let Some(socket) = pool.for_host(&host).ok().and_then(|h| h.socket_path()) else {
+                    eprintln!("cm-tui: A-w kill_session({uid}) skipped — host {} has no live socket", host.as_str());
+                    return;
+                };
+                if let Err(e) = crate::client_session::rpc_kill_session(&socket, &pool.operator_token_for(&host), &uid) {
+                    eprintln!("cm-tui: A-w kill_session({uid}) failed: {e} (orphan child will be reaped when it exits)");
+                }
+            });
+        if spawned.is_err() {
+            Self::kill_daemon_session_if_attached(host_pool, ts);
         }
     }
 
@@ -1807,7 +1779,7 @@ impl App {
                     // for rationale. Bulk-cleanup paths (task close,
                     // workspace teardown) flow through here too.
                     if kill {
-                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[i]);
+                        Self::kill_daemon_session_for_close(&pool, &ws.sessions[i]);
                     }
                     Self::tombstone_session(ws, i);
                     ws.sessions[i].session.exited = true;
@@ -1878,7 +1850,7 @@ impl App {
                         // sessions need an explicit kill_session
                         // RPC because Drop is detach-only by
                         // design.
-                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[si]);
+                        Self::kill_daemon_session_for_close(&pool, &ws.sessions[si]);
                         Self::tombstone_session(ws, si);
                         let closed_uid = ws.sessions[si].uid.clone();
                         ws.sessions.remove(si);
@@ -1901,7 +1873,7 @@ impl App {
                     if ws.sessions.len() == 1 {
                         // Same operator-kill semantics as the
                         // Session-cursor arm above.
-                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[0]);
+                        Self::kill_daemon_session_for_close(&pool, &ws.sessions[0]);
                         Self::tombstone_session(ws, 0);
                         let closed_uid = ws.sessions[0].uid.clone();
                         ws.sessions.remove(0);
@@ -2329,8 +2301,8 @@ impl App {
     /// resurrects dead sessions).
     ///
     /// A LIVE session is a forced RESTART: the daemon child is killed
-    /// (`kill_live_session_for_restart` — kill RPC + bounded reap wait),
-    /// then the same revive flow runs. The use case is picking up a new
+    /// (kill RPC + bounded reap wait, on the `restart.rs` worker), then
+    /// the same revive flow runs. The use case is picking up a new
     /// agent binary / model without losing the conversation: the old
     /// process predates the update and only a respawn-resumed replaces it.
     ///
@@ -2374,71 +2346,27 @@ impl App {
             );
             return;
         }
-        let Some(wt_path) = ws.worktree_path.clone() else {
+        if ws.worktree_path.is_none() {
             self.set_status_msg("Workspace has no worktree path — can't revive");
             return;
-        };
-        // A LIVE session is a forced restart: kill the daemon child and
-        // wait for the reaper to clear the uid, then fall through to the
-        // normal dead-session revive below. Without the wait, the local
-        // live-uid probe would re-attach to the dying child and the
-        // remote `session.revive` would return Conflict (still running).
+        }
+        // A LIVE session is a forced restart: kill the daemon child and wait
+        // for the reaper to clear the uid, then revive. A remote revive is an
+        // RPC too. Both run on a worker (`restart.rs`), never this input
+        // thread: over a slow link they took minutes and froze every pane.
         let was_live = !ts.session.exited;
-        if was_live && !self.kill_live_session_for_restart(wi, si) {
+        if was_live || ts.host_id != cm_daemon::host_id::HostId::local() {
+            self.start_restart(wi, si, was_live);
             return;
         }
+        self.respawn_local_session(wi, si, false);
+    }
+
+    /// Local A-R: one-slot rerun of the startup restore. `was_live` means
+    /// the restart worker already killed the old child.
+    pub(super) fn respawn_local_session(&mut self, wi: usize, si: usize, was_live: bool) {
         let ws = &self.workspaces[wi];
         let ts = &ws.sessions[si];
-
-        let local = cm_daemon::host_id::HostId::local();
-        if ts.host_id != local {
-            // Remote: daemon-side same-uid revive, then the standard
-            // deferred-reattach flow rebinds the slot.
-            let ws_id = ws.id.clone();
-            let host_id = ts.host_id.clone();
-            let mut entry = ts.to_manifest_entry();
-            entry.last_exit = None;
-            let socket = self
-                .host_pool
-                .for_host(&host_id)
-                .ok()
-                .and_then(|h| h.socket_path());
-            let Some(socket) = socket else {
-                self.set_status_msg(&format!(
-                    "Host `{}` unreachable — can't revive",
-                    host_id.as_str(),
-                ));
-                return;
-            };
-            if let Err(e) = crate::client_session::rpc_session_revive(
-                &socket,
-                &self.host_pool.operator_token_for(&host_id),
-                &entry,
-                &ws_id,
-                &wt_path.to_string_lossy(),
-            ) {
-                let uid = self.workspaces[wi].sessions[si].uid.clone();
-                self.note_revive_failure(&uid, &e.to_string());
-                return;
-            }
-            self.revive_failed.remove(&self.workspaces[wi].sessions[si].uid.clone());
-            {
-                let ts = &mut self.workspaces[wi].sessions[si];
-                ts.session.exited = false;
-                ts.set_status(SessionStatus::Idle);
-                ts.preserved_last_exit = None;
-            }
-            self.requeue_remote_reconnect(wi, si, "A-R revive");
-            self.save_session_manifest();
-            self.set_status_msg(&format!(
-                "Session {} on `{}` — reattaching…",
-                if was_live { "restarted" } else { "revived" },
-                host_id.as_str(),
-            ));
-            return;
-        }
-
-        // Local: one-slot rerun of the startup restore.
         let mut entry = ts.to_manifest_entry();
         entry.last_exit = None;
         let (cols, rows) = self.last_term_size;
@@ -2447,7 +2375,7 @@ impl App {
         // path, whose own RPC then surfaces the real error.
         let live_uids = self
             .host_pool
-            .for_host(&local)
+            .for_host(&cm_daemon::host_id::HostId::local())
             .ok()
             .and_then(|h| h.socket_path())
             .and_then(|socket| {
@@ -2499,78 +2427,6 @@ impl App {
         self.revive_failed.insert(uid.to_owned(), error.to_owned());
         self.set_status_msg(&format!("Revive failed: {error} — the row is kept; fix and press A-R again"));
         self.needs_redraw = true;
-    }
-
-    /// A-R on a LIVE session — the kill half of a forced restart.
-    /// `kill_session` SIGKILLs via pidfd and returns before the reaper
-    /// runs, so after the RPC we poll the daemon registry until the uid
-    /// is gone (the reaper's on_exit removes it); only then can the
-    /// revive flow treat the session as exited. On success the uid is
-    /// also marked in `restart_suppressed_exit_uids` so the kill's own
-    /// `ManifestDiff::Exited` broadcast — applied only after this
-    /// synchronous flow returns, when the slot already holds the revived
-    /// incarnation — doesn't stamp `preserved_last_exit` on (or prune)
-    /// the new row.
-    ///
-    /// Returns false (with a status message) when the session isn't
-    /// daemon-owned (cloud SSH / backtest-watch views have no daemon
-    /// child to kill), the kill RPC fails, or the uid doesn't clear
-    /// within the bounded wait.
-    fn kill_live_session_for_restart(&mut self, wi: usize, si: usize) -> bool {
-        let (daemon_uid, host_id) = {
-            let Some(ts) =
-                self.workspaces.get(wi).and_then(|w| w.sessions.get(si))
-            else {
-                return false;
-            };
-            let Some(uid) = ts.session.daemon_session_uid.clone() else {
-                self.set_status_msg(
-                    "Not a daemon-owned session — A-R can't force-restart it",
-                );
-                return false;
-            };
-            (uid, ts.host_id.clone())
-        };
-        let socket = self
-            .host_pool
-            .for_host(&host_id)
-            .ok()
-            .and_then(|h| h.socket_path());
-        let Some(socket) = socket else {
-            self.set_status_msg(&format!(
-                "Host `{}` unreachable — can't restart",
-                host_id.as_str(),
-            ));
-            return false;
-        };
-        let token_owned = self.host_pool.operator_token_for(&host_id);
-        let token = token_owned.as_str();
-        if let Err(e) = crate::client_session::rpc_kill_session(
-            &socket,
-            token,
-            &daemon_uid,
-        ) {
-            self.set_status_msg(&format!("Restart kill failed: {e}"));
-            return false;
-        }
-        // Bounded reap wait: SIGKILL → reaper on_exit is normally
-        // milliseconds; 2s covers a loaded box. A-R is an explicit
-        // keystroke, so briefly blocking the UI thread is acceptable
-        // (every RPC in this flow is synchronous anyway).
-        for _ in 0..40 {
-            match crate::client_session::rpc_list_session_uids(&socket, token)
-            {
-                Ok(uids) if !uids.contains(&daemon_uid) => {
-                    self.restart_suppressed_exit_uids.insert(daemon_uid);
-                    return true;
-                }
-                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
-            }
-        }
-        self.set_status_msg(
-            "Killed the session but it hasn't exited yet — press A-R again",
-        );
-        false
     }
 
     pub(super) fn attach_active(&mut self) {
@@ -3151,56 +3007,41 @@ impl App {
         seed_from: Option<&str>,
         resume_from: Option<&str>,
     ) {
-        let socket = match self
-            .host_pool
-            .for_host(host)
-            .ok()
-            .and_then(|h| h.socket_path())
-        {
-            Some(s) => s,
-            None => {
-                self.set_status_msg(&format!(
-                    "Remote host `{}` not reachable (no live socket)",
-                    host.as_str()
-                ));
-                return;
-            }
-        };
-
+        // An unconfigured host fails now. Warming its tunnel, the add RPC
+        // and the attach run on a worker (`restart.rs`): over a slow link
+        // they held keyboard input to every pane.
+        if let Err(e) = self.host_pool.for_host(host) {
+            self.set_status_msg(&format!("Remote host `{}` not reachable ({e})", host.as_str()));
+            return;
+        }
         let (cols, rows) = self.last_term_size;
-        let workspace_id = self.workspaces[ws_index].id.clone();
-        let session_uid = new_session_uid();
-        let op_token_owned = self.host_pool.operator_token_for(host);
-        let op_token = op_token_owned.as_str();
-        // Daemon WIRE engine ("claude" → "claude-code").
-        let wire_engine = match session_type {
-            "claude" => "claude-code",
-            other => other,
-        };
-
-        let res = match crate::client_session::rpc_add_session_with_resume(
-            &socket,
-            op_token,
-            &session_uid,
-            &workspace_id,
-            session_type,
-            wire_engine,
-            task_id.as_deref(),
+        self.start_remote_add(super::restart::RemoteAdd {
+            host: host.clone(),
+            workspace_id: self.workspaces[ws_index].id.clone(),
+            uid: new_session_uid(),
+            session_type: session_type.to_owned(),
+            task_id,
+            seed_from: seed_from.map(str::to_owned),
+            resume_from: resume_from.map(str::to_owned),
             cols,
             rows,
-            resume_from,
-            seed_from,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                self.set_status_msg(&format!("Remote add_session failed: {}", e));
-                return;
-            }
-        };
+        });
+    }
 
+    /// The UI-thread half of remote A-s: bind the attached session (or
+    /// queue the reattach of a resumed one) into its workspace.
+    pub(super) fn finish_remote_add(
+        &mut self,
+        job: super::restart::RemoteAdd,
+        res: crate::client_session::AddSessionResult,
+        restored_entry: Option<cm_daemon::manifest::ManifestEntry>,
+        session: Result<Session, String>,
+    ) {
+        let host = &job.host;
+        let session_type = job.session_type.as_str();
         // The original identity may belong to another workspace/task. A picker
         // selection must not reparent it to the row that opened the dialog.
-        let workspace_id = res.workspace_id.clone().unwrap_or(workspace_id);
+        let workspace_id = res.workspace_id.clone().unwrap_or_else(|| job.workspace_id.clone());
         let ws_index = match self.workspaces.iter().position(|w| w.id == workspace_id && w.host_id == *host) {
             Some(i) => i,
             None => {
@@ -3217,70 +3058,30 @@ impl App {
                 i
             }
         };
-        let mut restored_entry = res.entry;
-        if let Some(e) = restored_entry.as_mut() {
-            e.host_id = host.clone();
-            e.session_type = normalize_session_type_to_internal(&e.session_type).to_string();
-        }
-        let task_id = restored_entry.as_ref().map(|e| e.task_id.clone()).unwrap_or(task_id);
-        let label = restored_entry.as_ref().map(|e| e.label.as_str()).unwrap_or(session_type);
-        let worktree_path = PathBuf::from(&res.worktree_path);
-        let session = match try_attach_via_daemon_with_deps(
-            &self.host_pool,
-            &res.session_uid,
-            &workspace_id,
-            &worktree_path,
-            session_type,
-            label,
-            cols,
-            rows,
-            task_id.as_deref(),
-            restored_entry.as_ref().and_then(|e| e.workflow_run_id.as_deref()),
-            restored_entry.as_ref().and_then(|e| e.workflow_role.as_deref()),
-            host,
-            None,
-        ) {
+        let session = match session {
             Ok(s) => s,
             Err(e) => {
-                if resume_from.is_some() {
-                    self.set_status_msg(&format!("Session resumed; attach will retry: {}", e));
-                    if let Some(entry) = restored_entry {
-                        self.forget_reconnect_state(&entry.uid);
-                        self.pending_remote_reattach.push(super::remote::PendingRemoteReattach::new(workspace_id.clone(), entry.clone()));
-                        self.skipped_manifest_entries.entry(workspace_id.clone()).or_default().push(entry);
-                        self.workspaces[ws_index].is_closed = false;
-                    }
-                    self.save_session_manifest();
-                    return;
+                // Only a resume reaches here: the worker kills a fresh
+                // session whose attach failed.
+                self.set_status_msg(&format!("Session resumed; attach will retry: {}", e));
+                if let Some(entry) = restored_entry {
+                    self.forget_reconnect_state(&entry.uid);
+                    self.pending_remote_reattach.push(super::remote::PendingRemoteReattach::new(workspace_id.clone(), entry.clone()));
+                    self.skipped_manifest_entries.entry(workspace_id.clone()).or_default().push(entry);
+                    self.workspaces[ws_index].is_closed = false;
                 }
-                // The daemon already started the session into the existing
-                // worktree. Mirror `ClientSession::new`'s cleanup contract:
-                // best-effort kill before bubbling so we don't leak a live,
-                // headless, unattached session on the remote host. Log the
-                // cleanup error separately; the original attach error wins.
-                if let Err(cleanup_err) = crate::client_session::rpc_kill_session(
-                    &socket,
-                    op_token,
-                    &res.session_uid,
-                ) {
-                    eprintln!(
-                        "add_remote_session cleanup: kill_session({}) failed \
-                         after attach error: {}",
-                        res.session_uid, cleanup_err,
-                    );
-                }
-                self.set_status_msg(&format!("Remote attach failed: {}", e));
+                self.save_session_manifest();
                 return;
             }
         };
-
+        let task_id = restored_entry.as_ref().map(|e| e.task_id.clone()).unwrap_or(job.task_id.clone());
         let ts = if let Some(entry) = restored_entry {
             Self::build_remote_terminal_session(&entry, session)
         } else {
             let mut ts = make_simple_session_with_uid(res.session_uid, session_type, session_type, session, None);
             ts.task_id = task_id;
-            ts.transcript_id = if session_type == "claude" || seed_from.is_none() { res.resume_id } else { None };
-            ts.seeded_from_snapshot = seed_from.map(str::to_owned);
+            ts.transcript_id = if session_type == "claude" || job.seed_from.is_none() { res.resume_id } else { None };
+            ts.seeded_from_snapshot = job.seed_from.clone();
             ts.host_id = host.clone();
             ts
         };
@@ -3299,7 +3100,7 @@ impl App {
         self.workspaces[ws_index].sessions.push(ts);
         self.cursor = Cursor::Session(ws_index, si);
         self.save_session_manifest();
-        let action = if resume_from.is_some() { "Resumed" } else { "Started" };
+        let action = if job.resume_from.is_some() { "Resumed" } else { "Started" };
         self.set_status_msg(&format!("{} {} on `{}`", action, label, host.as_str()));
     }
 
@@ -3685,7 +3486,7 @@ impl App {
             .map(|ts| ts.uid.clone())
             .collect();
         for ts in &self.workspaces[wi].sessions {
-            Self::kill_daemon_session_if_attached(&pool, ts);
+            Self::kill_daemon_session_for_close(&pool, ts);
         }
         self.workspaces.remove(wi);
         // Cancel reconnect/reattach for every session in the deleted
@@ -3987,52 +3788,76 @@ impl App {
     /// and cloud workspaces (those have no worktree to share).
     /// Explicit cross-host launches create a separate checkout and session.
     /// No files, task binding, or running conversation are moved by this action.
-    pub(super) fn new_workspace_on_host(&mut self, source_id: &str, host: &cm_daemon::host_id::HostId, engine: &str, seed_from: Option<&str>) -> Option<String> {
-        let source = self.workspaces.iter().find(|ws| ws.id == source_id)?;
+    /// The create RPC (it provisions a checkout) and the attach run on a
+    /// worker (`background.rs`); `then` runs with the new workspace id once
+    /// it is in the sidebar (A-f uses it to launch the workflow there).
+    pub(super) fn new_workspace_on_host(
+        &mut self,
+        source_id: &str,
+        host: &cm_daemon::host_id::HostId,
+        engine: &str,
+        seed_from: Option<&str>,
+        then: Option<Box<dyn FnOnce(&mut App, String) + Send>>,
+    ) {
+        let Some(source) = self.workspaces.iter().find(|ws| ws.id == source_id) else { return };
         let Some(repo) = source.repo_url.clone() else {
-            self.set_status_msg("Workspace has no repository configured"); return None;
+            self.set_status_msg("Workspace has no repository configured"); return;
         };
         let name = format!("{}-{}", source.name, host);
         let section = self.workspace_sections.get(source_id).cloned();
         let uid = new_session_uid();
         let ws_id = new_workspace_id();
         let slug = format!("{}-{}", worktree::slugify(&name), ws_id.trim_start_matches("ws-"));
-        let Some(socket) = self.host_pool.live_socket_path(host) else {
-            self.set_status_msg(&format!("Host `{}` is unavailable", host)); return None;
-        };
-        let token = self.host_pool.operator_token_for(host);
         let (cols, rows) = self.last_term_size;
-        let result = match crate::client_session::rpc_create_session_with_options(&socket, &token,
-            &uid, &ws_id, engine, if engine == "claude" { "claude-code" } else { engine },
-            &repo, None, &slug, None, cols, rows, false, seed_from) {
-            Ok(result) => result,
-            Err(e) => { self.set_status_msg(&format!("New workspace: {}", e)); return None; }
-        };
-        let path = PathBuf::from(&result.worktree_path);
-        let session = match try_attach_via_daemon_with_deps(&self.host_pool, &uid, &ws_id,
-            &path, engine, engine, cols, rows, None, None, None, host, None) {
-            Ok(session) => session,
-            Err(e) => {
-                let _ = crate::client_session::rpc_kill_session(&socket, &token, &uid);
-                self.set_status_msg(&format!("Attach: {}", e)); return None;
-            }
-        };
-        let mut ts = make_simple_session_with_uid(uid, engine, engine, session, None);
-        ts.host_id = host.clone();
-        ts.seeded_from_snapshot = seed_from.map(str::to_owned);
-        if engine == "claude" { ts.transcript_id = result.resume_id; }
-        let wi = self.workspaces.len();
-        self.workspaces.push(Workspace {
-            id: ws_id.clone(), name, color: None, pinned: false, is_closed: false,
-            is_cloud: false, repo_url: Some(repo), worktree_path: Some(path),
-            main_repo_path: result.main_repo_path.map(PathBuf::from), worker_vm: None,
-            worker_zone: None, host_id: host.clone(), sessions: vec![ts], tombstones: vec![],
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let host = host.clone();
+        let engine = engine.to_owned();
+        let seed_from = seed_from.map(str::to_owned);
+        let started = self.run_in_background(Some(format!("new_workspace:{source_id}:{host}")), move || {
+            let fail = |msg: String| -> super::background::Apply { Box::new(move |app: &mut App| app.set_status_msg(&msg)) };
+            let Some(socket) = pool.live_socket_path(&host) else {
+                return fail(format!("Host `{}` is unavailable", host));
+            };
+            let token = pool.operator_token_for(&host);
+            let result = match crate::client_session::rpc_create_session_with_options(&socket, &token,
+                &uid, &ws_id, &engine, if engine == "claude" { "claude-code" } else { &engine },
+                &repo, None, &slug, None, cols, rows, false, seed_from.as_deref()) {
+                Ok(result) => result,
+                Err(e) => return fail(format!("New workspace: {}", e)),
+            };
+            let path = PathBuf::from(&result.worktree_path);
+            let session = match try_attach_via_daemon_with_deps(&pool, &uid, &ws_id,
+                &path, &engine, &engine, cols, rows, None, None, None, &host, None) {
+                Ok(session) => session,
+                Err(e) => {
+                    let _ = crate::client_session::rpc_kill_session(&socket, &token, &uid);
+                    return fail(format!("Attach: {}", e));
+                }
+            };
+            Box::new(move |app: &mut App| {
+                let mut ts = make_simple_session_with_uid(uid, &engine, &engine, session, None);
+                ts.host_id = host.clone();
+                ts.seeded_from_snapshot = seed_from;
+                if engine == "claude" { ts.transcript_id = result.resume_id; }
+                let wi = app.workspaces.len();
+                app.workspaces.push(Workspace {
+                    id: ws_id.clone(), name, color: None, pinned: false, is_closed: false,
+                    is_cloud: false, repo_url: Some(repo), worktree_path: Some(path),
+                    main_repo_path: result.main_repo_path.map(PathBuf::from), worker_vm: None,
+                    worker_zone: None, host_id: host.clone(), sessions: vec![ts], tombstones: vec![],
+                });
+                if let Some(section) = section { app.workspace_sections.insert(ws_id.clone(), section); }
+                app.cursor = Cursor::Session(wi, 0);
+                app.save_session_manifest();
+                app.set_status_msg(&format!("Created new workspace on {}", host));
+                if let Some(then) = then {
+                    then(app, ws_id);
+                }
+            })
         });
-        if let Some(section) = section { self.workspace_sections.insert(ws_id.clone(), section); }
-        self.cursor = Cursor::Session(wi, 0);
-        self.save_session_manifest();
-        self.set_status_msg(&format!("Created new workspace on {}", host));
-        Some(ws_id)
+        if started {
+            self.set_status_msg("Creating the workspace…");
+        }
     }
 
     pub(super) fn alternate_form_host(&self, workspace_id: &str) -> Option<cm_daemon::host_id::HostId> {
@@ -7373,10 +7198,10 @@ mod migrate_tui_local_tests {
         );
         // The A-R path rides spawn_restored_session (so it inherits the
         // pin above) — keep it that way.
-        let revive = fn_body("fn revive_active_session(");
+        let revive = fn_body("fn respawn_local_session(");
         assert!(
             revive.contains("self.spawn_restored_session(&entry, ws, (cols, rows), &live_uids)"),
-            "revive_active_session must respawn through spawn_restored_session; body:\n{revive}",
+            "respawn_local_session must respawn through spawn_restored_session; body:\n{revive}",
         );
 
         // (2) agent-requested grant rides the spawn, not a second RPC.
@@ -7425,32 +7250,33 @@ mod migrate_tui_local_tests {
             "the pre-fix diff-gated `perms_change` path must be gone; arm:\n{arm}",
         );
         assert!(
-            arm.contains("self.set_session_global_perms(&uid, value)"),
+            arm.contains("self.set_session_global_perms(&uid, value, local_changed)"),
             "the settings save must call set_session_global_perms; arm:\n{arm}",
         );
 
         // (4) no silent local-only success when the host isn't live.
         let setter = fn_body("fn set_session_global_perms(");
         assert!(
-            !setter.contains("if let Some(socket) = self.host_pool.live_socket_path("),
+            !setter.contains("if let Some(socket) = pool.live_socket_path("),
             "set_session_global_perms must not silently skip the daemon when the \
              socket isn't live; body:\n{setter}",
         );
         assert!(
-            setter.contains("self.host_pool.live_socket_path(&host).ok_or_else("),
+            setter.contains("pool\n                .live_socket_path(&host)\n                .ok_or_else("),
             "a not-live host socket must be an error; body:\n{setter}",
         );
-        // And the push precedes the local mutation (a failed RPC must
-        // not leave the TUI's view diverged from the daemon's).
-        let push_idx = setter
-            .find("rpc_set_global_perms(")
-            .expect("setter pushes to the daemon");
-        let local_idx = setter
+        assert!(setter.contains("rpc_set_global_perms("), "setter pushes to the daemon");
+        // And the local row changes only after the daemon accepted (a failed
+        // RPC must not leave the TUI's view diverged from the daemon's).
+        let finish = fn_body("fn finish_global_perms(");
+        let accepted_idx = finish.find("Ok(ack) => ack").expect("finish matches the push result");
+        let local_idx = finish
             .find(".global_perms = value;")
-            .expect("setter updates the local row");
+            .expect("finish updates the local row");
+        assert!(accepted_idx < local_idx, "the local row update follows an accepted push");
         assert!(
-            push_idx < local_idx,
-            "daemon push must precede the local row update",
+            !setter.contains(".global_perms = value;"),
+            "the setter itself never touches the row before the daemon answers",
         );
     }
 
@@ -8211,6 +8037,294 @@ pub(crate) mod revive_session_tests {
             .unwrap_or_default()
     }
 
+    /// Apply A-R / A-O worker results, as the main loop does each tick.
+    fn settle_restarts(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !app.restarts.is_empty() || !app.restores.is_empty() {
+            assert!(Instant::now() < deadline, "restart worker never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            app.drain_restarts();
+        }
+    }
+
+    /// A host that accepts connections and never answers: Owner's link on
+    /// 2026-10-16, where every RPC ran out its full budget.
+    fn silent_host() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("silent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                held.push(conn);
+            }
+        });
+        (dir, socket)
+    }
+
+    fn app_on_silent_host(ts_uid: &str) -> (App, tempfile::TempDir) {
+        let slow = cm_daemon::host_id::HostId::new("slow");
+        let (dir, socket) = silent_host();
+        let mut app = app_with_session(dummy_ts(ts_uid, true, slow.clone()));
+        app.workspaces[0].host_id = slow.clone();
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(&slow, socket)).expect("pool"),
+        );
+        (app, dir)
+    }
+
+    /// 2026-10-16: A-R over a slow link froze keyboard input to every pane
+    /// while its RPCs ran out their budgets on the input thread. It now
+    /// returns at once; the outcome lands on a later tick.
+    #[test]
+    fn a_r_on_a_silent_host_returns_at_once_and_reports_the_failure_later() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0b-0");
+        let started = Instant::now();
+        app.revive_active_session();
+        assert!(started.elapsed() < Duration::from_millis(500), "A-R blocked input for {:?}", started.elapsed());
+        assert!(status_text(&app).starts_with("Reviving"), "{}", status_text(&app));
+        app.revive_active_session();
+        assert!(status_text(&app).contains("already in progress"), "{}", status_text(&app));
+        settle_restarts(&mut app);
+        assert!(status_text(&app).starts_with("Revive failed"), "{}", status_text(&app));
+        assert!(app.workspaces[0].sessions[0].session.exited);
+        assert!(app.pending_remote_reattach.is_empty());
+    }
+
+    /// How the scripted host answers `kill_session`.
+    #[derive(Clone, Copy)]
+    enum KillReply {
+        /// The kill lands but the reply never arrives (Owner's slow link).
+        Lost,
+        /// A second A-R: the first one's kill already landed.
+        AlreadyExited,
+    }
+
+    /// A host that kills, lists nothing, and answers `session.revive` with
+    /// `revive_ok`. Returns how many revives it served.
+    fn scripted_host(
+        kill: KillReply,
+        revive_ok: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use cm_daemon::control::protocol::{ErrorBody, ErrorCode, Response};
+        use cm_daemon::control::wire;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("scripted.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let revives = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = std::sync::Arc::clone(&revives);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { return };
+                let Ok(Some(req)) = wire::read_request(&mut stream) else { continue };
+                let error = |message: &str| Response {
+                    id: req.id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(ErrorBody { code: ErrorCode::NotFound, message: message.into() }),
+                };
+                let ok = |result| Response { id: req.id.clone(), ok: true, result: Some(result), error: None };
+                let resp = match (req.method.as_str(), kill) {
+                    ("kill_session", KillReply::Lost) => continue,
+                    ("kill_session", KillReply::AlreadyExited) => error("session already exited"),
+                    ("list_sessions", _) => ok(serde_json::json!([])),
+                    ("session.revive", _) => {
+                        served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if revive_ok { ok(serde_json::json!({})) } else { error("no transcript") }
+                    }
+                    _ => error("unexpected method"),
+                };
+                let _ = wire::write_response(&mut stream, &resp);
+            }
+        });
+        (dir, socket, revives)
+    }
+
+    fn live_app_on(socket: std::path::PathBuf, uid: &str) -> App {
+        let host = cm_daemon::host_id::HostId::new("scripted");
+        let mut app = app_with_session(dummy_ts(uid, false, host.clone()));
+        app.workspaces[0].host_id = host.clone();
+        app.workspaces[0].sessions[0].session.daemon_session_uid = Some(uid.into());
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(&host, socket)).expect("pool"),
+        );
+        app
+    }
+
+    /// 2026-10-18, Swarm-Coord: A-R's kill landed but its reply was lost, so
+    /// the restart gave up with the session dead behind a live-looking row,
+    /// and every later A-R failed on "already exited". Both now revive.
+    #[test]
+    fn a_r_revives_when_the_kill_reply_is_lost_or_the_session_already_exited() {
+        for (kill, uid) in [
+            (KillReply::Lost, "ts-aaaaaaaaaaaaaa13-0"),
+            (KillReply::AlreadyExited, "ts-aaaaaaaaaaaaaa14-0"),
+        ] {
+            let (_dir, socket, revives) = scripted_host(kill, true);
+            let mut app = live_app_on(socket, uid);
+            app.revive_active_session();
+            assert!(status_text(&app).starts_with("Restarting"), "{}", status_text(&app));
+            settle_restarts(&mut app);
+            assert!(status_text(&app).contains("restarted"), "{}", status_text(&app));
+            assert_eq!(revives.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(!app.workspaces[0].sessions[0].session.exited);
+        }
+    }
+
+    /// A restart that gives up after its exit was suppressed shows the row
+    /// as exited, so the next A-R revives instead of killing a dead uid.
+    #[test]
+    fn a_failed_restart_whose_exit_was_suppressed_leaves_the_row_exited() {
+        let uid = "ts-aaaaaaaaaaaaaa15-0";
+        let (_dir, socket, revives) = scripted_host(KillReply::AlreadyExited, false);
+        let mut app = live_app_on(socket, uid);
+        app.revive_active_session();
+        // The Exited diff consumed the marker while the worker ran.
+        assert!(app.restart_suppressed_exit_uids.remove(uid));
+        settle_restarts(&mut app);
+        assert!(status_text(&app).starts_with("Revive failed"), "{}", status_text(&app));
+        assert_eq!(revives.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(app.workspaces[0].sessions[0].session.exited);
+        assert!(app.restart_suppressed_exit_uids.is_empty());
+    }
+
+    /// A-w on a remote session: the row closes at once; the kill RPC runs
+    /// on a worker.
+    #[test]
+    fn closing_a_remote_session_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0d-0");
+        app.workspaces[0].sessions[0].session.exited = false;
+        app.workspaces[0].sessions[0].session.daemon_session_uid = Some("ts-aaaaaaaaaaaaaa0d-0".into());
+        let started = Instant::now();
+        app.close_active_session();
+        assert!(started.elapsed() < Duration::from_millis(500), "A-w blocked input for {:?}", started.elapsed());
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+    }
+
+    /// Remote A-s: the add RPC and the attach run on a worker.
+    #[test]
+    fn adding_a_session_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0e-0");
+        let host = app.workspaces[0].host_id.clone();
+        let started = Instant::now();
+        app.add_remote_session(&host, 0, "codex", None, None, None);
+        assert!(started.elapsed() < Duration::from_millis(500), "A-s blocked input for {:?}", started.elapsed());
+        assert!(status_text(&app).starts_with("Starting codex on `slow`"), "{}", status_text(&app));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !app.remote_adds.is_empty() {
+            assert!(Instant::now() < deadline, "add worker never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            app.drain_restarts();
+        }
+        assert!(status_text(&app).starts_with("Remote add_session failed"), "{}", status_text(&app));
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "no row for a failed add");
+    }
+
+    fn assert_prompt(started: Instant, what: &str) {
+        assert!(started.elapsed() < Duration::from_millis(500), "{what} blocked input for {:?}", started.elapsed());
+    }
+
+    /// A-f's `start_workflow` has a 150 s budget; on a silent host it used
+    /// to hold input for all of it.
+    #[test]
+    fn a_f_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0f-0");
+        app.workspaces[0].sessions[0].session.exited = false;
+        let id = app.workspaces[0].id.clone();
+        let started = Instant::now();
+        app.launch_workflow_via_daemon(&id, "feedback", &[], None, None);
+        assert_prompt(started, "A-f");
+        assert!(status_text(&app).starts_with("Launching feedback"), "{}", status_text(&app));
+        app.launch_workflow_via_daemon(&id, "feedback", &[], None, None);
+        assert!(status_text(&app).contains("Already in progress"), "{}", status_text(&app));
+    }
+
+    /// A-e's global-perms save: the row changes only after the daemon
+    /// answers, and a failure says so.
+    #[test]
+    fn global_perms_save_on_a_silent_host_returns_at_once_and_leaves_the_row_unchanged() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa10-0");
+        app.workspaces[0].sessions[0].session.exited = false;
+        let started = Instant::now();
+        app.set_session_global_perms("ts-aaaaaaaaaaaaaa10-0", true, true);
+        assert_prompt(started, "global-perms save");
+        assert!(status_text(&app).contains("applying global permissions"), "{}", status_text(&app));
+        assert!(!app.workspaces[0].sessions[0].global_perms, "not granted before the daemon answers");
+        app.settle_background();
+        assert!(status_text(&app).contains("global-perms change failed"), "{}", status_text(&app));
+        assert!(!app.workspaces[0].sessions[0].global_perms, "a failed push leaves the row as it was");
+    }
+
+    /// A-s → Resume on a remote workspace lists its transcripts over the
+    /// link; a failure returns to the form with what was typed.
+    #[test]
+    fn transcript_picker_on_a_silent_host_returns_at_once_and_restores_the_form() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa11-0");
+        let id = app.workspaces[0].id.clone();
+        let started = Instant::now();
+        app.open_transcript_picker(TranscriptPickTarget::NewTerminalSession {
+            workspace_id: id.clone(),
+            session_type: "claude".into(),
+            task_id: None,
+            existing_seed_from: None,
+            existing_resume_from: None,
+        });
+        assert_prompt(started, "the transcript picker");
+        assert!(status_text(&app).starts_with("Loading transcripts"), "{}", status_text(&app));
+        app.settle_background();
+        assert!(status_text(&app).starts_with("Transcript catalog"), "{}", status_text(&app));
+        assert!(
+            matches!(&app.input_mode, InputMode::NewTerminalSession { workspace_id, .. } if *workspace_id == id),
+            "back on the A-s form",
+        );
+    }
+
+    /// A cross-host new workspace provisions a checkout before replying.
+    #[test]
+    fn new_workspace_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa12-0");
+        app.workspaces[0].repo_url = Some("https://example.invalid/repo".into());
+        let id = app.workspaces[0].id.clone();
+        let host = app.workspaces[0].host_id.clone();
+        let started = Instant::now();
+        app.new_workspace_on_host(&id, &host, "bash", None, None);
+        assert_prompt(started, "new workspace on host");
+        assert!(status_text(&app).starts_with("Creating the workspace"), "{}", status_text(&app));
+        assert_eq!(app.workspaces.len(), 1, "nothing added until the host answers");
+    }
+
+    /// The same for A-O on a remote workspace: its revives run serially,
+    /// one RPC budget each.
+    #[test]
+    fn a_o_on_a_silent_host_returns_at_once_and_keeps_the_tombstones_listed() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0c-0");
+        let ws = &mut app.workspaces[0];
+        ws.sessions.clear();
+        ws.tombstones = vec![SessionTombstone {
+            entry: None,
+            uid: "ts-dead-2".into(),
+            managed_by_uid: None,
+            label: "worker".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            last_transcript_id: Some("tid".into()),
+            worktree_path: Some(std::env::temp_dir()),
+            generation: 0,
+            exited_at: 1.0,
+        }];
+        let id = app.workspaces[0].id.clone();
+        let started = Instant::now();
+        app.restore_tombstones_for_workspace(&id);
+        assert!(started.elapsed() < Duration::from_millis(500), "A-O blocked input for {:?}", started.elapsed());
+        assert!(status_text(&app).starts_with("Restoring 1 session on `slow`"), "{}", status_text(&app));
+        assert_eq!(app.workspaces[0].tombstones.len(), 1, "listed while the revive is in flight");
+        settle_restarts(&mut app);
+        let status = status_text(&app);
+        assert!(status.starts_with("Restored 0/1 session on `slow`"), "{status}");
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+    }
+
     /// A-R on a LIVE session is a forced restart: kill the daemon child,
     /// then revive. The kill step needs a daemon binding to target — a
     /// live session without one (this fixture; e.g. a cloud SSH view) is
@@ -8332,6 +8446,7 @@ pub(crate) mod revive_session_tests {
         assert!(app.reopen_workspace_by_id("ws-cloud"));
         assert!(!app.auto_close_workspaces.contains("ws-cloud"), "a reopen claims the workspace");
         app.restore_tombstones_for_workspace("ws-cloud");
+        settle_restarts(&mut app);
 
         let status = status_text(&app);
         assert!(status.starts_with("Restored 1/1 session on `sessions`"), "{status}");
@@ -8387,6 +8502,7 @@ pub(crate) mod revive_session_tests {
         }];
         let id = app.workspaces[0].id.clone();
         app.restore_tombstones_for_workspace(&id);
+        settle_restarts(&mut app);
         let status = status_text(&app);
         assert!(status.starts_with("Restored 0/1 session on `ghost`"), "{status}");
         assert!(status.contains("failed (still listed, A-O retries): worker:"), "{status}");
@@ -8435,6 +8551,7 @@ pub(crate) mod revive_session_tests {
             crate::host_pool::HostPool::from_config(&hosts).expect("pool"),
         );
         app.revive_active_session();
+        settle_restarts(&mut app);
         assert!(
             status_text(&app).starts_with("Revive failed"),
             "RPC failure surfaced, got: {}",

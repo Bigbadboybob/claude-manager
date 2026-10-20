@@ -37,10 +37,13 @@ fn pane_cell_pixels(graphics: bool) -> (u16, u16) {
         .unwrap_or((1, 1))
 }
 
-/// Proxy that forwards alacritty terminal events to a channel.
+/// Proxy that forwards alacritty terminal events to a channel. Clones share
+/// the target, so [`Self::retarget`] moves a `Term`'s events (title, bell,
+/// query replies) to a new session's channel when a resumed stream adopts
+/// that `Term`.
 #[derive(Clone)]
 pub struct EventProxy {
-    tx: mpsc::Sender<TermEvent>,
+    tx: Arc<std::sync::Mutex<mpsc::Sender<TermEvent>>>,
 }
 
 impl EventProxy {
@@ -49,13 +52,18 @@ impl EventProxy {
     /// equivalent EventProxies without exposing the private `tx`
     /// field across modules.
     pub fn new(tx: mpsc::Sender<TermEvent>) -> Self {
-        Self { tx }
+        Self { tx: Arc::new(std::sync::Mutex::new(tx)) }
+    }
+
+    /// Send this proxy's events, and every clone's, to `tx` from now on.
+    pub fn retarget(&self, tx: mpsc::Sender<TermEvent>) {
+        *self.tx.lock().unwrap_or_else(|p| p.into_inner()) = tx;
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
-        let _ = self.tx.send(event);
+        let _ = self.tx.lock().unwrap_or_else(|p| p.into_inner()).send(event);
     }
 }
 
@@ -146,6 +154,19 @@ pub struct Session {
     /// Kitty graphics passthrough for daemon-attached panes; `None` when it
     /// is off or for local PTYs. See doc/kitty-graphics-passthrough.md.
     pub graphics: Option<crate::graphics::PaneGraphics>,
+    /// Attached screen-first (remote panes): only the visible screen was
+    /// sent, so scrolling up has nothing to show until the full output ring
+    /// is fetched. The app re-attaches with the ring on the first scroll up.
+    pub history_deferred: bool,
+    /// Daemon-attached: where this pane's terminal is in the session's output
+    /// stream, so a reconnect can resume instead of repainting. `None` for
+    /// local PTYs and older daemons.
+    pub stream: Option<crate::client_session::StreamCursor>,
+    /// The events proxy `term` was built with (daemon-attached only).
+    pub term_events: Option<EventProxy>,
+    /// This session continues an earlier session's `term` (see
+    /// [`Self::resume_from`]); the app carries that pane's state over.
+    pub resumed: bool,
 }
 
 #[derive(Default)]
@@ -320,6 +341,10 @@ impl Session {
             attach_hup_fd: None,
             output_control: None,
             graphics: None,
+            history_deferred: false,
+            stream: None,
+            term_events: None,
+            resumed: false,
         })
     }
 
@@ -346,12 +371,13 @@ impl Session {
     pub fn new_attached_existing(
         config: crate::client_session::ClientSessionConfig,
     ) -> anyhow::Result<Self> {
-        Self::new_attached_existing_with_context(config, false)
+        Self::new_attached_existing_with_context(config, false, Default::default())
     }
 
     pub(crate) fn new_attached_existing_with_context(
         config: crate::client_session::ClientSessionConfig,
         restore_context: bool,
+        how: crate::client_session::AttachHow,
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
         // A bounded raw replay can start after the application's last complete
@@ -362,7 +388,9 @@ impl Session {
         } else {
             Repaint::None
         };
-        let cs = crate::client_session::ClientSession::attach_existing_with_context(config, restore_context)?;
+        let cs = crate::client_session::ClientSession::attach_existing_with_context(config, restore_context, how)?;
+        // A resumed terminal missed nothing, so the program need not redraw.
+        let repaint = if cs.resumed { Repaint::None } else { repaint };
         let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
         Ok(Session {
             repaint,
@@ -384,6 +412,10 @@ impl Session {
             attach_hup_fd: cs.hup_fd,
             output_control: cs.output_control,
             graphics: cs.graphics,
+            history_deferred: cs.history_deferred,
+            stream: cs.stream,
+            term_events: Some(cs.term_events),
+            resumed: cs.resumed,
         })
     }
 
@@ -439,6 +471,22 @@ impl Session {
             attach_hup_fd: cs.hup_fd,
             output_control: cs.output_control,
             graphics: cs.graphics,
+            history_deferred: cs.history_deferred,
+            stream: cs.stream,
+            term_events: Some(cs.term_events),
+            resumed: cs.resumed,
+        })
+    }
+
+    /// What a reconnect needs to continue this pane's terminal from where
+    /// its stream stopped: the stream position plus the terminal itself.
+    pub fn resume_from(&self) -> Option<crate::client_session::ResumeFrom> {
+        let stream = self.stream.as_ref()?;
+        Some(crate::client_session::ResumeFrom {
+            stream_id: stream.stream_id,
+            position: stream.position.load(std::sync::atomic::Ordering::SeqCst),
+            term: self.term.clone(),
+            term_events: self.term_events.clone()?,
         })
     }
 

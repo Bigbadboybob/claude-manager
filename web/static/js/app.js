@@ -3,7 +3,8 @@
 import { api, allPages, newRequestId, ApiError } from "./api.js";
 import {
   REACTIONS, LEVELS, renderBody, formatTime, dayLabel, sortConversations, filterConversations,
-  badgeCount, reactionList, truncate, parseRoute, routeHash, groupAlerts, age,
+  badgeCount, reactionList, truncate, parseRoute, routeHash, groupAlerts, age, withoutSeenAlerts,
+  learnNames, nameFor, alertParticipant, directDm, hasIdentity, dmCandidates,
 } from "./format.js";
 import * as push from "./push.js";
 
@@ -14,10 +15,16 @@ const state = {
   me: null,
   channels: [],
   dms: [],
-  people: new Map(), // id -> name
+  people: new Map(), // id -> name (present participants only)
+  engines: new Map(), // id -> engine (claude-code, codex, bash) when reported
+  knownNames: new Map(), // id -> name seen in DM rows and messages (incl. departed)
   counts: { conversations: {}, unread: 0, dms: 0, mentions: 0 },
   availability: null,
   alerts: [],
+  alertHosts: [],
+  // Alert ids acknowledged here: hidden at once and kept hidden even if a
+  // refresh that raced the acknowledgement still returns them.
+  seenAlerts: new Map(), // id -> time acknowledged
   route: parseRoute(location.hash),
   query: "",
   conv: null, // {id, items, next, loadingOlder, replyTo, thread, atBottom}
@@ -66,6 +73,9 @@ function fail(e) {
 
 // ---------- drafts (survive errors, reloads and Access expiry) ----------
 const draftKey = (id) => `cm-board:draft:${id}`;
+/** Drafts of a DM that does not exist yet are kept under the participant. */
+const draftId = (c) => c.id || `dm:${c.dmTo}`;
+
 function loadDraft(id) {
   try {
     return JSON.parse(localStorage.getItem(draftKey(id)) || "null") || { body: "", request_id: null, reply_to: null };
@@ -84,8 +94,7 @@ function saveDraft(id, draft) {
 
 // ---------- directory ----------
 function personName(id) {
-  if (id === "owner") return "Owner";
-  return state.people.get(id) || String(id).split(":").pop();
+  return nameFor(id, state.people, state.knownNames);
 }
 
 function convCounts(id) {
@@ -134,7 +143,9 @@ async function loadDirectory() {
   ]);
   state.channels = channels;
   state.dms = dms;
+  learnNames(state.knownNames, { dms });
   state.people = new Map(people.map((p) => [p.id, p.name]));
+  state.engines = new Map(people.filter((p) => p.engine).map((p) => [p.id, p.engine]));
 }
 
 async function loadCounts() {
@@ -164,6 +175,7 @@ async function openConversation(id, messageId = null) {
     const page = await api.read({ conversation: id, newest_first: true, limit: PAGE });
     if (state.conv?.id !== id) return;
     state.conv.items = newestAtBottom(page.items || []);
+    learnNames(state.knownNames, { messages: state.conv.items });
     state.conv.next = page.next_cursor || null;
     // A push opened a specific message: page back until it is loaded.
     for (let i = 0; messageId && i < 10 && state.conv.next && !state.conv.items.some((m) => m.id === messageId); i += 1) {
@@ -180,7 +192,7 @@ async function openConversation(id, messageId = null) {
 
 async function loadOlder(rerender = true) {
   const c = state.conv;
-  if (!c || !c.next || c.loadingOlder) return;
+  if (!c || !c.id || !c.next || c.loadingOlder) return;
   c.loadingOlder = true;
   try {
     const page = await api.read({ conversation: c.id, newest_first: true, limit: PAGE, cursor: c.next, mark_read: false });
@@ -188,6 +200,7 @@ async function loadOlder(rerender = true) {
     const scroller = document.querySelector(".conv .scroll");
     const before = scroller ? scroller.scrollHeight - scroller.scrollTop : 0;
     c.items = mergeItems(c.items, page.items || []);
+    learnNames(state.knownNames, { messages: page.items || [] });
     c.next = page.next_cursor || null;
     if (rerender) {
       renderConversation();
@@ -204,13 +217,14 @@ async function loadOlder(rerender = true) {
 
 async function refreshConversation() {
   const c = state.conv;
-  if (!c) return;
+  if (!c || !c.id) return;
   try {
     // Only mark read while the newest message is on screen.
     const page = await api.read({ conversation: c.id, newest_first: true, limit: PAGE, mark_read: c.atBottom });
     if (state.conv !== c) return;
     const had = c.items.length;
     c.items = mergeItems(c.items, page.items || []);
+    learnNames(state.knownNames, { messages: page.items || [] });
     if (c.items.length !== had || (page.items || []).length) {
       const stick = c.atBottom;
       renderConversation();
@@ -244,7 +258,7 @@ async function send() {
   const c = state.conv;
   if (!c) return;
   const box = document.querySelector(".composer textarea");
-  const draft = loadDraft(c.id);
+  const draft = loadDraft(draftId(c));
   draft.body = box ? box.value : draft.body;
   if (!draft.body.trim()) return;
   if (draft.body.length > 3000) {
@@ -255,17 +269,17 @@ async function send() {
   // timeout must not post twice.
   draft.request_id = draft.request_id || newRequestId();
   draft.reply_to = c.replyTo?.id || draft.reply_to || null;
-  saveDraft(c.id, draft);
+  saveDraft(draftId(c), draft);
   state.busy.add("send");
   renderComposer();
   try {
-    await sendDraft(c.id, draft);
+    await sendDraft(c, draft);
   } catch (e) {
-    if (e instanceof ApiError && e.code === "join_required") {
+    if (e instanceof ApiError && e.code === "join_required" && c.id) {
       if (confirm("Join this channel to post?")) {
         try {
           await api.join(c.id, newRequestId());
-          await sendDraft(c.id, draft);
+          await sendDraft(c, draft);
         } catch (e2) {
           fail(e2);
         }
@@ -279,11 +293,20 @@ async function send() {
   }
 }
 
-async function sendDraft(id, draft) {
-  const params = { conversation: id, body: draft.body, request_id: draft.request_id };
+async function sendDraft(c, draft) {
+  const id = c.id;
+  // A DM that does not exist yet is created by its first message.
+  const params = id ? { conversation: id } : { dm: c.dmTo };
+  Object.assign(params, { body: draft.body, request_id: draft.request_id });
   if (draft.reply_to) params.reply_to = draft.reply_to;
-  await api.send(params);
-  saveDraft(id, { body: "", request_id: null, reply_to: null });
+  const res = await api.send(params);
+  saveDraft(draftId(c), { body: "", request_id: null, reply_to: null });
+  if (!id) {
+    const created = res?.event?.conversation_id;
+    await loadDirectory().catch(() => {});
+    if (created) go({ view: "conversation", id: created });
+    return;
+  }
   if (state.conv?.id === id) {
     state.conv.replyTo = null;
     state.conv.atBottom = true;
@@ -324,7 +347,7 @@ async function markRead(params, label) {
 
 async function openThread(root) {
   const c = state.conv;
-  if (!c) return;
+  if (!c || !c.id) return;
   c.thread = { root, items: [] };
   renderThread();
   try {
@@ -341,10 +364,17 @@ async function openThread(root) {
 async function loadAlerts() {
   try {
     const res = await api.alerts();
-    state.alerts = res.items || [];
+    state.alerts = visibleAlerts(res.items || []);
+    state.alertHosts = res.alert_hosts || state.me?.features?.alert_hosts || [];
   } catch (e) {
     fail(e);
   }
+}
+
+/** Drop alerts acknowledged here; forget an acknowledgement once the server
+ *  stops listing that alert (or after two minutes, in case it never did). */
+function visibleAlerts(items) {
+  return withoutSeenAlerts(items, state.seenAlerts, Date.now());
 }
 
 async function setLevel(level) {
@@ -384,8 +414,9 @@ function renderHeader() {
   if (!el) return;
   const level = state.availability?.level || "unset";
   const route = state.route;
-  const inConv = route.view === "conversation";
-  const title = inConv ? conversationTitle(route.id) : route.view === "alerts" ? "Alerts" : "CM Board";
+  const inConv = route.view === "conversation" || route.view === "newdm";
+  const title = route.view === "newdm" ? personName(route.pid)
+    : inConv ? conversationTitle(route.id) : route.view === "alerts" ? "Alerts" : "CM Board";
   put(el, h("div", { class: "bar" },
     inConv || route.view === "alerts"
       ? h("button", { class: "ghost back", "aria-label": "Back", onclick: () => go({ view: "list" }) }, "‹")
@@ -406,7 +437,7 @@ function renderMain() {
   const listPane = h("section", { class: `list-pane pane${view === "list" ? "" : " hidden-narrow"}`, id: "list" });
   put(main, listPane);
   renderList();
-  if (view === "conversation") {
+  if (view === "conversation" || view === "newdm") {
     main.append(h("section", { class: "pane conv", id: "conv" }));
     renderConversation();
   } else if (view === "alerts") {
@@ -425,7 +456,7 @@ function renderList() {
     type: "search", placeholder: "Filter conversations", value: state.query, "aria-label": "Filter",
     // Only the rows re-render, so the input keeps focus while typing.
     oninput: (e) => { state.query = e.target.value; renderListRows(); },
-  }));
+  }), h("button", { class: "new-dm", "aria-label": "New DM", onclick: newDmSheet }, "New DM"));
   put(el, search, h("div", { class: "scroll", id: "list-rows" }));
   renderListRows();
 }
@@ -498,10 +529,11 @@ function renderConversation(keepScroll = false) {
   if (!el || !c) return;
   const prev = el.querySelector(".scroll");
   const prevTop = prev?.scrollTop;
-  const counts = convCounts(c.id);
-  const tools = h("div", { class: "bar", style: "position:static" },
+  const counts = c.id ? convCounts(c.id) : {};
+  const tools = !c.id ? h("div", { class: "bar toolbar" },
+    h("span", { class: "sub" }, `New conversation with ${personName(c.dmTo)}: your first message starts it`)) : h("div", { class: "bar toolbar" },
     h("span", { class: "sub" }, c.items.length ? `${c.items.length} loaded` : ""),
-    h("span", { style: "flex:1" }),
+    h("span", { class: "spacer" }),
     counts.mentions
       ? h("button", { onclick: () => markRead({ conversation: c.id, mentions: true }, "Mentions cleared") }, `Clear @${counts.mentions}`)
       : null,
@@ -540,9 +572,9 @@ function onConversationScroll(e) {
 function startReply(m) {
   if (!state.conv) return;
   state.conv.replyTo = m;
-  const draft = loadDraft(state.conv.id);
+  const draft = loadDraft(draftId(state.conv));
   draft.reply_to = m.id;
-  saveDraft(state.conv.id, draft);
+  saveDraft(draftId(state.conv), draft);
   renderComposer();
   document.querySelector(".composer textarea")?.focus();
 }
@@ -551,14 +583,14 @@ function renderComposer() {
   const el = document.getElementById("composer");
   const c = state.conv;
   if (!el || !c) return;
-  const draft = loadDraft(c.id);
+  const draft = loadDraft(draftId(c));
   const replyTo = c.replyTo || (draft.reply_to ? c.items.find((m) => m.id === draft.reply_to) : null);
   const box = h("textarea", {
-    rows: 1, placeholder: `Message ${conversationTitle(c.id)}`, "aria-label": "Message",
+    rows: 1, placeholder: `Message ${c.id ? conversationTitle(c.id) : personName(c.dmTo)}`, "aria-label": "Message",
     oninput: (e) => {
-      const d = loadDraft(c.id);
+      const d = loadDraft(draftId(c));
       d.body = e.target.value;
-      saveDraft(c.id, d);
+      saveDraft(draftId(c), d);
       autosize(e.target);
     },
     onkeydown: (e) => {
@@ -574,9 +606,9 @@ function renderComposer() {
       `Replying to ${replyTo ? `${replyTo.actor?.name}: ${truncate(replyTo.body, 60)}` : "a message"}`,
       h("button", { class: "ghost", "aria-label": "Cancel reply", onclick: () => {
         c.replyTo = null;
-        const d = loadDraft(c.id);
+        const d = loadDraft(draftId(c));
         d.reply_to = null;
-        saveDraft(c.id, d);
+        saveDraft(draftId(c), d);
         renderComposer();
       } }, "✕")) : null,
     h("div", { class: "composer" }, box,
@@ -597,11 +629,24 @@ function renderThread() {
   openSheet(`Thread`, [
     messageEl(t.root, { inThread: true }),
     ...t.items.filter((m) => m.id !== t.root.id).map((m) => messageEl(m, { inThread: true })),
-    h("button", { class: "primary", style: "width:100%;margin-top:8px", onclick: () => {
+    h("button", { class: "primary wide gap-top", onclick: () => {
       closeSheet();
       startReply(t.root);
     } }, "Reply in thread"),
   ], () => { if (state.conv) state.conv.thread = null; });
+}
+
+/** The alerting agent's name: a link to Owner's DM with it (an empty DM
+ *  composer when there is none yet), or plain text when it has no messaging
+ *  identity to write to. */
+function alertNameEl(row) {
+  const pid = alertParticipant(row.alerts[0], state.alertHosts);
+  if (!hasIdentity(pid, state.people, state.knownNames, state.dms)) {
+    return h("strong", {}, row.label);
+  }
+  const dm = directDm(pid, state.dms);
+  const href = routeHash(dm ? { view: "conversation", id: dm.id } : { view: "newdm", pid });
+  return h("a", { class: "who-link", href, title: dm ? "Open your DM" : "Start a DM" }, h("strong", {}, row.label));
 }
 
 function renderAlerts() {
@@ -611,16 +656,27 @@ function renderAlerts() {
   const rows = groupAlerts(state.alerts);
   const seen = (row) => async (e) => {
     e.target.disabled = true;
-    try {
-      for (const a of row.alerts) await api.alertSeen(a.key, a.id);
-      state.alerts = state.alerts.filter((a) => !row.alerts.includes(a));
+    // Hide by id first: a background refresh may replace state.alerts (new
+    // objects, possibly fetched before the acknowledgement committed).
+    const ids = row.alerts.map((a) => a.id);
+    const now = Date.now();
+    for (const id of ids) state.seenAlerts.set(id, now);
+    const redraw = () => {
+      state.alerts = state.alerts.filter((a) => !state.seenAlerts.has(a.id));
       renderAlerts();
       renderHeader();
       renderListRows();
+    };
+    redraw();
+    try {
+      for (const a of row.alerts) await api.alertSeen(a.key, a.id);
     } catch (err) {
-      e.target.disabled = false;
+      // Not acknowledged: show the row again.
+      for (const id of ids) state.seenAlerts.delete(id);
       fail(err);
+      await loadAlerts();
     }
+    redraw();
   };
   put(el, h("div", { class: "scroll" },
     // v1 lists the hub host's alerts only; cm-sessions alerts arrive with the
@@ -631,9 +687,9 @@ function renderAlerts() {
       class: "alert", id: `alert-row-${row.key}`, "data-alerts": row.alerts.map((a) => a.id).join(" "),
     },
     h("div", { class: "meta" },
-      h("strong", {}, row.label),
+      alertNameEl(row),
       row.host ? h("span", { class: "sub" }, ` · ${row.host}`) : null,
-      h("span", { style: "flex:1" }),
+      h("span", { class: "spacer" }),
       row.count > 1 ? h("span", { class: "badge at" }, row.count) : null,
       h("span", { class: "when" }, ` ${age(row.since)}`)),
     h("div", { class: "body" }, row.reason),
@@ -645,10 +701,17 @@ function renderAlerts() {
   }
 }
 
+/** A bottom sheet. It closes from its Close button, Escape or a tap on the
+ *  backdrop, which stays visible: the sheet is height-capped and its body
+ *  scrolls under a fixed header. */
 function openSheet(title, children, onClose) {
   closeSheet();
   const back = h("div", { class: "sheet-back", onclick: (e) => { if (e.target === back) closeSheet(); } },
-    h("div", { class: "sheet", role: "dialog", "aria-label": title }, h("h2", {}, title), ...children));
+    h("div", { class: "sheet", role: "dialog", "aria-label": title },
+      h("div", { class: "sheet-head" },
+        h("h2", {}, title),
+        h("button", { class: "ghost close", "aria-label": "Close", onclick: closeSheet }, "Close")),
+      h("div", { class: "sheet-body" }, ...children)));
   back.onCloseSheet = onClose;
   document.body.append(back);
 }
@@ -660,18 +723,56 @@ function closeSheet() {
   back.onCloseSheet?.();
 }
 
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && document.querySelector(".sheet-back")) {
+    e.preventDefault();
+    closeSheet();
+  }
+});
+
+/** Start a DM with anyone in the directory: their existing DM opens, else
+ *  an empty composer that creates it on the first message. */
+function newDmSheet() {
+  const rows = h("div", { class: "people" });
+  const fill = (query) => {
+    const people = dmCandidates(state.people, query, state.engines);
+    put(rows, ...people.map((p) => h("button", { class: "opt", onclick: () => startDm(p.id) },
+      h("span", {}, p.name),
+      directDm(p.id, state.dms) ? h("span", { class: "sub" }, "open DM") : null)),
+    people.length ? null : h("div", { class: "empty" }, state.people.size ? "No match" : "Loading…"));
+  };
+  const input = h("input", {
+    type: "search", placeholder: "Search people", "aria-label": "Search people",
+    oninput: (e) => fill(e.target.value),
+    onkeydown: (e) => {
+      if (e.key !== "Enter") return;
+      const [first] = dmCandidates(state.people, e.target.value, state.engines);
+      if (first) startDm(first.id);
+    },
+  });
+  fill("");
+  openSheet("New DM", [h("div", { class: "search" }, input), rows]);
+  input.focus();
+}
+
+function startDm(pid) {
+  closeSheet();
+  const dm = directDm(pid, state.dms);
+  go(dm ? { view: "conversation", id: dm.id } : { view: "newdm", pid });
+}
+
 function availabilitySheet() {
   const current = state.availability?.level || "unset";
   const what = {
-    away: "Emergencies only",
-    around: "Decisions and above",
-    focused: "Everything",
-    "on-call": "Everything",
+    away: "Not available",
+    around: "Intermittently available",
+    focused: "Concentrating on work",
+    "on-call": "Available for requests",
   };
   openSheet("Availability", [
     ...LEVELS.map((l) => h("button", { class: `opt${l === current ? " on" : ""}`, onclick: () => setLevel(l) },
       h("span", {}, l), h("span", { class: "sub" }, what[l]))),
-    h("p", {}, "Push notifications follow this level, as on the desktop (F7)."),
+    h("p", {}, "Availability is shared with agents. Notifications arrive at every level."),
   ]);
 }
 
@@ -696,7 +797,7 @@ async function settingsSheet() {
   };
   const children = [h("p", {}, lines[status])];
   if (status === "off") {
-    const b = h("button", { class: "primary", style: "width:100%" }, "Enable notifications");
+    const b = h("button", { class: "primary wide" }, "Enable notifications");
     b.onclick = busy(b, async () => {
       await push.enable();
       toast("Notifications enabled");
@@ -705,14 +806,14 @@ async function settingsSheet() {
     children.push(b);
   }
   if (status === "on") {
-    const test = h("button", { style: "width:100%;margin-bottom:8px" }, "Send test notification");
+    const test = h("button", { class: "wide gap-bottom" }, "Send test notification");
     test.onclick = busy(test, async () => {
       const reg = await navigator.serviceWorker.ready;
       const sub = await reg.pushManager.getSubscription();
       await api.pushTest(sub?.endpoint);
       toast("Test sent — it should arrive in a few seconds");
     });
-    const off = h("button", { style: "width:100%" }, "Turn off on this device");
+    const off = h("button", { class: "wide" }, "Turn off on this device");
     off.onclick = busy(off, async () => {
       await push.disable();
       toast("Notifications off");
@@ -743,6 +844,16 @@ function onRoute() {
   if (route.view === "conversation" && (prev.view !== "conversation" || prev.id !== route.id || route.message || !state.conv)) {
     openConversation(route.id, route.message);
   } else if (route.view === "conversation") {
+    renderConversation();
+  } else if (route.view === "newdm") {
+    // Owner's DM with the agent: open it when it exists, else an empty
+    // composer; nothing is created until the first send.
+    const existing = directDm(route.pid, state.dms);
+    if (existing) {
+      go({ view: "conversation", id: existing.id });
+      return;
+    }
+    state.conv = { id: null, dmTo: route.pid, items: [], next: null, loadingOlder: false, replyTo: null, thread: null, atBottom: true };
     renderConversation();
   } else {
     state.conv = null;

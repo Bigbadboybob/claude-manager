@@ -101,6 +101,7 @@ export function parseRoute(hash) {
   if (params.get("conversation")) {
     return { view: "conversation", id: params.get("conversation"), message: params.get("message") || null };
   }
+  if (params.get("dm")) return { view: "newdm", pid: params.get("dm") };
   if (params.has("alerts")) return { view: "alerts", alert: params.get("alert") || null };
   if (params.has("settings")) return { view: "settings" };
   return { view: "list" };
@@ -112,6 +113,7 @@ export function routeHash(route) {
     if (route.message) p.set("message", route.message);
     return `#${p.toString()}`;
   }
+  if (route.view === "newdm") return `#${new URLSearchParams({ dm: route.pid }).toString()}`;
   if (route.view === "alerts") return route.alert ? `#alerts&alert=${encodeURIComponent(route.alert)}` : "#alerts";
   if (route.view === "settings") return "#settings";
   return "#";
@@ -132,10 +134,13 @@ export function age(iso, now = new Date()) {
  *  {key, label, host, reason (first line of the newest), since (oldest),
  *  count, alerts}. */
 export function groupAlerts(alerts) {
-  const when = (a) => a.held_since || a.released_at || a.created_at || "";
+  // Original creation time when the relay supplies it (B5b), else the
+  // held/released stamps of older daemons.
+  const when = (a) => a.created_at || a.held_since || a.released_at || "";
   const rows = new Map();
   for (const a of alerts || []) {
-    const key = `${a.host || ""}|${a.session_uid || a.label || a.id}`;
+    // origin_host is the relay's stable host id; display names can collide.
+    const key = `${a.origin_host || a.host || ""}|${a.session_uid || a.label || a.id}`;
     const row = rows.get(key) || { key, label: a.label || a.session_uid || "agent", host: a.host || null, alerts: [] };
     row.alerts.push(a);
     rows.set(key, row);
@@ -150,4 +155,74 @@ export function groupAlerts(alerts) {
       reason: String(newest.message || "").split("\n")[0],
     };
   }).sort((x, y) => x.since.localeCompare(y.since));
+}
+
+/** Alerts minus those acknowledged locally (`seen`: id -> ms). An entry is
+ *  forgotten once the server stops listing that alert, or after `ttlMs` in
+ *  case it never does; until then a refresh that raced the acknowledgement
+ *  cannot bring the row back. Mutates `seen` (pruning). */
+export function withoutSeenAlerts(items, seen, nowMs, ttlMs = 120_000) {
+  const listed = new Set((items || []).map((a) => a.id));
+  for (const [id, at] of seen) {
+    if (!listed.has(id) || nowMs - at > ttlMs) seen.delete(id);
+  }
+  return (items || []).filter((a) => !seen.has(a.id));
+}
+
+/** Remember display names seen in DM rows (`member_names`, the last
+ *  message's actor) and in loaded messages, so departed agents (absent from
+ *  the people directory) keep their names. Mutates and returns `known`. */
+export function learnNames(known, { dms = [], messages = [] } = {}) {
+  for (const d of dms) {
+    for (const [id, name] of Object.entries(d.member_names || {})) if (name) known.set(id, name);
+    const a = d.last?.actor;
+    if (a?.id && a.name) known.set(a.id, a.name);
+  }
+  for (const m of messages) {
+    if (m.actor?.id && m.actor.name) known.set(m.actor.id, m.actor.name);
+  }
+  return known;
+}
+
+/** Display name: Owner, the people directory, names seen elsewhere, and
+ *  only then the bare id's last segment. */
+export function nameFor(id, people, known) {
+  if (id === "owner") return "Owner";
+  return people?.get(id) || known?.get(id) || String(id).split(":").pop();
+}
+
+/** The messaging participant behind an alert: `agent:<host daemon>:<uid>`,
+ *  using the alert's own origin host (relayed alerts come from other
+ *  daemons), else the local host for older alerts. Null when unknown. */
+export function alertParticipant(alert, alertHosts) {
+  const host = alert?.origin_host || (alertHosts || []).find((h) => h.local)?.id;
+  return host && alert?.session_uid ? `agent:${host}:${alert.session_uid}` : null;
+}
+
+/** Owner's one-to-one DM with `pid`, if it exists. */
+export function directDm(pid, dms) {
+  return (dms || []).find((d) => {
+    const m = d.members || [];
+    return m.length === 2 && m.includes("owner") && m.includes(pid);
+  }) || null;
+}
+
+/** Whether `pid` has a messaging identity this client knows of: present in
+ *  the people directory, named elsewhere, or a member of some DM. */
+export function hasIdentity(pid, people, known, dms) {
+  return !!pid && (people?.has(pid) || known?.has(pid) || (dms || []).some((d) => (d.members || []).includes(pid)));
+}
+
+/** People Owner can start a DM with, matching `query` on name or id
+ *  (case-insensitive): name-prefix matches first, then by name. Bash
+ *  sessions are left out: no agent reads their messages. `engines` maps id
+ *  to the directory's `engine`; an unknown engine (older peer) is kept. */
+export function dmCandidates(people, query, engines = new Map()) {
+  const q = String(query || "").trim().toLowerCase();
+  const rows = [...(people || new Map())]
+    .filter(([id]) => id !== "owner" && engines?.get(id) !== "bash")
+    .map(([id, name]) => ({ id, name: name || String(id).split(":").pop() }))
+    .filter((p) => !q || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q));
+  const rank = (p) => (q && p.name.toLowerCase().startsWith(q) ? 0 : 1);
+  return rows.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
 }

@@ -135,6 +135,40 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.client.aclose)
         self.headers = {"Cf-Access-Jwt-Assertion": "signed-owner", "X-CM-Board": "1"}
 
+    async def test_cross_host_alert_metadata_bootstrap_and_opaque_seen_key(self):
+        from unittest.mock import AsyncMock
+        hosts = [{"id": "manager-uuid", "label": "cm-manager"},
+                 {"id": "sessions-uuid", "label": "cm-sessions"}]
+        key = "cm-alert-v1:" + "a" * 1500
+        row = {"key": key, "origin_key": "source-key", "origin_host": "sessions-uuid",
+               "host": "cm-sessions", "id": "alert-id", "created_at": "2026-10-12T23:00:00Z"}
+        async def call(method, params):
+            if method == "messaging.availability": return {"owner_availability": {"level": "focused"}}
+            if method == "owner_attention.list": return {"items": [row], "alert_hosts": hosts}
+            self.assertEqual(method, "owner_attention.ack")
+            self.assertEqual(params, {"session_uid": key, "alert_id": "alert-id"})
+            return {"ok": True, "acknowledged": True, "pending_origin": True}
+        self.daemon.call = AsyncMock(side_effect=call)
+        boot = await self.client.get("/api/bootstrap", headers=self.headers)
+        self.assertEqual(boot.json()["features"]["alert_hosts"], hosts)
+        listed = await self.client.get("/api/alerts", headers=self.headers)
+        self.assertEqual(listed.json()["items"], [row])
+        seen = await self.client.post("/api/alerts/seen", headers=self.headers,
+                                      json={"key": key, "alert_id": "alert-id"})
+        self.assertEqual(seen.status_code, 200)
+        self.assertTrue(seen.json()["pending_origin"])
+
+    async def test_bootstrap_survives_alert_metadata_failure(self):
+        from unittest.mock import AsyncMock
+        async def call(method, params):
+            if method == "owner_attention.list": raise DaemonError("alert_storage", "Unavailable")
+            return {"owner_availability": {"level": "focused"}}
+        self.daemon.call = AsyncMock(side_effect=call)
+        response = await self.client.get("/api/bootstrap", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["features"]["alert_hosts"], [])
+        self.assertEqual(response.json()["owner_availability"]["level"], "focused")
+
     async def test_everything_except_health_requires_access(self):
         self.assertEqual((await self.client.get("/healthz")).status_code, 200)
         for path in ["/", "/sw.js", "/manifest.webmanifest", "/api/counts", "/api/push/vapid-public-key"]:
@@ -220,7 +254,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", response.text)
 
     async def test_directory_gets_map_to_fixed_owner_methods(self):
-        for path, method in [("bootstrap", "messaging.availability"), ("channels", "messaging.channels"),
+        for path, method in [("bootstrap", "owner_attention.list"), ("channels", "messaging.channels"),
                              ("dms", "messaging.dms"), ("people", "messaging.people"),
                              ("counts", "messaging.counts"), ("alerts", "owner_attention.list"),
                              ("availability", "messaging.availability")]:

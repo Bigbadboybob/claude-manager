@@ -48,6 +48,8 @@ use events::*;
 mod lifecycle;
 mod plan_launch;
 mod remote_create;
+mod restart;
+mod background;
 mod fork;
 mod image_paste;
 use lifecycle::*;
@@ -66,7 +68,7 @@ mod board;
 mod owner_blocked;
 mod unread;
 
-pub(crate) use lifecycle::try_attach_via_daemon_with_deps;
+pub(crate) use lifecycle::{attach_via_daemon, try_attach_via_daemon_with_deps};
 
 pub(crate) use model::{
     new_workspace_id, parse_worktree_mode, PendingWrite, SessionStatus, TaskEntry, TaskStatus,
@@ -516,6 +518,14 @@ pub struct App {
     pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
     plan_launches: Vec<plan_launch::PlanLaunchFlight>,
     remote_creates: Vec<remote_create::RemoteCreateFlight>,
+    /// A-R restarts/revives whose daemon RPCs are in flight (`restart.rs`).
+    restarts: Vec<restart::RestartFlight>,
+    /// A-O remote restores in flight.
+    restores: Vec<restart::RestoreFlight>,
+    /// Remote A-s adds in flight.
+    remote_adds: Vec<restart::AddFlight>,
+    /// Keypress-triggered daemon RPCs in flight (`background.rs`).
+    background_jobs: Vec<background::BackgroundJob>,
     /// A-F forks in flight (the host provisions a worktree before replying).
     fork_flights: Vec<fork::ForkFlight>,
     image_pastes: Vec<image_paste::ImagePasteFlight>,
@@ -537,8 +547,8 @@ pub struct App {
     /// that diff is applied, the slot already holds the revived
     /// incarnation, so the normal exit handling (stamping
     /// `preserved_last_exit`, pruning agent-spawned rows) would act on
-    /// the wrong session. Inserted by `kill_live_session_for_restart`
-    /// once the reap is confirmed; consumed one-shot in
+    /// the wrong session. Inserted by `start_restart` before the kill is
+    /// sent (removed again if the kill fails); consumed one-shot in
     /// `apply_manifest_diff_from_host`.
     pub(crate) restart_suppressed_exit_uids: std::collections::HashSet<String>,
     /// Sessions whose last A-R failed, with the error: the row stays (no
@@ -547,6 +557,12 @@ pub struct App {
     /// Last `session.viewed` report: which session, and when. See
     /// `report_viewed_session`.
     pub(crate) viewed_report: Option<(String, std::time::Instant)>,
+    /// `session.viewed` reports waiting per host. A host present here has a
+    /// sender thread running, which sends the latest uid (if any) and exits
+    /// when none is left, so quick selection changes cost one RPC at a time.
+    viewed_pending: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<cm_daemon::host_id::HostId, Option<String>>>,
+    >,
     /// 12a (Phase 3): parsed `~/.cm/hosts.toml`. Synthesized
     /// local-default when the file is missing (A1 in the Phase 3
     /// plan). No consumer yet — 12b adds the field to manifest
@@ -662,6 +678,15 @@ pub struct App {
     /// Transient + in-memory only. Cleared when the session is re-queued (and
     /// re-inserted on the next successful attach).
     attached_tunnel_generation: std::collections::HashMap<String, u64>,
+    /// Per-uid reconnect backoff (`remote::ReattachBackoff`).
+    reattach_backoff: std::collections::HashMap<String, remote::ReattachBackoff>,
+    /// Scrollback loads Owner asked for by scrolling up in a screen-first
+    /// pane (`load_deferred_history`); that pane's next attach replays the
+    /// whole ring.
+    pub(crate) history_fetches: std::collections::HashMap<String, remote::HistoryFetch>,
+    /// Panes whose scrollback just loaded: scroll them up a page once the
+    /// replay has been read, so the gesture that asked for it takes effect.
+    scroll_after_load: std::collections::HashMap<String, Instant>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -1010,6 +1035,7 @@ impl App {
             restart_suppressed_exit_uids: std::collections::HashSet::new(),
             revive_failed: HashMap::new(),
             viewed_report: None,
+            viewed_pending: Default::default(),
             hosts,
             host_pool,
             skipped_manifest_entries: HashMap::new(),
@@ -1018,6 +1044,10 @@ impl App {
             attaching: HashMap::new(),
             plan_launches: Vec::new(),
             remote_creates: Vec::new(),
+            restarts: Vec::new(),
+            restores: Vec::new(),
+            remote_adds: Vec::new(),
+            background_jobs: Vec::new(),
             fork_flights: Vec::new(),
             image_pastes: Vec::new(),
             push_worker,
@@ -1034,6 +1064,9 @@ impl App {
             last_idle_bucket_check: None,
             reconnecting_sessions: std::collections::HashSet::new(),
             attached_tunnel_generation: std::collections::HashMap::new(),
+            reattach_backoff: std::collections::HashMap::new(),
+            history_fetches: std::collections::HashMap::new(),
+            scroll_after_load: std::collections::HashMap::new(),
         }
     }
 

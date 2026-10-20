@@ -37,7 +37,7 @@ pub(super) struct ReadState {
 #[derive(Default)]
 pub(super) struct ConversationIndex {
     pub messages: Vec<(ReadCursor, usize)>,
-    pub arrivals: Vec<u64>,
+    pub arrivals: Vec<(u64, usize)>,
     pub timeline: Vec<(ReadCursor, usize)>,
     pub authors: BTreeMap<String, Vec<ReadCursor>>,
     pub mentions: BTreeMap<String, Vec<ReadCursor>>,
@@ -98,7 +98,7 @@ impl Store {
                 .entry(cid.clone())
                 .or_default();
             insert(&mut conv.messages, (key.clone(), index));
-            conv.arrivals.push(e.position);
+            conv.arrivals.push((e.position, index));
             insert(
                 conv.authors
                     .entry(strv(&e.event["actor"], "id").into())

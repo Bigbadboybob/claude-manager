@@ -41,10 +41,24 @@ class Board:
         self.lock = threading.Lock()
         self.seq = itertools.count(1)
         self.people = [
-            {"id": "owner", "name": "Owner"},
-            {"id": "agent:scout", "name": "Scout"},
-            {"id": "agent:swarm-coord", "name": "Swarm-Coord"},
-            {"id": "agent:state-core", "name": "state-core"},
+            {"id": "owner", "name": "Owner", "kind": "owner"},
+            {"id": "agent:hub:scout", "name": "Scout", "engine": "codex"},
+            {"id": "agent:swarm-coord", "name": "Swarm-Coord", "engine": "claude-code"},
+            {"id": "agent:state-core", "name": "state-core", "engine": "claude-code"},
+            # A cm-sessions agent with no DM yet (its alert links to a new DM).
+            {"id": "agent:sessions-uuid:ts-perf", "name": "Native-Rollout-Perf", "engine": "codex"},
+            # A bash session: in the directory, but no agent reads its DMs.
+            {"id": "agent:hub:ts-shell", "name": "bash", "engine": "bash"},
+            # From a peer that predates `engine`.
+            {"id": "agent:old-peer:ts-legacy", "name": "Legacy-Worker"},
+        ] + [
+            # Enough people that the New DM list outgrows a phone screen.
+            {"id": f"agent:hub:ts-worker-{n:02}", "name": f"Worker-{n:02}", "engine": "codex"}
+            for n in range(1, 21)
+        ]
+        self.alert_hosts = [
+            {"id": "hub", "label": "cm-manager", "local": True, "connected": True},
+            {"id": "sessions-uuid", "label": "cm-sessions", "local": False, "connected": True},
         ]
         self.names = {p["id"]: p["name"] for p in self.people}
         self.channels = [
@@ -53,36 +67,48 @@ class Board:
              "name": "Swarm Focused Design · claude-manager", "joined": True},
             {"id": "c-gpu", "path": "gpu-utilization", "name": "gpu-utilization", "joined": True},
         ]
-        self.dms = [{"id": "d-scout", "members": ["owner", "agent:scout"]}]
+        self.dms = [
+            {"id": "d-scout", "members": ["owner", "agent:hub:scout"]},
+            # A departed agent: not in self.people, named only by member_names.
+            {"id": "d-sejd", "members": ["owner", "agent:ts-18d28e6057a24116-5"],
+             "member_names": {"owner": "Owner", "agent:ts-18d28e6057a24116-5": "SEJD Coordinator"}},
+        ]
         self.messages: dict[str, list[dict]] = {c["id"]: [] for c in self.channels}
         self.messages["d-scout"] = []
+        self.messages["d-sejd"] = []
         self.read_through: dict[str, int] = {}
         self.requests: dict[str, dict] = {}
         self.subscriptions: dict[str, dict] = {}
         self.availability = {"level": "focused", "set": True, "changed_at": iso(now()), "age_s": 0}
         self.alerts = [{
-            "key": "q-1", "id": "alert-1", "session_uid": "ts-scout", "label": "Scout",
+            "key": "q-1", "id": "alert-1", "origin_host": "hub", "host": "cm-manager",
+            "session_uid": "scout", "label": "Scout",
             "message": "Need a decision: deploy R1.1 tonight or tomorrow?", "task_id": None,
             "continuous_task_id": None, "urgency": "decision", "released_at": iso(now()),
         }, {
             "key": "q-2", "id": "alert-2", "session_uid": "ts-perf", "label": "Native-Rollout-Perf",
-            "host": "sessions", "message": "Bench finished: 18% faster. Merge?\nDetails in #gpu-utilization.",
+            "origin_host": "sessions-uuid", "host": "cm-sessions", "message": "Bench finished: 18% faster. Merge?\nDetails in #gpu-utilization.",
             "task_id": "fb838659", "continuous_task_id": None, "urgency": "decision",
             "released_at": iso(now() - timedelta(hours=3)),
         }, {
             "key": "q-2", "id": "alert-3", "session_uid": "ts-perf", "label": "Native-Rollout-Perf",
-            "host": "sessions", "message": "Still waiting on the merge decision.", "task_id": "fb838659",
+            "origin_host": "sessions-uuid", "host": "cm-sessions", "message": "Still waiting on the merge decision.", "task_id": "fb838659",
             "continuous_task_id": None, "urgency": "decision", "released_at": iso(now() - timedelta(minutes=20)),
+        }, {
+            # An agent with no messaging identity: its name is plain text.
+            "key": "q-3", "id": "alert-4", "origin_host": "sessions-uuid", "host": "cm-sessions",
+            "session_uid": "ts-ghost", "label": "Ghost-Worker", "message": "Never joined messaging.",
+            "task_id": None, "continuous_task_id": None, "urgency": "fyi", "created_at": iso(now() - timedelta(minutes=5)),
         }]
         start = now() - timedelta(hours=30)
         for i in range(160):
-            self._post("c-swarm", ["agent:swarm-coord", "agent:state-core", "agent:scout"][i % 3],
+            self._post("c-swarm", ["agent:swarm-coord", "agent:state-core", "agent:hub:scout"][i % 3],
                        f"Status update {i}: slice progress, tests green. See `web/API.md`."
                        + (" Long detail. " * (i % 4)), start + timedelta(minutes=10 * i),
                        mention=(i in (150, 157)))
-        self._post("c-general", "agent:scout", "Morning all.", now() - timedelta(hours=2))
-        self._post("c-gpu", "agent:scout", "GPU utilisation 92% on the RL box.", now() - timedelta(minutes=50))
-        self._post("d-scout", "agent:scout", "Can you look at the bench results? https://example.com/bench",
+        self._post("c-general", "agent:hub:scout", "Morning all.", now() - timedelta(hours=2))
+        self._post("c-gpu", "agent:hub:scout", "GPU utilisation 92% on the RL box.", now() - timedelta(minutes=50))
+        self._post("d-scout", "agent:hub:scout", "Can you look at the bench results? https://example.com/bench",
                    now() - timedelta(minutes=5))
         # Owner has read everything except the newest few.
         for cid, items in self.messages.items():
@@ -126,7 +152,7 @@ class Board:
                 mentions += len(ment)
         return {"conversations": conversations, "unread": dms + mentions, "dms": dms, "mentions": mentions}
 
-    def target(self, p: dict) -> str:
+    def target(self, p: dict, create: bool = False) -> str:
         if p.get("conversation") in self.messages:
             return p["conversation"]
         for c in self.channels:
@@ -135,6 +161,13 @@ class Board:
         for d in self.dms:
             if p.get("dm") in d["members"]:
                 return d["id"]
+        if p.get("dm") and create:
+            # The first message to a participant creates the DM.
+            cid = f"d-{next(self.seq)}"
+            self.dms.append({"id": cid, "members": ["owner", p["dm"]],
+                             "member_names": {"owner": "Owner", p["dm"]: self.names.get(p["dm"], p["dm"])}})
+            self.messages[cid] = []
+            return cid
         raise ApiError(422, "invalid_target", "Choose one conversation, channel or dm")
 
     def read(self, p: dict) -> dict:
@@ -172,7 +205,7 @@ class Board:
         body = p.get("body") or ""
         if not 1 <= len(body) <= 3000:
             raise ApiError(422, "message_too_long", "Body must be 1–3000 characters")
-        cid = self.target(p)
+        cid = self.target(p, create=True)
         msg = self._post(cid, "owner", body, now(), reply_to=p.get("reply_to"))
         self.read_through[cid] = msg["_seq"]
         result = {"event": self._view(cid, msg), "event_id": msg["id"], "replication": "replicated"}
@@ -284,7 +317,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": True}
         if (method, path) == ("GET", "/api/bootstrap"):
             return {"actor": "owner", "user": {"email": "owner@example.com"},
-                    "features": {"alerts_seen": True, "push": True}, "owner_availability": b.availability}
+                    "features": {"alerts_seen": True, "push": True, "alert_hosts": b.alert_hosts},
+                    "owner_availability": b.availability}
         if (method, path) == ("GET", "/api/channels"):
             return {"items": [dict(c, **b.counts()["conversations"][c["id"]]) for c in b.channels], "next_cursor": None}
         if (method, path) == ("GET", "/api/dms"):
@@ -305,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
         if (method, path) == ("POST", "/api/react"):
             return b.react(self._body())
         if (method, path) == ("GET", "/api/alerts"):
-            return {"items": b.alerts, "seen_supported": True}
+            return {"items": b.alerts, "seen_supported": True, "alert_hosts": b.alert_hosts}
         if (method, path) == ("POST", "/api/alerts/seen"):
             p = self._body()
             before = len(b.alerts)
@@ -350,6 +384,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
+        # The strict policy the frontend is written for: no inline script or
+        # style attributes (CSSOM property writes are still allowed).
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+                         "connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; "
+                         "frame-ancestors 'none'")
         if target.name == "sw.js":
             self.send_header("Service-Worker-Allowed", "/")
         self.end_headers()

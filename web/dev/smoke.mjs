@@ -81,6 +81,82 @@ test("open alerts group one row per agent, oldest first", () => {
   assert.equal(f.age("2026-10-10T12:00:00Z", now), "2d");
 });
 
+test("relayed alerts group by origin host id, not the display name", () => {
+  const rows = f.groupAlerts([
+    { key: "k1", id: "a", origin_host: "uuid-1", host: "cm", session_uid: "s1", label: "W", message: "x", created_at: "2026-10-12T10:00:00Z" },
+    { key: "k2", id: "b", origin_host: "uuid-2", host: "cm", session_uid: "s1", label: "W", message: "y", created_at: "2026-10-12T09:00:00Z" },
+  ]);
+  assert.equal(rows.length, 2, "same display host and uid on two hosts are two agents");
+  assert.equal(rows[0].since, "2026-10-12T09:00:00Z", "created_at orders and ages");
+});
+
+test("an alert seen here stays hidden through a racing refresh, then is forgotten", () => {
+  const seen = new Map([["a1", 1000]]);
+  const stale = [{ id: "a1" }, { id: "a2" }];
+  assert.deepEqual(f.withoutSeenAlerts(stale, seen, 2000).map((a) => a.id), ["a2"], "refresh fetched before the ack");
+  assert.ok(seen.has("a1"));
+  assert.deepEqual(f.withoutSeenAlerts([{ id: "a2" }], seen, 3000).map((a) => a.id), ["a2"]);
+  assert.ok(!seen.has("a1"), "forgotten once the server drops it");
+  seen.set("a3", 0);
+  assert.deepEqual(f.withoutSeenAlerts([{ id: "a3" }], seen, 200_000).map((a) => a.id), ["a3"], "an ack that never landed reappears after the ttl");
+});
+
+test("departed agents keep their names (member_names, last actor, loaded messages)", () => {
+  const people = new Map([["agent:x:present", "Present"]]);
+  const known = f.learnNames(new Map(), {
+    dms: [
+      { id: "d1", members: ["owner", "agent:x:ts-1"], member_names: { "agent:x:ts-1": "SEJD Coordinator", owner: "Owner" } },
+      { id: "d2", members: ["owner", "agent:x:ts-2"], last: { actor: { id: "agent:x:ts-2", name: "Old Worker" } } },
+    ],
+    messages: [{ actor: { id: "agent:x:ts-3", name: "Scout" } }],
+  });
+  assert.equal(f.nameFor("agent:x:ts-1", people, known), "SEJD Coordinator");
+  assert.equal(f.nameFor("agent:x:ts-2", people, known), "Old Worker");
+  assert.equal(f.nameFor("agent:x:ts-3", people, known), "Scout");
+  assert.equal(f.nameFor("agent:x:present", people, known), "Present", "the directory still wins");
+  assert.equal(f.nameFor("agent:x:ts-9", people, known), "ts-9", "uid only as the last resort");
+  assert.equal(f.nameFor("owner", people, known), "Owner");
+});
+
+test("an alert's agent maps to its DM on its own host", () => {
+  const hosts = [{ id: "hub", local: true }, { id: "sessions-uuid", local: false }];
+  assert.equal(f.alertParticipant({ origin_host: "sessions-uuid", session_uid: "ts-perf" }, hosts), "agent:sessions-uuid:ts-perf",
+    "relayed alerts use their origin host, not the hub");
+  assert.equal(f.alertParticipant({ session_uid: "ts-old" }, hosts), "agent:hub:ts-old", "legacy: the local host");
+  assert.equal(f.alertParticipant({ session_uid: "x" }, []), null);
+  const dms = [
+    { id: "d1", members: ["owner", "agent:hub:a"] },
+    { id: "g1", members: ["owner", "agent:hub:a", "agent:hub:b"] },
+  ];
+  assert.equal(f.directDm("agent:hub:a", dms).id, "d1", "the one-to-one DM, not a group");
+  assert.equal(f.directDm("agent:hub:b", dms), null, "only a group: no direct DM yet");
+  assert.ok(f.hasIdentity("agent:hub:b", new Map(), new Map(), dms), "a group member has an identity");
+  assert.ok(f.hasIdentity("agent:x:p", new Map([["agent:x:p", "P"]]), new Map(), []));
+  assert.ok(!f.hasIdentity("agent:x:ghost", new Map(), new Map(), dms));
+  const r = f.parseRoute("#dm=agent%3Asessions-uuid%3Ats-perf");
+  assert.deepEqual(r, { view: "newdm", pid: "agent:sessions-uuid:ts-perf" });
+  assert.equal(f.routeHash(r), "#dm=agent%3Asessions-uuid%3Ats-perf");
+});
+
+test("New DM candidates: everyone but Owner, searchable by name or id, prefix first", () => {
+  const people = new Map([
+    ["owner", "Owner"],
+    ["agent:hub:scout", "Scout"],
+    ["agent:hub:coord", "Swarm-Coord"],
+    ["agent:sessions-uuid:ts-perf", "Native-Rollout-Perf"],
+    ["agent:hub:ts-noname", ""],
+  ]);
+  assert.deepEqual(f.dmCandidates(people, "").map((p) => p.name), ["Native-Rollout-Perf", "Scout", "Swarm-Coord", "ts-noname"]);
+  assert.deepEqual(f.dmCandidates(people, "s").map((p) => p.name), ["Scout", "Swarm-Coord", "Native-Rollout-Perf", "ts-noname"],
+    "name-prefix matches rank first");
+  assert.deepEqual(f.dmCandidates(people, "SESSIONS-uuid").map((p) => p.id), ["agent:sessions-uuid:ts-perf"], "ids match too");
+  assert.deepEqual(f.dmCandidates(people, "owner"), [], "Owner never DMs themselves");
+  assert.deepEqual(f.dmCandidates(null, "x"), []);
+  const engines = new Map([["agent:hub:scout", "codex"], ["agent:hub:coord", "claude-code"], ["agent:hub:ts-noname", "bash"]]);
+  assert.deepEqual(f.dmCandidates(people, "", engines).map((p) => p.name), ["Native-Rollout-Perf", "Scout", "Swarm-Coord"],
+    "bash sessions are left out; an unknown engine is kept");
+});
+
 // ---------- against the fake backend ----------
 async function withServer(fn) {
   const port = 18000 + Math.floor(Math.random() * 2000);
@@ -166,6 +242,29 @@ test("API flows the app uses: open, page back, send, react, clear mentions, avai
     assert.equal((await write(base, "POST", "/api/push/subscribe", sub)).json.subscribed, true);
     assert.equal((await write(base, "POST", "/api/push/test", { endpoint: sub.endpoint })).json.accepted, true);
     assert.equal((await write(base, "DELETE", "/api/push/subscribe", { endpoint: sub.endpoint })).json.removed, true);
+
+    // New DM picker: the directory lists everyone; a pick with a DM opens
+    // it, one without goes to the empty composer.
+    const directory = (await get("/api/people")).items;
+    const people = new Map(directory.map((p) => [p.id, p.name]));
+    const engines = new Map(directory.filter((p) => p.engine).map((p) => [p.id, p.engine]));
+    const choices = f.dmCandidates(people, "", engines);
+    assert.ok(choices.length >= 3 && !choices.some((p) => p.id === "owner"));
+    assert.ok(!choices.some((p) => p.id === "agent:hub:ts-shell"), "no bash sessions");
+    assert.ok(choices.some((p) => p.id === "agent:old-peer:ts-legacy"), "an older peer's agents stay");
+    const dmsNow = (await get("/api/dms")).items;
+    assert.equal(f.directDm(f.dmCandidates(people, "scout")[0].id, dmsNow).id, "d-scout");
+    assert.equal(f.directDm(f.dmCandidates(people, "rollout")[0].id, dmsNow), null);
+
+    // The first message to a participant without a DM creates it.
+    const pid = "agent:sessions-uuid:ts-perf";
+    const before = (await get("/api/dms")).items;
+    assert.ok(!before.some((d) => d.members.includes(pid)));
+    const opened = await write(base, "POST", "/api/send", { dm: pid, body: "about that bench", request_id: "dm-1" });
+    assert.equal(opened.status, 200);
+    const created = opened.json.event.conversation_id;
+    const afterDms = (await get("/api/dms")).items;
+    assert.ok(afterDms.some((d) => d.id === created && d.members.includes(pid)));
 
     // Alerts: seen removes only the matching alert.
     const alerts = await get("/api/alerts");

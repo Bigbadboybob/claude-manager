@@ -8,6 +8,7 @@ fn person(s: &Store, uid: &str) -> Person {
         task: None,
         present: true,
         kind: "agent".into(),
+        engine: None,
     }
 }
 fn update(

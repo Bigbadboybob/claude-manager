@@ -160,11 +160,21 @@ impl Store {
         if !self.visible(actor, cid) {
             return false;
         }
+        if !self.scope_matches_conversation(actor, scope, cid) {
+            return false;
+        }
+        if let Some(root) = &scope.thread {
+            if event["id"] != *root && event["data"]["thread_root"] != *root {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Caller has already established visibility for this conversation.
+    pub(super) fn scope_matches_conversation(&self, actor: &str, scope: &Scope, cid: &str) -> bool {
         if let Some(path) = &scope.channel {
-            let actual = self
-                .channels
-                .iter()
-                .find_map(|(p, id)| (id == cid).then_some(p));
+            let actual = self.channel_path_of(cid);
             if !actual.is_some_and(|actual| {
                 path == "*"
                     || actual == path
@@ -183,11 +193,6 @@ impl Store {
             if !self.conversations.get(cid).is_some_and(|members| {
                 members.len() == 2 && members.contains(peer) && members.iter().any(|m| m == actor)
             }) {
-                return false;
-            }
-        }
-        if let Some(root) = &scope.thread {
-            if event["id"] != *root && event["data"]["thread_root"] != *root {
                 return false;
             }
         }
@@ -263,14 +268,18 @@ impl Store {
         Ok(())
     }
 
-    fn monitor_summary(&self, actor: &str, m: &Monitor) -> Value {
+    fn monitor_unseen_count(&self, actor: &str, m: &Monitor) -> usize {
         // A hit the reader has already read (an inbox page acknowledged, or a
         // bulk mark_read_before) is not outstanding, even before the monitor's
         // own result receipt is acknowledged: the two ack systems used to be
         // independent, so reading never lowered this count.
-        let unseen = self.read_model.conversations.keys().filter(|cid|self.visible(actor,cid))
+        self.read_model.conversations.keys().filter(|cid|self.visible(actor,cid))
             .flat_map(|cid|self.message_candidates(actor,cid,None,false,true,false))
-            .filter(|e| e.position > m.acknowledged && e.position <= m.hit_high && self.monitor_matches(actor,m,e)).count();
+            .filter(|e| e.position > m.acknowledged && e.position <= m.hit_high && self.monitor_matches(actor,m,e)).count()
+    }
+
+    fn monitor_summary(&self, actor: &str, m: &Monitor) -> Value {
+        let unseen = self.monitor_unseen_count(actor, m);
         let delivery = actor
             .strip_prefix(&format!("agent:{}:", self.daemon_id))
             .map(|uid| super::super::delivery::monitor_status(&self.root, uid, &m.id))
@@ -568,13 +577,22 @@ impl Store {
     }
 
     pub fn monitor_status(&self, actor: &str) -> Value {
-        let state = self.personal_state(actor);
-        let summaries: Vec<_> = state
-            .monitors
-            .values()
-            .filter(|m| m.state != "dismissed")
-            .map(|m| self.monitor_summary(actor, m))
-            .collect();
+        let Some(state) = self.personal.get(actor) else {
+            return json!({"recently_expired":[],"active":0,"unacknowledged":0,"badges":0});
+        };
+        // Every chat response needs these counts, not the rich summaries'
+        // delivery receipts (which load the recipient's queue for each watch).
+        let mut active = 0;
+        let mut unacknowledged = 0u64;
+        let mut badges = 0u64;
+        for m in state.monitors.values().filter(|m| m.state != "dismissed") {
+            active += usize::from(m.state == "active");
+            let unseen = self.monitor_unseen_count(actor, m) as u64;
+            unacknowledged += unseen;
+            if m.notify != "none" {
+                badges += unseen;
+            }
+        }
         // Expiry is silent by design (no wake); surface recent expiries on
         // every messaging response so an agent can re-arm a lapsed watch.
         let horizon = Utc::now() - chrono::Duration::hours(24);
@@ -589,6 +607,6 @@ impl Store {
             .collect();
         expired.sort_by(|a, b| b.0.cmp(&a.0));
         let recently_expired: Vec<_> = expired.into_iter().take(5).map(|(_, v)| v).collect();
-        json!({"recently_expired":recently_expired,"active":summaries.iter().filter(|m|m["state"] == "active").count(),"unacknowledged":summaries.iter().filter_map(|m|m["unacknowledged"].as_u64()).sum::<u64>(),"badges":summaries.iter().filter(|m|m["notify"] != "none").filter_map(|m|m["unacknowledged"].as_u64()).sum::<u64>()})
+        json!({"recently_expired":recently_expired,"active":active,"unacknowledged":unacknowledged,"badges":badges})
     }
 }

@@ -307,3 +307,99 @@ This is a TUI-only change: no daemon or session restart is needed. The cloud
 controller currently has only a read-only laptop export, so preparing a release
 here does not install it on the laptop. Do not duplicate-launch the recovered
 `predictionTrading/openai-and-consistently-recency-filters` session.
+
+## Slow links: reconnect loop, compression, screen-first attach
+
+2026-10-13. On a bad link Owner's TUI was near-unusable and slow to start.
+Every attach replayed the session's whole 1 MiB output ring (1.4 MB as
+base64 frames) through the one SSH connection the host shares. Attaches that
+waited behind other panes' replays were abandoned and retried with another
+full replay: 32 attaches a minute, the same session 3–4 times.
+
+- **Reconnect loop** (merged d163de1).
+  - The attach handshake waits 30 s, up from 5 s.
+  - Reconnects back off per session: 2 s doubling to 60 s for failed attaches
+    and for streams that die within a minute of attaching. The focused pane
+    waits at most 10 s, and A-r / A-R retry at once.
+  - The daemon gives a slow viewer 120 s without progress, up from 10 s, and
+    a 4 MiB queue, up from 2 MiB.
+  - The SSH keepalive allows 30 s of silence.
+- **Compression** (merged ef94266). The tunnel runs with
+  `Compression=yes`. Replays compress about 5.7× (1.4 MB to about 220 KB
+  per pane, measured on 36 live sessions).
+- **Screen-first attach.** Remote panes attach with
+  `attach.direct {replay: "screen"}`.
+  - The daemon parses the ring into a throwaway terminal at the viewer's
+    size (`daemon/src/screen_replay.rs`, same alacritty parser as the TUI).
+    It sends only the visible screen with its colors, cursor, alt screen,
+    input modes and scroll region: a few KB instead of the ring. Live output
+    continues from the reply's `offset`.
+  - The pane then has no scrollback. The first scroll up (wheel, PageUp,
+    Shift+PageUp) loads that one pane's full ring. The pane keeps its live
+    stream meanwhile, without ⟳. The status line says "Loading
+    scrollback…" and then "Scrollback loaded", and the pane scrolls up a
+    page once the ring has been read.
+  - A failed load says "Scrollback load failed — retrying (n)". After three
+    attempts it gives up with "scroll up again or press A-r to retry".
+  - In an app that tracks the mouse, wheel events go to the app, so only
+    Shift+PageUp starts the load there. Wheel handling there is unchanged
+    from before screen-first.
+  - When kitty graphics passthrough is on and the ring holds image commands,
+    the daemon replays the full ring so the images come back.
+  - Local panes keep the full replay. An older daemon ignores the parameter
+    and replays the ring as before.
+
+- **Resume after a drop.**
+  - Every attach reply carries the stream's `offset` and `stream_id`, and
+    the TUI counts the live bytes each pane has consumed.
+  - On a reconnect the pane sends `since` and `stream_id`. If the ring
+    still holds that position in the same stream, the daemon replies
+    `replay: "resume"` with only the missing bytes. The new stream then
+    drives the pane's existing terminal, so screen and scrollback stay and
+    nothing is repainted.
+  - Another stream's id (a respawn or brain restart) or an evicted position
+    falls back to a screen-first attach.
+  - The terminal's event proxy is retargeted to the new session's channel.
+    The new event loop has its own proxy, so a late exit from the dead loop
+    cannot reach the pane.
+
+- **Smaller polls** (merged f6b5feb). The 5 s session poll asks
+  `list_sessions` only for the 13 fields it reads, and sends the previous
+  `etag`. On cm-sessions that brought it from 108 KB to 4.6 KB, and 80 B
+  when nothing changed. `session.viewed` keeps one report in flight per
+  host, sending only the latest.
+- **Raw output frames.** With `attach.direct {binary: true}` the daemon
+  sends output as a raw data frame (the usual length prefix, a `0x00` tag,
+  then the bytes) instead of base64 inside JSON. That cuts a third before
+  compression, and about 2.3× after zlib on the live rings. Input frames
+  stay JSON. An older daemon ignores the flag, and the TUI's reader takes
+  either kind.
+
+Five 300 KB panes over a modelled 120 KB/s link
+(`tui/src/app/remote/slow_link_tests.rs`):
+- A cold start sends 12 KB with screen-first attach. Full replays send
+  1.5 MB as raw frames, against 2.0 MB as base64.
+- After the link drops, all five resume with under 2 KB in total.
+
+### Diagnosing slow input and reconnects
+
+Added 2026-10-16, after keypresses took minutes to arrive and the log could
+not say when anything happened.
+
+- **Timestamps.** Every `daemon.log` line starts with an RFC3339 UTC
+  timestamp in milliseconds. A child process (`cm-daemon --log-pump <path>`)
+  stamps the brain's stdout/stderr, so the last lines of a crashing brain
+  are still written. If the pump cannot start or dies, the brain writes to
+  the file directly, unstamped.
+- **`slow input:`** An attach input frame took over 1 s to reach the PTY.
+  The line splits the time into the state-lock wait and the write itself.
+- **`brain stall:`** The brain's 250 ms health tick ran over 1 s late: the
+  whole process was not scheduled, or was blocked in the kernel (disk
+  pressure, swap).
+- **`slow attach render:`** A screen-first repaint took over 250 ms.
+  **`attach burst:`** is one line per burst of attaches (less than 5 s
+  apart). It gives the count, the replay kinds, the replay bytes, and the
+  render times.
+- **Disk.** When `/` or `/home` reaches 90%, Owner gets one Emergency alert
+  through Owner attention, which also sends `notify_command`. It re-arms
+  once usage drops below 85%. The level is checked every minute.

@@ -9,6 +9,7 @@ struct Network {
 fn state(root: &Path, uid: &str) -> Arc<Mutex<DaemonState>> {
     let mut state = DaemonState::default();
     state.messaging_root = root.into();
+    state.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
     state.tui_sessions.insert(
         uid.into(),
         serde_json::from_value(json!({"uid":uid,"label":"default"})).unwrap(),
@@ -989,7 +990,7 @@ fn messaging_sync_legacy_replica_keeps_single_cursor_protocol() {
     let next = loop {
         let frame = receive_frame(&mut socket);
         assert!(
-            !matches!(frame["kind"].as_str(), Some("backfill" | "backfills")),
+            !matches!(frame["kind"].as_str(), Some("backfill" | "backfills" | "owner_alert_seen")),
             "{frame}"
         );
         if frame["kind"] == "batch" && frame["revision"].as_u64().unwrap() > 1 {
@@ -1022,7 +1023,7 @@ fn messaging_sync_scoped_replica_falls_back_with_a_legacy_hub() {
     let (mut hub, _) = listener.accept().unwrap();
     hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let hello = receive_frame(&mut hub);
-    assert_eq!(hello["features"], json!([FEATURE]));
+    assert_eq!(hello["features"], json!([FEATURE, transport::FEATURE_ALERTS]));
     // A hub from before the feature answers with the old hello shape.
     send_frame(
         &mut hub,
@@ -1111,4 +1112,348 @@ fn messaging_sync_probe_large_channel_join_timing() {
         started.elapsed()
     );
     assert!(all_present(b, &ids));
+}
+
+#[test]
+fn messaging_sync_owner_alert_relay_offline_seen_restart_newer_id_and_scope() {
+    let n = Network::new();
+    let a = &n.clients[0];
+    let request = |method: &str, params: Value| Request {
+        id: "alerts".into(),
+        method: method.into(),
+        caller: Caller::operator("test"),
+        params,
+    };
+    let notify = |s: &Arc<Mutex<DaemonState>>, msg: &str| {
+        let req = Request {
+            id: "notify".into(),
+            method: "notify_user".into(),
+            caller: Caller::session("client-0"),
+            params: json!({"message":msg}),
+        };
+        let reply = crate::owner_attention::notify(&s.lock().unwrap(), &req);
+        assert!(reply.ok, "{reply:?}");
+        reply.result.unwrap()["alert_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let list = || {
+        crate::owner_alert_relay::list(&n.hub, &request("owner_attention.list", json!({})))
+            .result
+            .unwrap()
+    };
+    let aid = with_store(a, |s| s.daemon_id.clone());
+    let first = notify(a, "First review");
+    wait_for(|| {
+        list()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == first)
+    });
+    let page = list();
+    let row = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == first)
+        .unwrap();
+    assert_eq!(row["origin_host"], aid);
+    assert_eq!(row["origin_key"], "client-0");
+    assert!(row["created_at"].is_string());
+    assert_eq!(page["alert_hosts"].as_array().unwrap().len(), 3);
+    let key = row["key"].as_str().unwrap().to_owned();
+    let feed = { n.hub.lock().unwrap().owner_notifications.clone() };
+    feed.flush();
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let events = feed.next(&root, &json!({"wait_ms":0})).unwrap();
+    assert_eq!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["id"] == format!("cm-alert:{aid}:{first}"))
+            .count(),
+        1
+    );
+    let runtime = a.lock().unwrap().messaging_sync.take().unwrap();
+    runtime.stop();
+    let seen = crate::owner_alert_relay::acknowledge(
+        &n.hub,
+        &request(
+            "owner_attention.ack",
+            json!({"session_uid":key,"alert_id":first}),
+        ),
+    );
+    assert!(seen.ok);
+    assert_eq!(seen.result.unwrap()["pending_origin"], true);
+    assert!(list()["items"].as_array().unwrap().is_empty());
+    // Reload hub state exactly as a brain restart, retaining durable Seen.
+    n.hub.lock().unwrap().owner_alert_relay = Arc::new(crate::owner_alert_relay::Relay::default());
+    assert!(list()["items"].as_array().unwrap().is_empty());
+    let second = notify(a, "New review while source offline");
+    start(a);
+    wait_for(|| {
+        list()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == second)
+    });
+    assert_eq!(
+        crate::owner_attention::snapshot(&a.lock().unwrap()).unwrap()["client-0"].id,
+        second
+    );
+    let stale = crate::owner_alert_relay::acknowledge(
+        &n.hub,
+        &request(
+            "owner_attention.ack",
+            json!({"session_uid":key,"alert_id":first}),
+        ),
+    );
+    assert_eq!(stale.result.unwrap()["acknowledged"], false);
+    let seen = crate::owner_alert_relay::acknowledge(
+        &n.hub,
+        &request(
+            "owner_attention.ack",
+            json!({"session_uid":key,"alert_id":second}),
+        ),
+    );
+    assert!(seen.ok);
+    wait_for(|| {
+        crate::owner_attention::snapshot(&a.lock().unwrap())
+            .unwrap()
+            .is_empty()
+    });
+    wait_for(|| {
+        n.hub
+            .lock()
+            .unwrap()
+            .owner_alert_relay
+            .pending(&root, &aid)
+            .unwrap()
+            .is_empty()
+    });
+    // Away is informational: alerts immediately enter the cross-host relay.
+    let source_root = a.lock().unwrap().messaging_root.clone();
+    let projection = crate::owner_availability::projection_path(&source_root);
+    fs::create_dir_all(projection.parent().unwrap()).unwrap();
+    fs::write(
+        &projection,
+        json!({"level":"away","event_id":"hold-test","changed_at":"2026-10-12T23:00:00Z"})
+            .to_string(),
+    )
+    .unwrap();
+    let away = notify(a, "Review while away");
+    let source_runtime = { a.lock().unwrap().messaging_sync.clone().unwrap() };
+    assert_eq!(source_runtime.alert_snapshot().unwrap().alerts.len(), 1);
+    assert!(crate::owner_attention::held_snapshot(&a.lock().unwrap()).unwrap().is_empty());
+    let original = crate::owner_attention::snapshot(&a.lock().unwrap()).unwrap()["client-0"].created_at.clone();
+    wait_for(|| {
+        list()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == away)
+    });
+    assert_eq!(
+        crate::owner_attention::snapshot(&a.lock().unwrap()).unwrap()["client-0"].created_at,
+        original
+    );
+    crate::owner_attention::withdraw(&a.lock().unwrap(), "client-0", &away).unwrap();
+    wait_for(|| list()["items"].as_array().unwrap().is_empty());
+    let third = notify(a, "Check enrollment scope");
+    wait_for(|| {
+        list()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == third)
+    });
+    with_store(&n.hub, |s| {
+        s.register_host(&aid, false, false, &[]).unwrap()
+    });
+    assert!(list()["items"].as_array().unwrap().is_empty());
+    let denied = crate::owner_alert_relay::acknowledge(
+        &n.hub,
+        &request(
+            "owner_attention.ack",
+            json!({"session_uid":key,"alert_id":third}),
+        ),
+    );
+    assert!(!denied.ok);
+    let runtime = n.hub.lock().unwrap().messaging_sync.clone().unwrap();
+    assert!(runtime
+        .accept_alert_snapshot(&aid, &json!({"snapshot":{}}))
+        .is_err());
+}
+
+#[test]
+fn messaging_sync_owner_alert_feature_requires_owner_access_and_rejects_unnegotiated_frames() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    b.lock().unwrap().messaging_sync.take().unwrap().stop();
+    let local_root = b.lock().unwrap().messaging_root.clone();
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let config = Config::load(&local_root).unwrap().unwrap();
+    let token = fs::read_to_string(config.token_file.unwrap()).unwrap();
+    let (host, space) = with_store(b, |s| (s.daemon_id.clone(), s.space_id.clone()));
+    fs::write(root.join("messaging-peers").join(format!("{host}.json")),json!({"active":true,"owner_access":false,"token_sha256":transport::digest(token.trim().as_bytes())}).to_string()).unwrap();
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(root.join("messaging-sync.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    send_frame(
+        &mut socket,
+        &json!({"kind":"hello","daemon_id":host,"space_id":space,"token":token,"people":[],"interests":[],"resume":null,"features":[transport::FEATURE_ALERTS]}),
+    );
+    let hello = receive_frame(&mut socket);
+    assert!(hello["features"].is_null(), "{hello}");
+    send_frame(
+        &mut socket,
+        &json!({"kind":"owner_alert_snapshot","snapshot":{}}),
+    );
+    // The unexpected feature frame closes the authenticated but unprivileged link.
+    use std::io::Read;
+    let mut header = [0; 4];
+    loop {
+        match socket.read_exact(&mut header) {
+            Ok(()) => {
+                let len = u32::from_be_bytes(header) as usize;
+                assert!(len <= 4 * 1024 * 1024);
+                let mut data = vec![0; len];
+                socket.read_exact(&mut data).unwrap();
+            }
+            Err(e) => {
+                assert!(
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "{e}"
+                );
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn messaging_sync_bad_alert_frame_does_not_disconnect_or_block_chat_upload() {
+    let n = Network::new();
+    let b = &n.clients[1];
+    b.lock().unwrap().messaging_sync.take().unwrap().stop();
+    let local_root = b.lock().unwrap().messaging_root.clone();
+    let root = n.hub.lock().unwrap().messaging_root.clone();
+    let config = Config::load(&local_root).unwrap().unwrap();
+    let token = fs::read_to_string(config.token_file.unwrap()).unwrap();
+    let (host, space) = with_store(b, |s| (s.daemon_id.clone(), s.space_id.clone()));
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(root.join("messaging-sync.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_frame(
+        &mut socket,
+        &json!({"kind":"hello","daemon_id":host,"space_id":space,"token":token,
+        "people":[],"interests":["general"],"resume":null,"features":[transport::FEATURE_ALERTS]}),
+    );
+    assert_eq!(
+        receive_frame(&mut socket)["features"],
+        json!([transport::FEATURE_ALERTS])
+    );
+    // Oversized label is a real review failure, not a malformed outer transport.
+    send_frame(
+        &mut socket,
+        &json!({"kind":"owner_alert_snapshot","snapshot":{
+        "version":1,"generation":uuid::Uuid::new_v4().to_string(),"revision":1,"host_label":"sessions",
+        "alerts":{"bad":{"id":"bad","session_uid":"client-1","label":"x".repeat(4097),"message":"bad",
+            "task_id":null,"continuous_task_id":null}}}}),
+    );
+    let sent = call(
+        b,
+        "client-1",
+        "send",
+        json!({"channel":"general","body":"Chat survives bad alert","request_id":"after-bad-alert"}),
+    );
+    let id = sent["event_id"].as_str().unwrap();
+    let wire = with_store(b, |s| {
+        s.pending_uploads(64)
+            .unwrap()
+            .into_iter()
+            .find(|v| {
+                serde_json::from_str::<Value>(v["event"].as_str().unwrap()).unwrap()["id"] == id
+            })
+            .unwrap()
+    });
+    send_frame(&mut socket, &json!({"kind":"upload","id":id,"wire":wire}));
+    let (mut retry, mut receipt) = (false, false);
+    while !retry || !receipt {
+        let frame = receive_frame(&mut socket);
+        match frame["kind"].as_str() {
+            Some("owner_alert_result") => {
+                assert_eq!(frame["status"], "retry");
+                retry = true;
+            }
+            Some("receipt") => {
+                assert_eq!(frame["id"], id);
+                receipt = true;
+            }
+            Some("batch") => send_frame(
+                &mut socket,
+                &json!({"kind":"ack","revision":frame["revision"],"cursor":frame["page"]["cursor"],"dependency_offset":frame["page"]["dependency_offset"]}),
+            ),
+            _ => {}
+        }
+    }
+    wait_for(|| with_store(&n.clients[0], |s| s.wire_event(id).is_ok()));
+    // The same socket still answers after the bad frame and successful upload.
+    send_frame(&mut socket, &json!({"kind":"ping","people":[]}));
+    loop {
+        let frame = receive_frame(&mut socket);
+        if frame["kind"] == "pong" {
+            break;
+        }
+    }
+}
+
+#[test]
+fn messaging_sync_alert_rollback_resync_and_source_storage_failure_leave_chat_alive() {
+    let n = Network::new();
+    let a = &n.clients[0];
+    let runtime = { a.lock().unwrap().messaging_sync.clone().unwrap() };
+    let source_root = a.lock().unwrap().messaging_root.clone();
+    let origin = with_store(a, |s| s.daemon_id.clone());
+    let mut newer = runtime.alert_snapshot().unwrap();
+    let generation = newer.generation.clone();
+    newer.revision += 2;
+    let (relay, root) = {
+        let hub = n.hub.lock().unwrap();
+        (hub.owner_alert_relay.clone(), hub.messaging_root.clone())
+    };
+    relay.ingest(&root, &origin, newer).unwrap();
+    a.lock().unwrap().messaging_sync.take().unwrap().stop();
+    start(a);
+    let runtime = { a.lock().unwrap().messaging_sync.clone().unwrap() };
+    wait_for(|| runtime.alert_snapshot().unwrap().generation != generation);
+    assert!(runtime.connected.load(Ordering::Acquire));
+    // Local alert-file corruption must not poison the normal upload loop.
+    fs::write(
+        source_root.join("owner-attention.json"),
+        b"broken-alert-json",
+    )
+    .unwrap();
+    runtime.signal_owner_alerts();
+    let sent = call(
+        a,
+        "client-0",
+        "send",
+        json!({"channel":"general","body":"Chat survives alert file error","request_id":"after-alert-file-error"}),
+    );
+    let id = sent["event_id"].as_str().unwrap();
+    wait_for(|| with_store(&n.clients[1], |s| s.wire_event(id).is_ok()));
+    assert!(runtime.connected.load(Ordering::Acquire));
+    fs::write(source_root.join("owner-attention.json"), b"{}").unwrap();
 }

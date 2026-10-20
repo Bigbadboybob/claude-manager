@@ -68,8 +68,8 @@ class Join(Model):
 
 
 class Seen(Model):
-    key: Short
-    alert_id: Short
+    key: Annotated[str, Field(min_length=1, max_length=8192)]
+    alert_id: Annotated[str, Field(min_length=1, max_length=1024)]
 
 
 class Availability(Model):
@@ -170,8 +170,14 @@ def create_app(settings=None, *, daemon=None, verifier=None, push=None, workers=
     @app.get("/api/bootstrap")
     async def bootstrap(request: Request):
         availability = await daemon.call("messaging.availability", {"action": "get"})
+        try:
+            alerts = await daemon.call("owner_attention.list", {})
+        except DaemonError:
+            # Alert metadata is optional; chat/availability remain usable.
+            alerts = {}
         return {"actor": "owner", "user": {"email": request.state.identity["email"]},
-                "features": {"alerts_seen": True, "push": True}, **availability}
+                "features": {"alerts_seen": True, "push": True,
+                             "alert_hosts": alerts.get("alert_hosts", [])}, **availability}
 
     @app.get("/api/channels")
     async def channels(query: str = Query(default="", max_length=200),

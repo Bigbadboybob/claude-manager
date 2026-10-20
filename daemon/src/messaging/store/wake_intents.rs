@@ -1,10 +1,158 @@
+use super::preferences::Follow;
+use super::watches::{Monitor, Scope};
 use super::*;
 
-#[derive(Clone, Debug)]
+#[cfg(test)]
+mod oracle;
+#[cfg(test)]
+mod tests;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WakeIntent {
     pub key: String,
     pub event_id: String,
     pub monitor: Option<String>,
+}
+
+/// Actor-wide decisions are prepared once, then narrowed by conversation.
+struct WakeRules<'a> {
+    rules: Vec<&'a Follow>,
+    monitors: Vec<WakeMonitor<'a>>,
+}
+
+struct WakeMonitor<'a> {
+    monitor: &'a Monitor,
+    acknowledged: Option<&'a BTreeSet<String>>,
+}
+
+impl<'a> WakeRules<'a> {
+    fn new(store: &'a Store, actor: &str, personal: Option<&'a Personal>) -> Self {
+        let mut rules: Vec<_> = personal
+            .into_iter()
+            .flat_map(|p| p.preferences.rules.values())
+            .collect();
+        // Stable ordering retains the BTreeMap tie-break used by preferences.
+        rules.sort_by_key(|r| r.scope.specificity());
+        let monitors = personal
+            .into_iter()
+            .flat_map(|p| p.monitors.values())
+            .filter(|m| {
+                m.notify == "wake"
+                    && !["cancelled", "dismissed"].contains(&m.state.as_str())
+                    && m.hit_high > m.acknowledged
+            })
+            .filter_map(|monitor| {
+                let acknowledged = if let Some(task) = &monitor.task_subscription {
+                    let b = store.task_bindings.get(task)?;
+                    if !b.active
+                        || b.actor != actor
+                        || monitor.id != format!("task-{}-{}", b.id, b.revision)
+                    {
+                        return None;
+                    }
+                    Some(&b.acknowledged)
+                } else {
+                    None
+                };
+                Some(WakeMonitor {
+                    monitor,
+                    acknowledged,
+                })
+            })
+            .collect();
+        Self { rules, monitors }
+    }
+
+    fn conversation(&self, store: &Store, actor: &str, cid: &str) -> ConversationWake<'_> {
+        ConversationWake {
+            rules: self
+                .rules
+                .iter()
+                .copied()
+                .filter(|r| store.scope_matches_conversation(actor, &r.scope, cid))
+                .collect(),
+            monitors: self
+                .monitors
+                .iter()
+                .filter(|m| store.scope_matches_conversation(actor, &m.monitor.scope, cid))
+                .collect(),
+        }
+    }
+}
+
+struct ConversationWake<'a> {
+    rules: Vec<&'a Follow>,
+    monitors: Vec<&'a WakeMonitor<'a>>,
+}
+
+fn thread_matches(scope: &Scope, id: &str, root: Option<&str>) -> bool {
+    scope
+        .thread
+        .as_deref()
+        .is_none_or(|wanted| wanted == id || root == Some(wanted))
+}
+
+impl ConversationWake<'_> {
+    fn evaluate(
+        &self,
+        store: &Store,
+        actor: &str,
+        e: &Published,
+        read: Option<&ReadCursor>,
+        default_wake: bool,
+        intents: &mut Vec<WakeIntent>,
+    ) {
+        #[cfg(test)]
+        tests::count_candidate();
+        // Each candidate is decoded/read-checked once, regardless of how many
+        // follows or monitors contributed it. Own messages are always read.
+        let v = &e.event;
+        let id = strv(v, "id");
+        if v["actor"]["id"] == actor
+            || store.replication.rejections.contains_key(id)
+            || read.is_some_and(|r| {
+                (strv(v, "logical_time").parse::<u64>().unwrap_or(0), id)
+                    <= (r.logical_time, r.event_id.as_str())
+            })
+        {
+            return;
+        }
+        let root = v["data"]["thread_root"].as_str();
+        let mut wake = default_wake;
+        for rule in &self.rules {
+            if thread_matches(&rule.scope, id, root) {
+                // Mutes are sticky across all matching rules, independent of
+                // follow boundaries. DND is handled before candidate selection.
+                if rule.muted {
+                    return;
+                }
+                if e.position > rule.wake_since.unwrap_or(rule.since) || !rule.wake {
+                    wake = rule.wake;
+                }
+            }
+        }
+        if wake {
+            intents.push(WakeIntent {
+                key: id.into(),
+                event_id: id.into(),
+                monitor: None,
+            });
+        }
+        for eligible in &self.monitors {
+            let m = eligible.monitor;
+            if e.position > m.acknowledged
+                && e.position <= m.hit_high
+                && thread_matches(&m.scope, id, root)
+                && !eligible.acknowledged.is_some_and(|ids| ids.contains(id))
+            {
+                intents.push(WakeIntent {
+                    key: format!("monitor:{}:{id}", m.id),
+                    event_id: id.into(),
+                    monitor: Some(m.id.clone()),
+                });
+            }
+        }
+    }
 }
 
 impl Store {
@@ -16,7 +164,6 @@ impl Store {
     }
 
     pub(super) fn owner_message_notification(&self, e: &Published) -> Option<crate::owner_notifications::Notification> {
-        use crate::owner_availability::{self, Level, Urgency};
         if self.owner_notifications.is_none() || self.sync_enabled() && !self.is_coordinator()
             || !self.owner_inbox_notification(e) {
             return None;
@@ -27,8 +174,6 @@ impl Store {
         if !self.conversations.contains_key(cid) && !mention_recipients(&e.event).contains(&"owner") {
             return None;
         }
-        let level = self.owner_availability["level"].as_str().and_then(Level::parse);
-        if !owner_availability::delivers(level, Urgency::Fyi) { return None; }
         let place = self.channel_path_of(cid).map(|p| format!("#{p}")).unwrap_or_else(|| "DM".into());
         let sender = self.names.get(strv(&e.event["actor"], "id"))
             .map(|n| n.name.as_str()).unwrap_or_else(|| strv(&e.event["actor"], "name"));
@@ -129,15 +274,89 @@ impl Store {
     }
 
     fn wake_intents_for_actor(&self, actor: &str) -> Vec<WakeIntent> {
-        let mut intents = Vec::new();
         let personal = self.personal.get(actor);
-        for cid in self.read_model.conversations.keys().filter(|cid|self.visible(actor,cid)) {
-            for e in self.message_candidates(actor,cid,None,false,true,false) {
-                self.event_wake_intents(actor,personal,e,&mut intents);
+        if personal.is_some_and(|p| p.preferences.dnd) {
+            return Vec::new();
+        }
+        let plan = WakeRules::new(self, actor, personal);
+        let mut ordered = Vec::new();
+        for (cid, index) in &self.read_model.conversations {
+            if !self.visible(actor, cid) {
+                continue;
+            }
+            let read = self.reads.get(actor).and_then(|r| r.cursors.get(cid));
+            let unread_lo = read.map_or(0, |r| index.messages.partition_point(|(k, _)| k <= r));
+            let unread = &index.messages[unread_lo..];
+            let conversation = plan.conversation(self, actor, cid);
+            // Union default unread DM/mention candidates with the local arrival
+            // intervals that can enable a follow or retained monitor hit. The
+            // bool retains default eligibility when ranges overlap. Threads are
+            // conservatively selected by conversation, then checked once below.
+            let mut candidates = BTreeMap::new();
+            if actor != "owner" {
+                if self.conversations.contains_key(cid) {
+                    candidates.extend(unread.iter().map(|(_, i)| (*i, true)));
+                } else if let Some(mentions) = index.mentions.get(actor) {
+                    let lo = read.map_or(0, |r| mentions.partition_point(|k| k <= r));
+                    candidates.extend(
+                        mentions[lo..]
+                            .iter()
+                            .filter_map(|k| self.event_index.get(&k.event_id).map(|i| (*i, true))),
+                    );
+                }
+            }
+            // Coalesce overlapping follow/monitor intervals before visiting
+            // arrivals: 100 watches on one channel should not rescan it 100x.
+            let mut ranges: Vec<_> = conversation
+                .rules
+                .iter()
+                .filter(|r| r.wake)
+                .map(|r| (r.wake_since.unwrap_or(r.since), self.position))
+                .chain(
+                    conversation
+                        .monitors
+                        .iter()
+                        .map(|m| (m.monitor.acknowledged, m.monitor.hit_high)),
+                )
+                .filter(|(lo, hi)| lo < hi)
+                .collect();
+            ranges.sort_unstable();
+            let mut through = 0;
+            for (after, high) in ranges {
+                let after = after.max(through);
+                if after >= high {
+                    continue;
+                }
+                let lo = index.arrivals.partition_point(|(p, _)| *p <= after);
+                let hi = index.arrivals.partition_point(|(p, _)| *p <= high);
+                // Use the narrower index when most of a followed channel is
+                // already read. Arrival order and read order can differ after
+                // replication, so neither boundary substitutes for the other.
+                if unread.len() < hi - lo {
+                    for (_, i) in unread {
+                        let position = self.events[*i].position;
+                        if position > after && position <= high {
+                            candidates.entry(*i).or_insert(false);
+                        }
+                    }
+                } else {
+                    for (_, i) in &index.arrivals[lo..hi] {
+                        candidates.entry(*i).or_insert(false);
+                    }
+                }
+                through = high;
+            }
+            for (i, default_wake) in candidates {
+                let e = &self.events[i];
+                let mut intents = Vec::new();
+                conversation.evaluate(self, actor, e, read, default_wake, &mut intents);
+                ordered.extend(intents.into_iter().map(|intent| (e.position, intent)));
             }
         }
-        intents.sort_by_key(|intent| self.published(&intent.event_id).map(|e|e.position).unwrap_or(0));
-        intents
+        // Stable sort: direct intent before monitors (in monitor ID order) for
+        // each event; publication order across conversations and late arrivals.
+        ordered.sort_by_key(|(position, _)| *position);
+        ordered.into_iter().map(|(_, intent)| intent).collect()
     }
 
     fn event_wake_intents(
@@ -147,38 +366,25 @@ impl Store {
         e: &Published,
         intents: &mut Vec<WakeIntent>,
     ) {
+        let cid = strv(&e.event, "conversation_id");
         if e.event["type"] != "message.create"
-            || self.replication.rejections.contains_key(strv(&e.event, "id"))
+            || !self.visible(actor, cid)
+            || personal.is_some_and(|p| p.preferences.dnd)
         {
             return;
         }
-        let (_, wake, muted) = self.preference_for_event(actor, e);
-        let id = strv(&e.event, "id");
-        if wake && !self.is_read(actor,&e.event) {
-            intents.push(WakeIntent {
-                key: id.into(),
-                event_id: id.into(),
-                monitor: None,
-            });
-        }
-        if muted {
-            return;
-        }
-        for m in personal.into_iter().flat_map(|p| p.monitors.values()) {
-            if m.notify == "wake"
-                && !["cancelled", "dismissed"].contains(&m.state.as_str())
-                && !self.is_read(actor,&e.event)
-                && e.position > m.acknowledged
-                && e.position <= m.hit_high
-                && self.monitor_matches(actor, m, e)
-            {
-                intents.push(WakeIntent {
-                    key: format!("monitor:{}:{id}", m.id),
-                    event_id: id.into(),
-                    monitor: Some(m.id.clone()),
-                });
-            }
-        }
+        let plan = WakeRules::new(self, actor, personal);
+        let default_wake = actor != "owner"
+            && (self.conversations.contains_key(cid)
+                || mention_recipients(&e.event).contains(&actor));
+        plan.conversation(self, actor, cid).evaluate(
+            self,
+            actor,
+            e,
+            self.reads.get(actor).and_then(|r| r.cursors.get(cid)),
+            default_wake,
+            intents,
+        );
     }
 
 }

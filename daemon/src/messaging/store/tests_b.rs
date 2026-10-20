@@ -7,6 +7,7 @@ fn person(s: &Store, uid: &str) -> Person {
         task: None,
         present: true,
         kind: "agent".into(),
+        engine: None,
     }
 }
 fn post(s: &mut Store, p: &Person, target: Value, key: &str, people: &[Person]) -> Value {
@@ -16,6 +17,129 @@ fn post(s: &mut Store, p: &Person, target: Value, key: &str, people: &[Person]) 
     q["name"] = json!(format!("{} builder", p.name));
     s.send(&p.id, &p.session_uid, "agent", &q, people).unwrap()
 }
+
+#[test]
+fn monitor_status_counts_receipts_without_delivery_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    let b = person(&s, "b");
+    let people = vec![a.clone(), b.clone()];
+    s.enroll_participants(&people).unwrap();
+    assert_eq!(s.monitor_status(&b.id), json!({
+        "active":0,"unacknowledged":0,"badges":0,"recently_expired":[]
+    }));
+    let mut monitors = BTreeMap::new();
+    for (key, mode, notify) in [
+        ("wake", "continuous", "wake"),
+        ("badge", "continuous", "badge"),
+        ("silent", "continuous", "none"),
+        ("once", "once", "wake"),
+        ("cancel", "continuous", "wake"),
+        ("dismiss", "continuous", "badge"),
+        ("expire", "continuous", "wake"),
+    ] {
+        let mut p = json!({"scope":{"dm":a.id},"mode":mode,"notify":notify,"request_id":key});
+        if key == "expire" {
+            p["expires_in"] = json!("1m");
+        }
+        monitors.insert(key, s.register_monitor(&b.id, &p, &people).unwrap());
+    }
+    let first = post(&mut s, &a, json!({"dm":b.id}), "first", &people);
+    post(&mut s, &a, json!({"dm":b.id}), "second", &people);
+    for action in ["cancel", "dismiss"] {
+        s.monitors(&b.id, &json!({
+            "action":action,"monitor_id":monitors[action]["id"],
+            "request_id":format!("{action}-now")
+        })).unwrap();
+    }
+    s.advance_monitors_at(Utc::now() + chrono::Duration::minutes(2)).unwrap();
+
+    // A real retained receipt must remain visible to explicit monitor reads.
+    let wake_id = monitors["wake"]["id"].as_str().unwrap();
+    let queue = s.root.join("_delivery").join(format!("{}.json", hash(b.session_uid.as_bytes())));
+    atomic_replace(&queue, &json!({"last_attempt":0,"batches":[{
+        "wake_id":"retained","ids":[format!("monitor:{wake_id}:{}", first["event_id"].as_str().unwrap())],
+        "status":"confirmed","released":true
+    }]})).unwrap();
+    let check = |s: &Store, unread: u64, badges: u64| {
+        let before = super::super::delivery::queue_load_count();
+        let status = s.monitor_status(&b.id);
+        assert_eq!(super::super::delivery::queue_load_count(), before,
+            "aggregate chat decoration must perform zero delivery queue loads");
+        assert_eq!(status["active"], 3);
+        assert_eq!(status["unacknowledged"], unread);
+        assert_eq!(status["badges"], badges);
+        assert_eq!(status["recently_expired"][0]["id"], monitors["expire"]["id"]);
+    };
+    check(&s, 11, 9);
+    let before = super::super::delivery::queue_load_count();
+    let listing = s.monitors(&b.id, &json!({"action":"list"})).unwrap();
+    assert_eq!(super::super::delivery::queue_load_count() - before, 6);
+    let rich = listing["items"].as_array().unwrap().iter()
+        .find(|m| m["id"] == wake_id).unwrap();
+    assert_eq!(rich["delivery"], json!({"confirmed":1}));
+    assert_eq!(rich["unacknowledged"], 2);
+
+    // A result receipt affects one watch, whereas a read receipt affects all
+    // matching watches. Overlap must not decrement the same hit twice.
+    let page = s.monitors(&b.id, &json!({
+        "action":"get","monitor_id":wake_id,"limit":1,"unacknowledged_only":true
+    })).unwrap();
+    s.monitors(&b.id, &json!({"action":"ack","monitor_id":wake_id,
+        "receipt":page["receipt"],"request_id":"ack-first"})).unwrap();
+    check(&s, 10, 8);
+    s.acknowledge(&b.id, &json!({"actor":b.id,"space_id":s.space_id,
+        "ids":[first["event_id"]]})).unwrap();
+    check(&s, 5, 4);
+    s.mark_read(&b.id, &json!({"all":true}), &people).unwrap();
+    check(&s, 0, 0);
+}
+
+#[test]
+fn monitor_status_recent_expiries_keep_order_limit_and_horizon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let m = s.register_monitor("owner", &json!({
+        "scope":{"channel":"general"},"mode":"continuous","request_id":"template"
+    }), &[]).unwrap();
+    let mut state = s.personal_state("owner");
+    let template = state.monitors.remove(m["id"].as_str().unwrap()).unwrap();
+    let now = Utc::now();
+    for hours in 1..=7 {
+        let mut expired = template.clone();
+        expired.id = format!("expired-{hours}");
+        expired.state = "expired".into();
+        expired.expires_at = Some((now - chrono::Duration::hours(hours)).to_rfc3339());
+        state.monitors.insert(expired.id.clone(), expired);
+    }
+    for (id, status, expiry) in [
+        ("old", "expired", Some((now - chrono::Duration::hours(25)).to_rfc3339())),
+        ("invalid", "expired", Some("invalid".into())),
+        ("missing", "expired", None),
+        ("dismissed", "dismissed", Some(now.to_rfc3339())),
+    ] {
+        let mut monitor = template.clone();
+        monitor.id = id.into();
+        monitor.state = status.into();
+        monitor.expires_at = expiry;
+        state.monitors.insert(id.into(), monitor);
+    }
+    s.save_personal(state).unwrap();
+    let status = s.monitor_status("owner");
+    assert_eq!(status["active"], 0);
+    assert_eq!(status["unacknowledged"], 0);
+    assert_eq!(status["badges"], 0);
+    let expired = status["recently_expired"].as_array().unwrap();
+    assert_eq!(expired.len(), 5);
+    for (i, entry) in expired.iter().enumerate() {
+        assert_eq!(entry["id"], format!("expired-{}", i + 1));
+        assert_eq!(entry["mode"], "continuous");
+        assert_eq!(entry["scope"], m["scope"]);
+        assert_eq!(entry["expired_at"], (now - chrono::Duration::hours(i as i64 + 1)).to_rfc3339());
+    }
+}
+
 #[test]
 fn messaging_monitors_first_contact_privacy_restart_and_receipt_boundary() {
     let tmp = tempfile::tempdir().unwrap();
@@ -392,4 +516,21 @@ fn thread_watch_interest_is_its_own_conversation_only() {
         BTreeSet::from([s.channels["alpha"].clone()]),
         "only the thread's conversation"
     );
+}
+
+/// DM rows name every member, including agents that have since left the
+/// people directory (which lists only present participants): the board
+/// showed a departed peer's raw uid as the DM label (2026-10-13).
+#[test]
+fn dm_rows_carry_member_names_including_departed_agents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    post(&mut s, &a, json!({"dm":"owner"}), "hello", &[a.clone()]);
+    // The agent departs: nothing below passes a people list.
+    let page = s.dms_page("owner", &json!({})).unwrap();
+    let row = &page["items"][0];
+    assert_eq!(row["member_names"][&a.id], "a-builder", "{row}");
+    assert_eq!(row["member_names"]["owner"], "Owner");
+    assert_eq!(row["peer"], json!(a.id), "existing fields unchanged");
 }

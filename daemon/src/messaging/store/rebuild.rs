@@ -122,6 +122,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         };
         s.send(
             &person.id,

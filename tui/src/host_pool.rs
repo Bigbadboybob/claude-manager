@@ -825,10 +825,22 @@ impl SshTunnel {
                     // 3s×2 makes ssh detect the dead peer and EXIT within ~6s,
                     // converting the undetectable hang into the death the
                     // existing dead-tunnel respawn already heals.
+                    //
+                    // 10s×3 (30s), not 3s×2: on a slow, lossy link a 6s gap is
+                    // normal, and each false "dead" respawn reattached every
+                    // session on the host with a full replay (2026-10-13).
+                    // Route changes and resume from sleep are caught at once by
+                    // `network_watch`, so only a silent stall waits the 30s.
                     "-o".into(),
-                    "ServerAliveInterval=3".into(),
+                    "ServerAliveInterval=10".into(),
                     "-o".into(),
-                    "ServerAliveCountMax=2".into(),
+                    "ServerAliveCountMax=3".into(),
+                    // zlib on the whole connection. Attach replays are base64
+                    // terminal output in JSON and compress 4-12x (5.7x across
+                    // 36 live sessions on cm-sessions, 2026-10-13: 1.4 MB per
+                    // pane down to ~220 KB); RPCs and live output shrink too.
+                    "-o".into(),
+                    "Compression=yes".into(),
                     // Exit immediately if the forward can't be established
                     // (don't linger with a useless connection the readiness
                     // probe would still pass once the socket binds).

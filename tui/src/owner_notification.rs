@@ -109,8 +109,7 @@ mod tests {
     }
 }
 
-/// Released held requests arriving this close together (one availability
-/// change releases them all at once) become one desktop popup.
+/// Legacy held requests released together after upgrade become one desktop popup.
 const RELEASE_DIGEST_WINDOW: Duration = Duration::from_secs(3);
 
 pub struct Delivery {

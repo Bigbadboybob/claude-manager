@@ -673,18 +673,45 @@ impl App {
         let uid = ts.uid.clone();
         let host = ws.host_id.clone();
         self.viewed_report = Some((uid.clone(), std::time::Instant::now()));
+        {
+            // Latest selection wins; a sender already running for this host
+            // picks it up after its current RPC.
+            let mut pending = self.viewed_pending.lock().unwrap_or_else(|p| p.into_inner());
+            let running = pending.contains_key(&host);
+            pending.insert(host.clone(), Some(uid));
+            if running {
+                return;
+            }
+        }
         let pool = std::sync::Arc::clone(&self.host_pool);
-        let _ = std::thread::Builder::new()
+        let pending = std::sync::Arc::clone(&self.viewed_pending);
+        let spawned = std::thread::Builder::new()
             .name("cm-viewed-report".into())
-            .spawn(move || {
-                let Ok(handle) = pool.for_host(&host) else { return };
-                let Some(socket) = handle.socket_path() else { return };
-                let _ = crate::client_session::rpc_session_viewed(
-                    &socket,
-                    &pool.operator_token_for(&host),
-                    &uid,
-                );
+            .spawn({
+                let host = host.clone();
+                move || loop {
+                    let uid = {
+                        let mut slots = pending.lock().unwrap_or_else(|p| p.into_inner());
+                        match slots.get_mut(&host).and_then(Option::take) {
+                            Some(uid) => uid,
+                            None => {
+                                slots.remove(&host);
+                                return;
+                            }
+                        }
+                    };
+                    let Ok(handle) = pool.for_host(&host) else { continue };
+                    let Some(socket) = handle.socket_path() else { continue };
+                    let _ = crate::client_session::rpc_session_viewed(
+                        &socket,
+                        &pool.operator_token_for(&host),
+                        &uid,
+                    );
+                }
             });
+        if spawned.is_err() {
+            self.viewed_pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&host);
+        }
     }
 
     /// Throttled entry point for daemon-session adoption, called from the
