@@ -959,7 +959,7 @@ impl App {
 
     /// Older adopted orchestrator rows sometimes lack task_id. The planning
     /// workspace binding is authoritative; labels and old manager UIDs aren't.
-    fn continuous_planning_task<'a>(&'a self, ws: &'a Workspace, ts: &'a TerminalSession) -> Option<&'a str> {
+    pub(super) fn continuous_planning_task<'a>(&'a self, ws: &'a Workspace, ts: &'a TerminalSession) -> Option<&'a str> {
         ts.task_id.as_deref().or_else(|| self.tasks.iter().find(|t|
             t.is_continuous && t.workspace_id.as_deref() == Some(ws.id.as_str()))
             .and_then(|t| t.task_id.as_deref()))
@@ -1086,6 +1086,17 @@ impl App {
     /// Closed workspaces skipped. Pure read — the render + cursor consume this;
     /// it's only drawn/navigated when the column is on.
     pub(super) fn visual_items_continuous(&self) -> Vec<ContinuousRow> {
+        let mut rows = self.continuous_rows_unfiltered();
+        if let Some(query) = self.sidebar_filter.as_deref() {
+            let query = query.to_lowercase();
+            rows.retain(|r| self.visual_item_matches(&r.visual_item(), &query));
+        }
+        rows
+    }
+
+    /// The continuous column's grouping before the sidebar filter (A-/)
+    /// applies. The org chart (F6) reuses it for its Continuous org.
+    pub(super) fn continuous_rows_unfiltered(&self) -> Vec<ContinuousRow> {
         // Orchestrators: (ws_idx, sess_idx, uid, task_id, label).
         let mut orchestrators: Vec<(usize, usize, &str, Option<&str>, &str)> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
@@ -1262,10 +1273,6 @@ impl App {
             for (_retired, _label, group_rows) in groups {
                 rows.extend(group_rows);
             }
-        }
-        if let Some(query) = self.sidebar_filter.as_deref() {
-            let query = query.to_lowercase();
-            rows.retain(|r| self.visual_item_matches(&r.visual_item(), &query));
         }
         rows
     }
@@ -1597,7 +1604,7 @@ impl App {
     /// uid → `(ws_idx, sess_idx)` among non-closed workspaces. `None`
     /// when the session is gone for good (workspace closed or session
     /// removed) — MRU jumps DROP such uids from the deque.
-    fn find_session_by_uid(&self, uid: &str) -> Option<(usize, usize)> {
+    pub(super) fn find_session_by_uid(&self, uid: &str) -> Option<(usize, usize)> {
         for (wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed {
                 continue;

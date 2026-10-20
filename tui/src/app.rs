@@ -68,6 +68,7 @@ mod global_settings;
 mod availability;
 mod agent_state;
 mod board;
+mod orgchart;
 mod owner_blocked;
 mod color_grid;
 mod unread;
@@ -276,6 +277,8 @@ pub struct App {
     global_settings: global_settings::GlobalSettings,
     availability: availability::Availability,
     board: board::Board,
+    /// F6 org chart overlay (app/orgchart.rs).
+    orgchart: orgchart::OrgChart,
     owner_blocked: owner_blocked::OwnerBlocked,
     /// Reap requests submitted from the cleanup dialog, tracked after it closed.
     cleanup_jobs: Vec<worktree_cleanup::Menu>,
@@ -1007,6 +1010,7 @@ impl App {
             global_settings: global_settings::GlobalSettings::load(),
             availability: availability::Availability::load(),
             board: board::Board::default(),
+            orgchart: orgchart::OrgChart::default(),
             owner_blocked: owner_blocked::OwnerBlocked::default(),
             cleanup_jobs: Vec::new(),
             unread: unread::Unread::default(),

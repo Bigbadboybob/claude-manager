@@ -116,7 +116,7 @@ impl App {
     /// a bold bead that pulses small→large while its color cycles through the
     /// rainbow. Fully replaces the normal status indicator while the alert is
     /// pending — the animation *is* the signal.
-    fn alert_indicator(&self) -> (&'static str, Style) {
+    pub(super) fn alert_indicator(&self) -> (&'static str, Style) {
         let f = self.alert_frame() as usize;
         let glyph = ALERT_PULSE[f % ALERT_PULSE.len()];
         let color = theme::ALERT_RAINBOW[f % theme::ALERT_RAINBOW.len()];
@@ -124,6 +124,12 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.orgchart.visible {
+            self.draw_orgchart(frame);
+            self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
+            return;
+        }
         if self.board.visible {
             self.draw_board(frame);
             self.global_settings.draw(frame, frame.area());

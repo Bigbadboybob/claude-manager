@@ -123,7 +123,7 @@ impl Board {
 /// Recently-closed items shown (and selectable) under the board.
 const CLOSED_SHOWN: usize = 10;
 
-fn age(secs: i64) -> String {
+pub(super) fn age(secs: i64) -> String {
     let s = secs.max(0);
     if s >= 86_400 {
         format!("{}d", s / 86_400)
@@ -1041,7 +1041,7 @@ fn detail_edge_lines(item: &Value, index: &ItemIndex) -> usize {
     by + usize::from(by > 0) + blocks + usize::from(blocks > 0)
 }
 
-fn now_unix() -> i64 {
+pub(super) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1083,7 +1083,7 @@ pub(super) fn parse_rfc3339(s: &str) -> Option<i64> {
 
 /// Colored status badge: ACTIVE green, WAIT cyan with the ETA countdown
 /// (red once overdue), BLOCKED yellow, OPEN grey, DONE/DROPPED dim.
-fn status_badge(item: &Value, now: i64) -> (String, Style) {
+pub(super) fn status_badge(item: &Value, now: i64) -> (String, Style) {
     let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
     match item["status"].as_str().unwrap_or("?") {
         "active" => ("ACTIVE".into(), bold(theme::OK)),
