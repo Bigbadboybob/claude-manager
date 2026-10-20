@@ -24,7 +24,7 @@ F6, Esc or `q` closes it.
   the label, the engine, and a host marker: ⌂ for local, otherwise the first
   letter of the host name, in magenta.
 - Bash sessions are hidden by default; `b` shows them. Opening the chart on a
-  bash session shows them automatically.
+  bash session shows just that one, until the chart closes.
 - Once a box has more than three reports with no reports of their own, those
   reports stack in a column, so a 50-report lead stays two boxes wide.
 
@@ -59,7 +59,9 @@ For the focused session, the pane shows:
   and flags.
 
 Board items come from the planning API's open-board list plus `board.read` on
-each board. They are matched by the holders' `session_uid`. The chart re-lists
+each board. They are matched by the holders' `session_uid`. A board that
+fails to read waits its normal turn, and its error is listed by name in the
+pane. The chart re-lists
 boards every 60 s and re-reads each board every 30 s, with one request in
 flight at a time, and only while the chart is open.
 
@@ -70,6 +72,6 @@ number of reports and how many sessions are under it.
 
 `tui/src/app/orgchart.rs` contains the model (`org_model`), the layout
 (`layout`), the keys, drawing and the board poll. The chart reuses
-`task_leads`, `planning.task_division`, `reveal_session` (`app/tree.rs`),
+`task_leads` and `planning.task_division` (`app/tree.rs`), the palette jump,
 `task_parent_map` and the continuous column's `continuous_rows_unfiltered`
 (`app/nav.rs`).

@@ -443,7 +443,11 @@ pub(super) struct ChartBoards {
     slugs: Vec<String>,
     /// Open items per board slug.
     pub(super) items: BTreeMap<String, Vec<Value>>,
+    /// Last read attempt per board, success or failure, so a failing board
+    /// waits its turn instead of starving the rest.
     read_at: HashMap<String, Instant>,
+    /// The last read error per board.
+    pub(super) read_errors: BTreeMap<String, String>,
     listed_at: Option<Instant>,
     retry_at: Option<Instant>,
     rx: Option<mpsc::Receiver<BoardReply>>,
@@ -475,6 +479,9 @@ pub(super) struct OrgChart {
     pub(super) session: usize,
     pub(super) folds: HashSet<String>,
     pub(super) show_bash: bool,
+    /// The bash session the chart was opened on: shown while bash is
+    /// hidden, until the chart closes or `b` is pressed.
+    pub(super) bash_uid: Option<String>,
     pub(super) hide_info: bool,
     /// Viewport origin in chart coordinates. Cells so draw can keep the
     /// focused box in view.
@@ -501,14 +508,16 @@ impl App {
             .iter()
             .find(|t| t.task_id.as_deref() == Some(task_id))
             .map(|t| t.name.clone())
-            .unwrap_or_else(|| format!("task {}", &task_id[..task_id.len().min(8)]))
+            .unwrap_or_else(|| format!("task {}", task_id.chars().take(8).collect::<String>()))
     }
 
     /// Build the chart from the live session state.
     pub(super) fn org_model(&self, show_bash: bool) -> ChartModel {
         let mut m = ChartModel::default();
         let owner = m.push(None, "owner".into(), NodeKind::Owner, "Owner".into(), None, 0);
-        let keep = |ts: &TerminalSession| show_bash || ts.session_type != "bash";
+        // The one bash session the chart was opened on shows even with bash hidden.
+        let opened_on = self.orgchart.bash_uid.as_deref();
+        let keep = |ts: &TerminalSession| show_bash || ts.session_type != "bash" || opened_on == Some(ts.uid.as_str());
         let leads = self.task_leads();
         let parents = self.task_parent_map();
         let mut orgs: HashMap<String, usize> = HashMap::new();
@@ -530,7 +539,7 @@ impl App {
                 (0, _) | (_, None) => {
                     let cont = org(&mut m, "continuous", "Continuous", 2);
                     let task = self.continuous_planning_task(ws, ts).map(str::to_owned);
-                    let key = format!("orch:{}", ts.continuous_task_id.as_deref().unwrap_or(&ts.uid));
+                    let key = format!("orch:{}:{}", ws.host_id, ts.continuous_task_id.as_deref().unwrap_or(&ts.uid));
                     let title = task.as_deref().map_or_else(|| ts.label.clone(), |t| self.chart_task_title(t));
                     let i = m.push(Some(cont), key, NodeKind::Orchestrator, title, task.clone(), 0);
                     if let Some(t) = task {
@@ -549,7 +558,7 @@ impl App {
                     let otask = m.nodes[o].task_id.clone();
                     let task = ts.task_id.clone().filter(|t| Some(t) != otask.as_ref());
                     let title = task.as_deref().map_or_else(|| ts.label.clone(), |t| self.chart_task_title(t));
-                    let i = m.push(Some(o), format!("worker:{}", task.as_deref().unwrap_or(&ts.uid)), NodeKind::Worker, title, task.clone(), 1);
+                    let i = m.push(Some(o), format!("worker:{}:{}", ws.host_id, task.as_deref().unwrap_or(&ts.uid)), NodeKind::Worker, title, task.clone(), 1);
                     if let Some(t) = task {
                         orch_of_task.insert(t, i);
                     }
@@ -732,7 +741,7 @@ impl App {
         if let Some(uid) = uid {
             let bash = self.find_session_by_uid(&uid).map(|(wi, si)| self.workspaces[wi].sessions[si].session_type == "bash");
             if bash == Some(true) {
-                self.orgchart.show_bash = true;
+                self.orgchart.bash_uid = Some(uid.clone());
             }
             let model = self.org_model(self.orgchart.show_bash);
             if let Some((i, s)) = model.find_session(&uid) {
@@ -742,6 +751,13 @@ impl App {
             }
         }
         self.orgchart_tick();
+    }
+
+    fn close_orgchart(&mut self) {
+        self.orgchart.visible = false;
+        self.orgchart.bash_uid = None;
+        self.orgchart.pending = None;
+        self.orgchart.search = None;
     }
 
     /// Unfold `i`'s ancestors so it is visible.
@@ -779,14 +795,19 @@ impl App {
             self.orgchart.status = "No session in this box".into();
             return;
         };
-        self.orgchart.visible = false;
+        self.close_orgchart();
+        // Nothing may sit over the Sessions view: other overlays close and
+        // an open form or prompt is cancelled.
+        self.board.visible = false;
+        self.messages.visible = false;
+        self.input_mode = InputMode::Normal;
         self.view_mode = ViewMode::Sessions;
         let continuous = self.find_session_by_uid(&s.uid).is_some_and(|k| self.continuous_members().contains(&k));
         if continuous && !self.continuous_column_on {
             self.continuous_column_on = true;
             self.set_status_msg("Continuous column shown (A-c hides it)");
         }
-        self.reveal_session(&s.uid);
+        // The palette jump unfolds the sidebar above the session (reveal_cursor).
         self.apply_palette_jump(PaletteTarget::Session { uid: s.uid });
         self.needs_redraw = true;
     }
@@ -905,7 +926,7 @@ impl App {
                 }
                 self.orgchart.follow.set(true);
             }
-            (_, KeyCode::F(6) | KeyCode::Esc | KeyCode::Char('q')) => self.orgchart.visible = false,
+            (_, KeyCode::F(6) | KeyCode::Esc | KeyCode::Char('q')) => self.close_orgchart(),
             (_, KeyCode::Enter) => self.orgchart_jump(&model),
             (_, KeyCode::Char('t')) if alt => self.orgchart_jump(&model),
             (_, KeyCode::Char(c @ ('g' | 'z'))) => self.orgchart.pending = Some(c),
@@ -961,6 +982,7 @@ impl App {
                 self.orgchart.follow.set(true);
             }
             (_, KeyCode::Char('b')) => {
+                self.orgchart.bash_uid = None;
                 self.orgchart.show_bash = !self.orgchart.show_bash;
                 self.orgchart.status = if self.orgchart.show_bash { "Showing bash sessions" } else { "Bash sessions hidden" }.into();
                 self.orgchart.follow.set(true);
@@ -1001,9 +1023,13 @@ impl App {
             b.rx = None;
             self.needs_redraw = true;
             match (slug, result) {
-                (_, Err(e)) => {
+                (None, Err(e)) => {
                     b.error = e;
                     b.retry_at = Some(Instant::now() + BOARD_RETRY);
+                }
+                (Some(slug), Err(e)) => {
+                    b.read_at.insert(slug.clone(), Instant::now());
+                    b.read_errors.insert(slug, e);
                 }
                 (None, Ok(v)) => {
                     b.error.clear();
@@ -1012,9 +1038,10 @@ impl App {
                     let slugs = b.slugs.clone();
                     b.items.retain(|s, _| slugs.contains(s));
                     b.read_at.retain(|s, _| slugs.contains(s));
+                    b.read_errors.retain(|s, _| slugs.contains(s));
                 }
                 (Some(slug), Ok(v)) => {
-                    b.error.clear();
+                    b.read_errors.remove(&slug);
                     b.read_at.insert(slug.clone(), Instant::now());
                     if v["unchanged"] != true {
                         b.items.insert(slug, v["items"].as_array().cloned().unwrap_or_default());
@@ -1292,7 +1319,8 @@ impl App {
                 None => b.title.clone(),
             }
         };
-        let Some(s) = self.orgchart_focused_session(model) else {
+        let picked = self.orgchart.session.min(node.sessions.len().saturating_sub(1));
+        let Some(s) = node.sessions.get(picked).cloned() else {
             lines.push(Line::styled(node.title.clone(), Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)));
             let kind = match node.kind {
                 NodeKind::Owner => "owner",
@@ -1355,8 +1383,11 @@ impl App {
             format!("Board items ({})", held.len())
         };
         lines.push(Line::styled(heading, Style::default().fg(theme::HEADER)));
-        if !b.error.is_empty() && held.is_empty() {
-            lines.push(Line::styled(crate::planning::truncate_with_ellipsis(&b.error, width), Style::default().fg(theme::ERROR)));
+        if !b.error.is_empty() {
+            lines.push(Line::styled(crate::planning::truncate_with_ellipsis(&format!("boards: {}", b.error), width), Style::default().fg(theme::ERROR)));
+        }
+        for (slug, e) in &b.read_errors {
+            lines.push(Line::styled(crate::planning::truncate_with_ellipsis(&format!("{slug}: unreadable ({e})"), width), Style::default().fg(theme::ERROR)));
         }
         let unix = board::now_unix();
         for h in held {
@@ -1617,10 +1648,10 @@ mod tests {
         let m = app.org_model(false);
         let cont = m.find("continuous").unwrap();
         assert_eq!(m.nodes[cont].parent, Some(0));
-        let orch = m.find("orch:health").unwrap();
+        let orch = m.find("orch:manager:health").unwrap();
         assert_eq!(m.nodes[orch].parent, Some(cont));
         assert!(m.nodes[orch].sessions[0].lead);
-        let worker = m.find("worker:bug-1").unwrap();
+        let worker = m.find("worker:manager:bug-1").unwrap();
         assert_eq!(m.nodes[worker].parent, Some(orch));
         let deep = m.find("task:bug-1-sub").unwrap();
         assert_eq!(m.nodes[deep].parent, Some(worker));
@@ -1815,15 +1846,84 @@ mod tests {
     }
 
     #[test]
-    fn opening_on_a_bash_session_shows_bash() {
+    fn opening_on_a_bash_session_shows_only_that_one_until_close() {
         let mut app = org_app();
+        app.workspaces[3].sessions.push(dummy_ts("ts-61-0", false, HostId::local()));
+        app.workspaces[3].sessions[1].session_type = "bash".into();
         app.cursor = Cursor::Session(0, 2); // root-sh
         app.handle_event(&key(KeyCode::F(6)));
-        assert!(app.orgchart.show_bash);
-        let m = app.org_model(true);
+        assert!(!app.orgchart.show_bash, "the bash toggle is untouched");
+        let m = app.org_model(false);
         assert_eq!(app.orgchart_focused_session(&m).unwrap().uid, "ts-30-0");
+        assert!(m.find_session("ts-61-0").is_none(), "other bash sessions stay hidden");
+        app.handle_event(&key(KeyCode::Esc));
+        assert!(app.orgchart.bash_uid.is_none());
+        assert!(app.org_model(false).find_session("ts-30-0").is_none(), "closing restores the filter");
+        // `b` still toggles every bash session.
+        app.handle_event(&key(KeyCode::F(6)));
         press(&mut app, "b");
-        assert!(!app.orgchart.show_bash);
+        assert!(app.orgchart.show_bash && app.orgchart.bash_uid.is_none());
+        assert!(app.org_model(true).find_session("ts-61-0").is_some());
+    }
+
+    #[test]
+    fn the_same_continuous_task_on_two_hosts_gets_two_boxes() {
+        let mut app = test_app();
+        app.workspaces = vec![ws("w-a", HostId::new("manager")), ws("w-b", HostId::new("sessions"))];
+        for wi in 0..2 {
+            session(&mut app, wi, 0x10 + wi as u32, "triage-orchestrator", "codex", Some("orch-task"));
+            app.workspaces[wi].sessions[0].continuous_task_id = Some("triage".into());
+        }
+        let m = app.org_model(false);
+        let a = m.find("orch:manager:triage").expect("manager's box");
+        let b = m.find("orch:sessions:triage").expect("sessions' box");
+        assert_ne!(a, b);
+        assert_eq!(m.nodes.iter().filter(|n| n.key.starts_with("orch:")).count(), 2);
+    }
+
+    #[test]
+    fn a_failing_board_waits_its_turn_and_reports_only_itself() {
+        let mut app = org_app();
+        app.orgchart.visible = true;
+        app.orgchart.boards.listed_at = Some(Instant::now());
+        app.orgchart.boards.slugs = vec!["bad".into(), "good".into()];
+        app.orgchart.boards.items.insert("good".into(), vec![]);
+        let (tx, rx) = mpsc::channel();
+        app.orgchart.boards.rx = Some(rx);
+        tx.send((Some("bad".into()), Err("boom".into()))).unwrap();
+        app.orgchart_tick();
+        let b = &app.orgchart.boards;
+        assert!(b.read_at.contains_key("bad"), "a failed read counts as an attempt");
+        assert_eq!(b.read_errors.get("bad").map(String::as_str), Some("boom"));
+        assert!(b.error.is_empty() && b.retry_at.is_none(), "one board's failure doesn't pause the poll");
+        // The next request goes to the other board.
+        let rx = app.orgchart.boards.rx.take().expect("next read in flight");
+        drop(rx);
+        assert!(app.orgchart.boards.read_at.get("good").is_none());
+        let m = app.org_model(false);
+        let text: Vec<String> = app.orgchart_info_lines(&m, m.find("task:mid").unwrap(), 60).iter().map(|l| l.to_string()).collect();
+        assert!(text.iter().any(|l| l.contains("bad: unreadable (boom)")), "{text:?}");
+        assert!(!text.iter().any(|l| l.contains("good:")), "{text:?}");
+        // A good read clears that board's error.
+        let (tx, rx) = mpsc::channel();
+        app.orgchart.boards.rx = Some(rx);
+        tx.send((Some("bad".into()), Ok(json!({"items": []})))).unwrap();
+        app.orgchart_tick();
+        assert!(app.orgchart.boards.read_errors.is_empty());
+    }
+
+    #[test]
+    fn the_jump_closes_other_overlays_and_cancels_input() {
+        let mut app = org_app();
+        app.board.visible = true;
+        app.messages.visible = true;
+        app.input_mode = InputMode::SidebarSearch { query: String::new() };
+        app.handle_event(&key(KeyCode::F(6)));
+        app.orgchart.focus = Some("task:leaf".into());
+        app.handle_event(&key(KeyCode::Enter));
+        assert!(!app.orgchart.visible && !app.board.visible && !app.messages.visible);
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(app.cursor_session_uid().as_deref(), Some("ts-50-0"));
     }
 
     #[test]
