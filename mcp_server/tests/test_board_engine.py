@@ -115,6 +115,41 @@ class ComputeFlags(unittest.TestCase):
                       waiting_set_at=ago(minutes=45))
         self.assertEqual(flags(within, idle), {})
 
+    def test_an_active_item_inside_its_eta_is_not_idle_stale_or_background_stale(self):
+        idle = {LANE["pid"]: state("idle", ago(hours=5))}
+        busy = {LANE["pid"]: {**state("working-background"), "reported_at": ago(seconds=5)}}
+        inside = item(touched=ago(hours=8), eta_at=ago(minutes=-30), waiting_set_at=ago(hours=1))
+        self.assertEqual(flags(inside, idle), {})
+        self.assertEqual(flags(inside, busy), {})
+        # Errored or gone holders end the window at once; errored still flags.
+        errored = {LANE["pid"]: state("errored")}
+        self.assertEqual(set(flags(inside, errored)), {"holder_errored", "stale"})
+        gone = {LANE["pid"]: state(exited=True)}
+        self.assertIn("holder_gone", flags(inside, gone, live={"d1"}))
+        self.assertIn("stale", flags(inside, gone, live={"d1"}))
+        waiting_human = {LANE["pid"]: state("waiting-on-human")}
+        self.assertEqual(set(flags(inside, waiting_human)), {"holder_waiting_on_human"})
+
+    def test_a_passed_eta_flags_once_then_stale_after_the_fixed_grace(self):
+        idle = {LANE["pid"]: state("idle", ago(hours=5))}
+        just = item(touched=ago(hours=3), eta_at=ago(minutes=10))
+        self.assertEqual(flags(just, idle), {"eta_passed": {"eta_at": just.eta_at.isoformat()}})
+        later = item(touched=ago(hours=3), eta_at=ago(minutes=31))
+        got = flags(later, idle)
+        self.assertEqual(set(got), {"eta_passed", "stale"})
+        self.assertEqual(got["stale"], {"eta_at": later.eta_at.isoformat()})
+        # Activity since the ETA clears both; normal clocks resume.
+        touched = item(touched=ago(minutes=5), eta_at=ago(minutes=31))
+        self.assertEqual(flags(touched, idle), {})
+
+    def test_an_active_eta_is_capped_at_stale_background_s(self):
+        # Review of f24e170: eta="30d" must not silence an item for weeks.
+        idle = {LANE["pid"]: state("idle", ago(hours=9))}
+        far = item(touched=ago(hours=8), eta_at=ago(days=-30), waiting_set_at=ago(hours=8))
+        got = flags(far, idle, board={"stale_background_s": 6 * 3600})
+        self.assertEqual(set(got), {"eta_passed", "stale"})
+        self.assertEqual(got["eta_passed"]["eta_at"], ago(hours=2).isoformat())
+
     def test_stale_and_its_exemptions(self):
         self.assertEqual(flags(item(touched=ago(hours=3))), {"stale": None})
         blocker = item(2)
@@ -235,6 +270,12 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
             await conn.execute("UPDATE item_holders SET added_at = added_at - $1::interval", d)
             await conn.execute("UPDATE items SET stale_nudged_at = stale_nudged_at - $1::interval, "
                                "check_back_at = check_back_at - $1::interval", d)
+            # The engine's "pushed at" marks move with the other clocks.
+            for r in await conn.fetch("SELECT id, flag_pushed FROM items"):
+                marks = {k: ({**v, "at": (datetime.fromisoformat(v["at"]) - d).isoformat()}
+                             if isinstance(v, dict) and v.get("at") else v)
+                         for k, v in (r["flag_pushed"] or {}).items()}
+                await conn.execute("UPDATE items SET flag_pushed = $2 WHERE id = $1", r["id"], marks)
 
     async def pushes(self, kind=None):
         rows = await self.sql("SELECT kind, session_uid, text, owner_alert FROM item_pushes ORDER BY id")
@@ -260,12 +301,11 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(board_push), 1)
         self.assertEqual(board_push[0]["session_uid"], "orch-uid")
         self.assertIn("#1 stale (untouched 2h30m)", board_push[0]["text"])
-        # No re-push before repush_s.
+        # Never re-pushed on a timer: the item has not changed.
         await self.tick()
-        self.assertEqual(len(await self.pushes("board")), 1)
         await self.age(31)
         await self.tick()
-        self.assertEqual(len(await self.pushes("board")), 2)
+        self.assertEqual(len(await self.pushes("board")), 1)
         # Touching the item clears the flag.
         await items_db.update_items(self.pool, self.ref, HOLDER, [1], {"note": "still on it"})
         s = await self.tick()
@@ -348,7 +388,7 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         await self.tick()
         self.assertEqual(len(await self.pushes("escalation")), 1)
 
-    async def test_flags_raised_at_different_times_share_one_repush(self):
+    async def test_a_push_carries_only_flags_whose_item_changed(self):
         await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
         await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
         await self.age(150)
@@ -357,17 +397,82 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE items SET touched_at = now() - interval '3 hours' WHERE number = 2")
         await self.age(10)
-        await self.tick()                                   # #2 new: push 2 carries both
+        await self.tick()                                   # #2 new: push 2 is only #2
         second = (await self.pushes("board"))[-1]["text"]
-        self.assertIn("2 flags", second)
-        await self.age(25)
-        await self.tick()                                   # #1 would be due alone: not yet
-        self.assertEqual(len(await self.pushes("board")), 2)
-        await self.age(6)
+        self.assertIn("1 flag: #2 stale", second)
+        await self.age(120)
         await self.tick()
-        boards = await self.pushes("board")
-        self.assertEqual(len(boards), 3)
-        self.assertIn("2 flags", boards[-1]["text"])
+        self.assertEqual(len(await self.pushes("board")), 2, "nothing changed, nothing pushed")
+
+    async def test_a_flapping_background_flag_is_pushed_once_per_item_state(self):
+        # EP, 2026-10-20: the same stale_background flags arrived over and
+        # over. A holder flickering between background work and idle clears
+        # and re-raises the flag; with no change to the item it stays quiet.
+        busy = self.row(HOLDER, "working-background")
+        await self.beat(self.row(ORCH, "working", task=self.root), busy)
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        await self.age(7 * 60)
+        s = await self.tick()
+        self.assertEqual(s["raised"], [(1, "stale_background")])
+        self.assertEqual(len(await self.pushes("board")), 1)
+        for _ in range(3):
+            await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
+            await self.tick()
+            await self.beat(self.row(ORCH, "working", task=self.root), busy)
+            s = await self.tick()
+        self.assertEqual(s["raised"], [(1, "stale_background")], "it really did come back")
+        texts = [p["text"] for p in await self.pushes("board")]
+        self.assertEqual(sum("stale_background" in t for t in texts), 1, texts)
+        # A change to the item (a holder's update) makes it news again.
+        await items_db.update_items(self.pool, self.ref, HOLDER, [1], {"note": "still running"})
+        await self.age(8 * 60)  # (the outbox dedupes identical text within a minute)
+        await self.tick()
+        texts = [p["text"] for p in await self.pushes("board")]
+        self.assertEqual(sum("stale_background" in t for t in texts), 2, texts)
+
+    async def test_a_second_episode_of_an_episodic_flag_is_pushed_again(self):
+        # Review of f24e170: a second permission prompt after recovery has
+        # the same detail (holder names) and must still reach the orchestrator.
+        await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
+        await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a", "holders": [HOLDER]}])
+        for _ in range(2):
+            await self.beat(self.row(ORCH, "working", task=self.root),
+                            self.row(HOLDER, "waiting-on-human"))
+            s = await self.tick()
+            self.assertIn((1, "holder_waiting_on_human"), s["raised"])
+            await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
+            s = await self.tick()
+            self.assertIn((1, "holder_waiting_on_human"), s["cleared"])
+        # Both episodes were pushed (the outbox itself folds identical text
+        # inside one minute, which only a test reaches this fast).
+        rows = await self.sql("SELECT push_count FROM item_flags "
+                              "WHERE kind = 'holder_waiting_on_human' ORDER BY id")
+        self.assertEqual([r["push_count"] for r in rows], [1, 1])
+
+    async def test_an_active_eta_flags_eta_passed_once_then_stale(self):
+        await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "idle", 3600))
+        await items_db.create_items(self.pool, self.ref, ORCH, [
+            {"title": "bench", "holders": [HOLDER], "status": "active", "eta": "2h"}])
+        (row,) = await self.sql("SELECT status, eta_at FROM items")
+        self.assertEqual(row["status"], "active")
+        self.assertIsNotNone(row["eta_at"])
+        await self.age(150)                                 # untouched 2.5h, inside the eta
+        self.assertEqual((await self.tick())["raised"], [])
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET eta_at = now() - interval '5 min'")
+        s = await self.tick()
+        self.assertEqual(s["raised"], [(1, "eta_passed")])
+        self.assertEqual([p["session_uid"] for p in await self.pushes("eta_passed")], ["lane-uid"])
+        await self.tick()
+        self.assertEqual(len(await self.pushes("eta_passed")), 1, "once")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET eta_at = now() - interval '31 min'")
+        s = await self.tick()
+        self.assertEqual(s["raised"], [(1, "stale")], "no nudge round: the holder heard at the eta")
+        # A new eta clears both.
+        await items_db.update_items(self.pool, self.ref, HOLDER, [1], {"status": "active", "eta": "1h"})
+        s = await self.tick()
+        self.assertEqual(sorted(s["cleared"]), [(1, "eta_passed"), (1, "stale")])
 
     async def test_escalates_when_orchestrator_errored(self):
         await self.beat(self.row(ORCH, "errored", task=self.root), self.row(HOLDER, "working"))

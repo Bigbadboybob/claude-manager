@@ -1468,6 +1468,28 @@ impl App {
     /// Navigate the cursor up or down. +1 = down, -1 = up.
     /// Skips non-selectable items (Separators, headers with sessions).
     pub(super) fn navigate(&mut self, direction: i32) {
+        self.navigate_step(direction, true);
+    }
+
+    /// A-u / A-d: move half the focused column's visible rows, like vim's
+    /// Ctrl-u / Ctrl-d. Stops at the first or last row instead of wrapping.
+    pub(super) fn page_sidebar(&mut self, direction: i32) {
+        let rows = if self.cursor_column == SidebarColumn::Continuous && self.continuous_column_on {
+            self.continuous_page_rows
+        } else {
+            self.sidebar_page_rows
+        };
+        let half = (rows / 2).max(1);
+        for _ in 0..half {
+            if !self.navigate_step(direction.signum(), false) {
+                break;
+            }
+        }
+    }
+
+    /// One cursor step. Returns false when nothing moved; without `wrap` a
+    /// step past either end is refused.
+    fn navigate_step(&mut self, direction: i32, wrap: bool) -> bool {
         // S4: in the continuous column, navigate over its own row list
         // (every row is a selectable session, so just wrap ±1).
         if self.cursor_column == SidebarColumn::Continuous && self.continuous_column_on {
@@ -1480,7 +1502,7 @@ impl App {
                     .take()
                     .unwrap_or(Cursor::Workspace(0));
                 self.cursor_column = SidebarColumn::Main;
-                return;
+                return false;
             }
             let cur = match &self.cursor {
                 Cursor::Workspace(wi) => rows.iter().position(|r| r.ws_idx == *wi && r.sess_idx.is_none()).unwrap_or(0),
@@ -1494,7 +1516,11 @@ impl App {
                 _ => 0,
             };
             let n = (rows.len() + backtests.len()) as i32;
-            let next = (cur as i32 + direction).rem_euclid(n) as usize;
+            let raw = cur as i32 + direction;
+            if !wrap && !(0..n).contains(&raw) {
+                return false;
+            }
+            let next = raw.rem_euclid(n) as usize;
             if next < rows.len() {
                 let r = rows[next];
                 self.cursor = r.cursor();
@@ -1506,17 +1532,17 @@ impl App {
                     _ => Cursor::Backtest(BacktestCursor::Group),
                 };
             }
-            return;
+            return true;
         }
 
         let items = self.visual_items();
         if items.is_empty() {
-            return;
+            return false;
         }
 
         // Workspace headers are selectable only when the workspace has no
         // sessions (otherwise the cursor lives on a child session).
-        // Task headers are always selectable — they support A-d / A-x / A-e
+        // Task headers are always selectable — they support A-D / A-x / A-e
         // etc. even when they have sessions underneath.
         let is_selectable = |item: &VisualItem| match item {
             VisualItem::Session(_, _) => true,
@@ -1542,7 +1568,7 @@ impl App {
         };
 
         if !items.iter().any(is_selectable) {
-            return;
+            return false;
         }
 
         let cur_pos = items
@@ -1576,11 +1602,20 @@ impl App {
 
         let len = items.len() as i32;
         let mut next = cur_pos;
+        let mut found = false;
         for _ in 0..items.len() {
-            next = (next + direction).rem_euclid(len);
+            let raw = next + direction;
+            if !wrap && !(0..len).contains(&raw) {
+                return false;
+            }
+            next = raw.rem_euclid(len);
             if is_selectable(&items[next as usize]) {
+                found = true;
                 break;
             }
+        }
+        if !found {
+            return false;
         }
 
         match &items[next as usize] {
@@ -1606,6 +1641,7 @@ impl App {
             }
             _ => {}
         }
+        true
     }
 
     /// A-g: jump the cursor to the next session that needs a human, in

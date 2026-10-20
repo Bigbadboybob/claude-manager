@@ -17,31 +17,21 @@ const ALERT_FRAME_MS: u128 = 120;
 /// through per frame is `theme::ALERT_RAINBOW`.
 const ALERT_PULSE: &[&str] = &["\u{00b7}", "\u{2022}", "\u{25cf}", "\u{25c9}", "\u{25cf}", "\u{2022}"];
 
-/// Value spans for a color-picker field in the A-e settings dialogs: a
-/// "none" slot plus one swatch per `theme::USER_COLORS` entry, the current
-/// selection bracketed. Callers style their own label; a ←/→ hint is
-/// appended while the field is focused.
+/// Value spans for a color field in the A-e settings dialogs: the current
+/// swatch and its name, or "none". While focused, a hint names the key
+/// that opens the grid picker (`color_grid.rs`).
 fn color_picker_spans(current: Option<&str>, focused: bool) -> Vec<Span<'static>> {
     let dim = Style::default().fg(theme::DIM);
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        if current.is_none() { "[none]" } else { " none " },
-        if current.is_none() {
-            Style::default().fg(theme::TEXT)
-        } else {
-            dim
-        },
-    ));
-    for (name, color) in theme::USER_COLORS {
-        let marker = if current == Some(*name) {
-            "[\u{25a0}]"
-        } else {
-            " \u{25a0} "
-        };
-        spans.push(Span::styled(marker, Style::default().fg(*color)));
+    match current.and_then(|name| theme::user_color(name).map(|c| (name, c))) {
+        Some((name, color)) => {
+            spans.push(Span::styled("\u{2588}\u{2588} ", Style::default().fg(color)));
+            spans.push(Span::styled(name.to_string(), Style::default().fg(theme::TEXT)));
+        }
+        None => spans.push(Span::styled("none", dim)),
     }
     if focused {
-        spans.push(Span::styled("  \u{2190}/\u{2192}", dim));
+        spans.push(Span::styled("  Enter: pick", dim));
     }
     spans
 }
@@ -426,6 +416,7 @@ impl App {
                 }
                 InputMode::Normal => {}
             }
+            self.draw_color_grid(frame, area);
             if let Some(m) = peek_max {
                 if let InputMode::TaskPeek { scroll, max_scroll, .. } = &mut self.input_mode {
                     *max_scroll = m;
@@ -1608,6 +1599,7 @@ impl App {
         }
         frame.render_stateful_widget(List::new(items).highlight_style(Style::default()), rows_area, &mut state);
         self.continuous_list_state = state;
+        self.continuous_page_rows = rows_area.height;
     }
 
     fn backtest_list_items(
@@ -1829,13 +1821,13 @@ impl App {
         // bottom rows of the list and indicators vanish).
         let help_entries: Vec<(&str, &str)> = if self.keybinding_helper_visible { vec![
             ("A-/    filter", "A-?  helper"),
-            ("A-j/k  nav", "A-d  done"),
+            ("A-j/k  nav", "A-D  done"),
             ("A-h/l  column", "A-x  delete"),
             ("A-a    attach", "A-v  view"),
             ("A-n    new ws", "A-r  refresh"),
             ("A-s    +session", "A-q  quit"),
             ("A-w    close sess", "A-y  history"),
-            ("A-W    close ws", "A-u  resume"),
+            ("A-W    close ws", "A-U  resume wf"),
             ("A-e    settings", "F9   global"),
             ("A-H    hide", "A-z  catalog"),
             ("A-f    workflow", "A-t  planning"),
@@ -1844,7 +1836,7 @@ impl App {
             ("A-b    snapshot", "A-g  attention"),
             ("A-O    reopen ws", "A-F  fork task"),
             ("A-N    +section", "A-J/K sect order"),
-            ("PgUp/Dn scroll", ""),
+            ("PgUp/Dn scroll", "A-u/d half page"),
             ("A-Ent  newline", "A-;  recent"),
             ("A-p    find", "A-i  info"),
             ("A-'    yank", "A-M  mouse"),
@@ -2322,6 +2314,7 @@ impl App {
             &mut state,
         );
         self.sidebar_list_state = state;
+        self.sidebar_page_rows = list_height;
 
         if helper_height > 0 {
             let help_y = inner.y + inner.height.saturating_sub(helper_height);
@@ -2533,7 +2526,7 @@ impl App {
                 Style::default().fg(theme::ATTN),
             ));
         }
-        // Background worktree cleanups (Alt+d / Alt+Shift+w reap).
+        // Background worktree cleanups (Alt+D / Alt+Shift+w reap).
         if let Some(progress) = self.cleanup_progress() {
             rollup.push(Span::styled(format!("\u{27f2} {progress} "), Style::default().fg(theme::MUTED)));
         }

@@ -1,6 +1,6 @@
 # Closing tasks and reclaiming worktrees
 
-In the work view, **Alt+d** opens the completion dialog for the selected task.
+In the work view, **Alt+D** opens the completion dialog for the selected task.
 **Keep worktrees** is the default. Use Tab or the arrow keys to select
 **Reap this task + descendants** and press Enter. Reap does not wait for the
 preview: Enter marks the task done (or closes the workspace), closes the
@@ -15,11 +15,11 @@ the preview, which names the task that owns it.
 
 **Alt+Shift+w** opens the same choice for closing a workspace. Closing a
 workspace does not mark its associated planning tasks done: any nonterminal
-task still protects its checkout. For task completion and cleanup, use Alt+d
+task still protects its checkout. For task completion and cleanup, use Alt+D
 on that task's header. Plain Alt+w retains its existing close-session behavior.
 A workspace containing several tasks requires selecting a specific task before
-Alt+d; cleanup never guesses which one to complete.
-For an exited worker whose viewer binding is missing, Alt+d resolves a single
+Alt+D; cleanup never guesses which one to complete.
+For an exited worker whose viewer binding is missing, Alt+D resolves a single
 associated task from the host's checkout inventory before completion. A
 workspace-close preview includes the workspace's own task owners; an open
 associated task is reported as needing completion, not as unrelated sharing.
@@ -43,7 +43,7 @@ The policy applies to newly adopted workspaces after the viewer update. Older em
 - A session Owner used in the last two hours is never closed: typed into, shown in the TUI (the viewer reports the session it shows to its owning daemon with `session.viewed`, on selection and every five minutes), or revived, resumed or started by Owner. A revived worker on a still-done task therefore stays up; there is no need to reopen the task first. View stamps live in the brain's memory, so after a brain restart every session counts as used at start, which only delays sweeps by one window.
 - A closed worker says why: its exit record carries `killed_by: "terminal-task-sweep (terminal task)"`, and the sidebar row, the Alt+i peek and the Alt+Shift+O reopen picker show **closed: task done** instead of a bare exit. `A-R` revives it as before.
 
-Automatic closure never submits a reap request. The scheduled reaper still applies its usual seven-day retention and task/activity protections; an unfinished triage task keeps its checkout. For immediate cleanup later, **Alt+Shift+O** opens past workspaces; type to filter them by workspace or task name, branch, worktree path, session label or host (Esc clears the query, then closes). Reopen the workspace, then use **Alt+d → Reap this task + descendants** once that task is finished. Reopening returns bound Done tasks to Running and can resume designated designer sessions; restoring other closed sessions is optional. Cloud paths are not checked on the laptop or falsely labelled gone: the owning host validates them when launching sessions or previewing cleanup. A missing local worktree still blocks reopening.
+Automatic closure never submits a reap request. The scheduled reaper still applies its usual seven-day retention and task/activity protections; an unfinished triage task keeps its checkout. For immediate cleanup later, **Alt+Shift+O** opens past workspaces; type to filter them by workspace or task name, branch, worktree path, session label or host (Esc clears the query, then closes). Reopen the workspace, then use **Alt+D → Reap this task + descendants** once that task is finished. Reopening returns bound Done tasks to Running and can resume designated designer sessions; restoring other closed sessions is optional. Cloud paths are not checked on the laptop or falsely labelled gone: the owning host validates them when launching sessions or previewing cleanup. A missing local worktree still blocks reopening.
 
 Task completion previews the owning host and other configured remote hosts,
 so CM children created on a different worker host can be included. A remote

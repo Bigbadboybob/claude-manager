@@ -839,7 +839,7 @@ impl App {
             if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
                 *slot = updated;
             }
-            self.set_status_msg("Workflow paused (A-u to resume)");
+            self.set_status_msg("Workflow paused (A-U to resume)");
         }
     }
 

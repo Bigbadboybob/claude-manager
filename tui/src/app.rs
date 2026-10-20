@@ -67,6 +67,7 @@ mod availability;
 mod agent_state;
 mod board;
 mod owner_blocked;
+mod color_grid;
 mod unread;
 
 pub(crate) use lifecycle::{attach_via_daemon, try_attach_via_daemon_with_deps};
@@ -256,6 +257,12 @@ pub struct App {
     pub keybinding_helper_visible: bool,
     sidebar_list_state: ListState,
     continuous_list_state: ListState,
+    /// Rows the main sidebar list and the continuous column showed on the
+    /// last draw; A-u / A-d page by half of the focused one.
+    pub(crate) sidebar_page_rows: u16,
+    /// The open grid color picker over an A-e form, if any.
+    pub(crate) color_grid: Option<color_grid::ColorGrid>,
+    pub(crate) continuous_page_rows: u16,
     pub view_mode: ViewMode,
     pub planning: PlanningView,
     pub should_quit: bool,
@@ -972,6 +979,9 @@ impl App {
             keybinding_helper_visible,
             sidebar_list_state: ListState::default(),
             continuous_list_state: ListState::default(),
+            sidebar_page_rows: 0,
+            color_grid: None,
+            continuous_page_rows: 0,
             view_mode: ViewMode::Sessions,
             planning,
             should_quit: false,
@@ -1149,7 +1159,7 @@ impl App {
                 .and_then(|ts| ts.task_id.clone()),
             Cursor::Workspace(_) => None,
             // Deliberately None even on a Run row: task-scoped actions
-            // (A-d done, A-x delete) must not act on a backtest task from
+            // (A-D done, A-x delete) must not act on a backtest task from
             // the sidebar — the dispatch daemon owns its lifecycle.
             Cursor::Backtest(_) => None,
             // A section header is a display grouping, not a task.

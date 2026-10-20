@@ -78,7 +78,12 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
 - Running a job longer than about 20 minutes (tests, a backtest, training):
   `item_set(14, "waiting", eta="40m", note="full C2 run")`. Waiting before its
   ETA is never flagged idle; past ETA plus a grace it is flagged overdue and you
-  are asked first.
+  are asked first. Still actively working but expect to take a while:
+  `item_set(14, "active", eta="2h")` keeps it from idle/stale flags until then;
+  at the ETA without an update you are asked (`eta_passed`).
+- Progress in chat counts: a top-level post naming `#14`, or a reply in its
+  thread, refreshes the item when you hold it (or steward/orchestrate the
+  board). Quoting someone (`>`) or mentioning another item does not.
 - Waiting on another item: `item_set(15, blocked_by=[14])`. It must be a real,
   open item on the same board, and cycles are refused. When #14 is done, #15
   goes back to active and you are woken. Waiting on anything else ("EP GO",
@@ -127,7 +132,7 @@ then has no cwd and its tools fail. Ask Owner to close the workspace
 anyway, CM re-creates the checkout from its branch and tells you.
 
 Owner can choose **Reap this task + descendants** when completing a task in the
-work view (Alt+d). This preserves branches/WIP/artifacts and retains active,
+work view (Alt+D). This preserves branches/WIP/artifacts and retains active,
 shared, pinned or continuous work. Raw `git worktree add` creation is tracked by
 a chained post-checkout hook. Keep inherited `CM_TUI_SESSION_ID`; do not replace
 the hook or guess historical ownership from branch ancestry. For intentionally

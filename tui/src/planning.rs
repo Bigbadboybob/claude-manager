@@ -2182,6 +2182,9 @@ impl PlanningView {
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
+                    // `A-D`: mark done (moved from A-d, 2026-10-20, to match
+                    // the Sessions view where A-d pages the sidebar).
+                    KeyCode::Char('d') | KeyCode::Char('D') => { return self.cycle_status_to_done(); }
                     // `A-O` (Alt+Shift+O): reopen a done task's worktree.
                     // Only fires on a focused task whose status is Done.
                     KeyCode::Char('o') | KeyCode::Char('O') => {
@@ -2316,7 +2319,9 @@ impl PlanningView {
                         }
                         return self.delete_task();
                     }
-                    KeyCode::Char('d') => { return self.cycle_status_to_done(); }
+                    // A-D marks done (Alt+Shift+d arrives here when the
+                    // terminal folds Shift into the char).
+                    KeyCode::Char('D') => { return self.cycle_status_to_done(); }
                     KeyCode::Char('f') => { self.cancel_visual(); return self.start_launch(); }
                     KeyCode::Char('u') => {
                         self.cancel_visual();
@@ -4275,7 +4280,7 @@ impl PlanningView {
             dim,
         )));
         help_lines.push(Line::from(Span::styled(
-            " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+            " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-D done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
             dim,
         )));
         frame.render_widget(Paragraph::new(help_lines), help_area);
@@ -4487,7 +4492,7 @@ impl PlanningView {
         if inner.height < 4 || inner.width < 4 { return; }
 
         let help_entries: Vec<(&str, &str)> = vec![
-            ("A-j/k  nav", "A-d    done"),
+            ("A-j/k  nav", "A-D    done"),
             ("A-J/K  reorder", "A-f    launch"),
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
@@ -4723,7 +4728,7 @@ impl PlanningView {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(" PROPOSED ", Style::default().fg(theme::TEXT).bg(theme::REMOTE).add_modifier(Modifier::BOLD)),
-                    Span::styled("  Alt+a to accept, Alt+d to reject", Style::default().fg(theme::DIM)),
+                    Span::styled("  Alt+a to accept, Alt+D to reject", Style::default().fg(theme::DIM)),
                 ]));
             }
             lines.push(Line::from(""));
@@ -6079,6 +6084,32 @@ mod tests {
             .map(|pd| pd.project.clone())
             .collect();
         view
+    }
+
+    /// 2026-10-20: mark done moved from A-d to A-D (A-d pages the Sessions
+    /// sidebar). Both Shift encodings reach it; plain A-d no longer does.
+    #[test]
+    fn alt_shift_d_marks_done_and_plain_alt_d_does_not() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: char, m: KeyModifiers| CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(c), m));
+        let is_done = |a: &PlanAction| matches!(a, PlanAction::UpdateTask { fields, .. }
+            if fields.get("status") == Some(&serde_json::json!("done")));
+
+        let focused = || {
+            let mut view = view_with_one_task();
+            view.project_data[0].layout.columns = vec![vec![GridItem::Task("toplevel".to_string())]];
+            view.rebuild_unified_cols();
+            view.cursor = GridCursor { col: 0, row: 0 };
+            assert!(view.selected_task_loc().is_some(), "cursor on the task");
+            view
+        };
+        let mut view = focused();
+        assert!(!is_done(&view.handle_event(&key('d', KeyModifiers::ALT))));
+        assert_eq!(view.project_data[0].tasks[0].status, PlanStatus::Backlog);
+        assert!(is_done(&view.handle_event(&key('D', KeyModifiers::ALT | KeyModifiers::SHIFT))));
+
+        let mut view = focused();
+        assert!(is_done(&view.handle_event(&key('D', KeyModifiers::ALT))), "Shift folded into the char");
     }
 
     /// Default is Codex, and ←/→ toggles to Claude. The chosen engine

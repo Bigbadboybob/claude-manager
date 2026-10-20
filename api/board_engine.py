@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -35,8 +36,58 @@ ARCHIVE_AFTER = timedelta(hours=24)
 ENGINE_KINDS = frozenset({
     "unassigned", "holder_gone", "holder_idle", "holder_waiting_on_human",
     "holder_errored", "stale", "stale_background", "overdue", "check_back",
-    "blocker_dropped",
+    "blocker_dropped", "eta_passed",
 })
+# An active item whose ETA passed with no activity since becomes stale this
+# long after the ETA (Board-Steward, 2026-10-20: a fixed grace, not a formula).
+ETA_STALE_GRACE_S = 1800
+# Kinds the holder hears about first; the orchestrator only after repush_s.
+HOLDER_FIRST = frozenset({"overdue", "eta_passed"})
+# Each raise of these is a new episode (another permission prompt, another
+# error, another exit or drop), news even when the item looks the same.
+EPISODIC = frozenset({"holder_errored", "holder_waiting_on_human", "holder_gone",
+                      "blocker_dropped"})
+
+
+def flag_fingerprint(item: Item, kind: str, detail) -> str:
+    """The non-time part of the item state a flag is about: its status,
+    holders and the flag's own detail. Together with "no activity since the
+    last push" (`_news`) it decides whether a flag is news. Any member's
+    write touches the item, so every status, ETA, blocker or note change also
+    counts as activity."""
+    state = {
+        "kind": kind,
+        "status": item.status,
+        "holders": sorted(h["pid"] for h in item.holders),
+        "detail": detail,
+    }
+    return hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _news(item: Item | None, key: str, kind: str, detail) -> bool:
+    """A flag reaches an audience again only when the item changed since it
+    last did: a different status, holders or detail, or any activity since.
+    Never on a timer, and never just because the flag cleared and came back
+    (2026-10-20: EP saw the same seven stale_background flags pushed over and
+    over). `key` names the audience: `kind` (orchestrator), `kind:holder`,
+    `kind:escalated` (Owner)."""
+    if item is None:
+        return False
+    mark = item.flag_pushed.get(key)
+    if not isinstance(mark, dict) or mark.get("fp") != flag_fingerprint(item, kind, detail):
+        return True
+    episode = max(t for t in (item.touched_at, item.clock_reset_at) if t is not None)
+    try:
+        at = datetime.fromisoformat(mark["at"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return episode > at
+
+
+def _mark(item: Item, key: str, kind: str, detail, now: datetime) -> dict:
+    mark = {"fp": flag_fingerprint(item, kind, detail), "at": iso(now)}
+    item.flag_pushed[key] = mark
+    return mark
 
 
 def background_busy(row: dict | None, now: datetime) -> bool:
@@ -144,7 +195,30 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
     exempt = exempt or item.status == OWNER_BLOCKED
 
     busy = any(background_busy(states.get(h["pid"]), now) for h in item.holders)
-    if (board.get("holder_idle_enabled") and (item.status == "active" or held_open) and item.holders
+
+    # An active item with an ETA (§5): inside it, no idle, stale or
+    # check-back clock. Errored, waiting-on-human and blocker flags always
+    # apply, and a holder that is gone or errored ends the window at once.
+    # At the ETA, with no activity since, `eta_passed` (once, anchored on the
+    # ETA); ETA_STALE_GRACE_S later, stale. New activity or a new ETA clears
+    # both.
+    # The quiet window is capped at stale_background_s from when the ETA
+    # was set, so eta="30d" cannot silence an item for weeks.
+    eta_window = eta_overrun = False
+    if item.status == "active" and item.eta_at is not None:
+        cap = board.get("stale_background_s")
+        cap = 21600 if cap is None else cap
+        eta = min(item.eta_at, (item.waiting_set_at or touched) + timedelta(seconds=cap))
+        trouble = any(status[h["pid"]] in ("gone", "errored") for h in item.holders)
+        if now < eta:
+            eta_window = not trouble
+        elif touched <= eta:
+            flags["eta_passed"] = {"eta_at": iso(eta)}
+            eta_overrun = True
+            if _seconds(now - eta) >= ETA_STALE_GRACE_S:
+                flags["stale"] = {"eta_at": iso(eta)}
+    if (not eta_window and not eta_overrun
+            and board.get("holder_idle_enabled") and (item.status == "active" or held_open) and item.holders
             and not busy and all(status[h["pid"]] == "idle" for h in item.holders)):
         since = []
         for h in item.holders:
@@ -159,7 +233,7 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
     # A parked item (free-text block with a check-back time) is not stale
     # before its check-back; the check_back flag takes over after it.
     parked = bool(item.blocked_on and item.check_back_at and now < item.check_back_at)
-    if not exempt and not parked and working:
+    if not exempt and not parked and working and not eta_window and not eta_overrun:
         threshold = board["stale_s"]
         if item.status == "waiting" and item.eta_at and item.waiting_set_at:
             threshold = max(threshold, _seconds(item.eta_at - item.waiting_set_at))
@@ -178,9 +252,37 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
         if now > item.eta_at + timedelta(seconds=grace):
             flags["overdue"] = {"eta_at": iso(item.eta_at)}
 
-    if item.blocked_on and item.check_back_at and now >= item.check_back_at:
+    if (item.blocked_on and item.check_back_at and now >= item.check_back_at
+            and not eta_window):
         flags["check_back"] = {"check_back_at": iso(item.check_back_at)}
     return flags
+
+
+def _due(flag: dict, item: Item | None, suffix: str = "") -> bool:
+    if _news(item, flag["kind"] + suffix, flag["kind"], flag.get("detail")):
+        return True
+    if flag["kind"] not in EPISODIC or item is None:
+        return False
+    # Raised again after it last reached this audience: a new episode.
+    mark = item.flag_pushed.get(flag["kind"] + suffix) or {}
+    try:
+        return flag["raised_at"] > datetime.fromisoformat(mark["at"])
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+async def _mark_pushed(conn, items: dict, flags: list[dict], now: datetime,
+                       suffix: str = "") -> None:
+    by_item: dict[int, dict] = {}
+    for f in flags:
+        item = items.get(f["n"])
+        if item is None:
+            continue
+        key = f["kind"] + suffix
+        by_item.setdefault(item.id, {})[key] = _mark(item, key, f["kind"], f.get("detail"), now)
+    for item_id, marks in by_item.items():
+        await conn.execute("UPDATE items SET flag_pushed = flag_pushed || $2::jsonb WHERE id = $1",
+                           item_id, marks)
 
 
 def _short(seconds: float) -> str:
@@ -214,10 +316,14 @@ def describe(flag: dict, item: Item | None, states: dict, now: datetime) -> str:
     elif kind in ("stale", "stale_background") and item is not None:
         touched = max(t for t in (item.touched_at, item.clock_reset_at) if t is not None)
         why = f"untouched {_short(_seconds(now - touched))}"
+        if kind == "stale" and detail.get("eta_at") and item.eta_at:
+            why += f", eta passed {_short(_seconds(now - item.eta_at))} ago"
         if kind == "stale_background":
             why += ", holder busy in background work"
-    elif kind == "overdue" and item is not None and item.eta_at:
+    elif kind in ("overdue", "eta_passed") and item is not None and item.eta_at:
         why = f"eta passed {_short(_seconds(now - item.eta_at))} ago"
+        if kind == "eta_passed":
+            why += ", no activity since"
     elif kind == "unassigned" and item is not None:
         # Measured like the flag: since the item was last touched (made open
         # or handed back), not since the flag was raised.
@@ -367,7 +473,7 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
                         continue
                     if (item.n, kind) in snoozed:
                         continue
-                    if kind == "stale":
+                    if kind == "stale" and not (detail or {}).get("eta_at"):
                         step = stale_step(item, board, now)
                         if step == "nudge":
                             # Quiet first: the holder gets a chance to touch
@@ -386,11 +492,13 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
                     tx.raise_flag(item, kind, detail)
                     tx.dirty.add(item.n)
                     summary["raised"].append((item.n, kind))
-                    if kind == "overdue":
+                    if kind in HOLDER_FIRST and _news(item, f"{kind}:holder", kind, detail):
                         for h in item.holders:
-                            tx._push(item, h, "overdue",
+                            tx._push(item, h, kind,
                                      f"[cm-board {board['slug']}] #{item.n} \"{item.title}\" is "
                                      f"past its eta: update it (new eta, done, or hand back).")
+                        _mark(item, f"{kind}:holder", kind, detail, now)
+                        tx.dirty.add(item.n)
                 for kind in sorted(set(item.open_flags) - set(want)):
                     if kind in ENGINE_KINDS and tx.resolve_flag(item, kind, "cleared"):
                         summary["cleared"].append((item.n, kind))
@@ -398,7 +506,7 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
 
             orch = await _orchestrator_row(conn, board, now)
             await _push_orchestrator(conn, board, items, states, orch, now, summary)
-            await _escalate(conn, board, orch, now, summary)
+            await _escalate(conn, board, items, orch, now, summary)
     return summary
 
 
@@ -417,14 +525,12 @@ async def _open_flags(conn, board_id: str) -> list[dict]:
 async def _push_orchestrator(conn, board, items, states, orch, now, summary) -> None:
     flags = await _open_flags(conn, board["id"])
     repush = timedelta(seconds=board["repush_s"])
-    # The holder hears about an overdue item first.
+    # The holder hears about an overdue item or a passed ETA first.
     eligible = [f for f in flags
-                if not (f["kind"] == "overdue" and now - f["raised_at"] < repush)]
-    # One wake carries every open flag: when any is new or due, all go, and
-    # their re-push clocks align so k flags never mean k wakes per window.
-    trigger = any(f["last_pushed_at"] is None or now - f["last_pushed_at"] >= repush
-                  for f in eligible)
-    due = eligible if trigger else []
+                if not (f["kind"] in HOLDER_FIRST and now - f["raised_at"] < repush)]
+    # Only flags whose item changed since they last reached the orchestrator.
+    # One wake carries all of them.
+    due = [f for f in eligible if _due(f, items.get(f["n"]))]
     closed: dict[str, list[int]] = {}
     digest_due = (board.get("last_digest_at") is None
                   or now - board["last_digest_at"] >= timedelta(seconds=board["digest_s"]))
@@ -459,6 +565,7 @@ async def _push_orchestrator(conn, board, items, states, orch, now, summary) -> 
                 WHERE id = ANY($1::bigint[])""",
             [f["id"] for f in due], now,
         )
+        await _mark_pushed(conn, items, due, now)
     summary["pushed"] = True
 
 
@@ -466,10 +573,11 @@ async def _push_orchestrator(conn, board, items, states, orch, now, summary) -> 
 _UNROUTABLE: set[str] = set()
 
 
-async def _escalate(conn, board, orch, now, summary) -> None:
+async def _escalate(conn, board, items, orch, now, summary) -> None:
     flags = await _open_flags(conn, board["id"])
     threshold = timedelta(seconds=board["escalate_s"])
-    stuck = [f for f in flags if f["escalated_at"] is None and now - f["raised_at"] >= threshold]
+    stuck = [f for f in flags if f["escalated_at"] is None and now - f["raised_at"] >= threshold
+             and _due(f, items.get(f["n"]), ":escalated")]
     if not stuck:
         return
     orch_state = "none"
@@ -499,6 +607,7 @@ async def _escalate(conn, board, orch, now, summary) -> None:
                 owner_alert=True)
     await conn.execute("UPDATE item_flags SET escalated_at = $2 WHERE id = ANY($1::bigint[])",
                        [f["id"] for f in stuck], now)
+    await _mark_pushed(conn, items, stuck, now, ":escalated")
     summary["escalated"] = True
 
 

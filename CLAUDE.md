@@ -29,7 +29,7 @@ See [cloud responsiveness verification](doc/cloud-responsiveness-fixes.md).
 
 ## Task worktree cleanup
 
-In the work view, Alt+d offers **Keep worktrees** (default) or immediate cleanup
+In the work view, Alt+D offers **Keep worktrees** (default) or immediate cleanup
 of the selected task and tracked descendants. Alt+Shift+w offers workspace
 closure without changing planning task status. Cleanup runs durably on the
 owning hosts, retains branches and useful artifacts, and protects active,
@@ -159,7 +159,7 @@ A workflow is a TOML-defined state machine of agent roles running as sibling ses
 ### Workflow keybindings (Sessions view)
 
 - `A-f` — launch a workflow on the focused session (prefills feedback mode)
-- `A-u` — resume a paused workflow (runs auto-pause when you type into a participant session)
+- `A-U` — resume a paused workflow (runs auto-pause when you type into a participant session)
 - `A-o` — stop the workflow (sessions stay open; their transcripts persist)
 - `A-y` — show the workflow's history
 
@@ -173,7 +173,8 @@ Global:
 - `A-?` — show/hide shortcut hints in Sessions and Planning; saved in `~/.cm/tui-sessions.json` and restored on viewer restart
 - `A-q` — quit
 - `A-j/k` — navigate
-- `A-d` — mark task done
+- `A-u` / `A-d` — Sessions view: page the focused sidebar column (main or continuous) up / down by half its visible rows, like vim's Ctrl-u / Ctrl-d; stops at the ends
+- `A-D` — mark task done (Sessions and Planning; moved from `A-d` 2026-10-20)
 - `A-x` — delete
 - `A-,` — toggle the activity feed (5-line strip above the status bar showing recent agent-initiated mutations: start_session, send_input, kill_session, start/stop_workflow, create_subtask, mark_subtask_done). Off by default.
 
@@ -187,7 +188,7 @@ Sessions view:
 - `A-h` / `A-l` — move the sidebar cursor LEFT / RIGHT between the main column and the **continuous column** (when the continuous column is shown; see `A-c`). `A-j`/`A-k` stay vertical within the focused column. See `DESIGN_CONTINUOUS_PANEL.md`.
 - `A-c` — toggle the dedicated **continuous column** (orchestrators with their spawned subtasks nested) on/off. This is the single continuous control: ON = a third pane splits off the right (terminal | main | continuous) showing the continuous tree; OFF = continuous tasks are hidden entirely. Continuous tasks (an orchestrator + its subtasks, matched by `managed_by_uid` **or** task-tree `parent_task_id` **or** — for same-task workers like momentum-detective's ephemeral `detective-*` spawns, which carry the orchestrator's own `task_id` and no subtask — `managed_by_uid.is_some() && task_id == orchestrator.task_id`, so they group correctly across orchestrator respawns; pre-fix a prior instance's worker fell into the main sidebar the moment the scheduler respawned its parent) render **only** in this column — never in the main sidebar. Persisted. (The old `A-C` column toggle + the separate `A-c` master-hide were merged into this one key.)
 - `A-N` — **new sidebar section** (doc/sidebar-sections.md). Sections are Owner-created, collapsible groups of workspaces in the Task sub-view, stored in the local manifest (`sections` + `workspace_sections` sidecars) — pure display, orthogonal to subtasks and planning initiatives. Agents can discover sections with `list_sidebar_sections` and queue workspace moves with `set_session_section`; see the guide for scope and delivery receipts. Sections render first (in display order), loose workspaces after. On a section header: `Space`/`Enter` fold/unfold, `A-e` rename/recolor, `A-x` delete (members become loose), `A-J`/`A-K` reorder, `A-i` peek members, and `A-n` creates the new workspace INSIDE the section. Membership: the **Section** field on the workspace / task `A-e` forms (`auto` = inherit, `none` = explicitly loose, or a section); a workspace with no explicit choice inherits its parent task's section through `parent_task_id` (so an agent's `create_subtask` lands under its parent's project) or, for `propose_task` rows, through `metadata.filer.task_id`. `A-n` while focused on any row inside a section also joins it. Status sub-view is unchanged (flat).
-- `A-e` — settings for the focused row (Tab cycles fields; Space toggles checkboxes; Space/←/→ cycles color pickers). On a **session**: label, idle/burst timers, hidden, notify-on-idle, **global perms**, accent color, and **Transcript** (Enter opens the same picker as A-s's Resume field and rebinds the row — repair a mis-detected binding, or point a dead row at the right conversation before `A-R` revives it; the pick applies immediately and closes the form, so save other edits first). On a live session a rebind is metadata only: the pane keeps its conversation until you run `/resume <id>` in it, after which the binding follows on its own (below). On a **workspace**: name, accent color (cascades to its sessions), **pinned** (pinned workspaces sort to the top of the sidebar with a 📌 marker), **section** (see `A-N`). On a **task** subheader: name, accent color (stored TUI-side in the manifest's `task_colors` sidecar — tasks live in the planning API), **section** (applies to the task's workspace). On a **section header**: name, accent color. Colors come from the named `USER_COLORS` palette and tint the row in the sidebar; selection highlight still overrides.
+- `A-e` — settings for the focused row (Tab cycles fields; Space toggles checkboxes; on a Color field Enter/Space/←/→ opens a grid picker — arrows move and preview, Enter picks, Esc restores). On a **session**: label, idle/burst timers, hidden, notify-on-idle, **global perms**, accent color, and **Transcript** (Enter opens the same picker as A-s's Resume field and rebinds the row — repair a mis-detected binding, or point a dead row at the right conversation before `A-R` revives it; the pick applies immediately and closes the form, so save other edits first). On a live session a rebind is metadata only: the pane keeps its conversation until you run `/resume <id>` in it, after which the binding follows on its own (below). On a **workspace**: name, accent color (cascades to its sessions), **pinned** (pinned workspaces sort to the top of the sidebar with a 📌 marker), **section** (see `A-N`). On a **task** subheader: name, accent color (stored TUI-side in the manifest's `task_colors` sidecar — tasks live in the planning API), **section** (applies to the task's workspace). On a **section header**: name, accent color. Colors come from the named `USER_COLORS` palette (28: light/base/dark of eight hues plus neutrals; the original eight names keep their values) and tint the row in the sidebar; selection highlight still overrides.
 - `A-v` — toggle Status / Task sub-view
 - `A-g` — jump to the next session needing attention (pending `notify_user` alerts first, then idle sessions; wraps, crosses into the continuous column)
 - `A-;` — MRU quick-switch: alt-tab through recently focused sessions (first press ping-pongs A↔B; repeated presses walk deeper; any other key resets the walk)
@@ -197,7 +198,7 @@ Sessions view:
 - `A-'` — yank the focused session's last assistant message to the clipboard (OSC 52, works over SSH; ~100KB cap with truncation notice; reads this machine's transcripts only, so a session on another host or with no bound transcript reports that in the status line)
 - **Codex scrollback**: Codex launches inline (`--no-alt-screen`), so its history reaches CM's scrollback (mouse wheel, Shift+PageUp). Existing sessions switch after `A-R`. Turn this off with `codex_inline_scrollback = false` in `daemon.toml` / `tui-settings.toml`. In an alternate-screen app without mouse reporting, the wheel sends PageUp/PageDown to Codex and arrow keys to other apps. See [terminal rendering](doc/terminal-rendering.md#scrolling-codex-sessions).
 - `A-r` — refresh
-- `A-R` — **revive / restart** the focused session in place: same uid, label, and task binding, with the conversation resumed (claude `--resume` / codex `resume`; bash respawns fresh). On a **dead** session it's a revive; on a **live** session it's a forced restart — the TUI kills the daemon child, waits (bounded ~2s) for the reaper to clear the uid, then runs the same revive flow (use case: pick up an updated agent binary/model without losing the conversation). Local sessions re-run the startup-restore primitive for one slot (re-attach if the daemon still holds the uid live, else respawn-resumed); remote sessions go through the daemon's `session.revive` RPC (argv/env composed daemon-side) and then auto-reattach via the deferred-reattach flow. Workflow participants are refused (the workflow engine owns their lifecycle — `A-u` resumes the run), as are continuous sessions (scheduler-owned). Codex resumes omit CM permission overrides for compatibility with the remote frontend; fresh sessions retain YOLO. See [restart permissions](doc/messaging/NATIVE_NOTIFICATIONS.md#codex-restart-permissions-cli-0154).
+- `A-R` — **revive / restart** the focused session in place: same uid, label, and task binding, with the conversation resumed (claude `--resume` / codex `resume`; bash respawns fresh). On a **dead** session it's a revive; on a **live** session it's a forced restart — the TUI kills the daemon child, waits (bounded ~2s) for the reaper to clear the uid, then runs the same revive flow (use case: pick up an updated agent binary/model without losing the conversation). Local sessions re-run the startup-restore primitive for one slot (re-attach if the daemon still holds the uid live, else respawn-resumed); remote sessions go through the daemon's `session.revive` RPC (argv/env composed daemon-side) and then auto-reattach via the deferred-reattach flow. Workflow participants are refused (the workflow engine owns their lifecycle — `A-U` resumes the run), as are continuous sessions (scheduler-owned). Codex resumes omit CM permission overrides for compatibility with the remote frontend; fresh sessions retain YOLO. See [restart permissions](doc/messaging/NATIVE_NOTIFICATIONS.md#codex-restart-permissions-cli-0154).
 
 **Alt+s Resume preserves identity.** Local and cloud Resume reuse the original inactive CM UID and saved task, parent, workspace, permissions and session preferences. Running conversations are refused; attach to them instead. Keeping the UID on the same daemon preserves chat identity. Snapshot seeds still create a new identity. See [session resume and recovery](doc/session-resume-identity.md).
 
@@ -235,7 +236,7 @@ on a synthetic subtask row — subtasks have no raw position to
 operate on. `A-J/K` reorder is the exception: on a subtask it
 swaps with the adjacent sibling under the same parent (clamped
 to the parent's slot range, so subtasks never leak out from
-under their parent). Task-level ops (`A-d` done, `A-s/S` status,
+under their parent). Task-level ops (`A-D` done, `A-s/S` status,
 `A-e` edit, `A-x` delete, `A-f` launch) work on subtasks normally
 since they go through the slug, not the raw layout.
 

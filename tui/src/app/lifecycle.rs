@@ -2338,7 +2338,7 @@ impl App {
         let Some(ts) = ws.sessions.get(si) else { return };
         if ts.workflow_run_id.is_some() {
             self.set_status_msg(
-                "Workflow participant — the workflow owns its lifecycle (A-u resumes the run)",
+                "Workflow participant — the workflow owns its lifecycle (A-U resumes the run)",
             );
             return;
         }
@@ -3130,7 +3130,7 @@ impl App {
                     .filter_map(|t| t.task_id.clone())
                     .collect();
                 if bound.len() > 1 {
-                    self.set_status_msg("Multiple tasks bound — pick one (A-d on its header)");
+                    self.set_status_msg("Multiple tasks bound — pick one (A-D on its header)");
                     return;
                 }
                 match bound.into_iter().next() {
@@ -3186,7 +3186,7 @@ impl App {
     /// P1 (Feature 3), hoisted: soft-close every "spent" workspace so none
     /// lingers after its work finishes. Originally this ran as per-site
     /// `maybe_reap_spent_workspace(wi)` calls at two specific teardown sites
-    /// (A-d `mark_active_done`, the manifest `Exited`-diff prune) — every
+    /// (A-D `mark_active_done`, the manifest `Exited`-diff prune) — every
     /// other way a session could end (daemon-side kills seen only as attach
     /// EOF, exits missed while the TUI was down or the tunnel disconnected,
     /// a task flipping terminal AFTER its sessions were already gone, an
@@ -8362,7 +8362,7 @@ pub(crate) mod revive_session_tests {
     }
 
     /// Workflow participants are workflow-engine-owned; revive refuses
-    /// them and points at A-u (resume the run) instead.
+    /// them and points at A-U (resume the run) instead.
     #[test]
     fn revive_refuses_workflow_participant() {
         let mut ts =

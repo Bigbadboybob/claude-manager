@@ -1,5 +1,9 @@
-//! Chat → item freshness (doc/items-board.md §4): a holder's post naming
-//! `#N`, or a reply in a thread whose root names `#N`, touches that item.
+//! Chat → item freshness (doc/items-board.md §4). A post refreshes item N
+//! when it is a top-level post naming `#N`, or a reply in a thread whose root
+//! names `#N` (a reply naming some other `#M` is only a reference), and the
+//! sender holds N or is its board's steward or orchestrator. Quoted lines
+//! (`>`) never count. The API resolves which board N is on: the one bound to
+//! the channel, else the only board where the sender may refresh it.
 //!
 //! Runs after a successful `messaging.send` on the sender's own daemon. The
 //! hook never holds the daemon lock while it reads the messaging store, and
@@ -40,10 +44,17 @@ pub(crate) fn refs(text: &str) -> Vec<i64> {
     out
 }
 
+/// [`refs`] outside quoted lines (`> …`), which repeat someone else's words.
+pub(crate) fn unquoted_refs(text: &str) -> Vec<i64> {
+    let own: Vec<&str> = text.lines().filter(|l| !l.trim_start().starts_with('>')).collect();
+    refs(&own.join("\n"))
+}
+
 struct Job {
     api: Api,
     actor: Value,
     ns: Vec<i64>,
+    channel: Option<String>,
     message_id: Option<String>,
     excerpt: String,
 }
@@ -61,9 +72,19 @@ fn worker() -> &'static SyncSender<Job> {
     })
 }
 
-/// Touch, on every board where the sender holds one of the named items, the
-/// items it holds there. 404s and timeouts are skipped silently.
+/// One call: the API resolves boards and applies the sender rules. An API
+/// that predates it (404) gets the holder-only touches below.
 fn run(job: &Job) {
+    let body = json!({"actor": job.actor, "ns": job.ns, "channel": job.channel, "source": "chat",
+                      "message_id": job.message_id, "excerpt": job.excerpt});
+    if let Err((crate::control::protocol::ErrorCode::NotFound, _)) = job.api.post("/items/chat-touch", &body) {
+        run_holder_only(job);
+    }
+}
+
+/// Pre-2026-10-20 API: touch, on every board where the sender holds one of
+/// the named items, the items it holds there. Timeouts are skipped silently.
+fn run_holder_only(job: &Job) {
     let pid = job.actor["pid"].as_str().unwrap_or_default();
     let Ok(held) = job.api.get("/items", &[("holder_pid", pid.to_owned()), ("open", "true".into())]) else {
         return;
@@ -87,7 +108,7 @@ fn run(job: &Job) {
 /// After a successful send by `uid`: find `#N` and queue the touch.
 pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply: &Value) {
     let body = params["body"].as_str().unwrap_or_default();
-    let mut ns = refs(body);
+    let channel = params["channel"].as_str().map(|c| c.trim_start_matches('#').to_owned());
     // Snapshot under the daemon lock, then release it before the messaging
     // slot is touched.
     let (handle, api_url, api_token, task_id, title) = {
@@ -107,15 +128,16 @@ pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply
         let Some(store) = slot.as_ref() else { return };
         let pid = store.participant_id(uid);
         let name = store.names.get(&pid).map(|n| n.name.clone());
-        let root = match (&thread_root, ns.is_empty()) {
-            (Some(root), true) => store.message_body(root),
-            _ => None,
-        };
+        let root = thread_root.as_ref().and_then(|root| store.message_body(root));
         (store.daemon_id.clone(), name, root)
     };
-    if let Some(root) = root_body {
-        ns = refs(&root);
-    }
+    // A reply refreshes the items its thread is about; a top-level post the
+    // items it names.
+    let ns = match (&thread_root, root_body) {
+        (Some(_), Some(root)) => unquoted_refs(&root),
+        (Some(_), None) => Vec::new(),
+        (None, _) => unquoted_refs(body),
+    };
     if ns.is_empty() {
         return;
     }
@@ -125,6 +147,7 @@ pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply
         actor: json!({"pid": format!("agent:{daemon_id}:{uid}"), "name": name.unwrap_or(title),
                       "session_uid": uid, "daemon_id": daemon_id, "task_id": task_id}),
         ns,
+        channel,
         message_id: reply["event_id"].as_str().or_else(|| reply["event"]["id"].as_str()).map(str::to_owned),
         excerpt: body.chars().take(EXCERPT_CHARS).collect(),
     };
@@ -142,10 +165,9 @@ mod tests {
     use crate::control::protocol::{Caller, Request};
     use std::io::{BufRead, BufReader, Read, Write};
 
-    #[test]
-    fn a_thread_reply_touches_the_items_its_root_names_on_the_holders_boards() {
-        let _env = crate::test_support::env_lock();
-        let root = tempfile::tempdir().unwrap();
+    /// A tiny planning API: records every request; answers POST
+    /// /items/chat-touch with `chat_touch` status (404 = an older API).
+    fn fake_api(chat_touch: u16) -> (String, Arc<Mutex<Vec<(String, String, Value)>>>) {
         let seen: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
         let log = seen.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -168,17 +190,26 @@ mod tests {
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 let parts: Vec<String> = first.split_whitespace().map(str::to_owned).collect();
-                let reply = if parts[0] == "GET" {
+                let (status, reply) = if parts[1] == "/items/chat-touch" {
+                    (chat_touch, r#"{"touched":{"sfd":[7]},"skipped":[]}"#)
+                } else if parts[0] == "GET" {
                     // Holds #7 on two boards, and #8 elsewhere (not named).
-                    r#"[{"board":"sfd","n":7},{"board":"other","n":7},{"board":"sfd","n":8}]"#
+                    (200, r#"[{"board":"sfd","n":7},{"board":"other","n":7},{"board":"sfd","n":8}]"#)
                 } else {
-                    r#"{"touched":[7],"skipped":[]}"#
+                    (200, r#"{"touched":[7],"skipped":[]}"#)
                 };
                 log.lock().unwrap().push((parts[0].clone(), parts[1].clone(),
                     serde_json::from_slice(&body).unwrap_or(Value::Null)));
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let _ = write!(stream, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
             }
         });
+        (url, seen)
+    }
+
+    /// Sends a root naming #7 and returns the state plus the root's id.
+    fn thread_fixture(url: String) -> (Arc<Mutex<DaemonState>>, String, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
         let mut st = DaemonState::default();
         st.messaging_root = root.path().into();
         st.config.api_url = url;
@@ -194,23 +225,61 @@ mod tests {
             params: json!({"channel":"general","name":"Lane","body":"plan for #7","request_id":"root-1"}),
         });
         let root_id = sent.result.unwrap()["event_id"].as_str().unwrap().to_owned();
-        on_send(&state, "me-uid", &json!({"body": "progress update"}),
-                &json!({"event_id": "reply-1", "event": {"data": {"thread_root": root_id}}}));
+        (state, root_id, root)
+    }
+
+    fn wait_for(seen: &Arc<Mutex<Vec<(String, String, Value)>>>, n: usize) -> Vec<(String, String, Value)> {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while seen.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
+        while seen.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        let seen = seen.lock().unwrap();
-        assert!(seen[0].0 == "GET" && seen[0].1.starts_with("/items?"), "{:?}", seen[0]);
-        let mut posts: Vec<_> = seen[1..].iter().map(|(m, p, b)| (m.clone(), p.clone(), b["ns"].to_string())).collect();
+        seen.lock().unwrap().clone()
+    }
+
+    /// A reply refreshes the item its thread is about, not other items it
+    /// names (2026-10-20 activity rules); the API resolves the board.
+    #[test]
+    fn a_thread_reply_refreshes_the_items_its_root_names_through_chat_touch() {
+        let _env = crate::test_support::env_lock();
+        let (url, seen) = fake_api(200);
+        let (state, root_id, _dir) = thread_fixture(url);
+        on_send(&state, "me-uid", &json!({"channel": "#general", "body": "progress, see also #9"}),
+                &json!({"event_id": "reply-1", "event": {"data": {"thread_root": root_id}}}));
+        let seen = wait_for(&seen, 1);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let (method, path, body) = &seen[0];
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/items/chat-touch"));
+        assert_eq!(body["ns"], json!([7]));
+        assert_eq!(body["channel"], "general");
+        assert_eq!(body["message_id"], "reply-1");
+        assert_eq!(body["source"], "chat");
+        assert!(body["actor"]["pid"].as_str().unwrap().ends_with(":me-uid"));
+    }
+
+    /// An API without /items/chat-touch gets the old holder-only touches.
+    #[test]
+    fn an_older_api_falls_back_to_holder_only_touches() {
+        let _env = crate::test_support::env_lock();
+        let (url, seen) = fake_api(404);
+        let (state, root_id, _dir) = thread_fixture(url);
+        on_send(&state, "me-uid", &json!({"channel": "general", "body": "progress update"}),
+                &json!({"event_id": "reply-1", "event": {"data": {"thread_root": root_id}}}));
+        let seen = wait_for(&seen, 4);
+        assert_eq!(seen[0].1, "/items/chat-touch");
+        assert!(seen[1].0 == "GET" && seen[1].1.starts_with("/items?"), "{:?}", seen[1]);
+        let mut posts: Vec<_> = seen[2..].iter().map(|(m, p, b)| (m.clone(), p.clone(), b["ns"].to_string())).collect();
         posts.sort();
         assert_eq!(posts, vec![
             ("POST".to_string(), "/boards/other/items/touch".to_string(), "[7]".to_string()),
             ("POST".to_string(), "/boards/sfd/items/touch".to_string(), "[7]".to_string()),
         ]);
-        assert_eq!(seen[1].2["source"], "chat");
-        assert_eq!(seen[1].2["message_id"], "reply-1");
-        assert!(seen[1].2["actor"]["pid"].as_str().unwrap().ends_with(":me-uid"));
+    }
+
+    #[test]
+    fn quoted_lines_are_references_not_activity() {
+        assert_eq!(unquoted_refs("> they said #3 is done\nworking on #4"), vec![4]);
+        assert_eq!(unquoted_refs("   > #3\n>#5"), Vec::<i64>::new());
+        assert_eq!(unquoted_refs("#2 and #2 again"), vec![2]);
     }
 
     #[test]
