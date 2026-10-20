@@ -1882,15 +1882,19 @@ impl App {
         let list_height = inner.height.saturating_sub(helper_height);
 
         // Task sub-view: the nested work tree (app/tree.rs) and its row
-        // metadata, built once per frame. A fold, folded section or filter
-        // must never hide the cursor's row (a jump, spawn or restore can
-        // land there): reveal it, and rebuild only then.
+        // metadata, built once per frame. When the cursor has moved since
+        // the last draw (a jump, spawn, fork, restore or event) and a fold,
+        // folded section or filter hides its row, reveal it and rebuild.
+        // A draw with the cursor unmoved never undoes Owner's own filter
+        // or folds.
+        let moved = self.last_drawn_cursor.as_ref() != Some(&self.cursor);
+        self.last_drawn_cursor = Some(self.cursor.clone());
         let mut tree = (self.sidebar_view == SidebarView::Task).then(|| self.task_tree());
         let mut visual = match &tree {
             Some(t) => self.filter_visual_items(t.items.clone()),
             None => self.visual_items(),
         };
-        if tree.is_some() && self.cursor_row_hidden(&visual) && self.reveal_cursor() {
+        if moved && tree.is_some() && self.cursor_row_hidden(&visual) && self.reveal_cursor() {
             let t = self.task_tree();
             visual = self.filter_visual_items(t.items.clone());
             tree = Some(t);

@@ -309,11 +309,12 @@ impl App {
         self.reveal_row(VisualItem::Session(wi, si), wi, &node, true)
     }
 
-    /// Keep the cursor's row on screen: when a fold, a folded section or
-    /// the filter hides it (a jump, spawn or restore landing there), reveal
-    /// it. Called before every sidebar draw and navigation, so no
-    /// cursor-setting path can leave the cursor on no row. Returns true
-    /// when anything changed.
+    /// Reveal the cursor's row when a fold, a folded section or the filter
+    /// hides it. Called by the jumps (A-p, A-;, A-g, alerts, org chart) and
+    /// by the sidebar draw when the cursor moved since the last draw (spawn,
+    /// fork, plan launch, restore, events), so none of those leaves the
+    /// cursor on no row; an unmoved cursor never undoes Owner's filter or
+    /// folds. Returns true when anything changed.
     pub(crate) fn reveal_cursor(&mut self) -> bool {
         let Some((row, wi, node, own)) = self.cursor_target() else {
             return false;
@@ -469,7 +470,8 @@ impl App {
             emit.out
                 .items
                 .push(VisualItem::SectionHeader(sec.id.clone()));
-            if !sec.folded {
+            // The unfolded tree (`folds == false`) opens sections too.
+            if !emit.folds || !sec.folded {
                 let entries = emit.entries(by_section.remove(&sec.id).unwrap_or_default());
                 for (i, entry) in entries.into_iter().enumerate() {
                     if i > 0 {
@@ -1237,9 +1239,10 @@ mod tree_tests {
             "only the folds above it open"
         );
         // A spawn / restore that sets the cursor directly: the next draw
-        // and the next A-j reveal it first.
+        // reveals it, and A-j moves on from there.
         app.folded_tasks.insert("tr".into());
         app.cursor = Cursor::Session(3, 0); // ts-14-0, under tr
+        sidebar_buffer(&mut app, 30);
         app.navigate(1);
         assert!(app.folded_tasks.iter().all(|t| t != "tr"));
         assert_eq!(
@@ -1272,6 +1275,54 @@ mod tree_tests {
         app.sidebar_filter = Some("ts-13".into());
         assert!(!app.reveal_session("ts-13-0"));
         assert_eq!(app.sidebar_filter.as_deref(), Some("ts-13"));
+    }
+
+    /// Review follow-up: an unmoved cursor never fights Owner. A filter
+    /// typed while the cursor sits on a row it excludes stays, through
+    /// draws and A-j; a header folded around the active session stays folded.
+    #[test]
+    fn an_unmoved_cursor_never_undoes_a_filter_or_a_fold() {
+        let mut app = org_app();
+        app.cursor = Cursor::Session(2, 0); // ts-13-0 under tc
+        sidebar_buffer(&mut app, 30);
+        app.sidebar_filter = Some("ts-15".into());
+        sidebar_buffer(&mut app, 30);
+        assert_eq!(
+            app.sidebar_filter.as_deref(),
+            Some("ts-15"),
+            "the draw kept the filter"
+        );
+        app.navigate(1);
+        assert_eq!(
+            app.sidebar_filter.as_deref(),
+            Some("ts-15"),
+            "A-j kept it too"
+        );
+        app.sidebar_filter = None;
+        // Owner folds tc and its section with the active session inside
+        // (folding happens on the header, so the cursor leaves the session).
+        app.sections.push(cm_daemon::manifest::SidebarSection {
+            id: "s1".into(),
+            name: "Project".into(),
+            color: None,
+            folded: false,
+        });
+        app.workspace_sections.insert("r".into(), "s1".into());
+        app.cursor = Cursor::Task {
+            ws_idx: 1,
+            task_id: "tc".into(),
+        };
+        assert!(app.toggle_tree_fold());
+        sidebar_buffer(&mut app, 30);
+        assert!(app.folded_tasks.contains("tc"), "the fold stays");
+        app.cursor = Cursor::Section("s1".into());
+        assert!(app.toggle_section_fold());
+        sidebar_buffer(&mut app, 30);
+        sidebar_buffer(&mut app, 30);
+        assert!(app.sections[0].folded, "the section fold stays");
+        // A later jump into it still reveals.
+        assert!(app.jump_cursor_to_session_uid("ts-13-0"));
+        assert!(!app.sections[0].folded && !app.folded_tasks.contains("tc"));
     }
 
     /// Review (2): A-g reaches an alert inside a fold, and a folded header

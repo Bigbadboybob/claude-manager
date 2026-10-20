@@ -400,6 +400,10 @@ pub struct App {
     /// Set per frame while an A-e form is open on a nested workspace: the
     /// read-only Section value it inherits (`App::nested_section_label`).
     pub(crate) section_note: Option<String>,
+    /// The cursor at the last sidebar draw: a draw reveals the cursor's row
+    /// only when the cursor moved since (a jump, spawn, fork, restore or an
+    /// event), never against Owner's own filter or folds.
+    pub(crate) last_drawn_cursor: Option<Cursor>,
     /// Sidebar sections (doc/sidebar-sections.md) in display order.
     /// Persisted as `Manifest::sections`; see `app/sections.rs`.
     pub(crate) sections: Vec<SidebarSection>,
@@ -1045,6 +1049,7 @@ impl App {
             folded_tasks,
             folded_divisions,
             section_note: None,
+            last_drawn_cursor: None,
             sections,
             workspace_sections,
             sidebar_receipts: manifest.sidebar_receipts.clone(),

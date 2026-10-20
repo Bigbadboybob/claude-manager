@@ -1344,8 +1344,6 @@ impl App {
     /// Navigate the cursor up or down. +1 = down, -1 = up.
     /// Skips non-selectable items (Separators, headers with sessions).
     pub(super) fn navigate(&mut self, direction: i32) {
-        // Start from a row that is actually drawn.
-        self.reveal_cursor();
         self.navigate_step(direction, true);
     }
 
