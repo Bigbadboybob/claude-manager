@@ -2627,7 +2627,7 @@ impl App {
             Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Task { ws_idx, .. } => self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
             // Not workspace-scoped; clamp_cursor re-validates it at the end.
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => None,
         };
         let saved_session_uid = match &self.cursor {
             Cursor::Session(wi, si) => self
@@ -3494,13 +3494,15 @@ mod apply_manifest_diff_tests {
         std::mem::forget(tx);
     }
 
+    /// A task header no longer displays its single session (2026-10-20: it
+    /// is a tree row, app/tree.rs), so only the workspace row is pinned.
     #[test]
-    fn single_session_workspace_and_task_rows_repaint_terminal_output() {
+    fn single_session_workspace_row_repaints_terminal_output() {
         let mut app = build_app_with_session("ts-visible");
         app.workspaces[0].sessions[0].task_id = Some("task-visible".into());
         let (tx, rx) = std::sync::mpsc::channel();
         app.workspaces[0].sessions[0].session.event_rx = rx;
-        for cursor in [Cursor::Workspace(0), Cursor::Task { ws_idx: 0, task_id: "task-visible".into() }] {
+        for cursor in [Cursor::Workspace(0)] {
             app.cursor = cursor;
             app.drain_terminal_events();
             app.needs_redraw = false;
@@ -6380,6 +6382,8 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6594,6 +6598,8 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6805,6 +6811,8 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6958,6 +6966,8 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -7101,6 +7111,8 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),

@@ -33,6 +33,8 @@ use backtests::*;
 mod sections;
 mod sidebar_remote;
 use sections::*;
+mod tree;
+
 mod model;
 use model::*;
 mod nav;
@@ -390,6 +392,11 @@ pub struct App {
     /// manifest as a sidecar (`Manifest::task_colors`). Consumed by the
     /// sidebar `TaskHeader` arm; edited via A-e on a task row.
     pub task_colors: HashMap<String, String>,
+    /// Folded task and division headers of the Task sub-view's work tree
+    /// (`app/tree.rs`), by task id and initiative id. Persisted in the
+    /// manifest.
+    pub(crate) folded_tasks: HashSet<String>,
+    pub(crate) folded_divisions: HashSet<String>,
     /// Sidebar sections (doc/sidebar-sections.md) in display order.
     /// Persisted as `Manifest::sections`; see `app/sections.rs`.
     pub(crate) sections: Vec<SidebarSection>,
@@ -754,6 +761,8 @@ impl App {
         let mut planning = PlanningView::new();
         planning.keybinding_helper_visible = keybinding_helper_visible;
         let task_colors = manifest.task_colors.clone();
+        let folded_tasks: HashSet<String> = manifest.folded_tasks.iter().cloned().collect();
+        let folded_divisions: HashSet<String> = manifest.folded_divisions.iter().cloned().collect();
         let sections = manifest.sections.clone();
         // Only keep bindings whose target workspace still exists in the
         // manifest — otherwise we'd set workspace_id to a dangling id that
@@ -1030,6 +1039,8 @@ impl App {
             hide_continuous,
             continuous_column_on,
             task_colors,
+            folded_tasks,
+            folded_divisions,
             sections,
             workspace_sections,
             sidebar_receipts: manifest.sidebar_receipts.clone(),
@@ -1140,7 +1151,7 @@ impl App {
             Cursor::Workspace(wi) => *wi,
             Cursor::Task { ws_idx, .. } => *ws_idx,
             Cursor::Session(wi, _) => *wi,
-            Cursor::Backtest(_) | Cursor::Section(_) => return None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => return None,
         };
         (wi < self.workspaces.len()).then_some(wi)
     }
@@ -1162,8 +1173,9 @@ impl App {
             // (A-D done, A-x delete) must not act on a backtest task from
             // the sidebar — the dispatch daemon owns its lifecycle.
             Cursor::Backtest(_) => None,
-            // A section header is a display grouping, not a task.
-            Cursor::Section(_) => None,
+            // A section header is a display grouping, not a task; nor is a
+            // division header (task actions there would hit its root task).
+            Cursor::Section(_) | Cursor::Division(_) => None,
         }
     }
 
@@ -1183,22 +1195,13 @@ impl App {
                     None
                 }
             }
-            Cursor::Task { ws_idx, task_id } => {
-                let ws = self.workspaces.get(*ws_idx)?;
-                let matches: Vec<&TerminalSession> = ws
-                    .sessions
-                    .iter()
-                    .filter(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
-                    .collect();
-                if matches.len() == 1 {
-                    Some((ws, matches[0]))
-                } else {
-                    None
-                }
-            }
+            // A task header is a tree row (app/tree.rs): Space/Enter fold
+            // it, and no keys reach a terminal from it, even when its task
+            // has a single session (that session is one row down).
+            Cursor::Task { .. } => None,
             // No PTY behind backtest rows — plain keys fall through to the
             // fold toggle in input.rs instead of a terminal.
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => None,
         }
     }
 
@@ -1217,24 +1220,8 @@ impl App {
                     None
                 }
             }
-            Cursor::Task { ws_idx, task_id } => {
-                let task_id = task_id.clone();
-                let ws = self.workspaces.get_mut(*ws_idx)?;
-                let mut found_idx = None;
-                let mut count = 0;
-                for (i, ts) in ws.sessions.iter().enumerate() {
-                    if ts.task_id.as_deref() == Some(task_id.as_str()) {
-                        count += 1;
-                        if count == 1 {
-                            found_idx = Some(i);
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-                ws.sessions.get_mut(found_idx?)
-            }
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            Cursor::Task { .. } => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => None,
         }
     }
 

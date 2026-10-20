@@ -567,7 +567,7 @@ impl App {
                 );
                 return;
             }
-            Cursor::Section(_) => {
+            Cursor::Section(_) | Cursor::Division(_) => {
                 self.set_status_msg("Focus a session or task to launch a workflow");
                 return;
             }
@@ -960,7 +960,7 @@ impl App {
                 })
             }
             Cursor::Workspace(_) => None,
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => None,
         }
     }
 }

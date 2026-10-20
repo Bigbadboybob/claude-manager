@@ -46,8 +46,9 @@ pub fn pinned_lead(metadata: &Value) -> Option<&str> {
 /// Spawn order key for a session uid. Both sides mint
 /// `ts-<spawn nanos hex>-<counter hex>`, and A-R keeps the uid, so the uid
 /// is a restart-stable spawn order. Unparseable uids sort after every
-/// parseable one (then by the uid string).
-fn spawn_order(uid: &str) -> (u8, u128, u64) {
+/// parseable one (then by the uid string). The TUI's A-e Lead field lists
+/// its choices in this order.
+pub fn spawn_order(uid: &str) -> (u8, u128, u64) {
     let parsed = uid.strip_prefix("ts-").and_then(|rest| {
         let (nanos, counter) = rest.split_once('-')?;
         Some((

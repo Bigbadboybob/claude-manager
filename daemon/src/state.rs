@@ -1178,6 +1178,8 @@ impl DaemonState {
             continuous_column_on: false,
             hide_keybinding_helper: false,
             task_colors: HashMap::new(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),

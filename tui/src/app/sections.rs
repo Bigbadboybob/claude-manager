@@ -76,7 +76,13 @@ impl App {
     /// Resolve each displayed row independently so filtering or scrolling away
     /// a section heading cannot lose its tint. Only gaps within the same
     /// section share the surface; boundaries and loose rows stay transparent.
-    pub(super) fn sidebar_section_backgrounds(&self, rows: &[VisualItem]) -> Vec<Option<Color>> {
+    /// `block_root` maps a workspace to the top-level block it renders
+    /// under in the work tree: a nested block takes its root's section.
+    pub(super) fn sidebar_section_backgrounds(
+        &self,
+        rows: &[VisualItem],
+        block_root: &dyn Fn(usize) -> usize,
+    ) -> Vec<Option<Color>> {
         if self.sidebar_view != SidebarView::Task || self.sections.is_empty() {
             return vec![None; rows.len()];
         }
@@ -86,16 +92,27 @@ impl App {
                 | VisualItem::TaskHeader { ws_idx: wi, .. }
                 | VisualItem::WorkflowHeader { ws_idx: wi, .. } = row
             {
-                workspace_sections.entry(*wi).or_insert_with(|| self.section_of_workspace(*wi));
+                workspace_sections.entry(*wi).or_insert_with(|| self.section_of_workspace(block_root(*wi)));
             }
         }
-        let sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
+        let mut sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
             VisualItem::SectionHeader(id) => Some(id.as_str()),
             VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
             | VisualItem::TaskHeader { ws_idx: wi, .. }
             | VisualItem::WorkflowHeader { ws_idx: wi, .. } => workspace_sections[wi].as_deref(),
             _ => None,
         }).collect();
+        // A division header sits inside the section of the rows before it.
+        for i in 0..rows.len() {
+            if matches!(rows[i], VisualItem::DivisionHeader(_)) {
+                sections[i] = rows[..i]
+                    .iter()
+                    .zip(&sections[..i])
+                    .rev()
+                    .find(|(r, _)| !matches!(r, VisualItem::Separator))
+                    .and_then(|(r, s)| (!matches!(r, VisualItem::SectionEnd)).then_some(*s).flatten());
+            }
+        }
         rows.iter().enumerate().map(|(i, row)| {
             let section = if matches!(row, VisualItem::Separator) {
                 let before = i.checked_sub(1).and_then(|i| sections[i]);
@@ -210,7 +227,7 @@ impl App {
             Cursor::Section(id) => Some(id.clone()),
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => self.section_of_workspace(*wi),
             Cursor::Task { ws_idx, .. } => self.section_of_workspace(*ws_idx),
-            Cursor::Backtest(_) => None,
+            Cursor::Backtest(_) | Cursor::Division(_) => None,
         }
     }
 
@@ -319,36 +336,17 @@ impl App {
     /// rollup and the A-i peek.
     pub(crate) fn section_members(&self, id: &str) -> Vec<usize> {
         let members = self.continuous_members();
+        let roots = self.task_tree().block_root;
         self.task_view_visible_workspaces(&members)
             .into_iter()
-            .filter(|wi| self.section_of_workspace(*wi).as_deref() == Some(id))
+            .filter(|wi| self.section_of_workspace(roots.get(wi).copied().unwrap_or(*wi)).as_deref() == Some(id))
             .collect()
     }
 
     /// `(workspaces, running, idle)` counts for a section's folded header.
     pub(crate) fn section_rollup(&self, id: &str) -> (usize, usize, usize) {
         let members = self.section_members(id);
-        let mut running = 0;
-        let mut idle = 0;
-        for wi in &members {
-            for ts in &self.workspaces[*wi].sessions {
-                if ts.session.exited {
-                    continue;
-                }
-                // Engine state when reported: background work is running;
-                // waiting/errored/unknown are neither (they show as glyphs).
-                use super::agent_state::Activity;
-                match self.agent_activity(ts) {
-                    Some(Activity::Working | Activity::Starting | Activity::Background) => running += 1,
-                    Some(Activity::Idle) => idle += 1,
-                    Some(_) => {}
-                    None => match ts.status {
-                        SessionStatus::Running => running += 1,
-                        SessionStatus::Idle => idle += 1,
-                    },
-                }
-            }
-        }
+        let (_, running, idle) = self.rollup(members.iter().flat_map(|wi| &self.workspaces[*wi].sessions));
         (members.len(), running, idle)
     }
 }
@@ -379,10 +377,10 @@ mod section_choice_tests {
 }
 
 #[cfg(test)]
-mod layout_tests {
+pub(crate) mod layout_tests {
     use super::*;
 
-    fn bare_ws(id: &str) -> Workspace {
+    pub(crate) fn bare_ws(id: &str) -> Workspace {
         Workspace {
             id: id.to_string(),
             name: id.to_string(),
@@ -401,7 +399,7 @@ mod layout_tests {
         }
     }
 
-    fn task(id: &str, ws: &str, parent: Option<&str>) -> TaskEntry {
+    pub(crate) fn task(id: &str, ws: &str, parent: Option<&str>) -> TaskEntry {
         TaskEntry {
             task_id: Some(id.to_string()),
             name: id.to_string(),
@@ -421,7 +419,7 @@ mod layout_tests {
         }
     }
 
-    fn test_app() -> App {
+    pub(crate) fn test_app() -> App {
         let _g = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
@@ -518,17 +516,30 @@ mod layout_tests {
         assert_eq!(layout(&app), ["#s1", "a", "b", "c", "d"]);
         assert_eq!(app.section_of_workspace(1).as_deref(), Some("s1"), "b inherits via tb→ta");
         assert_eq!(app.section_of_workspace(2), None, "explicit none beats inheritance");
-        assert_eq!(app.section_rollup("s1").0, 2);
+        // c's task reports to ta, so its block nests under a's in the work
+        // tree (app/tree.rs) and follows a's section there.
+        assert_eq!(app.section_rollup("s1").0, 3);
     }
 
-    fn add_task_session(app: &mut App, wi: usize, tid: &str) {
+    /// The tint test's fixture without nesting: two top-level blocks in s1
+    /// (a, b), one in s2 (c), and d loose.
+    fn flat_sectioned_app() -> App {
+        let mut app = sectioned_app();
+        for t in &mut app.tasks {
+            t.parent_task_id = None;
+        }
+        app.workspace_sections.insert("b".into(), "s1".into());
+        app
+    }
+
+    pub(crate) fn add_task_session(app: &mut App, wi: usize, tid: &str) {
         let session = Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None).unwrap();
         let mut ts = make_simple_session_with_uid(format!("uid-{tid}"), tid, "codex", session, None);
         ts.task_id = Some(tid.into());
         app.workspaces[wi].sessions.push(ts);
     }
 
-    fn sidebar_buffer(app: &mut App, height: u16) -> ratatui::buffer::Buffer {
+    pub(crate) fn sidebar_buffer(app: &mut App, height: u16) -> ratatui::buffer::Buffer {
         use ratatui::{backend::TestBackend, Terminal};
         app.keybinding_helper_visible = false;
         let mut terminal = Terminal::new(TestBackend::new(40, height)).unwrap();
@@ -538,7 +549,7 @@ mod layout_tests {
 
     #[test]
     fn sidebar_tint_covers_section_members_but_not_boundaries_or_loose_rows() {
-        let mut app = sectioned_app();
+        let mut app = flat_sectioned_app();
         app.sections[0].color = Some("blue".into());
         app.sections.push(SidebarSection {
             id: "s2".into(), name: "Second".into(), color: Some("blue".into()), folded: false,
@@ -550,9 +561,11 @@ mod layout_tests {
         let buffer = sidebar_buffer(&mut app, 24);
         let blue = theme::sidebar_section_bg(Some("blue"), 2.0);
         // Header, workspace, task, session, internal gap, inherited workspace/task/session.
+        // The focused group (tb's header and session) lifts the section tint.
         for y in 1..=8 {
+            let surface = if y >= 7 { theme::focus_tint(Some(blue)) } else { blue };
             for x in 1..=38 {
-                assert_eq!(buffer[(x, y)].bg, blue, "section cell ({x}, {y})");
+                assert_eq!(buffer[(x, y)].bg, surface, "section cell ({x}, {y})");
             }
             assert_eq!(buffer[(0, y)].bg, Color::Reset, "border stays clear");
         }
@@ -587,15 +600,17 @@ mod layout_tests {
         add_task_session(&mut app, 1, "tb");
         app.cursor = Cursor::Session(1, 0);
         let neutral = theme::sidebar_section_bg(None, 2.0);
+        // The selected session's group lifts its section's tint.
+        let lifted = theme::focus_tint(Some(neutral));
         let buffer = sidebar_buffer(&mut app, 5);
         assert!(app.sidebar_list_state.offset() > 0, "section heading scrolled away");
-        assert_eq!(buffer[(38, 3)].bg, neutral, "selected inherited session keeps tint");
+        assert_eq!(buffer[(38, 3)].bg, lifted, "selected inherited session keeps tint");
 
         app.sidebar_filter = Some("tb".into());
         app.sidebar_list_state = Default::default();
         let buffer = sidebar_buffer(&mut app, 10);
-        assert_eq!(buffer[(38, 1)].bg, neutral, "filtered task keeps tint without its heading");
-        assert_eq!(buffer[(38, 2)].bg, neutral, "filtered session keeps tint without its heading");
+        assert_eq!(buffer[(38, 1)].bg, lifted, "filtered task keeps tint without its heading");
+        assert_eq!(buffer[(38, 2)].bg, lifted, "filtered session keeps tint without its heading");
         assert_eq!(buffer[(38, 3)].bg, Color::Reset, "empty space stays transparent");
     }
 
@@ -628,7 +643,8 @@ mod layout_tests {
         for _ in 0..30 { app.handle_event(&key(KeyCode::Left)); }
         let buffer = sidebar_buffer(&mut app, 20);
         assert_eq!(buffer[(38, 1)].bg, Color::Reset, "zero disables tint");
-        assert_eq!(buffer[(2, 5)].symbol(), "━", "closing rule survives tint off");
+        // Header, a, ta (holding the nested blocks), b, c, then the rule.
+        assert_eq!(buffer[(2, 6)].symbol(), "━", "closing rule survives tint off");
         app.handle_event(&key(KeyCode::Esc));
         assert_eq!(sidebar_buffer(&mut app, 20)[(38, 1)].bg, original);
     }
@@ -701,7 +717,8 @@ mod layout_tests {
     fn folded_section_hides_members_but_keeps_header() {
         let mut app = sectioned_app();
         app.sections[0].folded = true;
-        assert_eq!(layout(&app), ["#s1", "c", "d"]);
+        // c nests under a (its task reports to ta), so it folds away too.
+        assert_eq!(layout(&app), ["#s1", "d"]);
         // Space on the header unfolds it again.
         app.cursor = Cursor::Section("s1".into());
         assert!(app.toggle_section_fold());
