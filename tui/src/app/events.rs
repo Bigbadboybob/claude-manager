@@ -1237,6 +1237,9 @@ impl App {
                 BackendEvent::ReportingTaskCreated { request_id, result } => {
                     self.on_reporting_task_created(&request_id, result);
                 }
+                BackendEvent::TaskLeadFailed { id, attempted, previous, error } => {
+                    self.on_task_lead_failed(&id, attempted, previous, &error);
+                }
             }
         }
     }

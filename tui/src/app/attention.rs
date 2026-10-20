@@ -152,6 +152,7 @@ impl App {
         }
         self.cursor_column = if continuous { SidebarColumn::Continuous } else { SidebarColumn::Main };
         self.cursor = Cursor::Session(wi, si);
+        self.reveal_cursor();
         self.acknowledge_owner_alerts_for_row(uid);
         self.alerts.remove(uid);
         self.owner_alert_since.remove(&format!("legacy:{uid}"));

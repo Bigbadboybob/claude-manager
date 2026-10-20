@@ -655,6 +655,22 @@ impl App {
             }
             return;
         }
+        // A division header that no longer draws (its blocks closed, or the
+        // initiative is no longer a division) falls back to the first row.
+        if let Cursor::Division(id) = &self.cursor {
+            let items = self.task_tree().items;
+            if !items.iter().any(|vi| matches!(vi, VisualItem::DivisionHeader(d) if d == id)) {
+                self.cursor = items
+                    .iter()
+                    .find_map(|vi| match vi {
+                        VisualItem::WorkspaceHeader(wi) => Some(Cursor::Workspace(*wi)),
+                        _ => None,
+                    })
+                    .unwrap_or(Cursor::Workspace(0));
+                self.clamp_cursor();
+            }
+            return;
+        }
         if self.workspaces.is_empty() {
             self.cursor = Cursor::Workspace(0);
             return;
@@ -687,8 +703,12 @@ impl App {
                     .tasks
                     .iter()
                     .any(|t| t.task_id.as_deref() == Some(tid.as_str()))
+                    || !self.task_tree_unfolded().items.iter().any(|vi| {
+                        matches!(vi, VisualItem::TaskHeader { ws_idx, task_id } if *ws_idx == wi && *task_id == tid)
+                    })
                 {
-                    // Task disappeared — fall back to workspace.
+                    // Task disappeared, or its header no longer draws (its
+                    // last session left) — fall back to workspace.
                     self.cursor = Cursor::Workspace(wi);
                 }
             }
@@ -1324,6 +1344,8 @@ impl App {
     /// Navigate the cursor up or down. +1 = down, -1 = up.
     /// Skips non-selectable items (Separators, headers with sessions).
     pub(super) fn navigate(&mut self, direction: i32) {
+        // Start from a row that is actually drawn.
+        self.reveal_cursor();
         self.navigate_step(direction, true);
     }
 
@@ -1518,7 +1540,13 @@ impl App {
     pub(super) fn jump_to_next_attention(&mut self) {
         // (ws_idx, sess_idx, is_continuous_row) in sidebar visual order.
         let mut rows: Vec<(usize, usize, bool)> = Vec::new();
-        for vi in self.visual_items() {
+        // Folded sessions count: an alert inside a fold must still be
+        // reachable (the jump unfolds it).
+        let main = match self.sidebar_view {
+            SidebarView::Task => self.filter_visual_items(self.task_tree_unfolded().items),
+            SidebarView::Status => self.visual_items(),
+        };
+        for vi in main {
             if let VisualItem::Session(wi, si) = vi {
                 rows.push((wi, si, false));
             }
@@ -1564,6 +1592,7 @@ impl App {
             SidebarColumn::Main
         };
         self.cursor = Cursor::Session(wi, si);
+        self.reveal_cursor();
         self.needs_redraw = true;
     }
 
@@ -1602,7 +1631,7 @@ impl App {
     /// `step_column` (so a later A-h/A-l lands back where you were). The
     /// terminal pane follows because it renders the cursor's session.
     /// Returns false when the uid doesn't resolve to a visible row.
-    fn jump_cursor_to_session_uid(&mut self, uid: &str) -> bool {
+    pub(super) fn jump_cursor_to_session_uid(&mut self, uid: &str) -> bool {
         let Some((wi, si, to_continuous)) = self.resolve_session_target(uid) else {
             return false;
         };
@@ -1618,6 +1647,7 @@ impl App {
             SidebarColumn::Main
         };
         self.cursor = Cursor::Session(wi, si);
+        self.reveal_cursor();
         self.needs_redraw = true;
         true
     }
@@ -1934,7 +1964,8 @@ impl App {
                         "Space fold · A-e edit · A-x delete · A-J/K reorder · A-n new ws here".into(),
                     ));
                 }
-            }            Cursor::Division(id) => {
+            }
+            Cursor::Division(id) => {
                 let name = self.planning.division(id).map_or_else(|| id.clone(), |d| d.name);
                 out.push(PeekLine::Title(format!("Division: {name}")));
                 out.push(PeekLine::Field { label: "Initiative".into(), value: id.clone() });

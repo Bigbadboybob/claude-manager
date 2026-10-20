@@ -185,6 +185,8 @@ pub enum BackendCommand {
     SetTaskLead {
         id: String,
         session_uid: Option<String>,
+        /// The pin before this change, restored if the call fails.
+        previous: Option<String>,
     },
     /// Delete a planning task from the DB.
     DeletePlanTask {
@@ -225,6 +227,13 @@ pub enum BackendEvent {
     ReportingTaskCreated {
         request_id: String,
         result: Result<Task, String>,
+    },
+    /// `POST /tasks/{id}/lead` failed: undo the optimistic local pin.
+    TaskLeadFailed {
+        id: String,
+        attempted: Option<String>,
+        previous: Option<String>,
+        error: String,
     },
 }
 
@@ -336,8 +345,8 @@ impl BackendHandle {
         );
     }
 
-    pub fn set_task_lead(&self, id: String, session_uid: Option<String>) {
-        self.try_send_or_warn(BackendCommand::SetTaskLead { id, session_uid }, "set_task_lead");
+    pub fn set_task_lead(&self, id: String, session_uid: Option<String>, previous: Option<String>) {
+        self.try_send_or_warn(BackendCommand::SetTaskLead { id, session_uid, previous }, "set_task_lead");
     }
 
     pub fn delete_plan_task(&self, id: String) {
@@ -472,7 +481,7 @@ fn backend_loop(
                 }
                 let _ = event_tx.send(BackendEvent::ReportingTaskCreated { request_id, result });
             }
-            Ok(BackendCommand::SetTaskLead { id, session_uid }) => {
+            Ok(BackendCommand::SetTaskLead { id, session_uid, previous }) => {
                 match client.set_task_lead(&id, session_uid.as_deref()) {
                     Ok(task) => {
                         if let Some(task) = task {
@@ -481,7 +490,12 @@ fn backend_loop(
                         after_write(&client);
                     }
                     Err(e) => {
-                        let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
+                        let _ = event_tx.send(BackendEvent::TaskLeadFailed {
+                            id,
+                            attempted: session_uid,
+                            previous,
+                            error: e.to_string(),
+                        });
                     }
                 }
             }
