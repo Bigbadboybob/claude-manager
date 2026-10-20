@@ -586,6 +586,9 @@ fn execute_with_freshness(
             message: "Messaging method not implemented".into(),
         }),
     };
+    if result.as_ref().is_err_and(|e| e.code == "search_indexing") {
+        store.start_search_worker(&handle)?;
+    }
     project_names(state, store, true);
     let mut retraction_note = None;
     // A bulk mark settles pending wakes for every message it marked, exactly
@@ -991,6 +994,43 @@ mod tests {
         let opened = call(&state, "b", "open", json!({"channel":"roles"})).unwrap();
         assert_eq!(opened["target"]["can_edit"], false);
         assert_eq!(opened["target"]["created_by"], channel["created_by"]);
+    }
+    #[test]
+    fn messaging_search_build_keeps_sends_and_retry_responsive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        call(&state, "a", "send", json!({"channel":"general","name":"Search Builder","body":"first verdict","request_id":"first"})).unwrap();
+        let handle = state.lock().unwrap().messaging.clone();
+        let (entered, release) = handle.lock().unwrap().as_mut().unwrap().pause_search_for_test();
+        let q = json!({"channel":"general","query":"verdict"});
+        let error = call(&state, "b", "read", q.clone()).unwrap_err();
+        assert_eq!(error.code, "search_indexing");
+        assert!(error.message.contains("after 1 second"));
+        entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        // The worker is suspended mid-build until release, making this a
+        // deterministic concurrency check rather than a race with a tiny index.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clone = state.clone();
+        let sender = std::thread::spawn(move || {
+            tx.send(call(&clone, "a", "send", json!({"channel":"general","body":"delta verdict","request_id":"delta"}))).unwrap();
+        });
+        let sent = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("send blocked on cold search").unwrap();
+        sender.join().unwrap();
+        assert_eq!(call(&state, "b", "read", q.clone()).unwrap_err().code, "search_indexing");
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let page = loop {
+            match call(&state, "b", "read", q.clone()) {
+                Ok(page) => break page,
+                Err(e) if e.code == "search_indexing" => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(page["items"].as_array().unwrap().len(), 2);
+        assert!(page["items"].as_array().unwrap().iter().any(|e| e["id"] == sent["event_id"]));
     }
     #[test]
     fn messaging_reads_and_cancellation_serialize_with_wake_publication_but_sends_do_not() {

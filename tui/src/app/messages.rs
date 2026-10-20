@@ -1438,6 +1438,8 @@ impl App {
                         })
                         .unwrap_or_default(),
                     f["time_basis"].as_str().unwrap_or("created").into(),
+                    f["sender"].as_str().unwrap_or("").into(),
+                    f["query"].as_str().unwrap_or("").into(),
                 ];
                 self.messages.start_form("filter", fields);
             }
@@ -1578,6 +1580,11 @@ impl App {
                     }
                 }
                 self.messages.filter = json!({"time":if time.as_object().is_some_and(|v|v.is_empty()){Value::Null}else{time},"tags":split(&fields[3]),"time_basis":fields[4].trim()});
+                for (i, key) in [(5, "sender"), (6, "query")] {
+                    if !fields[i].trim().is_empty() {
+                        self.messages.filter[key] = json!(fields[i].trim());
+                    }
+                }
                 self.messages.page_cursor = Value::Null;
                 self.messaging_request("messaging.read", self.messages.query());
             }
@@ -2037,6 +2044,8 @@ impl App {
                             "Until (date/time + zone)",
                             "Tags, comma separated",
                             "Time basis (created / received)",
+                            "Sender name or participant ID",
+                            "Words / phrase (case-insensitive)",
                         ],
                         "metadata" => vec![
                             "Tags, comma separated",
@@ -2732,16 +2741,32 @@ mod tests {
             KeyCode::Char('/'),
             KeyModifiers::NONE,
         )));
-        assert_eq!(app.messages.fields.len(), 5);
+        assert_eq!(app.messages.fields.len(), 7);
         app.messages.fields = vec![
             "10m".into(),
             "".into(),
             "".into(),
             "needs-owner".into(),
             "received".into(),
+            "Scout".into(),
+            "final verdict".into(),
         ];
+        app.messages.page_cursor = json!({"old":"cursor"});
         app.messaging_submit_form();
         assert_eq!(app.messages.filter["time"]["since"], "10m");
+        assert_eq!(app.messages.query()["sender"], "Scout");
+        assert_eq!(app.messages.query()["query"], "final verdict");
+        assert!(app.messages.page_cursor.is_null());
+        // The submitted read owns the busy state until its reply arrives.
+        app.messages.busy = false;
+        app.messaging_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('/'), KeyModifiers::NONE,
+        )));
+        app.messages.fields[5].clear();
+        app.messages.fields[6].clear();
+        app.messaging_submit_form();
+        assert!(app.messages.filter.get("sender").is_none());
+        assert!(app.messages.filter.get("query").is_none());
     }
     #[test]
     fn messaging_settings_and_reconnect_preserve_newer_names_and_grouping() {

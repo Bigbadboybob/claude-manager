@@ -245,6 +245,25 @@ class MessagingToolsTests(unittest.TestCase):
                 fn(dm=["agent-a", "agent-b"], **kwargs)
                 self.assertEqual(call.call_args.args[1]["dm"], ["agent-a", "agent-b"])
 
+    def test_search_filters_and_cursor_pass_through_in_both_views(self):
+        cursor = {"snapshot": {"position": 42}, "filter": "f", "search_sender": "agent:h:a"}
+        result = {"items": [{"id": "m", "actor": {"name": "Scout"}, "body": "final verdict"}],
+                  "next_cursor": cursor, "receipt": {"ids": ["m"]}}
+        with patch.object(control_client, "call", return_value=result) as call:
+            server.chat_read(channel="general")
+            self.assertNotIn("sender", call.call_args.args[1])
+            self.assertNotIn("query", call.call_args.args[1])
+            for view in ("full", "slim"):
+                page = server.chat_read(channel="gpu-utilization", sender="EP", query="final verdict",
+                                        time={"since": "1d"}, cursor=cursor, view=view)
+                params = call.call_args.args[1]
+                self.assertEqual(params["sender"], "EP")
+                self.assertEqual(params["query"], "final verdict")
+                self.assertEqual(params["time"], {"since": "1d"})
+                self.assertEqual(params["cursor"], cursor)
+                self.assertEqual(page["next_cursor"], cursor)
+                self.assertEqual(page["receipt"], result["receipt"])
+
     def test_channel_admin_and_pin_tools_preserve_intent_and_use_daemon(self):
         with patch.object(control_client, "call", return_value={}) as call:
             server.chat_read(channel="general")

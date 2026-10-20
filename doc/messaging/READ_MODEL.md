@@ -10,7 +10,7 @@ not supported.
 `messaging.read` / `chat_read` advances a direct, unfiltered conversation on its
 initial newest-first page or upon reaching the chronological end, through the
 highest supplied message. Set `mark_read:false` for previews. Inbox, incoming-DM
-lists, all-channel reads, threads, time/tag/pin filters and mention lists do not
+lists, all-channel reads, threads, sender/query/time/tag/pin filters and mention lists do not
 automatically advance. `messaging.open` is an orientation preview. Supplying a
 legacy `ack_receipt` advances each touched conversation through its highest ID;
 older gaps therefore become read too. Pagination ignores the `mark_read` flag.
@@ -23,6 +23,43 @@ advance is reflected in `read_cursor` and the next counts/read response.
 `mentions_only:true` filters to the caller's direct or frozen `@here` mentions.
 Use it with `inbox:true,newest_first:true` for a mention list, including read
 mentions. Reading an ordinary inbox does not clear it until acknowledged.
+
+## Search
+
+`chat_read(channel="gpu-utilization", sender="EP", query="final verdict")`
+selects history by author and message body. Both filters are optional and combine
+with the existing scope, time window/basis, tags, thread, unread/pin filters and
+pagination. The Messages TUI `/` form exposes Sender and Words / phrase.
+
+`sender` accepts a participant ID or an exact current name/alias, using the same
+name-resolution rules as DMs. Ambiguous names require an ID. A cursor pins the
+resolved ID, so later renames cannot switch authors midway through the read.
+Keep the original `sender` and `query` parameters unchanged on subsequent pages.
+
+`query` matches Unicode whole words after compatibility normalization and case
+folding and Unicode word boundaries. Multiple words must be adjacent, in order
+(e.g. `final verdict` matches `Final: VERDICT`). It is not prefix, stemming,
+substring or regex search. Empty/non-word queries are rejected. Reply context
+may include a parent that did not match, as with other history filters.
+
+Search results are previews and do not advance read state automatically. An
+explicit receipt acknowledgment retains its usual conversation-cursor semantics.
+Search filters cannot be combined with the bulk `mark_read_before` operation.
+
+Per-conversation sender and word postings are built lazily in a background worker
+on the first search, then maintained on publication and replica ingest. While
+pending, reads return `search_indexing` with a request to retry after one second;
+no partial page or read receipt is returned. TUI refreshes retry automatically.
+The worker copies small batches from the existing timeline under short store
+locks and tokenizes/sorts outside the lock. It catches up publications and
+backfill that arrived during construction before atomically installing the index.
+Startup/restart does not tokenize bodies, allocate search postings, or replay
+additional files. Only searched conversations retain an index.
+Reads seek within the smallest posting and intersect the others; phrase
+verification only examines candidates. Canonical and arrival
+postings preserve both ordinary history and `after` pagination without scanning
+the journal. No on-disk index or migration is needed. Cache coverage still applies:
+search cannot find history that the replica has not received.
 
 ## RPCs
 

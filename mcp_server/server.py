@@ -617,7 +617,8 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
               limit: int = 50, ack_receipt: dict | None = None,
               newest_first: bool | None = None, pinned_only: bool | None = None,
               view: str | None = None, mark_read_before: str | None = None,
-              mark_read: bool = True, mentions_only: bool = False) -> dict:
+              mark_read: bool = True, mentions_only: bool = False,
+              sender: str | None = None, query: str | None = None) -> dict:
     """Read history, a thread, your inbox, or incoming DMs. Select one scope.
 
     Inbox and dms reads default to newest first and view="slim"; other reads
@@ -633,7 +634,17 @@ def chat_read(channel: str | None = None, dm: str | list[str] | None = None,
     after a long absence, once you have skimmed the newest messages.
 
     time={"since":"10m"} or {"start":RFC3339,"end":RFC3339} filters a fixed
-    window. pinned_only filters to pinned messages at the read snapshot.
+    window. sender accepts an exact name/alias or participant ID. query searches
+    case-insensitive whole words in message bodies; multiple words must be
+    adjacent under Unicode word boundaries (e.g. Final: VERDICT). No prefix,
+    stemming or regex search.
+    Both use indexes and compose with the scope/time/cursor filters. Keep sender
+    and query unchanged on subsequent pages; name resolution is pinned by the
+    cursor. A cold search returns search_indexing; retry the same query after one
+    second while its index builds in the background.
+    Search does not auto-mark history read; receipts still advance through
+    supplied messages. Search cannot be combined with mark_read_before.
+    pinned_only filters to pinned messages at the read snapshot.
     channel="*" reads all public channels. newest_first shows recent
     messages first. received basis finds late arrivals. tags must all match. Use cursor
     unchanged for pagination. Acknowledge the returned receipt on a later read
