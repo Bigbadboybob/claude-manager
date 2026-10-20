@@ -52,8 +52,12 @@ impl Store {
         let mut scope = SearchScope::default();
         let mut failed = None;
         for cid in selected {
+            let documents = self.read_model.conversations[&cid].timeline.len();
             let search = &mut self.read_model.search;
-            if let Some(error) = search.failure(&cid) {
+            if let Some(error) = search
+                .too_large(&cid, documents)
+                .or_else(|| search.failure(&cid))
+            {
                 if conv.is_some() || pinned.is_some() {
                     return Err(error);
                 }

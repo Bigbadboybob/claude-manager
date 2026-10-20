@@ -820,6 +820,143 @@ fn chat_search_byte_budget_lru_and_failure_backoff() {
 }
 
 #[test]
+fn chat_search_oversize_is_remembered_until_growth_or_budget_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, people) = setup(tmp.path());
+    let cid = s.channel_id_at_path("general").unwrap().to_owned();
+    s.create_channel("owner", &json!({"path":"huge","request_id":"huge"}))
+        .unwrap();
+    let huge = s.channel_id_at_path("huge").unwrap().to_owned();
+    for i in 0..300 {
+        let body = (0..100)
+            .map(|n| format!("word{i}n{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        indexed(
+            &mut s,
+            &huge,
+            &people[0].id,
+            &body,
+            i,
+            "2026-10-20T20:00:00Z",
+        );
+    }
+    s.prepare_search("owner", Some(&cid), false, false)
+        .unwrap_err();
+    s.finish_search_for_test();
+    let budget = s.read_model.search.total_bytes * 2;
+    let handle = Arc::new(Mutex::new(Some(s)));
+    {
+        let mut slot = handle.lock().unwrap();
+        let s = slot.as_mut().unwrap();
+        s.configure_search(&handle, budget);
+        s.prepare_search("owner", Some(&huge), false, false)
+            .unwrap_err();
+        s.start_search_worker(&handle).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .read_model
+            .search
+            .worker
+            .is_none()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut slot = handle.lock().unwrap();
+    let s = slot.as_mut().unwrap();
+    assert!(s.read_model.search.conversations.contains_key(&cid));
+    let attempts = s.read_model.search.probe.spawn_attempts;
+    for _ in 0..3 {
+        assert_eq!(
+            s.prepare_search("owner", Some(&huge), false, false)
+                .unwrap_err()
+                .code,
+            "search_too_large"
+        );
+        s.start_search_worker(&handle).unwrap();
+    }
+    assert_eq!(s.read_model.search.probe.spawn_attempts, attempts);
+    assert!(s.read_model.search.pending.is_empty());
+    assert!(s.read_model.search.conversations.contains_key(&cid));
+    // The recorded size came from a partial batch, but the generation must
+    // cover all 300 messages. One new arrival explicitly invalidates it.
+    indexed(
+        s,
+        &huge,
+        &people[0].id,
+        "new arrival",
+        500,
+        "2026-10-20T20:00:00Z",
+    );
+    assert_eq!(
+        s.prepare_search("owner", Some(&huge), false, false)
+            .unwrap_err()
+            .code,
+        "search_indexing"
+    );
+    let documents = s.read_model.conversations[&huge].timeline.len();
+    s.read_model
+        .search
+        .remember_oversize(huge.clone(), budget + 1, documents);
+    assert_eq!(
+        s.prepare_search("owner", Some(&huge), false, false)
+            .unwrap_err()
+            .code,
+        "search_too_large"
+    );
+    s.configure_search(&handle, budget * 2);
+    assert_eq!(
+        s.prepare_search("owner", Some(&huge), false, false)
+            .unwrap_err()
+            .code,
+        "search_indexing"
+    );
+}
+
+#[test]
+fn chat_search_oversize_warm_growth_preserves_other_indexes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, people) = setup(tmp.path());
+    let cid = s.channel_id_at_path("general").unwrap().to_owned();
+    s.prepare_search("owner", Some(&cid), false, false)
+        .unwrap_err();
+    s.finish_search_for_test();
+    let mut other = ConversationSearch::default();
+    other.document(ReadCursor::default(), 0, "owner", "keep this", false);
+    s.read_model.search.install("other".into(), other);
+    s.read_model.search.touch(&cid); // Oversized index is most recently searched.
+    s.read_model.search.budget = s.read_model.search.total_bytes;
+    let body = (0..1000)
+        .map(|n| format!("word{n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    indexed(
+        &mut s,
+        &cid,
+        &people[0].id,
+        &body,
+        500,
+        "2026-10-20T20:00:00Z",
+    );
+    assert!(s.read_model.search.conversations.contains_key("other"));
+    assert_eq!(
+        s.prepare_search("owner", Some(&cid), false, false)
+            .unwrap_err()
+            .code,
+        "search_too_large"
+    );
+}
+
+#[test]
 fn chat_search_worker_panic_has_backoff_then_recovers() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut s, _) = setup(tmp.path());

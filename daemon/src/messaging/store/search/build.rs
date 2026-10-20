@@ -109,10 +109,27 @@ impl Build {
             .search
             .install(self.cid.clone(), std::mem::take(&mut self.index));
     }
+    fn reserve(&self, store: &mut Store) -> bool {
+        let documents = store.read_model.conversations[&self.cid].timeline.len();
+        let search = &mut store.read_model.search;
+        if search.reserve(self.index.bytes) {
+            return true;
+        }
+        // Use the full current conversation length, not the partial build's
+        // length, so a retry does not immediately invalidate this refusal.
+        search.remember_oversize(self.cid.clone(), self.index.bytes, documents);
+        search.active = None;
+        search.building_bytes = 0;
+        false
+    }
 }
 
 #[derive(Default, Clone)]
 pub(super) struct Probe {
+    #[cfg(test)]
+    pub fail_spawn: bool,
+    #[cfg(test)]
+    pub spawn_attempts: usize,
     #[cfg(test)]
     pub max_lock_ns: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
@@ -166,7 +183,7 @@ fn with_store<T>(
 }
 
 fn run(handle: &Weak<Handle>, token: &str, mut probe: Probe) {
-    loop {
+    'conversations: loop {
         let Some(Some(mut build)) = with_store(handle, token, &probe, |s| {
             let search = &mut s.read_model.search;
             if let Some(cid) = search.pending.pop_front() {
@@ -188,21 +205,10 @@ fn run(handle: &Weak<Handle>, token: &str, mut probe: Probe) {
             for doc in batch {
                 doc.index(&mut build.index, false);
             }
-            let reserved = with_store(handle, token, &probe, |s| {
-                if s.read_model.search.reserve(build.index.bytes) {
-                    true
-                } else {
-                    s.read_model.search.fail(
-                        build.cid.clone(),
-                        "Conversation exceeds the search byte budget",
-                    );
-                    s.read_model.search.active = None;
-                    s.read_model.search.building_bytes = 0;
-                    false
-                }
-            });
-            if reserved != Some(true) {
-                return;
+            match with_store(handle, token, &probe, |s| build.reserve(s)) {
+                Some(true) => (),
+                Some(false) => continue 'conversations,
+                None => return,
             }
             if done {
                 break;
@@ -227,19 +233,10 @@ fn run(handle: &Weak<Handle>, token: &str, mut probe: Probe) {
             for doc in batch {
                 doc.index(&mut build.index, true);
             }
-            let reserved = with_store(handle, token, &probe, |s| {
-                s.read_model.search.reserve(build.index.bytes)
-            });
-            if reserved != Some(true) {
-                with_store(handle, token, &probe, |s| {
-                    s.read_model.search.fail(
-                        build.cid.clone(),
-                        "Conversation exceeds the search byte budget",
-                    );
-                    s.read_model.search.active = None;
-                    s.read_model.search.building_bytes = 0;
-                });
-                return;
+            match with_store(handle, token, &probe, |s| build.reserve(s)) {
+                Some(true) => (),
+                Some(false) => continue 'conversations,
+                None => return,
             }
         }
     }
@@ -261,6 +258,14 @@ impl SearchIndex {
         {
             return Ok(());
         }
+        #[cfg(test)]
+        {
+            search.probe.spawn_attempts += 1;
+            if search.probe.fail_spawn {
+                return Err(std::io::Error::other("injected search worker spawn failure").into());
+            }
+        }
+        search.start_disposer()?;
         let token = uuid();
         search.worker = Some(token.clone());
         let handle = search.handle.clone();
@@ -303,6 +308,12 @@ impl SearchIndex {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn fail_search_spawn_for_test(&mut self, fail: bool) -> usize {
+        self.read_model.search.probe.fail_spawn = fail;
+        self.read_model.search.probe.spawn_attempts
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_search_for_test(
         &mut self,

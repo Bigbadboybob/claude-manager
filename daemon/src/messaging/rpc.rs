@@ -336,7 +336,7 @@ fn execute_with_freshness(
         coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
     let store = slot.as_mut().ok_or_else(super::startup::starting)?;
-    store.configure_search(&handle, search_budget)?;
+    store.configure_search(&handle, search_budget);
     let actor = if kind == "owner" {
         "owner".into()
     } else {
@@ -588,7 +588,13 @@ fn execute_with_freshness(
             message: "Messaging method not implemented".into(),
         }),
     };
-    store.start_search_worker(&handle)?;
+    if req.method == "messaging.read"
+        && ["sender", "query"].iter().any(|key| p.get(key).is_some_and(|v| !v.is_null()))
+    {
+        if let Err(error) = store.start_search_worker(&handle) {
+            eprintln!("cm messaging: could not start search worker: {error}");
+        }
+    }
     let result = match result {
         Err(e) if e.code == "search_indexing" => Ok(json!({"items":[], "indexing":true,
             "retry_after":1,"partial_scope":p["channel"] == "*" || p["inbox"] == true || p["dms"] == true,
@@ -1000,6 +1006,32 @@ mod tests {
         let opened = call(&state, "b", "open", json!({"channel":"roles"})).unwrap();
         assert_eq!(opened["target"]["can_edit"], false);
         assert_eq!(opened["target"]["created_by"], channel["created_by"]);
+    }
+    #[test]
+    fn messaging_search_spawn_failure_never_fails_or_restarts_on_ordinary_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let handle = state.lock().unwrap().messaging.clone();
+        handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(true);
+        call(&state, "a", "send", json!({"channel":"general","name":"Search Builder","body":"first verdict","request_id":"first"})).unwrap();
+        let q = json!({"channel":"general","query":"verdict"});
+        assert_eq!(call(&state, "b", "read", q.clone()).unwrap()["indexing"], true);
+        assert_eq!(handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(true), 1);
+        let sent = call(&state, "a", "send", json!({"channel":"general","body":"second verdict","request_id":"second"})).unwrap();
+        let page = call(&state, "b", "read", json!({"channel":"general"})).unwrap();
+        assert!(page["items"].as_array().unwrap().iter().any(|e| e["id"] == sent["event_id"]));
+        assert_eq!(handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(false), 1,
+            "non-search RPCs must not even attempt to start the queued worker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let page = call(&state, "b", "read", q.clone()).unwrap();
+            if page["indexing"] != true {
+                assert_eq!(page["items"].as_array().unwrap().len(), 2);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
     #[test]
     fn messaging_search_build_keeps_sends_and_retry_responsive() {

@@ -53,7 +53,9 @@ returns no messages or receipt. Broad reads may already return warm results.
 The TUI retries at most five times, respecting `retry_after` with exponential
 backoff; reapply `/` filters to retry after that. Changing targets clears sender
 and query filters. Build failures return `search_index_failed` with a 30-second
-backoff instead of an endless indexing response.
+backoff instead of an endless indexing response. Worker threads start only on
+search reads; a thread startup failure is logged and leaves the read pending
+for retry, without failing ordinary messaging operations.
 The worker copies small batches from the existing timeline under short store
 locks and tokenizes/sorts outside the lock. It catches up publications and
 backfill that arrived during construction before atomically installing the index.
@@ -63,8 +65,10 @@ zero disables search. Config reload applies it on the next messaging RPC.
 Accounting includes vector capacities, string storage and a conservative hash
 table allowance, across cached indexes and the worker's in-progress index;
 it is not a bound on whole-process RSS. Least-recently-searched indexes are
-evicted and freed outside the store lock. A conversation exceeding the budget
-fails with backoff. A direct request takes priority over queued broad builds.
+evicted and freed outside the store lock. A conversation exceeding the whole
+budget returns `search_too_large`; its measured size is remembered until the
+conversation grows or the budget changes, avoiding repeated builds/evictions.
+A direct request takes priority over queued broad builds.
 
 Broad searches select at most 20 recently active conversations and initially
 search their warm indexes while queuing the cold ones. `partial_scope:true`

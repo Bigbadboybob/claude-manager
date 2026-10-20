@@ -66,12 +66,14 @@ pub(super) struct SearchIndex {
     worker: Option<String>,
     active: Option<String>,
     failed: HashMap<String, cache::Failure>,
+    oversized: HashMap<String, cache::Oversized>,
     requested: HashMap<String, u64>,
     budget: usize,
     total_bytes: usize,
     building_bytes: usize,
     clock: u64,
     retired: Vec<ConversationSearch>,
+    disposer: Option<std::sync::mpsc::Sender<ConversationSearch>>,
     handle: Weak<Mutex<Option<Store>>>,
     #[cfg(test)]
     probe: build::Probe,
@@ -163,9 +165,6 @@ impl SearchIndex {
             }
         }
         self.enforce_budget();
-        if !self.retired.is_empty() {
-            let _ = self.launch_worker();
-        }
     }
 }
 
