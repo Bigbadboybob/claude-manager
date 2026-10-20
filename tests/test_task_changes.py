@@ -327,6 +327,75 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         page2 = await self.changes(page["cursor"], snap["epoch"])
         self.assertEqual(page2["changes"], [])
 
+    async def test_division_kind_is_permanent_and_rides_task_rows(self):
+        await db.init_db(self.pool)  # migrations re-run on every API start
+        coord = await self.create("cto")
+        r = await self.client.post("/initiatives", json={
+            "name": "Trader", "coordinator_task_id": coord["id"], "kind": "bogus"})
+        self.assertEqual(r.status_code, 400, r.text)
+        r = await self.client.post("/initiatives", json={
+            "name": "Trader", "coordinator_task_id": coord["id"], "kind": "division"})
+        self.assertEqual(r.status_code, 200, r.text)
+        div = r.json()
+        self.assertEqual(div["kind"], "division")
+        # Existing (default) initiatives read back as kind 'initiative'.
+        other = await self.create("other-coord")
+        r = await self.client.post("/initiatives", json={
+            "name": "Plain", "coordinator_task_id": other["id"]})
+        self.assertEqual(r.json()["kind"], "initiative")
+        r = await self.client.get("/initiatives", params={"kind": "division"})
+        self.assertEqual([i["slug"] for i in r.json()], [div["slug"]])
+
+        # A subtask under the root inherits the division, and both task-row
+        # readers carry kind in the embedded initiative object.
+        r = await self.client.post(f"/initiatives/{div['id']}/projects", json={"project": "proj"})
+        r = await self.client.patch(f"/initiatives/{div['id']}/projects/proj",
+                                    json={"status": "approved"})
+        self.assertEqual(r.status_code, 200, r.text)
+        child = await self.create("report", parent_task_id=coord["id"])
+        self.assertEqual(child["initiative_id"], div["id"])
+        self.assertEqual((await self.client.get(f"/tasks/{child['id']}")).json()
+                         ["initiative"]["kind"], "division")
+        snap = await self.snapshot()
+        rows = {t["id"]: t for t in snap["tasks"]}
+        self.assertEqual(rows[child["id"]]["initiative"]["kind"], "division")
+
+        # Divisions have no done state.
+        r = await self.client.post(f"/initiatives/{div['id']}/approve")
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.client.post(f"/initiatives/{div['id']}/complete")
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("permanent", r.text)
+        r = await self.client.patch(f"/initiatives/{div['id']}", json={"status": "completed"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+        # A kind change re-delivers member tasks through the feed.
+        r = await self.client.patch(f"/initiatives/{div['id']}", json={"kind": "initiative"})
+        self.assertEqual(r.status_code, 200, r.text)
+        page = await self.changes(snap["cursor"], snap["epoch"])
+        kinds = {c["task_id"]: c["task"]["initiative"]["kind"] for c in page["changes"]}
+        self.assertEqual(kinds, {coord["id"]: "initiative", child["id"]: "initiative"})
+        # A completed initiative cannot become a division.
+        r = await self.client.post(f"/initiatives/{div['id']}/complete")
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.client.patch(f"/initiatives/{div['id']}", json={"kind": "division"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    async def test_set_task_lead_touches_only_its_key(self):
+        task = await self.create("led", metadata={"filer": {"session_uid": "ts-1-1"}})
+        r = await self.client.post(f"/tasks/{task['id']}/lead", json={"session_uid": "ts-2-0"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"},
+                                                "lead_session_uid": "ts-2-0"})
+        r = await self.client.post(f"/tasks/{task['id']}/lead", json={"session_uid": None})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"}})
+        bare = await self.create("bare")
+        r = await self.client.post(f"/tasks/{bare['id']}/lead", json={"session_uid": " ts-3-0 "})
+        self.assertEqual(r.json()["metadata"], {"lead_session_uid": "ts-3-0"})
+        r = await self.client.post(f"/tasks/{uuid.uuid4()}/lead", json={"session_uid": "x"})
+        self.assertEqual(r.status_code, 404, r.text)
+
     async def test_expired_foreign_and_future_cursors_resnapshot(self):
         a = await self.create("a")
         snap = await self.snapshot()

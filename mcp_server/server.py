@@ -868,6 +868,7 @@ def propose_task(
     difficulty: int | None = None,
     depends: list[str] | None = None,
     initiative_id: str | None = None,
+    reports_to: str | None = None,
 ) -> str:
     """Propose a new task to the project backlog.
 
@@ -880,6 +881,11 @@ def propose_task(
     you spawned. Prefer `create_subtask` when the work should live in
     its own worktree under your task; prefer propose_task when the user
     should triage it on the planning board first.
+
+    Without `reports_to` the draft is a top-level task. When the work is
+    your direct report, pass `reports_to="me"`: the draft becomes a
+    subtask of your task (`parent_task_id`), joins your division or
+    initiative, and shows under you in the org tree (see `org`).
 
     `description` and `prompt` serve different purposes — set BOTH:
       - `description`: what the user sees in the planning queue when
@@ -900,6 +906,8 @@ def propose_task(
         difficulty: Optional difficulty rating (1-10)
         depends: Optional list of task slugs this depends on
         initiative_id: Existing initiative UUID or slug to attach this task to
+        reports_to: Reporting line: "me" (your own task) or a task id. Sets
+            the draft's parent task; omit for a standalone task.
     """
     _check_parameter_confusion("description", description)
     _check_parameter_confusion("prompt", prompt)
@@ -950,6 +958,8 @@ def propose_task(
             params["depends"] = list(depends)
         if initiative_id:
             params["initiative_id"] = initiative_id
+        if reports_to:
+            params["reports_to"] = reports_to
         try:
             task = control_client.call("propose_task", params, socket_path=route.path)
         except control_client.ControlError as e:
@@ -959,6 +969,12 @@ def propose_task(
     else:
         client = PlanningClient()
         filer = _caller_filer_context("mcp.propose_task")
+        parent_task_id = reports_to
+        if reports_to and reports_to.strip().lower() == "me":
+            parent_task_id = filer.get("task_id")
+            if not parent_task_id:
+                return ("propose_task failed: reports_to=\"me\" needs a caller bound "
+                        "to a task; pass a task id or omit reports_to")
         task = client.propose_task(
             project=project,
             name=name,
@@ -967,6 +983,7 @@ def propose_task(
             difficulty=difficulty,
             depends=depends,
             initiative_id=initiative_id,
+            parent_task_id=parent_task_id,
             metadata={"filer": filer},
         )
     # Inline round-trip preview so the caller sees what actually landed
@@ -997,18 +1014,24 @@ def list_initiatives(
     status: str | None = None,
     project: str | None = None,
     include_archived: bool = False,
+    kind: str | None = None,
 ) -> list[dict]:
-    """List first-class initiatives and their project memberships."""
+    """List first-class initiatives and their project memberships.
+
+    `kind="division"` lists only divisions (permanent org units); each row
+    carries `kind` ("initiative" or "division").
+    """
     route = control_client.resolve_socket_route()
     if route.chose_daemon:
         return control_client.call("list_initiatives", {
             key: value for key, value in {
-                "status": status, "project": project,
+                "status": status, "project": project, "kind": kind,
                 "include_archived": include_archived,
             }.items() if value is not None
         }, socket_path=route.path)
     return PlanningClient().list_initiatives(
         status=status, project=project, include_archived=include_archived,
+        kind=kind,
     )
 
 
@@ -1024,6 +1047,52 @@ def get_initiative(initiative_id: str) -> dict:
 
 
 @mcp.tool()
+def org(
+    view: str | None = None,
+    action: str | None = None,
+    task_id: str | None = None,
+    division: str | None = None,
+    session_uid: str | None = None,
+) -> dict:
+    """Find your place in the org: your boss, your reports, your division.
+
+    Reporting lines follow the task tree: a task reports to its parent task,
+    and a task with no parent is standalone. Each task's lead is its pinned
+    `metadata.lead_session_uid` if that session is live, else its
+    earliest-spawned live claude/codex session. Views return names and ids
+    only; reporting is not approval authority. Leads are resolved from
+    sessions on this host, so a remote lead reads as `lead: null` (the raw
+    pin is in `pinned_lead_session_uid`).
+
+    Views (open to every agent):
+      - `view="me"` (default): your task and lead, your boss (the parent
+        task and its lead, which is whom you report to), the chain up to the
+        root, and your division (or initiative).
+      - `view="reports", task_id=None`: child tasks of your task (or of
+        `task_id`) with their leads.
+      - `view="division", division=None`: the task tree under your division
+        (or the given initiative id/slug), rooted at its coordinator task.
+
+    Actions (your own task only):
+      - `action="set_lead", session_uid=None`: pin the lead of your task to
+        `session_uid` (default: you). It must be a live claude/codex session
+        bound to your task.
+      - `action="clear_lead"`: remove the pin, so the fallback rule applies.
+    """
+    params = {key: value for key, value in {
+        "view": view, "action": action, "task_id": task_id,
+        "division": division, "session_uid": session_uid,
+    }.items() if value is not None}
+    route = control_client.resolve_socket_route()
+    if not route.chose_daemon:
+        raise RuntimeError("org needs the CM daemon (CM_DAEMON_SOCKET is not set)")
+    try:
+        return control_client.call("org", params, socket_path=route.path)
+    except control_client.ControlError as e:
+        raise RuntimeError(f"org failed ({e.code}): {e.message}") from e
+
+
+@mcp.tool()
 def propose_initiative(
     name: str,
     coordinator_task_id: str,
@@ -1032,17 +1101,22 @@ def propose_initiative(
     color: str | None = None,
     coordinator_project: str | None = None,
     docs_path: str = "cm-initiative",
+    kind: str = "initiative",
 ) -> dict:
     """Create a draft initiative around an existing coordinator task.
 
     This does not activate the initiative or launch any work. Owner approval
     is required before adding project sides or activating it.
+
+    `kind="division"` proposes a permanent org unit (no done state) whose
+    root is the coordinator task; subtasks under it inherit the division.
     """
     body = {
         "name": name,
         "coordinator_task_id": coordinator_task_id,
         "description": description,
         "docs_path": docs_path,
+        "kind": kind,
     }
     for key, value in {
         "slug": slug, "color": color, "coordinator_project": coordinator_project,

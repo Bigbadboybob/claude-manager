@@ -203,6 +203,8 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "get_initiative",
     "propose_initiative",
     "propose_initiative_project",
+    # Org hierarchy: reporting-line views + set_lead on the caller's task.
+    "org",
     # 10d-2b: workflow_transition / workflow_done flip from
     # MCP-server-side `_append_event` (direct events.jsonl
     # write) to daemon-side writers via 10d-2a's

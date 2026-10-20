@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from api.auth import verify_token
 from api.models import (
     TaskCreate, TaskUpdate, TaskResponse, ArtifactCreate, ArtifactResponse,
-    BacktestPhaseUpdate, InitiativeCreate, InitiativeUpdate,
+    BacktestPhaseUpdate, TaskLeadUpdate, InitiativeCreate, InitiativeUpdate,
     InitiativeProjectCreate, InitiativeProjectUpdate, InitiativeResponse,
     TaskChangesResponse,
 )
@@ -748,6 +748,25 @@ async def update_backtest_phase(task_id: str, body: BacktestPhaseUpdate,
     return updated
 
 
+@app.post("/tasks/{task_id}/lead", response_model=TaskResponse,
+          dependencies=[Depends(verify_token)])
+async def set_task_lead(task_id: str, body: TaskLeadUpdate, pool=Depends(get_pool)):
+    """Pin the task's lead session (``metadata.lead_session_uid``), or clear it with null.
+
+    One server-side statement that touches only that key, so the TUI's Lead
+    field and the ``org(action="set_lead")`` tool never clobber
+    ``metadata.filer`` or anything else (``PATCH /tasks/{id}`` replaces the
+    whole bag). Whether the uid is live and bound to the task is the readers'
+    concern: the shared lead rule ignores a pin that isn't.
+    """
+    task = await _get_task_or_error(pool, task_id)
+    uid = (body.session_uid or "").strip() or None
+    updated = await db.set_task_lead(pool, str(task["id"]), uid)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return updated
+
+
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     task = await _get_task_or_error(pool, task_id)
@@ -874,6 +893,7 @@ async def create_initiative(body: InitiativeCreate, pool=Depends(get_pool)):
             color=body.color, coordinator_task_id=body.coordinator_task_id,
             coordinator_project=body.coordinator_project, docs_path=body.docs_path,
             shared_channel=body.shared_channel, metadata=body.metadata,
+            kind=body.kind,
         )
     except db.InvalidTaskId as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -888,11 +908,13 @@ async def create_initiative(body: InitiativeCreate, pool=Depends(get_pool)):
 async def list_initiatives(
     status: str | None = Query(None),
     project: str | None = Query(None),
+    kind: str | None = Query(None),
     include_archived: bool = Query(False),
     pool=Depends(get_pool),
 ):
     return await db.list_initiatives(
-        pool, status=status, project=project, include_archived=include_archived,
+        pool, status=status, project=project, kind=kind,
+        include_archived=include_archived,
     )
 
 
@@ -927,6 +949,17 @@ async def update_initiative(
     return updated
 
 
+async def _transition_initiative(initiative: dict, status: str, reason: str, pool) -> dict:
+    # An illegal transition (including completing a permanent division) is a
+    # client error, not a 500.
+    try:
+        return await db.update_initiative(
+            pool, initiative["id"], status=status, actor="owner", reason=reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/initiatives/{initiative_ref}/approve", response_model=InitiativeResponse,
           dependencies=[Depends(verify_token)])
 async def approve_initiative(initiative_ref: str, pool=Depends(get_pool)):
@@ -937,30 +970,21 @@ async def approve_initiative(initiative_ref: str, pool=Depends(get_pool)):
             status_code=400,
             detail="approve at least one initiative project before activation",
         )
-    return await db.update_initiative(
-        pool, initiative["id"], status="active", actor="owner",
-        reason="Owner approved initiative",
-    )
+    return await _transition_initiative(initiative, "active", "Owner approved initiative", pool)
 
 
 @app.post("/initiatives/{initiative_ref}/pause", response_model=InitiativeResponse,
           dependencies=[Depends(verify_token)])
 async def pause_initiative(initiative_ref: str, pool=Depends(get_pool)):
     initiative = await _initiative_or_404(pool, initiative_ref)
-    return await db.update_initiative(
-        pool, initiative["id"], status="paused", actor="owner",
-        reason="Owner paused initiative",
-    )
+    return await _transition_initiative(initiative, "paused", "Owner paused initiative", pool)
 
 
 @app.post("/initiatives/{initiative_ref}/complete", response_model=InitiativeResponse,
           dependencies=[Depends(verify_token)])
 async def complete_initiative(initiative_ref: str, pool=Depends(get_pool)):
     initiative = await _initiative_or_404(pool, initiative_ref)
-    return await db.update_initiative(
-        pool, initiative["id"], status="completed", actor="owner",
-        reason="Owner completed initiative",
-    )
+    return await _transition_initiative(initiative, "completed", "Owner completed initiative", pool)
 
 
 @app.post("/initiatives/{initiative_ref}/projects",

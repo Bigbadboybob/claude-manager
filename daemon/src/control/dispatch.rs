@@ -721,6 +721,7 @@ pub fn dispatch_request(
         "list_initiatives" => DispatchOutcome::Done(dispatch_list_initiatives(state, req)),
         "get_initiative" => DispatchOutcome::Done(dispatch_get_initiative(state, req)),
         "propose_initiative" => DispatchOutcome::Done(dispatch_propose_initiative(state, req)),
+        "org" => DispatchOutcome::Done(dispatch_org(state, req)),
         "propose_initiative_project" => DispatchOutcome::Done(dispatch_propose_initiative_project(state, req)),
 
         // 10d-2b: workflow_transition / workflow_done relocate
@@ -1658,6 +1659,19 @@ fn dispatch_list_initiatives(state: &Arc<Mutex<DaemonState>>, req: &Request) -> 
 
 fn dispatch_get_initiative(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     match methods::get_initiative(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `org` — reporting-line views (open to every caller) plus `set_lead` on
+/// the caller's own task. The Session caller's uid scopes "me".
+fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::org(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -10120,6 +10134,44 @@ mod tests {
             std::env::remove_var("CM_API_URL");
             std::env::remove_var("CM_API_TOKEN");
         }
+    }
+
+    /// `propose_task(reports_to=…)` sets the draft's `parent_task_id`; "me"
+    /// needs a tasked caller (an Operator frame has none).
+    #[test]
+    fn propose_task_reports_to_sets_parent_task_id() {
+        let _g = crate::planning_client::test_env_lock();
+        let (port, captured) =
+            crate::planning_client::spawn_stub_api_for_test(200, r#"{"id":"task-report"}"#);
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.config = crate::config::DaemonConfig {
+                api_url: format!("http://127.0.0.1:{}", port),
+                api_token: "tok".into(),
+                ..Default::default()
+            };
+        }
+        let params = |reports_to: &str| {
+            serde_json::json!({
+                "project": "p", "name": "n", "repo_url": "git@x.com:a/b.git",
+                "reports_to": reports_to,
+            })
+        };
+        let resp = dispatch_request(&state, &operator_request("propose_task", params("me")))
+            .into_response();
+        assert!(!resp.ok, "operator has no task for reports_to=me");
+        assert!(format!("{:?}", resp.error).contains("reports_to"), "{:?}", resp.error);
+
+        let resp = dispatch_request(&state, &operator_request("propose_task", params("boss-task")))
+            .into_response();
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(captured.lock().unwrap().body_json()["parent_task_id"], "boss-task");
+        // The auth overlay mirrors the planning parent.
+        assert_eq!(
+            state.lock().unwrap().task_tree.get("task-report"),
+            Some(&Some("boss-task".to_string()))
+        );
     }
 
     // -- Cloud auto-backtest (backtest.submit / backtest.result) -----------

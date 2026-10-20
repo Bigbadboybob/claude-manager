@@ -75,6 +75,7 @@ class PlanningClient:
         depends: list[str] | None = None,
         metadata: dict | None = None,
         initiative_id: str | None = None,
+        parent_task_id: str | None = None,
     ) -> dict:
         """Create a task with source='claude' in draft status."""
         if not repo_url:
@@ -99,6 +100,8 @@ class PlanningClient:
             body["metadata"] = metadata
         if initiative_id:
             body["initiative_id"] = initiative_id
+        if parent_task_id:
+            body["parent_task_id"] = parent_task_id
 
         r = self._client.client.post("/tasks", json=body)
         return _response_json(r)
@@ -127,10 +130,13 @@ class PlanningClient:
 
     def list_initiatives(self, status: str | None = None,
                          project: str | None = None,
-                         include_archived: bool = False) -> list[dict]:
+                         include_archived: bool = False,
+                         kind: str | None = None) -> list[dict]:
         params = {"include_archived": include_archived}
         if status:
             params["status"] = status
+        if kind:
+            params["kind"] = kind
         if project:
             params["project"] = project
         r = self._client.client.get("/initiatives", params=params)

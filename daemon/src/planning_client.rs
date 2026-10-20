@@ -94,6 +94,10 @@ struct ProposeTaskBody<'a> {
     depends: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     initiative_id: Option<&'a str>,
+    /// Reporting line (`propose_task(reports_to=…)`); the API inherits
+    /// the parent's initiative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_task_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<&'a serde_json::Value>,
 }
@@ -109,6 +113,7 @@ pub struct ProposeTaskRequest<'a> {
     pub difficulty: Option<i32>,
     pub depends: Option<&'a [String]>,
     pub initiative_id: Option<&'a str>,
+    pub parent_task_id: Option<&'a str>,
     pub metadata: Option<&'a serde_json::Value>,
 }
 
@@ -358,6 +363,7 @@ pub fn propose_task(
         difficulty: req.difficulty,
         depends: req.depends,
         initiative_id: req.initiative_id,
+        parent_task_id: req.parent_task_id,
         metadata: req.metadata,
     };
     let agent = build_agent();
@@ -490,6 +496,10 @@ impl TestCapturedRequest {
             parts.first().copied().unwrap_or("").to_string(),
             parts.get(1).copied().unwrap_or("").to_string(),
         )
+    }
+    pub(crate) fn body_json(&self) -> serde_json::Value {
+        let body = self.raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
     }
 }
 
@@ -661,6 +671,7 @@ mod tests {
             difficulty: None,
             depends: None,
             initiative_id: None,
+            parent_task_id: None,
             metadata: None,
         }
     }
@@ -703,6 +714,7 @@ mod tests {
         assert_eq!(body["priority"], 0);
         assert_eq!(body["metadata"], metadata);
         assert!(body.get("difficulty").is_none() || body["difficulty"].is_null());
+        assert!(body.get("parent_task_id").is_none(), "no reporting line unless asked");
         clear_env();
     }
 
@@ -726,6 +738,7 @@ mod tests {
             difficulty: None,
             depends: None,
             initiative_id: None,
+            parent_task_id: None,
             metadata: None,
         };
         let _ = propose_task(&req, None, None).expect("ok");

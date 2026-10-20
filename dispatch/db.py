@@ -163,7 +163,7 @@ TASK_ROW_SELECT = """SELECT t.*, i.slug AS initiative_slug, i.name AS initiative
                           CASE WHEN i.id IS NULL THEN NULL ELSE
                             jsonb_build_object('id', i.id, 'slug', i.slug,
                                                'name', i.name, 'status', i.status,
-                                               'color', i.color,
+                                               'color', i.color, 'kind', i.kind,
                                                'coordinator_task_id', i.coordinator_task_id) END AS initiative
                    FROM tasks t
                    LEFT JOIN initiatives i ON i.id = t.initiative_id"""
@@ -361,6 +361,16 @@ INITIATIVE_STATUSES = frozenset(
     {"draft", "active", "paused", "completed", "archived", "cancelled"}
 )
 INITIATIVE_PROJECT_STATUSES = frozenset({"proposed", "approved", "removed"})
+# A division is a permanent org unit: it never reaches a done state.
+INITIATIVE_KINDS = frozenset({"initiative", "division"})
+DIVISION_FORBIDDEN_STATUSES = frozenset({"completed", "archived"})
+
+
+def _check_initiative_kind(kind: str) -> None:
+    if kind not in INITIATIVE_KINDS:
+        raise ValueError(
+            f"invalid initiative kind: {kind!r} (expected one of {sorted(INITIATIVE_KINDS)})"
+        )
 
 
 def _initiative_ref(ref: str) -> tuple[str, str]:
@@ -407,7 +417,8 @@ async def get_initiative(pool: asyncpg.Pool, ref: str) -> dict | None:
 
 async def list_initiatives(
     pool: asyncpg.Pool, *, status: str | None = None,
-    project: str | None = None, include_archived: bool = False,
+    project: str | None = None, kind: str | None = None,
+    include_archived: bool = False,
 ) -> list[dict]:
     async with pool.acquire() as conn:
         conditions: list[str] = []
@@ -415,6 +426,9 @@ async def list_initiatives(
         if status:
             params.append(status)
             conditions.append(f"i.status = ${len(params)}")
+        if kind:
+            params.append(kind)
+            conditions.append(f"i.kind = ${len(params)}")
         if project:
             params.append(project)
             conditions.append(
@@ -443,8 +457,9 @@ async def create_initiative(
     color: str | None = None, coordinator_task_id: str,
     coordinator_project: str | None = None, docs_path: str = "cm-initiative",
     shared_channel: str | None = None, metadata: dict | None = None,
-    actor: str = "owner",
+    actor: str = "owner", kind: str = "initiative",
 ) -> dict:
+    _check_initiative_kind(kind)
     coordinator_task_id = normalize_task_id(coordinator_task_id)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -457,11 +472,11 @@ async def create_initiative(
             row = await conn.fetchrow(
                 """INSERT INTO initiatives
                     (slug, name, description, color, coordinator_task_id,
-                     coordinator_project, docs_path, shared_channel, metadata)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""",
+                     coordinator_project, docs_path, shared_channel, metadata, kind)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""",
                 slug, name, description, color, coordinator_task_id,
                 coordinator_project or task["project"], docs_path,
-                shared_channel, metadata,
+                shared_channel, metadata, kind,
             )
             # The coordinator is a normal task, but it is also the durable
             # anchor for this initiative. Attach it in the same transaction so
@@ -480,7 +495,7 @@ async def create_initiative(
                 """INSERT INTO initiative_events
                    (initiative_id, actor, event_type, new_value, reason)
                    VALUES ($1,$2,'created',$3,$4)""",
-                row["id"], actor, {"status": "draft", "slug": slug},
+                row["id"], actor, {"status": "draft", "slug": slug, "kind": kind},
                 "initiative created",
             )
         result = _serialize(dict(row))
@@ -494,8 +509,11 @@ async def update_initiative(
     reason: str | None = None, **fields,
 ) -> dict | None:
     allowed = {"name", "description", "color", "status", "coordinator_task_id",
-               "coordinator_project", "docs_path", "shared_channel", "metadata"}
+               "coordinator_project", "docs_path", "shared_channel", "metadata",
+               "kind"}
     fields = {key: value for key, value in fields.items() if key in allowed}
+    if "kind" in fields:
+        _check_initiative_kind(fields["kind"])
     if not fields:
         return await get_initiative(pool, ref)
     if "status" in fields and fields["status"] not in INITIATIVE_STATUSES:
@@ -512,6 +530,13 @@ async def update_initiative(
             )
             if not current:
                 return None
+            kind = fields.get("kind", current["kind"])
+            status = fields.get("status", current["status"])
+            if kind == "division" and status in DIVISION_FORBIDDEN_STATUSES:
+                raise ValueError(
+                    f"a division is permanent and cannot be {status}; "
+                    "pause or cancel it, or change its kind first"
+                )
             if "coordinator_task_id" in fields:
                 coordinator = await conn.fetchrow(
                     "SELECT id, initiative_id FROM tasks WHERE id = $1",
@@ -670,7 +695,7 @@ async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
             """SELECT t.*, CASE WHEN i.id IS NULL THEN NULL ELSE
                        jsonb_build_object('id', i.id, 'slug', i.slug,
                                           'name', i.name, 'status', i.status,
-                                          'color', i.color,
+                                          'color', i.color, 'kind', i.kind,
                                           'coordinator_task_id', i.coordinator_task_id) END AS initiative
                   FROM tasks t LEFT JOIN initiatives i ON i.id = t.initiative_id
                  WHERE t.id = $1""", task_id,
@@ -690,6 +715,34 @@ async def update_task(pool: asyncpg.Pool, task_id: str, **fields) -> dict | None
             task_id, *fields.values(),
         )
         return _serialize(dict(row)) if row else None
+
+
+async def set_task_lead(pool: asyncpg.Pool, task_id: str, session_uid: str | None) -> dict | None:
+    """Set or (with None) remove ``metadata.lead_session_uid`` in one statement.
+
+    Every other metadata key is preserved, unlike ``update_task``'s
+    whole-object replace. Returns the full task row, or None if missing.
+    """
+    task_id = normalize_task_id(task_id)
+    async with pool.acquire() as conn:
+        if session_uid is None:
+            updated = await conn.fetchval(
+                """UPDATE tasks SET metadata = COALESCE(metadata, '{}'::jsonb) - 'lead_session_uid',
+                                   updated_at = now()
+                   WHERE id = $1 RETURNING id""",
+                task_id,
+            )
+        else:
+            updated = await conn.fetchval(
+                """UPDATE tasks SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                                                         '{lead_session_uid}', to_jsonb($2::text), true),
+                                   updated_at = now()
+                   WHERE id = $1 RETURNING id""",
+                task_id, session_uid,
+            )
+    if not updated:
+        return None
+    return await get_task(pool, task_id)
 
 
 async def merge_task_metadata_backtest(

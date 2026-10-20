@@ -77,6 +77,7 @@ pub mod messaging;
 pub mod mcp_config;
 pub mod migrate;
 pub mod notify;
+pub mod org;
 pub mod owner_attention;
 pub mod owner_availability;
 pub mod sidebar;
