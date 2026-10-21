@@ -10,14 +10,22 @@
 //! (`continuous_rows_unfiltered`). Reporting lines only: nothing here
 //! implies approval rights.
 //!
-//! The overlay takes every key while open: h/l siblings, j back to the
-//! last-focused child (else the first), k parent, gg/G, Tab/S-Tab a session
+//! A leader (a task with live reports, the leader marks' predicate, or a
+//! continuous orchestrator) stacks its reports that have none of their own
+//! in one column under it; reports with reports fan out beside that column.
+//! Reports of structural boxes (Owner, projects, splits, divisions) never
+//! stack.
+//!
+//! The overlay takes every key while open: h/l along the row (a stack is
+//! one slot; at a stack's end, the leader's row), j back to the
+//! last-focused child (else the first) or down a stack, k up a stack, else
+//! parent, gg/G, Tab/S-Tab a session
 //! within the box, / n N search, Space/zc/zo/za fold, zM/zR fold/unfold the
 //! projects and splits, +/- zoom (ten levels), H/J/K/L or arrows pan,
 //! c centre, b bash, i info pane, ? symbol legend (app/symbols.rs). Enter
 //! (or A-t) and every exit (F6/Esc/q) return to the Sessions view focused on
-//! the chart's session. Every level is one row; the viewport follows the
-//! focus.
+//! the chart's session. Apart from stacks every level is one row; the
+//! viewport follows the focus.
 //! The info pane's board items come from `board.read`, polled only while the
 //! chart is open.
 
@@ -162,6 +170,10 @@ pub(super) struct ChartNode {
     pub sessions: Vec<ChartSession>,
     pub children: Vec<usize>,
     pub parent: Option<usize>,
+    /// A leader: a task with live reports (`OrgIndex::has_reports`, the
+    /// predicate behind the leader marks), or a continuous orchestrator.
+    /// Its reports that have no reports of their own stack in a column.
+    pub leader: bool,
     /// Sort rank among siblings (coordinator tasks first, then tasks, then
     /// loose workspaces); ties sort by title.
     rank: u8,
@@ -176,7 +188,7 @@ pub(super) struct ChartModel {
 impl ChartModel {
     fn push(&mut self, parent: Option<usize>, key: String, kind: NodeKind, title: String, task_id: Option<String>, rank: u8) -> usize {
         let i = self.nodes.len();
-        self.nodes.push(ChartNode { key, kind, title, task_id, sessions: Vec::new(), children: Vec::new(), parent, rank });
+        self.nodes.push(ChartNode { key, kind, title, task_id, sessions: Vec::new(), children: Vec::new(), parent, leader: false, rank });
         if let Some(p) = parent {
             self.nodes[p].children.push(i);
         }
@@ -236,10 +248,33 @@ impl ChartModel {
 
     /// Reports in display order (left to right). Folded nodes show none.
     pub(super) fn visual_children(&self, i: usize, folds: &HashSet<String>) -> Vec<usize> {
+        let mut out = self.stack(i, folds);
+        out.extend(self.branches(i, folds));
+        out
+    }
+
+    /// Whether `i` sits in its boss's stack: the boss is a leader and `i`
+    /// has no reports in the chart. A stacked box is the bottom of its
+    /// branch. Structural nodes are never leaders, so their reports never
+    /// stack.
+    pub(super) fn stacked(&self, i: usize) -> bool {
+        self.nodes[i].children.is_empty() && self.nodes[i].parent.is_some_and(|p| self.nodes[p].leader)
+    }
+
+    /// `i`'s stacked reports, top to bottom (none when folded).
+    pub(super) fn stack(&self, i: usize, folds: &HashSet<String>) -> Vec<usize> {
         if folds.contains(&self.nodes[i].key) {
             return Vec::new();
         }
-        self.nodes[i].children.clone()
+        self.nodes[i].children.iter().copied().filter(|&c| self.stacked(c)).collect()
+    }
+
+    /// `i`'s reports laid out side by side (none when folded).
+    pub(super) fn branches(&self, i: usize, folds: &HashSet<String>) -> Vec<usize> {
+        if folds.contains(&self.nodes[i].key) {
+            return Vec::new();
+        }
+        self.nodes[i].children.iter().copied().filter(|&c| !self.stacked(c)).collect()
     }
 
     /// Visible nodes in depth-first display order.
@@ -301,16 +336,35 @@ impl Layouter<'_> {
         2 + lines as i32
     }
 
-    /// Every level is one row: the chart grows as wide as it needs.
-    fn band(&mut self, i: usize) -> (Vec<usize>, i32, i32) {
-        let kids = self.model.visual_children(i, self.folds);
-        let (mut w, mut h) = (0, 0);
-        for (k, &c) in kids.iter().enumerate() {
-            let (cw, ch) = self.measure(c);
-            w += cw + if k > 0 { self.zoom.hgap() } else { 0 };
-            h = h.max(ch);
+    /// A box's reports in layout order: its stack (one column) first, then
+    /// its branches side by side. The chart grows as wide as the branches
+    /// need.
+    fn units(&self, i: usize) -> Vec<Unit> {
+        let stack = self.model.stack(i, self.folds);
+        let mut out = Vec::new();
+        if !stack.is_empty() {
+            out.push(Unit::Column(stack));
         }
-        (kids, w, h)
+        out.extend(self.model.branches(i, self.folds).into_iter().map(Unit::Sub));
+        out
+    }
+
+    fn unit_size(&mut self, u: &Unit) -> (i32, i32) {
+        match u {
+            Unit::Sub(c) => self.measure(*c),
+            Unit::Column(ls) => (2 + self.zoom.box_w(), ls.iter().map(|&l| self.box_h(l)).sum()),
+        }
+    }
+
+    fn band(&mut self, i: usize) -> (Vec<Unit>, i32, i32) {
+        let units = self.units(i);
+        let (mut w, mut h) = (0, 0);
+        for (k, u) in units.iter().enumerate() {
+            let (uw, uh) = self.unit_size(u);
+            w += uw + if k > 0 { self.zoom.hgap() } else { 0 };
+            h = h.max(uh);
+        }
+        (units, w, h)
     }
 
     fn measure(&mut self, i: usize) -> (i32, i32) {
@@ -318,8 +372,13 @@ impl Layouter<'_> {
             return *s;
         }
         let (bw, bh) = (self.zoom.box_w(), self.box_h(i));
-        let (kids, band_w, band_h) = self.band(i);
-        let size = if kids.is_empty() { (bw, bh) } else { (bw.max(band_w), bh + self.zoom.vgap() + band_h) };
+        let (units, band_w, band_h) = self.band(i);
+        let size = match units.as_slice() {
+            [] => (bw, bh),
+            // Only a stack: a list straight under the box, one spine row below it.
+            [Unit::Column(_)] => (bw.max(1 + band_w), bh + 1 + band_h),
+            _ => (bw.max(band_w), bh + self.zoom.vgap() + band_h),
+        };
         self.sizes.insert(i, size);
         size
     }
@@ -328,13 +387,39 @@ impl Layouter<'_> {
         self.out.lines.push((x, y, c));
     }
 
+    /// A stack under spine `sx`: the spine runs from row `top`, and the
+    /// items start at row `y`, two cells right of it.
+    fn column(&mut self, ls: &[usize], sx: i32, top: i32, y: i32) {
+        // Full cards: the arm meets the card's first session row.
+        let arm = if self.zoom.detail() == Detail::Full { 1 } else { 0 };
+        let last_arm = y + ls.iter().take(ls.len() - 1).map(|&l| self.box_h(l)).sum::<i32>() + arm;
+        for row in top..last_arm {
+            self.line(sx, row, '\u{2502}');
+        }
+        let (bw, mut yy) = (self.zoom.box_w(), y);
+        for (k, &l) in ls.iter().enumerate() {
+            let lh = self.box_h(l);
+            self.line(sx, yy + arm, if k + 1 == ls.len() { '\u{2514}' } else { '\u{251c}' });
+            self.line(sx + 1, yy + arm, '\u{2500}');
+            self.out.boxes.insert(l, Placed { x: sx + 2, y: yy, w: bw, h: lh });
+            yy += lh;
+        }
+    }
+
     fn assign(&mut self, i: usize, x: i32, y: i32) {
         let (w, _) = self.measure(i);
         let (bw, bh) = (self.zoom.box_w(), self.box_h(i));
+        let (units, band_w, _) = self.band(i);
+        if let [Unit::Column(ls)] = units.as_slice() {
+            // The leader sits at the left, its list hangs from a spine
+            // under its second cell.
+            self.out.boxes.insert(i, Placed { x, y, w: bw, h: bh });
+            self.column(ls, x + 1, y + bh, y + bh + 1);
+            return;
+        }
         let bx = x + (w - bw) / 2;
         self.out.boxes.insert(i, Placed { x: bx, y, w: bw, h: bh });
-        let (kids, band_w, _) = self.band(i);
-        if kids.is_empty() {
+        if units.is_empty() {
             return;
         }
         let px = bx + bw / 2;
@@ -342,11 +427,21 @@ impl Layouter<'_> {
         let bus_y = child_y - 1;
         let mut cur = x + (w - band_w) / 2;
         let mut attach = Vec::new();
-        for &c in &kids {
-            let (cw, _) = self.measure(c);
-            attach.push(cur + (cw - bw) / 2 + bw / 2);
-            self.assign(c, cur, child_y);
-            cur += cw + self.zoom.hgap();
+        for u in &units {
+            let (uw, _) = self.unit_size(u);
+            match u {
+                Unit::Sub(c) => {
+                    // Over the box as placed: a leader with only a stack
+                    // sits at the left of its branch, not centred.
+                    self.assign(*c, cur, child_y);
+                    attach.push(self.out.boxes[c].x + bw / 2);
+                }
+                Unit::Column(ls) => {
+                    attach.push(cur);
+                    self.column(ls, cur, child_y, child_y);
+                }
+            }
+            cur += uw + self.zoom.hgap();
         }
         for row in y + bh..bus_y {
             self.line(px, row, '\u{2502}');
@@ -358,6 +453,12 @@ impl Layouter<'_> {
             self.line(xx, bus_y, c);
         }
     }
+}
+
+/// A box's reports as laid out: one branch, or a leader's stack.
+enum Unit {
+    Sub(usize),
+    Column(Vec<usize>),
 }
 
 /// The box-drawing character joining the given directions.
@@ -505,6 +606,10 @@ pub(super) struct OrgChart {
     pub(super) last_child: HashMap<String, String>,
     /// The session last focused in each box (node key → uid).
     pub(super) last_session: HashMap<String, String>,
+    /// Where each slot of a row was left by `h`/`l`: a branch's key, or
+    /// `<leader key>#stack` for a leader's stack → the box focused then
+    /// (the branch's head or one of its stacked reports, or a stacked box).
+    pub(super) branch_focus: HashMap<String, String>,
     pub(super) show_bash: bool,
     /// The bash session the chart was opened on: shown while bash is
     /// hidden, until the chart closes or `b` is pressed.
@@ -692,8 +797,14 @@ impl App {
         // Leads (the shared rule; an orchestrator without one falls back to
         // its first session), leader marks exactly as the sidebar draws
         // them, then sessions lead-first in spawn order.
-        let marks = self.leader_marks(&self.org_index());
+        let org = self.org_index();
+        let marks = self.leader_marks(&org);
         for node in &mut m.nodes {
+            node.leader = match node.kind {
+                NodeKind::Task | NodeKind::Worker => node.task_id.as_deref().is_some_and(|t| org.has_reports(t)),
+                NodeKind::Orchestrator => true,
+                _ => false,
+            };
             let task_lead = node.task_id.as_ref().and_then(|t| leads.get(t)).cloned();
             let lead = match node.kind {
                 NodeKind::Orchestrator => task_lead.or_else(|| node.sessions.first().map(|s| s.uid.clone())),
@@ -1054,18 +1165,58 @@ impl App {
                 }
             }
             (_, KeyCode::Char('h')) | (_, KeyCode::Char('l')) => {
+                // Sideways along a box's reports as laid out: its stack is
+                // one slot (`None`), then each branch. At the end of a
+                // stack's row, carry on along its leader's row.
                 let next = key.code == KeyCode::Char('l');
-                if let Some(p) = model.nodes[focus].parent {
-                    let sibs = model.visual_children(p, &self.orgchart.folds);
-                    let at = sibs.iter().position(|&s| s == focus).unwrap_or(0);
-                    let to = if next { sibs.get(at + 1) } else { at.checked_sub(1).and_then(|a| sibs.get(a)) };
-                    if let Some(&to) = to {
-                        self.orgchart_set_focus(&model, to);
+                let folds = &self.orgchart.folds;
+                let slots = |p: usize| -> Vec<Option<usize>> {
+                    let mut row = Vec::new();
+                    if !model.stack(p, folds).is_empty() {
+                        row.push(None);
                     }
+                    row.extend(model.branches(p, folds).into_iter().map(Some));
+                    row
+                };
+                let mut here = (model.nodes[focus].parent, (!model.stacked(focus)).then_some(focus));
+                let mut moved = None;
+                while let (Some(p), slot) = here {
+                    let row = slots(p);
+                    let at = row.iter().position(|&s| s == slot);
+                    let to = at.and_then(|a| if next { row.get(a + 1) } else { a.checked_sub(1).and_then(|a| row.get(a)) });
+                    if let Some(&to) = to {
+                        moved = Some((p, slot, to));
+                        break;
+                    }
+                    if slot.is_some() {
+                        break;
+                    }
+                    here = (model.nodes[p].parent, Some(p));
+                }
+                if let Some((p, from, to)) = moved {
+                    // Leave a note where this slot was, and come back into
+                    // the other one where it was left.
+                    let slot_key = |s: Option<usize>| match s {
+                        Some(b) => model.nodes[b].key.clone(),
+                        None => format!("{}#stack", model.nodes[p].key),
+                    };
+                    let stack = model.stack(to.unwrap_or(p), folds);
+                    let back = self.orgchart.branch_focus.get(&slot_key(to)).and_then(|k| stack.iter().copied().find(|&c| &model.nodes[c].key == k));
+                    let land = back.unwrap_or(to.unwrap_or_else(|| stack[0]));
+                    self.orgchart.branch_focus.insert(slot_key(from), model.nodes[focus].key.clone());
+                    self.orgchart_set_focus(&model, land);
+                }
+            }
+            (_, KeyCode::Char('j')) if model.stacked(focus) => {
+                // Down the stack; its last box is the bottom of the branch.
+                let stack = model.stack(model.nodes[focus].parent.unwrap_or(0), &self.orgchart.folds);
+                if let Some(&below) = stack.iter().skip_while(|&&c| c != focus).nth(1) {
+                    self.orgchart_set_focus(&model, below);
                 }
             }
             (_, KeyCode::Char('j')) => {
-                // Back to the report last focused here, else the first.
+                // Back to the report last focused here, else the first
+                // (the top of the stack, when there is one).
                 let kids = model.visual_children(focus, &self.orgchart.folds);
                 let back = self.orgchart.last_child.get(&model.nodes[focus].key).and_then(|k| kids.iter().copied().find(|&c| &model.nodes[c].key == k));
                 if let Some(c) = back.or(kids.first().copied()) {
@@ -1073,8 +1224,15 @@ impl App {
                 }
             }
             (_, KeyCode::Char('k')) => {
-                if let Some(p) = model.nodes[focus].parent {
-                    self.orgchart_set_focus(&model, p);
+                // Up the stack, then to the leader; elsewhere to the boss.
+                let parent = model.nodes[focus].parent;
+                let above = parent.filter(|_| model.stacked(focus)).and_then(|p| {
+                    let stack = model.stack(p, &self.orgchart.folds);
+                    let at = stack.iter().position(|&c| c == focus)?;
+                    at.checked_sub(1).map(|a| stack[a])
+                });
+                if let Some(to) = above.or(parent) {
+                    self.orgchart_set_focus(&model, to);
                 }
             }
             (_, KeyCode::Tab) | (_, KeyCode::BackTab) => {
@@ -1941,8 +2099,8 @@ mod tests {
 
     #[test]
     fn after_a_pan_a_refresh_keeps_the_focused_box_where_it_was() {
-        let mut app = wide_app(10);
-        app.cursor = Cursor::Session(0, 6); // rep-05
+        let mut app = wide_roots_app(10);
+        app.cursor = Cursor::Session(0, 5); // rt-05
         app.handle_event(&key(KeyCode::F(6)));
         app.orgchart.hide_info = true;
         screen(&mut app, 100, 30);
@@ -1954,9 +2112,9 @@ mod tests {
             (p.x - app.orgchart.ox.get(), p.y - app.orgchart.oy.get())
         };
         let before = on_screen(&app);
-        // Two new reports sort before rep-05 and push its box right.
+        // Two new root tasks sort before rt-05 and push its box right.
         for (k, id) in ["r00a", "r00b"].into_iter().enumerate() {
-            app.tasks.push(task(id, &format!("report 00{}", ["a", "b"][k]), Some("boss")));
+            app.tasks.push(task(id, &format!("root 00{}", ["a", "b"][k]), None));
             session(&mut app, 0, 0x200 + k as u32, &format!("new-{k}"), "codex", Some(id));
         }
         screen(&mut app, 100, 30);
@@ -1971,21 +2129,21 @@ mod tests {
 
     #[test]
     fn j_goes_back_down_to_the_box_and_session_k_came_up_from() {
-        let mut app = wide_app(3);
-        app.cursor = Cursor::Session(0, 1); // rep-00
+        let mut app = wide_roots_app(3);
+        app.cursor = Cursor::Session(0, 0); // rt-00
         app.handle_event(&key(KeyCode::F(6)));
         press(&mut app, "ll");
-        assert_eq!(focused_title(&app), "report 02");
+        assert_eq!(focused_title(&app), "root 02");
         press(&mut app, "kj");
-        assert_eq!(focused_title(&app), "report 02", "j returns to the last-focused report");
+        assert_eq!(focused_title(&app), "root 02", "j returns to the last-focused report");
         // Up two levels and back down two.
         press(&mut app, "hkkjj");
-        assert_eq!(focused_title(&app), "report 01");
+        assert_eq!(focused_title(&app), "root 01");
         // A box never visited still starts at its first report.
         press(&mut app, "gg");
         app.orgchart.last_child.clear();
-        press(&mut app, "jjjj"); // Owner → Other → Teams → The boss → its first report
-        assert_eq!(focused_title(&app), "report 00");
+        press(&mut app, "jjj"); // Owner → Other → Teams → its first root task
+        assert_eq!(focused_title(&app), "root 00");
 
         // Inside a box: k from the second session, then j, lands on it again.
         let mut app = org_app();
@@ -2096,9 +2254,20 @@ mod tests {
         app
     }
 
+    /// `n` root tasks side by side under Teams, which never stacks.
+    fn wide_roots_app(n: usize) -> App {
+        let mut app = test_app();
+        app.workspaces = vec![ws("w", HostId::local())];
+        for k in 0..n {
+            app.tasks.push(task(&format!("r{k:02}"), &format!("root {k:02}"), None));
+            session(&mut app, 0, 0x100 + k as u32, &format!("rt-{k:02}"), "codex", Some(&format!("r{k:02}")));
+        }
+        app
+    }
+
     #[test]
     fn layouts_never_overlap_at_any_zoom_for_deep_and_wide_trees() {
-        for app in [deep_app(12), wide_app(60), org_app()] {
+        for app in [deep_app(12), wide_app(60), wide_roots_app(60), mixed_app(), org_app()] {
             let m = app.org_model(true);
             for zoom in all_zooms() {
                 let lay = layout(&m, zoom, &HashSet::new());
@@ -2120,14 +2289,15 @@ mod tests {
 
     #[test]
     fn wide_fan_out_stays_one_row_at_every_zoom() {
-        let app = wide_app(60);
+        let app = wide_roots_app(60);
         let m = app.org_model(false);
-        let boss = m.find("task:boss").unwrap();
+        let teams = m.find("teams:proj:").unwrap();
         for zoom in all_zooms() {
             let lay = layout(&m, zoom, &HashSet::new());
-            let kids = &m.nodes[boss].children;
+            let kids = &m.nodes[teams].children;
+            assert_eq!(kids.len(), 60);
             let ys: HashSet<i32> = kids.iter().map(|c| lay.boxes[c].y).collect();
-            assert_eq!(ys.len(), 1, "{zoom:?}: 60 reports share one row");
+            assert_eq!(ys.len(), 1, "{zoom:?}: 60 root tasks share one row");
             let xs: Vec<i32> = kids.iter().map(|c| lay.boxes[c].x).collect();
             assert!(xs.windows(2).all(|w| w[0] + zoom.box_w() + zoom.hgap() <= w[1]), "{zoom:?}: left to right, apart");
             // The chart grows as wide as the row needs.
@@ -2160,10 +2330,10 @@ mod tests {
 
     #[test]
     fn reports_sit_in_a_row_with_a_bus() {
-        let app = wide_app(3);
+        let app = wide_roots_app(3);
         let m = app.org_model(false);
         let lay = layout(&m, Zoom::FULL, &HashSet::new());
-        let boss = m.find("task:boss").unwrap();
+        let boss = m.find("teams:proj:").unwrap();
         let ys: HashSet<i32> = m.nodes[boss].children.iter().map(|c| lay.boxes[c].y).collect();
         assert_eq!(ys.len(), 1, "one row");
         let bus_y = lay.boxes[&m.nodes[boss].children[0]].y - 1;
@@ -2173,6 +2343,261 @@ mod tests {
             cells.into_iter().map(|c| c.1).collect()
         };
         assert!(bus.starts_with('\u{250c}') && bus.ends_with('\u{2510}') && bus.contains('\u{253c}'), "{bus}");
+    }
+
+    /// Teams: "Neighbour" (leaves "nleaf 0/1"), "Solo" (no reports) and
+    /// "The boss", whose reports are three leaves "leaf 0..2" and
+    /// "Sub lead" with two leaves of its own, "deep 0/1". Sessions, in
+    /// cursor order: boss, lf-0..2, sub, dp-0/1, nb, nl-0/1, solo.
+    fn mixed_app() -> App {
+        let mut app = test_app();
+        app.workspaces = vec![ws("w", HostId::local())];
+        let add = |app: &mut App, n: u32, id: &str, title: &str, parent: Option<&str>, label: &str| {
+            app.tasks.push(task(id, title, parent));
+            session(app, 0, n, label, "codex", Some(id));
+        };
+        add(&mut app, 0x1, "boss", "The boss", None, "boss");
+        for k in 0..3 {
+            add(&mut app, 0x10 + k, &format!("l{k}"), &format!("leaf {k}"), Some("boss"), &format!("lf-{k}"));
+        }
+        add(&mut app, 0x20, "sub", "Sub lead", Some("boss"), "sub");
+        for k in 0..2 {
+            add(&mut app, 0x30 + k, &format!("d{k}"), &format!("deep {k}"), Some("sub"), &format!("dp-{k}"));
+        }
+        add(&mut app, 0x40, "nb", "Neighbour", None, "nb");
+        for k in 0..2 {
+            add(&mut app, 0x50 + k, &format!("n{k}"), &format!("nleaf {k}"), Some("nb"), &format!("nl-{k}"));
+        }
+        add(&mut app, 0x60, "solo", "Solo", None, "solo");
+        app
+    }
+
+    fn node(m: &ChartModel, key: &str) -> usize {
+        m.find(key).unwrap_or_else(|| panic!("no {key}"))
+    }
+
+    #[test]
+    fn leaves_stack_only_under_leaders() {
+        let app = mixed_app();
+        let m = app.org_model(false);
+        for (key, leader) in [("task:boss", true), ("task:sub", true), ("task:nb", true), ("task:solo", false), ("task:l0", false), ("teams:proj:", false), ("owner", false)] {
+            assert_eq!(m.nodes[node(&m, key)].leader, leader, "{key}");
+        }
+        for (key, stacked) in [("task:l0", true), ("task:l2", true), ("task:d1", true), ("task:n0", true), ("task:sub", false), ("task:solo", false), ("task:boss", false), ("task:nb", false)] {
+            assert_eq!(m.stacked(node(&m, key)), stacked, "{key}");
+        }
+        // Reports of Owner, a project, Teams/Continuous, a division or
+        // Other never stack, whatever they are.
+        for (i, n) in m.nodes.iter().enumerate() {
+            if matches!(n.kind, NodeKind::Owner | NodeKind::Project | NodeKind::Org) {
+                assert!(!n.leader, "{}", n.key);
+                assert!(n.children.iter().all(|&c| !m.stacked(c)), "{}", n.key);
+                assert!(m.stack(i, &HashSet::new()).is_empty());
+            }
+        }
+        // A root without reports stays in the Teams row.
+        let teams = node(&m, "teams:proj:");
+        for zoom in all_zooms() {
+            let lay = layout(&m, zoom, &HashSet::new());
+            let ys: HashSet<i32> = m.nodes[teams].children.iter().map(|c| lay.boxes[c].y).collect();
+            assert_eq!(ys.len(), 1, "{zoom:?}");
+        }
+
+        // A continuous orchestrator is a leader: a worker without reports
+        // stacks, one with a subtask stays a branch.
+        let mut app = org_app();
+        app.tasks.push(task("orch-task", "Health triage", None));
+        app.tasks.push(task("bug-1", "bug one", Some("orch-task")));
+        app.tasks.push(task("bug-1-sub", "bug one deeper", Some("bug-1")));
+        app.tasks.push(task("bug-2", "bug two", Some("orch-task")));
+        for name in ["w-orch", "w-bug", "w-deep", "w-bug2"] {
+            app.workspaces.push(ws(name, HostId::new("manager")));
+        }
+        let o = session(&mut app, 4, 0x70, "health-orchestrator", "codex", Some("orch-task"));
+        app.workspaces[4].sessions[0].continuous_task_id = Some("health".into());
+        session(&mut app, 5, 0x80, "bug-1-fix", "codex", Some("bug-1"));
+        app.workspaces[5].sessions[0].managed_by_uid = Some(o.clone());
+        session(&mut app, 6, 0x90, "deeper", "claude", Some("bug-1-sub"));
+        session(&mut app, 7, 0xa0, "bug-2-fix", "codex", Some("bug-2"));
+        app.workspaces[7].sessions[0].managed_by_uid = Some(o);
+        let m = app.org_model(false);
+        let orch = node(&m, "orch:manager:health");
+        assert!(m.nodes[orch].leader);
+        assert!(m.stacked(node(&m, "worker:manager:bug-2")), "a leaf worker stacks");
+        assert!(!m.stacked(node(&m, "worker:manager:bug-1")), "a worker with a subtask is a branch");
+        assert!(!m.stacked(orch), "Continuous is structural");
+    }
+
+    #[test]
+    fn a_leader_with_both_shows_its_stack_as_a_column_beside_its_branches() {
+        let app = mixed_app();
+        let m = app.org_model(false);
+        let [boss, sub, l0, l1, l2, d0, d1] = ["task:boss", "task:sub", "task:l0", "task:l1", "task:l2", "task:d0", "task:d1"].map(|k| node(&m, k));
+        for zoom in all_zooms() {
+            let lay = layout(&m, zoom, &HashSet::new());
+            assert_no_overlap(&lay);
+            let b = |i: usize| lay.boxes[&i];
+            // The leaves: one column, top to bottom, on the row of the
+            // sub-leader's box and left of it.
+            assert!([l1, l2].iter().all(|&l| b(l).x == b(l0).x), "{zoom:?}");
+            assert_eq!(b(l1).y, b(l0).y + b(l0).h, "{zoom:?}");
+            assert_eq!(b(l2).y, b(l1).y + b(l1).h, "{zoom:?}");
+            assert_eq!(b(l0).y, b(sub).y, "{zoom:?}");
+            assert!(b(l0).x + b(l0).w <= b(sub).x, "{zoom:?}");
+            assert!(b(l0).y > b(boss).y + b(boss).h, "{zoom:?}");
+            // The sub-leader's own leaves hang from a spine under its second cell.
+            assert_eq!(b(d0).x, b(sub).x + 3, "{zoom:?}");
+            assert_eq!(b(d0).y, b(sub).y + b(sub).h + 1, "{zoom:?}");
+            assert_eq!(b(d1).y, b(d0).y + b(d0).h, "{zoom:?}");
+            // The column's spine meets the bus.
+            let bus_y = b(sub).y - 1;
+            let spine_x = b(l0).x - 2;
+            assert!(lay.lines.iter().any(|&(x, y, _)| x == spine_x && y == bus_y), "{zoom:?}");
+            assert!(lay.lines.iter().any(|&(x, y, c)| x == spine_x && y > bus_y && c == '\u{2514}'), "{zoom:?}: the last leaf's arm");
+        }
+    }
+
+    #[test]
+    fn a_flat_fan_out_under_a_leader_is_one_narrow_column() {
+        let app = wide_app(60);
+        let m = app.org_model(false);
+        let boss = node(&m, "task:boss");
+        let wide = wide_roots_app(60);
+        let wm = wide.org_model(false);
+        for zoom in all_zooms() {
+            let lay = layout(&m, zoom, &HashSet::new());
+            let kids = &m.nodes[boss].children;
+            assert_eq!(kids.len(), 60);
+            let xs: HashSet<i32> = kids.iter().map(|c| lay.boxes[c].x).collect();
+            assert_eq!(xs.len(), 1, "{zoom:?}: one column");
+            assert!(kids.windows(2).all(|w| lay.boxes[&w[0]].y + lay.boxes[&w[0]].h == lay.boxes[&w[1]].y), "{zoom:?}: top to bottom");
+            assert!(lay.width <= zoom.box_w() + 3, "{zoom:?}: width {} for box {}", lay.width, zoom.box_w());
+            let row = layout(&wm, zoom, &HashSet::new());
+            assert!(lay.width * 10 < row.width, "{zoom:?}: {} vs a row of {}", lay.width, row.width);
+            assert_no_overlap(&lay);
+        }
+    }
+
+    #[test]
+    fn j_and_k_walk_a_stack_and_h_and_l_leave_it_sideways() {
+        let mut app = mixed_app();
+        app.cursor = Cursor::Session(0, 1); // lf-0
+        app.handle_event(&key(KeyCode::F(6)));
+        assert_eq!(focused_title(&app), "leaf 0");
+        press(&mut app, "j");
+        assert_eq!(focused_title(&app), "leaf 1");
+        press(&mut app, "jj");
+        assert_eq!(focused_title(&app), "leaf 2", "the last leaf is the bottom");
+        press(&mut app, "kk");
+        assert_eq!(focused_title(&app), "leaf 0");
+        press(&mut app, "k");
+        assert_eq!(focused_title(&app), "The boss", "k on the first leaf goes to the leader");
+        press(&mut app, "j");
+        assert_eq!(focused_title(&app), "leaf 0", "j enters the stack at the item it was left from");
+        // From the column, l goes to the leader's sub-leader branch and h
+        // comes back to the same leaf.
+        press(&mut app, "jjl");
+        assert_eq!(focused_title(&app), "Sub lead");
+        press(&mut app, "h");
+        assert_eq!(focused_title(&app), "leaf 2");
+        // Down the sub-leader's stack; it has no neighbour to the right.
+        press(&mut app, "ljj");
+        assert_eq!(focused_title(&app), "deep 1");
+        press(&mut app, "l");
+        assert_eq!(focused_title(&app), "deep 1");
+        // h from there goes to the column left of the sub-leader.
+        press(&mut app, "h");
+        assert_eq!(focused_title(&app), "leaf 2");
+        // h from the column: the leader's neighbour in the Teams row.
+        press(&mut app, "h");
+        assert_eq!(focused_title(&app), "Solo");
+        press(&mut app, "h");
+        assert_eq!(focused_title(&app), "Neighbour");
+        // A leader with only a stack: l from any of its leaves goes to the
+        // leader's neighbour.
+        press(&mut app, "jj");
+        assert_eq!(focused_title(&app), "nleaf 1");
+        press(&mut app, "l");
+        assert_eq!(focused_title(&app), "Solo");
+        // Tab still cycles sessions within a stacked box.
+        let mut app2 = mixed_app();
+        app2.workspaces[0].sessions.push({
+            let mut ts = dummy_ts("ts-99-0", false, HostId::local());
+            ts.label = "lf-1-b".into();
+            ts.session_type = "codex".into();
+            ts.task_id = Some("l1".into());
+            ts
+        });
+        app2.cursor = Cursor::Session(0, 2); // lf-1
+        app2.handle_event(&key(KeyCode::F(6)));
+        app2.handle_event(&key(KeyCode::Tab));
+        assert_eq!(focused_title(&app2), "leaf 1");
+        assert_eq!(app2.orgchart.session.as_deref(), Some("ts-99-0"));
+    }
+
+    #[test]
+    fn coming_back_to_a_branch_lands_on_the_stacked_item_left() {
+        let mut app = mixed_app();
+        app.cursor = Cursor::Session(0, 3); // lf-2
+        app.handle_event(&key(KeyCode::F(6)));
+        press(&mut app, "h");
+        assert_eq!(focused_title(&app), "Solo");
+        press(&mut app, "l");
+        assert_eq!(focused_title(&app), "leaf 2", "back on the leaf, not the leader");
+        // Through Neighbour's stack and back.
+        press(&mut app, "hhjj");
+        assert_eq!(focused_title(&app), "nleaf 1");
+        press(&mut app, "ll");
+        assert_eq!(focused_title(&app), "leaf 2");
+        press(&mut app, "hh");
+        assert_eq!(focused_title(&app), "nleaf 1");
+        // Up to Teams and down again: j remembers the way too.
+        press(&mut app, "kkk");
+        assert_eq!(focused_title(&app), "Teams");
+        press(&mut app, "jj");
+        assert_eq!(focused_title(&app), "nleaf 0", "k walked up through nleaf 0");
+        // A branch left from its head comes back to the head.
+        press(&mut app, "kl");
+        assert_eq!(focused_title(&app), "Solo");
+        press(&mut app, "h");
+        assert_eq!(focused_title(&app), "Neighbour");
+    }
+
+    #[test]
+    fn search_folds_exit_and_follow_work_for_stacked_items() {
+        let mut app = wide_app(60);
+        app.handle_event(&key(KeyCode::F(6)));
+        press(&mut app, "/rep-47");
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(focused_title(&app), "report 47");
+        for zoom in all_zooms() {
+            app.orgchart.zoom = zoom;
+            app.orgchart.follow.set(true);
+            screen(&mut app, 120, 30);
+            assert!(focus_in_view(&app), "{zoom:?}");
+        }
+        app.orgchart.zoom = Zoom::FULL;
+        // Walking the stack keeps the focus on screen.
+        for k in 48..60 {
+            press(&mut app, "j");
+            assert_eq!(focused_title(&app), format!("report {k:02}"));
+            screen(&mut app, 120, 30);
+            assert!(focus_in_view(&app), "report {k}");
+        }
+        // Folding the leader hides its stack; the search unfolds it again.
+        press(&mut app, "gg");
+        app.orgchart.focus = Some("task:boss".into());
+        press(&mut app, "zc");
+        let m = app.org_model(false);
+        assert_eq!(layout(&m, Zoom::FULL, &app.orgchart.folds).boxes.len(), 4, "owner, other, teams, the folded boss");
+        assert!(m.stack(node(&m, "task:boss"), &app.orgchart.folds).is_empty());
+        press(&mut app, "/rep-03");
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(focused_title(&app), "report 03");
+        assert!(!app.orgchart.folds.contains("task:boss"));
+        // The exit lands on the stacked box's session.
+        app.handle_event(&key(KeyCode::Esc));
+        assert_eq!(app.cursor_session_uid().as_deref(), Some("ts-103-0"));
     }
 
     #[test]
@@ -2388,19 +2813,19 @@ mod tests {
 
     #[test]
     fn the_viewport_follows_focus_along_a_wide_row_search_and_zoom() {
-        let mut app = wide_app(60);
-        app.cursor = Cursor::Session(0, 1); // rep-00
+        let mut app = wide_roots_app(60);
+        app.cursor = Cursor::Session(0, 0); // rt-00
         app.handle_event(&key(KeyCode::F(6)));
-        assert_eq!(focused_title(&app), "report 00");
+        assert_eq!(focused_title(&app), "root 00");
         screen(&mut app, 120, 30);
         assert!(focus_in_view(&app));
         let start = app.orgchart.ox.get();
         for k in 1..60 {
             press(&mut app, "l");
-            assert_eq!(focused_title(&app), format!("report {k:02}"));
+            assert_eq!(focused_title(&app), format!("root {k:02}"));
             let s = screen(&mut app, 120, 30);
             assert!(focus_in_view(&app), "after {k} l presses");
-            assert!(s.contains(&format!("rep-{k:02}")), "{s}");
+            assert!(s.contains(&format!("rt-{k:02}")), "{s}");
         }
         assert!(app.orgchart.ox.get() > start, "the viewport scrolled right");
         for k in (0..59).rev() {
@@ -2410,9 +2835,9 @@ mod tests {
         }
         // A pan, then a search jump far off screen: the viewport follows again.
         press(&mut app, "KK");
-        press(&mut app, "/rep-47");
+        press(&mut app, "/rt-47");
         app.handle_event(&key(KeyCode::Enter));
-        assert_eq!(focused_title(&app), "report 47");
+        assert_eq!(focused_title(&app), "root 47");
         screen(&mut app, 120, 30);
         assert!(focus_in_view(&app), "after the search jump");
         // A pan, then a zoom change.

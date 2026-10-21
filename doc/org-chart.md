@@ -44,15 +44,23 @@ the chart's focused session selected.
   mark of the board item it holds, its engine, and its host.
 - Bash sessions are hidden by default; `b` shows them. Opening the chart on a
   bash session shows just that one, until the chart closes.
-- Every level is laid out in one row, left to right, however many reports a
-  box has; the chart grows as wide as it needs and the viewport pans to it.
+- **Stacks.** A **leader** is a task box with live reports (the same rule as
+  the leader marks; a continuous orchestrator counts as one). A leader's
+  reports that have no reports of their own stack in one column straight
+  under it, a compact list hanging from a spine. Reports that have reports of
+  their own fan out side by side as branches; a leader with both draws its
+  stack as one column to the left of its branches. Only leaders stack: the
+  reports of Owner, a project, Teams, Continuous, a division or Other always
+  sit side by side, so root tasks stay in one row.
+- Apart from stacks, every level is laid out in one row, left to right; the
+  chart grows as wide as it needs and the viewport pans to it.
 
 ## Keys
 
 | Key | Action |
 |---|---|
-| `h` / `l` | previous / next sibling |
-| `j` / `k` | down to the report last focused under this box (else the first) / up to the boss. Each box also remembers its last-focused session, so `k` then `j` lands where you were |
+| `h` / `l` | previous / next box along the row. A stack counts as one slot of its leader's row (left of the leader's branches); at the end of a stack's row, `h`/`l` carry on to the leader's neighbours. Coming back to a branch or stack lands on the box it was left from, stacked or not |
+| `j` / `k` | down to the report last focused under this box (else the first; a stack comes first) / up to the boss. Inside a stack, `j`/`k` move down and up the list; `k` on its first item goes to the leader, and the last item is the bottom of the branch. Each box also remembers its last-focused session, so `k` then `j` lands where you were |
 | `gg` / `G` | Owner / last box |
 | `Tab` / `S-Tab` | next / previous session in the box |
 | `/` `n` `N` | search session labels and box names, then step through matches; the search unfolds a match's ancestors |
