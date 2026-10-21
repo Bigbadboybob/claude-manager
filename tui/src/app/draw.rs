@@ -1965,7 +1965,7 @@ impl App {
             t
         };
         // Leader marks: the lead of each task with subtasks, by level.
-        let marks = tree.as_ref().map_or_else(HashMap::new, |t| self.leader_marks(&t.reports));
+        let marks = tree.as_ref().map_or_else(HashMap::new, |t| self.leader_marks(&t.org));
 
         let section_backgrounds = self.sidebar_section_backgrounds(&visual, &block_root);
         for (vi, background) in visual.iter().zip(section_backgrounds) {
@@ -2320,7 +2320,7 @@ impl App {
                     let initiative_marker = self.planning.task_initiative_marker(task_id);
                     let node = super::tree::Node::Task(task_id.clone());
                     let folded = self.tree_folded(&node);
-                    let has_reports = tree.as_ref().is_some_and(|t| t.reports.contains(task_id));
+                    let has_reports = tree.as_ref().is_some_and(|t| t.org.has_reports(task_id));
                     let tail = fold_tail(&node);
                     let prefix = tree_prefix(vi, *ws_idx);
                     let prefix_width: usize = prefix.iter().map(|s| s.content.chars().count()).sum();

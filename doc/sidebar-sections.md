@@ -6,9 +6,9 @@ Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view)
 
 **Work tree display (2026-10-21).** Every block draws at the top-level indent, whatever its depth; only sessions keep their indent under their workspace row. The hierarchy shows through two cues instead:
 - **Group strip.** The focused row's group (its task or workspace and everything below it) shows as a narrow coloured strip (`▏`) at the sidebar's left edge, clear of the row text. The group has no background tint, so section tints show unchanged.
-- **Leader marks.** The lead session of a task with subtasks carries its level's mark: ★ for a root task, ☆ one level down, ✦, then ✧ for every deeper level. Leaves carry none. The F6 org chart uses the same marks (`tree::leader_glyph`; see doc/org-chart.md).
+- **Leader marks.** The lead session of a task with live reports carries its level's mark: ★ for a root task, ☆ one level down, ✦, then ✧ for every deeper level. A live report is a subtask that is not done or archived and has a live agent session in its subtree; sessionless, bash-only and finished subtasks don't count. The F6 org chart draws the same marks (`App::leader_marks`; see doc/org-chart.md).
 
-Space/Enter on a task header folds only its subtasks: the task's workspace row and its own sessions stay, and the folded header's count covers just the hidden subtree. A task without subtasks has no fold glyph and does not fold. A division header still folds its whole tree.
+Space/Enter on a task header folds only its subtasks: the task's workspace row and its own sessions stay, and the folded header's count covers just the hidden subtree. Only a task with live reports has a fold glyph and folds, decided per task, so a task bound to two workspaces folds from either header. A division header still folds its whole tree.
 
 ## Agent tools: remote subsection assignment
 

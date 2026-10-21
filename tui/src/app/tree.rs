@@ -59,9 +59,41 @@ pub(super) struct TaskTree {
     pub folded: HashMap<Node, Rollup>,
     /// Divisions by initiative id, for header rendering.
     pub divisions: HashMap<String, crate::planning::Division>,
-    /// Tasks with subtasks in the tree (folds ignored): the ones that fold
-    /// and whose lead carries a leader mark.
-    pub reports: HashSet<String>,
+    /// Reporting lines for this frame: levels and live reports (the tasks
+    /// that fold and whose lead carries a leader mark).
+    pub org: OrgIndex,
+}
+
+/// Reporting lines and liveness, built once per frame and shared by the
+/// sidebar (fold glyph, fold, leader marks) and the F6 org chart.
+#[derive(Default)]
+pub(crate) struct OrgIndex {
+    parents: HashMap<String, String>,
+    /// Tasks with at least one live report: a child task that is not done
+    /// or archived and has a live agent session in its own subtree (through
+    /// open tasks only). An empty workspace, a bash-only or sessionless
+    /// subtask, or an all-done subtree kept on disk is not a report.
+    reports: HashSet<String>,
+}
+
+impl OrgIndex {
+    /// A task's level below Owner: 1 for a root task, 2 for its subtask,
+    /// and so on, along `parent_task_id` (a cycle ends the walk).
+    pub(crate) fn level(&self, task_id: &str) -> usize {
+        let mut seen = HashSet::from([task_id]);
+        let mut level = 1;
+        let mut cur = task_id;
+        while let Some(p) = self.parents.get(cur).map(String::as_str).filter(|p| seen.insert(*p)) {
+            level += 1;
+            cur = p;
+        }
+        level
+    }
+
+    /// Whether a task has live reports (see [`OrgIndex::reports`]).
+    pub(crate) fn has_reports(&self, task_id: &str) -> bool {
+        self.reports.contains(task_id)
+    }
 }
 
 impl TaskTree {
@@ -154,13 +186,6 @@ impl Forest {
         for wj in self.nested_blocks(wi, t) {
             self.block_sessions(wj, out);
         }
-    }
-
-    /// Whether a task has subtasks under its header: nested blocks or
-    /// inherit-mode subtasks with content.
-    fn has_reports(&self, wi: usize, t: &str) -> bool {
-        !self.nested_blocks(wi, t).is_empty()
-            || self.local_children(wi, t).any(|c| self.has_content(wi, c))
     }
 
     /// The session rows a task's fold hides: its subtasks', not its own.
@@ -454,15 +479,8 @@ impl App {
                 .values()
                 .map(|d| (d.id.clone(), d.clone()))
                 .collect(),
-            reports: HashSet::new(),
+            org: self.org_index(),
         };
-        for &wi in &f.order {
-            for t in &f.bound[&wi] {
-                if f.home.get(t) == Some(&wi) && f.has_reports(wi, t) {
-                    out.reports.insert(t.clone());
-                }
-            }
-        }
         for &wi in &f.order {
             let mut top = wi;
             while let Some((p, _)) = f.attach.get(&top) {
@@ -572,7 +590,7 @@ impl App {
     pub(crate) fn toggle_tree_fold(&mut self) -> bool {
         if let Cursor::Task { task_id, .. } = &self.cursor {
             if !self.folded_tasks.contains(task_id)
-                && !self.task_tree_unfolded().reports.contains(task_id)
+                && !self.org_index().has_reports(task_id)
             {
                 self.set_status_msg("No subtasks to fold");
                 return true;
@@ -689,27 +707,55 @@ impl App {
         self.set_status_msg(&format!("Lead not saved: {error}"));
     }
 
-    /// A task's level below Owner: 1 for a root task, 2 for its subtask,
-    /// and so on, along `parent_task_id` (a cycle ends the walk).
-    pub(crate) fn task_level(&self, task_id: &str) -> usize {
-        let parents = self.task_parent_map();
-        let mut seen = HashSet::from([task_id]);
-        let mut level = 1;
-        let mut cur = task_id;
-        while let Some(p) = parents.get(cur).copied().filter(|p| seen.insert(*p)) {
-            level += 1;
-            cur = p;
+    /// Reporting lines and live reports, from the task tree and the live
+    /// sessions; build it once per frame (see [`OrgIndex`]).
+    pub(crate) fn org_index(&self) -> OrgIndex {
+        let parents: HashMap<String, String> = self
+            .task_parent_map()
+            .into_iter()
+            .map(|(t, p)| (t.to_owned(), p.to_owned()))
+            .collect();
+        let mut closed = self.planning.closed_task_ids();
+        closed.extend(self.sidebar_done_task_ids.iter().cloned());
+        closed.extend(
+            self.tasks
+                .iter()
+                .filter(|t| t.api_status == TaskStatus::Done)
+                .filter_map(|t| t.task_id.clone()),
+        );
+        // Walk up from every open task with a live agent session: each open
+        // task on the way is a live report of its parent. A closed task
+        // breaks the chain.
+        let mut active: HashSet<String> = HashSet::new();
+        let mut reports: HashSet<String> = HashSet::new();
+        let staffed = self
+            .workspaces
+            .iter()
+            .filter(|w| !w.is_closed)
+            .flat_map(|w| &w.sessions)
+            .filter(|ts| !ts.session.exited && is_agent_engine(&ts.session_type))
+            .filter_map(|ts| ts.task_id.as_deref());
+        for t in staffed {
+            let mut cur = t;
+            while !closed.contains(cur) && active.insert(cur.to_owned()) {
+                let Some(p) = parents.get(cur) else { break };
+                reports.insert(p.clone());
+                cur = p;
+            }
         }
-        level
+        OrgIndex { parents, reports }
     }
 
-    /// Leader marks by session uid: the lead of each task in `reports` (a
-    /// task with subtasks) gets its level's glyph.
-    pub(super) fn leader_marks(&self, reports: &HashSet<String>) -> HashMap<String, &'static str> {
+    /// Leader marks by session uid: the lead (shared rule, [`task_leads`])
+    /// of each task with live reports gets its level's glyph. The sidebar
+    /// and the F6 org chart both draw these.
+    ///
+    /// [`task_leads`]: App::task_leads
+    pub(crate) fn leader_marks(&self, org: &OrgIndex) -> HashMap<String, &'static str> {
         self.task_leads()
             .into_iter()
-            .filter(|(t, _)| reports.contains(t))
-            .map(|(t, uid)| (uid, leader_glyph(self.task_level(&t))))
+            .filter(|(t, _)| org.has_reports(t))
+            .map(|(t, uid)| (uid, leader_glyph(org.level(&t))))
             .collect()
     }
 
@@ -884,7 +930,7 @@ impl Emit<'_> {
         // A fold hides the subtasks only: the task's own sessions stay.
         let own = self.f.bucket(wi, Some(t)).to_vec();
         self.sessions(wi, &own, &node, cells, local);
-        if self.folds && self.app.tree_folded(&node) && self.f.has_reports(wi, t) {
+        if self.folds && self.app.tree_folded(&node) && self.out.org.has_reports(t) {
             let mut sessions = Vec::new();
             self.f.subtask_sessions(wi, t, &mut sessions);
             self.fold(node, &sessions);
@@ -1160,7 +1206,7 @@ mod tree_tests {
         };
         assert!(app.handle_event(&space));
         assert!(app.folded_tasks.is_empty(), "a leaf does not fold");
-        assert!(!app.task_tree().reports.contains("tl"));
+        assert!(!app.task_tree().org.has_reports("tl"));
         // Inherit-mode subtasks fold too: tr hides tr2 and every block below.
         app.cursor = Cursor::Task {
             ws_idx: 0,
@@ -1246,12 +1292,12 @@ mod tree_tests {
         app.tasks.push(task("ty", "y", Some("tz")));
         session(&mut app, 5, "tz", "ts-16-0", "codex");
         session(&mut app, 6, "ty", "ts-17-0", "codex");
+        let org = app.org_index();
         assert_eq!(
-            ["tr", "tr2", "tc", "tg", "tx", "to", "tz", "ty", "tl"].map(|t| app.task_level(t)),
+            ["tr", "tr2", "tc", "tg", "tx", "to", "tz", "ty", "tl"].map(|t| org.level(t)),
             [1, 2, 2, 3, 2, 3, 4, 5, 1]
         );
-        let tree = app.task_tree();
-        let marks = app.leader_marks(&tree.reports);
+        let marks = app.leader_marks(&app.task_tree().org);
         let expected = HashMap::from([
             ("ts-10-0".to_string(), "\u{2605}"), // tr: tr2, c and o report to it
             ("ts-12-0".to_string(), "\u{2606}"), // tc: g
@@ -1259,12 +1305,147 @@ mod tree_tests {
             ("ts-16-0".to_string(), "\u{2727}"), // tz: y
         ]);
         assert_eq!(marks, expected, "leaves (tr2, to, ty, tl) carry none");
-        // The org chart agrees, box by box.
-        let model = app.org_model(true);
-        for (t, uid) in [("tr", "ts-10-0"), ("tc", "ts-12-0"), ("tg", "ts-13-0"), ("tz", "ts-16-0"), ("tr2", "ts-11-0"), ("ty", "ts-17-0")] {
-            let node = &model.nodes[model.find(&format!("task:{t}")).unwrap()];
-            assert_eq!(node.mark, marks.get(uid).copied(), "{t}");
+        assert_eq!(chart_marks(&app), expected, "the org chart agrees");
+    }
+
+    /// Marks the F6 chart draws, by session uid (bash shown or not).
+    fn chart_marks(app: &App) -> HashMap<String, &'static str> {
+        let mut out = HashMap::new();
+        for show_bash in [false, true] {
+            for node in app.org_model(show_bash).nodes {
+                for s in node.sessions {
+                    if let Some(g) = s.mark {
+                        assert_eq!(*out.entry(s.uid.clone()).or_insert(g), g, "{}", s.uid);
+                    }
+                }
+            }
         }
+        out
+    }
+
+    /// Marks the sidebar draws, by session uid, read from the render.
+    fn sidebar_marks(app: &mut App) -> HashMap<String, &'static str> {
+        let buffer = sidebar_buffer(app, 40);
+        let mut out = HashMap::new();
+        for y in 0..40u16 {
+            let row: String = (0..40u16).map(|x| buffer[(x, y)].symbol().to_string()).collect();
+            for g in LEADER_GLYPHS {
+                if let Some(at) = row.find(&format!("{g} ts-")) {
+                    let uid: String = row[at + g.len() + 1..].split_whitespace().next().unwrap().into();
+                    out.insert(uid, g);
+                }
+            }
+        }
+        out
+    }
+
+    /// Review of f385d1b (1, 2): a report is a LIVE subtask with a live
+    /// agent in its subtree. Sessionless, bash-only and done subtasks don't
+    /// count, a lead that exits hands the mark on, and the sidebar (mark and
+    /// fold glyph) and the F6 chart agree on every case.
+    #[test]
+    fn only_live_reports_count_and_both_views_agree() {
+        // tc's only report is g (tg, one codex session).
+        let base = || {
+            let mut app = org_app();
+            app.cursor = Cursor::Workspace(4);
+            app
+        };
+        let fold_glyph = |app: &mut App, t: &str| -> bool {
+            let buffer = sidebar_buffer(app, 40);
+            (0..40u16).any(|y| {
+                let row: String = (0..40u16).map(|x| buffer[(x, y)].symbol().to_string()).collect();
+                row.contains(&format!("\u{25be} {t}")) || row.contains(&format!("\u{25b8} {t}"))
+            })
+        };
+        let mut app = base();
+        assert_eq!(sidebar_marks(&mut app).get("ts-12-0"), Some(&"\u{2606}"));
+        assert!(fold_glyph(&mut app, "tc"));
+
+        // Sessionless: g's workspace stays, its session is gone.
+        let mut app = base();
+        app.workspaces[2].sessions.clear();
+        // Bash-only.
+        let mut bash = base();
+        bash.workspaces[2].sessions.clear();
+        session(&mut bash, 2, "tg", "ts-13-0", "bash");
+        // Only an exited agent.
+        let mut exited = base();
+        exited.workspaces[2].sessions[0].session.exited = true;
+        // Done, kept on disk: by the planning feed, or by the work list.
+        let mut done = base();
+        done.sidebar_done_task_ids.insert("tg".into());
+        let mut done_entry = base();
+        done_entry.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some("tg")).unwrap().api_status =
+            TaskStatus::Done;
+        for (case, app) in [
+            ("sessionless", &mut app),
+            ("bash-only", &mut bash),
+            ("exited", &mut exited),
+            ("done", &mut done),
+            ("done entry", &mut done_entry),
+        ] {
+            assert!(!app.org_index().has_reports("tc"), "{case}");
+            let sidebar = sidebar_marks(app);
+            assert!(!sidebar.contains_key("ts-12-0"), "{case}: no mark on tc's lead");
+            assert!(!fold_glyph(app, "tc"), "{case}: tc does not fold");
+            assert_eq!(chart_marks(app), sidebar, "{case}: the chart agrees");
+            // tr still has live reports (o's to): its mark stays.
+            assert_eq!(sidebar.get("ts-10-0"), Some(&"\u{2605}"), "{case}");
+        }
+
+        // tr's lead exits: the mark moves to its next live agent, in both
+        // views; with no live agent left, neither view marks tr.
+        let mut app = base();
+        session(&mut app, 0, "tr", "ts-30-0", "claude");
+        app.workspaces[0].sessions[0].session.exited = true; // ts-10-0
+        let sidebar = sidebar_marks(&mut app);
+        assert_eq!(sidebar.get("ts-30-0"), Some(&"\u{2605}"));
+        assert!(!sidebar.contains_key("ts-10-0"));
+        assert_eq!(chart_marks(&app), sidebar);
+        let last = app.workspaces[0].sessions.len() - 1;
+        app.workspaces[0].sessions[last].session.exited = true;
+        let sidebar = sidebar_marks(&mut app);
+        assert!(!sidebar.contains_key("ts-10-0") && !sidebar.contains_key("ts-30-0"));
+        assert_eq!(chart_marks(&app), sidebar);
+    }
+
+    /// Review of f385d1b (3): a task bound to two workspaces has its
+    /// reports task-wide: both headers show the fold glyph and fold from
+    /// either one.
+    #[test]
+    fn a_task_in_two_workspaces_folds_and_marks_from_either_header() {
+        let mut app = org_app();
+        // tc gets a second checkout, "c2", after its home "c".
+        app.workspaces.push(bare_ws("c2"));
+        session(&mut app, 5, "tc", "ts-40-0", "codex");
+        let tree = app.task_tree();
+        assert!(tree.org.has_reports("tc"));
+        let headers: Vec<usize> = tree
+            .items
+            .iter()
+            .filter_map(|vi| match vi {
+                VisualItem::TaskHeader { ws_idx, task_id } if task_id == "tc" => Some(*ws_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, [1, 5]);
+        let buffer = sidebar_buffer(&mut app, 40);
+        let glyphs = (0..40u16)
+            .filter(|y| {
+                let row: String = (0..40u16).map(|x| buffer[(x, *y)].symbol().to_string()).collect();
+                row.contains("\u{25be} tc")
+            })
+            .count();
+        assert_eq!(glyphs, 2, "both tc headers show the fold glyph");
+        app.cursor = Cursor::Task {
+            ws_idx: 5,
+            task_id: "tc".into(),
+        };
+        assert!(app.toggle_tree_fold());
+        assert!(app.folded_tasks.contains("tc"), "the second header folds tc");
+        assert!(!shown(&app, "ts-13-0"), "g folds away under the home header");
+        assert!(shown(&app, "ts-40-0") && shown(&app, "ts-12-0"), "tc's own sessions stay");
     }
 
     /// Owner-approved 2026-10-20: a task header is a tree row. Even with a

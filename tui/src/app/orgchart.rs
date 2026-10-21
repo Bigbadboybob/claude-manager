@@ -108,6 +108,9 @@ pub(super) struct ChartSession {
     pub wi: usize,
     pub si: usize,
     pub lead: bool,
+    /// The leader mark it carries: the sidebar's, from the same
+    /// [`App::leader_marks`] (a lead of a task with live reports, by level).
+    pub mark: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,10 +126,6 @@ pub(super) struct ChartNode {
     /// Sort rank among siblings (coordinator tasks first, then tasks, then
     /// loose workspaces); ties sort by title.
     rank: u8,
-    /// The leader mark its lead session carries: its level's glyph
-    /// ([`super::tree::leader_glyph`], shared with the sidebar) when the
-    /// box has reports, else none.
-    pub mark: Option<&'static str>,
 }
 
 /// The org as a tree; `nodes[0]` is Owner.
@@ -138,7 +137,7 @@ pub(super) struct ChartModel {
 impl ChartModel {
     fn push(&mut self, parent: Option<usize>, key: String, kind: NodeKind, title: String, task_id: Option<String>, rank: u8) -> usize {
         let i = self.nodes.len();
-        self.nodes.push(ChartNode { key, kind, title, task_id, sessions: Vec::new(), children: Vec::new(), parent, rank, mark: None });
+        self.nodes.push(ChartNode { key, kind, title, task_id, sessions: Vec::new(), children: Vec::new(), parent, rank });
         if let Some(p) = parent {
             self.nodes[p].children.push(i);
         }
@@ -538,7 +537,7 @@ impl App {
             let Some(si) = r.sess_idx else { continue };
             let ws = &self.workspaces[r.ws_idx];
             let ts = &ws.sessions[si];
-            let cs = ChartSession { uid: ts.uid.clone(), wi: r.ws_idx, si, lead: false };
+            let cs = ChartSession { uid: ts.uid.clone(), wi: r.ws_idx, si, lead: false, mark: None };
             let target = match (r.depth, orch) {
                 (0, _) | (_, None) => {
                     let cont = org(&mut m, "continuous", "Continuous", 2);
@@ -586,7 +585,7 @@ impl App {
                 if members.contains(&(wi, si)) || !keep(ts) {
                     continue;
                 }
-                let cs = ChartSession { uid: ts.uid.clone(), wi, si, lead: false };
+                let cs = ChartSession { uid: ts.uid.clone(), wi, si, lead: false, mark: None };
                 match &ts.task_id {
                     Some(t) => by_task.entry(t.clone()).or_default().push(cs),
                     None => unbound.push(cs),
@@ -640,14 +639,19 @@ impl App {
             m.nodes[i].sessions = sessions;
         }
 
-        // Leads, then sessions lead-first in spawn order.
+        // Leads (the shared rule; an orchestrator without one falls back to
+        // its first session), leader marks exactly as the sidebar draws
+        // them, then sessions lead-first in spawn order.
+        let marks = self.leader_marks(&self.org_index());
         for node in &mut m.nodes {
+            let task_lead = node.task_id.as_ref().and_then(|t| leads.get(t)).cloned();
             let lead = match node.kind {
-                NodeKind::Orchestrator => node.sessions.first().map(|s| s.uid.clone()),
-                _ => node.task_id.as_ref().and_then(|t| leads.get(t)).cloned(),
+                NodeKind::Orchestrator => task_lead.or_else(|| node.sessions.first().map(|s| s.uid.clone())),
+                _ => task_lead,
             };
             for s in &mut node.sessions {
                 s.lead = lead.as_deref() == Some(s.uid.as_str()) && !self.workspaces[s.wi].sessions[s.si].session.exited;
+                s.mark = marks.get(&s.uid).copied();
             }
             if !matches!(node.kind, NodeKind::Orchestrator | NodeKind::Worker) {
                 node.sessions.sort_by(|a, b| b.lead.cmp(&a.lead).then_with(|| spawn_key(&a.uid).cmp(&spawn_key(&b.uid))));
@@ -657,19 +661,6 @@ impl App {
         }
         let mut m = m.prune();
         m.sort_children();
-        // Leader marks: only a box with reports, by its level below Owner
-        // (a task's along `parent_task_id`, as the sidebar counts it; a
-        // taskless worker's from the boxes above it).
-        for i in 0..m.nodes.len() {
-            if !matches!(m.nodes[i].kind, NodeKind::Task | NodeKind::Orchestrator | NodeKind::Worker) || m.nodes[i].children.is_empty() {
-                continue;
-            }
-            let level = match &m.nodes[i].task_id {
-                Some(t) => self.task_level(t),
-                None => 1 + m.ancestors(i).iter().filter(|&&a| !matches!(m.nodes[a].kind, NodeKind::Owner | NodeKind::Org)).count(),
-            };
-            m.nodes[i].mark = Some(super::tree::leader_glyph(level));
-        }
         m
     }
 
@@ -1229,8 +1220,7 @@ impl App {
                     }
                 }
                 Zoom::Compact => {
-                    let lead = node.sessions.first().is_some_and(|s| s.lead);
-                    let mark = node.mark.filter(|_| lead).unwrap_or(" ");
+                    let mark = node.sessions.first().and_then(|s| s.mark).unwrap_or(" ");
                     let extra = node.sessions.len().saturating_sub(1) + hidden;
                     let tail = match (folded, extra) {
                         (true, _) => format!(" \u{25b8}{extra}"),
@@ -1299,7 +1289,7 @@ impl App {
                         let label = crate::planning::truncate_with_ellipsis(&ts.label, label_room);
                         let label_style = if ts.session.exited { Style::default().fg(theme::DIM) } else { Style::default().fg(theme::TEXT) };
                         put(buf, p.x + 1, y, &" ".repeat(w - 2), bg(Style::default()));
-                        put(buf, p.x + 1, y, node.mark.filter(|_| s.lead).unwrap_or(" "), bg(Style::default().fg(theme::ATTN)));
+                        put(buf, p.x + 1, y, s.mark.unwrap_or(" "), bg(Style::default().fg(theme::ATTN)));
                         put(buf, p.x + 2, y, g, bg(gs));
                         put(buf, p.x + 4, y, &label, bg(label_style));
                         put(buf, p.x + p.w as i32 - 3 - engine.len() as i32, y, engine, bg(Style::default().fg(theme::MUTED)));
@@ -1361,7 +1351,7 @@ impl App {
         let mut head = vec![Span::styled(format!("{g} "), gs), Span::styled(ts.label.clone(), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD))];
         if s.lead {
             // The leader mark only where the box has reports.
-            let lead = node.mark.map_or_else(|| "  lead".to_string(), |g| format!("  {g} lead"));
+            let lead = s.mark.map_or_else(|| "  lead".to_string(), |g| format!("  {g} lead"));
             head.push(Span::styled(lead, Style::default().fg(theme::ATTN)));
         }
         lines.push(Line::from(head));

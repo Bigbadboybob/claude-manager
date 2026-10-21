@@ -1301,6 +1301,16 @@ impl PlanningView {
         })
     }
 
+    /// Ids of done and archived tasks, in one pass.
+    pub(crate) fn closed_task_ids(&self) -> HashSet<String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .filter(|t| matches!(t.status, PlanStatus::Done | PlanStatus::Archived))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
     /// Every task in a division, mapped to that division: one pass over the
     /// planning data, for the sidebar tree.
     pub(crate) fn divisions_by_task(&self) -> HashMap<String, Division> {

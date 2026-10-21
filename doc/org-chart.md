@@ -19,13 +19,16 @@ F6, Esc or `q` closes it.
 - A task box lists the task's sessions. The lead session comes first; it is
   chosen by the shared lead rule (`task_leads`). The other sessions follow in
   spawn order.
-- **Leader marks.** Only the lead of a box with reports carries a mark, and
-  the mark gives its level below Owner: ★ for a root task (level 1), ☆ for
-  its subtask (level 2), ✦ for level 3, and ✧ for level 4 and deeper. A
-  task's level counts its `parent_task_id` chain; a continuous worker without
-  its own task counts the boxes above it. Leads with no reports carry no
-  mark. ◆ stays reserved for divisions. The Sessions sidebar uses the same
-  marks from the same function, `tree::leader_glyph`.
+- **Leader marks.** Only the lead of a task with live reports carries a
+  mark, and the mark gives its level below Owner: ★ for a root task
+  (level 1), ☆ for its subtask (level 2), ✦ for level 3, and ✧ for level 4
+  and deeper. A level counts the task's `parent_task_id` chain. A live report
+  is a child task that is not done or archived and has a live agent
+  (claude/codex) session somewhere in its subtree; a sessionless, bash-only
+  or finished subtask doesn't count, and neither does a worker with no task
+  of its own. ◆ stays reserved for divisions. The chart draws exactly the
+  Sessions sidebar's marks: both come from `App::leader_marks` over one
+  `OrgIndex` (`app/tree.rs`).
 - Each session line shows the sidebar's state glyph (spinner, afterglow,
   settled or stale ●, ◐, ?, ✗, alert, owner-blocked, ⟳; × when exited), then
   the label, the engine, and a host marker: ⌂ for local, otherwise the first
