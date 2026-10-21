@@ -11,8 +11,10 @@
 //!
 //! The overlay takes every key while open: h/l siblings, j first child,
 //! k parent, gg/G, Tab/S-Tab a session within the box, / n N search,
-//! zc/zo/za fold, +/- zoom, H/J/K/L or arrows pan, c centre, b bash,
-//! i info pane, Enter (or A-t) → Sessions view focused there, F6/Esc/q close.
+//! Space/zc/zo/za fold, zM/zR fold/unfold the orgs, +/- zoom (ten levels),
+//! H/J/K/L or arrows pan, c centre, b bash, i info pane. Enter (or A-t) and
+//! every exit (F6/Esc/q) return to the Sessions view focused on the chart's
+//! session. Every level is one row; the viewport follows the focus.
 //! The info pane's board items come from `board.read`, polled only while the
 //! chart is open.
 
@@ -29,16 +31,12 @@ const BOARD_READ_EVERY: Duration = Duration::from_secs(30);
 const BOARD_RETRY: Duration = Duration::from_secs(15);
 /// Repaint cadence while open, so spinners and ages move.
 const REPAINT: Duration = Duration::from_millis(250);
-/// More leaf reports than this stack in a column instead of a row.
-const STACK_MIN: usize = 3;
-/// Session lines in a full card before "+N more".
-const FULL_MAX_SESSIONS: usize = 6;
 const INFO_WIDTH: u16 = 46;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum Zoom {
+/// How much a box shows at a zoom level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Detail {
     /// Bordered cards: task title, every session with glyph, engine, host.
-    #[default]
     Full,
     /// One line per box: lead glyph and the box's name.
     Compact,
@@ -46,46 +44,70 @@ pub(super) enum Zoom {
     Dense,
 }
 
+/// (detail, box width, gap between siblings, session lines in a card),
+/// most zoomed out first.
+const ZOOM_LEVELS: [(Detail, i32, i32, usize); 10] = [
+    (Detail::Dense, 2, 0, 0),
+    (Detail::Dense, 2, 1, 0),
+    (Detail::Compact, 10, 1, 0),
+    (Detail::Compact, 14, 1, 0),
+    (Detail::Compact, 18, 1, 0),
+    (Detail::Compact, 24, 2, 0),
+    (Detail::Full, 22, 1, 2),
+    (Detail::Full, 26, 2, 4),
+    (Detail::Full, 30, 2, 6),
+    (Detail::Full, 36, 2, 8),
+];
+
+/// An index into `ZOOM_LEVELS`; `+`/`-` step one level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Zoom(usize);
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Zoom::FULL
+    }
+}
+
 impl Zoom {
+    /// The widest card at the default card size.
+    pub(super) const FULL: Zoom = Zoom(8);
+    pub(super) const DENSE: Zoom = Zoom(0);
+    pub(super) const MAX: Zoom = Zoom(ZOOM_LEVELS.len() - 1);
+
+    pub(super) fn detail(self) -> Detail {
+        ZOOM_LEVELS[self.0].0
+    }
     fn box_w(self) -> i32 {
-        match self {
-            Zoom::Full => 30,
-            Zoom::Compact => 18,
-            Zoom::Dense => 2,
-        }
+        ZOOM_LEVELS[self.0].1
     }
     fn hgap(self) -> i32 {
-        match self {
-            Zoom::Full => 2,
-            Zoom::Compact => 1,
-            Zoom::Dense => 0,
-        }
+        ZOOM_LEVELS[self.0].2
+    }
+    /// Session lines in a full card before "+N more".
+    fn max_sessions(self) -> usize {
+        ZOOM_LEVELS[self.0].3
     }
     /// Rows between a box and its reports: stem rows, then the bus row.
     fn vgap(self) -> i32 {
-        match self {
-            Zoom::Dense => 1,
+        match self.detail() {
+            Detail::Dense => 1,
             _ => 2,
         }
     }
     fn zoom_in(self) -> Self {
-        match self {
-            Zoom::Dense => Zoom::Compact,
-            _ => Zoom::Full,
-        }
+        Zoom((self.0 + 1).min(Zoom::MAX.0))
     }
     fn zoom_out(self) -> Self {
-        match self {
-            Zoom::Full => Zoom::Compact,
-            _ => Zoom::Dense,
-        }
+        Zoom(self.0.saturating_sub(1))
     }
-    fn name(self) -> &'static str {
-        match self {
-            Zoom::Full => "full",
-            Zoom::Compact => "compact",
-            Zoom::Dense => "dense",
-        }
+    fn name(self) -> String {
+        let d = match self.detail() {
+            Detail::Full => "full",
+            Detail::Compact => "compact",
+            Detail::Dense => "dense",
+        };
+        format!("{d} {}/{}", self.0 + 1, ZOOM_LEVELS.len())
     }
 }
 
@@ -195,20 +217,12 @@ impl ChartModel {
         }
     }
 
-    /// Reports in display order: with more than `STACK_MIN` leaf reports
-    /// the leaves come first (they stack in a column at the left), then
-    /// the reports that have their own reports. Folded nodes show none.
+    /// Reports in display order (left to right). Folded nodes show none.
     pub(super) fn visual_children(&self, i: usize, folds: &HashSet<String>) -> Vec<usize> {
         if folds.contains(&self.nodes[i].key) {
             return Vec::new();
         }
-        let kids = &self.nodes[i].children;
-        let leaf = |c: &usize| self.nodes[*c].children.is_empty() || folds.contains(&self.nodes[*c].key);
-        let leaves = kids.iter().filter(|c| leaf(c)).count();
-        if leaves <= STACK_MIN {
-            return kids.clone();
-        }
-        kids.iter().copied().filter(|c| leaf(c)).chain(kids.iter().copied().filter(|c| !leaf(c))).collect()
+        self.nodes[i].children.clone()
     }
 
     /// Visible nodes in depth-first display order.
@@ -252,12 +266,6 @@ pub(super) struct ChartLayout {
     pub height: i32,
 }
 
-enum Unit {
-    Sub(usize),
-    /// Leaf reports stacked under a spine.
-    Column(Vec<usize>),
-}
-
 struct Layouter<'a> {
     model: &'a ChartModel,
     zoom: Zoom,
@@ -268,40 +276,24 @@ struct Layouter<'a> {
 
 impl Layouter<'_> {
     fn box_h(&self, i: usize) -> i32 {
-        if self.zoom != Zoom::Full {
+        if self.zoom.detail() != Detail::Full {
             return 1;
         }
         let n = self.model.nodes[i].sessions.len();
-        let lines = if n == 0 { 1 } else if n > FULL_MAX_SESSIONS { FULL_MAX_SESSIONS } else { n };
+        let lines = n.clamp(1, self.zoom.max_sessions());
         2 + lines as i32
     }
 
-    fn units(&self, i: usize) -> Vec<Unit> {
+    /// Every level is one row: the chart grows as wide as it needs.
+    fn band(&mut self, i: usize) -> (Vec<usize>, i32, i32) {
         let kids = self.model.visual_children(i, self.folds);
-        let leaf = |c: &usize| self.model.visual_children(*c, self.folds).is_empty();
-        let leaves: Vec<usize> = kids.iter().copied().filter(|c| leaf(c)).collect();
-        if leaves.len() <= STACK_MIN {
-            return kids.into_iter().map(Unit::Sub).collect();
-        }
-        std::iter::once(Unit::Column(leaves)).chain(kids.into_iter().filter(|c| !leaf(c)).map(Unit::Sub)).collect()
-    }
-
-    fn unit_size(&mut self, u: &Unit) -> (i32, i32) {
-        match u {
-            Unit::Sub(c) => self.measure(*c),
-            Unit::Column(ls) => (2 + self.zoom.box_w(), ls.iter().map(|&l| self.box_h(l)).sum()),
-        }
-    }
-
-    fn band(&mut self, i: usize) -> (Vec<Unit>, i32, i32) {
-        let units = self.units(i);
         let (mut w, mut h) = (0, 0);
-        for (k, u) in units.iter().enumerate() {
-            let (uw, uh) = self.unit_size(u);
-            w += uw + if k > 0 { self.zoom.hgap() } else { 0 };
-            h = h.max(uh);
+        for (k, &c) in kids.iter().enumerate() {
+            let (cw, ch) = self.measure(c);
+            w += cw + if k > 0 { self.zoom.hgap() } else { 0 };
+            h = h.max(ch);
         }
-        (units, w, h)
+        (kids, w, h)
     }
 
     fn measure(&mut self, i: usize) -> (i32, i32) {
@@ -309,8 +301,8 @@ impl Layouter<'_> {
             return *s;
         }
         let (bw, bh) = (self.zoom.box_w(), self.box_h(i));
-        let (units, band_w, band_h) = self.band(i);
-        let size = if units.is_empty() { (bw, bh) } else { (bw.max(band_w), bh + self.zoom.vgap() + band_h) };
+        let (kids, band_w, band_h) = self.band(i);
+        let size = if kids.is_empty() { (bw, bh) } else { (bw.max(band_w), bh + self.zoom.vgap() + band_h) };
         self.sizes.insert(i, size);
         size
     }
@@ -324,42 +316,20 @@ impl Layouter<'_> {
         let (bw, bh) = (self.zoom.box_w(), self.box_h(i));
         let bx = x + (w - bw) / 2;
         self.out.boxes.insert(i, Placed { x: bx, y, w: bw, h: bh });
-        let (units, band_w, _) = self.band(i);
-        if units.is_empty() {
+        let (kids, band_w, _) = self.band(i);
+        if kids.is_empty() {
             return;
         }
         let px = bx + bw / 2;
         let child_y = y + bh + self.zoom.vgap();
         let bus_y = child_y - 1;
-        let arm = if self.zoom == Zoom::Full { 1 } else { 0 };
         let mut cur = x + (w - band_w) / 2;
         let mut attach = Vec::new();
-        for u in &units {
-            let (uw, _) = self.unit_size(u);
-            match u {
-                Unit::Sub(c) => {
-                    let (cw, _) = self.measure(*c);
-                    attach.push(cur + (cw - bw) / 2 + bw / 2);
-                    self.assign(*c, cur, child_y);
-                }
-                Unit::Column(ls) => {
-                    attach.push(cur);
-                    let mut yy = child_y;
-                    let last_arm = child_y + ls.iter().take(ls.len() - 1).map(|&l| self.box_h(l)).sum::<i32>() + arm;
-                    for row in child_y..last_arm {
-                        self.line(cur, row, '\u{2502}');
-                    }
-                    for (k, &l) in ls.iter().enumerate() {
-                        let lh = self.box_h(l);
-                        let a = yy + arm;
-                        self.line(cur, a, if k + 1 == ls.len() { '\u{2514}' } else { '\u{251c}' });
-                        self.line(cur + 1, a, '\u{2500}');
-                        self.out.boxes.insert(l, Placed { x: cur + 2, y: yy, w: bw, h: lh });
-                        yy += lh;
-                    }
-                }
-            }
-            cur += uw + self.zoom.hgap();
+        for &c in &kids {
+            let (cw, _) = self.measure(c);
+            attach.push(cur + (cw - bw) / 2 + bw / 2);
+            self.assign(c, cur, child_y);
+            cur += cw + self.zoom.hgap();
         }
         for row in y + bh..bus_y {
             self.line(px, row, '\u{2502}');
@@ -744,6 +714,8 @@ impl App {
         c.search = None;
         c.status.clear();
         c.follow.set(true);
+        // The chart always opens fully unfolded.
+        c.folds.clear();
         c.boards.listed_at = None;
         let uid = self.cursor_session_uid();
         if let Some(uid) = uid {
@@ -797,12 +769,15 @@ impl App {
         node.sessions.get(self.orgchart.session.min(node.sessions.len().saturating_sub(1))).cloned()
     }
 
-    /// Enter: back to the Sessions view with the focused session selected.
-    fn orgchart_jump(&mut self, model: &ChartModel) {
-        let Some(s) = self.orgchart_focused_session(model) else {
+    /// Enter (`explicit`) or any other exit: back to the Sessions view with
+    /// the focused session selected. Enter on a box with no session stays
+    /// in the chart; other exits leave the sidebar cursor where it was.
+    fn orgchart_jump(&mut self, model: &ChartModel, explicit: bool) {
+        let target = self.orgchart_focused_session(model);
+        if target.is_none() && explicit {
             self.orgchart.status = "No session in this box".into();
             return;
-        };
+        }
         self.close_orgchart();
         // Nothing may sit over the Sessions view: other overlays close and
         // an open form or prompt is cancelled.
@@ -810,6 +785,10 @@ impl App {
         self.messages.visible = false;
         self.input_mode = InputMode::Normal;
         self.view_mode = ViewMode::Sessions;
+        let Some(s) = target else {
+            self.needs_redraw = true;
+            return;
+        };
         let continuous = self.find_session_by_uid(&s.uid).is_some_and(|k| self.continuous_members().contains(&k));
         if continuous && !self.continuous_column_on {
             self.continuous_column_on = true;
@@ -915,14 +894,27 @@ impl App {
         let pending = self.orgchart.pending.take();
         let focus = self.orgchart_focus(&model);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let (step_x, step_y) = match self.orgchart.zoom {
-            Zoom::Full => (16, 6),
-            Zoom::Compact => (12, 4),
-            Zoom::Dense => (8, 3),
+        let (step_x, step_y) = match self.orgchart.zoom.detail() {
+            Detail::Full => (16, 6),
+            Detail::Compact => (12, 4),
+            Detail::Dense => (8, 3),
         };
         match (pending, key.code) {
             (Some('g'), KeyCode::Char('g')) => self.orgchart_set_focus(&model, 0),
-            (Some('z'), KeyCode::Char(c @ ('c' | 'o' | 'a'))) => {
+            (Some('z'), KeyCode::Char(c @ ('M' | 'R'))) => {
+                // Fold (M) or unfold (R) every top-level org.
+                for &org in &model.nodes[0].children {
+                    let k = model.nodes[org].key.clone();
+                    if c == 'R' {
+                        self.orgchart.folds.remove(&k);
+                    } else if !model.nodes[org].children.is_empty() {
+                        self.orgchart.folds.insert(k);
+                    }
+                }
+                self.orgchart.follow.set(true);
+            }
+            (Some('z'), KeyCode::Char(c @ ('c' | 'o' | 'a'))) | (_, KeyCode::Char(c @ ' ')) => {
+                let c = if c == ' ' { 'a' } else { c };
                 let k = model.nodes[focus].key.clone();
                 let folded = self.orgchart.folds.contains(&k);
                 if model.nodes[focus].children.is_empty() {
@@ -934,9 +926,9 @@ impl App {
                 }
                 self.orgchart.follow.set(true);
             }
-            (_, KeyCode::F(6) | KeyCode::Esc | KeyCode::Char('q')) => self.close_orgchart(),
-            (_, KeyCode::Enter) => self.orgchart_jump(&model),
-            (_, KeyCode::Char('t')) if alt => self.orgchart_jump(&model),
+            (_, KeyCode::F(6) | KeyCode::Esc | KeyCode::Char('q')) => self.orgchart_jump(&model, false),
+            (_, KeyCode::Enter) => self.orgchart_jump(&model, true),
+            (_, KeyCode::Char('t')) if alt => self.orgchart_jump(&model, true),
             (_, KeyCode::Char(c @ ('g' | 'z'))) => self.orgchart.pending = Some(c),
             (_, KeyCode::Char('G')) => {
                 if let Some(&last) = model.preorder(&self.orgchart.folds).last() {
@@ -995,7 +987,10 @@ impl App {
                 self.orgchart.status = if self.orgchart.show_bash { "Showing bash sessions" } else { "Bash sessions hidden" }.into();
                 self.orgchart.follow.set(true);
             }
-            (_, KeyCode::Char('i')) => self.orgchart.hide_info = !self.orgchart.hide_info,
+            (_, KeyCode::Char('i')) => {
+                self.orgchart.hide_info = !self.orgchart.hide_info;
+                self.orgchart.follow.set(true);
+            }
             (_, KeyCode::Char('c')) => self.orgchart_centre(&model),
             (_, KeyCode::Char('H')) | (_, KeyCode::Left) => self.orgchart_pan(-step_x, 0),
             (_, KeyCode::Char('L')) | (_, KeyCode::Right) => self.orgchart_pan(step_x, 0),
@@ -1210,8 +1205,8 @@ impl App {
                 None => ("\u{25cb}", Style::default().fg(theme::DIM)),
             };
             let focus_bg = |s: Style| if focused { s.bg(theme::SELECT_BG) } else { s };
-            match self.orgchart.zoom {
-                Zoom::Dense => {
+            match self.orgchart.zoom.detail() {
+                Detail::Dense => {
                     put(buf, p.x, p.y, head_glyph.0, focus_bg(head_glyph.1));
                     if folded {
                         put(buf, p.x + 1, p.y, "\u{25b8}", focus_bg(Style::default().fg(theme::MUTED)));
@@ -1219,7 +1214,7 @@ impl App {
                         put(buf, p.x + 1, p.y, " ", focus_bg(Style::default()));
                     }
                 }
-                Zoom::Compact => {
+                Detail::Compact => {
                     let mark = node.sessions.first().and_then(|s| s.mark).unwrap_or(" ");
                     let extra = node.sessions.len().saturating_sub(1) + hidden;
                     let tail = match (folded, extra) {
@@ -1236,7 +1231,7 @@ impl App {
                     put(buf, p.x + 3, p.y, &name, focus_bg(text_style));
                     put(buf, p.x + p.w - tail.chars().count() as i32, p.y, &tail, focus_bg(Style::default().fg(theme::MUTED)));
                 }
-                Zoom::Full => {
+                Detail::Full => {
                     let border = if focused {
                         Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD)
                     } else if header {
@@ -1270,7 +1265,8 @@ impl App {
                         continue;
                     }
                     let n = node.sessions.len();
-                    let shown = if n > FULL_MAX_SESSIONS { FULL_MAX_SESSIONS - 1 } else { n };
+                    let max = self.orgchart.zoom.max_sessions();
+                    let shown = if n > max { max - 1 } else { n };
                     // Keep the selected session on screen inside a long box.
                     let first = match selected {
                         Some(s) if s >= shown => s + 1 - shown,
@@ -1435,7 +1431,7 @@ impl App {
                 Span::styled(format!("  {}", c.status), Style::default().fg(theme::MUTED)),
             ]);
         }
-        let help = "h/l sibling  j child  k boss  gg/G  Tab session  / n N  zc/zo fold  +/- zoom  HJKL pan  c centre  b bash  i info  Enter go  F6 close";
+        let help = "h/l sibling  j child  k boss  gg/G  Tab session  / n N  Space fold  zM/zR orgs  +/- zoom  HJKL pan  c centre  b bash  i info  Enter go  F6 close";
         let mut text = if c.status.is_empty() { help.to_owned() } else { format!("{}  \u{00b7}  {help}", c.status) };
         if let Some(p) = c.pending {
             text = format!("{p}…  {text}");
@@ -1720,7 +1716,7 @@ mod tests {
     fn layouts_never_overlap_at_any_zoom_for_deep_and_wide_trees() {
         for app in [deep_app(12), wide_app(60), org_app()] {
             let m = app.org_model(true);
-            for zoom in [Zoom::Full, Zoom::Compact, Zoom::Dense] {
+            for zoom in all_zooms() {
                 let lay = layout(&m, zoom, &HashSet::new());
                 assert_eq!(lay.boxes.len(), m.nodes.len(), "{zoom:?}: every node placed");
                 assert_no_overlap(&lay);
@@ -1734,31 +1730,55 @@ mod tests {
         }
     }
 
+    fn all_zooms() -> Vec<Zoom> {
+        (0..ZOOM_LEVELS.len()).map(Zoom).collect()
+    }
+
     #[test]
-    fn wide_fan_out_stacks_leaf_reports_in_a_column() {
+    fn wide_fan_out_stays_one_row_at_every_zoom() {
         let app = wide_app(60);
         let m = app.org_model(false);
         let boss = m.find("task:boss").unwrap();
-        for zoom in [Zoom::Full, Zoom::Compact, Zoom::Dense] {
+        for zoom in all_zooms() {
             let lay = layout(&m, zoom, &HashSet::new());
-            let xs: HashSet<i32> = m.nodes[boss].children.iter().map(|c| lay.boxes[c].x).collect();
-            assert_eq!(xs.len(), 1, "{zoom:?}: 60 leaf reports share one column");
-            // The chart stays narrow: about two boxes wide.
-            assert!(lay.width <= 2 * zoom.box_w() + 4, "{zoom:?}: width {}", lay.width);
+            let kids = &m.nodes[boss].children;
+            let ys: HashSet<i32> = kids.iter().map(|c| lay.boxes[c].y).collect();
+            assert_eq!(ys.len(), 1, "{zoom:?}: 60 reports share one row");
+            let xs: Vec<i32> = kids.iter().map(|c| lay.boxes[c].x).collect();
+            assert!(xs.windows(2).all(|w| w[0] + zoom.box_w() + zoom.hgap() <= w[1]), "{zoom:?}: left to right, apart");
+            // The chart grows as wide as the row needs.
+            assert!(lay.width >= 60 * zoom.box_w() + 59 * zoom.hgap(), "{zoom:?}: width {}", lay.width);
         }
         // Dense packs a deep chain into a narrow, short chart.
         let deep = deep_app(12);
         let dm = deep.org_model(false);
-        let full = layout(&dm, Zoom::Full, &HashSet::new());
-        let dense = layout(&dm, Zoom::Dense, &HashSet::new());
+        let full = layout(&dm, Zoom::FULL, &HashSet::new());
+        let dense = layout(&dm, Zoom::DENSE, &HashSet::new());
         assert!(dense.height < full.height / 2 && dense.width < full.width);
     }
 
     #[test]
-    fn three_or_fewer_leaf_reports_sit_in_a_row_with_a_bus() {
+    fn zoom_steps_through_every_level_one_at_a_time() {
+        let widths: Vec<i32> = all_zooms().into_iter().map(Zoom::box_w).collect();
+        let full: Vec<i32> = all_zooms().into_iter().filter(|z| z.detail() == Detail::Full).map(Zoom::box_w).collect();
+        let compact: Vec<i32> = all_zooms().into_iter().filter(|z| z.detail() == Detail::Compact).map(Zoom::box_w).collect();
+        assert!(full.windows(2).all(|w| w[0] < w[1]) && compact.windows(2).all(|w| w[0] < w[1]), "{widths:?}");
+        assert!(full.len() >= 3 && compact.len() >= 3, "intermediate levels: {widths:?}");
+        let mut z = Zoom::DENSE;
+        for k in 1..ZOOM_LEVELS.len() {
+            z = z.zoom_in();
+            assert_eq!(z, Zoom(k));
+        }
+        assert_eq!(z.zoom_in(), Zoom::MAX, "the widest card is the ceiling");
+        assert_eq!(Zoom::DENSE.zoom_out(), Zoom::DENSE, "dense is the floor");
+        assert_eq!(Zoom::default(), Zoom::FULL);
+    }
+
+    #[test]
+    fn reports_sit_in_a_row_with_a_bus() {
         let app = wide_app(3);
         let m = app.org_model(false);
-        let lay = layout(&m, Zoom::Full, &HashSet::new());
+        let lay = layout(&m, Zoom::FULL, &HashSet::new());
         let boss = m.find("task:boss").unwrap();
         let ys: HashSet<i32> = m.nodes[boss].children.iter().map(|c| lay.boxes[c].y).collect();
         assert_eq!(ys.len(), 1, "one row");
@@ -1778,11 +1798,11 @@ mod tests {
         app.orgchart.focus = Some("task:t1".into());
         press(&mut app, "zc");
         let m = app.org_model(false);
-        assert_eq!(layout(&m, Zoom::Full, &app.orgchart.folds).boxes.len(), 4, "owner, standalone, t0, folded t1");
+        assert_eq!(layout(&m, Zoom::FULL, &app.orgchart.folds).boxes.len(), 4, "owner, standalone, t0, folded t1");
         let s = screen(&mut app, 140, 40);
         assert!(s.contains("level 1 \u{25b8} 2 below") || s.contains("\u{25b8} 2 below"), "{s}");
         press(&mut app, "zo");
-        assert_eq!(layout(&m, Zoom::Full, &app.orgchart.folds).boxes.len(), 6);
+        assert_eq!(layout(&m, Zoom::FULL, &app.orgchart.folds).boxes.len(), 6);
     }
 
     #[test]
@@ -1936,6 +1956,17 @@ mod tests {
         assert_eq!(app.cursor_session_uid().as_deref(), Some("ts-50-0"));
     }
 
+    /// Whether the focused box is fully inside the chart viewport at the
+    /// last draw.
+    fn focus_in_view(app: &App) -> bool {
+        let m = app.org_model(app.orgchart.show_bash);
+        let lay = layout(&m, app.orgchart.zoom, &app.orgchart.folds);
+        let p = lay.boxes[&app.orgchart_focus(&m)];
+        let (vw, vh) = app.orgchart.viewport.get();
+        let (ox, oy) = (app.orgchart.ox.get(), app.orgchart.oy.get());
+        p.x >= ox && p.x + p.w.min(vw as i32) <= ox + vw as i32 && p.y >= oy && p.y + p.h.min(vh as i32) <= oy + vh as i32
+    }
+
     #[test]
     fn every_zoom_renders_and_keeps_the_focus_in_view() {
         let mut app = wide_app(60);
@@ -1945,28 +1976,132 @@ mod tests {
         let s = screen(&mut app, 120, 30);
         assert!(s.contains("Org chart"), "{s}");
         assert!(s.contains("rep-59"), "the focused report scrolled into view:\n{s}");
-        press(&mut app, "-");
-        assert_eq!(app.orgchart.zoom, Zoom::Compact);
-        app.orgchart.focus = Some("task:r00".into());
-        app.orgchart.follow.set(true);
-        let s = screen(&mut app, 120, 30);
-        assert!(s.contains("report 00"), "{s}");
-        press(&mut app, "-");
-        assert_eq!(app.orgchart.zoom, Zoom::Dense);
-        let s = screen(&mut app, 120, 30);
-        assert!(s.contains("zoom dense"), "{s}");
+        // Step down one level at a time to dense, the focus always in view.
+        for k in (0..Zoom::FULL.0).rev() {
+            press(&mut app, "-");
+            assert_eq!(app.orgchart.zoom, Zoom(k));
+            let s = screen(&mut app, 120, 30);
+            assert!(s.contains(&format!("zoom {}", Zoom(k).name())), "{s}");
+            assert!(focus_in_view(&app), "level {k}");
+        }
         press(&mut app, "--");
-        assert_eq!(app.orgchart.zoom, Zoom::Dense, "dense is the floor");
-        press(&mut app, "+++");
-        assert_eq!(app.orgchart.zoom, Zoom::Full);
+        assert_eq!(app.orgchart.zoom, Zoom::DENSE, "dense is the floor");
+        for k in 1..=Zoom::MAX.0 {
+            press(&mut app, "+");
+            screen(&mut app, 120, 30);
+            assert!(focus_in_view(&app), "level {k}");
+        }
+        assert_eq!(app.orgchart.zoom, Zoom::MAX);
         // Panning moves the viewport and stops following.
         let before = app.orgchart.ox.get();
-        press(&mut app, "L");
+        press(&mut app, "H");
         assert!(!app.orgchart.follow.get());
-        assert_eq!(app.orgchart.ox.get(), before + 16);
+        assert_eq!(app.orgchart.ox.get(), before - 16);
         // Narrow terminals put the info pane underneath.
         let s = screen(&mut app, 80, 40);
         assert!(s.contains(" Info "), "{s}");
+    }
+
+    #[test]
+    fn the_viewport_follows_focus_along_a_wide_row_search_and_zoom() {
+        let mut app = wide_app(60);
+        app.cursor = Cursor::Session(0, 1); // rep-00
+        app.handle_event(&key(KeyCode::F(6)));
+        assert_eq!(focused_title(&app), "report 00");
+        screen(&mut app, 120, 30);
+        assert!(focus_in_view(&app));
+        let start = app.orgchart.ox.get();
+        for k in 1..60 {
+            press(&mut app, "l");
+            assert_eq!(focused_title(&app), format!("report {k:02}"));
+            let s = screen(&mut app, 120, 30);
+            assert!(focus_in_view(&app), "after {k} l presses");
+            assert!(s.contains(&format!("rep-{k:02}")), "{s}");
+        }
+        assert!(app.orgchart.ox.get() > start, "the viewport scrolled right");
+        for k in (0..59).rev() {
+            press(&mut app, "h");
+            screen(&mut app, 120, 30);
+            assert!(focus_in_view(&app), "back at {k}");
+        }
+        // A pan, then a search jump far off screen: the viewport follows again.
+        press(&mut app, "KK");
+        press(&mut app, "/rep-47");
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(focused_title(&app), "report 47");
+        screen(&mut app, 120, 30);
+        assert!(focus_in_view(&app), "after the search jump");
+        // A pan, then a zoom change.
+        press(&mut app, "HHHH");
+        press(&mut app, "-");
+        screen(&mut app, 120, 30);
+        assert!(focus_in_view(&app), "after zooming out");
+        press(&mut app, "LLLL++");
+        screen(&mut app, 120, 30);
+        assert!(focus_in_view(&app), "after zooming in");
+    }
+
+    #[test]
+    fn every_exit_returns_to_the_sessions_view_on_the_charts_focus() {
+        for exit in [KeyCode::Esc, KeyCode::F(6), KeyCode::Char('q')] {
+            let mut app = org_app();
+            app.view_mode = ViewMode::Planning;
+            app.board.visible = true;
+            app.cursor = Cursor::Session(3, 0); // scratch
+            app.handle_event(&key(KeyCode::F(6)));
+            press(&mut app, "/leaf-1");
+            app.handle_event(&key(KeyCode::Enter));
+            app.handle_event(&key(exit));
+            assert!(!app.orgchart.visible, "{exit:?}");
+            assert!(!app.board.visible, "{exit:?}");
+            assert_eq!(app.view_mode, ViewMode::Sessions, "{exit:?}");
+            assert_eq!(app.cursor_session_uid().as_deref(), Some("ts-50-0"), "{exit:?}");
+        }
+        // Tab picks a session inside the box; the exit lands on that one.
+        let mut app = org_app();
+        app.cursor = Cursor::Session(0, 0); // root-b
+        app.handle_event(&key(KeyCode::F(6)));
+        assert_eq!(app.orgchart_focused_session(&app.org_model(false)).unwrap().uid, "ts-20-0");
+        app.handle_event(&key(KeyCode::Tab));
+        app.handle_event(&key(KeyCode::Esc));
+        assert_eq!(app.cursor_session_uid().as_deref(), Some("ts-10-0"));
+        // A box with no session: the exit still closes, the cursor stays.
+        app.handle_event(&key(KeyCode::F(6)));
+        press(&mut app, "gg");
+        app.handle_event(&key(KeyCode::Esc));
+        assert!(!app.orgchart.visible);
+        assert_eq!(app.cursor_session_uid().as_deref(), Some("ts-10-0"));
+    }
+
+    #[test]
+    fn the_chart_opens_unfolded_and_folds_top_level_orgs() {
+        let mut app = org_app();
+        app.tasks.push(task("solo", "Solo", None));
+        session(&mut app, 3, 0x70, "solo-1", "codex", Some("solo"));
+        app.handle_event(&key(KeyCode::F(6)));
+        assert!(app.orgchart.folds.is_empty(), "the default is fully unfolded");
+        let m = app.org_model(false);
+        let all = layout(&m, app.orgchart.zoom, &app.orgchart.folds).boxes.len();
+        assert_eq!(all, m.nodes.len());
+        // zM folds every top-level org, zR unfolds them.
+        press(&mut app, "zM");
+        assert!(app.orgchart.folds.contains("standalone"));
+        assert_eq!(layout(&m, app.orgchart.zoom, &app.orgchart.folds).boxes.len(), 2, "Owner and Standalone");
+        let s = screen(&mut app, 140, 40);
+        assert!(s.contains("\u{25b8}"), "{s}");
+        press(&mut app, "zR");
+        assert!(app.orgchart.folds.is_empty());
+        // Space toggles the focused org.
+        app.orgchart.focus = Some("standalone".into());
+        press(&mut app, " ");
+        assert!(app.orgchart.folds.contains("standalone"));
+        press(&mut app, " ");
+        assert!(!app.orgchart.folds.contains("standalone"));
+        // Folds never survive a close: the next open is unfolded again.
+        press(&mut app, " ");
+        app.handle_event(&key(KeyCode::Esc));
+        app.handle_event(&key(KeyCode::F(6)));
+        assert!(app.orgchart.folds.is_empty());
     }
 
     #[test]

@@ -2,7 +2,8 @@
 
 F6 opens a full-screen org chart of every agent session on every host. It
 shows reporting lines only; nothing on it grants or implies approval rights.
-F6, Esc or `q` closes it.
+F6, Esc or `q` closes it and, like Enter, returns to the Sessions view with
+the chart's focused session selected.
 
 ## Layout
 
@@ -35,8 +36,8 @@ F6, Esc or `q` closes it.
   letter of the host name, in magenta.
 - Bash sessions are hidden by default; `b` shows them. Opening the chart on a
   bash session shows just that one, until the chart closes.
-- Once a box has more than three reports with no reports of their own, those
-  reports stack in a column, so a 50-report lead stays two boxes wide.
+- Every level is laid out in one row, left to right, however many reports a
+  box has; the chart grows as wide as it needs and the viewport pans to it.
 
 ## Keys
 
@@ -47,15 +48,19 @@ F6, Esc or `q` closes it.
 | `gg` / `G` | Owner / last box |
 | `Tab` / `S-Tab` | next / previous session in the box |
 | `/` `n` `N` | search session labels and box names, then step through matches; the search unfolds a match's ancestors |
-| `zc` `zo` `za` | fold / unfold / toggle the box's subtree; a folded box shows how many sessions it hides |
-| `+` / `-` | zoom: full cards, then compact (one line: name and lead glyph), then dense (one glyph per box) |
+| Space or `za`, `zc`, `zo` | toggle, fold, unfold the box's subtree; a folded box shows how many sessions it hides |
+| `zM` / `zR` | fold / unfold every top-level org (divisions, Standalone, Continuous) |
+| `+` / `-` | zoom one of ten levels: four full-card widths (more sessions per card as they widen), four compact widths (one line: name and lead glyph), and two dense (one glyph per box) |
 | `H` `J` `K` `L`, arrows | pan |
 | `c` | centre on the focused box |
 | `i` | show or hide the info pane |
-| Enter (or `A-t`) | open the Sessions view with that session focused; folded sidebar headers above it unfold |
+| Enter (or `A-t`) | open the Sessions view with that session focused; folded sidebar headers above it unfold. Enter on a box with no session stays in the chart |
+| F6, Esc, `q` | the same, except that a box with no session leaves the sidebar cursor where it was |
 
-The chart opens on the session focused in the Sessions view. Moving the focus
-scrolls it into view; panning stops that until the focus moves again.
+The chart opens on the session focused in the Sessions view, fully unfolded
+(folds last only while it is open). After any focus move, search jump, zoom,
+fold or info-pane toggle the viewport pans to keep the focused box on screen;
+a manual pan stops that until the next one.
 
 ## Info pane
 
