@@ -5,11 +5,16 @@
 //!   parent task, at any depth. Reporting lines follow `parent_task_id`.
 //! - A division (an initiative with `kind = "division"`) groups the
 //!   top-level blocks of its tree under one header.
+//! - Every block draws at the top-level indent, whatever its depth
+//!   (Owner, 2026-10-21): the group strip and the level marks carry the
+//!   hierarchy.
 //! - Task and division headers fold with Space/Enter; the fold state rides
-//!   the manifest. A folded header shows its session rollup.
-//! - The focused row's ancestor chain draws a coloured gutter bar, and its
-//!   group a tint.
-//! - Each task's lead session carries a leader mark (see [`lead_session_uid`]).
+//!   the manifest. A folded task hides only its subtasks (its own sessions
+//!   stay), and shows the hidden subtree's rollup.
+//! - The focused group draws a narrow coloured strip at the sidebar's left
+//!   edge (no tint).
+//! - The lead session (see [`lead_session_uid`]) of a task with subtasks
+//!   carries its level's leader mark ([`leader_glyph`]); leaves carry none.
 //!
 //! Sections still group top-level blocks; a nested block follows its root
 //! block's section. The Status sub-view and the continuous column are
@@ -29,8 +34,8 @@ pub(super) enum Node {
 /// Tree metadata for one Task sub-view row.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct TreeRow {
-    /// Enclosing nodes of the blocks this row sits inside, outermost first:
-    /// one gutter cell each.
+    /// Enclosing nodes of the blocks this row sits inside, outermost first.
+    /// Structure only: the sidebar no longer indents by depth.
     pub cells: Vec<Node>,
     /// Extra depth inside its own block: an inherit-mode subtask shares its
     /// parent's checkout and nests under it there.
@@ -54,6 +59,9 @@ pub(super) struct TaskTree {
     pub folded: HashMap<Node, Rollup>,
     /// Divisions by initiative id, for header rendering.
     pub divisions: HashMap<String, crate::planning::Division>,
+    /// Tasks with subtasks in the tree (folds ignored): the ones that fold
+    /// and whose lead carries a leader mark.
+    pub reports: HashSet<String>,
 }
 
 impl TaskTree {
@@ -140,6 +148,23 @@ impl Forest {
     /// Every session row under a task header, nested blocks included.
     fn task_sessions(&self, wi: usize, t: &str, out: &mut Vec<(usize, usize)>) {
         out.extend(self.bucket(wi, Some(t)).iter().map(|si| (wi, *si)));
+        for c in self.local_children(wi, t) {
+            self.task_sessions(wi, c, out);
+        }
+        for wj in self.nested_blocks(wi, t) {
+            self.block_sessions(wj, out);
+        }
+    }
+
+    /// Whether a task has subtasks under its header: nested blocks or
+    /// inherit-mode subtasks with content.
+    fn has_reports(&self, wi: usize, t: &str) -> bool {
+        !self.nested_blocks(wi, t).is_empty()
+            || self.local_children(wi, t).any(|c| self.has_content(wi, c))
+    }
+
+    /// The session rows a task's fold hides: its subtasks', not its own.
+    fn subtask_sessions(&self, wi: usize, t: &str, out: &mut Vec<(usize, usize)>) {
         for c in self.local_children(wi, t) {
             self.task_sessions(wi, c, out);
         }
@@ -290,8 +315,8 @@ impl App {
     }
 
     /// Make a session's row show: clear an A-/ filter that excludes it,
-    /// then unfold every task and division header above it (its own task
-    /// included) and its root block's section. For jumps from the org
+    /// then unfold every task and division header above its task (whose
+    /// own fold never hides it) and its root block's section. For jumps from the org
     /// chart (F6) and the board (A-B). Returns true when anything changed.
     pub(crate) fn reveal_session(&mut self, uid: &str) -> bool {
         let Some((wi, si)) = self
@@ -306,7 +331,7 @@ impl App {
             .task_id
             .clone()
             .map_or(Node::Workspace(wi), Node::Task);
-        self.reveal_row(VisualItem::Session(wi, si), wi, &node, true)
+        self.reveal_row(VisualItem::Session(wi, si), wi, &node)
     }
 
     /// Reveal the cursor's row when a fold, a folded section or the filter
@@ -316,15 +341,16 @@ impl App {
     /// cursor on no row; an unmoved cursor never undoes Owner's filter or
     /// folds. Returns true when anything changed.
     pub(crate) fn reveal_cursor(&mut self) -> bool {
-        let Some((row, wi, node, own)) = self.cursor_target() else {
+        let Some((row, wi, node)) = self.cursor_target() else {
             return false;
         };
-        self.reveal_row(row, wi, &node, own)
+        self.reveal_row(row, wi, &node)
     }
 
     /// The main-column Task sub-view row the cursor stands for:
-    /// `(row, workspace, node, whether the node's own fold hides the row)`.
-    fn cursor_target(&self) -> Option<(VisualItem, usize, Node, bool)> {
+    /// `(row, workspace, node)`. Only the folds above the node can hide it:
+    /// a task's own fold hides its subtasks, never its header or sessions.
+    fn cursor_target(&self) -> Option<(VisualItem, usize, Node)> {
         if self.sidebar_view != SidebarView::Task || self.cursor_column != SidebarColumn::Main {
             return None;
         }
@@ -332,10 +358,8 @@ impl App {
             Cursor::Session(wi, si) => {
                 let ts = self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si))?;
                 let node = ts.task_id.clone().map_or(Node::Workspace(*wi), Node::Task);
-                (VisualItem::Session(*wi, *si), *wi, node, true)
+                (VisualItem::Session(*wi, *si), *wi, node)
             }
-            // A header stays visible while folded itself; only its
-            // ancestors' folds can hide it.
             Cursor::Task { ws_idx, task_id } => (
                 VisualItem::TaskHeader {
                     ws_idx: *ws_idx,
@@ -343,14 +367,8 @@ impl App {
                 },
                 *ws_idx,
                 Node::Task(task_id.clone()),
-                false,
             ),
-            Cursor::Workspace(wi) => (
-                VisualItem::WorkspaceHeader(*wi),
-                *wi,
-                Node::Workspace(*wi),
-                false,
-            ),
+            Cursor::Workspace(wi) => (VisualItem::WorkspaceHeader(*wi), *wi, Node::Workspace(*wi)),
             _ => return None,
         };
         self.workspaces.get(target.1)?;
@@ -363,7 +381,7 @@ impl App {
             .is_some_and(|(row, ..)| !visible.contains(&row))
     }
 
-    fn reveal_row(&mut self, row: VisualItem, wi: usize, node: &Node, own: bool) -> bool {
+    fn reveal_row(&mut self, row: VisualItem, wi: usize, node: &Node) -> bool {
         let shown = |app: &App| app.visual_items().contains(&row);
         if shown(self) {
             return false;
@@ -379,7 +397,7 @@ impl App {
                 return true;
             }
         }
-        changed |= self.reveal_node(node, own);
+        changed |= self.reveal_node(node);
         let root = self
             .task_tree_unfolded()
             .block_root
@@ -399,11 +417,11 @@ impl App {
         changed
     }
 
-    /// Clear the folds above `node` (and on it when `own`).
-    fn reveal_node(&mut self, node: &Node, own: bool) -> bool {
+    /// Clear the folds above `node`.
+    fn reveal_node(&mut self, node: &Node) -> bool {
         let mut changed = false;
         let chain = self.task_tree_with(false).chain(node);
-        for n in chain.into_iter().skip(usize::from(!own)) {
+        for n in chain.into_iter().skip(1) {
             changed |= match n {
                 Node::Task(t) => self.folded_tasks.remove(&t),
                 Node::Division(d) => self.folded_divisions.remove(&d),
@@ -436,7 +454,15 @@ impl App {
                 .values()
                 .map(|d| (d.id.clone(), d.clone()))
                 .collect(),
+            reports: HashSet::new(),
         };
+        for &wi in &f.order {
+            for t in &f.bound[&wi] {
+                if f.home.get(t) == Some(&wi) && f.has_reports(wi, t) {
+                    out.reports.insert(t.clone());
+                }
+            }
+        }
         for &wi in &f.order {
             let mut top = wi;
             while let Some((p, _)) = f.attach.get(&top) {
@@ -541,8 +567,17 @@ impl App {
         }
     }
 
-    /// Space/Enter on a task or division header: fold or unfold it.
+    /// Space/Enter on a task or division header: fold or unfold it. A task
+    /// without subtasks has nothing to fold.
     pub(crate) fn toggle_tree_fold(&mut self) -> bool {
+        if let Cursor::Task { task_id, .. } = &self.cursor {
+            if !self.folded_tasks.contains(task_id)
+                && !self.task_tree_unfolded().reports.contains(task_id)
+            {
+                self.set_status_msg("No subtasks to fold");
+                return true;
+            }
+        }
         let set = match &self.cursor {
             Cursor::Task { task_id, .. } => Some((&mut self.folded_tasks, task_id.clone())),
             Cursor::Division(id) => Some((&mut self.folded_divisions, id.clone())),
@@ -652,6 +687,30 @@ impl App {
             self.needs_redraw = true;
         }
         self.set_status_msg(&format!("Lead not saved: {error}"));
+    }
+
+    /// A task's level below Owner: 1 for a root task, 2 for its subtask,
+    /// and so on, along `parent_task_id` (a cycle ends the walk).
+    pub(crate) fn task_level(&self, task_id: &str) -> usize {
+        let parents = self.task_parent_map();
+        let mut seen = HashSet::from([task_id]);
+        let mut level = 1;
+        let mut cur = task_id;
+        while let Some(p) = parents.get(cur).copied().filter(|p| seen.insert(*p)) {
+            level += 1;
+            cur = p;
+        }
+        level
+    }
+
+    /// Leader marks by session uid: the lead of each task in `reports` (a
+    /// task with subtasks) gets its level's glyph.
+    pub(super) fn leader_marks(&self, reports: &HashSet<String>) -> HashMap<String, &'static str> {
+        self.task_leads()
+            .into_iter()
+            .filter(|(t, _)| reports.contains(t))
+            .map(|(t, uid)| (uid, leader_glyph(self.task_level(&t))))
+            .collect()
     }
 
     /// Lead session of every task with sessions in the sidebar, by the
@@ -822,14 +881,15 @@ impl Emit<'_> {
                 node: Some(node.clone()),
             },
         );
-        if self.folds && self.app.tree_folded(&node) {
+        // A fold hides the subtasks only: the task's own sessions stay.
+        let own = self.f.bucket(wi, Some(t)).to_vec();
+        self.sessions(wi, &own, &node, cells, local);
+        if self.folds && self.app.tree_folded(&node) && self.f.has_reports(wi, t) {
             let mut sessions = Vec::new();
-            self.f.task_sessions(wi, t, &mut sessions);
+            self.f.subtask_sessions(wi, t, &mut sessions);
             self.fold(node, &sessions);
             return;
         }
-        let own = self.f.bucket(wi, Some(t)).to_vec();
-        self.sessions(wi, &own, &node, cells, local);
         let local_children: Vec<String> = self.f.local_children(wi, t).cloned().collect();
         for c in local_children {
             self.task(wi, &c, cells, local.saturating_add(1));
@@ -896,6 +956,16 @@ impl Emit<'_> {
             }
         }
     }
+}
+
+/// Leader marks by level below Owner, shared by the sidebar and the F6 org
+/// chart: ★ for a root task's lead, ☆ one level down, then ✦, then ✧ for
+/// every deeper level. ◆ is taken (divisions, coordinators).
+pub(crate) const LEADER_GLYPHS: [&str; 4] = ["\u{2605}", "\u{2606}", "\u{2726}", "\u{2727}"];
+
+/// The leader mark for a lead at `level` (1 = a root task).
+pub(crate) fn leader_glyph(level: usize) -> &'static str {
+    LEADER_GLYPHS[level.clamp(1, LEADER_GLYPHS.len()) - 1]
 }
 
 // The lead rule is shared with the daemon's `org` tool: one function.
@@ -1023,8 +1093,10 @@ mod tree_tests {
         );
     }
 
+    /// Owner, 2026-10-21: a fold hides the task's subtasks only. Its own
+    /// sessions stay, and the rollup counts just the hidden subtree.
     #[test]
-    fn a_folded_task_hides_its_subtree_and_rolls_it_up_until_unfolded() {
+    fn a_folded_task_hides_its_subtasks_only_and_rolls_them_up_until_unfolded() {
         let mut app = org_app();
         app.cursor = Cursor::Task {
             ws_idx: 1,
@@ -1034,11 +1106,13 @@ mod tree_tests {
         assert!(app.handle_event(&space));
         assert!(app.folded_tasks.contains("tc"));
         let outline_folded = outline(&app);
-        assert!(
-            outline_folded.contains(&">task:tc".to_string()),
-            "the header stays"
-        );
-        for hidden in [">ts-12-0", ">>ws:g", ">>ts-13-0"] {
+        for kept in ["ws:r", ">ws:c", ">task:tc", ">ts-12-0"] {
+            assert!(
+                outline_folded.contains(&kept.to_string()),
+                "{kept}: the header, its workspace and its own session stay"
+            );
+        }
+        for hidden in [">>ws:g", ">>task:tg", ">>ts-13-0"] {
             assert!(
                 !outline_folded.contains(&hidden.to_string()),
                 "{hidden} folds away"
@@ -1047,8 +1121,8 @@ mod tree_tests {
         let tree = app.task_tree();
         assert_eq!(
             tree.folded[&Node::Task("tc".into())].0,
-            2,
-            "tc's session and g's"
+            1,
+            "only g's session is hidden"
         );
         // Filtering ignores folds, so a match is never hidden.
         app.sidebar_filter = Some("ts-13".into());
@@ -1063,7 +1137,8 @@ mod tree_tests {
         ))));
         assert!(!app.folded_tasks.contains("tc"));
         assert_eq!(outline(&app), outline(&org_app()));
-        // reveal_session unfolds every header above a session, its own task's too.
+        // reveal_session unfolds every header above a session's task; the
+        // task's own fold never hid it, so it stays.
         app.folded_tasks.extend([
             "tr".to_string(),
             "tc".to_string(),
@@ -1071,13 +1146,125 @@ mod tree_tests {
             "tl".to_string(),
         ]);
         assert!(app.reveal_session("ts-13-0"));
-        assert!(
-            app.folded_tasks.iter().eq(["tl".to_string()].iter()),
-            "{:?}",
-            app.folded_tasks
+        assert_eq!(
+            app.folded_tasks,
+            HashSet::from(["tg".to_string(), "tl".to_string()]),
         );
         assert!(outline(&app).contains(&">>ts-13-0".to_string()));
         assert!(!app.reveal_session("ts-13-0"), "nothing left to unfold");
+        // A task without subtasks has nothing to fold.
+        app.folded_tasks.clear();
+        app.cursor = Cursor::Task {
+            ws_idx: 4,
+            task_id: "tl".into(),
+        };
+        assert!(app.handle_event(&space));
+        assert!(app.folded_tasks.is_empty(), "a leaf does not fold");
+        assert!(!app.task_tree().reports.contains("tl"));
+        // Inherit-mode subtasks fold too: tr hides tr2 and every block below.
+        app.cursor = Cursor::Task {
+            ws_idx: 0,
+            task_id: "tr".into(),
+        };
+        assert!(app.handle_event(&space));
+        assert_eq!(
+            outline(&app),
+            ["ws:r", "task:tr", "ts-10-0", "ws:l", "task:tl", "ts-15-0"]
+        );
+        assert_eq!(app.task_tree().folded[&Node::Task("tr".into())].0, 4);
+    }
+
+    /// Owner, 2026-10-21 (longstanding): a task-feed refresh re-sorts the
+    /// workspaces and used to drop the cursor from a task header to its
+    /// workspace's header. It stays on the task.
+    #[test]
+    fn a_task_header_keeps_the_cursor_through_a_task_refresh() {
+        let mut app = org_app();
+        app.cursor = Cursor::Task {
+            ws_idx: 1,
+            task_id: "tc".into(),
+        };
+        let api = |id: &str, parent: Option<&str>| -> crate::api::Task {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "created_at": "2026-10-21T00:00:00Z", "repo_url": "",
+                "repo_branch": "main", "name": id, "status": "running",
+                "parent_task_id": parent,
+            }))
+            .unwrap()
+        };
+        let feed = vec![
+            api("tr", None),
+            api("tr2", Some("tr")),
+            api("tc", Some("tr")),
+            api("tg", Some("tc")),
+            api("to", Some("tx")),
+            api("tl", None),
+        ];
+        // Move c to the end first, so the re-sort really moves it.
+        let c = app.workspaces.remove(1);
+        app.workspaces.push(c);
+        app.cursor = Cursor::Task {
+            ws_idx: 4,
+            task_id: "tc".into(),
+        };
+        for _ in 0..3 {
+            app.reconcile_tasks(feed.clone());
+            let Cursor::Task { ws_idx, task_id } = &app.cursor else {
+                panic!("cursor left the task header: {:?}", app.cursor);
+            };
+            assert_eq!(task_id, "tc");
+            assert_eq!(app.workspaces[*ws_idx].id, "c");
+        }
+        // A header for a task only its sessions know (not in the feed yet)
+        // holds the cursor too.
+        app.tasks.retain(|t| t.task_id.as_deref() != Some("tl"));
+        let wl = app.workspaces.iter().position(|w| w.id == "l").unwrap();
+        app.cursor = Cursor::Task {
+            ws_idx: wl,
+            task_id: "tl".into(),
+        };
+        app.clamp_cursor();
+        assert!(matches!(&app.cursor, Cursor::Task { task_id, .. } if task_id == "tl"));
+    }
+
+    /// Owner, 2026-10-21: only the lead of a task with subtasks carries a
+    /// leader mark, by level below Owner (★ ☆ ✦ ✧, then ✧ again), and the
+    /// F6 org chart uses the same marks.
+    #[test]
+    fn only_leads_with_reports_carry_their_levels_mark_in_both_views() {
+        assert_eq!(
+            (1..=6).map(leader_glyph).collect::<Vec<_>>(),
+            ["\u{2605}", "\u{2606}", "\u{2726}", "\u{2727}", "\u{2727}", "\u{2727}"]
+        );
+        assert_eq!(leader_glyph(0), "\u{2605}");
+        assert!(!LEADER_GLYPHS.contains(&"\u{25c6}"), "◆ marks divisions");
+        let mut app = org_app();
+        // A deeper chain: tg → tz (level 4) → ty (level 5).
+        app.workspaces.push(bare_ws("z"));
+        app.workspaces.push(bare_ws("y"));
+        app.tasks.push(task("tz", "z", Some("tg")));
+        app.tasks.push(task("ty", "y", Some("tz")));
+        session(&mut app, 5, "tz", "ts-16-0", "codex");
+        session(&mut app, 6, "ty", "ts-17-0", "codex");
+        assert_eq!(
+            ["tr", "tr2", "tc", "tg", "tx", "to", "tz", "ty", "tl"].map(|t| app.task_level(t)),
+            [1, 2, 2, 3, 2, 3, 4, 5, 1]
+        );
+        let tree = app.task_tree();
+        let marks = app.leader_marks(&tree.reports);
+        let expected = HashMap::from([
+            ("ts-10-0".to_string(), "\u{2605}"), // tr: tr2, c and o report to it
+            ("ts-12-0".to_string(), "\u{2606}"), // tc: g
+            ("ts-13-0".to_string(), "\u{2726}"), // tg: z
+            ("ts-16-0".to_string(), "\u{2727}"), // tz: y
+        ]);
+        assert_eq!(marks, expected, "leaves (tr2, to, ty, tl) carry none");
+        // The org chart agrees, box by box.
+        let model = app.org_model(true);
+        for (t, uid) in [("tr", "ts-10-0"), ("tc", "ts-12-0"), ("tg", "ts-13-0"), ("tz", "ts-16-0"), ("tr2", "ts-11-0"), ("ty", "ts-17-0")] {
+            let node = &model.nodes[model.find(&format!("task:{t}")).unwrap()];
+            assert_eq!(node.mark, marks.get(uid).copied(), "{t}");
+        }
     }
 
     /// Owner-approved 2026-10-20: a task header is a tree row. Even with a
@@ -1455,50 +1642,62 @@ mod tree_tests {
         );
     }
 
+    /// Owner, 2026-10-21: no indent by depth (every block at the top-level
+    /// indent; sessions keep theirs), and the focused group shows only as
+    /// a narrow strip at the sidebar's left edge: no tint, no ancestor bar.
     #[test]
-    fn the_sidebar_draws_the_lead_mark_gutter_bar_and_group_tint() {
+    fn the_sidebar_draws_flat_blocks_level_marks_and_a_group_edge_strip() {
         let mut app = org_app();
         // A second, later agent on tc: the earlier one leads; a bash
         // session never does.
         session(&mut app, 1, "tc", "ts-20-0", "claude");
         session(&mut app, 1, "tc", "ts-05-0", "bash");
-        let leads = app.task_leads();
-        assert_eq!(leads["tc"], "ts-12-0");
+        assert_eq!(app.task_leads()["tc"], "ts-12-0");
         app.cursor = Cursor::Session(1, 0);
         let buffer = sidebar_buffer(&mut app, 30);
-        let rows: Vec<String> = (0..30u16)
-            .map(|y| {
-                (0..40u16)
-                    .map(|x| buffer[(x, y)].symbol().to_string())
-                    .collect()
-            })
+        let rows: Vec<Vec<String>> = (0..30u16)
+            .map(|y| (0..40u16).map(|x| buffer[(x, y)].symbol().to_string()).collect())
             .collect();
-        let row_of = |needle: &str| {
-            rows.iter()
-                .position(|r| r.contains(needle))
-                .unwrap_or_else(|| panic!("{needle}\n{}", rows.join("\n")))
+        let text = |y: usize| rows[y].concat();
+        // Column of `needle` in its row (cells, not bytes).
+        let at = |needle: &str| -> (usize, usize) {
+            let chars: Vec<char> = needle.chars().collect();
+            for (y, row) in rows.iter().enumerate() {
+                for x in 0..row.len().saturating_sub(chars.len()) {
+                    if (0..chars.len()).all(|k| row[x + k] == chars[k].to_string()) {
+                        return (y, x);
+                    }
+                }
+            }
+            panic!("{needle}\n{}", (0..30).map(text).collect::<Vec<_>>().join("\n"));
         };
-        assert!(
-            rows[row_of("ts-12-0")].contains("\u{2605} ts-12-0"),
-            "{}",
-            rows.join("\n")
-        );
-        assert!(!rows[row_of("ts-20-0")].contains('\u{2605}'));
-        // Focused group (tc and everything under it): bar and tint.
-        for needle in ["tc", "ts-12-0", "ts-13-0"] {
-            let y = row_of(needle) as u16;
-            assert_eq!(buffer[(1, y)].symbol(), "\u{258e}", "{needle}: gutter bar");
-            assert_eq!(
-                buffer[(30, y)].bg,
-                theme::focus_tint(None),
-                "{needle}: group tint"
-            );
+        // Task headers at every depth share one column, and so do
+        // workspace headers; sessions keep one indent.
+        let (_, tr) = at("\u{25be} tr");
+        assert_eq!(at("\u{25be} tc").1, tr, "tc (level 2) at the root's indent");
+        assert_eq!(at("   tg").1 + 1, tr, "tg (level 3) too, a leaf: no fold glyph");
+        assert_eq!(at("   to").1 + 1, tr, "to (level 3, under a missing tx) too");
+        assert_eq!(at("ts-13-0").1, at("ts-15-0").1, "sessions keep their indent");
+        // Level marks on the leads with reports only.
+        assert_eq!(at("\u{2605} ts-10-0").1 + 2, at("ts-10-0").1);
+        assert!(text(at("ts-12-0").0).contains("\u{2606} ts-12-0"), "tc is level 2");
+        for leaf in ["ts-15-0", "ts-14-0", "ts-11-0", "ts-20-0"] {
+            let row = text(at(leaf).0);
+            assert!(!row.contains(['\u{2605}', '\u{2606}', '\u{2726}', '\u{2727}']), "{leaf}: {row}");
         }
-        // Ancestors get the bar but not the tint; an unrelated block neither.
-        let y = row_of("ts-10-0") as u16;
-        assert_ne!(buffer[(30, y)].bg, theme::FOCUS_TINT);
-        let y = row_of("ts-15-0") as u16;
-        assert_eq!(buffer[(1, y)].symbol(), " ");
-        assert_ne!(buffer[(30, y)].bg, theme::FOCUS_TINT);
+        // The group (tc and everything under it) gets the edge strip and no
+        // background; its ancestors and an unrelated block get neither.
+        for needle in ["\u{25be} tc", "ts-12-0", "ts-20-0", "   tg", "ts-13-0"] {
+            let (y, _) = at(needle);
+            assert_eq!(rows[y][1], "\u{258f}", "{needle}: edge strip");
+            assert_eq!(buffer[(1, y as u16)].fg, theme::TREE_FOCUS);
+        }
+        for needle in ["\u{25be} tr", "ts-10-0", "ts-15-0"] {
+            assert_eq!(rows[at(needle).0][1], " ", "{needle}: no strip");
+        }
+        assert!(
+            buffer.content().iter().all(|c| c.bg == ratatui::style::Color::Reset),
+            "no group tint anywhere"
+        );
     }
 }

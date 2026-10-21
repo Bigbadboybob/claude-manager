@@ -574,11 +574,11 @@ pub(crate) mod layout_tests {
         let buffer = sidebar_buffer(&mut app, 24);
         let blue = theme::sidebar_section_bg(Some("blue"), 2.0);
         // Header, workspace, task, session, internal gap, inherited workspace/task/session.
-        // The focused group (tb's header and session) lifts the section tint.
+        // The focused group (tb's header and session) keeps the section
+        // tint: only its left-edge strip marks it.
         for y in 1..=8 {
-            let surface = if y >= 7 { theme::focus_tint(Some(blue)) } else { blue };
             for x in 1..=38 {
-                assert_eq!(buffer[(x, y)].bg, surface, "section cell ({x}, {y})");
+                assert_eq!(buffer[(x, y)].bg, blue, "section cell ({x}, {y})");
             }
             assert_eq!(buffer[(0, y)].bg, Color::Reset, "border stays clear");
         }
@@ -613,8 +613,8 @@ pub(crate) mod layout_tests {
         add_task_session(&mut app, 1, "tb");
         app.cursor = Cursor::Session(1, 0);
         let neutral = theme::sidebar_section_bg(None, 2.0);
-        // The selected session's group lifts its section's tint.
-        let lifted = theme::focus_tint(Some(neutral));
+        // The selected session's group keeps its section's tint.
+        let lifted = neutral;
         let buffer = sidebar_buffer(&mut app, 5);
         assert!(app.sidebar_list_state.offset() > 0, "section heading scrolled away");
         assert_eq!(buffer[(38, 3)].bg, lifted, "selected inherited session keeps tint");

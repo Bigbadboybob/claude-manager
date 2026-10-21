@@ -699,16 +699,13 @@ impl App {
                 let tid = task_id.clone();
                 if wi > max {
                     self.cursor = Cursor::Workspace(max);
-                } else if !self
-                    .tasks
-                    .iter()
-                    .any(|t| t.task_id.as_deref() == Some(tid.as_str()))
-                    || !self.task_tree_unfolded().items.iter().any(|vi| {
-                        matches!(vi, VisualItem::TaskHeader { ws_idx, task_id } if *ws_idx == wi && *task_id == tid)
-                    })
-                {
-                    // Task disappeared, or its header no longer draws (its
-                    // last session left) — fall back to workspace.
+                } else if !self.task_tree_unfolded().items.iter().any(|vi| {
+                    matches!(vi, VisualItem::TaskHeader { ws_idx, task_id } if *ws_idx == wi && *task_id == tid)
+                }) {
+                    // Its header no longer draws (its last session left) —
+                    // fall back to workspace. A header for a task known only
+                    // from its sessions (not yet in the task feed) draws too,
+                    // so the cursor may rest on it.
                     self.cursor = Cursor::Workspace(wi);
                 }
             }

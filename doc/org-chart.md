@@ -16,9 +16,16 @@ F6, Esc or `q` closes it.
   `parent_task_id` at any depth. If a task in the chain has no session of its
   own, it still gets a box so the chain stays connected. A subtask of a
   continuous worker nests under that worker.
-- A task box lists the task's sessions. The lead session comes first and is
-  marked ★; it is chosen by the shared lead rule (`task_leads`). The other
-  sessions follow in spawn order.
+- A task box lists the task's sessions. The lead session comes first; it is
+  chosen by the shared lead rule (`task_leads`). The other sessions follow in
+  spawn order.
+- **Leader marks.** Only the lead of a box with reports carries a mark, and
+  the mark gives its level below Owner: ★ for a root task (level 1), ☆ for
+  its subtask (level 2), ✦ for level 3, and ✧ for level 4 and deeper. A
+  task's level counts its `parent_task_id` chain; a continuous worker without
+  its own task counts the boxes above it. Leads with no reports carry no
+  mark. ◆ stays reserved for divisions. The Sessions sidebar uses the same
+  marks from the same function, `tree::leader_glyph`.
 - Each session line shows the sidebar's state glyph (spinner, afterglow,
   settled or stale ●, ◐, ?, ✗, alert, owner-blocked, ⟳; × when exited), then
   the label, the engine, and a host marker: ⌂ for local, otherwise the first
@@ -72,6 +79,7 @@ number of reports and how many sessions are under it.
 
 `tui/src/app/orgchart.rs` contains the model (`org_model`), the layout
 (`layout`), the keys, drawing and the board poll. The chart reuses
-`task_leads` and `planning.task_division` (`app/tree.rs`), the palette jump,
+`task_leads`, `task_level`, `leader_glyph` and `planning.task_division`
+(`app/tree.rs`), the palette jump,
 `task_parent_map` and the continuous column's `continuous_rows_unfiltered`
 (`app/nav.rs`).

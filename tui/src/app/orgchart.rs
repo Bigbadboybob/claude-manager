@@ -123,6 +123,10 @@ pub(super) struct ChartNode {
     /// Sort rank among siblings (coordinator tasks first, then tasks, then
     /// loose workspaces); ties sort by title.
     rank: u8,
+    /// The leader mark its lead session carries: its level's glyph
+    /// ([`super::tree::leader_glyph`], shared with the sidebar) when the
+    /// box has reports, else none.
+    pub mark: Option<&'static str>,
 }
 
 /// The org as a tree; `nodes[0]` is Owner.
@@ -134,7 +138,7 @@ pub(super) struct ChartModel {
 impl ChartModel {
     fn push(&mut self, parent: Option<usize>, key: String, kind: NodeKind, title: String, task_id: Option<String>, rank: u8) -> usize {
         let i = self.nodes.len();
-        self.nodes.push(ChartNode { key, kind, title, task_id, sessions: Vec::new(), children: Vec::new(), parent, rank });
+        self.nodes.push(ChartNode { key, kind, title, task_id, sessions: Vec::new(), children: Vec::new(), parent, rank, mark: None });
         if let Some(p) = parent {
             self.nodes[p].children.push(i);
         }
@@ -653,6 +657,19 @@ impl App {
         }
         let mut m = m.prune();
         m.sort_children();
+        // Leader marks: only a box with reports, by its level below Owner
+        // (a task's along `parent_task_id`, as the sidebar counts it; a
+        // taskless worker's from the boxes above it).
+        for i in 0..m.nodes.len() {
+            if !matches!(m.nodes[i].kind, NodeKind::Task | NodeKind::Orchestrator | NodeKind::Worker) || m.nodes[i].children.is_empty() {
+                continue;
+            }
+            let level = match &m.nodes[i].task_id {
+                Some(t) => self.task_level(t),
+                None => 1 + m.ancestors(i).iter().filter(|&&a| !matches!(m.nodes[a].kind, NodeKind::Owner | NodeKind::Org)).count(),
+            };
+            m.nodes[i].mark = Some(super::tree::leader_glyph(level));
+        }
         m
     }
 
@@ -1213,6 +1230,7 @@ impl App {
                 }
                 Zoom::Compact => {
                     let lead = node.sessions.first().is_some_and(|s| s.lead);
+                    let mark = node.mark.filter(|_| lead).unwrap_or(" ");
                     let extra = node.sessions.len().saturating_sub(1) + hidden;
                     let tail = match (folded, extra) {
                         (true, _) => format!(" \u{25b8}{extra}"),
@@ -1223,7 +1241,7 @@ impl App {
                     let name = crate::planning::truncate_with_ellipsis(&node.title, room);
                     let text_style = if header { Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::TEXT) };
                     put(buf, p.x, p.y, &" ".repeat(p.w as usize), focus_bg(Style::default()));
-                    put(buf, p.x, p.y, if lead { "\u{2605}" } else { " " }, focus_bg(Style::default().fg(theme::ATTN)));
+                    put(buf, p.x, p.y, mark, focus_bg(Style::default().fg(theme::ATTN)));
                     put(buf, p.x + 1, p.y, head_glyph.0, focus_bg(head_glyph.1));
                     put(buf, p.x + 3, p.y, &name, focus_bg(text_style));
                     put(buf, p.x + p.w - tail.chars().count() as i32, p.y, &tail, focus_bg(Style::default().fg(theme::MUTED)));
@@ -1281,7 +1299,7 @@ impl App {
                         let label = crate::planning::truncate_with_ellipsis(&ts.label, label_room);
                         let label_style = if ts.session.exited { Style::default().fg(theme::DIM) } else { Style::default().fg(theme::TEXT) };
                         put(buf, p.x + 1, y, &" ".repeat(w - 2), bg(Style::default()));
-                        put(buf, p.x + 1, y, if s.lead { "\u{2605}" } else { " " }, bg(Style::default().fg(theme::ATTN)));
+                        put(buf, p.x + 1, y, node.mark.filter(|_| s.lead).unwrap_or(" "), bg(Style::default().fg(theme::ATTN)));
                         put(buf, p.x + 2, y, g, bg(gs));
                         put(buf, p.x + 4, y, &label, bg(label_style));
                         put(buf, p.x + p.w as i32 - 3 - engine.len() as i32, y, engine, bg(Style::default().fg(theme::MUTED)));
@@ -1342,7 +1360,9 @@ impl App {
         let (g, gs) = self.chart_glyph(ts, now);
         let mut head = vec![Span::styled(format!("{g} "), gs), Span::styled(ts.label.clone(), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD))];
         if s.lead {
-            head.push(Span::styled("  \u{2605} lead", Style::default().fg(theme::ATTN)));
+            // The leader mark only where the box has reports.
+            let lead = node.mark.map_or_else(|| "  lead".to_string(), |g| format!("  {g} lead"));
+            head.push(Span::styled(lead, Style::default().fg(theme::ATTN)));
         }
         lines.push(Line::from(head));
         let (word, since) = self.chart_status(ts);
@@ -1989,7 +2009,8 @@ mod tests {
         let m = app.org_model(false);
         let text: Vec<String> = app.orgchart_info_lines(&m, app.orgchart_focus(&m), 60).iter().map(|l| l.to_string()).collect();
         let joined = text.join("\n");
-        assert!(joined.contains("mid-1") && joined.contains("\u{2605} lead"), "{joined}");
+        // mid-1 leads Middle (level 2, with reports): ☆, the sidebar's mark.
+        assert!(joined.contains("mid-1") && joined.contains("\u{2606} lead"), "{joined}");
         assert!(joined.contains("engine   codex"), "{joined}");
         assert!(joined.contains("since spawn"), "{joined}");
         assert!(joined.contains("task     Middle"), "{joined}");

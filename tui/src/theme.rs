@@ -67,11 +67,9 @@ pub(crate) const CONFLICT_BG: Color = Color::Rgb(80, 0, 0);
 /// Bright closing rule for a task-sidebar section, drawn with a heavy glyph.
 pub(crate) const SECTION_BOUNDARY: Color = Color::Rgb(215, 220, 230);
 
-/// Work tree (Task sub-view): nesting guides, the focused chain's gutter
-/// bar, the focused group's tint and the lead session's mark.
-pub(crate) const TREE_GUIDE: Color = Color::Rgb(62, 70, 86);
+/// Work tree (Task sub-view): the focused group's left-edge strip and the
+/// leader marks.
 pub(crate) const TREE_FOCUS: Color = Color::Rgb(92, 210, 232);
-pub(crate) const FOCUS_TINT: Color = Color::Rgb(30, 38, 52);
 pub(crate) const LEAD: Color = Color::Rgb(255, 205, 90);
 
 /// Messages: navy surfaces, slate chrome, and a cyan focus outline.
@@ -212,15 +210,6 @@ pub(crate) fn faded(color: Color) -> Color {
 /// Task-sidebar section surfaces, with optional user-color accents.
 /// Keep a neutral base so missing colors are visible rather than near black.
 /// Terminal opacity is applied by the terminal emulator; ANSI colors have no alpha.
-/// The focused group's tint: a lift of the row's own surface (a section's
-/// tint), or a subtle surface of its own on an untinted row.
-pub(crate) fn focus_tint(surface: Option<Color>) -> Color {
-    match surface {
-        Some(Color::Rgb(r, g, b)) => Color::Rgb(r.saturating_add(16), g.saturating_add(16), b.saturating_add(20)),
-        _ => FOCUS_TINT,
-    }
-}
-
 pub(crate) fn sidebar_section_bg(color: Option<&str>, strength: f64) -> Color {
     if strength <= 0.0 { return Color::Reset; }
     let (r, g, b) = match color.and_then(user_color) {

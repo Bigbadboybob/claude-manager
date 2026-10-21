@@ -2601,7 +2601,7 @@ impl App {
     /// ephemeral GCP worker VMs, never hold a local session, and are
     /// therefore modelled as sidebar `backtest_rows` (one collapsible
     /// group) instead of workspaces — see `app/backtests.rs`.
-    fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
+    pub(super) fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
         // The work list below intentionally omits Done tasks. Keep their
         // ancestry separately: a retained session must not fall out of its
         // continuous tree merely because its planning task completed.
@@ -2638,6 +2638,12 @@ impl App {
                 .get(*wi)
                 .and_then(|w| w.sessions.get(*si))
                 .map(|s| s.uid.clone()),
+            _ => None,
+        };
+        // A task header keeps its task too: pre-fix every task-feed refresh
+        // dropped the cursor from a task header to its workspace's header.
+        let saved_task_id = match &self.cursor {
+            Cursor::Task { task_id, .. } => Some(task_id.clone()),
             _ => None,
         };
 
@@ -2967,6 +2973,8 @@ impl App {
                     } else {
                         self.cursor = Cursor::Workspace(wi);
                     }
+                } else if let Some(task_id) = saved_task_id {
+                    self.cursor = Cursor::Task { ws_idx: wi, task_id };
                 } else {
                     self.cursor = Cursor::Workspace(wi);
                 }

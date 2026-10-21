@@ -1929,48 +1929,24 @@ impl App {
         let indent = |wi: usize| -> &'static str {
             if in_section.contains(&wi) { " " } else { "" }
         };
-        // The focused row's chain (it and its ancestors) and group.
+        // The focused row's group: its node and everything under it.
         let focus = tree.as_ref().zip(self.cursor_node());
-        let chain: Vec<super::tree::Node> = focus.as_ref().map(|(t, n)| t.chain(n)).unwrap_or_default();
         let in_group = |vi: &VisualItem| -> bool {
             let Some((t, f)) = &focus else { return false };
             t.rows.get(vi).and_then(|r| r.node.as_ref()).is_some_and(|n| t.within(n, f))
         };
-        // Tree rows start with a one-cell gutter (the focused chain's bar)
-        // and one guide cell per enclosing block, then the local indent.
+        // Tree rows start with the sidebar's left-edge cell: a narrow strip
+        // there marks the focused group, clear of the row text (Owner,
+        // 2026-10-21: it replaces the group tint and the ancestor bar). No
+        // indent by depth: every block draws at the top-level indent, and
+        // the strip and the level marks carry the hierarchy.
         let tree_prefix = |vi: &VisualItem, wi: usize| -> Vec<Span<'static>> {
-            let section = Span::raw(indent(wi));
-            let Some(row) = tree.as_ref().and_then(|t| t.rows.get(vi)) else {
-                return vec![Span::raw(" "), section];
+            let edge = if in_group(vi) {
+                Span::styled("\u{258f}", Style::default().fg(theme::TREE_FOCUS))
+            } else {
+                Span::raw(" ")
             };
-            // The bar marks the focused group and the headers of its
-            // ancestors (not the ancestors' own sessions).
-            let header = matches!(
-                vi,
-                VisualItem::WorkspaceHeader(_) | VisualItem::TaskHeader { .. } | VisualItem::DivisionHeader(_)
-            );
-            let on_chain = (header && row.node.as_ref().is_some_and(|n| chain.contains(n))) || in_group(vi);
-            let mut spans = vec![
-                if on_chain {
-                    Span::styled("\u{258e}", Style::default().fg(theme::TREE_FOCUS))
-                } else {
-                    Span::raw(" ")
-                },
-                section,
-            ];
-            // Three cells per level: the guide sits under the parent task
-            // header's fold glyph.
-            for cell in &row.cells {
-                spans.push(if chain.contains(cell) {
-                    Span::styled(" \u{2503} ", Style::default().fg(theme::TREE_FOCUS))
-                } else {
-                    Span::styled(" \u{2502} ", Style::default().fg(theme::TREE_GUIDE))
-                });
-            }
-            if row.local > 0 {
-                spans.push(Span::raw("  ".repeat(row.local as usize)));
-            }
-            spans
+            vec![edge, Span::raw(indent(wi))]
         };
         let fold_tail = |node: &super::tree::Node| -> String {
             let Some((n, running, idle, alerting)) = tree.as_ref().and_then(|t| t.folded.get(node)) else {
@@ -1988,7 +1964,8 @@ impl App {
             }
             t
         };
-        let leads = if tree.is_some() { self.task_leads() } else { HashMap::new() };
+        // Leader marks: the lead of each task with subtasks, by level.
+        let marks = tree.as_ref().map_or_else(HashMap::new, |t| self.leader_marks(&t.reports));
 
         let section_backgrounds = self.sidebar_section_backgrounds(&visual, &block_root);
         for (vi, background) in visual.iter().zip(section_backgrounds) {
@@ -2194,11 +2171,11 @@ impl App {
                             Span::styled(format!(" {} ", indicator), indicator_style),
                         ]
                     };
-                    // The task's lead session (app/tree.rs) carries a star
-                    // in front of its label.
-                    let is_lead = ts.task_id.as_ref().is_some_and(|t| leads.get(t) == Some(&ts.uid));
-                    let (display, lead_mark) = match (is_lead, display.find(|c: char| c != ' ')) {
-                        (true, Some(at)) => (display[at..].to_string(), Some(display[..at].to_string())),
+                    // The lead of a task with subtasks carries its level's
+                    // leader mark in front of its label (app/tree.rs).
+                    let mark = marks.get(&ts.uid).copied();
+                    let (display, lead_mark) = match (mark, display.find(|c: char| c != ' ')) {
+                        (Some(g), Some(at)) => (display[at..].to_string(), Some((display[..at].to_string(), g))),
                         _ => (display, None),
                     };
                     // Vertical line prefix for sessions inside a workflow group
@@ -2212,9 +2189,9 @@ impl App {
                     if let Some((badge, style)) = wf_badge {
                         spans.push(Span::styled(badge, style));
                     }
-                    if let Some(pad) = lead_mark {
+                    if let Some((pad, glyph)) = lead_mark {
                         spans.push(Span::raw(pad));
-                        spans.push(Span::styled("\u{2605} ", Style::default().fg(theme::LEAD)));
+                        spans.push(Span::styled(format!("{glyph} "), Style::default().fg(theme::LEAD)));
                     }
                     spans.push(Span::raw(display));
                     if owner_blocked {
@@ -2343,6 +2320,7 @@ impl App {
                     let initiative_marker = self.planning.task_initiative_marker(task_id);
                     let node = super::tree::Node::Task(task_id.clone());
                     let folded = self.tree_folded(&node);
+                    let has_reports = tree.as_ref().is_some_and(|t| t.reports.contains(task_id));
                     let tail = fold_tail(&node);
                     let prefix = tree_prefix(vi, *ws_idx);
                     let prefix_width: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
@@ -2368,7 +2346,12 @@ impl App {
                         Style::default().fg(theme::HEADER)
                     };
                     let mut spans = prefix;
-                    spans.push(Span::raw(if folded { " \u{25b8} " } else { " \u{25be} " }));
+                    // Only a task with subtasks folds, so only it has a glyph.
+                    spans.push(Span::raw(match (has_reports, folded) {
+                        (false, _) => "   ",
+                        (true, true) => " \u{25b8} ",
+                        (true, false) => " \u{25be} ",
+                    }));
                     spans.push(Span::raw(initiative_marker));
                     spans.push(Span::raw(name));
                     spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
@@ -2467,8 +2450,6 @@ impl App {
             }
             // Apply the surface to the whole row, including trailing cells,
             // while retaining foreground/status colors and selection emphasis.
-            // The focused group's tint takes the place of a section's.
-            let background = if in_group(vi) { Some(theme::focus_tint(background)) } else { background };
             if let Some(bg) = background {
                 use ratatui::style::Stylize;
                 for item in &mut items[first_item..] {
