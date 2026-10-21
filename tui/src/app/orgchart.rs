@@ -2,17 +2,19 @@
 //! org-design PLAN.md, "orgchart").
 //!
 //! Every session on every host, laid out as an org chart. Owner sits at the
-//! top; under it come each division, a Standalone org and a Continuous org;
-//! under those, root tasks and their subtasks along `parent_task_id`. A task
+//! top; under it each project (then Other), split into Teams (its divisions,
+//! then its other root tasks) and Continuous; under those, root tasks and
+//! their subtasks along `parent_task_id`. A task
 //! box holds that task's sessions with its lead (the shared lead rule) on
 //! top. The Continuous org reuses the continuous column's grouping
 //! (`continuous_rows_unfiltered`). Reporting lines only: nothing here
 //! implies approval rights.
 //!
-//! The overlay takes every key while open: h/l siblings, j first child,
-//! k parent, gg/G, Tab/S-Tab a session within the box, / n N search,
+//! The overlay takes every key while open: h/l siblings, j back to the
+//! last-focused child (else the first), k parent, gg/G, Tab/S-Tab a session within the box, / n N search,
 //! Space/zc/zo/za fold, zM/zR fold/unfold the orgs, +/- zoom (ten levels),
-//! H/J/K/L or arrows pan, c centre, b bash, i info pane. Enter (or A-t) and
+//! H/J/K/L or arrows pan, c centre, b bash, i info pane, ? symbol legend
+//! (app/symbols.rs). Enter (or A-t) and
 //! every exit (F6/Esc/q) return to the Sessions view focused on the chart's
 //! session. Every level is one row; the viewport follows the focus.
 //! The info pane's board items come from `board.read`, polled only while the
@@ -32,6 +34,12 @@ const BOARD_RETRY: Duration = Duration::from_secs(15);
 /// Repaint cadence while open, so spinners and ages move.
 const REPAINT: Duration = Duration::from_millis(250);
 const INFO_WIDTH: u16 = 46;
+/// A project's normal work: its divisions, then its other root tasks.
+const TEAMS_LABEL: &str = "Teams";
+/// A project's continuous orchestrators and their workers.
+const CONTINUOUS_LABEL: &str = "Continuous";
+/// The project node for tasks and workspaces with no project.
+const OTHER_PROJECT_LABEL: &str = "Other";
 
 /// How much a box shows at a zoom level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,10 +119,18 @@ impl Zoom {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Split {
+    Teams,
+    Continuous,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NodeKind {
     Owner,
-    /// A top-level org: a division, Standalone, or Continuous.
+    /// A planning project (the task rows' `project`), or Other.
+    Project,
+    /// A project's split (Teams or Continuous), or a division under Teams.
     Org,
     Task,
     /// Sessions bound to no task, grouped by workspace (Standalone).
@@ -456,6 +472,11 @@ pub(super) struct OrgChart {
     pub(super) focus: Option<String>,
     pub(super) session: usize,
     pub(super) folds: HashSet<String>,
+    /// Each node's last-focused report (node key → child key), so `j`
+    /// goes back down the way `k` came up.
+    pub(super) last_child: HashMap<String, String>,
+    /// The session last focused in each box (node key → uid).
+    pub(super) last_session: HashMap<String, String>,
     pub(super) show_bash: bool,
     /// The bash session the chart was opened on: shown while bash is
     /// hidden, until the chart closes or `b` is pressed.
@@ -500,9 +521,34 @@ impl App {
         let keep = |ts: &TerminalSession| show_bash || ts.session_type != "bash" || opened_on == Some(ts.uid.as_str());
         let leads = self.task_leads();
         let parents = self.task_parent_map();
+        // Owner → project → its split (Teams or Continuous) → divisions.
+        // Each is made on first use, so empty ones never appear.
         let mut orgs: HashMap<String, usize> = HashMap::new();
-        let mut org = |m: &mut ChartModel, key: &str, title: &str, rank: u8| -> usize {
-            *orgs.entry(key.to_owned()).or_insert_with(|| m.push(Some(owner), key.to_owned(), NodeKind::Org, title.to_owned(), None, rank))
+        let mut org = |m: &mut ChartModel, project: Option<&str>, split: Split, division: Option<(&str, &str)>| -> usize {
+            let pkey = format!("proj:{}", project.unwrap_or(""));
+            let proj = *orgs.entry(pkey.clone()).or_insert_with(|| {
+                let (title, rank) = match project {
+                    Some(p) => (p.to_owned(), 0),
+                    None => (OTHER_PROJECT_LABEL.to_owned(), 1),
+                };
+                m.push(Some(owner), pkey.clone(), NodeKind::Project, title, None, rank)
+            });
+            let (skey, stitle, srank) = match split {
+                Split::Teams => (format!("teams:{pkey}"), TEAMS_LABEL, 0),
+                Split::Continuous => (format!("continuous:{pkey}"), CONTINUOUS_LABEL, 1),
+            };
+            let split_node = *orgs.entry(skey.clone()).or_insert_with(|| m.push(Some(proj), skey.clone(), NodeKind::Org, stitle.to_owned(), None, srank));
+            let Some((id, name)) = division else { return split_node };
+            let dkey = format!("div:{}:{id}", project.unwrap_or(""));
+            *orgs.entry(dkey.clone()).or_insert_with(|| m.push(Some(split_node), dkey, NodeKind::Org, name.to_owned(), None, 0))
+        };
+        let known_projects: HashSet<&str> = self.tasks.iter().filter_map(|t| t.project.as_deref()).collect();
+        // A workspace with no task row to ask: its repository's name, when
+        // that names a known project.
+        let ws_project = |ws: &Workspace| -> Option<String> {
+            let path = ws.main_repo_path.as_ref().or(ws.worktree_path.as_ref())?;
+            let name = path.file_name()?.to_str()?;
+            known_projects.contains(name).then(|| name.to_owned())
         };
 
         // Continuous org: the continuous column's grouping, verbatim. Tasks
@@ -517,8 +563,9 @@ impl App {
             let cs = ChartSession { uid: ts.uid.clone(), wi: r.ws_idx, si, lead: false, mark: None };
             let target = match (r.depth, orch) {
                 (0, _) | (_, None) => {
-                    let cont = org(&mut m, "continuous", "Continuous", 2);
                     let task = self.continuous_planning_task(ws, ts).map(str::to_owned);
+                    let project = task.as_deref().and_then(|t| self.chart_task_project(t, &parents)).or_else(|| ws_project(ws));
+                    let cont = org(&mut m, project.as_deref(), Split::Continuous, None);
                     let key = format!("orch:{}:{}", ws.host_id, ts.continuous_task_id.as_deref().unwrap_or(&ts.uid));
                     let title = task.as_deref().map_or_else(|| ts.label.clone(), |t| self.chart_task_title(t));
                     let i = m.push(Some(cont), key, NodeKind::Orchestrator, title, task.clone(), 0);
@@ -595,10 +642,9 @@ impl App {
                 Some(i) => i,
                 None => {
                     let root = chain.last().cloned().unwrap_or_default();
-                    match self.planning.task_division(&root) {
-                        Some(d) => org(&mut m, &format!("div:{}", d.id), &d.name, 0),
-                        None => org(&mut m, "standalone", "Standalone", 1),
-                    }
+                    let project = self.chart_task_project(&task, &parents);
+                    let division = self.planning.task_division(&root);
+                    org(&mut m, project.as_deref(), Split::Teams, division.as_ref().map(|d| (d.id.as_str(), d.name.as_str())))
                 }
             };
             for t in chain.iter().rev() {
@@ -610,8 +656,8 @@ impl App {
             m.nodes[i].sessions.extend(sessions);
         }
         for (wi, sessions) in loose {
-            let s = org(&mut m, "standalone", "Standalone", 1);
             let ws = &self.workspaces[wi];
+            let s = org(&mut m, ws_project(ws).as_deref(), Split::Teams, None);
             let i = m.push(Some(s), format!("ws:{}", ws.id), NodeKind::Workspace, ws.name.clone(), None, 2);
             m.nodes[i].sessions = sessions;
         }
@@ -639,6 +685,19 @@ impl App {
         let mut m = m.prune();
         m.sort_children();
         m
+    }
+
+    /// A task's project: the nearest one set on it or an ancestor.
+    fn chart_task_project(&self, task: &str, parents: &HashMap<&str, &str>) -> Option<String> {
+        let mut cur = task.to_owned();
+        let mut seen = HashSet::new();
+        while seen.insert(cur.clone()) {
+            if let Some(p) = self.tasks.iter().find(|t| t.task_id.as_deref() == Some(cur.as_str())).and_then(|t| t.project.clone()) {
+                return Some(p);
+            }
+            cur = parents.get(cur.as_str())?.to_string();
+        }
+        None
     }
 
     fn chart_ts(&self, s: &ChartSession) -> Option<&TerminalSession> {
@@ -726,6 +785,7 @@ impl App {
                 self.orgchart_reveal(&model, i);
                 self.orgchart.focus = Some(model.nodes[i].key.clone());
                 self.orgchart.session = s;
+                self.orgchart_remember_path(&model, i);
             }
         }
         self.orgchart_tick();
@@ -756,9 +816,25 @@ impl App {
     }
 
     fn orgchart_set_focus(&mut self, model: &ChartModel, i: usize) {
-        self.orgchart.focus = Some(model.nodes[i].key.clone());
-        self.orgchart.session = 0;
+        let here = self.orgchart_focus(model);
+        if let Some(s) = self.orgchart_focused_session(model) {
+            self.orgchart.last_session.insert(model.nodes[here].key.clone(), s.uid);
+        }
+        self.orgchart_remember_path(model, i);
+        let node = &model.nodes[i];
+        self.orgchart.focus = Some(node.key.clone());
+        let back = self.orgchart.last_session.get(&node.key);
+        self.orgchart.session = back.and_then(|uid| node.sessions.iter().position(|s| &s.uid == uid)).unwrap_or(0);
         self.orgchart.follow.set(true);
+    }
+
+    /// Record the way down from Owner to `i` for `j`.
+    fn orgchart_remember_path(&mut self, model: &ChartModel, i: usize) {
+        let mut c = i;
+        while let Some(p) = model.nodes[c].parent {
+            self.orgchart.last_child.insert(model.nodes[p].key.clone(), model.nodes[c].key.clone());
+            c = p;
+        }
     }
 
     /// The focused session, if the focused box has any.
@@ -899,16 +975,15 @@ impl App {
         };
         match (pending, key.code) {
             (Some('g'), KeyCode::Char('g')) => self.orgchart_set_focus(&model, 0),
-            (Some('z'), KeyCode::Char(c @ ('M' | 'R'))) => {
-                // Fold (M) or unfold (R) every top-level org.
-                for &org in &model.nodes[0].children {
-                    let k = model.nodes[org].key.clone();
-                    if c == 'R' {
-                        self.orgchart.folds.remove(&k);
-                    } else if !model.nodes[org].children.is_empty() {
-                        self.orgchart.folds.insert(k);
-                    }
+            (Some('z'), KeyCode::Char('M')) => {
+                // Fold every project, split and division (zo then opens one level).
+                for n in model.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Project | NodeKind::Org) && !n.children.is_empty()) {
+                    self.orgchart.folds.insert(n.key.clone());
                 }
+                self.orgchart.follow.set(true);
+            }
+            (Some('z'), KeyCode::Char('R')) => {
+                self.orgchart.folds.clear();
                 self.orgchart.follow.set(true);
             }
             (Some('z'), KeyCode::Char(c @ ('c' | 'o' | 'a'))) | (_, KeyCode::Char(c @ ' ')) => {
@@ -945,7 +1020,10 @@ impl App {
                 }
             }
             (_, KeyCode::Char('j')) => {
-                if let Some(&c) = model.visual_children(focus, &self.orgchart.folds).first() {
+                // Back to the report last focused here, else the first.
+                let kids = model.visual_children(focus, &self.orgchart.folds);
+                let back = self.orgchart.last_child.get(&model.nodes[focus].key).and_then(|k| kids.iter().copied().find(|&c| &model.nodes[c].key == k));
+                if let Some(c) = back.or(kids.first().copied()) {
                     self.orgchart_set_focus(&model, c);
                 }
             }
@@ -1205,7 +1283,7 @@ impl App {
             let selected = focused.then(|| self.orgchart.session.min(node.sessions.len().saturating_sub(1)));
             let folded = self.orgchart.folds.contains(&node.key) && !node.children.is_empty();
             let hidden = if folded { model.subtree_sessions(i) - node.sessions.len() } else { 0 };
-            let header = matches!(node.kind, NodeKind::Owner | NodeKind::Org);
+            let header = matches!(node.kind, NodeKind::Owner | NodeKind::Project | NodeKind::Org);
             let head_glyph = match node.sessions.first().and_then(|s| self.chart_ts(s)) {
                 Some(ts) => self.chart_glyph(ts, now),
                 None if header => ("\u{25c6}", Style::default().fg(theme::HEADER)),
@@ -1261,7 +1339,8 @@ impl App {
                     put(buf, p.x, p.y + p.h - 1, &format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(w - 2)), border);
                     if node.sessions.is_empty() {
                         let text = match node.kind {
-                            NodeKind::Owner => format!("{} \u{00b7} {}", plural(node.children.len(), "org"), plural(model.subtree_sessions(i), "session")),
+                            NodeKind::Owner => format!("{} \u{00b7} {}", plural(node.children.len(), "project"), plural(model.subtree_sessions(i), "session")),
+                            NodeKind::Project => format!("{} \u{00b7} {}", plural(model.subtree_sessions(i), "session"), node.children.iter().map(|&c| model.nodes[c].title.as_str()).collect::<Vec<_>>().join(" + ")),
                             NodeKind::Org => format!("{} \u{00b7} {}", plural(node.children.len(), "report"), plural(model.subtree_sessions(i), "session")),
                             _ => "no session here".into(),
                         };
@@ -1341,8 +1420,10 @@ impl App {
             lines.push(Line::styled(node.title.clone(), Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)));
             let kind = match node.kind {
                 NodeKind::Owner => "owner",
+                NodeKind::Project => "project",
                 NodeKind::Org if node.key.starts_with("div:") => "division",
-                NodeKind::Org => "org",
+                NodeKind::Org if node.key.starts_with("continuous:") => "continuous work",
+                NodeKind::Org => "teams (normal work)",
                 _ => "task (no session)",
             };
             lines.push(Line::from(vec![label("kind"), text(kind.into())]));
@@ -1576,7 +1657,8 @@ mod tests {
         let app = org_app();
         let m = app.org_model(false);
         let titles: Vec<&str> = m.preorder(&HashSet::new()).into_iter().map(|i| m.nodes[i].title.as_str()).collect();
-        assert_eq!(titles, ["Owner", "Standalone", "Root lead", "Middle", "Leaf work", "w-loose"]);
+        // No task has a project, so everything sits under Other → Teams.
+        assert_eq!(titles, ["Owner", "Other", "Teams", "Root lead", "Middle", "Leaf work", "w-loose"]);
         let root = &m.nodes[m.find("task:root").unwrap()];
         let uids: Vec<&str> = root.sessions.iter().map(|s| s.uid.as_str()).collect();
         // The earliest-spawned agent leads and sits on top; bash is hidden.
@@ -1625,18 +1707,97 @@ mod tests {
             division_task("side", None, false),
         ]);
         let m = app.org_model(false);
-        let div = m.find("div:div-1").expect("division org");
+        let div = m.find("div::div-1").expect("division org");
         assert_eq!(m.nodes[div].title, "Trader");
-        let orgs: Vec<&str> = m.nodes[0].children.iter().map(|&c| m.nodes[c].key.as_str()).collect();
-        assert_eq!(orgs, ["div:div-1", "standalone"], "divisions come first");
+        let teams = m.find("teams:proj:").unwrap();
+        assert_eq!(m.nodes[div].parent, Some(teams), "a division sits under its project's Teams");
+        let kids: Vec<&str> = m.nodes[teams].children.iter().map(|&c| m.nodes[c].key.as_str()).collect();
+        assert_eq!(kids, ["div::div-1", "ws:w-loose"], "divisions come first, then the other work");
         let roots: Vec<&str> = m.nodes[div].children.iter().map(|&c| m.nodes[c].title.as_str()).collect();
         assert_eq!(roots, ["Root lead", "Another root"], "the coordinator's tree leads the division");
-        let standalone = m.find("standalone").unwrap();
-        let loose: Vec<&str> = m.nodes[standalone].children.iter().map(|&c| m.nodes[c].title.as_str()).collect();
-        assert_eq!(loose, ["w-loose"]);
         // The info pane names the division.
         let lines: Vec<String> = app.orgchart_info_lines(&m, div, 50).iter().map(|l| l.to_string()).collect();
         assert!(lines.iter().any(|l| l.contains("division")), "{lines:?}");
+    }
+
+    #[test]
+    fn projects_are_the_top_level_and_split_into_teams_and_continuous() {
+        let mut app = test_app();
+        let in_project = |id: &str, name: &str, parent: Option<&str>, project: &str| TaskEntry { project: Some(project.into()), ..task(id, name, parent) };
+        app.tasks = vec![
+            in_project("cm-root", "CM work", None, "claude-manager"),
+            // A subtask without its own project takes its parent's.
+            task("cm-sub", "CM subtask", Some("cm-root")),
+            in_project("pt-root", "Trader work", None, "predictionTrading"),
+            in_project("pt-orch", "Bug triage", None, "predictionTrading"),
+            task("nowhere", "No project", None),
+        ];
+        app.workspaces = vec![ws("w-cm", HostId::local()), ws("w-pt", HostId::local()), ws("w-orch", HostId::new("manager")), ws("w-x", HostId::local()), ws("w-loose", HostId::local())];
+        app.workspaces[4].main_repo_path = Some("/home/u/code/claude-manager".into());
+        session(&mut app, 0, 0x10, "cm-1", "claude", Some("cm-root"));
+        session(&mut app, 0, 0x11, "cm-2", "codex", Some("cm-sub"));
+        session(&mut app, 1, 0x20, "pt-1", "codex", Some("pt-root"));
+        session(&mut app, 2, 0x30, "triage-orchestrator", "codex", Some("pt-orch"));
+        app.workspaces[2].sessions[0].continuous_task_id = Some("bug-triage".into());
+        session(&mut app, 3, 0x40, "x-1", "codex", Some("nowhere"));
+        session(&mut app, 4, 0x50, "scratch", "claude", None);
+        let m = app.org_model(false);
+        let title = |i: usize| m.nodes[i].title.as_str();
+        let kids = |key: &str| -> Vec<&str> { m.nodes[m.find(key).unwrap()].children.iter().map(|&c| title(c)).collect() };
+        assert_eq!(kids("owner"), ["claude-manager", "predictionTrading", "Other"], "projects by name, Other last");
+        assert_eq!(kids("proj:claude-manager"), ["Teams"], "no Continuous without continuous work");
+        assert_eq!(kids("proj:predictionTrading"), ["Teams", "Continuous"]);
+        assert_eq!(kids("teams:proj:claude-manager"), ["CM work", "w-loose"], "a loose workspace joins its repo's project");
+        assert_eq!(kids("task:cm-root"), ["CM subtask"]);
+        assert_eq!(kids("continuous:proj:predictionTrading"), ["Bug triage"]);
+        assert_eq!(kids("teams:proj:"), ["No project"]);
+        assert!(m.nodes.iter().all(|n| n.key != "continuous:proj:" && n.key != "standalone"), "no global Continuous or Standalone");
+        // Other only appears when something has no project.
+        app.tasks.retain(|t| t.task_id.as_deref() != Some("nowhere"));
+        app.workspaces[3].sessions.clear();
+        assert!(app.org_model(false).find("proj:").is_none());
+        // Project and split boxes fold like any other.
+        app.handle_event(&key(KeyCode::F(6)));
+        app.orgchart.focus = Some("proj:predictionTrading".into());
+        press(&mut app, " ");
+        let m = app.org_model(false);
+        assert!(layout(&m, app.orgchart.zoom, &app.orgchart.folds).boxes.keys().all(|&i| !m.nodes[i].key.starts_with("continuous:")));
+    }
+
+    #[test]
+    fn j_goes_back_down_to_the_box_and_session_k_came_up_from() {
+        let mut app = wide_app(3);
+        app.cursor = Cursor::Session(0, 1); // rep-00
+        app.handle_event(&key(KeyCode::F(6)));
+        press(&mut app, "ll");
+        assert_eq!(focused_title(&app), "report 02");
+        press(&mut app, "kj");
+        assert_eq!(focused_title(&app), "report 02", "j returns to the last-focused report");
+        // Up two levels and back down two.
+        press(&mut app, "hkkjj");
+        assert_eq!(focused_title(&app), "report 01");
+        // A box never visited still starts at its first report.
+        press(&mut app, "gg");
+        app.orgchart.last_child.clear();
+        press(&mut app, "jjjj"); // Owner → Other → Teams → The boss → its first report
+        assert_eq!(focused_title(&app), "report 00");
+
+        // Inside a box: k from the second session, then j, lands on it again.
+        let mut app = org_app();
+        app.cursor = Cursor::Session(1, 0); // mid-1
+        app.handle_event(&key(KeyCode::F(6)));
+        press(&mut app, "k");
+        assert_eq!(focused_title(&app), "Root lead");
+        assert_eq!(app.orgchart.session, 0, "a box opens on its lead the first time");
+        app.handle_event(&key(KeyCode::Tab));
+        let picked = app.orgchart_focused_session(&app.org_model(false)).unwrap().uid;
+        assert_eq!(picked, "ts-20-0");
+        press(&mut app, "j");
+        assert_eq!(focused_title(&app), "Middle", "j from Root lead returns to Middle");
+        press(&mut app, "k");
+        assert_eq!(app.orgchart_focused_session(&app.org_model(false)).unwrap().uid, picked, "k returns to the session left");
+        press(&mut app, "kj");
+        assert_eq!(app.orgchart_focused_session(&app.org_model(false)).unwrap().uid, picked, "and so does j");
     }
 
     #[test]
@@ -1669,8 +1830,9 @@ mod tests {
         // Continuous org, under its parent's box.
         session(&mut app, 6, 0x90, "deeper", "claude", Some("bug-1-sub"));
         let m = app.org_model(false);
-        let cont = m.find("continuous").unwrap();
-        assert_eq!(m.nodes[cont].parent, Some(0));
+        let cont = m.find("continuous:proj:").unwrap();
+        let other = m.find("proj:").unwrap();
+        assert_eq!(m.nodes[cont].parent, Some(other), "Continuous is a split of its project");
         let orch = m.find("orch:manager:health").unwrap();
         assert_eq!(m.nodes[orch].parent, Some(cont));
         assert!(m.nodes[orch].sessions[0].lead);
@@ -1678,9 +1840,9 @@ mod tests {
         assert_eq!(m.nodes[worker].parent, Some(orch));
         let deep = m.find("task:bug-1-sub").unwrap();
         assert_eq!(m.nodes[deep].parent, Some(worker));
-        // Owner's orgs: Standalone before Continuous.
-        let orgs: Vec<&str> = m.nodes[0].children.iter().map(|&c| m.nodes[c].key.as_str()).collect();
-        assert_eq!(orgs, ["standalone", "continuous"]);
+        // The project's splits: Teams before Continuous.
+        let splits: Vec<&str> = m.nodes[other].children.iter().map(|&c| m.nodes[c].title.as_str()).collect();
+        assert_eq!(splits, ["Teams", "Continuous"]);
         // The continuous sessions are not also in the main org.
         assert_eq!(m.nodes.iter().filter(|n| n.sessions.iter().any(|s| s.uid == o)).count(), 1);
     }
@@ -1815,11 +1977,11 @@ mod tests {
         app.orgchart.focus = Some("task:t1".into());
         press(&mut app, "zc");
         let m = app.org_model(false);
-        assert_eq!(layout(&m, Zoom::FULL, &app.orgchart.folds).boxes.len(), 4, "owner, standalone, t0, folded t1");
+        assert_eq!(layout(&m, Zoom::FULL, &app.orgchart.folds).boxes.len(), 5, "owner, other, teams, t0, folded t1");
         let s = screen(&mut app, 140, 40);
         assert!(s.contains("level 1 \u{25b8} 2 below") || s.contains("\u{25b8} 2 below"), "{s}");
         press(&mut app, "zo");
-        assert_eq!(layout(&m, Zoom::FULL, &app.orgchart.folds).boxes.len(), 6);
+        assert_eq!(layout(&m, Zoom::FULL, &app.orgchart.folds).boxes.len(), 7);
     }
 
     #[test]
@@ -1832,9 +1994,9 @@ mod tests {
         press(&mut app, "k");
         assert_eq!(focused_title(&app), "Root lead");
         press(&mut app, "k");
-        assert_eq!(focused_title(&app), "Standalone");
+        assert_eq!(focused_title(&app), "Teams");
         press(&mut app, "l");
-        assert_eq!(focused_title(&app), "Standalone", "no sibling to the right");
+        assert_eq!(focused_title(&app), "Teams", "no sibling to the right");
         press(&mut app, "j");
         assert_eq!(focused_title(&app), "Root lead");
         press(&mut app, "l");
@@ -2100,20 +2262,20 @@ mod tests {
         let m = app.org_model(false);
         let all = layout(&m, app.orgchart.zoom, &app.orgchart.folds).boxes.len();
         assert_eq!(all, m.nodes.len());
-        // zM folds every top-level org, zR unfolds them.
+        // zM folds every project and split, zR unfolds everything.
         press(&mut app, "zM");
-        assert!(app.orgchart.folds.contains("standalone"));
-        assert_eq!(layout(&m, app.orgchart.zoom, &app.orgchart.folds).boxes.len(), 2, "Owner and Standalone");
+        assert!(app.orgchart.folds.contains("proj:") && app.orgchart.folds.contains("teams:proj:"));
+        assert_eq!(layout(&m, app.orgchart.zoom, &app.orgchart.folds).boxes.len(), 2, "Owner and Other");
         let s = screen(&mut app, 140, 40);
         assert!(s.contains("\u{25b8}"), "{s}");
         press(&mut app, "zR");
         assert!(app.orgchart.folds.is_empty());
         // Space toggles the focused org.
-        app.orgchart.focus = Some("standalone".into());
+        app.orgchart.focus = Some("teams:proj:".into());
         press(&mut app, " ");
-        assert!(app.orgchart.folds.contains("standalone"));
+        assert!(app.orgchart.folds.contains("teams:proj:"));
         press(&mut app, " ");
-        assert!(!app.orgchart.folds.contains("standalone"));
+        assert!(!app.orgchart.folds.contains("teams:proj:"));
         // Folds never survive a close: the next open is unfolded again.
         press(&mut app, " ");
         app.handle_event(&key(KeyCode::Esc));

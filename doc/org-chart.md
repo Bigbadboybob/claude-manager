@@ -7,13 +7,21 @@ the chart's focused session selected.
 
 ## Layout
 
-- **Owner** is at the top. Its reports are the orgs:
-  - one box per **division**, an initiative whose `kind` is `division`;
-  - **Standalone**, for task trees outside any division, plus a box for each
-    workspace whose sessions have no task;
-  - **Continuous**, one box per continuous orchestrator. Its workers sit under
-    it, grouped exactly as in the continuous column (`A-c`).
-- Under each org come the root tasks, with subtasks nested along
+- **Owner** is at the top. Its reports are the **projects** (the task rows'
+  `project`, by name), then **Other** for tasks with no project. A subtask
+  without a project takes its nearest ancestor's. Other appears only when
+  something is in it.
+- Each project splits in two:
+  - **Teams**, the normal work: one box per **division** (an initiative whose
+    `kind` is `division`), then the project's other root tasks, then a box
+    for each workspace whose sessions have no task. Such a workspace joins
+    the project its repository is named after, else Other.
+  - **Continuous**, only when the project has any: one box per continuous
+    orchestrator. Its workers sit under it, grouped exactly as in the
+    continuous column (`A-c`).
+  The split labels are constants at the top of `orgchart.rs`
+  (`TEAMS_LABEL`, `CONTINUOUS_LABEL`, `OTHER_PROJECT_LABEL`).
+- Under each split or division come the root tasks, with subtasks nested along
   `parent_task_id` at any depth. If a task in the chain has no session of its
   own, it still gets a box so the chain stays connected. A subtask of a
   continuous worker nests under that worker.
@@ -32,8 +40,8 @@ the chart's focused session selected.
   `OrgIndex` (`app/tree.rs`).
 - Each session line shows the sidebar's state glyph (spinner, afterglow,
   settled or stale ●, ◐, ?, ✗, alert, owner-blocked, ⟳; × when exited), then
-  the label, the engine, and a host marker: ⌂ for local, otherwise the first
-  letter of the host name, in magenta.
+  the label and, at the right edge, three one-cell symbols (see Symbols): the
+  mark of the board item it holds, its engine, and its host.
 - Bash sessions are hidden by default; `b` shows them. Opening the chart on a
   bash session shows just that one, until the chart closes.
 - Every level is laid out in one row, left to right, however many reports a
@@ -44,12 +52,13 @@ the chart's focused session selected.
 | Key | Action |
 |---|---|
 | `h` / `l` | previous / next sibling |
-| `j` / `k` | first report / boss |
+| `j` / `k` | down to the report last focused under this box (else the first) / up to the boss. Each box also remembers its last-focused session, so `k` then `j` lands where you were |
 | `gg` / `G` | Owner / last box |
 | `Tab` / `S-Tab` | next / previous session in the box |
 | `/` `n` `N` | search session labels and box names, then step through matches; the search unfolds a match's ancestors |
 | Space or `za`, `zc`, `zo` | toggle, fold, unfold the box's subtree; a folded box shows how many sessions it hides |
-| `zM` / `zR` | fold / unfold every top-level org (divisions, Standalone, Continuous) |
+| `zM` / `zR` | fold every project, split and division / unfold everything |
+| `?` | show or hide the symbol legend above the help line |
 | `+` / `-` | zoom one of ten levels: four full-card widths (more sessions per card as they widen), four compact widths (one line: name and lead glyph), and two dense (one glyph per box) |
 | `H` `J` `K` `L`, arrows | pan |
 | `c` | centre on the focused box |
@@ -61,6 +70,27 @@ The chart opens on the session focused in the Sessions view, fully unfolded
 (folds last only while it is open). After any focus move, search jump, zoom,
 fold or info-pane toggle the viewport pans to keep the focused box on screen;
 a manual pan stops that until the next one.
+
+## Symbols
+
+Every symbol is plain Unicode one terminal cell wide; no Nerd Font or
+terminal graphics are needed. The mapping is in one place,
+`tui/src/app/symbols.rs`, which the chart, its legend (`?`) and the Sessions
+view's A-i peek all use.
+
+| Symbol | Meaning |
+|---|---|
+| ✻ (orange) | Claude, the mark Claude Code itself uses |
+| ◎ (teal) | Codex |
+| `$` | bash |
+| ⌂ | local host; any other host shows its first letter in magenta |
+| ○ ▶ ◷ ⊘ ◆ ✓ ✗ | board item open, active, waiting, blocked, blocked on Owner, done, dropped |
+| ⚑ | a flagged board item (a card shows a flag first, else the most urgent status) |
+| ▸ | a folded box |
+
+Cards use only the symbols. The info pane and the A-i peek keep the word
+beside each one (`◎ codex`, `▶ sejd #14 ACTIVE`). The Sessions sidebar rows
+show no engine name, so they are unchanged.
 
 ## Info pane
 
