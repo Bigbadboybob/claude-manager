@@ -417,12 +417,10 @@ impl Layouter<'_> {
             self.column(ls, x + 1, y + bh, y + bh + 1);
             return;
         }
-        let bx = x + (w - bw) / 2;
-        self.out.boxes.insert(i, Placed { x: bx, y, w: bw, h: bh });
         if units.is_empty() {
+            self.out.boxes.insert(i, Placed { x: x + (w - bw) / 2, y, w: bw, h: bh });
             return;
         }
-        let px = bx + bw / 2;
         let child_y = y + bh + self.zoom.vgap();
         let bus_y = child_y - 1;
         let mut cur = x + (w - band_w) / 2;
@@ -443,6 +441,14 @@ impl Layouter<'_> {
             }
             cur += uw + self.zoom.hgap();
         }
+        // Centred over the band; over a lone report's attach point, so a
+        // leader drawn at the left of its branch gets a straight line.
+        let bx = match attach.as_slice() {
+            [a] => (a - bw / 2).clamp(x, x + w - bw),
+            _ => x + (w - bw) / 2,
+        };
+        self.out.boxes.insert(i, Placed { x: bx, y, w: bw, h: bh });
+        let px = bx + bw / 2;
         for row in y + bh..bus_y {
             self.line(px, row, '\u{2502}');
         }
@@ -608,7 +614,7 @@ pub(super) struct OrgChart {
     pub(super) last_session: HashMap<String, String>,
     /// Where each slot of a row was left by `h`/`l`: a branch's key, or
     /// `<leader key>#stack` for a leader's stack → the box focused then
-    /// (the branch's head or one of its stacked reports, or a stacked box).
+    /// (the branch's head or any box under it, or a stacked box).
     pub(super) branch_focus: HashMap<String, String>,
     pub(super) show_bash: bool,
     /// The bash session the chart was opened on: shown while bash is
@@ -1167,7 +1173,8 @@ impl App {
             (_, KeyCode::Char('h')) | (_, KeyCode::Char('l')) => {
                 // Sideways along a box's reports as laid out: its stack is
                 // one slot (`None`), then each branch. At the end of a
-                // stack's row, carry on along its leader's row.
+                // stack's row, or of a leader's row, carry on along the row
+                // above.
                 let next = key.code == KeyCode::Char('l');
                 let folds = &self.orgchart.folds;
                 let slots = |p: usize| -> Vec<Option<usize>> {
@@ -1188,7 +1195,7 @@ impl App {
                         moved = Some((p, slot, to));
                         break;
                     }
-                    if slot.is_some() {
+                    if slot.is_some() && !model.nodes[p].leader {
                         break;
                     }
                     here = (model.nodes[p].parent, Some(p));
@@ -1200,8 +1207,23 @@ impl App {
                         Some(b) => model.nodes[b].key.clone(),
                         None => format!("{}#stack", model.nodes[p].key),
                     };
-                    let stack = model.stack(to.unwrap_or(p), folds);
-                    let back = self.orgchart.branch_focus.get(&slot_key(to)).and_then(|k| stack.iter().copied().find(|&c| &model.nodes[c].key == k));
+                    // The remembered box, if still shown in that slot: in
+                    // the stack, or anywhere under the branch.
+                    let stack = model.stack(p, folds);
+                    let shown_in = |c: usize| match to {
+                        None => stack.contains(&c),
+                        Some(b) => {
+                            let mut a = c;
+                            while a != b {
+                                match model.nodes[a].parent {
+                                    Some(up) if !folds.contains(&model.nodes[up].key) => a = up,
+                                    _ => return false,
+                                }
+                            }
+                            true
+                        }
+                    };
+                    let back = self.orgchart.branch_focus.get(&slot_key(to)).and_then(|k| model.find(k)).filter(|&c| shown_in(c));
                     let land = back.unwrap_or(to.unwrap_or_else(|| stack[0]));
                     self.orgchart.branch_focus.insert(slot_key(from), model.nodes[focus].key.clone());
                     self.orgchart_set_focus(&model, land);
@@ -2345,10 +2367,11 @@ mod tests {
         assert!(bus.starts_with('\u{250c}') && bus.ends_with('\u{2510}') && bus.contains('\u{253c}'), "{bus}");
     }
 
-    /// Teams: "Neighbour" (leaves "nleaf 0/1"), "Solo" (no reports) and
+    /// Teams: "Neighbour" (leaves "nleaf 0/1"), "Solo" (no reports),
     /// "The boss", whose reports are three leaves "leaf 0..2" and
-    /// "Sub lead" with two leaves of its own, "deep 0/1". Sessions, in
-    /// cursor order: boss, lf-0..2, sub, dp-0/1, nb, nl-0/1, solo.
+    /// "Sub lead" with two leaves of its own, "deep 0/1", and "Zed" (no
+    /// reports) right of the boss. Sessions, in cursor order: boss,
+    /// lf-0..2, sub, dp-0/1, nb, nl-0/1, solo, zed.
     fn mixed_app() -> App {
         let mut app = test_app();
         app.workspaces = vec![ws("w", HostId::local())];
@@ -2369,6 +2392,7 @@ mod tests {
             add(&mut app, 0x50 + k, &format!("n{k}"), &format!("nleaf {k}"), Some("nb"), &format!("nl-{k}"));
         }
         add(&mut app, 0x60, "solo", "Solo", None, "solo");
+        add(&mut app, 0x70, "zed", "Zed", None, "zed");
         app
     }
 
@@ -2380,7 +2404,7 @@ mod tests {
     fn leaves_stack_only_under_leaders() {
         let app = mixed_app();
         let m = app.org_model(false);
-        for (key, leader) in [("task:boss", true), ("task:sub", true), ("task:nb", true), ("task:solo", false), ("task:l0", false), ("teams:proj:", false), ("owner", false)] {
+        for (key, leader) in [("task:boss", true), ("task:sub", true), ("task:nb", true), ("task:solo", false), ("task:zed", false), ("task:l0", false), ("teams:proj:", false), ("owner", false)] {
             assert_eq!(m.nodes[node(&m, key)].leader, leader, "{key}");
         }
         for (key, stacked) in [("task:l0", true), ("task:l2", true), ("task:d1", true), ("task:n0", true), ("task:sub", false), ("task:solo", false), ("task:boss", false), ("task:nb", false)] {
@@ -2457,6 +2481,58 @@ mod tests {
         }
     }
 
+    /// A continuous orchestrator with two leaf workers, alone under its
+    /// project's Continuous split.
+    fn lone_orchestrator_app() -> App {
+        let mut app = test_app();
+        app.tasks = vec![task("orch-task", "Health triage", None), task("bug-1", "bug one", Some("orch-task")), task("bug-2", "bug two", Some("orch-task"))];
+        app.workspaces = vec![ws("w-orch", HostId::new("manager")), ws("w-bug", HostId::new("manager"))];
+        let o = session(&mut app, 0, 0x70, "health-orchestrator", "codex", Some("orch-task"));
+        app.workspaces[0].sessions[0].continuous_task_id = Some("health".into());
+        for (k, t) in ["bug-1", "bug-2"].into_iter().enumerate() {
+            session(&mut app, 1, 0x80 + k as u32, &format!("{t}-fix"), "codex", Some(t));
+            app.workspaces[1].sessions[k].managed_by_uid = Some(o.clone());
+        }
+        app
+    }
+
+    #[test]
+    fn a_lone_report_hangs_straight_under_its_boss() {
+        for app in [wide_app(3), lone_orchestrator_app(), mixed_app(), org_app()] {
+            let m = app.org_model(false);
+            if app.workspaces.iter().any(|w| w.id == "w-orch") {
+                assert!(m.nodes[m.find("orch:manager:health").unwrap()].leader);
+            }
+            for zoom in all_zooms() {
+                let lay = layout(&m, zoom, &HashSet::new());
+                let bw = zoom.box_w();
+                for (i, n) in m.nodes.iter().enumerate() {
+                    let [c] = m.branches(i, &HashSet::new())[..] else { continue };
+                    if !m.stack(i, &HashSet::new()).is_empty() {
+                        continue;
+                    }
+                    let (p, b) = (lay.boxes[&i], lay.boxes[&c]);
+                    assert_eq!(p.x + bw / 2, b.x + bw / 2, "{zoom:?}: {} over {}", n.title, m.nodes[c].title);
+                    let jog: Vec<_> = lay.lines.iter().filter(|l| l.1 >= p.y + p.h && l.1 < b.y && l.0 >= p.x.min(b.x) && l.0 < (p.x + p.w).max(b.x + b.w) && l.0 != p.x + bw / 2).collect();
+                    assert!(jog.is_empty(), "{zoom:?}: {} → {}: {jog:?}", n.title, m.nodes[c].title);
+                }
+            }
+        }
+        // As drawn: no jog between Teams and a lone leader, or Continuous
+        // and a lone orchestrator.
+        for mut app in [wide_app(3), lone_orchestrator_app()] {
+            app.handle_event(&key(KeyCode::F(6)));
+            app.orgchart.hide_info = true;
+            for zoom in all_zooms() {
+                app.orgchart.zoom = zoom;
+                let s = screen(&mut app, 150, 60);
+                for jog in ["\u{250c}\u{2518}", "\u{2514}\u{2510}", "\u{2510}\u{2514}", "\u{2518}\u{250c}", "\u{250c}\u{2500}\u{2518}", "\u{2514}\u{2500}\u{2510}"] {
+                    assert!(!s.contains(jog), "{zoom:?}:\n{s}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_flat_fan_out_under_a_leader_is_one_narrow_column() {
         let app = wide_app(60);
@@ -2500,12 +2576,25 @@ mod tests {
         assert_eq!(focused_title(&app), "Sub lead");
         press(&mut app, "h");
         assert_eq!(focused_title(&app), "leaf 2");
-        // Down the sub-leader's stack; it has no neighbour to the right.
+        // Down the sub-leader's stack. Its row and the boss's row end
+        // there, so l climbs to the boss's right neighbour, and h comes
+        // back to the box it left.
         press(&mut app, "ljj");
         assert_eq!(focused_title(&app), "deep 1");
         press(&mut app, "l");
+        assert_eq!(focused_title(&app), "Zed");
+        press(&mut app, "l");
+        assert_eq!(focused_title(&app), "Zed", "the end of the Teams row");
+        press(&mut app, "h");
         assert_eq!(focused_title(&app), "deep 1");
-        // h from there goes to the column left of the sub-leader.
+        // The same from the sub-leader itself.
+        press(&mut app, "kk");
+        assert_eq!(focused_title(&app), "Sub lead");
+        press(&mut app, "l");
+        assert_eq!(focused_title(&app), "Zed");
+        press(&mut app, "h");
+        assert_eq!(focused_title(&app), "Sub lead");
+        // h from the sub-leader goes to the column left of it.
         press(&mut app, "h");
         assert_eq!(focused_title(&app), "leaf 2");
         // h from the column: the leader's neighbour in the Teams row.

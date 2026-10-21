@@ -59,7 +59,7 @@ the chart's focused session selected.
 
 | Key | Action |
 |---|---|
-| `h` / `l` | previous / next box along the row. A stack counts as one slot of its leader's row (left of the leader's branches); at the end of a stack's row, `h`/`l` carry on to the leader's neighbours. Coming back to a branch or stack lands on the box it was left from, stacked or not |
+| `h` / `l` | previous / next box along the row. A stack counts as one slot of its leader's row (left of the leader's branches); at the end of a stack's row, or of a leader's row, `h`/`l` carry on along the row above (to the leader's neighbours). Coming back to a branch or stack lands on the box it was left from, however deep |
 | `j` / `k` | down to the report last focused under this box (else the first; a stack comes first) / up to the boss. Inside a stack, `j`/`k` move down and up the list; `k` on its first item goes to the leader, and the last item is the bottom of the branch. Each box also remembers its last-focused session, so `k` then `j` lands where you were |
 | `gg` / `G` | Owner / last box |
 | `Tab` / `S-Tab` | next / previous session in the box |
