@@ -378,6 +378,7 @@ dependencies = [
  "terminput",
  "terminput-crossterm",
  "toml",
+ "unicode-width",
  "ureq",
  "uuid",
 ]

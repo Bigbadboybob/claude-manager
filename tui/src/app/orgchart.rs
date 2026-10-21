@@ -414,9 +414,32 @@ fn orgchart_legend_line() -> Line<'static> {
         spans.push(Span::styled(sym, style));
         spans.push(Span::styled(format!(" {word}  "), Style::default().fg(theme::MUTED)));
     }
-    spans.push(Span::styled("\u{25b8}", Style::default().fg(theme::MUTED)));
-    spans.push(Span::styled(" folded", Style::default().fg(theme::MUTED)));
+    let header = Style::default().fg(theme::HEADER);
+    for (sym, style, word) in [(symbols::HEADER_BOX, header, "org  "), (symbols::DIVISION, header, "division  "), ("\u{25b8}", Style::default().fg(theme::MUTED), "folded")] {
+        spans.push(Span::styled(sym, style));
+        spans.push(Span::styled(format!(" {word}"), Style::default().fg(theme::MUTED)));
+    }
     Line::from(spans)
+}
+
+/// Planning rows by task id, built once per chart rebuild.
+type TaskRows<'a> = HashMap<&'a str, &'a TaskEntry>;
+
+fn chart_task_title(tasks: &TaskRows, task_id: &str) -> String {
+    tasks.get(task_id).map(|t| t.name.clone()).unwrap_or_else(|| format!("task {}", task_id.chars().take(8).collect::<String>()))
+}
+
+/// A task's project: the nearest one set on it or an ancestor.
+fn chart_task_project(tasks: &TaskRows, task: &str, parents: &HashMap<&str, &str>) -> Option<String> {
+    let mut cur = task;
+    let mut seen = HashSet::new();
+    while seen.insert(cur) {
+        if let Some(p) = tasks.get(cur).and_then(|t| t.project.clone()) {
+            return Some(p);
+        }
+        cur = parents.get(cur)?;
+    }
+    None
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -469,9 +492,13 @@ impl ChartBoards {
 pub(super) struct OrgChart {
     pub(super) visible: bool,
     pub(super) zoom: Zoom,
-    /// Focused node key, and the session within its box.
+    /// Focused node key, and the selected session's uid within its box.
+    /// By uid, not index: a box re-sorts (lead first) on every rebuild.
     pub(super) focus: Option<String>,
-    pub(super) session: usize,
+    pub(super) session: Option<String>,
+    /// The sidebar cursor when the chart opened, restored by an exit that
+    /// has no session to go to.
+    opened_from: Option<(Cursor, SidebarColumn)>,
     pub(super) folds: HashSet<String>,
     /// Each node's last-focused report (node key → child key), so `j`
     /// goes back down the way `k` came up.
@@ -489,15 +516,20 @@ pub(super) struct OrgChart {
     /// focused box in view.
     ox: Cell<i32>,
     oy: Cell<i32>,
-    /// Scroll the focused box into view on the next draw (cleared by a pan).
+    /// Scroll the focused box into view on the next draw (cleared by a pan
+    /// or `c`; any focus move sets it again).
     follow: Cell<bool>,
+    /// The focused box's key and chart position at the last draw. While
+    /// not following, a refresh that moves the box shifts the viewport with
+    /// it, so it stays where the pan left it.
+    anchor: std::cell::RefCell<Option<(String, i32, i32)>>,
     /// Chart viewport size at the last draw, for `c` (centre).
     viewport: Cell<(u16, u16)>,
     /// `g` or `z` waiting for its second key.
     pending: Option<char>,
     /// `/` query being typed, and where the cursor was when it began.
     search: Option<String>,
-    search_origin: Option<(Option<String>, usize)>,
+    search_origin: Option<(Option<String>, Option<String>)>,
     last_query: Option<String>,
     status: String,
     last_paint: Option<Instant>,
@@ -505,13 +537,6 @@ pub(super) struct OrgChart {
 }
 
 impl App {
-    fn chart_task_title(&self, task_id: &str) -> String {
-        self.tasks
-            .iter()
-            .find(|t| t.task_id.as_deref() == Some(task_id))
-            .map(|t| t.name.clone())
-            .unwrap_or_else(|| format!("task {}", task_id.chars().take(8).collect::<String>()))
-    }
 
     /// Build the chart from the live session state.
     pub(super) fn org_model(&self, show_bash: bool) -> ChartModel {
@@ -543,6 +568,7 @@ impl App {
             let dkey = format!("div:{}:{id}", project.unwrap_or(""));
             *orgs.entry(dkey.clone()).or_insert_with(|| m.push(Some(split_node), dkey, NodeKind::Org, name.to_owned(), None, 0))
         };
+        let tasks: TaskRows = self.tasks.iter().filter_map(|t| Some((t.task_id.as_deref()?, t))).collect();
         let known_projects: HashSet<&str> = self.tasks.iter().filter_map(|t| t.project.as_deref()).collect();
         // A workspace with no task row to ask: its repository's name, when
         // that names a known project.
@@ -565,10 +591,10 @@ impl App {
             let target = match (r.depth, orch) {
                 (0, _) | (_, None) => {
                     let task = self.continuous_planning_task(ws, ts).map(str::to_owned);
-                    let project = task.as_deref().and_then(|t| self.chart_task_project(t, &parents)).or_else(|| ws_project(ws));
+                    let project = task.as_deref().and_then(|t| chart_task_project(&tasks, t, &parents)).or_else(|| ws_project(ws));
                     let cont = org(&mut m, project.as_deref(), Split::Continuous, None);
                     let key = format!("orch:{}:{}", ws.host_id, ts.continuous_task_id.as_deref().unwrap_or(&ts.uid));
-                    let title = task.as_deref().map_or_else(|| ts.label.clone(), |t| self.chart_task_title(t));
+                    let title = task.as_deref().map_or_else(|| ts.label.clone(), |t| chart_task_title(&tasks, t));
                     let i = m.push(Some(cont), key, NodeKind::Orchestrator, title, task.clone(), 0);
                     if let Some(t) = task {
                         orch_of_task.insert(t, i);
@@ -585,7 +611,7 @@ impl App {
                 (1, Some(o)) => {
                     let otask = m.nodes[o].task_id.clone();
                     let task = ts.task_id.clone().filter(|t| Some(t) != otask.as_ref());
-                    let title = task.as_deref().map_or_else(|| ts.label.clone(), |t| self.chart_task_title(t));
+                    let title = task.as_deref().map_or_else(|| ts.label.clone(), |t| chart_task_title(&tasks, t));
                     let i = m.push(Some(o), format!("worker:{}:{}", ws.host_id, task.as_deref().unwrap_or(&ts.uid)), NodeKind::Worker, title, task.clone(), 1);
                     if let Some(t) = task {
                         orch_of_task.insert(t, i);
@@ -643,14 +669,14 @@ impl App {
                 Some(i) => i,
                 None => {
                     let root = chain.last().cloned().unwrap_or_default();
-                    let project = self.chart_task_project(&task, &parents);
+                    let project = chart_task_project(&tasks, &task, &parents);
                     let division = self.planning.task_division(&root);
                     org(&mut m, project.as_deref(), Split::Teams, division.as_ref().map(|d| (d.id.as_str(), d.name.as_str())))
                 }
             };
             for t in chain.iter().rev() {
                 let rank = if self.planning.task_division(t).is_some_and(|d| d.coordinator) { 0 } else { 1 };
-                parent = m.push(Some(parent), format!("task:{t}"), NodeKind::Task, self.chart_task_title(t), Some(t.clone()), rank);
+                parent = m.push(Some(parent), format!("task:{t}"), NodeKind::Task, chart_task_title(&tasks, t), Some(t.clone()), rank);
                 task_node.insert(t.clone(), parent);
             }
             let i = task_node.get(&task).copied().unwrap_or(parent);
@@ -688,18 +714,6 @@ impl App {
         m
     }
 
-    /// A task's project: the nearest one set on it or an ancestor.
-    fn chart_task_project(&self, task: &str, parents: &HashMap<&str, &str>) -> Option<String> {
-        let mut cur = task.to_owned();
-        let mut seen = HashSet::new();
-        while seen.insert(cur.clone()) {
-            if let Some(p) = self.tasks.iter().find(|t| t.task_id.as_deref() == Some(cur.as_str())).and_then(|t| t.project.clone()) {
-                return Some(p);
-            }
-            cur = parents.get(cur.as_str())?.to_string();
-        }
-        None
-    }
 
     fn chart_ts(&self, s: &ChartSession) -> Option<&TerminalSession> {
         self.workspaces.get(s.wi)?.sessions.get(s.si).filter(|ts| ts.uid == s.uid)
@@ -775,25 +789,40 @@ impl App {
         // The chart always opens fully unfolded.
         c.folds.clear();
         c.boards.listed_at = None;
+        self.orgchart.opened_from = Some((self.cursor.clone(), self.cursor_column));
         let uid = self.cursor_session_uid();
-        if let Some(uid) = uid {
-            let bash = self.find_session_by_uid(&uid).map(|(wi, si)| self.workspaces[wi].sessions[si].session_type == "bash");
+        if let Some(uid) = &uid {
+            let bash = self.find_session_by_uid(uid).map(|(wi, si)| self.workspaces[wi].sessions[si].session_type == "bash");
             if bash == Some(true) {
                 self.orgchart.bash_uid = Some(uid.clone());
             }
-            let model = self.org_model(self.orgchart.show_bash);
-            if let Some((i, s)) = model.find_session(&uid) {
-                self.orgchart_reveal(&model, i);
-                self.orgchart.focus = Some(model.nodes[i].key.clone());
-                self.orgchart.session = s;
-                self.orgchart_remember_path(&model, i);
-            }
         }
+        // Start on the sidebar's focus: its session, else the box for its
+        // task or workspace header, else Owner. Never the last visit's focus.
+        let model = self.org_model(self.orgchart.show_bash);
+        let start = match (&uid, &self.cursor) {
+            (Some(uid), _) if model.find_session(uid).is_some() => model.find_session(uid).map(|(i, _)| (i, Some(uid.clone()))),
+            (_, Cursor::Task { task_id, .. }) => model.find(&format!("task:{task_id}")).map(|i| (i, None)),
+            (_, Cursor::Workspace(wi)) => self.workspaces.get(*wi).and_then(|ws| {
+                // A loose workspace has its own box; otherwise the box of its first charted session.
+                let own = model.find(&format!("ws:{}", ws.id));
+                own.or_else(|| ws.sessions.iter().find_map(|ts| model.find_session(&ts.uid).map(|(i, _)| i)))
+            }).map(|i| (i, None)),
+            _ => None,
+        };
+        let (i, session) = start.unwrap_or((0, None));
+        self.orgchart_reveal(&model, i);
+        self.orgchart.focus = Some(model.nodes[i].key.clone());
+        // Opened on a header: no session is selected until the focus moves,
+        // so an exit from here puts the sidebar cursor back on that header.
+        self.orgchart.session = session;
+        self.orgchart_remember_path(&model, i);
         self.orgchart_tick();
     }
 
     fn close_orgchart(&mut self) {
         self.orgchart.visible = false;
+        self.orgchart.opened_from = None;
         self.orgchart.bash_uid = None;
         self.orgchart.pending = None;
         self.orgchart.search = None;
@@ -824,8 +853,8 @@ impl App {
         self.orgchart_remember_path(model, i);
         let node = &model.nodes[i];
         self.orgchart.focus = Some(node.key.clone());
-        let back = self.orgchart.last_session.get(&node.key);
-        self.orgchart.session = back.and_then(|uid| node.sessions.iter().position(|s| &s.uid == uid)).unwrap_or(0);
+        let back = self.orgchart.last_session.get(&node.key).filter(|uid| node.sessions.iter().any(|s| &s.uid == *uid));
+        self.orgchart.session = back.cloned().or_else(|| node.sessions.first().map(|s| s.uid.clone()));
         self.orgchart.follow.set(true);
     }
 
@@ -838,21 +867,31 @@ impl App {
         }
     }
 
+    /// The selected session's index in `node` (its first when the uid is
+    /// gone or belongs to another box).
+    fn orgchart_selected(&self, node: &ChartNode) -> usize {
+        self.orgchart.session.as_ref().and_then(|uid| node.sessions.iter().position(|s| &s.uid == uid)).unwrap_or(0)
+    }
+
     /// The focused session, if the focused box has any.
     pub(super) fn orgchart_focused_session(&self, model: &ChartModel) -> Option<ChartSession> {
         let node = &model.nodes[self.orgchart_focus(model)];
-        node.sessions.get(self.orgchart.session.min(node.sessions.len().saturating_sub(1))).cloned()
+        node.sessions.get(self.orgchart_selected(node)).cloned()
     }
 
     /// Enter (`explicit`) or any other exit: back to the Sessions view with
     /// the focused session selected. Enter on a box with no session stays
-    /// in the chart; other exits leave the sidebar cursor where it was.
+    /// in the chart; other exits with no session selected put the sidebar
+    /// cursor back where it was when the chart opened.
     fn orgchart_jump(&mut self, model: &ChartModel, explicit: bool) {
-        let target = self.orgchart_focused_session(model);
+        // Without a selection (opened on a header, not moved since), only
+        // Enter picks the box's first session.
+        let target = self.orgchart_focused_session(model).filter(|_| explicit || self.orgchart.session.is_some());
         if target.is_none() && explicit {
             self.orgchart.status = "No session in this box".into();
             return;
         }
+        let opened_from = self.orgchart.opened_from.take();
         self.close_orgchart();
         // Nothing may sit over the Sessions view: other overlays close and
         // an open form or prompt is cancelled.
@@ -861,6 +900,10 @@ impl App {
         self.input_mode = InputMode::Normal;
         self.view_mode = ViewMode::Sessions;
         let Some(s) = target else {
+            if let Some((cursor, column)) = opened_from {
+                self.cursor = cursor;
+                self.cursor_column = column;
+            }
             self.needs_redraw = true;
             return;
         };
@@ -903,7 +946,8 @@ impl App {
         }
         let order = model.preorder(&HashSet::new());
         let pos = |&(i, k): &(usize, usize)| (order.iter().position(|&o| o == i).unwrap_or(0), k);
-        let here = (order.iter().position(|&o| o == self.orgchart_focus(model)).unwrap_or(0), self.orgchart.session);
+        let focus = self.orgchart_focus(model);
+        let here = (order.iter().position(|&o| o == focus).unwrap_or(0), self.orgchart_selected(&model.nodes[focus]));
         let pick = if dir > 0 {
             matches.iter().find(|m| if inclusive { pos(m) >= here } else { pos(m) > here }).or(matches.first())
         } else {
@@ -913,7 +957,7 @@ impl App {
         let n = matches.iter().position(|m| *m == (i, k)).unwrap_or(0) + 1;
         self.orgchart_reveal(model, i);
         self.orgchart_set_focus(model, i);
-        self.orgchart.session = k;
+        self.orgchart.session = model.nodes[i].sessions.get(k).map(|s| s.uid.clone());
         self.orgchart.status = format!("match {n}/{}", matches.len());
         true
     }
@@ -1034,14 +1078,17 @@ impl App {
                 }
             }
             (_, KeyCode::Tab) | (_, KeyCode::BackTab) => {
-                let n = model.nodes[focus].sessions.len();
+                let node = &model.nodes[focus];
+                let n = node.sessions.len();
                 if n > 0 {
-                    let cur = self.orgchart.session.min(n - 1);
-                    self.orgchart.session = if key.code == KeyCode::Tab { (cur + 1) % n } else { (cur + n - 1) % n };
+                    let cur = self.orgchart_selected(node);
+                    let next = if key.code == KeyCode::Tab { (cur + 1) % n } else { (cur + n - 1) % n };
+                    self.orgchart.session = Some(node.sessions[next].uid.clone());
+                    self.orgchart.follow.set(true);
                 }
             }
             (_, KeyCode::Char('/')) => {
-                self.orgchart.search_origin = Some((self.orgchart.focus.clone(), self.orgchart.session));
+                self.orgchart.search_origin = Some((self.orgchart.focus.clone(), self.orgchart.session.clone()));
                 self.orgchart.search = Some(String::new());
             }
             (_, KeyCode::Char(c @ ('n' | 'N'))) => match self.orgchart.last_query.clone() {
@@ -1215,7 +1262,7 @@ impl App {
         };
         self.orgchart.viewport.set((chart_area.width, chart_area.height));
         let lay = layout(&model, self.orgchart.zoom, &self.orgchart.folds);
-        self.orgchart_follow(&lay, focus, chart_area);
+        self.orgchart_follow(&model, &lay, focus, chart_area);
         self.draw_chart_body(frame.buffer_mut(), chart_area, &model, &lay, focus);
         if let Some(info) = info_area {
             self.draw_chart_info(frame, info, &model, focus);
@@ -1223,10 +1270,28 @@ impl App {
         frame.render_widget(Paragraph::new(self.orgchart_status_line(status_area.width as usize)), status_area);
     }
 
-    /// Scroll so the focused box is in view (only after a focus move).
-    fn orgchart_follow(&self, lay: &ChartLayout, focus: usize, area: Rect) {
+    /// Scroll so the focused box is in view. After a pan or `c` the
+    /// viewport stays put, but moves with the box when a refresh shifts
+    /// the layout, and follows again if the focus itself changes.
+    fn orgchart_follow(&self, model: &ChartModel, lay: &ChartLayout, focus: usize, area: Rect) {
         let c = &self.orgchart;
         let (vw, vh) = (area.width as i32, area.height as i32);
+        if let Some(p) = lay.boxes.get(&focus) {
+            let key = &model.nodes[focus].key;
+            let mut anchor = c.anchor.borrow_mut();
+            match anchor.as_ref() {
+                Some((k, x, y)) if k == key => {
+                    if !c.follow.get() {
+                        c.ox.set(c.ox.get() + p.x - x);
+                        c.oy.set(c.oy.get() + p.y - y);
+                    }
+                }
+                // A different box is focused (e.g. the old one vanished).
+                Some(_) => c.follow.set(true),
+                None => {}
+            }
+            *anchor = Some((key.clone(), p.x, p.y));
+        }
         // Never scroll past the chart's edges more than needed.
         c.ox.set(c.ox.get().clamp(-vw / 2, (lay.width - vw / 2).max(0)));
         c.oy.set(c.oy.get().clamp(-vh / 2, (lay.height - vh / 2).max(0)));
@@ -1281,14 +1346,16 @@ impl App {
             }
             let node = &model.nodes[i];
             let focused = i == focus;
-            let selected = focused.then(|| self.orgchart.session.min(node.sessions.len().saturating_sub(1)));
+            let selected = focused.then(|| self.orgchart_selected(node));
             let folded = self.orgchart.folds.contains(&node.key) && !node.children.is_empty();
             let hidden = if folded { model.subtree_sessions(i) - node.sessions.len() } else { 0 };
             let header = matches!(node.kind, NodeKind::Owner | NodeKind::Project | NodeKind::Org);
             let head_glyph = match node.sessions.first().and_then(|s| self.chart_ts(s)) {
                 Some(ts) => self.chart_glyph(ts, now),
-                None if header => ("\u{25c6}", Style::default().fg(theme::HEADER)),
-                None => ("\u{25cb}", Style::default().fg(theme::DIM)),
+                None if node.key.starts_with("div:") => (symbols::DIVISION, Style::default().fg(theme::HEADER)),
+                None if header => (symbols::HEADER_BOX, Style::default().fg(theme::HEADER)),
+                // A task box whose sessions are all elsewhere in its subtree.
+                None => ("\u{2218}", Style::default().fg(theme::DIM)),
             };
             let focus_bg = |s: Style| if focused { s.bg(theme::SELECT_BG) } else { s };
             match self.orgchart.zoom.detail() {
@@ -1370,7 +1437,9 @@ impl App {
                         let (engine, es) = symbols::engine(&ts.session_type);
                         let held = self.orgchart.boards.held_by(&ts.uid);
                         let mark = symbols::held_mark(held.iter().map(|h| (h.item["status"].as_str().unwrap_or(""), h.item["flags"].as_array().is_some_and(|f| !f.is_empty()))));
-                        // Right edge: held-item mark, engine, host, each one cell.
+                        // Right edge: held-item mark, engine, host, each one
+                        // cell with a blank cell between, so a terminal that
+                        // draws a mark two cells wide never covers the next.
                         let label_room = w.saturating_sub(4 + 7);
                         let label = crate::planning::truncate_with_ellipsis(&ts.label, label_room);
                         let label_style = if ts.session.exited { Style::default().fg(theme::DIM) } else { Style::default().fg(theme::TEXT) };
@@ -1416,7 +1485,7 @@ impl App {
                 None => b.title.clone(),
             }
         };
-        let picked = self.orgchart.session.min(node.sessions.len().saturating_sub(1));
+        let picked = self.orgchart_selected(node);
         let Some(s) = node.sessions.get(picked).cloned() else {
             lines.push(Line::styled(node.title.clone(), Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)));
             let kind = match node.kind {
@@ -1766,6 +1835,141 @@ mod tests {
     }
 
     #[test]
+    fn opening_off_a_session_focuses_its_header_box_or_owner_never_the_last_visit() {
+        let mut app = org_app();
+        app.cursor = Cursor::Session(2, 0); // leaf-1
+        app.handle_event(&key(KeyCode::F(6)));
+        assert_eq!(focused_title(&app), "Leaf work");
+        app.handle_event(&key(KeyCode::Esc));
+        // A task header opens on that task's box; Esc puts the cursor back.
+        let on_task = Cursor::Task { ws_idx: 1, task_id: "mid".into() };
+        app.cursor = on_task.clone();
+        app.handle_event(&key(KeyCode::F(6)));
+        assert_eq!(focused_title(&app), "Middle");
+        app.handle_event(&key(KeyCode::Esc));
+        assert_eq!(app.cursor, on_task, "exit without a selection restores the cursor exactly");
+        // ...but Enter there goes to the box's first session.
+        app.handle_event(&key(KeyCode::F(6)));
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(app.cursor_session_uid().as_deref(), Some("ts-40-0"));
+        // A loose workspace header opens on its workspace box.
+        app.cursor = Cursor::Workspace(3);
+        app.handle_event(&key(KeyCode::F(6)));
+        assert_eq!(focused_title(&app), "w-loose");
+        app.handle_event(&key(KeyCode::Esc));
+        assert_eq!(app.cursor, Cursor::Workspace(3));
+        // A workspace whose sessions are in a task box opens on that box.
+        app.cursor = Cursor::Workspace(0);
+        app.handle_event(&key(KeyCode::F(6)));
+        assert_eq!(focused_title(&app), "Root lead");
+        app.handle_event(&key(KeyCode::Esc));
+        // Anything else opens on Owner, not on the previous visit's box.
+        app.orgchart.focus = Some("task:leaf".into());
+        app.cursor = Cursor::Section("nowhere".into());
+        app.handle_event(&key(KeyCode::F(6)));
+        assert_eq!(focused_title(&app), "Owner");
+        app.handle_event(&key(KeyCode::Esc));
+        assert_eq!(app.cursor, Cursor::Section("nowhere".into()));
+        assert_eq!(app.view_mode, ViewMode::Sessions);
+    }
+
+    #[test]
+    fn the_selection_survives_a_lead_exit_and_the_bash_toggle() {
+        let mut app = org_app();
+        app.cursor = Cursor::Session(0, 1); // root-a, the lead
+        app.handle_event(&key(KeyCode::F(6)));
+        app.handle_event(&key(KeyCode::Tab));
+        let picked = || "ts-20-0";
+        let selected = |app: &App| app.orgchart_focused_session(&app.org_model(app.orgchart.show_bash)).unwrap().uid;
+        assert_eq!(selected(&app), picked());
+        // root-a exits: root-b becomes the lead and sorts first.
+        app.workspaces[0].sessions[1].session.exited = true;
+        let m = app.org_model(false);
+        assert_eq!(m.nodes[m.find("task:root").unwrap()].sessions[0].uid, "ts-20-0", "re-sorted");
+        assert_eq!(selected(&app), picked(), "the selection follows the uid, not the index");
+        screen(&mut app, 160, 40);
+        // b adds root-sh to the box; the selection stays.
+        press(&mut app, "b");
+        assert_eq!(app.org_model(true).nodes[app.org_model(true).find("task:root").unwrap()].sessions.len(), 3);
+        assert_eq!(selected(&app), picked());
+        press(&mut app, "b");
+        assert_eq!(selected(&app), picked());
+        app.handle_event(&key(KeyCode::Esc));
+        assert_eq!(app.cursor_session_uid().as_deref(), Some(picked()));
+    }
+
+    #[test]
+    fn exit_after_zm_puts_the_cursor_back() {
+        let mut app = org_app();
+        app.cursor = Cursor::Session(2, 0); // leaf-1
+        app.view_mode = ViewMode::Planning;
+        app.handle_event(&key(KeyCode::F(6)));
+        press(&mut app, "zM");
+        // The focus shows on the folded project, which has no session.
+        assert_eq!(focused_title(&app), "Other");
+        screen(&mut app, 160, 40);
+        app.handle_event(&key(KeyCode::Esc));
+        assert!(!app.orgchart.visible);
+        assert_eq!(app.view_mode, ViewMode::Sessions);
+        assert_eq!(app.cursor, Cursor::Session(2, 0));
+        // The next open is unfolded and back on leaf-1.
+        app.handle_event(&key(KeyCode::F(6)));
+        assert!(app.orgchart.folds.is_empty());
+        assert_eq!(focused_title(&app), "Leaf work");
+    }
+
+    #[test]
+    fn a_continuous_orchestrator_finds_its_project_by_repo_or_lands_in_other() {
+        let mut app = test_app();
+        app.tasks = vec![TaskEntry { project: Some("predictionTrading".into()), ..task("pt", "Trader work", None) }, task("o1", "Repo triage", None), task("o2", "Lost triage", None)];
+        app.workspaces = vec![ws("w-pt", HostId::local()), ws("w-o1", HostId::new("manager")), ws("w-o2", HostId::new("manager"))];
+        app.workspaces[1].main_repo_path = Some("/home/u/.cm/repos/predictionTrading".into());
+        app.workspaces[2].main_repo_path = Some("/home/u/.cm/repos/somewhere-else".into());
+        session(&mut app, 0, 0x10, "pt-1", "codex", Some("pt"));
+        for (wi, n, label, tid, ct) in [(1, 0x20, "repo-orchestrator", "o1", "repo-triage"), (2, 0x30, "lost-orchestrator", "o2", "lost-triage")] {
+            session(&mut app, wi, n, label, "codex", Some(tid));
+            app.workspaces[wi].sessions[0].continuous_task_id = Some(ct.into());
+        }
+        let m = app.org_model(false);
+        let repo = m.find("orch:manager:repo-triage").unwrap();
+        assert_eq!(m.nodes[m.nodes[repo].parent.unwrap()].key, "continuous:proj:predictionTrading", "placed by its repo's name");
+        let lost = m.find("orch:manager:lost-triage").unwrap();
+        assert_eq!(m.nodes[m.nodes[lost].parent.unwrap()].key, "continuous:proj:", "no project and an unknown repo: Other");
+        assert_eq!(m.nodes[m.find("proj:").unwrap()].title, "Other");
+        assert!(m.find("teams:proj:").is_none(), "Other has only Continuous here");
+    }
+
+    #[test]
+    fn after_a_pan_a_refresh_keeps_the_focused_box_where_it_was() {
+        let mut app = wide_app(10);
+        app.cursor = Cursor::Session(0, 6); // rep-05
+        app.handle_event(&key(KeyCode::F(6)));
+        app.orgchart.hide_info = true;
+        screen(&mut app, 100, 30);
+        press(&mut app, "H");
+        screen(&mut app, 100, 30);
+        let on_screen = |app: &App| {
+            let m = app.org_model(false);
+            let p = layout(&m, app.orgchart.zoom, &app.orgchart.folds).boxes[&app.orgchart_focus(&m)];
+            (p.x - app.orgchart.ox.get(), p.y - app.orgchart.oy.get())
+        };
+        let before = on_screen(&app);
+        // Two new reports sort before rep-05 and push its box right.
+        for (k, id) in ["r00a", "r00b"].into_iter().enumerate() {
+            app.tasks.push(task(id, &format!("report 00{}", ["a", "b"][k]), Some("boss")));
+            session(&mut app, 0, 0x200 + k as u32, &format!("new-{k}"), "codex", Some(id));
+        }
+        screen(&mut app, 100, 30);
+        assert!(!app.orgchart.follow.get(), "still panned");
+        assert_eq!(on_screen(&app), before, "the viewport moved with the box");
+        // The next focus move follows again.
+        press(&mut app, "l");
+        assert!(app.orgchart.follow.get());
+        screen(&mut app, 100, 30);
+        assert!(focus_in_view(&app));
+    }
+
+    #[test]
     fn j_goes_back_down_to_the_box_and_session_k_came_up_from() {
         let mut app = wide_app(3);
         app.cursor = Cursor::Session(0, 1); // rep-00
@@ -1789,7 +1993,7 @@ mod tests {
         app.handle_event(&key(KeyCode::F(6)));
         press(&mut app, "k");
         assert_eq!(focused_title(&app), "Root lead");
-        assert_eq!(app.orgchart.session, 0, "a box opens on its lead the first time");
+        assert_eq!(app.orgchart.session.as_deref(), Some("ts-10-0"), "a box opens on its lead the first time");
         app.handle_event(&key(KeyCode::Tab));
         let picked = app.orgchart_focused_session(&app.org_model(false)).unwrap().uid;
         assert_eq!(picked, "ts-20-0");
@@ -2005,7 +2209,7 @@ mod tests {
         press(&mut app, "h");
         assert_eq!(focused_title(&app), "Root lead");
         app.handle_event(&key(KeyCode::Tab));
-        assert_eq!(app.orgchart.session, 1);
+        assert_eq!(app.orgchart.session.as_deref(), Some("ts-20-0"));
         press(&mut app, "G");
         assert_eq!(focused_title(&app), "w-loose");
         press(&mut app, "gg");
@@ -2020,7 +2224,7 @@ mod tests {
         press(&mut app, "/root-");
         app.handle_event(&key(KeyCode::Enter));
         assert_eq!(focused_title(&app), "Root lead");
-        let first = app.orgchart.session;
+        let first = app.orgchart.session.clone();
         press(&mut app, "n");
         assert_ne!(app.orgchart.session, first, "n steps to the next matching session");
         press(&mut app, "N");
@@ -2294,8 +2498,8 @@ mod tests {
         assert!(row("root-a").contains("\u{2605}"), "lead star: {}", row("root-a"));
         // Engines and hosts are one-cell symbols, not words.
         assert!(row("root-a").contains("\u{273b} \u{2302}"), "claude, local host: {}", row("root-a"));
-        assert!(row("mid-1").contains("\u{25ce} s"), "codex, sessions host: {}", row("mid-1"));
-        assert!(row("leaf-1").contains("\u{25ce} m"), "codex, manager host: {}", row("leaf-1"));
+        assert!(row("mid-1").contains("\u{2b21} s"), "codex, sessions host: {}", row("mid-1"));
+        assert!(row("leaf-1").contains("\u{2b21} m"), "codex, manager host: {}", row("leaf-1"));
         assert!(!row("root-a").contains("claude") && !row("mid-1").contains("codex"), "{s}");
         // A held board item puts its mark before the engine: a flag wins.
         app.orgchart.boards.items.insert(
@@ -2307,8 +2511,8 @@ mod tests {
         );
         let s = screen(&mut app, 200, 40);
         let row = |label: &str| s.lines().find(|l| l.contains(label)).unwrap().to_owned();
-        assert!(row("mid-1").contains("\u{2298} \u{25ce} s"), "blocked item: {}", row("mid-1"));
-        assert!(row("leaf-1").contains("\u{2691} \u{25ce} m"), "flagged item: {}", row("leaf-1"));
+        assert!(row("mid-1").contains("\u{2298} \u{2b21} s"), "blocked item: {}", row("mid-1"));
+        assert!(row("leaf-1").contains("\u{2691} \u{2b21} m"), "flagged item: {}", row("leaf-1"));
     }
 
     #[test]
@@ -2320,7 +2524,7 @@ mod tests {
         press(&mut app, "?");
         let s = screen(&mut app, 220, 40);
         let legend = s.lines().find(|l| l.contains("host initial")).unwrap_or_else(|| panic!("{s}"));
-        for part in ["\u{273b} claude", "\u{25ce} codex", "\u{2302} local", "\u{25b6} active", "\u{2691} flagged", "\u{25b8} folded"] {
+        for part in ["\u{273b} claude", "\u{2b21} codex", "\u{2302} local", "\u{27a4} active", "\u{229b} on Owner", "\u{2691} flagged", "\u{229e} org", "\u{25c6} division", "\u{25b8} folded"] {
             assert!(legend.contains(part), "{part}: {legend}");
         }
         press(&mut app, "?");
@@ -2347,7 +2551,7 @@ mod tests {
         // mid-1 leads Middle (level 2, with reports): ☆, the sidebar's mark.
         assert!(joined.contains("mid-1") && joined.contains("\u{2606} lead"), "{joined}");
         // The info pane keeps words beside the symbols.
-        assert!(joined.contains("engine   \u{25ce} codex"), "{joined}");
+        assert!(joined.contains("engine   \u{2b21} codex"), "{joined}");
         assert!(joined.contains("since spawn"), "{joined}");
         assert!(joined.contains("task     Middle"), "{joined}");
         assert!(joined.contains("boss     Root lead (lead root-a)"), "{joined}");
@@ -2355,7 +2559,7 @@ mod tests {
         assert!(joined.contains("host     s sessions"), "{joined}");
         assert!(joined.contains("worktree /wt/w-mid"), "{joined}");
         assert!(joined.contains("Board items (1)"), "{joined}");
-        assert!(joined.contains("\u{25b6} sejd #14 ACTIVE") && joined.contains("ETA") && joined.contains("holder_idle"), "{joined}");
+        assert!(joined.contains("\u{27a4} sejd #14 ACTIVE") && joined.contains("ETA") && joined.contains("holder_idle"), "{joined}");
         assert!(joined.contains("fuse kernels") && !joined.contains("not mine"), "{joined}");
     }
 

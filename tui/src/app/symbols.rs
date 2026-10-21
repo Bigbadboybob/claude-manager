@@ -1,20 +1,23 @@
 //! One-cell symbols for engines, hosts and board items (Owner request
 //! 2026-10-21). This is the only mapping: the org chart, its legend and the
 //! A-i peek all read it. Every symbol is plain Unicode one terminal cell
-//! wide (no Nerd Font glyphs, no emoji presentation).
+//! wide, also in East Asian contexts (no Ambiguous-width characters, so
+//! nothing from U+25A0-25EF's ambiguous ranges), with no emoji presentation
+//! and no Nerd Font glyphs. ◆ stays reserved for divisions and the
+//! owner-blocked blink.
 
 use crate::theme;
 use cm_daemon::host_id::HostId;
 use ratatui::style::{Modifier, Style};
 
 /// The engine's mark: Claude ✻ (the mark Claude Code itself uses) in
-/// orange, Codex ◎ in teal, bash `$`.
+/// orange, Codex ⬡ in teal, bash `$`.
 pub(crate) fn engine(session_type: &str) -> (&'static str, Style) {
     match session_type {
         "claude" | "claude-code" => ("\u{273b}", Style::default().fg(theme::CLAUDE)),
-        "codex" => ("\u{25ce}", Style::default().fg(theme::CODEX)),
+        "codex" => ("\u{2b21}", Style::default().fg(theme::CODEX)),
         "bash" => ("$", Style::default().fg(theme::MUTED)),
-        _ => ("\u{00b7}", Style::default().fg(theme::DIM)),
+        _ => ("-", Style::default().fg(theme::DIM)),
     }
 }
 
@@ -46,16 +49,21 @@ pub(crate) fn host(id: &HostId) -> (String, Style) {
 pub(crate) fn board_status(status: &str) -> (&'static str, Style) {
     let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
     match status {
-        "open" => ("\u{25cb}", Style::default().fg(theme::MUTED)),
-        "active" => ("\u{25b6}", bold(theme::OK)),
+        "open" => ("\u{25cc}", Style::default().fg(theme::MUTED)),
+        "active" => ("\u{27a4}", bold(theme::OK)),
         "waiting" => ("\u{25f7}", bold(theme::HEADER)),
         "blocked" => ("\u{2298}", bold(theme::ATTN)),
-        "blocked_on_owner" => ("\u{25c6}", super::owner_blocked::owner_style()),
+        "blocked_on_owner" => ("\u{229b}", super::owner_blocked::owner_style()),
         "done" => ("\u{2713}", Style::default().fg(theme::DIM)),
         "dropped" => ("\u{2717}", Style::default().fg(theme::DIM)),
         _ => ("?", Style::default().fg(theme::TEXT)),
     }
 }
+
+/// A chart box with no session of its own: Owner, a project, Teams or
+/// Continuous. A division keeps ◆, as in the sidebar.
+pub(crate) const HEADER_BOX: &str = "\u{229e}";
+pub(crate) const DIVISION: &str = "\u{25c6}";
 
 /// A board item that carries a flag (holder idle, overdue, …).
 pub(crate) const FLAG: &str = "\u{2691}";
@@ -117,12 +125,24 @@ mod tests {
     use ratatui::text::Span;
 
     #[test]
-    fn every_symbol_is_one_cell_wide() {
-        for (s, _, word) in legend() {
+    fn every_symbol_is_one_cell_wide_even_in_cjk_terminals() {
+        use unicode_width::UnicodeWidthStr;
+        let mut all: Vec<(String, &str)> = legend().into_iter().map(|(s, _, w)| (s, w)).collect();
+        all.extend([(engine("other").0.to_owned(), "unknown engine"), (board_status("weird").0.to_owned(), "unknown status"), (HEADER_BOX.to_owned(), "header box")]);
+        for (s, word) in all {
             assert_eq!(Span::raw(s.clone()).width(), 1, "{word}: {s:?}");
+            assert_eq!(s.width_cjk(), 1, "{word}: {s:?} is East Asian Ambiguous");
         }
-        assert_eq!(Span::raw(engine("other").0).width(), 1);
-        assert_eq!(Span::raw(board_status("weird").0).width(), 1);
+    }
+
+    #[test]
+    fn glyphs_do_not_double_up() {
+        // ◆ is the division header and the owner-blocked blink only.
+        let marks: Vec<String> = legend().into_iter().map(|(s, _, _)| s).collect();
+        assert!(!marks.contains(&DIVISION.to_owned()), "{marks:?}");
+        assert!(!marks.contains(&HEADER_BOX.to_owned()) && HEADER_BOX != DIVISION);
+        let unique: std::collections::HashSet<&String> = marks.iter().collect();
+        assert_eq!(unique.len(), marks.len(), "each mark means one thing: {marks:?}");
     }
 
     #[test]

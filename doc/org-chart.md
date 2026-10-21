@@ -64,32 +64,44 @@ the chart's focused session selected.
 | `c` | centre on the focused box |
 | `i` | show or hide the info pane |
 | Enter (or `A-t`) | open the Sessions view with that session focused; folded sidebar headers above it unfold. Enter on a box with no session stays in the chart |
-| F6, Esc, `q` | the same, except that a box with no session leaves the sidebar cursor where it was |
+| F6, Esc, `q` | the same, except that with no session selected (a box without one, or a header the chart opened on and you haven't moved from) the sidebar cursor goes back exactly where it was when the chart opened |
 
-The chart opens on the session focused in the Sessions view, fully unfolded
-(folds last only while it is open). After any focus move, search jump, zoom,
-fold or info-pane toggle the viewport pans to keep the focused box on screen;
-a manual pan stops that until the next one.
+The chart opens fully unfolded (folds last only while it is open), on the
+Sessions view's focus: its session; for a task or workspace header, that
+box with no session selected yet; anything else, Owner. It never reopens on
+the previous visit's box. Within a box the selection is kept by session uid,
+so a lead exiting or `b` re-sorting the box doesn't move it.
+
+After any focus move, Tab, search jump, zoom, fold or info-pane toggle the
+viewport pans to keep the focused box on screen. A pan or `c` stops that until
+the next focus move; meanwhile, if a refresh moves the focused box, the
+viewport moves with it, so the box stays where you left it.
 
 ## Symbols
 
-Every symbol is plain Unicode one terminal cell wide; no Nerd Font or
-terminal graphics are needed. The mapping is in one place,
+Every symbol is plain Unicode one terminal cell wide, also where East Asian
+Ambiguous characters render wide (none is Ambiguous, none has an emoji
+presentation, and a test checks both widths); no Nerd Font or terminal
+graphics are needed. On a card a blank cell separates the engine and host
+marks, so even a wide rendering never covers the host. The mapping is in one place,
 `tui/src/app/symbols.rs`, which the chart, its legend (`?`) and the Sessions
 view's A-i peek all use.
 
 | Symbol | Meaning |
 |---|---|
 | ✻ (orange) | Claude, the mark Claude Code itself uses |
-| ◎ (teal) | Codex |
+| ⬡ (teal) | Codex |
 | `$` | bash |
 | ⌂ | local host; any other host shows its first letter in magenta |
-| ○ ▶ ◷ ⊘ ◆ ✓ ✗ | board item open, active, waiting, blocked, blocked on Owner, done, dropped |
+| ◌ ➤ ◷ ⊘ ⊛ ✓ ✗ | board item open, active, waiting, blocked, blocked on Owner, done, dropped |
 | ⚑ | a flagged board item (a card shows a flag first, else the most urgent status) |
+| ⊞ | a box with no session of its own: Owner, a project, Teams or Continuous |
+| ◆ | a division (as in the sidebar; ◆ is otherwise only the owner-blocked blink) |
+| ∘ | a task box whose sessions are all further down its subtree |
 | ▸ | a folded box |
 
 Cards use only the symbols. The info pane and the A-i peek keep the word
-beside each one (`◎ codex`, `▶ sejd #14 ACTIVE`). The Sessions sidebar rows
+beside each one (`⬡ codex`, `➤ sejd #14 ACTIVE`). The Sessions sidebar rows
 show no engine name, so they are unchanged.
 
 ## Info pane
