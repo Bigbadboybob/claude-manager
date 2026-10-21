@@ -69,6 +69,7 @@ mod availability;
 mod agent_state;
 mod board;
 mod orgchart;
+mod symbols;
 mod owner_blocked;
 mod color_grid;
 mod unread;

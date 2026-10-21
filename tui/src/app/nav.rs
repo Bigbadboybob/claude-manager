@@ -285,7 +285,7 @@ fn peek_workspace_lines(
         out.push(PeekLine::Text("(none)".into()));
     } else {
         for (label, stype, status) in sessions {
-            out.push(PeekLine::Text(format!("{} ({}) \u{2014} {}", label, stype, status)));
+            out.push(PeekLine::Text(format!("{} ({}) \u{2014} {}", label, super::symbols::engine_with_name(stype), status)));
         }
     }
     out
@@ -303,7 +303,7 @@ fn peek_session_lines(
     let mut out = vec![
         PeekLine::Field {
             label: "Session".into(),
-            value: format!("{} ({})", label, session_type),
+            value: format!("{} ({})", label, super::symbols::engine_with_name(session_type)),
         },
         PeekLine::Field { label: "Uid".into(), value: uid.to_string() },
     ];
@@ -2497,8 +2497,8 @@ mod nav_quickswitch_tests {
             value: "/tmp/wt".into()
         }));
         assert!(lines.contains(&PeekLine::Field { label: "Host".into(), value: "local".into() }));
-        assert!(lines.contains(&PeekLine::Text("worker (claude) \u{2014} running".into())));
-        assert!(lines.contains(&PeekLine::Text("shell (bash) \u{2014} idle".into())));
+        assert!(lines.contains(&PeekLine::Text("worker (\u{273b} claude) \u{2014} running".into())));
+        assert!(lines.contains(&PeekLine::Text("shell ($ bash) \u{2014} idle".into())));
         // Empty roster shows the placeholder.
         let empty = peek_workspace_lines("ws", None, None, None, "local", &[]);
         assert!(empty.contains(&PeekLine::Text("(none)".into())));
@@ -2515,7 +2515,7 @@ mod nav_quickswitch_tests {
         );
         assert!(lines.contains(&PeekLine::Field {
             label: "Session".into(),
-            value: "worker (claude)".into()
+            value: "worker (\u{273b} claude)".into()
         }));
         assert!(lines.contains(&PeekLine::Field {
             label: "Seeded from".into(),

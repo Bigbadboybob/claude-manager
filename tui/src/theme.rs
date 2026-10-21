@@ -72,6 +72,10 @@ pub(crate) const SECTION_BOUNDARY: Color = Color::Rgb(215, 220, 230);
 pub(crate) const TREE_FOCUS: Color = Color::Rgb(92, 210, 232);
 pub(crate) const LEAD: Color = Color::Rgb(255, 205, 90);
 
+/// Engine marks (app/symbols.rs): Claude Code's orange, Codex's teal.
+pub(crate) const CLAUDE: Color = Color::Rgb(217, 119, 87);
+pub(crate) const CODEX: Color = Color::Rgb(16, 163, 127);
+
 /// Messages: navy surfaces, slate chrome, and a cyan focus outline.
 /// Content accents stay the same when focus moves between panes.
 pub(crate) const CHAT_BG: Color = Color::Rgb(16, 21, 32);

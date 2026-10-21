@@ -390,15 +390,20 @@ fn spawn_key(uid: &str) -> (u8, u128, u64, String) {
     }
 }
 
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
+/// `?`: every symbol on the chart with its meaning, from `symbols::legend`.
+fn orgchart_legend_line() -> Line<'static> {
+    let mut spans = Vec::new();
+    for (sym, style, word) in symbols::legend() {
+        spans.push(Span::styled(sym, style));
+        spans.push(Span::styled(format!(" {word}  "), Style::default().fg(theme::MUTED)));
+    }
+    spans.push(Span::styled("\u{25b8}", Style::default().fg(theme::MUTED)));
+    spans.push(Span::styled(" folded", Style::default().fg(theme::MUTED)));
+    Line::from(spans)
 }
 
-fn short_engine(t: &str) -> &str {
-    match t {
-        "claude" | "claude-code" => "claude",
-        other => other,
-    }
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
 }
 
 /// One board item a session holds.
@@ -456,6 +461,8 @@ pub(super) struct OrgChart {
     /// hidden, until the chart closes or `b` is pressed.
     pub(super) bash_uid: Option<String>,
     pub(super) hide_info: bool,
+    /// `?`: the symbol legend above the help line.
+    pub(super) legend: bool,
     /// Viewport origin in chart coordinates. Cells so draw can keep the
     /// focused box in view.
     ox: Cell<i32>,
@@ -694,15 +701,6 @@ impl App {
         };
         let since = if word == "running" { None } else { since };
         (word.into(), since)
-    }
-
-    fn chart_host_marker(&self, ts: &TerminalSession) -> (String, Style) {
-        if ts.host_id == cm_daemon::host_id::HostId::local() {
-            ("\u{2302}".into(), Style::default().fg(theme::DIM))
-        } else {
-            let c = ts.host_id.as_str().chars().next().unwrap_or('?');
-            (c.to_string(), Style::default().fg(theme::REMOTE))
-        }
     }
 
     // ---- open / close / focus ---------------------------------------------
@@ -992,6 +990,10 @@ impl App {
                 self.orgchart.follow.set(true);
             }
             (_, KeyCode::Char('c')) => self.orgchart_centre(&model),
+            (_, KeyCode::Char('?')) => {
+                self.orgchart.legend = !self.orgchart.legend;
+                self.orgchart.follow.set(true);
+            }
             (_, KeyCode::Char('H')) | (_, KeyCode::Left) => self.orgchart_pan(-step_x, 0),
             (_, KeyCode::Char('L')) | (_, KeyCode::Right) => self.orgchart_pan(step_x, 0),
             (_, KeyCode::Char('K')) | (_, KeyCode::Up) => self.orgchart_pan(0, -step_y),
@@ -1117,7 +1119,12 @@ impl App {
             return;
         }
         let status_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-        let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+        let legend_rows = u16::from(self.orgchart.legend && inner.height > 4);
+        let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1 - legend_rows);
+        if legend_rows == 1 {
+            let legend_area = Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1);
+            frame.render_widget(Paragraph::new(orgchart_legend_line()), legend_area);
+        }
         let (chart_area, info_area) = if self.orgchart.hide_info {
             (body, None)
         } else if body.width >= 100 {
@@ -1279,17 +1286,23 @@ impl App {
                         let sel = selected == Some(k);
                         let bg = |st: Style| if sel { st.bg(theme::SELECT_BG) } else { st };
                         let (g, gs) = self.chart_glyph(ts, now);
-                        let (host, hs) = self.chart_host_marker(ts);
-                        let engine = short_engine(&ts.session_type);
-                        let label_room = w.saturating_sub(4 + 1 + engine.len() + 2 + 1);
+                        let (host, hs) = symbols::host(&ts.host_id);
+                        let (engine, es) = symbols::engine(&ts.session_type);
+                        let held = self.orgchart.boards.held_by(&ts.uid);
+                        let mark = symbols::held_mark(held.iter().map(|h| (h.item["status"].as_str().unwrap_or(""), h.item["flags"].as_array().is_some_and(|f| !f.is_empty()))));
+                        // Right edge: held-item mark, engine, host, each one cell.
+                        let label_room = w.saturating_sub(4 + 7);
                         let label = crate::planning::truncate_with_ellipsis(&ts.label, label_room);
                         let label_style = if ts.session.exited { Style::default().fg(theme::DIM) } else { Style::default().fg(theme::TEXT) };
                         put(buf, p.x + 1, y, &" ".repeat(w - 2), bg(Style::default()));
                         put(buf, p.x + 1, y, s.mark.unwrap_or(" "), bg(Style::default().fg(theme::ATTN)));
                         put(buf, p.x + 2, y, g, bg(gs));
                         put(buf, p.x + 4, y, &label, bg(label_style));
-                        put(buf, p.x + p.w as i32 - 3 - engine.len() as i32, y, engine, bg(Style::default().fg(theme::MUTED)));
-                        put(buf, p.x + p.w as i32 - 2, y, &host, bg(hs));
+                        if let Some((m, ms)) = mark {
+                            put(buf, p.x + p.w - 6, y, m, bg(ms));
+                        }
+                        put(buf, p.x + p.w - 4, y, engine, bg(es));
+                        put(buf, p.x + p.w - 2, y, &host, bg(hs));
                     }
                     if n > shown {
                         let more = n - shown;
@@ -1356,7 +1369,8 @@ impl App {
             Some(secs) => format!("{word} {}", board::age(secs)),
             None => word,
         };
-        lines.push(Line::from(vec![label("engine"), text(short_engine(&ts.session_type).to_owned())]));
+        let (mark, mark_style) = symbols::engine(&ts.session_type);
+        lines.push(Line::from(vec![label("engine"), Span::styled(format!("{mark} "), mark_style), text(symbols::engine_name(&ts.session_type).to_owned())]));
         lines.push(Line::from(vec![label("status"), text(status)]));
         let age = spawned_at(&ts.uid).map(|t| board::age(board::now_unix() - t)).unwrap_or_else(|| board::age(ts.created_at.elapsed().as_secs() as i64));
         lines.push(Line::from(vec![label("age"), text(format!("{age} since spawn"))]));
@@ -1376,8 +1390,9 @@ impl App {
             lines.push(Line::from(vec![label("boss"), text(boss_text(b))]));
         }
         lines.push(Line::from(vec![label("reports"), text(format!("{reports} direct"))]));
-        let host = if ts.host_id == cm_daemon::host_id::HostId::local() { "local \u{2302}".to_owned() } else { ts.host_id.to_string() };
-        lines.push(Line::from(vec![label("host"), text(host)]));
+        let (mark, mark_style) = symbols::host(&ts.host_id);
+        let host = if ts.host_id == cm_daemon::host_id::HostId::local() { "local".to_owned() } else { ts.host_id.to_string() };
+        lines.push(Line::from(vec![label("host"), Span::styled(format!("{mark} "), mark_style), text(host)]));
         let wt = ws.worktree_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "—".into());
         lines.push(Line::from(vec![label("worktree"), text(wt)]));
         lines.push(Line::from(""));
@@ -1400,7 +1415,9 @@ impl App {
             let item = &h.item;
             let (badge, badge_style) = board::status_badge(item, unix);
             let flags: Vec<String> = item["flags"].as_array().into_iter().flatten().filter_map(|f| f["kind"].as_str().map(str::to_owned)).collect();
+            let (mark, mark_style) = symbols::board_status(item["status"].as_str().unwrap_or(""));
             let mut spans = vec![
+                Span::styled(format!("{mark} "), mark_style),
                 Span::styled(format!("{} #{} ", h.board, item["n"]), Style::default().fg(theme::MUTED)),
                 Span::styled(format!("{badge} "), badge_style),
             ];
@@ -1411,7 +1428,7 @@ impl App {
                 }
             }
             if !flags.is_empty() {
-                spans.push(Span::styled(format!("\u{2691} {} ", flags.join(",")), Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(format!("{} {} ", symbols::FLAG, flags.join(",")), symbols::flag_style()));
             }
             lines.push(Line::from(spans));
             lines.push(Line::styled(
@@ -1431,7 +1448,7 @@ impl App {
                 Span::styled(format!("  {}", c.status), Style::default().fg(theme::MUTED)),
             ]);
         }
-        let help = "h/l sibling  j child  k boss  gg/G  Tab session  / n N  Space fold  zM/zR orgs  +/- zoom  HJKL pan  c centre  b bash  i info  Enter go  F6 close";
+        let help = "h/l sibling  j child  k boss  gg/G  Tab session  / n N  Space fold  zM/zR orgs  +/- zoom  HJKL pan  c centre  b bash  i info  ? legend  Enter go  F6 close";
         let mut text = if c.status.is_empty() { help.to_owned() } else { format!("{}  \u{00b7}  {help}", c.status) };
         if let Some(p) = c.pending {
             text = format!("{p}…  {text}");
@@ -2112,9 +2129,39 @@ mod tests {
         let s = screen(&mut app, 200, 40);
         let row = |label: &str| s.lines().find(|l| l.contains(label)).unwrap_or_else(|| panic!("{label}:\n{s}")).to_owned();
         assert!(row("root-a").contains("\u{2605}"), "lead star: {}", row("root-a"));
-        assert!(row("root-a").contains("claude \u{2302}"), "local host: {}", row("root-a"));
-        assert!(row("mid-1").contains("codex s"), "sessions host: {}", row("mid-1"));
-        assert!(row("leaf-1").contains("codex m"), "manager host: {}", row("leaf-1"));
+        // Engines and hosts are one-cell symbols, not words.
+        assert!(row("root-a").contains("\u{273b} \u{2302}"), "claude, local host: {}", row("root-a"));
+        assert!(row("mid-1").contains("\u{25ce} s"), "codex, sessions host: {}", row("mid-1"));
+        assert!(row("leaf-1").contains("\u{25ce} m"), "codex, manager host: {}", row("leaf-1"));
+        assert!(!row("root-a").contains("claude") && !row("mid-1").contains("codex"), "{s}");
+        // A held board item puts its mark before the engine: a flag wins.
+        app.orgchart.boards.items.insert(
+            "sejd".into(),
+            vec![
+                json!({"n":1,"status":"blocked","holders":[{"session_uid":"ts-40-0"}]}),
+                json!({"n":2,"status":"active","holders":[{"session_uid":"ts-50-0"}],"flags":[{"kind":"holder_idle"}]}),
+            ],
+        );
+        let s = screen(&mut app, 200, 40);
+        let row = |label: &str| s.lines().find(|l| l.contains(label)).unwrap().to_owned();
+        assert!(row("mid-1").contains("\u{2298} \u{25ce} s"), "blocked item: {}", row("mid-1"));
+        assert!(row("leaf-1").contains("\u{2691} \u{25ce} m"), "flagged item: {}", row("leaf-1"));
+    }
+
+    #[test]
+    fn question_mark_shows_the_symbol_legend() {
+        let mut app = org_app();
+        app.handle_event(&key(KeyCode::F(6)));
+        let s = screen(&mut app, 220, 40);
+        assert!(!s.contains("host initial") && s.contains("? legend"), "{s}");
+        press(&mut app, "?");
+        let s = screen(&mut app, 220, 40);
+        let legend = s.lines().find(|l| l.contains("host initial")).unwrap_or_else(|| panic!("{s}"));
+        for part in ["\u{273b} claude", "\u{25ce} codex", "\u{2302} local", "\u{25b6} active", "\u{2691} flagged", "\u{25b8} folded"] {
+            assert!(legend.contains(part), "{part}: {legend}");
+        }
+        press(&mut app, "?");
+        assert!(!screen(&mut app, 220, 40).contains("host initial"));
     }
 
     #[test]
@@ -2136,15 +2183,16 @@ mod tests {
         let joined = text.join("\n");
         // mid-1 leads Middle (level 2, with reports): ☆, the sidebar's mark.
         assert!(joined.contains("mid-1") && joined.contains("\u{2606} lead"), "{joined}");
-        assert!(joined.contains("engine   codex"), "{joined}");
+        // The info pane keeps words beside the symbols.
+        assert!(joined.contains("engine   \u{25ce} codex"), "{joined}");
         assert!(joined.contains("since spawn"), "{joined}");
         assert!(joined.contains("task     Middle"), "{joined}");
         assert!(joined.contains("boss     Root lead (lead root-a)"), "{joined}");
         assert!(joined.contains("reports  1 direct"), "{joined}");
-        assert!(joined.contains("host     sessions"), "{joined}");
+        assert!(joined.contains("host     s sessions"), "{joined}");
         assert!(joined.contains("worktree /wt/w-mid"), "{joined}");
         assert!(joined.contains("Board items (1)"), "{joined}");
-        assert!(joined.contains("sejd #14 ACTIVE") && joined.contains("ETA") && joined.contains("holder_idle"), "{joined}");
+        assert!(joined.contains("\u{25b6} sejd #14 ACTIVE") && joined.contains("ETA") && joined.contains("holder_idle"), "{joined}");
         assert!(joined.contains("fuse kernels") && !joined.contains("not mine"), "{joined}");
     }
 
