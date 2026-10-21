@@ -11,12 +11,13 @@
 //! implies approval rights.
 //!
 //! The overlay takes every key while open: h/l siblings, j back to the
-//! last-focused child (else the first), k parent, gg/G, Tab/S-Tab a session within the box, / n N search,
-//! Space/zc/zo/za fold, zM/zR fold/unfold the orgs, +/- zoom (ten levels),
-//! H/J/K/L or arrows pan, c centre, b bash, i info pane, ? symbol legend
-//! (app/symbols.rs). Enter (or A-t) and
-//! every exit (F6/Esc/q) return to the Sessions view focused on the chart's
-//! session. Every level is one row; the viewport follows the focus.
+//! last-focused child (else the first), k parent, gg/G, Tab/S-Tab a session
+//! within the box, / n N search, Space/zc/zo/za fold, zM/zR fold/unfold the
+//! projects and splits, +/- zoom (ten levels), H/J/K/L or arrows pan,
+//! c centre, b bash, i info pane, ? symbol legend (app/symbols.rs). Enter
+//! (or A-t) and every exit (F6/Esc/q) return to the Sessions view focused on
+//! the chart's session. Every level is one row; the viewport follows the
+//! focus.
 //! The info pane's board items come from `board.read`, polled only while the
 //! chart is open.
 
