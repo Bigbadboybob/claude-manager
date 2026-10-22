@@ -65,7 +65,7 @@ def receipt(**over) -> dict:
                      "dirty_after": False, "path": "/w/lane"},
         "inputs": [
             {"name": "harvest_a320", "kind": "dir", "locator": "$A320_HARVEST",
-             "resolved_root": "/data/harvest", "content_id": "tree:" + "9" * 64, "bytes": 10},
+             "resolved_root": "/data/harvest", "content_id": "tree:" + "9" * 64, "bytes": 10, "hashed_by": "cm-gate"},
             {"name": "ticks", "kind": "db", "locator": "SELECT * FROM ticks WHERE t BETWEEN 1 AND 2",
              "content_id": "snapshot:ticks-2026-10-20"},
         ],
@@ -309,7 +309,7 @@ class EPCases(unittest.TestCase):
     def test_staging_artifact_size_and_identity_are_bound(self):
         r = receipt(inputs=[{"name": "staging", "kind": "artifact", "locator": "/s/out.bin",
                              "content_id": "sha256:" + "8" * 64, "bytes": 12_980_000_000,
-                             "produced_by": "r-sejd-9-2"}])
+                             "produced_by": "r-sejd-9-2", "hashed_by": "cm-gate"}])
         inp = r["inputs"][0]
         self.assertEqual((inp["bytes"], inp["produced_by"]), (12_980_000_000, "r-sejd-9-2"))
         self.assertEqual(inp["verification"], "hashed_at_run")

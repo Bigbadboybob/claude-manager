@@ -59,7 +59,7 @@ def wire(head=HEAD, mf=None, **over) -> dict:
         "worktree": {"head_before": head, "head_after": head, "dirty_before": False,
                      "dirty_after": False, "path": "/w/lane"},
         "inputs": [{"name": "harvest", "kind": "dir", "locator": "/data/harvest",
-                    "content_id": "tree:" + "9" * 64}],
+                    "content_id": "tree:" + "9" * 64, "hashed_by": "cm-gate"}],
         "steps": [
             {"name": "pytest", "state": "ran", "rc": 0, "at_sha": head,
              "effective_cmd": {"argv": ["pytest", "tests"]},

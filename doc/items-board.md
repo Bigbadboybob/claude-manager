@@ -328,6 +328,11 @@ are restart-barrier read-only). The daemon resolves the caller's pid, task and
 board, resolves holder names, enforces §2 rule 10, stamps `actor`, and
 forwards. The Operator (TUI) acts as `owner`.
 
+Gate receipts add `gate.report`, `gate.receipts`, `gate.waive` and
+`gate.profile` (MCP `gate_report`, `gate_receipts`, `gate_waive`,
+`gate_profile`) and the runner `scripts/cm-gate`; see
+[gate-receipts.md](gate-receipts.md) §9.
+
 **TUI.** Every 20 s the viewer reads `board.owner_blocked` (one small filtered
 query, first reachable daemon) and marks each holder's sidebar row and its
 workspace header with an amber ◇/◆ alternating about once a second plus a bold
@@ -344,6 +349,10 @@ wait for show `→ blocks #4 #7` (the read's `blocks`, else computed in the
 viewer). Under the summary, `⟵ N blocked: on items · on Owner · external`.
 The detail pane lists **Blocked by** (each blocker's badge, title, holder
 chips and ETA, then the reason and check-back time) and **Blocks**.
+Gate receipts ([gate-receipts.md](gate-receipts.md)) add a cell after the badge
+(`✓PASS` `✗FAIL` `⊘VOID` `◐INC` `⟲STALE`; the worst gate, `+N` for others), a
+**Gate** section per gate in the detail pane, and `N stale receipts` /
+`runner VOID ×N` in the banner.
 
 Holder arguments accept a chat name, a session uid, a participant id, `me`, or
 `none`. An unknown or ambiguous name is refused with the candidates.
@@ -356,8 +365,10 @@ item(title: str | list[str], holder=None, status="active", note=None, group=None
 
 item_set(n: int | list[int], status=None, note=None, holder=None, add_holder=None,
          remove_holder=None, group=None, blocked_by=None, blocked_on=None,
-         check_back=None, eta=None, title=None, links=None, reason=None, board=None)
+         check_back=None, eta=None, title=None, links=None, reason=None, board=None,
+         head=None, mf=None, ruling=None, gate_class=None)
   -> {items, unblocked?, warnings?}
+  # head / mf / ruling / gate_class: gate bindings (gate-receipts.md §8)
 
 board(board=None, view="slim", mine=False, group=None, include_closed=True,
       archived=False, query=None)

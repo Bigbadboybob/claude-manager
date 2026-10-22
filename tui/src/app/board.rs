@@ -537,9 +537,10 @@ impl App {
             lines.push(Line::from(""));
         }
         // Items: flagged first (already ordered by the daemon), then groups.
-        let cols = Columns::for_width(width);
-        let now = now_unix();
         let items = b.items();
+        let gated = items.iter().chain(b.closed()).any(|i| item_gate(i).is_some());
+        let cols = Columns::with_gate(width, gated);
+        let now = now_unix();
         let index = item_index(b);
         let mut group: Option<String> = None;
         let mut cursor_line = 0usize;
@@ -574,7 +575,7 @@ impl App {
         let footer_h = 2u16;
         // The compact pane grows by the selected row's Blocked by / Blocks
         // lines, up to half the overlay.
-        let edge_lines = b.selected().map_or(0, |item| detail_edge_lines(item, &index)) as u16;
+        let edge_lines = b.selected().map_or(0, |item| detail_edge_lines(item, &index) + gate_detail_lines(item)) as u16;
         let detail_h: u16 = if b.selected().is_none() {
             0
         } else if b.detail {
@@ -629,6 +630,22 @@ impl App {
         } else {
             spans.push(Span::styled("no flags", Style::default().fg(theme::OK)));
         }
+        let stale = b.items().iter().map(|i| gates_of(i).filter(|(_, g)| g["verdict"] == "STALE").count()).sum::<usize>();
+        if stale > 0 {
+            spans.push(sep());
+            spans.push(Span::styled(
+                format!("\u{27f2} {stale} stale receipt{}", if stale == 1 { "" } else { "s" }),
+                Style::default().fg(theme::ATTN),
+            ));
+        }
+        let runner_void = b.data["flags"].as_array().into_iter().flatten()
+            .filter(|f| f["kind"] == "runner_void")
+            .filter_map(|f| f["detail"]["count"].as_i64())
+            .max();
+        if let Some(count) = runner_void {
+            spans.push(sep());
+            spans.push(Span::styled(format!("runner VOID \u{00d7}{count}"), Style::default().fg(GATE_VOID).add_modifier(Modifier::BOLD)));
+        }
         let free = b.data["free_capacity"].as_array().map_or(0, Vec::len);
         if free > 0 {
             spans.push(sep());
@@ -661,6 +678,11 @@ impl App {
             Span::styled(if selected { "\u{25b6} " } else { "  " }, Style::default().fg(theme::TEXT)),
             Span::styled(format!("{:>4} ", format!("#{}", item["n"])), fade(Style::default().fg(theme::MUTED))),
             Span::styled(pad(&badge, cols.badge), fade(badge_style)),
+            match item_gate(item).filter(|_| cols.gate > 0) {
+                // Leading space: a full-width badge (`WAIT 32m left`) fills its column.
+                Some((cell, style)) => Span::styled(pad(&format!(" {cell}"), cols.gate), fade(style)),
+                None => Span::raw(" ".repeat(cols.gate)),
+            },
             if flagged {
                 Span::styled("\u{2691} ", Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD))
             } else if item["status"] == "blocked_on_owner" && !closed {
@@ -761,6 +783,7 @@ impl App {
         }
         lines.push(Line::styled(meta.join(" \u{00b7} "), Style::default().fg(theme::MUTED)));
         lines.extend(self.detail_edges(item, index, now));
+        lines.extend(gate_detail(item));
         if let Some(note) = item["note"].as_str().filter(|n| !n.is_empty()) {
             lines.push(Line::styled(format!("note: {note}"), Style::default().fg(theme::TEXT)));
         }
@@ -888,6 +911,8 @@ impl App {
 /// Column widths for one item row at `width` cells.
 struct Columns {
     badge: usize,
+    /// The gate-receipt cell (` ⟲STALE+1 `); 0 when no item has a receipt.
+    gate: usize,
     title: usize,
     chips: usize,
     note: usize,
@@ -898,12 +923,18 @@ impl Columns {
     /// tail, the tail a bit wider than the title since it carries the blocker;
     /// it disappears on very narrow terminals.
     fn for_width(width: usize) -> Self {
+        Self::with_gate(width, false)
+    }
+
+    /// As `for_width`, with room for the gate cell when any row has a receipt.
+    fn with_gate(width: usize, gated: bool) -> Self {
         let badge = 13;
-        let rest = width.saturating_sub(2 + 5 + badge + 2);
+        let gate = if gated { GATE_CELL + 2 } else { 0 };
+        let rest = width.saturating_sub(2 + 5 + badge + gate + 2);
         let chips = (rest / 5).clamp(12, 30).min(rest.saturating_sub(16));
         let title = (rest.saturating_sub(chips) * 2 / 5).clamp(16, 60).min(rest.saturating_sub(chips + 1));
         let note = rest.saturating_sub(title + 1 + chips);
-        Self { badge, title, chips, note: if note >= 10 { note } else { 0 } }
+        Self { badge, gate, title, chips, note: if note >= 10 { note } else { 0 } }
     }
 }
 
@@ -1032,6 +1063,152 @@ fn blocked_summary(items: &[Value], width: usize) -> Option<Line<'static>> {
         ],
         width,
     )))
+}
+
+/// Width of the row's gate cell: `⟲STALE+9`.
+const GATE_CELL: usize = 8;
+/// VOID (no result: infra trouble or a missing input) is neither red nor green.
+const GATE_VOID: ratatui::style::Color = ratatui::style::Color::Magenta;
+
+/// The item's latest receipt per gate (doc/gate-receipts.md §9), by gate name.
+fn gates_of(item: &Value) -> impl Iterator<Item = (&String, &Value)> {
+    item["gate"].as_object().into_iter().flatten()
+}
+
+/// Worst first: STALE > FAIL > VOID > INCOMPLETE > PASS; unknown verdicts last.
+fn gate_rank(verdict: &str) -> u8 {
+    match verdict {
+        "STALE" => 5,
+        "FAIL" => 4,
+        "VOID" => 3,
+        "INCOMPLETE" => 2,
+        "PASS" => 1,
+        _ => 0,
+    }
+}
+
+/// `✓PASS` green, `✗FAIL` red, `⊘VOID` magenta, `◐INC` amber, `⟲STALE` dim.
+fn gate_badge(verdict: &str) -> (String, Style) {
+    let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    match verdict {
+        "PASS" => ("\u{2713}PASS".into(), bold(theme::OK)),
+        "FAIL" => ("\u{2717}FAIL".into(), bold(theme::ERROR)),
+        "VOID" => ("\u{2298}VOID".into(), bold(GATE_VOID)),
+        "INCOMPLETE" => ("\u{25d0}INC".into(), bold(theme::ATTN)),
+        "STALE" => ("\u{27f2}STALE".into(), Style::default().fg(theme::DIM)),
+        // An unknown verdict is shown verbatim, never as a pass.
+        other => (truncate(other, GATE_CELL), Style::default().fg(theme::TEXT)),
+    }
+}
+
+/// The row cell: the worst gate's badge, plus `+N` for the other gates.
+fn item_gate(item: &Value) -> Option<(String, Style)> {
+    let gates: Vec<&Value> = gates_of(item).map(|(_, g)| g).collect();
+    let worst = gates.iter().max_by_key(|g| gate_rank(g["verdict"].as_str().unwrap_or("")))?;
+    let (mut text, style) = gate_badge(worst["verdict"].as_str().unwrap_or("?"));
+    if gates.len() > 1 {
+        text.push_str(&format!("+{}", gates.len() - 1));
+    }
+    Some((text, style))
+}
+
+/// `412 passed · 3 skipped` / `Found 2 errors` / `rc 1` for one step.
+fn step_summary(step: &Value) -> String {
+    let p = &step["parsed"];
+    if p["passed"].is_i64() {
+        let mut parts = vec![format!("{} passed", p["passed"])];
+        for key in ["failed", "errors", "skipped", "deselected"] {
+            if let Some(n) = p[key].as_i64().filter(|n| *n > 0) {
+                parts.push(format!("{n} {key}"));
+            }
+        }
+        return parts.join(" \u{00b7} ");
+    }
+    if let Some(ok) = p["ok"].as_bool() {
+        return if ok { "Success".into() } else { format!("Found {} errors", p["errors"]) };
+    }
+    if let Some(v) = p["violations"].as_i64() {
+        return if v == 0 { "All checks passed".into() } else { format!("{v} violations") };
+    }
+    match step["state"].as_str() {
+        Some("ran") => step["rc"].as_i64().map(|rc| format!("rc {rc}")).unwrap_or_default(),
+        Some(state) => state.replace('_', " "),
+        None => String::new(),
+    }
+}
+
+/// The detail pane's Gate section: one block per gate.
+fn gate_detail(item: &Value) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme::DIM);
+    let mut lines = Vec::new();
+    for (name, g) in gates_of(item) {
+        let verdict = g["verdict"].as_str().unwrap_or("?");
+        let (badge, style) = gate_badge(verdict);
+        lines.push(Line::from(vec![
+            Span::styled(format!("Gate {name} "), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+            Span::styled(badge, style),
+            Span::styled(format!("  {}", g["headline"].as_str().unwrap_or("")), Style::default().fg(theme::MUTED)),
+        ]));
+        let mut meta = vec![Span::styled(
+            format!("  head {}", g["head"].as_str().map(|h| h.get(..7).unwrap_or(h)).unwrap_or("?")),
+            Style::default().fg(theme::MUTED),
+        )];
+        if let Some(stale) = g["stale"].as_object() {
+            let mut why = stale.get("reason").and_then(Value::as_str).unwrap_or("stale").to_owned();
+            let (prev, new) = (stale.get("prev").and_then(Value::as_str), stale.get("new").and_then(Value::as_str));
+            if prev.is_some() || new.is_some() {
+                why.push_str(&format!(" {} \u{2192} {}", prev.unwrap_or("?"), new.unwrap_or("?")));
+            }
+            if let Some(was) = g["was"].as_str() {
+                why.push_str(&format!(" (was {was})"));
+            }
+            meta.push(Span::styled(" \u{00b7} ", dim));
+            meta.push(Span::styled(format!("STALE: {why}"), Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD)));
+        }
+        if let Some(s) = g["unchecked_s"].as_i64() {
+            meta.push(Span::styled(" \u{00b7} ", dim));
+            meta.push(Span::styled(format!("base unchecked {}", age(s)), Style::default().fg(theme::ATTN)));
+        }
+        if let Some(att) = g["attestation"].as_str() {
+            meta.push(Span::styled(format!(" \u{00b7} {att}"), dim));
+        }
+        lines.push(Line::from(meta));
+        let reasons: Vec<&Value> = g["reasons"].as_array().into_iter().flatten().collect();
+        for step in g["steps"].as_array().into_iter().flatten() {
+            let sname = step["name"].as_str().unwrap_or("?");
+            let blocked = reasons.iter().any(|r| r["step"] == sname && r["level"] != "void");
+            let (glyph, gstyle) = match step["state"].as_str() {
+                Some("void") => ("\u{2298}", Style::default().fg(GATE_VOID)),
+                Some("ran") if blocked => ("\u{2717}", Style::default().fg(theme::ERROR)),
+                Some("ran") => ("\u{2713}", Style::default().fg(theme::OK)),
+                _ => ("\u{00b7}", dim),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {glyph} "), gstyle),
+                Span::styled(format!("{sname} "), Style::default().fg(theme::TEXT)),
+                Span::styled(step_summary(step), Style::default().fg(theme::MUTED)),
+            ]));
+        }
+        for r in &reasons {
+            let color = match r["level"].as_str() {
+                Some("fail") => theme::ERROR,
+                Some("void") => GATE_VOID,
+                _ => theme::ATTN,
+            };
+            lines.push(Line::styled(format!("  ! {}", r["text"].as_str().unwrap_or("")), Style::default().fg(color)));
+        }
+        if let Some(id) = g["id"].as_str() {
+            lines.push(Line::styled(format!("  receipt {id}"), dim));
+        }
+    }
+    lines
+}
+
+/// Lines the detail pane needs for its Gate section.
+fn gate_detail_lines(item: &Value) -> usize {
+    gates_of(item)
+        .map(|(_, g)| 3 + g["steps"].as_array().map_or(0, Vec::len) + g["reasons"].as_array().map_or(0, Vec::len))
+        .sum()
 }
 
 /// Lines the detail pane needs for its Blocked by / Blocks sections.
@@ -1543,6 +1720,104 @@ mod tests {
         assert_eq!(Columns::for_width(60).note, 0, "very narrow terminals drop the note column");
         assert!(2 + 5 + wide.badge + 2 + wide.title + 1 + wide.chips + wide.note <= 158);
         assert!(2 + 5 + narrow.badge + 2 + narrow.title + 1 + narrow.chips <= 98);
+    }
+
+    fn gate(verdict: &str) -> Value {
+        json!({"id":"r-test-fake-board-3-1","verdict":verdict,"was":null,"headline":verdict,
+               "head":"a1b2c3d4e5f60718293a4b5c6d7e8f9012345678","stale":null,"attestation":"cm-gate",
+               "reasons":[],"steps":[]})
+    }
+
+    #[test]
+    fn gate_cell_for_each_verdict_and_the_worst_of_several() {
+        let cell = |v: Value| item_gate(&v).map(|(t, s)| (t, s.fg));
+        for (verdict, text, color) in [
+            ("PASS", "\u{2713}PASS", theme::OK),
+            ("FAIL", "\u{2717}FAIL", theme::ERROR),
+            ("VOID", "\u{2298}VOID", GATE_VOID),
+            ("INCOMPLETE", "\u{25d0}INC", theme::ATTN),
+            ("STALE", "\u{27f2}STALE", theme::DIM),
+        ] {
+            assert_eq!(cell(json!({"gate":{"gate": gate(verdict)}})), Some((text.into(), Some(color))));
+        }
+        assert_eq!(cell(json!({"n":1})), None, "no receipt, no cell");
+        let several = json!({"gate":{"gate":gate("PASS"),"bench":gate("VOID"),"integ":gate("FAIL")}});
+        assert_eq!(cell(several).unwrap().0, "\u{2717}FAIL+2", "worst first, then +N");
+        let stale = json!({"gate":{"gate":gate("FAIL"),"bench":gate("STALE")}});
+        assert_eq!(cell(stale).unwrap().0, "\u{27f2}STALE+1", "STALE outranks FAIL");
+        assert!(gate_badge("STALE").0.chars().count() + 2 <= GATE_CELL, "room for +N");
+    }
+
+    fn gated(app: &mut App) {
+        loaded(app);
+        let mut data = app.board.data.clone();
+        let item = &mut data["items"][0];
+        item["gate"] = json!({
+            "gate": {"id":"r-test-fake-board-3-4","verdict":"STALE","was":"PASS",
+                     "headline":"STALE (was PASS): head_moved a1b2c3d \u{2192} 9f8e7d6",
+                     "head":"a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+                     "stale":{"reason":"head_moved","prev":"a1b2c3d","new":"9f8e7d6"},
+                     "unchecked_s":2400,"attestation":"cm-gate",
+                     "reasons":[],
+                     "steps":[{"name":"pytest","state":"ran","rc":0,"parsed":{"passed":412,"failed":0,"errors":0,"skipped":3}},
+                              {"name":"mypy","state":"ran","rc":0,"parsed":{"ok":true,"errors":0,"files":9}},
+                              {"name":"fetch","state":"void","rc":null,"parsed":null}]},
+            "bench": {"id":"r-test-fake-board-3-2","verdict":"VOID","was":null,"headline":"VOID: fetch void (FETCH_FAIL)",
+                      "head":"a1b2c3d4e5f60718293a4b5c6d7e8f9012345678","stale":null,"attestation":"self",
+                      "reasons":[{"level":"void","text":"fetch: void (FETCH_FAIL)","step":"fetch"},
+                                 {"level":"fail","text":"ruff: 3 violations","step":"ruff"}],
+                      "steps":[{"name":"ruff","state":"ran","rc":1,"parsed":{"violations":3}},
+                               {"name":"fetch","state":"void","rc":null,"parsed":null}]}
+        });
+        data["items"][1]["gate"] = json!({"gate": gate("PASS")});
+        data["flags"].as_array_mut().unwrap().push(json!({"n":3,"kind":"runner_void","age_s":60,
+            "detail":{"runner_sha":"2222222","count":2,"receipts":[]}}));
+        app.board.data = data;
+        app.board.cursor = 0;
+        app.board.detail = true;
+    }
+
+    #[test]
+    fn gate_receipts_render_in_rows_detail_and_banner() {
+        for width in [100u16, 160] {
+            let mut app = test_app();
+            gated(&mut app);
+            let text = screen_at(&mut app, width, 60);
+            if std::env::var_os("CM_BOARD_DUMP").is_some() {
+                println!("--- {width} columns ---\n{text}");
+            }
+            // Row cells: the worst gate plus +N, and a plain PASS.
+            assert!(row(&text, "3").contains("\u{27f2}STALE+1"), "{text}");
+            assert!(row(&text, "1").contains("\u{2713}PASS"), "{text}");
+            // Banner counts.
+            assert!(text.contains("\u{27f2} 1 stale receipt"), "{text}");
+            assert!(text.contains("runner VOID \u{00d7}2"), "{text}");
+            // Detail: stale reason, unchecked base, attestation, steps, reasons, id.
+            assert!(text.contains("Gate gate \u{27f2}STALE"), "{text}");
+            assert!(text.contains("STALE: head_moved a1b2c3d \u{2192} 9f8e7d6 (was PASS)"), "{text}");
+            assert!(text.contains("head a1b2c3d"), "{text}");
+            assert!(text.contains("base unchecked 40m"), "{text}");
+            assert!(text.contains("\u{2713} pytest 412 passed \u{00b7} 3 skipped"), "{text}");
+            assert!(text.contains("\u{2713} mypy Success"), "{text}");
+            assert!(text.contains("\u{2298} fetch void"), "{text}");
+            assert!(text.contains("Gate bench \u{2298}VOID"), "{text}");
+            assert!(text.contains("\u{2717} ruff 3 violations"), "{text}");
+            assert!(text.contains("! fetch: void (FETCH_FAIL)"), "{text}");
+            assert!(text.contains("receipt r-test-fake-board-3-4"), "{text}");
+            // Badge columns still align with the gate column added.
+            let badge_at = |n: &str| {
+                let l: Vec<char> = row(&text, n).chars().collect();
+                ["ACTIVE", "WAIT", "BLOCKED", "OPEN"].iter().filter_map(|b| {
+                    let b: Vec<char> = b.chars().collect();
+                    l.windows(b.len()).position(|w| w == b.as_slice())
+                }).min()
+            };
+            let starts: Vec<_> = ["3", "1", "4", "2"].iter().map(|n| badge_at(n)).collect();
+            assert!(starts.iter().all(|s| s.is_some() && *s == starts[0]), "{starts:?}\n{text}");
+        }
+        let narrow = Columns::with_gate(98, true);
+        assert!(2 + 5 + narrow.badge + narrow.gate + 2 + narrow.title + 1 + narrow.chips + narrow.note <= 98);
+        assert_eq!(Columns::for_width(98).gate, 0, "no receipts, no gate column");
     }
 
     #[test]

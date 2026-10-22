@@ -299,6 +299,10 @@ def item_set(
     links: list[str] | None = None,
     reason: str | None = None,
     board: str | None = None,
+    head: str | None = None,
+    mf: str | None = None,
+    ruling: str | None = None,
+    gate_class: str | None = None,
 ) -> dict:
     """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
     note="needs EP GO"), item_set(15, blocked_by=[14]),
@@ -313,7 +317,9 @@ def item_set(
 
     holder replaces the holders ("none" hands the item back); add_holder /
     remove_holder adjust them. An empty string clears note, group or
-    blocked_on; blocked_by=[] clears blockers. Marking an item done unblocks
+    blocked_on; blocked_by=[] clears blockers. head / mf / ruling move the
+    item's gate bindings (full SHAs, a ruling id; "" clears) and make older
+    gate receipts STALE; gate_class picks its gate profile. Marking an item done unblocks
     items waiting only on it and wakes their holders. Anyone on the board may
     edit any item; history is kept, so give a reason for drops and handoffs.
 
@@ -385,6 +391,118 @@ def item_resolve(
         params["request_id"] = request_id or uuid.uuid4().hex
         return _items_call("item.resolve", params, timeout=_ITEMS_LAUNCH_TIMEOUT_S)
     return _items_call("item.resolve", params)
+
+
+@mcp.tool()
+def gate_report(
+    n: int,
+    steps: list[dict],
+    head: str,
+    mf: str | None = None,
+    runner: dict | None = None,
+    ruling: str | None = None,
+    base: dict | None = None,
+    closure: dict | None = None,
+    worktree: dict | None = None,
+    inputs: list[dict] | None = None,
+    waivers: list[str] | None = None,
+    gate: str = "gate",
+    klass: str | None = None,
+    log_path: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    attestation: str = "self",
+    board: str | None = None,
+    request_id: str | None = None,
+) -> dict:
+    """Post a gate receipt on item n (doc/gate-receipts.md). Prefer
+    `scripts/cm-gate run --item N`, which runs the item's gate profile and
+    posts everything below with attestation "cm-gate".
+
+    CM computes the verdict from the evidence: PASS / FAIL / VOID /
+    INCOMPLETE, and STALE once a bound identity moves. Your own word is never
+    the verdict. List EVERY planned step, including failed, skipped and never
+    started ones: {name, state: ran|skipped|not_run|void, rc, summary (the
+    tool's own summary lines), effective_cmd {argv, env, cwd}, at_sha}; pytest
+    steps also need nodes [{id, outcome, exc_type?}], skips [{node, reason}]
+    and deselected [{node, reason}] (an empty list is explicit; a missing one
+    is INCOMPLETE). Inputs are {name, kind: file|dir|gcs|artifact|db,
+    locator, content_id, state, bytes?, produced_by?}; a missing input makes
+    the run VOID, an unbound one INCOMPLETE. waivers cite grant ids a grantor
+    attached with gate_waive.
+
+    Returns {board, n, receipt: {id, verdict, headline, reasons, runs, stale?}}.
+    """
+    params = dict(locals())
+    params["request_id"] = request_id or uuid.uuid4().hex
+    return _items_call("gate.report", params)
+
+
+@mcp.tool()
+def gate_receipts(n: int, gate: str | None = None, history: bool = False,
+                  board: str | None = None) -> dict:
+    """Item n's latest gate receipt per gate (verdict, reasons, bound SHAs,
+    steps, inputs with how each was verified), its grants and its current
+    bindings; history=True adds every earlier receipt, newest first."""
+    return _items_call("gate.receipts", locals())
+
+
+@mcp.tool()
+def gate_waive(
+    n: int,
+    head: str,
+    step: str,
+    reason: str,
+    risk: str,
+    message_id: str,
+    kind: str = "waiver",
+    nodes: list[str] | None = None,
+    base: str | None = None,
+    cmd_digest: str | None = None,
+    gate: str = "gate",
+    revoke: str | None = None,
+    board: str | None = None,
+) -> dict:
+    """Grantors only (Owner and the board's waiver_grantors): attach a grant
+    to item n. First post the grant in chat, naming the exact HEAD SHA (at
+    least 12 characters; base→head if it depends on the base), the step or
+    node ids, the reason and the real risk; pass that message's id here.
+    Your daemon checks that you sent it and that it names the SHA.
+
+    kind="waiver" lets a receipt that cites the grant id count `step` (or
+    just `nodes`) as satisfied on exactly that head. kind="variance"
+    accepts a weakened run (fewer nodes, a narrower filter, a changed
+    command) for exactly that head and cmd_digest (from the FAIL reason or
+    gate_receipts). A grant for another SHA, or for "the gate", never
+    covers a run. revoke=<grant id> withdraws one and makes receipts that
+    relied on it STALE.
+    """
+    return _items_call("gate.waive", locals())
+
+
+@mcp.tool()
+def gate_profile(
+    klass: str | None = None,
+    profile: dict | None = None,
+    reason: str | None = None,
+    default: bool = False,
+    delete: bool = False,
+    n: int | None = None,
+    board: str | None = None,
+) -> dict:
+    """Read a board's gate profile (by klass, or n for that item's class),
+    or write one: Owner, the board orchestrator and gate_editors only, with a
+    reason. A profile lists the steps a valid run must contain (kind pytest /
+    mypy / ruff / rc, argv as granted, must_run nodes, skip_policy, MF
+    expect_fail types), its waivable steps, required identities
+    (require.mf_sha / runner / ruling_id / attestation), its base
+    {ref, scope: paths|tree} and declared inputs. Every edit is logged and
+    makes all receipts of that class STALE.
+    """
+    params = dict(locals())
+    if not delete:
+        params.pop("delete")
+    return _items_call("gate.profile", params)
 
 
 def _chat_call(method: str, params: dict) -> dict:

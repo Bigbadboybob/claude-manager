@@ -114,6 +114,9 @@ If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
   the list Owner reads. Check it (holder states, flags) before messaging a lane
   for status, and resolve every flag you are woken for with `item_resolve`.
 - Declare a job longer than 20 minutes on its item: `item_set(n, "waiting", eta=..., note=...)`.
+- Gate results go on the item as receipts, not prose: run `cm-gate run --item N`
+  (CM checkout `scripts/`) or `gate_report`. CM computes PASS / FAIL / VOID /
+  INCOMPLETE / STALE from the evidence; read `gate_receipts(n)` before ruling.
 - Only DMs, `mentions`, a body `@Name` of a current member, `mention_here` and
   session monitors wake anyone; read `warnings` on every send. After
   dispatching, end your turn and let the wake arrive.

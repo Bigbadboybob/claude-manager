@@ -30,6 +30,21 @@ class ItemToolsTests(unittest.TestCase):
         _, params = self.call(server.item_set, [14, 15], blocked_by=[])
         self.assertEqual(params, {"n": [14, 15], "blocked_by": []})
 
+    def test_gate_tools_route_to_the_daemon(self):
+        method, params = self.call(server.gate_report, 14, [], "a" * 40, klass="py")
+        self.assertEqual(method, "gate.report")
+        self.assertRegex(params.pop("request_id"), r"^[0-9a-f]{32}$")
+        self.assertEqual(params, {"n": 14, "steps": [], "head": "a" * 40, "klass": "py",
+                                  "gate": "gate", "attestation": "self"})
+        method, params = self.call(server.gate_waive, 14, "a" * 40, "mypy", "r", "k", "m-1")
+        self.assertEqual((method, params["kind"], params["message_id"]), ("gate.waive", "waiver", "m-1"))
+        method, params = self.call(server.gate_profile, klass="py")
+        self.assertEqual((method, params), ("gate.profile", {"klass": "py", "default": False}))
+        method, params = self.call(server.gate_receipts, 14)
+        self.assertEqual((method, params), ("gate.receipts", {"n": 14, "history": False}))
+        _, params = self.call(server.item_set, 14, mf="c" * 40, ruling="")
+        self.assertEqual(params, {"n": 14, "mf": "c" * 40, "ruling": ""})
+
     def test_board_defaults(self):
         method, params = self.call(server.board)
         self.assertEqual(method, "board.read")
@@ -58,7 +73,8 @@ class ItemToolsTests(unittest.TestCase):
         self.assertIn("request_id='rq-7'", str(cm.exception))
 
     def test_methods_are_daemon_routed(self):
-        for method in ("item.create", "item.set", "item.resolve", "board.read"):
+        for method in ("item.create", "item.set", "item.resolve", "board.read", "gate.report",
+                       "gate.receipts", "gate.waive", "gate.profile"):
             self.assertIn(method, control_client.DAEMON_METHODS)
 
 

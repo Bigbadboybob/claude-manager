@@ -78,6 +78,16 @@ impl Api {
             path,
         )
     }
+
+    pub fn put(&self, path: &str, body: &Value) -> ApiResult {
+        finish(
+            self.agent()
+                .put(&self.url(path))
+                .header("Authorization", &self.auth())
+                .send_json(body),
+            path,
+        )
+    }
 }
 
 fn finish(

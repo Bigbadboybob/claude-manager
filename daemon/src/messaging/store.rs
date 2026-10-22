@@ -2119,6 +2119,21 @@ impl Store {
             .find(|p| p.event["id"] == id && p.event["type"] == "message.create")
             .and_then(|p| p.event["body"].as_str().map(str::to_owned))
     }
+    /// A message's sender participant id and body (gate waivers check that
+    /// the grantor sent the linked message and that it names the SHA).
+    /// Read-only.
+    pub fn message_sender_and_body(&self, id: &str) -> Option<(String, String)> {
+        self.events
+            .iter()
+            .rev()
+            .find(|p| p.event["id"] == id && p.event["type"] == "message.create")
+            .map(|p| {
+                (
+                    p.event["actor"]["id"].as_str().unwrap_or_default().to_owned(),
+                    p.event["body"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+    }
     pub fn notifications(&self) -> Vec<(String, String, String)> {
         self.wake_intents()
             .into_iter()

@@ -396,9 +396,12 @@ def normalize_input(raw, attestation: str) -> dict:
         "produced_by": produced_by,
     }
     # Computed here, never taken from the poster.
+    # cm-gate marks the inputs it hashed itself; anything supplied on its
+    # command line, and every db identity, stays self-supplied.
     out["verification"] = ("hashed_at_run"
-                           if attestation == "cm-gate" and kind in CM_HASHED_KINDS
-                           and state == "bound" else "self_supplied_unverified")
+                           if attestation == "cm-gate" and raw.get("hashed_by") == "cm-gate"
+                           and kind in CM_HASHED_KINDS and state == "bound"
+                           else "self_supplied_unverified")
     return out
 
 

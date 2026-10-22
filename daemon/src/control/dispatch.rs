@@ -322,6 +322,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "backtest.result",
     "board.read",
     "board.owner_blocked",
+    "gate.receipts",
     "usage.read",
     "continuous.list",
     "continuous.context",
@@ -867,6 +868,10 @@ pub fn dispatch_request(
         ),
         "item.create" | "item.set" | "item.resolve" | "board.read" | "board.owner_blocked" => {
             DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
+        }
+        // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.
+        "gate.report" | "gate.receipts" | "gate.waive" | "gate.profile" => {
+            DispatchOutcome::Done(crate::items::gate::dispatch(state, req))
         }
 
         // remote-session-execution Phase 1: Operator-only daemon RPCs

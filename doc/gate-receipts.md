@@ -1,7 +1,8 @@
 # Gate receipts on board items: design
 
-**Status:** design revision 2 (2026-10-22, items lane). There is no code yet.
-Implementation waits for Owner's go.
+**Status:** design revision 2 (2026-10-22, items lane); the §11 v1 cut is
+implemented on `items/gate-receipts`. §13 lists where v1 differs in detail
+from the text above. Not deployed.
 
 **Sources:**
 - EP's round-2 and round-3 interview answers
@@ -474,15 +475,21 @@ It reads the item's profile, then:
 Every planned step is posted, so a step that never started appears as
 `not_run` rather than being left out.
 
-**Planning API** (`api/items.py`):
+**Planning API** (`api/items.py`; logic in `dispatch/gate_db.py`):
 
 | Method + path | Body | Returns |
 |---|---|---|
-| `POST /boards/{ref}/items/{n}/receipts` | `{actor, receipt…, request_id?}` | `{receipt, item}` |
-| `GET /boards/{ref}/items/{n}/receipts` | `?gate=&history=0` | `{latest, history, grants}` |
-| `POST /boards/{ref}/items/{n}/grants` | `{actor, kind, head, base?, step, nodes?, cmd_digest?, reason, risk, message_id, message_check: {found, sender, contains_head}}` or `{actor, revoke}` | `{grant}` (the daemon fills `message_check`) |
-| `POST /receipts/refresh` | `{daemon_id, observations: [{repo, ref, sha}], checks: [{receipt_id, base_sha, merge_tree, closure_hit: bool}], inputs: [{receipt_id, name, content_id}]}` | `{stale: [id], watch: [{receipt_id, repo, base_ref, head, runner_ref, closure_cmd, scope}]}`; the daemon keeps no state across brain restarts |
-| `PATCH /boards/{ref}` | `{gate_profiles?, gate_default_class?, gate_editors?, waiver_grantors?, reason}` | board header |
+| `POST /boards/{ref}/items/{n}/receipts` | `{actor, receipt, request_id?}` | `{board, n, receipt}` (the computed verdict, `runs`, `stale?`); a repeated `request_id` replays the first receipt |
+| `GET /boards/{ref}/items/{n}/receipts` | `?gate=&history=false` | `{n, class, binding, latest: {gate: receipt}, grants, history?}` |
+| `POST /boards/{ref}/items/{n}/grants` | `{actor, kind, gate, head, base?, step, nodes?, cmd_digest?, reason, risk, message_id, message_check}` | `{grant}`; 403 unless the actor is a grantor, 422 for a generic or mis-scoped grant |
+| `PATCH /boards/{ref}/items/{n}/grants/{id}` | `{actor, revoke: true}` or `{actor, message_check}` | `{grant}` |
+| `GET /boards/{ref}/gate-profiles` | `?class=&n=` | `{class, profile, classes, default_class, gate_editors, waiver_grantors, binding?}` |
+| `PUT /boards/{ref}/gate-profiles/{class}` | `{actor, profile \| null, reason, default}` | `{profile, version, restaled}` |
+| `POST /receipts/refresh` | `{daemon_id, checks: [{receipt_id, branch_head?, runner_sha?, base_sha?, changed_paths?, changed_paths_truncated?, merge_tree?, error?}]}` | `{stale: [id], watch: [{receipt_id, path, branch, head, base_ref, base_sha_after, runner_ref, scope}]}` |
+| `PATCH /boards/{ref}` | `{gate_default_class?, gate_editors?, waiver_grantors?}` | board header; the two lists are Owner-only |
+
+`board()` reads carry `gate: {<gate>: {id, verdict, was, headline, head, stale,
+unchecked_s?, reasons, steps}}` on each item.
 
 **TUI (Alt+B).** A gate cell after the status badge: `✓PASS` green, `✗FAIL`
 red, `⊘VOID` magenta, `◐INC` amber, `⟲STALE` dim. The detail pane gets a
@@ -500,92 +507,29 @@ The banner adds `N stale receipts` and any `runner VOID ×N`.
 ## 10. Storage (migration `023_item_receipts.sql`, number claimed at implementation)
 
 Uses the items style: rerunnable DDL only, no row UPDATEs, every write inside
-the board-row lock, and every change an `item_events` row.
+the board-row lock, and every change an `item_events` row. The DDL is
+`sql/023_item_receipts.sql`:
 
-```sql
-CREATE TABLE IF NOT EXISTS item_receipts (
-    id            BIGSERIAL PRIMARY KEY,
-    board_id      UUID NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
-    item_id       BIGINT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-    seq           INTEGER NOT NULL,
-    gate          TEXT NOT NULL DEFAULT 'gate',
-    class         TEXT,
-    profile_version INTEGER,
-    head_sha      TEXT NOT NULL,
-    mf_sha        TEXT,
-    runner        JSONB,
-    ruling_id     TEXT,
-    base          JSONB NOT NULL DEFAULT '{}'::jsonb,
-    closure       JSONB,
-    worktree      JSONB NOT NULL DEFAULT '{}'::jsonb,
-    inputs        JSONB NOT NULL DEFAULT '[]'::jsonb,
-    steps         JSONB NOT NULL,            -- incl. CM-parsed fields
-    waivers       TEXT[] NOT NULL DEFAULT '{}',
-    repo          TEXT, branch TEXT, log_path TEXT,
-    attestation   TEXT NOT NULL,
-    computed      JSONB NOT NULL,            -- {verdict, reasons} at post time
-    stale_at      TIMESTAMPTZ,
-    stale_reason  JSONB,                     -- {reason, prev, new}
-    checked_at    TIMESTAMPTZ,
-    poster_pid    TEXT NOT NULL,
-    request_id    TEXT,
-    posted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT item_receipts_seq_key UNIQUE (item_id, seq)
-);
-CREATE INDEX IF NOT EXISTS idx_item_receipts_latest
-    ON item_receipts (item_id, gate, id DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_item_receipts_request
-    ON item_receipts (board_id, request_id) WHERE request_id IS NOT NULL;
--- input identities, for input_changed and the derived-artifact cascade
-CREATE TABLE IF NOT EXISTS item_receipt_inputs (
-    receipt_id    BIGINT NOT NULL REFERENCES item_receipts(id) ON DELETE CASCADE,
-    name          TEXT NOT NULL,
-    locator       TEXT NOT NULL,
-    content_id    TEXT,
-    produced_by   BIGINT REFERENCES item_receipts(id) ON DELETE SET NULL,
-    PRIMARY KEY (receipt_id, name)
-);
-CREATE INDEX IF NOT EXISTS idx_item_receipt_inputs_locator ON item_receipt_inputs (locator);
-CREATE INDEX IF NOT EXISTS idx_item_receipt_inputs_producer ON item_receipt_inputs (produced_by);
+- `item_receipts`: one row per run, with the identities, steps, inputs,
+  `computed` (the verdict at post time) and `verdict` (the latest
+  evaluation; a grant attached later can change it), `stale_at` /
+  `stale_reason`, `checked_at`, and the poster's pid and daemon id (the
+  refresh watches only its own host's receipts).
+- `item_receipt_inputs`: `(receipt, name) → locator, content_id, state,
+  produced_by`, for `input_changed`, `input_void` and the cascade.
+- `item_grants`: waiver and variance grants with the daemon's
+  `message_check`.
+- `items.gate_class`, `items.gate_binding {head, mf, ruling_id}`;
+  `boards.gate_profiles {class: profile}`, `gate_default_class`,
+  `gate_editors`, `waiver_grantors`.
 
-CREATE TABLE IF NOT EXISTS item_grants (
-    id            BIGSERIAL PRIMARY KEY,
-    board_id      UUID NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
-    item_id       BIGINT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-    seq           INTEGER NOT NULL,
-    kind          TEXT NOT NULL CHECK (kind IN ('waiver', 'variance')),
-    gate          TEXT NOT NULL DEFAULT 'gate',
-    grantor_pid   TEXT NOT NULL,
-    head_sha      TEXT NOT NULL,
-    base_sha      TEXT,
-    step          TEXT NOT NULL,
-    nodes         TEXT[],
-    cmd_digest    TEXT,
-    reason        TEXT NOT NULL,
-    risk          TEXT NOT NULL,
-    message_id    TEXT NOT NULL,
-    message_check JSONB NOT NULL,
-    revoked_at    TIMESTAMPTZ,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT item_grants_seq_key UNIQUE (item_id, seq)
-);
+The verdict logic is a pure function in `dispatch/gate_rules.py`:
+`evaluate(receipt, profile, grants) -> {verdict, reasons}`, with the summary
+parsers, the grant-vs-executed diff and the staleness rules beside it. It
+can be tested without a database.
 
-ALTER TABLE items  ADD COLUMN IF NOT EXISTS gate_class TEXT;
-ALTER TABLE items  ADD COLUMN IF NOT EXISTS gate_binding JSONB NOT NULL DEFAULT '{}'::jsonb;
-    -- {head, mf, ruling_id}: what the item says is current
-ALTER TABLE boards ADD COLUMN IF NOT EXISTS gate_profiles JSONB NOT NULL DEFAULT '{}'::jsonb;
-ALTER TABLE boards ADD COLUMN IF NOT EXISTS gate_default_class TEXT;
-ALTER TABLE boards ADD COLUMN IF NOT EXISTS gate_editors TEXT[] NOT NULL DEFAULT '{}';
-ALTER TABLE boards ADD COLUMN IF NOT EXISTS waiver_grantors TEXT[] NOT NULL DEFAULT '{}';
-```
-
-The verdict logic is a pure function in `dispatch/items_rules.py`:
-`evaluate(receipt, profile, binding, grants) -> {verdict, reasons}`. It sits
-beside the other BoardTx rules and can be tested without a database. The
-parsers and the grant diff go in `dispatch/gate_parse.py`.
-
-A receipt is at most 256 KiB serialized, since `nodes` can be large. Full
-logs stay at `log_path`. Archiving an item archives its receipts and grants.
+A receipt is at most 4 MiB serialized (a large suite's `nodes` list is the
+bulk). Full logs stay at `log_path`. Archiving an item archives its receipts and grants.
 
 **Later: question/ruling records (not this batch).** EP's companion ask is a
 record of question, asker, decision owner, status (open / answered /
@@ -679,3 +623,43 @@ the Alt+B view.
 | Staging artifact 12.98 vs 6.55 GB | the input's `bytes` and `content_id` are bound; a consumer that read a different artifact binds a different id and `produced_by` |
 | Gate started just after a new ruling | the receipt's `ruling_id` differs from the item's, so STALE on arrival with `ruling_superseded` |
 | Unrelated landing on main | `paths` scope: no closure file touched, so the receipt stays valid; a deploy gate with `tree` scope restales |
+
+## 13. v1 implementation notes
+
+Where the code differs in detail from the sections above:
+
+- **Input verification label** (EP, 2026-10-22). Every input in a receipt
+  carries `verification`: `hashed_at_run` when cm-gate hashed it itself
+  (file, dir, gcs, artifact), otherwise `self_supplied_unverified` (every db
+  input, anything passed with `--input`, every `self` receipt). CM computes
+  the label; the poster cannot set it.
+- **pytest evidence** comes from CM's plugin `scripts/cm_gate_pytest.py`
+  (loaded with `-p cm_gate_pytest`), not JUnit XML: it records node ids
+  exactly, the exception type of each failure (forwarded from xdist workers),
+  skip reasons, deselections and collection errors. The granted node set is
+  a `--collect-only` run of the profile's argv, without workers.
+- **The class is the item's.** A receipt naming another class than the
+  item's effective one is refused (`class_mismatch`), so a poster cannot
+  pick a laxer profile. Changing an item's `gate_class` restales its
+  receipts (`class_changed`).
+- **Closure.** The receipt stores the closure paths (up to 20 000). The
+  refresh sends the base's changed paths and the API intersects them, so no
+  path list crosses the wire every five minutes. Without a `closure_cmd`,
+  cm-gate uses the tracked files under the steps' paths plus the files the
+  head changed against the base.
+- **Grant message checks.** `gate.waive` checks the linked message in the
+  grantor's daemon store (sender, and the head SHA's first 12 characters in
+  the body). If the message has not reached that host yet the grant is
+  stored unverified, and `gate_receipts` rechecks it on read.
+- **Void flags.** `runner_void` counts VOID receipts on the board with the
+  same runner SHA in 24 h; `input_void` counts receipts that had the same
+  input locator missing. Both resolve on the item's next non-VOID receipt.
+  Neither escalates to Owner; `receipt_stale` never reaches the orchestrator.
+- **cm-gate exit status**: 0 PASS, 1 FAIL, 2 VOID, 3 INCOMPLETE, 4 STALE,
+  5 runner error. Logs go to `~/.local/share/cm-gate/logs/` (or
+  `CM_GATE_LOG_DIR`) and are pruned after 14 days.
+- **Lane overrides** (`--override lane.toml|json`):
+  `[steps.<name>]` with `prefix`, `extra_args`, `env`,
+  `deselect = [{node, reason}]`, `skip` / `reason`. Each becomes part of the
+  effective command and goes through the §5 diff.
+

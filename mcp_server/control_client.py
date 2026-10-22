@@ -336,6 +336,11 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "item.resolve",
     "board.read",
     "board.owner_blocked",
+    # Gate receipts on items (doc/gate-receipts.md): same daemon-only proxy.
+    "gate.report",
+    "gate.receipts",
+    "gate.waive",
+    "gate.profile",
     # Usage recording (doc/usage-recording.md): read this host's samples.
     "usage.read",
 })

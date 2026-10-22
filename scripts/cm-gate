@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""Run an item's gate profile and post the receipt (doc/gate-receipts.md §9).
+
+    cm-gate run --item 14 [--gate gate] [--board sejd] [--override lane.toml]
+                [--mf SHA] [--ruling EP-A1021] [--input ticks=snapshot:…]
+                [--artifact harvest_json=r-sejd-9-2] [--dry-run]
+
+Run it from the item's checkout, inside a CM session (it posts through your
+daemon as you). It runs every step the item's gate profile declares, at the
+right commit, with CM's pytest plugin recording each node; captures the
+worktree, base and merge-tree identity before and after; hashes the declared
+inputs; and posts everything with attestation "cm-gate". CM computes the
+verdict. Exit status: 0 PASS, 1 FAIL, 2 VOID, 3 INCOMPLETE, 4 STALE, 5 error.
+
+v1 hashes file, dir, gcs and artifact inputs at run time only; db inputs take
+the content id you pass with --input (snapshot:… or rows:…), which CM records
+as self-supplied and unverified.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+EXIT = {"PASS": 0, "FAIL": 1, "VOID": 2, "INCOMPLETE": 3, "STALE": 4}
+SUMMARY_LINES = 40
+LOG_KEEP_DAYS = 14
+
+
+# ---- git -----------------------------------------------------------------------
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                          check=check, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+
+
+def rev(repo: Path, ref: str) -> str | None:
+    out = git(repo, "rev-parse", "--verify", "--quiet", ref, check=False)
+    sha = out.stdout.strip()
+    return sha if out.returncode == 0 and len(sha) == 40 else None
+
+
+def dirty(repo: Path) -> bool:
+    return bool(git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip())
+
+
+def merge_tree(repo: Path, base: str | None, head: str) -> str | None:
+    if not base:
+        return None
+    out = git(repo, "merge-tree", "--write-tree", base, head, check=False)
+    if out.returncode == 1:
+        return "conflict"
+    line = out.stdout.splitlines()[0].strip() if out.stdout else ""
+    return line if out.returncode == 0 and len(line) >= 40 else None
+
+
+def fetch(repo: Path, ref: str) -> None:
+    refname = ref.split(":", 1)[0]
+    if "/" in refname:
+        remote, branch = refname.split("/", 1)
+        git(repo, "fetch", "--quiet", "--no-tags", remote, branch, check=False)
+
+
+# ---- inputs --------------------------------------------------------------------
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def dir_manifest(path: Path) -> tuple[str, int]:
+    """`tree:<sha256 of sorted (relpath, size, sha256) lines>` and total bytes."""
+    lines, total = [], 0
+    for root, dirs, files in os.walk(path):
+        dirs.sort()
+        for name in sorted(files):
+            p = Path(root) / name
+            if p.is_symlink() or not p.is_file():
+                continue
+            size = p.stat().st_size
+            total += size
+            lines.append(f"{p.relative_to(path).as_posix()}\t{size}\t{sha256_file(p)}")
+    return "tree:" + hashlib.sha256("\n".join(lines).encode()).hexdigest(), total
+
+
+def gcs_identity(url: str) -> tuple[str | None, int | None]:
+    out = subprocess.run(["gcloud", "storage", "objects", "describe", url, "--format=json"],
+                         capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        return None, None
+    meta = json.loads(out.stdout or "{}")
+    digest = meta.get("md5_hash") or meta.get("crc32c_hash")
+    gen = meta.get("generation")
+    if not gen or not digest:
+        return None, None
+    return f"gcs:{gen}/{digest}", int(meta.get("size") or 0) or None
+
+
+def bind_input(decl: dict, supplied: dict, artifacts: dict) -> dict:
+    name, kind = decl["name"], decl["kind"]
+    out = {"name": name, "kind": kind, "root_env": decl.get("root_env")}
+    if name in supplied:
+        # Supplied on the command line: recorded, never claimed as hashed here.
+        out.update(locator=decl.get("locator") or decl.get("path") or f"--input {name}",
+                   content_id=supplied[name], state="bound")
+        return out
+    root = os.environ.get(decl["root_env"]) if decl.get("root_env") else None
+    locator = root or decl.get("path") or decl.get("locator") or ""
+    out["locator"] = (f"${decl['root_env']}" if decl.get("root_env") else locator) or name
+    if decl.get("root_env"):
+        out["resolved_root"] = root
+    if kind == "db":
+        out["locator"] = decl.get("locator") or out["locator"]
+        out["state"] = "unbound"
+        return out
+    if kind == "gcs":
+        cid, size = gcs_identity(locator) if locator else (None, None)
+        out.update(content_id=cid, bytes=size, state="bound" if cid else "missing",
+                   hashed_by="cm-gate" if cid else None)
+        return out
+    path = Path(os.path.expanduser(locator)) if locator else None
+    if path is None or not path.exists():
+        out["state"] = "missing"
+        return out
+    if path.is_dir():
+        cid, size = dir_manifest(path)
+    else:
+        cid, size = "sha256:" + sha256_file(path), path.stat().st_size
+    out.update(content_id=cid, bytes=size, state="bound", hashed_by="cm-gate")
+    if kind == "artifact" and name in artifacts:
+        out["produced_by"] = artifacts[name]
+    return out
+
+
+# ---- steps ---------------------------------------------------------------------
+
+def expand(argv: list[str], subs: dict) -> list[str]:
+    out = []
+    for tok in argv:
+        if tok == "{mf_nodes}":
+            out.extend(subs.get("mf_nodes") or [])
+            continue
+        for key in ("head", "mf", "base"):
+            tok = tok.replace("{" + key + "}", subs.get(key) or "")
+        out.append(tok)
+    return out
+
+
+def tail(text: str) -> str:
+    return "\n".join(text.splitlines()[-SUMMARY_LINES:])[-2000:]
+
+
+def run_cmd(argv: list[str], cwd: Path, env: dict, timeout: int | None, log: Path) -> dict:
+    start = dt.datetime.now(dt.timezone.utc)
+    try:
+        proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True,
+                              timeout=timeout)
+    except FileNotFoundError:
+        return {"state": "void", "reason": f"command not found: {argv[0]}",
+                "started_at": start.isoformat()}
+    except subprocess.TimeoutExpired as exc:
+        log.write_text((exc.stdout or "") if isinstance(exc.stdout, str) else "")
+        return {"state": "void", "reason": f"timeout after {timeout}s",
+                "started_at": start.isoformat()}
+    output = (proc.stdout or "") + (proc.stderr or "")
+    log.write_text(output)
+    out = {"state": "ran", "rc": proc.returncode, "summary": tail(output),
+           "started_at": start.isoformat(),
+           "ended_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    if proc.returncode < 0 or proc.returncode == 137:
+        out = {**out, "state": "void", "rc": None,
+               "reason": f"killed (signal {-proc.returncode if proc.returncode < 0 else 9})"}
+    return out
+
+
+def pytest_env(env: dict, report: Path) -> dict:
+    env = dict(env)
+    env["CM_GATE_REPORT"] = str(report)
+    env["PYTHONPATH"] = str(HERE) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    return env
+
+
+def collect_granted(argv: list[str], cwd: Path, env: dict, tmp: Path) -> list[str] | None:
+    """The node ids the granted command selects, collected without running."""
+    clean, skip = [], False
+    for tok in argv:  # collection needs no workers
+        if skip:
+            skip = False
+            continue
+        if tok in ("-n", "--numprocesses"):
+            skip = True
+            continue
+        if tok.startswith(("-n=", "--numprocesses=")) or (tok.startswith("-n") and tok[2:].isdigit()):
+            continue
+        clean.append(tok)
+    report = tmp / "collect.json"
+    proc = subprocess.run([*clean, "--collect-only", "-q", "-p", "cm_gate_pytest"], cwd=cwd,
+                          env=pytest_env(env, report), capture_output=True, text=True)
+    if not report.exists():
+        return None
+    data = json.loads(report.read_text())
+    return data["collected"] if proc.returncode in (0, 5) else None
+
+
+def run_pytest(sp: dict, argv: list[str], cwd: Path, env: dict, timeout, tmp: Path, log: Path,
+               deselect: list[dict]) -> dict:
+    report = tmp / f"{sp['name']}.json"
+    injected = ["-p", "cm_gate_pytest"]
+    result = run_cmd([*argv, *injected], cwd, pytest_env(env, report), timeout, log)
+    result["injected"] = injected
+    reasons = {d["node"]: d.get("reason") or "deselected by override" for d in deselect}
+    if report.exists():
+        data = json.loads(report.read_text())
+        nodes = []
+        for node in data["nodes"]:
+            nodes.append({k: node[k] for k in ("id", "outcome", "exc_type", "phase") if node.get(k)})
+        seen = {n["id"] for n in nodes}
+        for node_id in [*data["deselected"], *reasons]:
+            if node_id not in seen:
+                nodes.append({"id": node_id, "outcome": "deselected"})
+                seen.add(node_id)
+        result["nodes"] = nodes
+        result["skips"] = [{"node": n["id"], "reason": n.get("reason", "")}
+                           for n in data["nodes"] if n["outcome"] == "skipped"]
+        result["deselected"] = [{"node": n["id"], "reason": reasons.get(n["id"], "deselected")}
+                                for n in nodes if n["outcome"] == "deselected"]
+    return result
+
+
+def load_override(path: str | None) -> dict:
+    if not path:
+        return {}
+    text = Path(path).read_text()
+    if path.endswith(".toml"):
+        import tomllib
+
+        return tomllib.loads(text)
+    return json.loads(text)
+
+
+def prune_logs(root: Path) -> None:
+    cutoff = time.time() - LOG_KEEP_DAYS * 86400
+    for child in root.iterdir() if root.exists() else []:
+        if child.is_dir() and child.stat().st_mtime < cutoff:
+            shutil.rmtree(child, ignore_errors=True)
+
+
+def log_root() -> Path:
+    root = Path(os.environ.get("CM_GATE_LOG_DIR") or Path.home() / ".local/share/cm-gate/logs")
+    root.mkdir(parents=True, exist_ok=True)
+    owner = root.parent / "OWNER.md"
+    if not owner.exists():
+        owner.write_text(
+            "# cm-gate\n- created by: scripts/cm-gate (doc/gate-receipts.md)\n"
+            "- purpose: per-run gate logs referenced by receipts' log_path\n"
+            "- keep: nothing; receipts carry the summaries\n"
+            f"- delete-after: each run dir is pruned after {LOG_KEEP_DAYS} days\n")
+    prune_logs(root)
+    return root
+
+
+# ---- the run -------------------------------------------------------------------
+
+def gate_run(args) -> int:
+    repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").stdout.strip())
+    head = rev(repo, "HEAD")
+    branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip() or None
+    if args.profile_file:
+        reply = json.loads(Path(args.profile_file).read_text())
+        if "steps" in reply:
+            reply = {"profile": reply, "class": "local", "binding": {}}
+    else:
+        reply = daemon_call("gate.profile", {"n": args.item, "board": args.board})
+    profile = reply.get("profile")
+    if not profile:
+        print(f"cm-gate: item #{args.item} has no gate profile (class {reply.get('class')}); "
+              "ask the board orchestrator or EP for one", file=sys.stderr)
+        return 5
+    binding = reply.get("binding") or {}
+    mf = args.mf or binding.get("mf")
+    ruling = args.ruling or binding.get("ruling_id")
+    override = load_override(args.override)
+    supplied = dict(kv.split("=", 1) for kv in args.input or [])
+    artifacts = dict(kv.split("=", 1) for kv in args.artifact or [])
+    base_cfg = profile.get("base") or {}
+    runner_ref = args.runner_ref or profile.get("runner_ref")
+    if not args.no_fetch:
+        for ref in filter(None, [base_cfg.get("ref"), runner_ref]):
+            fetch(repo, ref)
+    logs = log_root() / f"{args.board or 'board'}-{args.item}-{int(time.time())}"
+    logs.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="cm-gate-"))
+    try:
+        head_before, dirty_before = head, dirty(repo)
+        base_ref = base_cfg.get("ref")
+        base_before = rev(repo, base_ref) if base_ref else None
+        tree_before = merge_tree(repo, base_before, head)
+        runner = None
+        if runner_ref and (sha := rev(repo, runner_ref)):
+            runner = {"ref": runner_ref, "sha": sha}
+        closure = compute_closure(repo, profile, base_before, head)
+        inputs = [bind_input(d, supplied, artifacts) for d in profile.get("inputs", [])]
+        for name, cid in supplied.items():
+            if not any(i["name"] == name for i in inputs):
+                inputs.append({"name": name, "kind": "db" if cid.startswith(("snapshot:", "rows:"))
+                               else "file", "locator": f"--input {name}", "content_id": cid})
+        steps = []
+        mf_tree = None
+        subs = {"head": head, "mf": mf, "base": base_before}
+        for sp in profile["steps"]:
+            ov = (override.get("steps") or {}).get(sp["name"], {})
+            if ov.get("skip"):
+                steps.append({"name": sp["name"], "state": "skipped",
+                              "reason": ov.get("reason") or "skipped by override"})
+                continue
+            argv = expand(ov.get("argv") or sp.get("argv") or [], subs)
+            if not argv:
+                steps.append({"name": sp["name"], "state": "not_run",
+                              "reason": "the profile gives this step no argv"})
+                continue
+            at_mf = sp.get("at") == "mf"
+            if at_mf and not mf:
+                steps.append({"name": sp["name"], "state": "not_run", "reason": "no MF SHA"})
+                continue
+            if at_mf and mf_tree is None:
+                mf_tree = tmp / "mf"
+                git(repo, "worktree", "add", "--detach", "--quiet", str(mf_tree), mf)
+            cwd = (mf_tree if at_mf else repo) / (sp.get("cwd") or "")
+            deselect = ov.get("deselect") or []
+            effective = [*ov.get("prefix", []), *argv, *ov.get("extra_args", [])]
+            for d in deselect:
+                effective += ["--deselect", d["node"]]
+            env = {**os.environ, **(ov.get("env") or {})}
+            log = logs / f"{sp['name']}.log"
+            granted = None
+            if sp["kind"] == "pytest":
+                granted = collect_granted(argv, cwd, env, tmp)
+                result = run_pytest(sp, effective, cwd, env, sp.get("timeout_s"), tmp, log, deselect)
+            else:
+                result = run_cmd(effective, cwd, env, sp.get("timeout_s"), log)
+            if result["state"] == "ran" and sp.get("void_on_fail") and result.get("rc"):
+                result.update(state="void", reason=f"rc {result['rc']} (void_on_fail)", rc=None)
+            step = {"name": sp["name"], "at_sha": mf if at_mf else head,
+                    "effective_cmd": {"argv": effective, "env": ov.get("env") or {},
+                                      "cwd": str(cwd)}, **result}
+            if "injected" in step:
+                step["effective_cmd"]["injected"] = step.pop("injected")
+            if granted is not None:
+                step["granted_nodes"] = granted
+            steps.append(step)
+        head_after, dirty_after = rev(repo, "HEAD"), dirty(repo)
+        base_after = rev(repo, base_ref) if base_ref else None
+        tree_after = merge_tree(repo, base_after, head)
+    finally:
+        if mf_tree is not None:
+            git(repo, "worktree", "remove", "--force", str(mf_tree), check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+    receipt = {
+        "n": args.item, "gate": args.gate, "head": head, "mf": mf, "ruling": ruling,
+        "runner": runner, "attestation": "cm-gate", "branch": branch,
+        "repo": git(repo, "remote", "get-url", "origin", check=False).stdout.strip() or None,
+        "base": {"ref": base_ref, "sha_before": base_before, "sha_after": base_after,
+                 "merge_tree_before": tree_before, "merge_tree_after": tree_after},
+        "closure": closure,
+        "worktree": {"head_before": head_before, "head_after": head_after,
+                     "dirty_before": dirty_before, "dirty_after": dirty_after, "path": str(repo)},
+        "inputs": inputs, "steps": steps, "waivers": args.waiver or [], "log_path": str(logs),
+    }
+    if args.board:
+        receipt["board"] = args.board
+    if args.dry_run:
+        json.dump(receipt, sys.stdout, indent=1)
+        print()
+        return 0
+    out = daemon_call("gate.report", receipt, timeout=60)
+    r = out["receipt"]
+    print(f"{r['id']}: {r['headline']}")
+    for reason in r.get("reasons", []):
+        print(f"  - {reason}")
+    for inp in r.get("inputs", []):
+        print(f"  input {inp['name']}: {inp['state']} ({inp['verification']})")
+    return EXIT.get(r["verdict"], 5)
+
+
+def compute_closure(repo: Path, profile: dict, base: str | None, head: str) -> dict | None:
+    cmd = profile.get("closure_cmd")
+    if cmd:
+        proc = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return None
+        paths = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+        return {"paths": paths, "cmd": cmd}
+    # Default closure: tracked files under the steps' positional paths, plus
+    # what the head changed relative to the base.
+    roots = sorted({tok.split("::", 1)[0] for sp in profile["steps"] for tok in sp.get("argv", [])[1:]
+                    if not tok.startswith("-") and "{" not in tok and (repo / tok.split("::", 1)[0]).exists()})
+    paths = set()
+    if roots:
+        paths.update(git(repo, "ls-files", "--", *roots).stdout.split())
+    if base:
+        mb = git(repo, "merge-base", base, head, check=False).stdout.strip()
+        if mb:
+            paths.update(git(repo, "diff", "--name-only", mb, head).stdout.split())
+    if not paths:
+        return None
+    return {"paths": sorted(paths),
+            "cmd": ["default: git ls-files <step paths> + git diff --name-only <merge-base> HEAD"]}
+
+
+def daemon_call(method: str, params: dict, timeout: float = 30) -> dict:
+    sys.path.insert(0, str(HERE.parent))
+    from mcp_server import control_client
+
+    params = {k: v for k, v in params.items() if v is not None}
+    return control_client.call(method, params, timeout=timeout)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="cm-gate", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    run = sub.add_parser("run", help="run the item's gate profile and post the receipt")
+    run.add_argument("--item", type=int, required=True)
+    run.add_argument("--gate", default="gate")
+    run.add_argument("--board")
+    run.add_argument("--override", help="lane-local overrides (.toml or .json)")
+    run.add_argument("--mf")
+    run.add_argument("--ruling")
+    run.add_argument("--runner-ref")
+    run.add_argument("--input", action="append", help="name=content_id (self-supplied)")
+    run.add_argument("--artifact", action="append", help="name=<producing receipt id>")
+    run.add_argument("--waiver", action="append", help="grant id to cite")
+    run.add_argument("--profile-file", help="use this profile JSON instead of the board's")
+    run.add_argument("--no-fetch", action="store_true")
+    run.add_argument("--dry-run", action="store_true", help="print the receipt; post nothing")
+    args = parser.parse_args(argv)
+    try:
+        return gate_run(args)
+    except subprocess.CalledProcessError as exc:
+        print(f"cm-gate: {shlex.join(exc.cmd)} failed: {exc.stderr.strip()}", file=sys.stderr)
+        return 5
+    except Exception as exc:  # noqa: BLE001 - one line for the operator, not a trace
+        print(f"cm-gate: {exc}", file=sys.stderr)
+        return 5
+
+
+if __name__ == "__main__":
+    sys.exit(main())

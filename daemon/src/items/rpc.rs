@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 
 pub const METHODS: &[&str] = &["item.create", "item.set", "item.resolve", "board.read", "board.owner_blocked"];
 
-type RpcResult<T = Value> = Result<T, (ErrorCode, String)>;
+pub(crate) type RpcResult<T = Value> = Result<T, (ErrorCode, String)>;
 
-fn bad(message: impl Into<String>) -> (ErrorCode, String) {
+pub(crate) fn bad(message: impl Into<String>) -> (ErrorCode, String) {
     (ErrorCode::InvalidParams, message.into())
 }
 
@@ -54,7 +54,7 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
-    fn capture(state: &Arc<Mutex<DaemonState>>, req: &Request) -> RpcResult<Self> {
+    pub(crate) fn capture(state: &Arc<Mutex<DaemonState>>, req: &Request) -> RpcResult<Self> {
         if matches!(req.caller, Caller::Operator(_)) {
             crate::control::operator::validate_operator(&req.caller)
                 .map_err(|e| (ErrorCode::Unauthorized, e.to_string()))?;
@@ -138,7 +138,7 @@ impl Ctx {
         })
     }
 
-    fn actor(&self) -> Value {
+    pub(crate) fn actor(&self) -> Value {
         json!({
             "pid": self.pid,
             "name": self.name,
@@ -248,11 +248,11 @@ fn holders_arg(ctx: &Ctx, value: &Value) -> RpcResult<Vec<Value>> {
     refs.into_iter().map(|r| resolve_holder(ctx, r)).collect()
 }
 
-fn present(params: &Value, key: &str) -> Option<Value> {
+pub(crate) fn present(params: &Value, key: &str) -> Option<Value> {
     params.get(key).filter(|v| !v.is_null()).cloned()
 }
 
-fn int_list(value: &Value, name: &str) -> RpcResult<Vec<i64>> {
+pub(crate) fn int_list(value: &Value, name: &str) -> RpcResult<Vec<i64>> {
     match value {
         Value::Number(n) => n.as_i64().map(|n| vec![n]).ok_or_else(|| bad(format!("{name} must be integers"))),
         Value::Array(items) => items
@@ -264,7 +264,7 @@ fn int_list(value: &Value, name: &str) -> RpcResult<Vec<i64>> {
 }
 
 /// The caller's board: `board` if given, else its task's board.
-fn resolve_board(ctx: &Ctx, params: &Value) -> RpcResult {
+pub(crate) fn resolve_board(ctx: &Ctx, params: &Value) -> RpcResult {
     if let Some(reference) = params.get("board").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
         return ctx.api.post("/boards/resolve", &json!({"ref": reference.trim()}));
     }
@@ -276,7 +276,7 @@ fn resolve_board(ctx: &Ctx, params: &Value) -> RpcResult {
 
 /// Editing rights (doc §2 rule 9): Owner, a global session, a session whose
 /// task resolves to the board, or a current holder of any item on it.
-fn authorize_edit(ctx: &Ctx, params: &Value, board: &Value) -> RpcResult<()> {
+pub(crate) fn authorize_edit(ctx: &Ctx, params: &Value, board: &Value) -> RpcResult<()> {
     if ctx.owner || ctx.global {
         return Ok(());
     }
@@ -303,7 +303,7 @@ fn authorize_edit(ctx: &Ctx, params: &Value, board: &Value) -> RpcResult<()> {
     ))
 }
 
-fn slug(board: &Value) -> RpcResult<String> {
+pub(crate) fn slug(board: &Value) -> RpcResult<String> {
     board["slug"].as_str().map(str::to_string).ok_or_else(|| {
         (ErrorCode::Internal, "planning API returned a board without a slug".into())
     })
@@ -312,8 +312,10 @@ fn slug(board: &Value) -> RpcResult<String> {
 /// Fields passed straight through to the API; "" clears a text field.
 const PASS_FIELDS: &[&str] = &[
     "status", "note", "group", "blocked_on", "check_back", "eta", "title", "links", "blocked_by",
+    // Gate bindings (doc/gate-receipts.md §8).
+    "head", "mf", "ruling", "gate_class",
 ];
-const CLEARABLE: &[&str] = &["note", "group", "blocked_on", "check_back", "eta"];
+const CLEARABLE: &[&str] = &["note", "group", "blocked_on", "check_back", "eta", "head", "mf", "ruling", "gate_class"];
 
 fn item_fields(ctx: &Ctx, params: &Value, skip_title: bool) -> RpcResult<Map<String, Value>> {
     let mut fields = Map::new();
@@ -587,7 +589,7 @@ fn launch(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value, slug: &str
 
 // ---- board() --------------------------------------------------------------
 
-fn short_duration(seconds: i64) -> String {
+pub(crate) fn short_duration(seconds: i64) -> String {
     let s = seconds.max(0);
     match s {
         0..=89 => format!("{s}s"),
@@ -654,6 +656,11 @@ pub(crate) fn slim_item(item: &Value, now: DateTime<Utc>) -> String {
             } else {
                 line.push_str(&format!(" eta passed {} ago", short_duration(-left)));
             }
+        }
+    }
+    if let Some(gates) = item["gate"].as_object() {
+        for (name, g) in gates {
+            line.push_str(&super::gate::slim_cell(name, g));
         }
     }
     if let Some(flags) = item["flags"].as_array() {
@@ -992,6 +999,82 @@ mod tests {
     }
 
     const BOARD: &str = r#"{"id":"b-1","slug":"sfd","name":"Swarm"}"#;
+
+    fn call_gate(state: &Arc<Mutex<DaemonState>>, uid: &str, method: &str, params: Value) -> Response {
+        crate::items::gate::dispatch(state, &Request {
+            id: "t".into(),
+            caller: Caller::session(uid),
+            method: method.into(),
+            params,
+        })
+    }
+
+    #[test]
+    fn gate_report_stamps_the_actor_and_returns_the_computed_verdict() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("POST", "/boards/sfd/items/14/receipts") => (200, r#"{"receipt":{"id":"r-sfd-14-1","gate":"gate","verdict":"VOID","headline":"VOID: fetch: void (FETCH_FAIL)","head":"aaaa","runs":{"VOID":1},"reasons":[{"level":"void","text":"fetch: void (FETCH_FAIL)"},{"level":"note","text":"x"}],"inputs":[{"name":"h","state":"missing","verification":"self_supplied_unverified"}]}}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let d = daemon_id(&state);
+        let resp = call_gate(&state, "me-uid", "gate.report", json!({
+            "n": 14, "head": "a".repeat(40), "klass": "py", "steps": [], "request_id": "rq",
+            "attestation": "self", "verdict": "PASS"}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let out = resp.result.unwrap();
+        assert_eq!(out["receipt"]["verdict"], "VOID", "the API's verdict, not the poster's");
+        assert_eq!(out["receipt"]["reasons"], json!(["fetch: void (FETCH_FAIL)"]));
+        let seen = seen.lock().unwrap();
+        let (_, _, body) = seen.iter().find(|(_, p, _)| p.ends_with("/receipts")).unwrap();
+        assert_eq!(body["actor"]["pid"], format!("agent:{d}:me-uid"));
+        assert_eq!(body["receipt"]["class"], "py");
+        assert!(body["receipt"].get("verdict").is_none(), "a posted verdict is never forwarded");
+        assert_eq!(body["request_id"], "rq");
+        let missing = call_gate(&state, "me-uid", "gate.report", json!({"n": 14, "steps": []}));
+        assert!(!missing.ok && missing.error.unwrap().message.contains("head is required"));
+    }
+
+    #[test]
+    fn gate_waive_checks_the_message_in_this_daemons_store() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("POST", "/boards/sfd/items/14/grants") => (200, r#"{"grant":{"id":"g-sfd-14-1","verified":false}}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let resp = call_gate(&state, "me-uid", "gate.waive", json!({
+            "n": 14, "head": "a".repeat(40), "step": "mypy", "reason": "r", "risk": "k",
+            "message_id": "no-such-message",
+            "message_check": {"found": true, "sender": "forged", "contains_head": true}}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let seen = seen.lock().unwrap();
+        let (_, _, body) = seen.iter().find(|(_, p, _)| p.ends_with("/grants")).unwrap();
+        assert_eq!(body["message_check"], json!({"found": false}), "the caller cannot supply the check");
+    }
+
+    #[test]
+    fn item_set_forwards_gate_bindings_and_blank_clears() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[],"unblocked":[],"warnings":[]}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let resp = call(&state, "me-uid", "item.set", json!({"n":14,"mf":"c".repeat(40),"ruling":"EP-A1","head":""}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let seen = seen.lock().unwrap();
+        let (_, _, body) = seen.iter().find(|(m, _, _)| m == "PATCH").unwrap();
+        assert_eq!(body["set"]["mf"], json!("c".repeat(40)));
+        assert_eq!(body["set"]["ruling"], "EP-A1");
+        assert!(body["set"]["head"].is_null() && body["set"].get("head").is_some());
+    }
 
     #[test]
     fn create_stamps_actor_and_resolves_holders() {

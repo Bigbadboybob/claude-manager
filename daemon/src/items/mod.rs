@@ -7,11 +7,14 @@
 
 pub mod api;
 pub mod chat;
+pub mod gate;
 pub mod heartbeat;
 pub mod held;
 pub mod rpc;
 
-/// Start the items background work (the holder-state heartbeat).
+/// Start the items background work (the holder-state heartbeat and the
+/// gate-receipt refresh, doc/gate-receipts.md §8).
 pub fn start(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>) {
     heartbeat::start(state);
+    gate::start_refresh(state);
 }
