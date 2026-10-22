@@ -146,22 +146,19 @@ needed.
 
 `switch <target>` under the lock:
 
-1. **Take Claude Code's refresh lock.** Claude Code serialises refreshes
-   across processes with `~/.claude/.oauth_refresh.lock` (proper-lockfile:
-   a `mkdir`'d directory, stale after 60 s; an older `~/.claude.lock` also
-   exists). Under the lock a refresher re-reads `.credentials.json` and, if
-   the access token there differs from the one it held, adopts the file
-   instead of refreshing. Holding this lock for steps 2–4 therefore keeps
-   any session from refreshing the old account mid-switch. (The lock
-   mechanism is read from the 2.1.308 binary; a session was observed
-   holding it while refreshing. Release it promptly: it is stale after
-   60 s.) The old quiet-point wait is then only a fallback.
+1. **Take Claude Code's refresh lock** with the identical mechanism (see
+   [Refresh lock](#refresh-lock-claude-code-21308)). Under the lock a
+   refresher re-reads `.credentials.json` and, if the access token there
+   differs from the one it held, adopts the file instead of refreshing.
+   Holding the lock for steps 2–3 keeps any session from refreshing the
+   old account mid-switch. Keep the hold to a few seconds.
 2. **Write back.** Read `.credentials.json`, identify it with the rules
    above, and save its `claudeAiOauth` block as that account's latest copy.
    Keep the account's `oauthAccount` from `capture`; never take it from the
    live `~/.claude.json` here, which can lag the credentials (validation
    saved one account's tokens with another's profile this way).
-3. **Swap credentials.** Write the target's `claudeAiOauth` block into
+3. **Swap credentials.** Replace only the `claudeAiOauth` key (the file
+   can hold other secrets, such as MCP servers' OAuth tokens) and write
    `.credentials.json` in place (truncate + write, mode 0600), as `/login`
    does (it kept the inode). Running sessions followed an in-place write.
    Claude Code's own refresh replaces the file by rename; whether running
@@ -192,6 +189,43 @@ or the first request after a switch fails authentication, mark the account
 `needs-login`, switch back, and notify Owner to `/login` that account and
 `capture` again.
 
+### Refresh lock (Claude Code 2.1.308)
+
+Read from the binary and confirmed live on the laptop. It is neither
+`flock` nor a timestamp file: it is the npm `proper-lockfile` scheme, a
+directory created with `mkdir` (atomic; `EEXIST` means held).
+
+- **Locks, in order:** `~/.claude/.oauth_refresh.lock` (current), then
+  `<realpath(~/.claude)>.lock`, i.e. `~/.claude.lock` (legacy). Both are
+  directories with options `stale: 60000, update: 5000`: the holder
+  touches each directory's mtime every 5 s, and a lock whose mtime is
+  older than 60 s counts as stale and may be removed by the next taker. If
+  the legacy lock is held, Claude Code releases the current one and backs
+  off.
+- **Owner record:** after acquiring, Claude Code writes
+  `~/.claude/.oauth_refresh.lock.owner` (JSON: `pid`, optional
+  `procStart`, `pidDomain`, `pidSpace`, `lockBirthtimeMs`, optional
+  `legacyLockBirthtimeMs`; behind feature flag `tengu_quiet_marten`) and
+  removes it on release. Waiters use it only to take over from a holder
+  proven dead; with no owner record they never take over early
+  (`no_owner_record`) and fall back to the 60 s staleness.
+- **Waiters:** on `ELOCKED` a refresher retries up to 5 times with
+  1–2 s random backoff (at least 7.5 s if the lock is unchanged), then
+  gives up for that attempt (`lock_busy` / `lock_timeout`) and retries on
+  a later request.
+- **Refresh is on demand**, triggered by a request with an expired (or
+  near-expiry) access token; nothing refreshes while sessions are idle.
+
+The switcher takes both directories in the same order, touches their
+mtime while held, writes **no** owner record (so nobody can take over
+from it early; if it dies, the 60 s staleness frees the lock), and
+releases in reverse order. Holds stay well under the waiters' ~7.5 s
+budget.
+
+Live check (laptop): with both directories held by a test script and the
+access token marked expired, a running session's refresh waited for the
+full 6 s hold and landed 1.5 s after release.
+
 ### Usage, dashboard and alerts
 
 - **Active account:** poll the usage data that `/usage` shows with the
@@ -203,6 +237,14 @@ or the first request after a switch fails authentication, mark the account
   spend fields. Undocumented, so tolerate it changing shape. Never poll an
   inactive account's saved token (decision 3); it only stays valid until
   that account's next refresh anyway.
+- **`poll` never refreshes a token.** If the live access token has
+  expired (`expiresAt` passed, or the usage request returns 401), skip the
+  cycle and record why; the next real request from a session refreshes it.
+- **`poll` repairs the profile.** Each cycle, after identifying the live
+  login, compare `oauthAccount.accountUuid` in `~/.claude.json` with that
+  account and rewrite the `oauthAccount` key (same atomic method as switch
+  step 4) if it names the wrong account. Running sessions rewrite
+  `~/.claude.json` and could restore a stale in-memory profile.
 - **Inactive accounts:** last reading taken while active, its timestamp,
   and the reset times from that reading. An account whose weekly reset has
   passed since its last reading is shown as "likely refilled".
@@ -298,7 +340,11 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
 ### 2. Build
 
 1. `cm-claude-accounts` CLI with `capture`, `list`, `switch` (including
-   quiet point, write-back and target-refresh handling) and tests against fake credential files.
+   refresh lock, write-back and target-refresh handling) and tests against
+   fake credential files. **Started:** `scripts/cm-claude-accounts` and
+   `tests/test_cm_claude_accounts.py` (12 tests; run
+   `python3 -m unittest tests.test_cm_claude_accounts`). `capture` and
+   `list` checked on the laptop; a real `switch` has not run yet.
 2. `poll` + state + alerts + a systemd user timer (every ~5 min).
 3. `suggest` autoswitch, then `auto` behind a config flag.
 4. Laptop rollout, then cm-sessions and cm-manager (one host at a time,
