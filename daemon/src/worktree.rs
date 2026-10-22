@@ -1486,23 +1486,64 @@ pub fn find_local_repo(repo_url: &str) -> Option<PathBuf> {
 }
 
 /// A repo URL reduced to what names the repo: `host/owner/name`,
-/// lower-cased, without scheme, user or `.git`, so the ssh and https forms
-/// of one GitHub repo compare equal. A bare shortname stays just the name.
+/// lower-cased, without scheme, user, port or `.git`, so the ssh, scp and
+/// https forms of one GitHub repo compare equal. An ssh host alias
+/// (`Host gh` in ~/.ssh/config) is resolved to its real host name via
+/// `ssh -G`. A bare shortname stays just the name.
 pub fn repo_identity(repo_url: &str) -> String {
-    let mut u = repo_url.trim().trim_end_matches('/').trim_end_matches(".git").to_string();
-    if let Some((_, rest)) = u.split_once("://") {
-        u = rest.to_string();
-    }
-    if let Some((_, rest)) = u.split_once('@') {
-        u = rest.to_string();
-    }
-    // scp form `host:owner/name` → `host/owner/name`.
-    if let Some((host, path)) = u.split_once(':') {
-        if !host.contains('/') {
-            u = format!("{}/{}", host, path.trim_start_matches('/'));
+    let u = repo_url.trim().trim_end_matches('/');
+    let u = u.strip_suffix(".git").unwrap_or(u).trim_end_matches('/');
+    let (scheme, rest) = match u.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, u),
+    };
+    let (host, path) = match scheme {
+        // `scheme://[user@]host[:port]/path`
+        Some(_) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            let host = host.split_once(':').map_or(host, |(h, _)| h);
+            (host.to_string(), path.to_string())
         }
+        None => match rest.split_once(':') {
+            // scp form `[user@]host:path`; a ':' after a '/' is a path.
+            Some((authority, path)) if !authority.contains('/') => {
+                let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+                (host.to_string(), path.trim_start_matches('/').to_string())
+            }
+            _ => return rest.to_ascii_lowercase(),
+        },
+    };
+    let ssh_like = matches!(scheme.as_deref(), None | Some("ssh") | Some("git+ssh"));
+    let host = if ssh_like { ssh_host_name(&host) } else { host };
+    format!("{}/{}", host, path.trim_end_matches('/')).to_ascii_lowercase()
+}
+
+/// The real host name behind an ssh alias (`ssh -G <alias>`'s `hostname`
+/// line), cached per process; the alias itself when ssh can't tell.
+fn ssh_host_name(alias: &str) -> String {
+    static CACHE: Mutex<Option<std::collections::HashMap<String, String>>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(Default::default);
+    if let Some(h) = map.get(alias) {
+        return h.clone();
     }
-    u.to_ascii_lowercase()
+    let resolved = Command::new("ssh")
+        .args(["-G", "--", alias])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("hostname ").map(|h| h.trim().to_string()))
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| alias.to_string());
+    map.insert(alias.to_string(), resolved.clone());
+    resolved
 }
 
 /// Whether two repo URLs name the same repo. A bare shortname on either
@@ -2387,6 +2428,9 @@ mod tests {
         assert!(same_repo(ssh, https));
         assert!(same_repo("ssh://git@github.com/Bigbadboybob/predictionTrading", https));
         assert!(same_repo("predictionTrading", https), "a bare name compares by name");
+        assert!(same_repo("ssh://git@github.com:22/Bigbadboybob/predictionTrading.git", https));
+        assert!(same_repo("github.com:Bigbadboybob/predictionTrading", https), "scp form, no user");
+        assert!(same_repo(&format!("{}/", https), "git@github.com:Bigbadboybob/predictionTrading"));
         assert!(!same_repo(ssh, "git@github.com:Bigbadboybob/claude-manager.git"));
         assert!(!same_repo(ssh, "git@github.com:someone-else/predictionTrading.git"));
     }

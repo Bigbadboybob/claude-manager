@@ -1351,7 +1351,6 @@ fn ensure_target_worktree(
     if worktree_path.is_dir() && cm_daemon::worktree::is_git_worktree_root(&worktree_path) {
         return Ok(WorktreeReport::default());
     }
-    // A task with a repo heals only from a clone of THAT repo.
     let task_repo_url: Option<String> = task_id.and_then(|tid| {
         app.tasks
             .iter()
@@ -1359,34 +1358,33 @@ fn ensure_target_worktree(
             .and_then(|t| t.repo_url.clone())
             .filter(|u| !u.trim().is_empty())
     });
-    let of_task_repo = |p: &std::path::PathBuf| {
-        task_repo_url.as_deref().is_none_or(|u| cm_daemon::worktree::checkout_is_repo(p, u))
-    };
-    let main_repo = ws
+    let ws_url_repo = ws.repo_url.as_deref().and_then(cm_daemon::worktree::find_local_repo);
+    let task_url_repo = task_repo_url.as_deref().and_then(cm_daemon::worktree::find_local_repo);
+    // Git's own registration of the path comes first, over every known
+    // main repo UNFILTERED: it is where the checkout really lives, even
+    // when the task row's repo_url is wrong.
+    let registered = ws
         .main_repo_path
-        .clone()
+        .iter()
+        .chain(ws_url_repo.iter())
+        .chain(task_url_repo.iter())
+        .chain(app.workspaces.iter().filter_map(|w| w.main_repo_path.as_ref()))
         .filter(|p| p.is_dir())
-        .filter(&of_task_repo)
-        .or_else(|| {
-            task_repo_url
-                .as_deref()
-                .or(ws.repo_url.as_deref())
-                .and_then(cm_daemon::worktree::find_local_repo)
-                .filter(&of_task_repo)
-        })
-        .or_else(|| {
-            // Any known main repo that still lists the path as a
-            // (prunable) worktree owns it.
-            app.workspaces
-                .iter()
-                .filter_map(|w| w.main_repo_path.clone())
-                .filter(|p| p.is_dir())
-                .filter(&of_task_repo)
-                .find(|r| {
-                    cm_daemon::worktree::registered_branch_for_path(r, &worktree_path).is_some()
-                })
-        })
-        ;
+        .find(|r| cm_daemon::worktree::registered_branch_for_path(r, &worktree_path).is_some())
+        .cloned();
+    // Nothing registered it: only a clone of the task's repo may rebuild it.
+    let of_task_repo = |p: &&std::path::PathBuf| {
+        p.is_dir()
+            && task_repo_url.as_deref().is_none_or(|u| cm_daemon::worktree::checkout_is_repo(p, u))
+    };
+    let main_repo = registered.or_else(|| {
+        ws.main_repo_path
+            .iter()
+            .chain(ws_url_repo.iter())
+            .chain(task_url_repo.iter())
+            .find(of_task_repo)
+            .cloned()
+    });
     let Some(main_repo) = main_repo else {
         if worktree_path.is_dir() {
             // A real directory not tied to any known repo: a usable cwd.
@@ -1816,14 +1814,26 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
     // arg get filtered out of the planning view by
     // `backend.rs::filter_project_tasks` after the next refresh.
     if let (Some(pj), parent_pj) = (p.project.as_deref(), parent.project.as_deref()) {
-        if parent_pj != Some(pj) {
-            // The TUI has no project→repo lookup; the daemon route has.
+        // Another project is fine when it shares the parent's repo: the
+        // repo most of the TUI's own rows for it carry. Otherwise the TUI
+        // can't resolve that repo; the daemon route can.
+        let mut counts: std::collections::HashMap<&str, usize> = Default::default();
+        for t in app.tasks.iter().filter(|t| t.project.as_deref() == Some(pj)) {
+            if let Some(u) = t.repo_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                *counts.entry(u).or_default() += 1;
+            }
+        }
+        let project_repo = counts.into_iter().max_by_key(|(_, n)| *n).map(|(u, _)| u);
+        let same_repo = project_repo
+            .is_some_and(|u| cm_daemon::worktree::same_repo(u, &parent_repo_url));
+        if parent_pj != Some(pj) && !same_repo {
             return Err((
                 ErrorCode::InvalidParams,
                 format!(
-                    "create_subtask: project '{}' differs from the parent's ({}), and a \
-                     TUI-owned session can't resolve another project's repo; use \
-                     propose_task(project='{}', reports_to='me') and start_session(task_id=…)",
+                    "create_subtask: project '{}' differs from the parent's ({}) and isn't \
+                     known to share its repo, and a TUI-owned session can't resolve another \
+                     project's repo; use propose_task(project='{}', reports_to='me') and \
+                     start_session(task_id=…)",
                     pj,
                     parent_pj.unwrap_or("none"),
                     pj,
@@ -1877,13 +1887,18 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
         } else {
             None
         };
-        if p.worktree_mode == "inherit" && parent_checkout.is_some() && parent_in_repo.is_none() {
+        // `inherit` / `in-place` run in an existing (shared) checkout:
+        // across repos only a fresh branch worktree is safe.
+        if matches!(p.worktree_mode.as_str(), "inherit" | "in-place")
+            && parent_checkout.is_some()
+            && parent_in_repo.is_none()
+        {
             return Err((
                 ErrorCode::InvalidParams,
                 format!(
-                    "create_subtask: worktree_mode='inherit' would run the subtask (repo {}) \
-                     in its parent's checkout of another repo; use worktree_mode='branch'",
-                    parent_repo_url,
+                    "create_subtask: worktree_mode='{}' would run the subtask (repo {}) in a \
+                     shared checkout outside its parent's repo; use worktree_mode='branch'",
+                    p.worktree_mode, parent_repo_url,
                 ),
             ));
         }
@@ -3871,6 +3886,77 @@ mod tests {
             assert!(err.1.contains(&wt.display().to_string()), "{}", err.1);
             assert!(err.1.contains("cannot be re-created"), "{}", err.1);
             assert!(!wt.exists());
+        });
+    }
+
+    /// Review 7b5fd3f #1, TUI twin: the task row's repo_url is wrong, but
+    /// git registered the reaped worktree in the workspace's own clone. The
+    /// heal trusts the registration and rebuilds it there.
+    #[test]
+    fn target_worktree_heal_trusts_git_registration_over_a_wrong_row_repo() {
+        with_app_and_repo("tuihealrow", |app, repo| {
+            let branch = "cm-sub/row-wrong-rand1234";
+            let wt = cm_daemon::worktree::create_subtask_worktree(
+                repo,
+                branch,
+                cm_daemon::worktree::SubtaskStart::ParentBranch("main"),
+            )
+            .expect("subtask worktree");
+            let mut ws = workspace_with(vec![], vec![]);
+            ws.id = "ws-row".into();
+            ws.repo_url = Some("tuihealrow".into());
+            ws.worktree_path = Some(wt.clone());
+            ws.main_repo_path = Some(repo.to_path_buf());
+            app.workspaces.push(ws);
+            let mut task = task_with_parent("task-row", Some("task-parent"), "Row wrong");
+            task.workspace_id = Some("ws-row".into());
+            task.repo_url = Some("git@github.com:o/claude-manager.git".into());
+            app.tasks.push(task);
+            let wi = app.workspaces.len() - 1;
+            std::fs::remove_dir_all(&wt).unwrap();
+            let healed = ensure_target_worktree(app, wi, Some("task-row")).expect("heal");
+            assert_eq!(healed.recreated.expect("re-created").branch, branch);
+            assert!(wt.is_dir() && cm_daemon::worktree::is_git_worktree_root(&wt));
+        });
+    }
+
+    /// Review 7b5fd3f #4b: from a TUI-owned session, create_subtask into
+    /// another project is allowed when that project shares the parent's
+    /// repo, and still refused when its repo is another one or unknown.
+    #[test]
+    fn tui_create_subtask_allows_another_project_in_the_parents_repo() {
+        with_app_and_repo("tuisamerepo", |app, repo| {
+            let mut ws = workspace_with(vec![live_ts("ts-lead", Some("task-lead"))], vec![]);
+            ws.id = "ws-lead".into();
+            ws.repo_url = Some("git@github.com:o/tuisamerepo.git".into());
+            ws.worktree_path = Some(repo.to_path_buf());
+            ws.main_repo_path = Some(repo.to_path_buf());
+            app.workspaces.push(ws);
+            let mut lead = task_with_parent("task-lead", None, "Lead");
+            lead.workspace_id = Some("ws-lead".into());
+            lead.project = Some("main-proj".into());
+            lead.repo_url = Some("git@github.com:o/tuisamerepo.git".into());
+            app.tasks.push(lead);
+            let mut sib = task_with_parent("task-sib", None, "Sibling");
+            sib.project = Some("sibling".into());
+            sib.repo_url = Some("https://github.com/o/tuisamerepo".into());
+            app.tasks.push(sib);
+            let mut other = task_with_parent("task-other", None, "Other");
+            other.project = Some("other".into());
+            other.repo_url = Some("git@github.com:o/other.git".into());
+            app.tasks.push(other);
+            let params = |project: &str| {
+                json!({"name": "w", "project": project, "worktree_mode": "branch"})
+            };
+            assert!(prepare_create_subtask(app, "ts-lead", &params("sibling")).is_ok());
+            for project in ["other", "unknown"] {
+                let err = match prepare_create_subtask(app, "ts-lead", &params(project)) {
+                    Err(e) => e,
+                    Ok(_) => panic!("{project}: expected a refusal"),
+                };
+                assert_eq!(err.0, ErrorCode::InvalidParams, "{project}");
+                assert!(err.1.contains("isn't known to share its repo"), "{project}: {}", err.1);
+            }
         });
     }
 

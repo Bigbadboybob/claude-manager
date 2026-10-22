@@ -5725,10 +5725,12 @@ struct ProposeTaskParams {
 }
 
 /// The repo a task proposed into `project` is stamped with. The project's
-/// own repo (its record, else the repo most of its rows carry) always wins;
-/// the caller's checkout is used only when the caller's task is in that same
-/// project and the project has no repo yet. Anything else is refused: a
-/// guessed repo propagates to every subtask and minted worktree.
+/// own repo (its record, else the repo most of its rows carry) always wins.
+/// A project with no repo yet takes the caller's checkout when the caller's
+/// task is in that same project, or when the caller has no task at all (a
+/// new project filed from its own checkout; logged as a warning). A tasked
+/// caller from another project is refused: a guessed repo propagates to
+/// every subtask and minted worktree.
 fn resolve_propose_repo(
     creds: &PlanningApiCreds,
     project: &str,
@@ -5748,11 +5750,20 @@ fn resolve_propose_repo(
         },
     };
     let caller_repo_url = caller_repo_url.trim();
-    if caller_project.as_deref() == Some(project) && !caller_repo_url.is_empty() {
-        return Ok(crate::planning_client::ProjectRepo {
-            repo_url: caller_repo_url.to_string(),
-            repo_branch: "main".to_string(),
-        });
+    let caller_repo = || crate::planning_client::ProjectRepo {
+        repo_url: caller_repo_url.to_string(),
+        repo_branch: "main".to_string(),
+    };
+    if !caller_repo_url.is_empty() && caller_project.as_deref() == Some(project) {
+        return Ok(caller_repo());
+    }
+    if !caller_repo_url.is_empty() && caller_task_id.is_none() {
+        eprintln!(
+            "cm-daemon: propose_task: project '{}' has no known repo and the caller has no \
+             task; stamping the caller's checkout {} (a new project?)",
+            project, caller_repo_url,
+        );
+        return Ok(caller_repo());
     }
     Err((
         ErrorCode::InvalidParams,
@@ -8445,6 +8456,9 @@ struct MintedWorkspace {
     /// directory, zero-commit-decoy warnings, …) — relayed on the
     /// response as `worktree_recreated` / `worktree_warning`.
     worktree_report: WorktreeCheckReport,
+    /// `ctx.base` named a commit of the caller's repo and the task is in
+    /// another one, so the cut fell back to that repo's trunk.
+    base_downgraded: bool,
 }
 
 /// What the pre-spawn worktree check found, for the agent-facing
@@ -8604,6 +8618,7 @@ fn mint_task_workspace(
     // A cut point from the caller's checkout (fork base=source) only means
     // something in that same repo; in another one the cut is its trunk.
     let base = ctx.base.as_deref().filter(|_| caller_main.as_deref() == Some(main_repo.as_path()));
+    let base_downgraded = ctx.base.is_some() && base.is_none();
 
     // Cut the worktree. `mint_task_worktree` resolves the project's trunk
     // to a concrete sha FIRST, so an unresolvable main (or a git failure)
@@ -8674,6 +8689,7 @@ fn mint_task_workspace(
                         recreated: minted.recreated,
                         warnings: minted.warnings,
                     },
+                    base_downgraded,
                 });
             }
         }
@@ -8748,6 +8764,7 @@ fn mint_task_workspace(
             recreated: minted.recreated,
             warnings: minted.warnings,
         },
+        base_downgraded,
     })
 }
 
@@ -8815,32 +8832,28 @@ fn ensure_ready_worktree(
             .map(str::to_string)
     };
     let task_repo_url = row_field("repo_url");
-    let url_resolved: Option<PathBuf> = task_repo_url.as_deref().or(ws_repo_url.as_deref()).and_then(|u| {
-        // Never clone on this path — empty allowlist + allow_clone=false
-        // makes this "find on disk / reuse a prior clone" only.
-        crate::worktree::resolve_repo(u, &repos_dir, false, &[]).ok()
-    });
-    // Candidate main repos, most specific first. When the workspace row
-    // itself doesn't say, any repo that still LISTS the path as a
-    // (prunable) worktree is the owner. A task with a repo heals only from
-    // a clone of THAT repo, never from whatever checkout the workspace
-    // happens to record.
+    // Never clone on this path — empty allowlist + allow_clone=false makes
+    // this "find on disk / reuse a prior clone" only.
+    let resolve_local =
+        |u: &str| crate::worktree::resolve_repo(u, &repos_dir, false, &[]).ok();
+    let ws_url_resolved: Option<PathBuf> = ws_repo_url.as_deref().and_then(resolve_local);
+    let task_url_resolved: Option<PathBuf> = task_repo_url.as_deref().and_then(resolve_local);
+    // Every main repo the daemon knows, most specific first, UNFILTERED:
+    // git's own registration of the path is ground truth about where the
+    // checkout lives, so it outranks a planning row whose repo_url may be
+    // the wrong one.
     let mut candidates: Vec<PathBuf> = Vec::new();
     for c in ws_main_repo
         .iter()
-        .chain(url_resolved.iter())
+        .chain(ws_url_resolved.iter())
+        .chain(task_url_resolved.iter())
         .chain(other_main_repos.iter())
     {
-        if c.is_dir()
-            && !candidates.contains(c)
-            && task_repo_url.as_deref().is_none_or(|u| crate::worktree::checkout_is_repo(c, u))
-        {
+        if c.is_dir() && !candidates.contains(c) {
             candidates.push(c.clone());
         }
     }
-    let ws_main_repo = ws_main_repo.filter(|r| candidates.contains(r));
-    let url_resolved = url_resolved.filter(|r| candidates.contains(r));
-    let main_repo = candidates
+    let registered = candidates
         .iter()
         .find(|r| crate::worktree::branch_for_worktree_dir(r, working_dir).is_some()
             && crate::worktree::registered_branch_for_path(r, working_dir).is_some())
@@ -8849,9 +8862,23 @@ fn ensure_ready_worktree(
                 .iter()
                 .find(|r| crate::worktree::registered_branch_for_path(r, working_dir).is_some())
         })
-        .or_else(|| ws_main_repo.as_ref().filter(|r| r.is_dir()))
-        .or_else(|| url_resolved.as_ref().filter(|r| r.is_dir()))
         .cloned();
+    // Nothing registered the path: only then does the task's repo decide,
+    // so a recorded checkout of some other repo can't rebuild it.
+    let of_task_repo = |r: &PathBuf| {
+        r.is_dir()
+            && task_repo_url
+                .as_deref()
+                .is_none_or(|u| crate::worktree::checkout_is_repo(r, u))
+    };
+    let main_repo = registered.or_else(|| {
+        ws_main_repo
+            .iter()
+            .chain(ws_url_resolved.iter())
+            .chain(task_url_resolved.iter())
+            .find(|r| of_task_repo(r))
+            .cloned()
+    });
     let Some(main_repo) = main_repo else {
         if working_dir.is_dir() {
             // A real directory that the daemon can't tie to any repo (a
@@ -15874,6 +15901,7 @@ pub fn create_subtask(
             task_id: Some(parent_task_id),
             workspace_id: caller.workspace_id.clone(),
             worktree_path: None,
+            base_from_parent_repo: false,
         }
     };
     create_subtask_core(state_arc, &p, base, leaf_slug, parent, caller_uid, "mcp.create_subtask")
@@ -15934,6 +15962,12 @@ struct SubtaskParent {
     task_id: Option<String>,
     workspace_id: String,
     worktree_path: Option<PathBuf>,
+    /// `base` is a commit of the PARENT's repo (a fork's source HEAD), so
+    /// when the subtask lands in another repo it is dropped for that
+    /// repo's trunk and the result says `base_downgraded: "trunk"`. An
+    /// explicit `create_subtask(base=…)` names a ref in the subtask's own
+    /// repo and is never dropped.
+    base_from_parent_repo: bool,
 }
 
 fn create_subtask_core(
@@ -16056,7 +16090,11 @@ fn create_subtask_core(
                     parent_repo_url.as_deref().unwrap_or("none"),
                 ),
             ))?;
-            Some(repo)
+            // Another project in the parent's own repo is no repo change.
+            (!parent_repo_url
+                .as_deref()
+                .is_some_and(|u| crate::worktree::same_repo(&repo.repo_url, u)))
+            .then_some(repo)
         }
         _ => None,
     };
@@ -16080,13 +16118,20 @@ fn create_subtask_core(
     let parent_in_repo: Option<PathBuf> = parent_checkout
         .clone()
         .filter(|c| other_project.is_none() && crate::worktree::checkout_is_repo(c, &repo_url));
-    if p.worktree_mode == "inherit" && (other_project.is_some() || (parent_checkout.is_some() && parent_in_repo.is_none())) {
+    // `inherit` and `in-place` both run in an existing checkout (the
+    // parent's, or the located clone's main checkout, which others share),
+    // so across repos only a fresh branch worktree is safe.
+    let shared_checkout_mode = matches!(p.worktree_mode.as_str(), "inherit" | "in-place");
+    let foreign_repo = other_project.is_some() || (parent_checkout.is_some() && parent_in_repo.is_none());
+    let base_downgraded = parent.base_from_parent_repo && foreign_repo && base.is_some();
+    let base = if base_downgraded { None } else { base };
+    if shared_checkout_mode && foreign_repo {
         return Err((
             ErrorCode::InvalidParams,
             format!(
-                "create_subtask: worktree_mode='inherit' would run the subtask (repo {}) \
-                 in its parent's checkout of another repo; use worktree_mode='branch'",
-                repo_url,
+                "create_subtask: worktree_mode='{}' would run the subtask (repo {}) in a \
+                 shared checkout outside its parent's repo; use worktree_mode='branch'",
+                p.worktree_mode, repo_url,
             ),
         ));
     }
@@ -16381,7 +16426,7 @@ fn create_subtask_core(
     // shell call. `null` when the path isn't readable as a git checkout.
     let base_sha = crate::worktree::worktree_head_sha(&worktree_path);
 
-    Ok(json!({
+    let mut out = json!({
         "task_id": new_task_id,
         "worktree_path": worktree_path.to_string_lossy(),
         "base_sha": base_sha,
@@ -16389,7 +16434,11 @@ fn create_subtask_core(
         // Stated explicitly so an agent doesn't assume a worker is
         // already running on it — nothing runs until start_session.
         "launched": false,
-    }))
+    });
+    if base_downgraded {
+        out["base_downgraded"] = json!("trunk");
+    }
+    Ok(out)
 }
 
 // ===================================================================
@@ -16778,6 +16827,9 @@ fn session_fork_once(
 
     // ---- the target workspace ----
     let mut worktree_report = WorktreeCheckReport::default();
+    // The source commit is meaningless in another repo: both paths below
+    // then cut at that repo's trunk and say so.
+    let mut base_downgraded = false;
     let mut rollback_new: Option<(String, String)> = None; // (task_id, workspace_id)
     let (task_id, task_name, parent_task_id, workspace_id, worktree_path, created_base_sha) =
         match (&target, plan) {
@@ -16807,6 +16859,7 @@ fn session_fork_once(
                         task_id: parent.clone(),
                         workspace_id: source.workspace_id.clone(),
                         worktree_path: Some(source.worktree_path.clone()),
+                        base_from_parent_repo: true,
                     },
                     caller_uid,
                     if caller_uid.is_some() { "mcp.fork_session" } else { "tui.fork" },
@@ -16819,6 +16872,7 @@ fn session_fork_once(
                 }
                 .ok_or((ErrorCode::Internal, "forked task has no workspace binding".into()))?;
                 rollback_new = Some((task_id.clone(), workspace_id.clone()));
+                base_downgraded = created.get("base_downgraded").is_some();
                 let base = created.get("base_sha").cloned().unwrap_or(Value::Null);
                 (task_id, task_name.clone(), parent, workspace_id, worktree_path, base)
             }
@@ -16867,6 +16921,7 @@ fn session_fork_once(
                 };
                 let minted = mint_task_workspace(state_arc, task_id, &ctx)?;
                 worktree_report = minted.worktree_report;
+                base_downgraded = minted.base_downgraded;
                 let name = minted
                     .task_row
                     .get("name")
@@ -16985,9 +17040,21 @@ fn session_fork_once(
     // fork writes its transcript only on its first message, so a fork that
     // was never prompted cannot be resumed after a daemon restart.
     let source_branch = crate::worktree::worktree_current_branch(&source.worktree_path);
-    let missing = match (source_head.as_deref(), crate::worktree::worktree_head_sha(&worktree_path)) {
-        (Some(a), Some(b)) => commits_not_carried(&worktree_path, &b, a),
-        _ => Vec::new(),
+    // In another repo the fork carries none of the source's own work:
+    // what it lacks is every source commit beyond the SOURCE repo's trunk.
+    let missing = if base_downgraded {
+        match (
+            source_head.as_deref(),
+            crate::worktree::resolve_project_main(&source.worktree_path).ok(),
+        ) {
+            (Some(a), Some((_, trunk))) => commits_not_carried(&source.worktree_path, &trunk, a),
+            _ => Vec::new(),
+        }
+    } else {
+        match (source_head.as_deref(), crate::worktree::worktree_head_sha(&worktree_path)) {
+            (Some(a), Some(b)) => commits_not_carried(&worktree_path, &b, a),
+            _ => Vec::new(),
+        }
     };
     let missing_truncated = missing.len() > FORK_MISSING_COMMITS_CAP;
     let missing: Vec<String> = missing.into_iter().take(FORK_MISSING_COMMITS_CAP).collect();
@@ -17040,6 +17107,7 @@ fn session_fork_once(
         },
         "commits_not_carried": missing,
         "commits_not_carried_truncated": missing_truncated,
+        "base_downgraded": if base_downgraded && !use_trunk { json!("trunk") } else { Value::Null },
         "prompt_source": if prompt.is_some() { "caller" } else { "none" },
         "uncommitted_left_behind": uncommitted_files > 0,
         "uncommitted_files": uncommitted_files,
@@ -33877,6 +33945,61 @@ while True:
         src.transcript_path = Some(path.to_string_lossy().into_owned());
     }
 
+    /// Review 7b5fd3f #3: a fork whose target lands in ANOTHER repo than the
+    /// source (a never-run predictionTrading task, or a new task under a lead
+    /// whose own row is predictionTrading while it runs in claude-manager)
+    /// cuts at that repo's trunk on BOTH paths, reports
+    /// `base_downgraded: "trunk"`, and lists the source commits beyond the
+    /// source repo's trunk as not carried.
+    #[test]
+    fn session_fork_into_another_repo_downgrades_base_on_both_paths() {
+        with_home_and_repo("cmrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["branch", "-M", "main"]);
+            run_git(&repo, &["remote", "add", "origin", "git@github.com:o/claude-manager.git"]);
+            run_git(&repo, &["checkout", "-q", "-b", "cm/wip"]);
+            std::fs::write(repo.join("wip.txt"), "source work").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "source wip"]);
+            let pt = seed_other_clone(home, "predictionTrading", "https://github.com/o/predictionTrading.git");
+            let pt_main = git_sha(&pt, "main");
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, "git@github.com:o/claude-manager.git");
+            state.lock().unwrap().record_agent_task_edge("task-pt", "task-src");
+            let stub = spawn_routed_stub(|method, path, _| match (method, path) {
+                ("GET", "/tasks/task-pt") => (
+                    200,
+                    r#"{"id":"task-pt","name":"PT task","repo_url":"git@github.com:o/predictionTrading.git"}"#.into(),
+                ),
+                ("GET", "/tasks/task-src") => (
+                    200,
+                    r#"{"id":"task-src","name":"Lead","repo_url":"git@github.com:o/predictionTrading.git","project":"predictionTrading","wip_branch":null}"#.into(),
+                ),
+                ("POST", "/tasks") => (200, r#"{"id":"task-new","name":"n"}"#.into()),
+                ("PATCH", _) | ("DELETE", _) => (200, "{}".into()),
+                _ => (404, r#"{"detail":"unexpected"}"#.into()),
+            });
+            set_api_env(stub.port);
+            let old_path = fake_claude_on_path(home);
+            let existing = session_fork(&state, &json!({"source_uid": "ts-src", "task_id": "task-pt"}), None);
+            let new = session_fork(&state, &json!({"source_uid": "ts-src", "task_name": "pt fork"}), None);
+            unsafe { std::env::set_var("PATH", &old_path) };
+            for (label, result) in [("existing", existing), ("new", new)] {
+                let result = result.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                assert_eq!(result["base_downgraded"], json!("trunk"), "{label}: {result}");
+                let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+                assert!(wt.join("predictionTrading.md").exists(), "{label}: a PT checkout");
+                assert!(!wt.join("wip.txt").exists(), "{label}: source work isn't carried");
+                assert_eq!(result["base_sha"], json!(pt_main), "{label}");
+                let missing = result["commits_not_carried"].as_array().unwrap();
+                assert_eq!(missing.len(), 1, "{label}: {result}");
+                assert!(missing[0].as_str().unwrap().contains("source wip"), "{label}: {result}");
+            }
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
     #[test]
     fn fork_base_choice_accepts_source_and_trunk_only() {
         assert_eq!(fork_base_choice(None), Ok(false));
@@ -35502,6 +35625,72 @@ while True:
         });
     }
 
+    /// Review 7b5fd3f #1: the planning row's repo_url is WRONG (says
+    /// claude-manager, and a claude-manager clone exists on the host) but the
+    /// reaped checkout really lives in a predictionTrading clone, which git
+    /// still has registered. Both the start_session heal and an A-R revive
+    /// rebuild it from the predictionTrading clone, never the row's repo.
+    #[test]
+    fn heal_and_revive_trust_git_registration_over_a_wrong_row_repo() {
+        with_home_and_repo("predictionTrading", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["remote", "add", "origin", "git@github.com:o/predictionTrading.git"]);
+            let cm = seed_other_clone(home, "claude-manager", "git@github.com:o/claude-manager.git");
+            let state = make_state_arc();
+            let (wt, branch, sha) = seed_bound_subtask_with_reaped_worktree(
+                &state,
+                &repo,
+                "git@github.com:o/predictionTrading.git",
+                "task-sub",
+                true,
+            );
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-sub") => (
+                    200,
+                    r#"{"id":"task-sub","name":"sub","repo_url":"git@github.com:o/claude-manager.git","project":"claude-manager"}"#.to_string(),
+                ),
+                _ => (404, "{}".to_string()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(
+                &state,
+                &json!({"type": "bash", "label": "w", "task_id": "task-sub"}),
+                Some("ts-orch"),
+            );
+            let resp = resp.expect("heal from the clone git registered");
+            assert_eq!(resp["worktree_recreated"]["branch"], json!(branch), "{resp}");
+            assert_eq!(git_sha(&wt, "HEAD"), sha, "the task's own work is back");
+            assert_eq!(
+                crate::worktree::main_checkout_of(&wt).map(|p| p.canonicalize().unwrap()),
+                Some(repo.canonicalize().unwrap()),
+                "rebuilt in the predictionTrading clone",
+            );
+            assert!(!cm.join(".git/worktrees").exists(), "nothing was cut in claude-manager");
+
+            // A-R revive after a second reap takes the same route.
+            let uid = resp["session_uid"].as_str().unwrap().to_string();
+            kill_all_sessions(&state);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while state.lock().unwrap().sessions.contains_key(&uid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::fs::remove_dir_all(&wt).unwrap();
+            let revived = revive_session(&state, &json!({"uid": uid, "workspace_id": "ws-sub",
+                "worktree_path": wt.to_string_lossy(), "session_type": "bash"}));
+            set_spawn_program_override_for_test(None);
+            let revived = revived.expect("revive heals from the registered clone");
+            assert_eq!(revived["worktree_recreated"]["branch"], json!(branch), "{revived}");
+            assert_eq!(git_sha(&wt, "HEAD"), sha);
+            assert!(!cm.join(".git/worktrees").exists());
+            kill_all_sessions(&state);
+        });
+    }
+
     /// A second spawn after the heal is the ordinary healthy path: no
     /// `worktree_recreated`, no warning, same checkout.
     #[test]
@@ -35710,12 +35899,23 @@ while True:
         assert_eq!(body["repo_url"], "git@x.com:o/claude-manager.git");
         assert_eq!(body["repo_branch"], "main");
 
-        // Someone else's project with no repo: refused, nothing created.
+        // A taskless caller filing a brand-new project: its checkout, logged.
+        let taskless = propose_task(
+            &state,
+            &json!({"project": "brand-new", "name": "n",
+                    "repo_url": "git@x.com:o/brand-new.git"}),
+            None,
+        );
+        taskless.expect("taskless new project falls back to the caller's repo");
+        let body = posted().pop().unwrap();
+        assert_eq!(body["repo_url"], "git@x.com:o/brand-new.git");
+
+        // A tasked caller in another project, project with no repo: refused.
         let err = propose("elsewhere").expect_err("unknown project refused");
         assert_eq!(err.0, ErrorCode::InvalidParams);
         assert!(err.1.contains("'elsewhere' has no known repo"), "{}", err.1);
         assert!(err.1.contains("'fresh'"), "names the caller's project: {}", err.1);
-        assert_eq!(posted().len(), 2, "no row for the refused proposal");
+        assert_eq!(posted().len(), 3, "no row for the refused proposal");
         clear_api_env();
     }
 
@@ -35779,6 +35979,13 @@ while True:
             .expect_err("inherit across projects refused");
             assert_eq!(err.0, ErrorCode::InvalidParams);
             assert!(err.1.contains("worktree_mode='branch'"), "{}", err.1);
+            let err = create_subtask(
+                &state,
+                &json!({"name": "pt work", "project": "predictionTrading", "worktree_mode": "in-place"}),
+                Some("ts-orch"),
+            )
+            .expect_err("in-place across projects refused");
+            assert!(err.1.contains("worktree_mode='in-place'"), "{}", err.1);
             let err = create_subtask(
                 &state,
                 &json!({"name": "x", "project": "nowhere", "worktree_mode": "branch"}),
@@ -35846,9 +36053,11 @@ while True:
                 _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
             });
             set_api_env(stub.port);
-            let err = create_subtask(&state, &json!({"name": "w", "worktree_mode": "inherit"}), Some("ts-orch"))
-                .expect_err("inherit into another repo's checkout");
-            assert!(err.1.contains("worktree_mode='branch'"), "{}", err.1);
+            for mode in ["inherit", "in-place"] {
+                let err = create_subtask(&state, &json!({"name": "w", "worktree_mode": mode}), Some("ts-orch"))
+                    .expect_err("a shared checkout in another repo");
+                assert!(err.1.contains("worktree_mode='branch'"), "{mode}: {}", err.1);
+            }
             let result = create_subtask(&state, &json!({"name": "w", "worktree_mode": "branch"}), Some("ts-orch"))
                 .expect("branch subtask");
             let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
@@ -35859,6 +36068,63 @@ while True:
             assert_eq!(ws.main_repo_path.as_deref(), Some(pt.as_path()));
             assert_eq!(ws.repo_url.as_deref(), Some("https://github.com/o/predictionTrading.git"));
             drop(s);
+            clear_api_env();
+        });
+    }
+
+    /// Same repo, written differently: the parent row says ssh, the clone's
+    /// origin is https. That is still the parent's repo, so the subtask is
+    /// cut from the PARENT's branch (not trunk), and `inherit` / another
+    /// project in the same repo stay allowed.
+    #[test]
+    fn create_subtask_same_repo_with_origin_cuts_from_the_parent_branch() {
+        with_home_and_repo("predictionTrading", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["branch", "-M", "main"]);
+            run_git(&repo, &["remote", "add", "origin", "https://github.com/o/predictionTrading.git"]);
+            run_git(&repo, &["checkout", "-q", "-b", "cm/lead-work"]);
+            std::fs::write(repo.join("lead.txt"), "lead").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "lead work"]);
+            let lead_sha = git_sha(&repo, "HEAD");
+            let _ = home;
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some("git@github.com:o/predictionTrading.git".to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-parent") => (
+                    200,
+                    r#"{"id":"task-parent","name":"Lead","repo_url":"git@github.com:o/predictionTrading.git","project":"predictionTrading","status":"running","wip_branch":"cm/lead-work","parent_task_id":null}"#.to_string(),
+                ),
+                ("GET", "/projects") => (
+                    200,
+                    r#"[{"name":"pt-sibling","repo_url":"ssh://git@github.com:22/o/predictionTrading","repo_branch":"main"}]"#.to_string(),
+                ),
+                ("POST", "/tasks") => (200, r#"{"id":"task-sub","status":"running"}"#.to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+            let result = create_subtask(&state, &json!({"name": "w", "worktree_mode": "branch"}), Some("ts-orch"))
+                .expect("same-repo branch subtask");
+            assert_eq!(result["base_sha"], json!(lead_sha), "cut from the parent's branch");
+            assert!(result.get("base_downgraded").is_none());
+            create_subtask(&state, &json!({"name": "i", "worktree_mode": "inherit"}), Some("ts-orch"))
+                .expect("inherit stays allowed in the same repo");
+            let sibling = create_subtask(
+                &state,
+                &json!({"name": "s", "project": "pt-sibling", "worktree_mode": "branch"}),
+                Some("ts-orch"),
+            )
+            .expect("another project in the same repo is no repo change");
+            assert_eq!(sibling["base_sha"], json!(lead_sha));
             clear_api_env();
         });
     }

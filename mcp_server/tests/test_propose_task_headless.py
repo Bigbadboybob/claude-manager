@@ -10,6 +10,7 @@ from ``cli``, exactly like create_subtask). This pins the cli-free daemon path.
 
 from __future__ import annotations
 
+import sys
 import types
 import unittest
 from unittest import mock
@@ -157,6 +158,58 @@ class ProposeTaskHeadlessTests(unittest.TestCase):
         self.assertEqual(posted[1]["repo_url"], "git@github.com:o/claude-manager.git")
         self.assertEqual(len(posted), 2)
         self.assertIn("'elsewhere' has no known repo", out)
+
+
+class ProposeRepoTests(unittest.TestCase):
+    """`_propose_repo` directly: the refusal branch and the taskless fallback."""
+
+    class _Client:
+        def __init__(self, projects, caller_project=None, get_raises=False):
+            self.projects, self.caller_project, self.get_raises = projects, caller_project, get_raises
+
+        def list_projects(self):
+            return self.projects
+
+        def get_task(self, task_id):
+            if self.get_raises:
+                raise RuntimeError("planning API down")
+            return {"id": task_id, "project": self.caller_project}
+
+    def test_tasked_caller_from_another_project_is_refused(self):
+        from mcp_server import server
+        client = self._Client([], caller_project="claude-manager")
+        with mock.patch.object(server, "_git_origin_url", return_value="git@x:o/cm.git"):
+            with self.assertRaises(ValueError) as cm:
+                server._propose_repo(client, "newproj", "caller-task")
+        msg = str(cm.exception)
+        self.assertIn("'newproj' has no known repo", msg)
+        self.assertIn("'claude-manager'", msg)
+        # An unreadable caller task is "unknown", still refused.
+        client = self._Client([], get_raises=True)
+        with mock.patch.object(server, "_git_origin_url", return_value="git@x:o/cm.git"):
+            with self.assertRaises(ValueError) as cm:
+                server._propose_repo(client, "newproj", "caller-task")
+        self.assertIn("caller's own project is unknown", str(cm.exception))
+
+    def test_taskless_caller_falls_back_to_its_checkout_with_a_warning(self):
+        from mcp_server import server
+        import io
+        client = self._Client([])
+        err = io.StringIO()
+        with mock.patch.object(server, "_git_origin_url", return_value="git@x:o/new.git"), \
+                mock.patch.object(sys, "stderr", err):
+            self.assertEqual(server._propose_repo(client, "newproj", None), ("git@x:o/new.git", "main"))
+        self.assertIn("has no known repo and the caller has no task", err.getvalue())
+        # No origin either: refused.
+        with mock.patch.object(server, "_git_origin_url", side_effect=RuntimeError("no origin")):
+            with self.assertRaises(ValueError):
+                server._propose_repo(client, "newproj", None)
+
+    def test_known_project_wins_with_its_branch(self):
+        from mcp_server import server
+        client = self._Client([{"name": "pt", "repo_url": "https://x/o/pt.git", "repo_branch": "trunk"}])
+        with mock.patch.object(server, "_git_origin_url", return_value="git@x:o/cm.git"):
+            self.assertEqual(server._propose_repo(client, "pt", None), ("https://x/o/pt.git", "trunk"))
 
 
 if __name__ == "__main__":

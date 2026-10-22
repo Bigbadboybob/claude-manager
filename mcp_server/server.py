@@ -1162,9 +1162,10 @@ def propose_task(
 def _propose_repo(client, project: str, caller_task_id: str | None) -> tuple[str, str]:
     """(repo_url, repo_branch) for a task proposed into `project`.
 
-    The project's own repo always wins; the caller's checkout stands in only
-    when the caller's task is in that same project and the project has no
-    repo yet. Anything else raises ValueError: a guessed repo propagates to
+    The project's own repo always wins. A project with no repo yet takes the
+    caller's checkout when the caller's task is in that project, or when the
+    caller has no task (a new project; logged as a warning). Anything else
+    raises ValueError: a guessed repo propagates to
     every subtask and minted worktree. Mirrors the daemon's
     `resolve_propose_repo`.
     """
@@ -1177,11 +1178,19 @@ def _propose_repo(client, project: str, caller_task_id: str | None) -> tuple[str
             caller_project = client.get_task(caller_task_id).get("project")
         except Exception:
             caller_project = None
-    if caller_project == project:
+    if caller_project == project or not caller_task_id:
         try:
-            return _git_origin_url(), "main"
+            origin = _git_origin_url()
         except (RuntimeError, OSError):
-            pass
+            origin = None
+        if origin:
+            if not caller_task_id:
+                print(
+                    f"propose_task: project {project!r} has no known repo and the caller "
+                    f"has no task; stamping the caller's checkout {origin} (a new project?)",
+                    file=sys.stderr,
+                )
+            return origin, "main"
     raise ValueError(
         f"project '{project}' has no known repo (no project record and no tasks "
         f"yet), and the caller's own project is "
