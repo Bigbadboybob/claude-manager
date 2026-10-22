@@ -47,6 +47,11 @@ class ItemFields(_Strict):
     check_back: When | None = None
     eta: When | None = None
     links: list[str] | None = None
+    # Gate bindings (doc/gate-receipts.md §8); item_set only.
+    head: Short | None = None
+    mf: Short | None = None
+    ruling: Short | None = None
+    gate_class: Short | None = None
 
 
 class ItemSpec(ItemFields):
@@ -73,6 +78,9 @@ class BoardPatchBody(_Strict):
     stale_background_s: Seconds | None = None
     nudge_grace_s: Seconds | None = None
     holder_idle_enabled: bool | None = None
+    gate_default_class: Short | None = None
+    gate_editors: list[Short] | None = Field(default=None, max_length=20)
+    waiver_grantors: list[Short] | None = Field(default=None, max_length=20)
 
 
 class ItemsCreateBody(_Strict):
@@ -126,3 +134,46 @@ class HeartbeatBody(_Strict):
     sessions: list[dict] = Field(default_factory=list, max_length=2000)
     exited: list[str] = Field(default_factory=list, max_length=2000)
     acked_push_ids: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list, max_length=1000)
+
+
+# ---- gate receipts (doc/gate-receipts.md §9) -----------------------------------
+
+class ReceiptBody(_Strict):
+    actor: Actor
+    # The receipt's wire shape is checked by dispatch.gate_rules.normalize_receipt,
+    # which keeps failed, skipped and missing evidence instead of refusing it.
+    receipt: dict
+    request_id: Short | None = None
+
+
+class GrantBody(_Strict):
+    actor: Actor
+    kind: str = Field(default="waiver", max_length=16)
+    gate: str = Field(default="gate", max_length=40)
+    head: Short
+    base: Short | None = None
+    step: str = Field(max_length=40)
+    nodes: list[str] | None = Field(default=None, max_length=500)
+    cmd_digest: str | None = Field(default=None, max_length=80)
+    reason: Reason
+    risk: Reason
+    message_id: Short
+    message_check: dict = Field(default_factory=dict)
+
+
+class GrantUpdateBody(_Strict):
+    actor: Actor
+    revoke: bool = False
+    message_check: dict | None = None
+
+
+class ProfileBody(_Strict):
+    actor: Actor
+    profile: dict | None = None
+    reason: Reason
+    default: bool = False
+
+
+class RefreshBody(_Strict):
+    daemon_id: Short
+    checks: list[dict] = Field(default_factory=list, max_length=500)

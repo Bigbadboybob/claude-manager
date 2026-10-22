@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from dispatch import items_db
+from dispatch.gate_rules import GATE_FLAG_KINDS, HOLDER_ONLY_FLAGS
 from dispatch.items_rules import CLOSED, OWNER_BLOCKED, BoardTx, Item, iso
 
 logger = logging.getLogger("cm.board_engine")
@@ -331,6 +332,10 @@ def describe(flag: dict, item: Item | None, states: dict, now: datetime) -> str:
         why = f"no holder {_short(_seconds(now - touched))}"
     elif kind == "check_back" and item is not None:
         why = f"check back on \"{item.blocked_on}\""
+    elif kind in ("runner_void", "input_void"):
+        what = (f"runner {detail.get('runner_sha')}" if kind == "runner_void"
+                else f"input {detail.get('input')}")
+        why = f"{what} VOID ×{detail.get('count')} in 24 h"
     elif kind == "blocker_dropped":
         why = "blocker " + ", ".join(f"#{b}" for b in detail.get("blockers", [])) + " dropped"
     return f"#{n} {kind}" + (f" ({why})" if why else "")
@@ -526,8 +531,11 @@ async def _push_orchestrator(conn, board, items, states, orch, now, summary) -> 
     flags = await _open_flags(conn, board["id"])
     repush = timedelta(seconds=board["repush_s"])
     # The holder hears about an overdue item or a passed ETA first.
+    # A stale gate receipt is the holder's to rerun; it never wakes the
+    # orchestrator (doc/gate-receipts.md §7).
     eligible = [f for f in flags
-                if not (f["kind"] in HOLDER_FIRST and now - f["raised_at"] < repush)]
+                if f["kind"] not in HOLDER_ONLY_FLAGS
+                and not (f["kind"] in HOLDER_FIRST and now - f["raised_at"] < repush)]
     # Only flags whose item changed since they last reached the orchestrator.
     # One wake carries all of them.
     due = [f for f in eligible if _due(f, items.get(f["n"]))]
@@ -577,6 +585,7 @@ async def _escalate(conn, board, items, orch, now, summary) -> None:
     flags = await _open_flags(conn, board["id"])
     threshold = timedelta(seconds=board["escalate_s"])
     stuck = [f for f in flags if f["escalated_at"] is None and now - f["raised_at"] >= threshold
+             and f["kind"] not in GATE_FLAG_KINDS
              and _due(f, items.get(f["n"]), ":escalated")]
     if not stuck:
         return

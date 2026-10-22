@@ -45,6 +45,10 @@ def _board_settings(board: dict) -> dict:
     out["orchestrator_pid"] = board["orchestrator_pid"]
     out["steward_pid"] = board.get("steward_pid")
     out["channel"] = board.get("channel")
+    out["gate_default_class"] = board.get("gate_default_class")
+    out["gate_classes"] = sorted((board.get("gate_profiles") or {}).keys())
+    out["gate_editors"] = list(board.get("gate_editors") or [])
+    out["waiver_grantors"] = list(board.get("waiver_grantors") or [])
     return out
 
 
@@ -286,7 +290,7 @@ async def _apply(conn, tx: BoardTx) -> None:
         )
 
 
-async def _write(pool: asyncpg.Pool, ref: str, actor: dict, extra_ns, run):
+async def _write(pool: asyncpg.Pool, ref: str, actor: dict, extra_ns, run, after=None):
     now = utcnow()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -294,6 +298,8 @@ async def _write(pool: asyncpg.Pool, ref: str, actor: dict, extra_ns, run):
             items = await _load_items(conn, board["id"], extra_ns)
             tx = BoardTx(board, items, actor, now)
             result = run(tx)
+            if after is not None:
+                await after(conn, tx)
             await _apply(conn, tx)
             if tx.owner_transitions:
                 await _push_owner_transitions(conn, board, tx, now)
@@ -392,11 +398,24 @@ async def create_items(pool, ref: str, actor: dict, specs: list[dict], *,
 
 async def update_items(pool, ref: str, actor: dict, ns: list[int], fields: dict, *,
                        add_holders=None, remove_holders=None, reason=None) -> dict:
-    tx, done = await _write(
-        pool, ref, actor, ns,
-        lambda tx: tx.update(ns, fields, add_holders=add_holders,
-                             remove_holders=remove_holders, reason=reason),
-    )
+    from dispatch import gate_db  # gate bindings (doc/gate-receipts.md §8)
+
+    fields, gate = gate_db.split_binding(dict(fields))
+    only_gate = gate and not fields and not add_holders and not remove_holders
+
+    def run(tx):
+        if only_gate:
+            for n in ns:
+                tx.item(n)
+            return list(ns)
+        return tx.update(ns, fields, add_holders=add_holders,
+                         remove_holders=remove_holders, reason=reason)
+
+    async def after(conn, tx):
+        if gate:
+            await gate_db.apply_binding(conn, tx, ns, gate)
+
+    tx, done = await _write(pool, ref, actor, ns, run, after)
     return _write_reply(tx, done)
 
 
@@ -511,6 +530,19 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
                                  field=key)
             text = (value or "").strip()
             sets[key] = (text.lstrip("#") if key == "channel" else text) or None
+        elif key in ("gate_editors", "waiver_grantors"):
+            if value is None:
+                value = []
+            if not isinstance(value, list) or len(value) > 20 or not all(
+                    isinstance(v, str) and 0 < len(v) <= 200 for v in value):
+                raise ItemsError(422, "invalid_field", f"{key} is a list of at most 20 pids",
+                                 field=key)
+            sets[key] = sorted(set(value))
+        elif key == "gate_default_class":
+            if value is not None and (not isinstance(value, str) or len(value) > 40):
+                raise ItemsError(422, "invalid_field", "gate_default_class is a class name",
+                                 field=key)
+            sets[key] = value or None
         elif key == "name":
             if not isinstance(value, str) or not value.strip() or len(value) > 200:
                 raise ItemsError(422, "invalid_field", "name must be 1-200 characters",
@@ -529,6 +561,17 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
                 if not orch or orch.get("pid") != actor["pid"]:
                     raise ItemsError(403, "forbidden",
                                      "only Owner or the board's orchestrator sets steward_pid")
+            # Who edits gate profiles and who may grant waivers is Owner's call;
+            # the default class is a profile edit (doc/gate-receipts.md §2, §4).
+            if ({"gate_editors", "waiver_grantors"} & set(sets)) and actor["pid"] != OWNER_PID:
+                raise ItemsError(403, "forbidden", "only Owner sets gate_editors and waiver_grantors")
+            if "gate_default_class" in sets:
+                from dispatch import gate_db
+
+                if not await gate_db._may_edit_profiles(conn, board, actor["pid"], now):
+                    raise ItemsError(403, "forbidden",
+                                     "gate_default_class is set by Owner, the orchestrator or a "
+                                     "gate editor")
             prev = {k: board[k] for k in sets}
             changed = {k: v for k, v in sets.items() if board[k] != v}
             if changed:
@@ -753,9 +796,14 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
                     "reason": e["reason"], "at": iso(e["created_at"]),
                 })
         needle = q.lower() if q else None
+        from dispatch import gate_db
+
+        gates = await gate_db.gate_summary(conn, board, ids, now)
 
         def view(it: Item) -> dict:
             out = it.public()
+            if it.id in gates:
+                out["gate"] = gates[it.id]
             for h, src in zip(out["holders"], it.holders):
                 h["state"] = holder_state(states.get(src["pid"]), now)
             out["blocks"] = sorted(o.n for o in items.values()

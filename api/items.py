@@ -9,6 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from api.auth import verify_token
 from api.items_models import (
     BoardPatchBody,
+    GrantBody,
+    GrantUpdateBody,
+    ProfileBody,
+    ReceiptBody,
+    RefreshBody,
     ItemsChatTouchBody,
     HeartbeatBody,
     BoardResolveBody,
@@ -17,7 +22,7 @@ from api.items_models import (
     ItemsPatchBody,
     ItemsTouchBody,
 )
-from dispatch import items_db
+from dispatch import gate_db, items_db
 from dispatch.items_rules import ItemsError
 
 router = APIRouter(dependencies=[Depends(verify_token)])
@@ -113,6 +118,60 @@ async def resolve_item(ref: str, body: ItemResolveBody, request: Request,
         holders=[h.model_dump() for h in body.holders] if body.holders is not None else None,
         blocked_by=body.blocked_by, blocked_on=body.blocked_on,
         check_back=body.check_back, reason=body.reason, message=body.message))
+
+
+# ---- gate receipts (doc/gate-receipts.md §9) ---------------------------------
+
+ItemN = Path(ge=1, le=2**31 - 1)
+
+
+@router.post("/boards/{ref}/items/{n}/receipts")
+async def post_receipt(ref: str, body: ReceiptBody, request: Request, n: int = ItemN):
+    return await _call(gate_db.post_receipt(
+        _pool(request), ref, body.actor.model_dump(), n, body.receipt,
+        request_id=body.request_id))
+
+
+@router.get("/boards/{ref}/items/{n}/receipts")
+async def list_receipts(ref: str, request: Request, n: int = ItemN,
+                        gate: str | None = Query(None, max_length=40),
+                        history: bool = Query(False)):
+    return await _call(gate_db.list_receipts(_pool(request), ref, n, gate=gate, history=history))
+
+
+@router.post("/boards/{ref}/items/{n}/grants")
+async def attach_grant(ref: str, body: GrantBody, request: Request, n: int = ItemN):
+    fields = body.model_dump()
+    actor = fields.pop("actor")
+    return await _call(gate_db.attach_grant(_pool(request), ref, actor, n, fields))
+
+
+@router.patch("/boards/{ref}/items/{n}/grants/{label}")
+async def update_grant(ref: str, body: GrantUpdateBody, request: Request, n: int = ItemN,
+                       label: str = Path(min_length=1, max_length=120)):
+    return await _call(gate_db.update_grant(
+        _pool(request), ref, body.actor.model_dump(), n, label, revoke=body.revoke,
+        message_check=body.message_check))
+
+
+@router.get("/boards/{ref}/gate-profiles")
+async def get_gate_profile(ref: str, request: Request,
+                           klass: str | None = Query(None, alias="class", max_length=40),
+                           n: int | None = Query(None, ge=1, le=2**31 - 1)):
+    return await _call(gate_db.get_profile(_pool(request), ref, klass=klass, n=n))
+
+
+@router.put("/boards/{ref}/gate-profiles/{klass}")
+async def put_gate_profile(ref: str, body: ProfileBody, request: Request,
+                           klass: str = Path(min_length=1, max_length=40)):
+    return await _call(gate_db.set_profile(
+        _pool(request), ref, body.actor.model_dump(), klass, body.profile, reason=body.reason,
+        default=body.default))
+
+
+@router.post("/receipts/refresh")
+async def refresh_receipts(body: RefreshBody, request: Request):
+    return await _call(gate_db.refresh(_pool(request), body.daemon_id, body.checks))
 
 
 @router.get("/items/owner-blocked")
