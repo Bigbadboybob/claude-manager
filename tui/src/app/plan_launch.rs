@@ -18,6 +18,7 @@ pub(super) struct PlanLaunchSpec {
     pub start_branch: Option<String>,
     /// Explicit model; `None` = the task default, else the engine default.
     pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 pub(super) struct PreparedPlanLaunch {
@@ -28,6 +29,7 @@ pub(super) struct PreparedPlanLaunch {
     pub remote_branch: Option<String>,
     /// The model the session was spawned with.
     pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 pub(super) struct PlanLaunchFlight {
@@ -97,16 +99,18 @@ impl App {
                         job.in_place,
                         None,
                         job.model.as_deref(),
+                        job.effort.as_deref(),
                         Duration::from_secs(150),
                     );
                     // A lost reply does not imply a failed spawn. Recover by the
                     // original UID; never repeat the create or kill a live worker.
-                    let (path, main_repo, branch, model) = match created {
+                    let (path, main_repo, branch, model, effort) = match created {
                         Ok(r) => (
                             PathBuf::from(r.worktree_path),
                             r.main_repo_path.map(PathBuf::from),
                             r.branch,
                             r.model,
+                            r.effort,
                         ),
                         Err(error) => {
                             let found =
@@ -118,7 +122,7 @@ impl App {
                             let Some(path) = found.and_then(|s| s.worktree_path) else {
                                 return Err(error);
                             };
-                            (PathBuf::from(path), None, None, job.model.clone())
+                            (PathBuf::from(path), None, None, job.model.clone(), job.effort.clone())
                         }
                     };
                     let session = try_attach_via_daemon_with_deps(
@@ -142,7 +146,7 @@ impl App {
                         session,
                         pending: None,
                         remote_branch: branch,
-                        model,
+                        model, effort,
                     })
                 };
                 let _ = tx.send(run());
@@ -274,7 +278,7 @@ mod tests {
             uid: "launch-uid".into(),
             workspace_id: "launch-ws".into(),
             start_branch: None,
-            model: None,
+            model: None, effort: None,
         };
         let started = Instant::now();
         app.start_remote_plan_launch(spec.clone());

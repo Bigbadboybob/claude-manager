@@ -14,21 +14,26 @@ alone rejects tools that still need approval; pair it with their explicit
 `default_tools_approval_mode="approve"` settings. See
 [Codex permissions and live repair](doc/messaging/NATIVE_NOTIFICATIONS.md#codex-restart-permissions-cli-0154).
 
-## Explicit models
+## Explicit models and effort
 
-CM never relies on an engine's default model: every Claude/Codex spawn passes
-`--model` / `-m`. Fresh spawns, resumes, `A-R`, restore, forks, continuous
-tasks, workflow roles (optional `model` per role) and MCP spawns all do this.
-Resolution: explicit `model=` / form field → the task default
-(`metadata.models.<engine>`, inherited from ancestors; set via
-`POST /tasks/{id}/model`, `A-e` on a task, or `propose_task` /
-`create_subtask(model=, model_engine=)`) → `[models] claude` / `codex` in
-`daemon.toml` and `tui-settings.toml` (defaults `claude-opus-5-5`,
-`gpt-6.1-sol`; `claude_choices` / `codex_choices` are the form presets, with
-`gpt-6-luna` as the cheap option). The resolved model is recorded on the
-session, reused by revive/resume, and shown in `list_sessions`, `A-i` and F6.
-The Model row is in `A-n`, `A-s`, `A-F` and the `A-f` dialogs (Alt+o). See
-[explicit model choice](doc/models.md).
+CM never relies on an engine's default model or reasoning effort: every
+Claude/Codex spawn passes `--model` / `-m` and `--effort` /
+`-c model_reasoning_effort=` (Codex's app-server threads get it too). Fresh
+spawns, resumes, `A-R`, restore, forks, continuous tasks, workflow roles
+(optional `model` / `effort` per role) and MCP spawns all do this.
+Resolution: explicit `model=` / `effort=` / form field → the task default
+(`metadata.models.<engine>` / `metadata.efforts.<engine>`, inherited from
+ancestors; set via `POST /tasks/{id}/model`, `A-e` on a task, or
+`propose_task` / `create_subtask(model=, effort=, model_engine=)`) →
+`[models]` in `daemon.toml` and `tui-settings.toml` (defaults
+`claude-opus-5-5`, `gpt-6.1-sol`, effort `xhigh` for both; `claude_choices` /
+`codex_choices` are the form presets, with `gpt-6-luna` as the cheap option).
+Effort levels are low/medium/high/xhigh, plus max on Claude. Both are recorded
+on the session, reused by revive/resume (older sessions: what the transcript
+ran on, else the default as `default_on_resume`), and shown in
+`list_sessions`, `A-i` and F6. The Model row (Effort on Shift+←/→) is in
+`A-n`, `A-s`, `A-F` and the `A-f` dialogs (Alt+o). See
+[explicit model and effort](doc/models.md).
 
 ## Repository workflow
 

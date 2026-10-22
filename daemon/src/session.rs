@@ -651,6 +651,14 @@ pub struct SpawnParams {
     /// revive, resume and restore reuse it. `None` for bash and for
     /// sessions recorded before models were.
     pub model: Option<String>,
+    /// Where `model` came from ([`crate::models::ModelSource::as_str`]):
+    /// `explicit`, `task`, `engine_default`, `transcript`, … `None` when
+    /// unknown (bash, or recorded before sources were).
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    pub effort_source: Option<String>,
     /// Global-permissions grant. When `true`, this session's
     /// Session-caller auth checks (`auth::check_session_caller` and
     /// `check_session_caller_for_exited`) short-circuit to `Allow`
@@ -754,6 +762,9 @@ impl SpawnParams {
             // Phase-1 continuous wire field: non-continuous default.
             continuous_task_id: None,
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             // Global perms default to off — descendant-only scope is
             // the safe baseline. Only the operator (TUI) or a global
             // caller can flip this true at spawn time.
@@ -1159,6 +1170,14 @@ pub struct DaemonSession {
     /// revive, resume and restore reuse it. `None` for bash and for
     /// sessions recorded before models were.
     pub model: Option<String>,
+    /// Where `model` came from ([`crate::models::ModelSource::as_str`]):
+    /// `explicit`, `task`, `engine_default`, `transcript`, … `None` when
+    /// unknown (bash, or recorded before sources were).
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    pub effort_source: Option<String>,
     /// Global-permissions grant for this session's Session-caller
     /// auth. When `true`, `auth::check_session_caller` /
     /// `check_session_caller_for_exited` short-circuit to `Allow`
@@ -1483,6 +1502,9 @@ impl DaemonSession {
             workflow_role: self.workflow_role.clone(),
             continuous_task_id: self.continuous_task_id.clone(),
             model: self.model.clone(),
+            model_source: self.model_source.clone(),
+            effort: self.effort.clone(),
+            effort_source: self.effort_source.clone(),
             task_id: self.task_id.clone(),
             notify_on_idle: false,
             // TUI-only presentation field (see doc comment above).
@@ -1585,6 +1607,9 @@ struct PendingSessionInner {
     /// DaemonSession alongside the workflow tags.
     continuous_task_id: Option<String>,
     model: Option<String>,
+    model_source: Option<String>,
+    effort: Option<String>,
+    effort_source: Option<String>,
     /// Global-perms grant, carried SpawnParams → DaemonSession.
     global_perms: bool,
     /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
@@ -1928,6 +1953,9 @@ impl PendingSession {
                 workflow_role: params.workflow_role,
                 continuous_task_id: params.continuous_task_id,
                 model: params.model,
+                model_source: params.model_source,
+                effort: params.effort,
+                effort_source: params.effort_source,
                 global_perms: params.global_perms,
                 last_activity_at,
                 title: params.title,
@@ -1996,6 +2024,9 @@ impl PendingSession {
             workflow_role,
             continuous_task_id,
             model,
+            model_source,
+            effort,
+            effort_source,
             global_perms,
             last_activity_at,
             title,
@@ -2098,6 +2129,9 @@ impl PendingSession {
             workflow_role,
             continuous_task_id,
             model,
+            model_source,
+            effort,
+            effort_source,
             global_perms,
             // Sub-2b-1 review-r#2 #2: generation starts at 0;
             // `session.set_transcript_path` increments on
@@ -2421,6 +2455,14 @@ pub struct AdoptedSessionMeta {
     /// revive, resume and restore reuse it. `None` for bash and for
     /// sessions recorded before models were.
     pub model: Option<String>,
+    /// Where `model` came from ([`crate::models::ModelSource::as_str`]):
+    /// `explicit`, `task`, `engine_default`, `transcript`, … `None` when
+    /// unknown (bash, or recorded before sources were).
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    pub effort_source: Option<String>,
     /// Global-permissions grant — an orchestrator must not lose its
     /// scope across a deploy.
     pub global_perms: bool,
@@ -2652,6 +2694,9 @@ impl AdoptedSessionBuild {
             workflow_role: meta.workflow_role,
             continuous_task_id: meta.continuous_task_id,
             model: meta.model,
+            model_source: meta.model_source,
+            effort: meta.effort,
+            effort_source: meta.effort_source,
             global_perms: meta.global_perms,
             generation: meta.generation,
             last_activity_at,

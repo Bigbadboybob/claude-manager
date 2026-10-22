@@ -98,6 +98,15 @@ echo "export CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_OAUTH_TOKEN" >> "$WORKER_HOME/.bash
 # ---------------------------------------------------------------------------
 # Restore session if resuming (cm push -> cloud)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Claude's model and effort (CM never relies on the engine's defaults).
+# Dispatch passes the task's own default, else the configured one; a resumed
+# session keeps what its transcript ran on unless the task names one.
+# ---------------------------------------------------------------------------
+CLAUDE_MODEL=$(curl -sf "$META_URL/claude-model" -H "$META_HEADER" || echo "claude-opus-5-5")
+CLAUDE_MODEL_SOURCE=$(curl -sf "$META_URL/claude-model-source" -H "$META_HEADER" || echo "config")
+CLAUDE_EFFORT=$(curl -sf "$META_URL/claude-effort" -H "$META_HEADER" || echo "xhigh")
+CLAUDE_EFFORT_SOURCE=$(curl -sf "$META_URL/claude-effort-source" -H "$META_HEADER" || echo "config")
 CLAUDE_ARGS="--dangerously-skip-permissions --permission-mode bypassPermissions"
 
 if [ -n "$SESSION_ID" ]; then
@@ -111,7 +120,18 @@ if [ -n "$SESSION_ID" ]; then
     chown -R worker:worker "$WORKER_HOME/.claude/projects"
     CLAUDE_ARGS="$CLAUDE_ARGS --resume $SESSION_ID"
     echo "[cm-worker] Will resume session $SESSION_ID"
+    TRANSCRIPT="$WORKER_HOME/.claude/projects/-workspace/$SESSION_ID.jsonl"
+    if [ -f "$TRANSCRIPT" ]; then
+        RAN_MODEL=$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -o '"model":"[A-Za-z0-9._:/@+-]*"' | grep -v synthetic | tail -1 | cut -d'"' -f4)
+        RAN_EFFORT=$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -o '"effort":"[a-z]*"' | tail -1 | cut -d'"' -f4)
+        [ "$CLAUDE_MODEL_SOURCE" != "task" ] && [ -n "$RAN_MODEL" ] && CLAUDE_MODEL="$RAN_MODEL"
+        [ "$CLAUDE_EFFORT_SOURCE" != "task" ] && [ -n "$RAN_EFFORT" ] && CLAUDE_EFFORT="$RAN_EFFORT"
+    fi
 fi
+case "$CLAUDE_MODEL" in ""|-*|*[!A-Za-z0-9._:/@+\[\]-]*) CLAUDE_MODEL="claude-opus-5-5" ;; esac
+case "$CLAUDE_EFFORT" in low|medium|high|xhigh|max) ;; *) CLAUDE_EFFORT="xhigh" ;; esac
+CLAUDE_ARGS="$CLAUDE_ARGS --model $CLAUDE_MODEL --effort $CLAUDE_EFFORT"
+echo "[cm-worker] Claude model $CLAUDE_MODEL, effort $CLAUDE_EFFORT"
 
 # ---------------------------------------------------------------------------
 # Start Claude Code in tmux

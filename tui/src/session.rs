@@ -112,6 +112,11 @@ pub struct Session {
     /// `None` for bash, local PTYs and plain re-attaches. TerminalSession
     /// constructors record it so revive / restart reuse it.
     pub spawn_model: Option<String>,
+    /// Where `spawn_model` came from.
+    pub spawn_model_source: Option<String>,
+    /// The reasoning effort the session was spawned with, and its source.
+    pub spawn_effort: Option<String>,
+    pub spawn_effort_source: Option<String>,
     /// Latched `memory_cap_kill` flag for daemon-attached
     /// sessions (slice 10c-e-3b-fix4b). The attach-stream reader
     /// half stores `true` here when the daemon's `End` frame
@@ -331,6 +336,9 @@ impl Session {
             event_rx,
             title: format!("{} {}", shell, args.join(" ")),
             spawn_model: None,
+            spawn_model_source: None,
+            spawn_effort: None,
+            spawn_effort_source: None,
             exited: false,
             wakeup_times: Vec::new(),
             memory_cap,
@@ -386,6 +394,9 @@ impl Session {
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
         let spawn_model = config.model.map(str::to_string);
+        let spawn_model_source = config.model_source.map(str::to_string);
+        let spawn_effort = config.effort.map(str::to_string);
+        let spawn_effort_source = config.effort_source.map(str::to_string);
         // A bounded raw replay can start after the application's last complete
         // screen. Codex and Claude Code rebuild their screen on resize; defer
         // that until this pane is viewed, rather than repainting the fleet.
@@ -406,6 +417,9 @@ impl Session {
             event_rx: cs.event_rx,
             title: format!("{} (daemon:{})", title_label, cs.session_uid),
             spawn_model: spawn_model.clone(),
+            spawn_model_source: spawn_model_source.clone(),
+            spawn_effort: spawn_effort.clone(),
+            spawn_effort_source: spawn_effort_source.clone(),
             exited: false,
             wakeup_times: Vec::new(),
             memory_cap: None,
@@ -431,6 +445,9 @@ impl Session {
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
         let spawn_model = config.model.map(str::to_string);
+        let spawn_model_source = config.model_source.map(str::to_string);
+        let spawn_effort = config.effort.map(str::to_string);
+        let spawn_effort_source = config.effort_source.map(str::to_string);
         let cs = crate::client_session::ClientSession::new(config)?;
         // Mirror the daemon-echoed cgroup_path so the local
         // Session has parity with what `Session::new` would
@@ -453,6 +470,9 @@ impl Session {
             event_rx: cs.event_rx,
             title: format!("{} (daemon:{})", title_label, cs.session_uid),
             spawn_model: spawn_model.clone(),
+            spawn_model_source: spawn_model_source.clone(),
+            spawn_effort: spawn_effort.clone(),
+            spawn_effort_source: spawn_effort_source.clone(),
             exited: false,
             wakeup_times: Vec::new(),
             // Daemon-spawned sessions: the memory-cap watcher

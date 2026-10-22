@@ -78,6 +78,10 @@ pub struct Role {
     /// a launch overrides the role's engine.
     #[serde(default)]
     pub model: Option<String>,
+    /// The reasoning effort this role's sessions launch with, resolved like
+    /// `model` (role → task default → config default).
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 fn default_needs_mcp() -> bool {

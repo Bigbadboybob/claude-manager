@@ -1885,15 +1885,20 @@ impl App {
     /// header block on top either way.
     /// `claude: X (task) · codex: Y (inherited)` for the peek: each
     /// engine's default as a spawn on this task would resolve it.
-    pub(crate) fn task_models_summary(&self, task_id: &str) -> String {
-        let own = self.planning.task_own_models(task_id);
+    pub(crate) fn task_models_summary(&self, task_id: &str, setting: cm_daemon::models::Setting) -> String {
+        use cm_daemon::models::Setting;
+        let own = self.planning.task_own(task_id, setting);
         ["claude", "codex"]
             .into_iter()
             .map(|engine| {
-                let (model, from) = match (own.get(engine), self.task_default_model(task_id, engine)) {
+                let fallback = match setting {
+                    Setting::Model => cm_daemon::models::default_model(engine),
+                    Setting::Effort => cm_daemon::models::default_effort(engine),
+                };
+                let (model, from) = match (own.get(engine), self.task_default(task_id, engine, setting)) {
                     (Some(m), _) => (m.clone(), "task"),
                     (None, Some(m)) => (m, "inherited"),
-                    (None, None) => (cm_daemon::models::default_model(engine).unwrap_or_default(), "engine default"),
+                    (None, None) => (fallback.unwrap_or_default(), "default"),
                 };
                 format!("{engine}: {model} ({from})")
             })
@@ -1919,7 +1924,16 @@ impl App {
                     ts.last_delivery.as_ref().map(|(s, _)| s.as_str()),
                 ));
                 if let Some(model) = ts.model.as_deref() {
-                    out.push(PeekLine::Field { label: "Model".into(), value: model.to_string() });
+                    out.push(PeekLine::Field {
+                        label: "Model".into(),
+                        value: super::model_field::with_source(model, ts.model_source.as_deref()),
+                    });
+                }
+                if let Some(effort) = ts.effort.as_deref() {
+                    out.push(PeekLine::Field {
+                        label: "Effort".into(),
+                        value: super::model_field::with_source(effort, ts.effort_source.as_deref()),
+                    });
                 }
                 if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
                     out.push(PeekLine::Field { label: "Status".into(), value: note.to_string() });
@@ -1947,7 +1961,9 @@ impl App {
                     let mut lines = peek_task_lines(task, parent);
                     // Default models sit with the task's fields, before the prompt.
                     let at = lines.iter().position(|l| *l == PeekLine::Blank).unwrap_or(lines.len());
-                    lines.insert(at, PeekLine::Field { label: "Models".into(), value: self.task_models_summary(task_id) });
+                    use cm_daemon::models::Setting;
+                    lines.insert(at, PeekLine::Field { label: "Models".into(), value: self.task_models_summary(task_id, Setting::Model) });
+                    lines.insert(at + 1, PeekLine::Field { label: "Efforts".into(), value: self.task_models_summary(task_id, Setting::Effort) });
                     out.extend(lines);
                 }
                 None => {

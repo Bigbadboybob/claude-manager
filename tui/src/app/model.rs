@@ -110,6 +110,12 @@ pub struct TerminalSession {
     /// restored from a manifest older than the field). Persisted in the
     /// manifest so revive / restart reuse it.
     pub model: Option<String>,
+    /// Where `model` came from (`ModelSource::as_str`; `None` if unknown).
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    pub effort_source: Option<String>,
     /// Marker that an Enter keystroke is queued to be written to the PTY at
     /// or after `fire_at`. Used to introduce a deliberate gap between the body
     /// of a multi-KB workflow prompt and the trailing Enter so the receiving
@@ -233,6 +239,9 @@ impl TerminalSession {
             color: self.color.clone(),
             global_perms: self.global_perms,
             model: self.model.clone(),
+            model_source: self.model_source.clone(),
+            effort: self.effort.clone(),
+            effort_source: self.effort_source.clone(),
             seeded_from_snapshot: self.seeded_from_snapshot.clone(),
             // Read-modify-write the daemon-owned `last_exit`. The TUI
             // never inspects or mutates it — just hands it back
@@ -516,6 +525,9 @@ pub(super) fn make_simple_session_with_uid(
 ) -> TerminalSession {
     TerminalSession {
         model: session.spawn_model.clone(),
+        model_source: session.spawn_model_source.clone(),
+        effort: session.spawn_effort.clone(),
+        effort_source: session.spawn_effort_source.clone(),
         color: None,
         uid,
         label: label.to_string(),
@@ -630,6 +642,9 @@ mod manifest_entry_seeded_from_tests {
     fn seeded_from_snapshot_round_trips() {
         let entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -683,6 +698,9 @@ mod manifest_entry_seeded_from_tests {
     fn none_does_not_serialize() {
         let entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -751,6 +769,9 @@ mod manifest_entry_seeded_from_tests {
         // correctly post-restart.
         let entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -823,6 +844,9 @@ mod manifest_entry_seeded_from_tests {
         };
         let initial = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -875,6 +899,9 @@ mod manifest_entry_seeded_from_tests {
         // this test would fail.
         let rebuilt = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -937,6 +964,9 @@ mod transcript_rebind_tests {
                 .expect("session for test");
         TerminalSession {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: "uid".into(),
             label: "test".into(),

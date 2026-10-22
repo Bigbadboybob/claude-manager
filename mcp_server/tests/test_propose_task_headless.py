@@ -214,3 +214,18 @@ class ProposeRepoTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FiledTaskDefaultsTests(unittest.TestCase):
+    """The no-daemon twin of the daemon's `filed_task_defaults`."""
+
+    def test_slots_levels_and_refusals(self):
+        from mcp_server.server import _filed_task_defaults as f
+
+        self.assertEqual(f(None, None, None), (None, None, None))
+        self.assertEqual(f("gpt-6-luna", "Medium", None), ({"codex": "gpt-6-luna"}, {"codex": "medium"}, None))
+        self.assertEqual(f(None, "max", "claude"), (None, {"claude": "max"}, None))
+        self.assertIn("model_engine", f(None, "high", None)[2])
+        self.assertIn("not a codex level", f(None, "max", "codex")[2])
+        self.assertIn("not a claude level", f("claude-opus-5-5", "extreme", None)[2])
+        self.assertIn("is a codex model", f("gpt-6-luna", None, "claude")[2])

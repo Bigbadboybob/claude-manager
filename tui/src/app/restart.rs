@@ -112,6 +112,7 @@ pub(super) struct RemoteAdd {
     pub resume_from: Option<String>,
     /// `None` = the host resolves it (task default, else engine default).
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub cols: u16,
     pub rows: u16,
 }
@@ -153,6 +154,7 @@ fn run_remote_add(pool: &crate::host_pool::HostPool, job: &RemoteAdd) -> AddOutc
         job.resume_from.as_deref(),
         job.seed_from.as_deref(),
         job.model.as_deref(),
+        job.effort.as_deref(),
     )
     .map_err(|e| format!("Remote add_session failed: {e}"))?;
     let workspace_id = res.workspace_id.clone().unwrap_or_else(|| job.workspace_id.clone());
@@ -273,7 +275,7 @@ impl App {
             task_id: job.task_id.clone(),
             seed_from: job.seed_from.clone(),
             resume_from: job.resume_from.clone(),
-            model: job.model.clone(),
+            model: job.model.clone(), effort: job.effort.clone(),
             cols: job.cols,
             rows: job.rows,
         };

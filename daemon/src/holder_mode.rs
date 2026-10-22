@@ -1199,6 +1199,9 @@ pub fn holder_spawn(
         workflow_role: params.workflow_role.clone(),
         continuous_task_id: params.continuous_task_id.clone(),
         model: params.model.clone(),
+        model_source: params.model_source.clone(),
+        effort: params.effort.clone(),
+        effort_source: params.effort_source.clone(),
         global_perms: params.global_perms,
         generation: 0,
         last_activity_at: None,
@@ -2057,6 +2060,9 @@ pub fn adopt_at_boot(
                 managed_by_uid: e.managed_by_uid.clone(),
                 continuous_task_id: e.continuous_task_id.clone(),
                 model: e.model.clone(),
+                model_source: e.model_source.clone(),
+                effort: e.effort.clone(),
+                effort_source: e.effort_source.clone(),
                 label: e.label.clone(),
                 workflow_run_id: None,
                 workflow_role: None,
@@ -2094,6 +2100,8 @@ pub fn adopt_at_boot(
             st.persist_sessions_best_effort();
         }
     }
+    // Sessions adopted across a deploy keep the model they really run.
+    crate::control::methods::backfill_session_models(state_arc, None);
     let count = {
         let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         st.sessions.len()
@@ -2123,6 +2131,9 @@ fn adopted_meta_from_manifest_entry(
         workflow_role: e.workflow_role.clone(),
         continuous_task_id: e.continuous_task_id.clone(),
         model: e.model.clone(),
+        model_source: e.model_source.clone(),
+        effort: e.effort.clone(),
+        effort_source: e.effort_source.clone(),
         global_perms: e.global_perms,
         generation: e.generation,
         // Activity cells reset to adoption time — the state-inventory
@@ -2268,6 +2279,9 @@ fn orphan_meta(uid: &str) -> AdoptedSessionMeta {
         workflow_role: None,
         continuous_task_id: None,
         model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
         global_perms: false,
         generation: 0,
         last_activity_at: None,
@@ -2394,6 +2408,9 @@ mod tests {
             workflow_role: None,
             continuous_task_id: None,
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             task_id: Some("task-1".into()),
             notify_on_idle: false,
             color: None,

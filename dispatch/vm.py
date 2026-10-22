@@ -21,12 +21,34 @@ def read_worker_script(filename: str = "startup.sh") -> str:
     return (Path(__file__).parent.parent / "worker" / filename).read_text()
 
 
+def claude_launch_metadata(task_metadata: dict | None) -> dict[str, str]:
+    """Instance metadata naming the worker Claude's model and effort.
+
+    ``claude-model`` / ``claude-effort`` carry the task's own default when it
+    sets one, else the configured worker default. ``*-source`` says which,
+    so a resuming worker can prefer the model its transcript ran on over a
+    config default.
+    """
+    from dispatch.config import WORKER_CLAUDE_EFFORT, WORKER_CLAUDE_MODEL
+    meta = task_metadata if isinstance(task_metadata, dict) else {}
+    out = {}
+    for name, key, default in (("model", "models", WORKER_CLAUDE_MODEL),
+                               ("effort", "efforts", WORKER_CLAUDE_EFFORT)):
+        slot = meta.get(key) if isinstance(meta.get(key), dict) else {}
+        value = slot.get("claude")
+        value = value.strip() if isinstance(value, str) else ""
+        out[f"claude-{name}"] = value or default
+        out[f"claude-{name}-source"] = "task" if value else "config"
+    return out
+
+
 def launch_worker(task_id: str, repo_url: str, repo_branch: str,
                   prompt: str, manager_callback_url: str, *,
                   overrides: dict | None = None,
                   startup_script: str | None = None,
                   extra_metadata: dict[str, str] | None = None,
-                  network_tags: list[str] | None = None) -> tuple[str, str]:
+                  network_tags: list[str] | None = None,
+                  task_metadata: dict | None = None) -> tuple[str, str]:
     """Create a spot VM for a task. Returns (instance_name, external_ip).
 
     `overrides` may carry per-task VM settings (metadata.vm on backtest
@@ -70,7 +92,7 @@ def launch_worker(task_id: str, repo_url: str, repo_branch: str,
         compute_v1.Items(key="manager-callback-url", value=manager_callback_url),
         compute_v1.Items(key="api-token", value=API_TOKEN),
     ]
-    for key, value in (extra_metadata or {}).items():
+    for key, value in {**claude_launch_metadata(task_metadata), **(extra_metadata or {})}.items():
         if len(value.encode("utf-8")) > _METADATA_VALUE_MAX_BYTES:
             raise ValueError(
                 f"instance metadata value for {key!r} exceeds "

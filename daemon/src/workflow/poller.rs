@@ -2251,7 +2251,7 @@ mod tests {
                     activation_prompt: Some("worker start".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -2264,7 +2264,7 @@ mod tests {
                     ),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -2388,9 +2388,9 @@ mod tests {
             s.workspaces.insert("ws-1".to_string(), ws);
             // All-claude feedback (reviewer fresh) — simplest transcript dir.
             let mut roles = BTreeMap::new();
-            roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
-            roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
-            roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
+            roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+            roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+            roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
             s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
                 name: "feedback".to_string(), description: String::new(), roles,
                 role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
@@ -2549,19 +2549,19 @@ mod tests {
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Persistent,
-                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None,
+                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             roles.insert("reviewer".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Fresh,
                 activation_prompt: Some("Review this: {{ roles.worker.last_message }}".to_string()),
-                subsequent_activation_prompt: None, needs_mcp: false, model: None,
+                subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             // Manager exists so the reviewer HAS an on_idle transition — that
             // way the reviewer's inert gate reports NoTranscriptId (sid unbound),
             // not NoOnIdleTransition. Manager itself is never reached in this test.
             roles.insert("manager".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Persistent,
-                activation_prompt: Some("decide".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None,
+                activation_prompt: Some("decide".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
                 name: "feedback".to_string(), description: String::new(), roles,
@@ -2690,12 +2690,12 @@ mod tests {
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Persistent,
-                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None,
+                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             roles.insert("reviewer".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Fresh,
                 activation_prompt: Some("review".to_string()),
-                subsequent_activation_prompt: None, needs_mcp: false, model: None,
+                subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
                 name: "feedback".to_string(), description: String::new(), roles,
@@ -2836,7 +2836,7 @@ mod tests {
                     activation_prompt: Some("manager first".to_string()),
                     subsequent_activation_prompt: Some("decide and CALL the tool".to_string()),
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -3141,7 +3141,7 @@ mod tests {
                     activation_prompt: Some("w".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -3152,7 +3152,7 @@ mod tests {
                     activation_prompt: Some("r".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -3289,7 +3289,7 @@ mod tests {
                     activation_prompt: Some("worker".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -3300,7 +3300,7 @@ mod tests {
                     activation_prompt: Some("review".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             // reviewer → worker on_idle so the active role
@@ -4042,7 +4042,7 @@ to = "reviewer"
                     activation_prompt: Some("worker prompt".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -4053,7 +4053,7 @@ to = "reviewer"
                     activation_prompt: Some("review".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -4196,7 +4196,7 @@ to = "reviewer"
                 activation_prompt: Some(p.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
-                model: None,
+                model: None, effort: None,
             };
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), make_role("w"));
@@ -4329,7 +4329,7 @@ to = "reviewer"
                 activation_prompt: Some(p.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
-                model: None,
+                model: None, effort: None,
             };
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), make_role("w"));
@@ -4479,7 +4479,7 @@ to = "reviewer"
                 activation_prompt: Some(prompt.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
-                model: None,
+                model: None, effort: None,
             };
             let mut old_roles = BTreeMap::new();
             old_roles.insert("worker".to_string(), make_role("w"));
@@ -4535,7 +4535,7 @@ to = "reviewer"
                 activation_prompt: Some(prompt.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
-                model: None,
+                model: None, effort: None,
             };
             let mut new_roles = BTreeMap::new();
             new_roles.insert("worker".to_string(), make_role("w"));
@@ -4632,7 +4632,7 @@ to = "reviewer"
                 activation_prompt: Some(prompt.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
-                model: None,
+                model: None, effort: None,
             };
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), make_role("w"));
@@ -4679,7 +4679,7 @@ to = "reviewer"
                 activation_prompt: Some(prompt.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
-                model: None,
+                model: None, effort: None,
             };
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), make_role("w"));
@@ -4750,7 +4750,7 @@ to = "reviewer"
                     activation_prompt: Some("ignored".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             // Reviewer has NO activation_prompt — daemon must
@@ -4763,7 +4763,7 @@ to = "reviewer"
                     activation_prompt: None,
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -4940,7 +4940,7 @@ to = "reviewer"
                     activation_prompt: Some("w".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -4951,7 +4951,7 @@ to = "reviewer"
                     activation_prompt: Some("r".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -5071,7 +5071,7 @@ to = "reviewer"
                     activation_prompt: Some(r.to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 });
             }
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
@@ -5199,7 +5199,7 @@ to = "reviewer"
                     activation_prompt: Some(r.to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 });
             }
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
@@ -5336,7 +5336,7 @@ to = "reviewer"
                     activation_prompt: Some(r.to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 });
             }
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
@@ -5490,7 +5490,7 @@ to = "reviewer"
                     activation_prompt: Some("w".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -5501,7 +5501,7 @@ to = "reviewer"
                     activation_prompt: Some("r".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(

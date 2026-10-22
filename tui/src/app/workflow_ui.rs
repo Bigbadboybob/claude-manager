@@ -165,6 +165,9 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     cap_status: &crate::memory_cap::MemoryCapAvailability,
     host_pool: &crate::host_pool::HostPool,
     workspace_id: &str,
+    // The task's default model and effort, for a row with none recorded.
+    task_model: Option<&str>,
+    task_effort: Option<&str>,
 ) -> Option<String> {
     // 12e-r6 F2: fail fast on a non-local pinned host BEFORE
     // any other work. The respawn would build local mcp_config
@@ -247,7 +250,10 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         &ts.host_id,
         pre_spawn_transcript.as_deref(),
         false, // global_perms
-        ts.model.as_deref(),
+        ts.model.as_deref().or(task_model),
+        if ts.model.is_some() { ts.model_source.as_deref() } else { task_model.map(|_| "task") },
+        ts.effort.as_deref().or(task_effort),
+        if ts.effort.is_some() { ts.effort_source.as_deref() } else { task_effort.map(|_| "task") },
     ) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
@@ -1121,6 +1127,9 @@ mod stop_workflow_local_cleanup_tests {
     fn entry_with_workflow(run_id: Option<&str>) -> ManifestEntry {
         ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -1297,6 +1306,9 @@ mod rotation_binding_tests {
     ) -> TerminalSession {
         TerminalSession {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: "uid".into(),
             label: "test".into(),

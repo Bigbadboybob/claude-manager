@@ -137,6 +137,9 @@ pub struct PlanTask {
     /// Per-engine default model (`metadata.models`: `{"claude": .., "codex": ..}`).
     /// Subtasks without their own inherit through `parent_task_id`.
     pub models: std::collections::BTreeMap<String, String>,
+    /// Per-engine default reasoning effort (`metadata.efforts`), inherited
+    /// the same way.
+    pub efforts: std::collections::BTreeMap<String, String>,
 }
 
 /// Pull a `"vm"` / `"backtest"` string field out of a task's free-form
@@ -167,6 +170,23 @@ pub(crate) fn meta_models(metadata: &Option<serde_json::Value>) -> std::collecti
         .unwrap_or_default()
 }
 
+/// `metadata.efforts` as an engine → effort map (invalid entries dropped).
+pub(crate) fn meta_efforts(metadata: &Option<serde_json::Value>) -> std::collections::BTreeMap<String, String> {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get(cm_daemon::models::TASK_EFFORTS_METADATA_KEY))
+        .and_then(|m| m.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let effort = cm_daemon::models::validate_effort(k, v.as_str()?).ok()?;
+                    Some((k.clone(), effort))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
     task.filer
         .as_ref()
@@ -175,6 +195,14 @@ fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
 }
 
 impl PlanTask {
+    /// The task's own per-engine models or efforts.
+    pub fn defaults(&self, setting: cm_daemon::models::Setting) -> &std::collections::BTreeMap<String, String> {
+        match setting {
+            cm_daemon::models::Setting::Model => &self.models,
+            cm_daemon::models::Setting::Effort => &self.efforts,
+        }
+    }
+
     fn initiative_marker(&self) -> &'static str {
         if self.is_initiative_coordinator { "◆ " } else { "" }
     }
@@ -220,6 +248,7 @@ impl PlanTask {
             bt_label: meta_str(&task.metadata, "backtest", "label"),
             filer: FilerMetadata::from_metadata(&task.metadata),
             models: meta_models(&task.metadata),
+            efforts: meta_efforts(&task.metadata),
         }
     }
 }
@@ -611,6 +640,7 @@ pub enum PlanAction {
         /// Model picked with Alt+o; `None` = the task default, else the
         /// engine default.
         model: Option<String>,
+        effort: Option<String>,
     },
     /// Bind a task to an existing workspace and spawn a session there
     /// (no new worktree, no branch input).
@@ -638,6 +668,7 @@ pub enum PlanAction {
         reparent: bool,
         /// See `LaunchTask::model`.
         model: Option<String>,
+        effort: Option<String>,
     },
     /// Clear a task's `workspace_id`. Task status is not affected.
     UnbindTask {
@@ -1278,13 +1309,13 @@ impl PlanningView {
         None
     }
 
-    /// The models the task itself sets (not inherited).
-    pub fn task_own_models(&self, task_id: &str) -> std::collections::BTreeMap<String, String> {
+    /// The models or efforts the task itself sets (not inherited).
+    pub fn task_own(&self, task_id: &str, setting: cm_daemon::models::Setting) -> std::collections::BTreeMap<String, String> {
         self.project_data
             .iter()
             .flat_map(|pd| &pd.tasks)
             .find(|t| t.id == task_id)
-            .map(|t| t.models.clone())
+            .map(|t| PlanTask::defaults(t, setting).clone())
             .unwrap_or_default()
     }
 
@@ -1296,15 +1327,15 @@ impl PlanningView {
             .and_then(|t| t.parent_task_id.clone())
     }
 
-    /// The task's default model for `engine` (its own, else its nearest
-    /// ancestor's), with the task that set it.
-    pub fn task_model(&self, task_id: &str, engine: &str) -> Option<(String, String)> {
+    /// The task's default model or effort for `engine` (its own, else its
+    /// nearest ancestor's), with the task that set it.
+    pub fn task_default(&self, task_id: &str, engine: &str, setting: cm_daemon::models::Setting) -> Option<(String, String)> {
         let key = cm_daemon::models::engine_key(engine)?;
         let find = |id: &str| self.project_data.iter().flat_map(|pd| &pd.tasks).find(|t| t.id == id);
         let mut current = find(task_id);
         for _ in 0..64 {
             let task = current?;
-            if let Some(m) = task.models.get(key) {
+            if let Some(m) = task.defaults(setting).get(key) {
                 return Some((m.clone(), task.id.clone()));
             }
             current = task.parent_task_id.as_deref().and_then(find);
@@ -1677,6 +1708,7 @@ impl PlanningView {
                 task.parent_task_id = api_task.parent_task_id.clone();
                 task.filer = FilerMetadata::from_metadata(&api_task.metadata);
                 task.models = meta_models(&api_task.metadata);
+                task.efforts = meta_efforts(&api_task.metadata);
                 self.recompute_conflicts();
                 self.needs_redraw = true;
                 return;
@@ -2980,7 +3012,7 @@ impl PlanningView {
                                     parent_task_id: task.parent_task_id.clone(),
                                     engine,
                                     reparent,
-                                    model: self.launch_model.value().unwrap_or(None),
+                                    model: self.launch_model.value().unwrap_or(None), effort: self.launch_model.effort_value(),
                                 };
                             }
                         }
@@ -3053,7 +3085,7 @@ impl PlanningView {
                                 engine,
                                 host_id: self.launch_host.clone(),
                                 reparent,
-                                model: self.launch_model.value().unwrap_or(None),
+                                model: self.launch_model.value().unwrap_or(None), effort: self.launch_model.effort_value(),
                             };
                         }
                     }
@@ -4002,13 +4034,18 @@ impl PlanningView {
     }
 
     /// Per-engine default models for a task, inherited through its parents.
-    fn task_models_of(&self, pi: usize, ti: usize) -> std::collections::BTreeMap<String, String> {
+    fn task_models_of(
+        &self,
+        pi: usize,
+        ti: usize,
+        setting: cm_daemon::models::Setting,
+    ) -> std::collections::BTreeMap<String, String> {
         let Some(id) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)).map(|t| t.id.clone()) else {
             return Default::default();
         };
         ["claude", "codex"]
             .into_iter()
-            .filter_map(|e| Some((e.to_string(), self.task_model(&id, e)?.0)))
+            .filter_map(|e| Some((e.to_string(), self.task_default(&id, e, setting)?.0)))
             .collect()
     }
 
@@ -4033,7 +4070,8 @@ impl PlanningView {
             self.launch_reports_to_orig = self.launch_reports_to.clone();
             self.launch_model = crate::app::model_field::ModelField::for_task(
                 LaunchEngine::default().as_session_type(),
-                self.task_models_of(pi, ti),
+                self.task_models_of(pi, ti, cm_daemon::models::Setting::Model),
+                self.task_models_of(pi, ti, cm_daemon::models::Setting::Effort),
             );
             self.input_mode = PlanInputMode::WorkspacePicker {
                 project_idx: pi,
@@ -5388,6 +5426,7 @@ mod tests {
             bt_label: None,
             filer: None,
             models: Default::default(),
+            efforts: Default::default(),
         }
     }
 
@@ -5961,6 +6000,7 @@ mod tests {
             bt_label: None,
             filer: None,
             models: Default::default(),
+            efforts: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
@@ -6021,6 +6061,7 @@ mod tests {
             bt_label: None,
             filer: None,
             models: Default::default(),
+            efforts: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view
@@ -6145,6 +6186,7 @@ mod tests {
             bt_label: None,
             filer: None,
             models: Default::default(),
+            efforts: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view
@@ -6212,6 +6254,7 @@ mod tests {
                 bt_label: None,
                 filer: None,
                 models: Default::default(),
+                efforts: Default::default(),
             });
             view.project_data.push(pd);
             view.projects = view
@@ -6291,6 +6334,7 @@ mod tests {
             bt_label: None,
             filer: None,
             models: Default::default(),
+            efforts: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view
@@ -6493,6 +6537,7 @@ mod tests {
             bt_label: None,
             filer: None,
             models: Default::default(),
+            efforts: Default::default(),
         }
     }
 

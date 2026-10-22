@@ -423,7 +423,8 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
             return r.json()
 
         self.assertEqual(await resolved(leaf, "codex"),
-                         {"engine": "codex", "model": None, "source_task_id": None})
+                         {"engine": "codex", "model": None, "source_task_id": None,
+                          "effort": None, "effort_source_task_id": None})
         r = await self.client.post(f"/tasks/{root['id']}/model",
                                    json={"engine": "codex", "model": "gpt-6-luna"})
         self.assertEqual(r.status_code, 200, r.text)
@@ -435,7 +436,8 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
                          {"codex": "gpt-6-luna", "claude": "claude-opus-5-5"})
         # The leaf inherits from the root, per engine.
         self.assertEqual(await resolved(leaf, "codex"),
-                         {"engine": "codex", "model": "gpt-6-luna", "source_task_id": root["id"]})
+                         {"engine": "codex", "model": "gpt-6-luna", "source_task_id": root["id"],
+                          "effort": None, "effort_source_task_id": None})
         # The nearest ancestor wins.
         await self.client.post(f"/tasks/{mid['id']}/model", json={"engine": "codex", "model": "gpt-6.1-sol"})
         self.assertEqual((await resolved(leaf, "codex"))["source_task_id"], mid["id"])
@@ -445,12 +447,37 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.json()["metadata"]["models"], {"claude": "claude-opus-5-5"})
         r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "claude", "model": None})
         self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"}})
+        # Effort is its own slot: setting it leaves the model alone, and it
+        # inherits separately. Whitespace is trimmed before validation.
+        r = await self.client.post(f"/tasks/{root['id']}/model",
+                                   json={"engine": "codex", "model": " gpt-6-luna ", "effort": "high"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["metadata"]["models"], {"codex": "gpt-6-luna"})
+        self.assertEqual(r.json()["metadata"]["efforts"], {"codex": "high"})
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "effort": None})
+        self.assertNotIn("efforts", r.json()["metadata"])
+        self.assertEqual(r.json()["metadata"]["models"], {"codex": "gpt-6-luna"})
+        await self.client.post(f"/tasks/{mid['id']}/model", json={"engine": "claude", "effort": "max"})
+        got = await resolved(leaf, "claude")
+        self.assertEqual((got["effort"], got["effort_source_task_id"]), ("max", mid["id"]))
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": None})
+        # A hand-edited non-object `models` is replaced, not an error, and
+        # reads as unset.
+        await self.client.patch(f"/tasks/{root['id']}", json={"metadata": {"models": "oops"}})
+        self.assertEqual((await resolved(root, "codex"))["model"], None)
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": None})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn("models", r.json()["metadata"])
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": "gpt-6-luna"})
+        self.assertEqual(r.json()["metadata"]["models"], {"codex": "gpt-6-luna"})
+        await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": None})
         # A parent cycle can't loop the resolver.
         await self.client.patch(f"/tasks/{root['id']}", json={"parent_task_id": leaf["id"]})
         self.assertEqual((await resolved(root, "codex"))["source_task_id"], mid["id"])
         # Bad input.
         for body in ({"engine": "bash", "model": "x"}, {"engine": "codex", "model": "a b"},
-                     {"engine": "codex", "model": "-m"}):
+                     {"engine": "codex", "model": "-m"}, {"engine": "codex", "effort": "max"},
+                     {"engine": "claude", "effort": "extreme"}, {"engine": "codex"}):
             r = await self.client.post(f"/tasks/{root['id']}/model", json=body)
             self.assertEqual(r.status_code, 422, body)
         r = await self.client.get(f"/tasks/{root['id']}/model", params={"engine": "bash"})

@@ -263,6 +263,9 @@ impl ForkForm {
         if let Ok(Some(model)) = self.model.value() {
             params["model"] = json!(model);
         }
+        if let Some(effort) = self.model.effort_value() {
+            params["effort"] = json!(effort);
+        }
         if self.existing {
             if let Some(t) = &self.existing_task {
                 params["task_id"] = json!(t.task_id);
@@ -421,6 +424,9 @@ pub(crate) struct ForkReply {
     pub commits_truncated: bool,
     /// The model the host spawned the fork with.
     pub model: Option<String>,
+    pub model_source: Option<String>,
+    pub effort: Option<String>,
+    pub effort_source: Option<String>,
 }
 
 pub(crate) fn parse_fork_reply(v: &Value) -> anyhow::Result<ForkReply> {
@@ -435,6 +441,9 @@ pub(crate) fn parse_fork_reply(v: &Value) -> anyhow::Result<ForkReply> {
         label: s("label").unwrap_or_default(),
         branch: s("branch"),
         model: s("model"),
+        model_source: s("model_source"),
+        effort: s("effort"),
+        effort_source: s("effort_source"),
         transcript_id: s("transcript_id"),
         source_transcript_id: v
             .get("forked_from")
@@ -555,7 +564,7 @@ impl App {
             return;
         }
         let mut form = ForkForm::new(&ws.id, &ts.uid, &ts.label, &ts.session_type);
-        form.model = super::model_field::ModelField::recorded(&ts.session_type, ts.model.as_deref());
+        form.model = super::model_field::ModelField::recorded(&ts.session_type, ts.model.as_deref(), ts.effort.as_deref());
         form.tasks = self
             .tasks
             .iter()
@@ -652,6 +661,9 @@ impl App {
         ts.task_id = Some(reply.task_id.clone());
         ts.host_id = host.clone();
         ts.model = reply.model.clone().or_else(|| form.model.value().ok().flatten());
+        ts.model_source = reply.model_source.clone();
+        ts.effort = reply.effort.clone().or_else(|| form.model.effort_value());
+        ts.effort_source = reply.effort_source.clone();
         // Bound to the FORK's own conversation, never the source's: claude's
         // id is pinned at spawn; codex's arrives with the host's transcript
         // broadcast once the forked thread starts.

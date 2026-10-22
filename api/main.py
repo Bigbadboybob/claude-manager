@@ -807,16 +807,24 @@ def _keep_lead_pin(task: dict, new_metadata: dict | None) -> dict | None:
 @app.post("/tasks/{task_id}/model", response_model=TaskResponse,
           dependencies=[Depends(verify_token)])
 async def set_task_model(task_id: str, body: TaskModelUpdate, pool=Depends(get_pool)):
-    """Set a task's default model for one engine, or clear it with null.
+    """Set a task's default model and/or effort for one engine; null (or
+    an empty string) clears one.
 
-    Touches only ``metadata.models.<engine>`` (``PATCH`` replaces the whole
-    bag). Subtasks inherit it: see ``GET /tasks/{id}/model``.
+    Touches only ``metadata.models.<engine>`` / ``metadata.efforts.<engine>``
+    for the fields sent (``PATCH`` replaces the whole bag). Subtasks inherit
+    them: see ``GET /tasks/{id}/model``.
     """
     task = await _get_task_or_error(pool, task_id)
-    model = (body.model or "").strip() or None
-    updated = await db.set_task_model(pool, str(task["id"]), body.engine, model)
-    if not updated:
-        raise HTTPException(status_code=404, detail="Task not found")
+    sent = body.model_fields_set & {"model", "effort"}
+    if not sent:
+        raise HTTPException(status_code=422, detail="send model and/or effort")
+    updated = None
+    for field, key in (("model", "models"), ("effort", "efforts")):
+        if field in sent:
+            updated = await db.set_task_default(pool, str(task["id"]), key, body.engine,
+                                                getattr(body, field))
+            if not updated:
+                raise HTTPException(status_code=404, detail="Task not found")
     return updated
 
 
@@ -824,15 +832,23 @@ async def set_task_model(task_id: str, body: TaskModelUpdate, pool=Depends(get_p
          dependencies=[Depends(verify_token)])
 async def resolve_task_model(task_id: str, engine: str = Query(..., pattern=r"^(claude|codex)$"),
                              pool=Depends(get_pool)):
-    """The default model for ``engine`` on this task: its own
-    ``metadata.models.<engine>``, else the nearest ancestor's. ``model`` is
-    null when none sets one; callers then use their engine default.
+    """The default model and effort for ``engine`` on this task: its own
+    ``metadata.models.<engine>`` / ``metadata.efforts.<engine>``, else the
+    nearest ancestor's, each resolved on its own. A value is null when none
+    sets one; callers then use their config default.
     """
     task = await _get_task_or_error(pool, task_id)
-    resolved = await db.resolve_task_model(pool, str(task["id"]), engine)
-    if resolved is None:
+    model = await db.resolve_task_default(pool, str(task["id"]), "models", engine)
+    effort = await db.resolve_task_default(pool, str(task["id"]), "efforts", engine)
+    if model is None or effort is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    return {"engine": engine, **resolved}
+    return {
+        "engine": engine,
+        "model": model["value"],
+        "source_task_id": model["source_task_id"],
+        "effort": effort["value"],
+        "effort_source_task_id": effort["source_task_id"],
+    }
 
 
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])

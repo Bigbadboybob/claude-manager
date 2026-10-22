@@ -212,6 +212,16 @@ struct StartSessionParams {
     /// revive, resume or restore reuses it. Must be absent for bash.
     #[serde(default)]
     model: Option<String>,
+    /// Where `model` came from (`crate::models::ModelSource::as_str`),
+    /// recorded with it. Optional: an unknown source is recorded as none.
+    #[serde(default)]
+    model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    #[serde(default)]
+    effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    #[serde(default)]
+    effort_source: Option<String>,
     /// Working directory for the spawned child. Pre-resolved to an
     /// absolute path on the TUI side so the daemon doesn't reach
     /// for `worktree_path` from its manifest snapshot — the caller
@@ -545,6 +555,44 @@ fn start_session_model(
     Ok(Some(model))
 }
 
+/// The effort gate, beside [`start_session_model`]: an agent spawn must
+/// name its reasoning effort in `params.effort`, in its argv (`--effort`
+/// / codex's `model_reasoning_effort` override), or both, agreeing. Bash
+/// takes none.
+fn start_session_effort(
+    session_type: &str,
+    declared: Option<&str>,
+    argv: &[String],
+) -> Result<Option<String>, (ErrorCode, String)> {
+    let invalid = |m: String| (ErrorCode::InvalidParams, m);
+    let declared = declared.filter(|e| !e.trim().is_empty());
+    if !crate::models::takes_model(session_type) {
+        return match declared {
+            Some(_) => Err(invalid(format!("effort applies to claude and codex sessions, not '{session_type}'"))),
+            None => Ok(None),
+        };
+    }
+    let in_argv = crate::models::argv_effort(session_type, argv);
+    let effort = match (declared, in_argv.as_deref()) {
+        (Some(d), Some(a)) => {
+            let d = crate::models::validate_effort(session_type, d).map_err(invalid)?;
+            if d != a {
+                return Err(invalid(format!("effort '{d}' does not match the argv's effort '{a}'")));
+            }
+            d
+        }
+        (Some(e), None) | (None, Some(e)) => crate::models::validate_effort(session_type, e).map_err(invalid)?,
+        (None, None) => {
+            return Err(invalid(format!(
+                "a {session_type} spawn must name its effort (`effort` or the argv's effort flag); \
+                 CM never relies on the engine's default effort. A viewer older than the \
+                 daemon sends neither: update the TUI."
+            )))
+        }
+    };
+    Ok(Some(effort))
+}
+
 pub fn start_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -623,6 +671,7 @@ pub(crate) fn start_session_with_spawn_fn(
     }
 
     let model = start_session_model(&p.session_type, p.model.as_deref(), &p.argv)?;
+    let effort = start_session_effort(&p.session_type, p.effort.as_deref(), &p.argv)?;
 
     // Sub-2b-3 review-4 #1: reject partial cap tuples at the
     // entry point. The cap triple `(memory_cap_bytes,
@@ -773,7 +822,20 @@ pub(crate) fn start_session_with_spawn_fn(
     // Phase-1 continuous wire field: carry the continuous-task tag
     // onto the DaemonSession. `None` for ordinary spawns.
     spawn_params.continuous_task_id = p.continuous_task_id.clone();
+    spawn_params.model_source = model.as_ref().and(
+        p.model_source
+            .as_deref()
+            .and_then(crate::models::ModelSource::parse)
+            .map(|src| src.as_str().to_string()),
+    );
     spawn_params.model = model;
+    spawn_params.effort_source = effort.as_ref().and(
+        p.effort_source
+            .as_deref()
+            .and_then(crate::models::ModelSource::parse)
+            .map(|src| src.as_str().to_string()),
+    );
+    spawn_params.effort = effort;
     // Global-perms grant. This RPC is operator-only (the TUI), so
     // the value is trusted here — the human (or a TUI flow acting
     // for the human) is the authority on who gets global perms. The
@@ -1493,6 +1555,9 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             managed_by_uid: sess.managed_by_uid.clone(),
             continuous_task_id: sess.continuous_task_id.clone(),
             model: sess.model.clone(),
+            model_source: sess.model_source.clone(),
+            effort: sess.effort.clone(),
+            effort_source: sess.effort_source.clone(),
             label: sess.title.clone(),
             workflow_run_id: sess.workflow_run_id.clone(),
             workflow_role: sess.workflow_role.clone(),
@@ -2559,6 +2624,9 @@ pub fn list_sessions(
             "name_revision": state.messaging_names.get(uid).map(|n|n.revision),
             "type": session.session_type,
             "model": session.model,
+            "model_source": session.model_source,
+            "effort": session.effort,
+            "effort_source": session.effort_source,
             "state": state_str,
             "idle": idle,
             "pty_idle": pty_idle,
@@ -2714,6 +2782,9 @@ pub fn list_sessions(
                 "label": tomb.label,
                 "type": tomb.session_type,
                 "model": tomb.model,
+                "model_source": tomb.model_source,
+                "effort": tomb.effort,
+                "effort_source": tomb.effort_source,
                 "state": "exited",
                 "idle": true,
                 "pty_idle": true,
@@ -4439,6 +4510,9 @@ struct StartWorkflowParams {
     /// task default → the engine default.
     #[serde(default)]
     role_models: Option<std::collections::BTreeMap<String, String>>,
+    /// Per-role effort override for fresh spawns, like `role_models`.
+    #[serde(default)]
+    role_efforts: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Phase 4 §D: daemon-side `start_workflow`. Spawns each role's participant
@@ -4944,14 +5018,20 @@ pub fn start_workflow(
             .and_then(|m| m.get(role_name))
             .cloned()
             .or_else(|| role.model.clone().filter(|_| session_type == toml_engine));
-        let role_model = match resolve_spawn_model(
+        let explicit_effort = p
+            .role_efforts
+            .as_ref()
+            .and_then(|m| m.get(role_name))
+            .cloned()
+            .or_else(|| role.effort.clone().filter(|_| session_type == toml_engine));
+        let (role_model, role_effort) = match resolve_spawn_pick(
             state_arc,
             session_type,
             explicit_model.as_deref(),
-            None,
+            explicit_effort.as_deref(),
             task_id.as_deref(),
         ) {
-            Ok(m) => m.map(|(m, _)| m),
+            Ok(m) => m,
             Err((c, m)) => {
                 cleanup_spawned(&spawned_uids);
                 return Err((c, format!("start_workflow role '{}': {}", role_name, m)));
@@ -4982,7 +5062,8 @@ pub fn start_workflow(
                 &uid,
                 Some(&wf_meta),
                 configured_mcp_server_path.as_deref(),
-                role_model.as_deref(),
+                role_model.as_ref().map(|(m, _)| m.as_str()),
+                role_effort.as_ref().map(|(e, _)| e.as_str()),
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -5025,9 +5106,7 @@ pub fn start_workflow(
         full.insert("worktree_path".into(), Value::String(worktree.clone()));
         full.insert("env".into(), Value::Object(env_obj));
         full.insert("session_type".into(), Value::String(session_type.to_string()));
-        if let Some(m) = &role_model {
-            full.insert("model".into(), Value::String(m.clone()));
-        }
+        insert_pick(&mut full, &role_model, &role_effort);
         full.insert("workflow_run_id".into(), Value::String(run_id.clone()));
         full.insert("workflow_role".into(), Value::String(role_name.clone()));
         if let Some(tid) = task_id.clone() {
@@ -5813,6 +5892,9 @@ struct ProposeTaskParams {
     /// the filing agent's own engine.
     #[serde(default)]
     model: Option<String>,
+    /// Default reasoning effort for the new task (`metadata.efforts.<engine>`), in the same slot as `model`.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     model_engine: Option<String>,
 }
@@ -5920,8 +6002,13 @@ pub fn propose_task(
         };
         let filer = filer_metadata(&st, caller_uid, machine.as_deref(), "mcp.propose_task");
         let mut metadata = json!({});
-        if let Some(models) = filed_task_models(&filer, p.model.as_deref(), p.model_engine.as_deref())? {
+        let (models, efforts) =
+            filed_task_defaults(p.model.as_deref(), p.effort.as_deref(), p.model_engine.as_deref())?;
+        if let Some(models) = models {
             metadata[crate::models::TASK_MODELS_METADATA_KEY] = models;
+        }
+        if let Some(efforts) = efforts {
+            metadata[crate::models::TASK_EFFORTS_METADATA_KEY] = efforts;
         }
         metadata["filer"] = filer;
         (
@@ -7332,6 +7419,9 @@ struct McpStartSessionParams {
     /// `[models]`. Rejected for bash.
     #[serde(default)]
     model: Option<String>,
+    /// The child's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 /// Kitty keyboard Enter (CSI 13 u). codex and claude-code both enable the
@@ -9469,13 +9559,14 @@ pub fn mcp_start_session(
         },
     };
 
-    // Explicit model → task default → engine default. Like the prompt
-    // lookup, the planning round trip happens before the slot is claimed.
-    let resolved_model = resolve_spawn_model(
+    // Explicit model/effort → task default → config default. Like the
+    // prompt lookup, the planning round trip happens before the slot is
+    // claimed.
+    let (resolved_model, resolved_effort) = resolve_spawn_pick(
         state_arc,
         &p.type_,
         p.model.as_deref(),
-        None,
+        p.effort.as_deref(),
         task_id_for_spawn.as_deref(),
     )?;
 
@@ -9609,6 +9700,7 @@ pub fn mcp_start_session(
         configured_mcp_server_path.as_deref(),
         None, // fresh agent spawn — never a resume
         resolved_model.as_ref().map(|(m, _)| m.as_str()),
+        resolved_effort.as_ref().map(|(e, _)| e.as_str()),
     )
     .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
 
@@ -9662,9 +9754,7 @@ pub fn mcp_start_session(
     );
     full_params.insert("env".into(), Value::Object(env_obj));
     full_params.insert("session_type".into(), Value::String(p.type_.clone()));
-    if let Some((model, _)) = resolved_model.as_ref() {
-        full_params.insert("model".into(), Value::String(model.clone()));
-    }
+    insert_pick(&mut full_params, &resolved_model, &resolved_effort);
     // H1 (restart hardening): a fresh claude spawn carries a daemon-minted
     // `--session-id` pin — stamp the matching transcript path NOW so the
     // session is resumable from birth (claude creates `<pin>.jsonl` at
@@ -9888,10 +9978,7 @@ pub fn mcp_start_session(
             obj.insert("task_id".into(), Value::String(tid.to_string()));
         }
         obj.insert("prompt_source".into(), Value::String(prompt_source.to_string()));
-        if let Some((model, source)) = resolved_model.as_ref() {
-            obj.insert("model".into(), Value::String(model.clone()));
-            obj.insert("model_source".into(), Value::String(source.as_str().into()));
-        }
+        insert_pick(obj, &resolved_model, &resolved_effort);
         if let Some(ticket) = &prompt_ticket {
             let receipt = ticket.lock().unwrap_or_else(|p| p.into_inner()).clone();
             obj.insert("prompt_delivery".into(), json!(receipt));
@@ -10112,6 +10199,9 @@ struct CreateSessionParams {
     /// default (`crate::models`).
     #[serde(default)]
     model: Option<String>,
+    /// The session's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default = "default_cols")]
     cols: u16,
     #[serde(default = "default_rows")]
@@ -10137,6 +10227,9 @@ struct AddSessionParams {
     /// task default → the engine default.
     #[serde(default)]
     model: Option<String>,
+    /// The session's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default = "default_cols")]
     cols: u16,
     #[serde(default = "default_rows")]
@@ -10177,9 +10270,11 @@ fn compose_daemon_spawn_params(
     // `None` is a fresh spawn. Only restore passes `Some`; every other
     // caller passes `None`.
     resume_session_id: Option<&str>,
-    // The resolved model (`resolve_spawn_model`); required for claude and
-    // codex, `None` for bash.
-    model: Option<&str>,
+    // The resolved model and effort with their sources
+    // (`resolve_spawn_pick`); required for claude and codex, `None` for
+    // bash. Recorded on the session.
+    model: &Resolved,
+    effort: &Resolved,
 ) -> MethodResult {
     // P-2: prefer the daemon's configured `mcp_server_path` so the
     // written MCP config points at the server on the daemon's host.
@@ -10222,7 +10317,8 @@ fn compose_daemon_spawn_params(
         None,
         configured_mcp_server_path.as_deref(),
         resume_session_id,
-        model,
+        model.as_ref().map(|(m, _)| m.as_str()),
+        effort.as_ref().map(|(e, _)| e.as_str()),
     )
     .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
     let mut argv = Vec::with_capacity(argv_tail.len() + 1);
@@ -10249,9 +10345,7 @@ fn compose_daemon_spawn_params(
     );
     full.insert("env".into(), Value::Object(env_obj));
     full.insert("session_type".into(), Value::String(engine.to_string()));
-    if let Some(m) = model {
-        full.insert("model".into(), Value::String(m.to_string()));
-    }
+    insert_pick(&mut full, model, effort);
     // H1 (restart hardening): same eager transcript stamp as
     // `mcp_start_session` — a fresh claude spawn's pin IS its transcript
     // identity, so record it before the child even starts. Resumes keep
@@ -10336,10 +10430,16 @@ fn compose_continuous_spawn_params(
     cols: u16,
     rows: u16,
 ) -> MethodResult {
-    // The continuous task's own model → its planning task's default → the
-    // engine default.
-    let configured = crate::continuous::task::load_one(continuous_task_id).and_then(|t| t.model);
-    let model = resolve_spawn_model(state_arc, engine, configured.as_deref(), None, task_id)?;
+    // The continuous task's own model/effort → its planning task's default
+    // → the config default.
+    let configured = crate::continuous::task::load_one(continuous_task_id);
+    let (model, effort) = resolve_spawn_pick(
+        state_arc,
+        engine,
+        configured.as_ref().and_then(|t| t.model.as_deref()),
+        configured.as_ref().and_then(|t| t.effort.as_deref()),
+        task_id,
+    )?;
     let mut full = compose_daemon_spawn_params(
         state_arc,
         uid,
@@ -10352,7 +10452,8 @@ fn compose_continuous_spawn_params(
         rows,
         Some(working_dir),
         None, // a continuous fire is a fresh conversation, never a resume
-        model.as_ref().map(|(m, _)| m.as_str()),
+        &model,
+        &effort,
     )?;
     // A continuous fire has no launching caller to inherit a cap from (the
     // scheduler tick / Operator run_now is headless), so derive it from config:
@@ -10699,6 +10800,153 @@ pub fn rehydrate_derived_state(
 /// DESIGN_SEAMLESS_RESTART phase 4g (audit gap 2): the NON-SPAWNING half of
 /// this function lives in [`rehydrate_derived_state`], which the re-exec
 /// Adopted path also calls — see its docs.
+/// A recorded setting and its source on a live session.
+fn session_slot(
+    s: &mut crate::session::DaemonSession,
+    setting: crate::models::Setting,
+) -> (&mut Option<String>, &mut Option<String>) {
+    match setting {
+        crate::models::Setting::Model => (&mut s.model, &mut s.model_source),
+        crate::models::Setting::Effort => (&mut s.effort, &mut s.effort_source),
+    }
+}
+
+/// A recorded setting and its source on an exit tombstone.
+fn tomb_slot(
+    t: &mut crate::state::ExitedTombstone,
+    setting: crate::models::Setting,
+) -> (&mut Option<String>, &mut Option<String>) {
+    match setting {
+        crate::models::Setting::Model => (&mut t.model, &mut t.model_source),
+        crate::models::Setting::Effort => (&mut t.effort, &mut t.effort_source),
+    }
+}
+
+/// A recorded setting and its source on a registry entry.
+fn entry_slot(e: &crate::manifest::ManifestEntry, setting: crate::models::Setting) -> Option<(&str, Option<&str>)> {
+    let (v, src) = match setting {
+        crate::models::Setting::Model => (&e.model, &e.model_source),
+        crate::models::Setting::Effort => (&e.effort, &e.effort_source),
+    };
+    Some((v.as_deref()?, src.as_deref()))
+}
+
+/// [`entry_slot`], mutably.
+fn entry_slot_mut(
+    e: &mut crate::manifest::ManifestEntry,
+    setting: crate::models::Setting,
+) -> (&mut Option<String>, &mut Option<String>) {
+    match setting {
+        crate::models::Setting::Model => (&mut e.model, &mut e.model_source),
+        crate::models::Setting::Effort => (&mut e.effort, &mut e.effort_source),
+    }
+}
+
+/// Record the real model and effort of every live session (and exit
+/// tombstone) that has none: the durable registry's record of it
+/// (`manifest`), else the value its transcript names (source
+/// `transcript`). Runs once after adoption (holder adopt-at-boot,
+/// monolith re-exec), so sessions carried across a deploy from before CM
+/// recorded them keep theirs on the next revive. A session with neither is
+/// left unrecorded: recording a default would claim something its live
+/// process isn't running, and its next resume resolves one
+/// (`default_on_resume`, logged). Returns how many values were recorded.
+pub fn backfill_session_models(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    manifest: Option<&crate::manifest::Manifest>,
+) -> usize {
+    use crate::models::Setting;
+    let entries: std::collections::HashMap<&str, &crate::manifest::ManifestEntry> = manifest
+        .map(|m| m.workspaces.values().flat_map(|ws| ws.sessions.iter()).map(|e| (e.uid.as_str(), e)).collect())
+        .unwrap_or_default();
+    // Fill from the registry under the lock; collect the rest for a
+    // lock-free transcript read.
+    let mut from_registry = 0usize;
+    let mut wanted: Vec<(Setting, String, String, Option<String>, Option<std::path::PathBuf>)> = Vec::new();
+    {
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let worktrees: std::collections::HashMap<String, std::path::PathBuf> = st
+            .workspaces
+            .iter()
+            .filter_map(|(id, ws)| Some((id.clone(), ws.worktree_path.clone()?)))
+            .collect();
+        for setting in [Setting::Model, Setting::Effort] {
+            for s in st.sessions.values_mut() {
+                if !crate::models::takes_model(&s.session_type) {
+                    continue;
+                }
+                let (uid, engine, path) = (s.uid.clone(), s.session_type.clone(), s.transcript_path.clone());
+                let wt = worktrees.get(&s.workspace_id).cloned();
+                let (value, source) = session_slot(s, setting);
+                if value.is_some() {
+                    continue;
+                }
+                if let Some((v, src)) = entries.get(uid.as_str()).and_then(|e| entry_slot(e, setting)) {
+                    *value = Some(v.to_string());
+                    *source = src.map(str::to_string);
+                    from_registry += 1;
+                } else {
+                    wanted.push((setting, uid, engine, path, wt));
+                }
+            }
+            for t in st.recently_exited.iter_mut() {
+                if !crate::models::takes_model(&t.session_type) {
+                    continue;
+                }
+                let (uid, engine, path) = (t.session_uid.clone(), t.session_type.clone(), t.transcript_path.clone());
+                let wt = t.worktree_path.clone().map(std::path::PathBuf::from)
+                    .or_else(|| worktrees.get(&t.workspace_id).cloned());
+                let (value, source) = tomb_slot(t, setting);
+                if value.is_some() {
+                    continue;
+                }
+                if let Some((v, src)) = entries.get(uid.as_str()).and_then(|e| entry_slot(e, setting)) {
+                    *value = Some(v.to_string());
+                    *source = src.map(str::to_string);
+                    from_registry += 1;
+                } else {
+                    wanted.push((setting, uid, engine, path, wt));
+                }
+            }
+        }
+    }
+    let found: Vec<(Setting, String, String)> = wanted
+        .into_iter()
+        .filter_map(|(setting, uid, engine, path, worktree)| {
+            let id = path.as_deref().and_then(crate::session::transcript_id_from_path);
+            let file = crate::models::session_transcript(&engine, worktree.as_deref(), path.as_deref(), id.as_deref())?;
+            Some((setting, uid, setting.from_transcript(&engine, &file)?))
+        })
+        .collect();
+    let from_transcript = found.len();
+    if from_registry + from_transcript > 0 {
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let source = Some(crate::models::ModelSource::Transcript.as_str().to_string());
+        for (setting, uid, v) in found {
+            if let Some(s) = st.sessions.get_mut(&uid) {
+                let (value, src) = session_slot(s, setting);
+                if value.is_none() {
+                    *value = Some(v.clone());
+                    *src = source.clone();
+                }
+            }
+            for t in st.recently_exited.iter_mut().filter(|t| t.session_uid == uid) {
+                let (value, src) = tomb_slot(t, setting);
+                if value.is_none() {
+                    *value = Some(v.clone());
+                    *src = source.clone();
+                }
+            }
+        }
+        st.persist_sessions_best_effort();
+        eprintln!(
+            "cm-daemon: recorded {} model/effort value(s) of adopted sessions ({} from the registry, {} from transcripts)",
+            from_registry + from_transcript, from_registry, from_transcript,
+        );
+    }
+    from_registry + from_transcript
+}
+
 pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
     // The NON-SPAWNING half (shared with the re-exec Adopted path — see
     // `rehydrate_derived_state`): read the durable registry and rebuild the
@@ -10766,9 +11014,14 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
         total,
         path.display(),
     );
+    let task_models = prefetch_task_models(
+        state_arc,
+        targets.iter().filter_map(|(_, wt, e)| restore_needs_task_model(wt, e)).collect(),
+        RESTORE_TASK_MODEL_BUDGET,
+    );
     let mut restored = 0usize;
     for (ws_id, worktree, e) in targets {
-        match restore_one_session(state_arc, &ws_id, &worktree, &e) {
+        match restore_one_session_with(state_arc, &ws_id, &worktree, &e, Some(&task_models)) {
             Ok(_) => restored += 1,
             Err((_code, msg)) => eprintln!(
                 "cm-daemon: restore of session {} failed: {} — skipping \
@@ -10778,6 +11031,26 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
         }
     }
     eprintln!("cm-daemon: restored {}/{} session(s)", restored, total);
+}
+
+/// The `(task_id, engine)` whose defaults a restored session needs: one
+/// with no recorded model (or effort) whose transcript (if resuming) names
+/// none either. Most sessions resolve locally and need no API call.
+fn restore_needs_task_model(
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+) -> Option<(String, &'static str)> {
+    use crate::models::Setting;
+    let key = crate::models::engine_key(&e.session_type)?;
+    let task = e.task_id.as_deref().filter(|t| !t.trim().is_empty())?;
+    let transcript = e.transcript_id.as_deref().and_then(|id| {
+        crate::models::session_transcript(&e.session_type, Some(worktree), e.transcript_path.as_deref(), Some(id))
+    });
+    let needs = |setting: Setting| {
+        let recorded = entry_slot(e, setting).is_some_and(|(v, _)| setting.validate(&e.session_type, v).is_ok());
+        !recorded && !transcript.as_deref().is_some_and(|p| setting.from_transcript(&e.session_type, p).is_some())
+    };
+    (needs(Setting::Model) || needs(Setting::Effort)).then(|| (task.to_string(), key))
 }
 
 /// Restore-scope predicate (the part that needs no disk IO): a still-live,
@@ -10817,35 +11090,68 @@ fn continuous_restorable(task_id: &str) -> bool {
 /// identity (`global_perms`, `managed_by_uid`), claude's explicit
 /// `transcript_path` (resume continues the same file), and the re-applied
 /// memory cap (graceful-degrade to uncapped if the cgroup prefix is gone).
+#[cfg(test)]
 fn compose_restore_params(
     state_arc: &Arc<Mutex<DaemonState>>,
     workspace_id: &str,
     worktree: &std::path::Path,
     e: &crate::manifest::ManifestEntry,
 ) -> MethodResult {
+    compose_restore_params_with(state_arc, workspace_id, worktree, e, None)
+}
+
+/// [`compose_restore_params`] with an optional prefetched task-model cache
+/// (startup restore); `None` looks the task default up live.
+fn compose_restore_params_with(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+    task_models: Option<&TaskModelCache>,
+) -> MethodResult {
     crate::continuous::retirement::ensure_open(&e.uid).map_err(|err| (ErrorCode::Conflict, err.to_string()))?;
-    let mut continuous_model = None;
+    let mut continuous = TaskDefaults::default();
     if let Some(id) = &e.continuous_task_id {
         let t = crate::continuous::task::load_one(id).ok_or((ErrorCode::Conflict, "Continuous task disappeared; cannot restore its old session.".into()))?;
         if t.engine.as_session_type() != e.session_type || (t.current_session_uid.as_deref() != Some(&e.uid) && t.in_flight.as_ref().map(|f| f.session_uid.as_str()) != Some(&e.uid)) {
             return Err((ErrorCode::Conflict, "Stale continuous session identity or engine; restore is refused.".into()));
         }
-        continuous_model = t.model.clone();
+        continuous = TaskDefaults { model: t.model.clone(), effort: t.effort.clone() };
     }
-    // The session's recorded model → its continuous task's → the task
-    // default → the engine default.
-    let model = resolve_spawn_model(
-        state_arc,
-        &e.session_type,
-        None,
-        e.model.as_deref().or(continuous_model.as_deref()),
-        e.task_id.as_deref(),
-    )?;
     // S3 (resume): a persisted transcript_id means "continue this
     // conversation" — the argv gets `--resume <id>` (claude) / the `resume`
     // subcommand (codex). `None` → fresh spawn (a session that never bound a
     // transcript falls back to fresh; never blocks — decision 3).
     let resume = e.transcript_id.as_deref();
+    // The recorded model → (resuming) the transcript's → the continuous
+    // task's or task default → the engine default.
+    let transcript = resume.map(|id| {
+        crate::models::session_transcript(&e.session_type, Some(worktree), e.transcript_path.as_deref(), Some(id))
+    });
+    let mut task_defaults_for = || {
+        let task = match (crate::models::engine_key(&e.session_type), e.task_id.as_deref()) {
+            (Some(key), Some(task)) if !task.trim().is_empty() => match task_models {
+                Some(cache) => cache.get(&(task.to_string(), key)).cloned().unwrap_or_default(),
+                None => task_defaults(state_arc, Some(task), &e.session_type),
+            },
+            _ => TaskDefaults::default(),
+        };
+        // The continuous task's own settings win over its planning task's.
+        TaskDefaults {
+            model: continuous.model.clone().or(task.model),
+            effort: continuous.effort.clone().or(task.effort),
+        }
+    };
+    let (model, effort) = resolve_respawn_pick(
+        &e.uid,
+        &e.session_type,
+        None,
+        None,
+        entry_slot(e, crate::models::Setting::Model),
+        entry_slot(e, crate::models::Setting::Effort),
+        transcript.as_ref().map(|t| t.as_deref()),
+        &mut task_defaults_for,
+    )?;
     // DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): a codex resume id
     // persisted by a pre-4f daemon is the FULL rollout stem
     // (`rollout-<ts>-<uuid>`), which `codex resume` doesn't recognize.
@@ -10875,7 +11181,8 @@ fn compose_restore_params(
         // restart (headless hosts have no tui-sessions.json to reload it).
         Some(worktree),
         resume,
-        model.as_ref().map(|(m, _)| m.as_str()),
+        &model,
+        &effort,
     )?;
     if let Value::Object(m) = &mut params {
         // A restore (and `session.revive`, which rides this composer)
@@ -10986,6 +11293,16 @@ fn restore_one_session(
     worktree: &std::path::Path,
     e: &crate::manifest::ManifestEntry,
 ) -> MethodResult {
+    restore_one_session_with(state_arc, workspace_id, worktree, e, None)
+}
+
+fn restore_one_session_with(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+    task_models: Option<&TaskModelCache>,
+) -> MethodResult {
     let resume = e.transcript_id.as_deref();
 
     // Snapshot existing transcript ids BEFORE the spawn so the detector armed
@@ -11007,7 +11324,7 @@ fn restore_one_session(
     // removed its own worktree): re-create it from its branch first, and
     // report it, instead of spawning into a missing cwd.
     let worktree_report = ensure_ready_worktree(state_arc, workspace_id, worktree, e.task_id.as_deref())?;
-    let params = compose_restore_params(state_arc, workspace_id, worktree, e)?;
+    let params = compose_restore_params_with(state_arc, workspace_id, worktree, e, task_models)?;
     {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Explicit Resume already checked the archive. Startup restore can
@@ -11108,9 +11425,19 @@ struct ReviveSessionParams {
     #[serde(default)]
     global_perms: Option<bool>,
     /// The model to relaunch with. Absent → the session's recorded model
-    /// → its task default → the engine default.
+    /// → (resuming) its transcript's → its task default → the engine
+    /// default.
     #[serde(default)]
     model: Option<String>,
+    /// Where the caller's `model` came from (the viewer's recorded source).
+    #[serde(default)]
+    model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    #[serde(default)]
+    effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    #[serde(default)]
+    effort_source: Option<String>,
 }
 
 /// `session.revive` — re-spawn one exited session at its same uid,
@@ -11120,6 +11447,47 @@ struct ReviveSessionParams {
 /// Spawn mechanics are exactly [`restore_one_session`]'s: argv/env
 /// rebuilt via `compose_restore_params`, mem-cap re-applied when its
 /// cgroup prefix survives, transcript detector armed for codex/fresh.
+/// The model and effort a revive relaunches with, merged onto `entry`:
+/// the entry's own record, else the exit tombstone's; then the caller's
+/// value (`given`, model then effort: the viewer's record, or an explicit
+/// change) wins. The same value keeps its recorded source unless the
+/// caller sends one; a different value without a source is the caller's
+/// explicit choice. Whatever stays unset is resolved by
+/// `compose_restore_params` (transcript, then default).
+fn merge_revive_settings(
+    entry: &mut crate::manifest::ManifestEntry,
+    tomb: Option<&crate::state::ExitedTombstone>,
+    given: [(Option<&str>, Option<&str>); 2],
+) {
+    use crate::models::Setting;
+    for (setting, (given, given_source)) in [Setting::Model, Setting::Effort].into_iter().zip(given) {
+        let (tomb_value, tomb_source) = match (setting, tomb) {
+            (_, None) => (None, None),
+            (Setting::Model, Some(t)) => (t.model.clone(), t.model_source.clone()),
+            (Setting::Effort, Some(t)) => (t.effort.clone(), t.effort_source.clone()),
+        };
+        let (value, source) = entry_slot_mut(entry, setting);
+        if value.is_none() {
+            *value = tomb_value;
+            *source = tomb_source;
+        }
+        let Some(v) = given.map(str::trim).filter(|v| !v.is_empty()) else { continue };
+        let v = match setting {
+            Setting::Model => v.to_string(),
+            Setting::Effort => v.to_ascii_lowercase(),
+        };
+        let given_source = given_source
+            .and_then(crate::models::ModelSource::parse)
+            .map(|s| s.as_str().to_string());
+        if value.as_deref() != Some(v.as_str()) {
+            *source = Some(given_source.unwrap_or_else(|| "explicit".into()));
+        } else if given_source.is_some() {
+            *source = given_source;
+        }
+        *value = Some(v);
+    }
+}
+
 pub fn revive_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -11260,6 +11628,9 @@ pub fn revive_session(
                 workflow_role: None,
                 continuous_task_id: None,
                 model: tomb.as_ref().and_then(|t| t.model.clone()),
+                model_source: tomb.as_ref().and_then(|t| t.model_source.clone()),
+                effort: tomb.as_ref().and_then(|t| t.effort.clone()),
+                effort_source: tomb.as_ref().and_then(|t| t.effort_source.clone()),
                 task_id: tomb.as_ref().and_then(|t| t.task_id.clone()),
                 notify_on_idle: false,
                 color: None,
@@ -11301,14 +11672,11 @@ pub fn revive_session(
         if p.transcript_id.is_some() {
             entry.transcript_id = p.transcript_id.clone();
         }
-        if entry.model.is_none() {
-            entry.model = tomb.as_ref().and_then(|t| t.model.clone());
-        }
-        // The caller's model (the viewer's record, or an explicit change)
-        // wins; `compose_restore_params` resolves an absent one.
-        if p.model.as_deref().is_some_and(|m| !m.trim().is_empty()) {
-            entry.model = p.model.clone();
-        }
+        merge_revive_settings(
+            &mut entry,
+            tomb.as_ref(),
+            [(p.model.as_deref(), p.model_source.as_deref()), (p.effort.as_deref(), p.effort_source.as_deref())],
+        );
         if p.managed_by_uid.is_some() {
             entry.managed_by_uid = p.managed_by_uid.clone();
         }
@@ -13645,6 +14013,9 @@ struct ContinuousCreateParams {
     /// the engine default, resolved at each spawn.
     #[serde(default)]
     model: Option<String>,
+    /// The orchestrator's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     /// `"fresh"`|`"persistent"` (default `fresh`; persistent is a Phase-3 no-op).
     #[serde(default)]
     run_mode: crate::continuous::task::RunMode,
@@ -13754,6 +14125,7 @@ pub fn continuous_create(
             .map_err(|e| (ErrorCode::InvalidParams, format!("mem_cap_bytes: {}", e)))?;
     }
     let model = continuous_model_param(p.engine.as_session_type(), p.model.as_deref())?;
+    let effort = continuous_effort_param(p.engine.as_session_type(), p.effort.as_deref())?;
 
     // Worktree slug defaults to the (already allowlist-validated) task_id. A
     // caller-supplied slug feeds `<repo>-<slug>` + `cm/<slug>`, so guard it
@@ -13859,6 +14231,7 @@ pub fn continuous_create(
     );
     task.planning_task_id = p.planning_task_id.clone();
     task.model = model;
+    task.effort = effort;
     task.task_channel = p.task_channel.unwrap_or(if messaging.is_some() {
         crate::continuous::task::TaskChannelPolicy::Manual
     } else {
@@ -13968,6 +14341,20 @@ fn continuous_model_param(
     crate::models::validate_model(m).map(Some).map_err(|e| (ErrorCode::InvalidParams, format!("model: {e}")))
 }
 
+/// A continuous task's `effort` param, like [`continuous_model_param`].
+fn continuous_effort_param(
+    session_type: &str,
+    effort: Option<&str>,
+) -> Result<Option<String>, (ErrorCode, String)> {
+    let Some(e) = effort.filter(|e| !e.trim().is_empty()) else { return Ok(None) };
+    if !crate::models::takes_model(session_type) {
+        return Err((ErrorCode::InvalidParams, format!("effort applies to claude and codex, not {session_type}")));
+    }
+    crate::models::validate_effort(session_type, e)
+        .map(Some)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("effort: {e}")))
+}
+
 #[derive(Deserialize)]
 struct ContinuousUpdateParams {
     task_id: String,
@@ -13975,6 +14362,9 @@ struct ContinuousUpdateParams {
     /// engine default). A live session keeps its model until respawned.
     #[serde(default)]
     model: Option<String>,
+    /// New effort for the next spawn; `""` clears it, like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     default_prompt: Option<String>,
     #[serde(default)]
@@ -14049,6 +14439,10 @@ pub fn continuous_update(
         None => None,
         Some(m) => Some(continuous_model_param(existing.engine.as_session_type(), Some(m))?),
     };
+    let effort_update = match p.effort.as_deref() {
+        None => None,
+        Some(e) => Some(continuous_effort_param(existing.engine.as_session_type(), Some(e))?),
+    };
     let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
         .map_err(|e| (ErrorCode::Internal, format!("continuous.update lock: {e}")))?;
     if let Some(dp) = &p.default_prompt {
@@ -14111,6 +14505,10 @@ pub fn continuous_update(
         if let Some(v) = &model_update {
             t.model = v.clone();
             updated.push("model");
+        }
+        if let Some(v) = &effort_update {
+            t.effort = v.clone();
+            updated.push("effort");
         }
         if let Some(v) = p.compact_every {
             // 0 disables (the fire check requires n > 0); store None so the
@@ -14765,9 +15163,10 @@ pub fn create_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Me
     if p.label.trim().is_empty() {
         return Err((ErrorCode::InvalidParams, "label must be non-empty".into()));
     }
-    // Resolve the model before any filesystem side effect, so a bad
-    // explicit one fails cleanly.
-    let model = resolve_spawn_model(state_arc, &p.engine, p.model.as_deref(), None, p.task_id.as_deref())?;
+    // Resolve the model and effort before any filesystem side effect, so a
+    // bad explicit one fails cleanly.
+    let (model, effort) =
+        resolve_spawn_pick(state_arc, &p.engine, p.model.as_deref(), p.effort.as_deref(), p.task_id.as_deref())?;
     if p.slug.trim().is_empty() {
         return Err((ErrorCode::InvalidParams, "slug must be non-empty".into()));
     }
@@ -14894,7 +15293,8 @@ pub fn create_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Me
         p.rows,
         Some(&worktree_path),
         resume_id.as_deref(),
-        model.as_ref().map(|(m, _)| m.as_str()),
+        &model,
+        &effort,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -14925,6 +15325,8 @@ pub fn create_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Me
         "workspace_id": p.workspace_id,
         "model": model.as_ref().map(|(m, _)| m.clone()),
         "model_source": model.as_ref().map(|(_, src)| src.as_str()),
+        "effort": effort.as_ref().map(|(e, _)| e.clone()),
+        "effort_source": effort.as_ref().map(|(_, src)| src.as_str()),
     }))
 }
 
@@ -15067,6 +15469,12 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
         }
         crate::models::validate_model(m).map_err(|e| (ErrorCode::InvalidParams, e))?;
     }
+    if let Some(e) = p.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+        if !crate::models::takes_model(&p.engine) {
+            return Err((ErrorCode::InvalidParams, format!("effort applies to claude and codex sessions, not '{}'", p.engine)));
+        }
+        crate::models::validate_effort(&p.engine, e).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    }
 
     if p.seed_from.is_some() && p.resume_id.is_some() {
         return Err((
@@ -15103,6 +15511,7 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
 
     let mut seed = SessionSeedGuard::new(snapshot.as_ref(), &worktree_path)?;
     let resume_id = seed.id().or(p.resume_id.as_deref()).map(str::to_owned);
+    let mut resume_transcript = None;
     if let Some(id) = &resume_id {
         crate::agent_memory::validate_transcript_id(id)
             .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?;
@@ -15111,14 +15520,30 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
             "codex" => crate::transcript_detect::codex_transcript_path(id),
             _ => None,
         };
-        if !path.is_some_and(|path| path.is_file()) {
+        if !path.as_ref().is_some_and(|path| path.is_file()) {
             return Err((
                 ErrorCode::NotFound,
                 "Requested transcript no longer exists on this host".into(),
             ));
         }
+        resume_transcript = path;
     }
-    let model = resolve_spawn_model(state_arc, &p.engine, p.model.as_deref(), None, p.task_id.as_deref())?;
+    // A resumed conversation keeps the model and effort its transcript
+    // names.
+    let (model, effort) = if resume_id.is_some() {
+        resolve_respawn_pick(
+            &p.uid,
+            &p.engine,
+            p.model.as_deref(),
+            p.effort.as_deref(),
+            None,
+            None,
+            Some(resume_transcript.as_deref()),
+            &mut || task_defaults(state_arc, p.task_id.as_deref(), &p.engine),
+        )?
+    } else {
+        resolve_spawn_pick(state_arc, &p.engine, p.model.as_deref(), p.effort.as_deref(), p.task_id.as_deref())?
+    };
     // No auto-register hint: the workspace is already known to the
     // daemon (we just looked it up).
     let full = compose_daemon_spawn_params(
@@ -15133,7 +15558,8 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
         p.rows,
         None,
         resume_id.as_deref(),
-        model.as_ref().map(|(m, _)| m.as_str()),
+        &model,
+        &effort,
     )?;
     let start_result = start_session(state_arc, &full)?;
 
@@ -15149,6 +15575,8 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
         "worktree_path": worktree_path.to_string_lossy().into_owned(),
         "model": model.as_ref().map(|(m, _)| m.clone()),
         "model_source": model.as_ref().map(|(_, src)| src.as_str()),
+        "effort": effort.as_ref().map(|(e, _)| e.clone()),
+        "effort_source": effort.as_ref().map(|(_, src)| src.as_str()),
     }))
 }
 
@@ -15182,8 +15610,16 @@ fn resume_picked_session(state_arc: &Arc<Mutex<DaemonState>>, p: &AddSessionPara
         _ => None,
     }.filter(|p| p.is_file()).ok_or((ErrorCode::NotFound, "Requested transcript no longer exists on this host".into()))?;
     record.entry.session_type = p.engine.clone();
-    if p.model.as_deref().is_some_and(|m| !m.trim().is_empty()) {
-        record.entry.model = p.model.clone();
+    // An explicit choice replaces the recorded one; the rest are reused.
+    use crate::models::{ModelSource, Setting};
+    let explicit = ModelSource::Explicit.as_str().to_string();
+    if let Some(m) = p.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        record.entry.model = Some(Setting::Model.validate(&p.engine, m).map_err(|e| (ErrorCode::InvalidParams, e))?);
+        record.entry.model_source = Some(explicit.clone());
+    }
+    if let Some(e) = p.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+        record.entry.effort = Some(Setting::Effort.validate(&p.engine, e).map_err(|e| (ErrorCode::InvalidParams, e))?);
+        record.entry.effort_source = Some(explicit);
     }
     record.entry.transcript_id = Some(id.into());
     record.entry.transcript_path = Some(path.to_string_lossy().into_owned());
@@ -15354,6 +15790,7 @@ fn resolve_workflow_spawn_program(
     workflow: Option<&crate::mcp_config::WorkflowMeta>,
     server_path_override: Option<&str>,
     model: Option<&str>,
+    effort: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>)> {
     #[cfg(test)]
     {
@@ -15377,7 +15814,7 @@ fn resolve_workflow_spawn_program(
     // new conversation per activation), so the detector remains the binding
     // authority. The pin still rides in argv, making the transcript file
     // name deterministic from process start.
-    crate::mcp_config::build_args(session_type, uid, workflow, server_path_override, None, model)
+    crate::mcp_config::build_args(session_type, uid, workflow, server_path_override, None, model, effort)
         .map(|(prog, args, _pin)| (prog, args))
 }
 
@@ -15842,13 +16279,31 @@ fn api_set_task_lead(
     crate::planning_client::decode_json_response(resp, "set_task_lead")
 }
 
-/// GET /tasks/{id}/model?engine= — the task's inherited default model
-/// for one engine (`None` when no task up the chain sets one).
-fn api_resolve_task_model(
+/// A task's inherited per-engine defaults (`metadata.models.<engine>` and
+/// `metadata.efforts.<engine>`, each from the nearest task up the chain
+/// that sets it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TaskDefaults {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl TaskDefaults {
+    pub(crate) fn get(&self, setting: crate::models::Setting) -> Option<String> {
+        match setting {
+            crate::models::Setting::Model => self.model.clone(),
+            crate::models::Setting::Effort => self.effort.clone(),
+        }
+    }
+}
+
+/// GET /tasks/{id}/model?engine= — the task's inherited default model and
+/// effort for one engine.
+fn api_resolve_task_defaults(
     creds: &PlanningApiCreds,
     task_id: &str,
     engine_key: &str,
-) -> Result<Option<String>, PlanningClientError> {
+) -> Result<TaskDefaults, PlanningClientError> {
     // Short bound: this sits in front of every spawn without a model of
     // its own, startup restore included.
     let agent = ureq::Agent::new_with_config(
@@ -15864,78 +16319,216 @@ fn api_resolve_task_model(
         .call()
         .map_err(map_ureq_err)?;
     let row: Value = crate::planning_client::decode_json_response(resp, "resolve_task_model")?;
-    Ok(row.get("model").and_then(Value::as_str).map(str::to_string))
+    let field = |k: &str| row.get(k).and_then(Value::as_str).map(str::to_string);
+    Ok(TaskDefaults { model: field("model"), effort: field("effort") })
 }
 
-/// POST /tasks/{id}/model — atomically set (or with None, clear)
-/// `metadata.models.<engine>`; returns the updated task row.
-fn api_set_task_model(
-    creds: &PlanningApiCreds,
-    task_id: &str,
-    engine_key: &str,
-    model: Option<&str>,
-) -> Result<Value, PlanningClientError> {
-    let agent = PlanningApiCreds::agent();
-    let resp = agent
-        .post(&creds.url(&format!("/tasks/{}/model", task_id)))
-        .header("Authorization", &creds.auth())
-        .send_json(json!({ "engine": engine_key, "model": model }))
-        .map_err(map_ureq_err)?;
-    crate::planning_client::decode_json_response(resp, "set_task_model")
-}
-
-/// The task default model step of [`crate::models::resolve`]: the task's
-/// (or nearest ancestor's) `metadata.models.<engine>`. Best-effort like
-/// prompt auto-delivery: no credentials, an unreachable API or a missing
-/// row all mean "no task default", and the engine default applies. Never
-/// called with the state lock held.
-fn task_default_model(
+/// The task default step of the resolution order: the task's (or nearest
+/// ancestor's) `metadata.models.<engine>` / `metadata.efforts.<engine>`.
+/// Best-effort like prompt auto-delivery: no credentials, an unreachable
+/// API or a missing row all mean "no task default", and the config
+/// default applies. Never called with the state lock held.
+fn task_defaults(
     state_arc: &Arc<Mutex<DaemonState>>,
     task_id: Option<&str>,
     engine: &str,
-) -> Option<String> {
-    let task_id = task_id.filter(|t| !t.trim().is_empty())?;
-    let key = crate::models::engine_key(engine)?;
+) -> TaskDefaults {
+    let Some(task_id) = task_id.filter(|t| !t.trim().is_empty()) else { return TaskDefaults::default() };
+    let Some(key) = crate::models::engine_key(engine) else { return TaskDefaults::default() };
     let (api_url_cfg, api_token_cfg) = {
         let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         (st.config.api_url.clone(), st.config.api_token.clone())
     };
-    let creds = PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).ok()?;
-    match api_resolve_task_model(&creds, task_id, key) {
-        Ok(model) => model,
+    let Ok(creds) = PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg) else {
+        return TaskDefaults::default();
+    };
+    match api_resolve_task_defaults(&creds, task_id, key) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!(
-                "cm-daemon: task '{}' default-model lookup failed ({:?}); using the {} engine default",
+                "cm-daemon: task '{}' default model/effort lookup failed ({:?}); using the {} config defaults",
                 task_id, e, key,
             );
-            None
+            TaskDefaults::default()
         }
     }
 }
 
-/// Resolve the model for one agent spawn: `explicit` → `recorded` (a
-/// respawn's own model) → the task default → the engine default.
-/// `Ok(None)` for bash. The planning lookup only runs when the earlier
-/// steps came up empty.
-pub(crate) fn resolve_spawn_model(
+/// A spawn's resolved model and effort, each with its source (`None`
+/// for bash).
+pub(crate) type Resolved = Option<(String, crate::models::ModelSource)>;
+
+/// Record a resolved model and effort, each with its source, on
+/// `start_session` params.
+fn insert_pick(full: &mut serde_json::Map<String, Value>, model: &Resolved, effort: &Resolved) {
+    for (key, v) in [("model", model), ("effort", effort)] {
+        if let Some((value, source)) = v {
+            full.insert(key.into(), Value::String(value.clone()));
+            full.insert(format!("{key}_source"), Value::String(source.as_str().into()));
+        }
+    }
+}
+
+/// Resolve the model and effort for one new agent spawn: `explicit` →
+/// the task default → the config default. The planning lookup runs once,
+/// and only when a setting has no explicit value.
+pub(crate) fn resolve_spawn_pick(
     state_arc: &Arc<Mutex<DaemonState>>,
     engine: &str,
-    explicit: Option<&str>,
-    recorded: Option<&str>,
+    explicit_model: Option<&str>,
+    explicit_effort: Option<&str>,
     task_id: Option<&str>,
-) -> Result<Option<(String, crate::models::ModelSource)>, (ErrorCode, String)> {
-    use crate::models::ModelSource;
-    let explicit = explicit.filter(|m| !m.trim().is_empty());
-    let recorded = recorded.filter(|m| crate::models::validate_model(m).is_ok());
-    let task = if explicit.is_none() && recorded.is_none() && crate::models::takes_model(engine) {
-        task_default_model(state_arc, task_id, engine)
+) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
+    use crate::models::{ModelSource, Setting};
+    let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
+    let task = if crate::models::takes_model(engine) && (blank(explicit_model) || blank(explicit_effort)) {
+        task_defaults(state_arc, task_id, engine)
     } else {
-        None
+        TaskDefaults::default()
     };
-    let inherited = recorded
-        .map(|m| (m, ModelSource::Recorded))
-        .or_else(|| task.as_deref().map(|m| (m, ModelSource::Task)));
-    crate::models::resolve(engine, explicit, inherited).map_err(|e| (ErrorCode::InvalidParams, e))
+    let one = |setting: Setting, explicit: Option<&str>| {
+        let from_task = task.get(setting);
+        setting
+            .resolve(engine, explicit, from_task.as_deref().map(|v| (v, ModelSource::Task)))
+            .map_err(|e| (ErrorCode::InvalidParams, e))
+    };
+    Ok((one(Setting::Model, explicit_model)?, one(Setting::Effort, explicit_effort)?))
+}
+
+/// Per-restore cache of task defaults, keyed by `(task_id, engine slot)`.
+/// Filled up front by [`prefetch_task_models`]; a key it couldn't fill
+/// in time maps to no defaults (the config defaults apply).
+pub(crate) type TaskModelCache = std::collections::HashMap<(String, &'static str), TaskDefaults>;
+
+/// How long a restore waits, in total, for task defaults.
+const RESTORE_TASK_MODEL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Look up the task defaults for each `(task_id, engine)` pair
+/// concurrently, giving up on whatever hasn't answered within `budget`.
+/// Restore needs these only for sessions with no recorded model or effort
+/// and none in their transcript, and must not stall on an unreachable API.
+pub(crate) fn prefetch_task_models(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    keys: Vec<(String, &'static str)>,
+    budget: std::time::Duration,
+) -> TaskModelCache {
+    let mut cache = TaskModelCache::new();
+    let keys: std::collections::BTreeSet<_> = keys.into_iter().collect();
+    if keys.is_empty() {
+        return cache;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    for key in &keys {
+        let (tx, state, key) = (tx.clone(), Arc::clone(state_arc), key.clone());
+        std::thread::spawn(move || {
+            let defaults = task_defaults(&state, Some(&key.0), key.1);
+            let _ = tx.send((key, defaults));
+        });
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + budget;
+    while cache.len() < keys.len() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((key, defaults)) => {
+                cache.insert(key, defaults);
+            }
+            Err(_) => break,
+        }
+    }
+    let missing = keys.len() - cache.len();
+    if missing > 0 {
+        eprintln!(
+            "cm-daemon: {} task default lookup(s) did not answer within {:?}; \
+             those sessions use the config defaults",
+            missing, budget,
+        );
+    }
+    for key in keys {
+        cache.entry(key).or_default();
+    }
+    cache
+}
+
+/// Resolve one setting (model or effort) for a respawn of an existing
+/// session (restore, revive, resume, fork): `explicit` → the recorded
+/// value (keeping its recorded source) → for a resume, the value the
+/// conversation's transcript names (`transcript`) → the task or config
+/// default. On a resume that last step is `default_on_resume` and logged:
+/// the conversation may have run something else. A fresh respawn resolves
+/// like a new spawn. `task_default` supplies the task's default for this
+/// engine (a restore passes its prefetched cache, so this never blocks on
+/// the API).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_respawn(
+    setting: crate::models::Setting,
+    uid: &str,
+    engine: &str,
+    explicit: Option<&str>,
+    recorded: Option<(&str, Option<&str>)>,
+    resume: Option<Option<&std::path::Path>>,
+    task_default: &mut dyn FnMut() -> Option<String>,
+) -> Resolved2 {
+    use crate::models::ModelSource;
+    let invalid = |e: String| (ErrorCode::InvalidParams, e);
+    if !crate::models::takes_model(engine) || explicit.is_some_and(|m| !m.trim().is_empty()) {
+        return setting.resolve(engine, explicit, None).map_err(invalid);
+    }
+    if let Some((v, source)) = recorded {
+        if let Ok(v) = setting.validate(engine, v) {
+            let source = source.and_then(ModelSource::parse).unwrap_or(ModelSource::Recorded);
+            return Ok(Some((v, source)));
+        }
+    }
+    let Some(transcript) = resume else {
+        let task = task_default();
+        let inherited = task.as_deref().map(|v| (v, ModelSource::Task));
+        return setting.resolve(engine, None, inherited).map_err(invalid);
+    };
+    if let Some(v) = transcript.and_then(|t| setting.from_transcript(engine, t)) {
+        return Ok(Some((v, ModelSource::Transcript)));
+    }
+    let task = task_default();
+    let fallback = setting
+        .resolve(engine, None, task.as_deref().map(|v| (v, ModelSource::Task)))
+        .map_err(invalid)?;
+    Ok(fallback.map(|(v, from)| {
+        eprintln!(
+            "cm-daemon: session {uid}: no recorded {name} and none in its transcript ({}); \
+             resuming on the {} default '{v}'",
+            transcript.map_or_else(|| "transcript not found".to_string(), |t| t.display().to_string()),
+            if from == ModelSource::Task { "task" } else { "config" },
+            name = setting.name(),
+        );
+        (v, ModelSource::DefaultOnResume)
+    }))
+}
+
+type Resolved2 = Result<Resolved, (ErrorCode, String)>;
+
+/// [`resolve_respawn`] for both settings, sharing one lazy task lookup.
+/// `recorded_*` are the session's recorded value and source.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_respawn_pick(
+    uid: &str,
+    engine: &str,
+    explicit_model: Option<&str>,
+    explicit_effort: Option<&str>,
+    recorded_model: Option<(&str, Option<&str>)>,
+    recorded_effort: Option<(&str, Option<&str>)>,
+    resume: Option<Option<&std::path::Path>>,
+    task_defaults: &mut dyn FnMut() -> TaskDefaults,
+) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
+    use crate::models::Setting;
+    let mut cached: Option<TaskDefaults> = None;
+    let mut lookup = |s: Setting| cached.get_or_insert_with(&mut *task_defaults).get(s);
+    let model = resolve_respawn(Setting::Model, uid, engine, explicit_model, recorded_model, resume, &mut || {
+        lookup(Setting::Model)
+    })?;
+    let effort = resolve_respawn(Setting::Effort, uid, engine, explicit_effort, recorded_effort, resume, &mut || {
+        lookup(Setting::Effort)
+    })?;
+    Ok((model, effort))
 }
 
 fn api_get_initiative(
@@ -16163,6 +16756,9 @@ struct CreateSubtaskParams {
     /// `ProposeTaskParams::model`. Absent = it inherits its parent's.
     #[serde(default)]
     model: Option<String>,
+    /// Default reasoning effort for the subtask (`metadata.efforts.<engine>`).
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     model_engine: Option<String>,
 }
@@ -16339,7 +16935,7 @@ fn create_subtask_core(
     // ---- API + git phase (lock dropped) ----
 
     // Refuse a bad model before anything is created.
-    let models = filed_task_models(&filer, p.model.as_deref(), p.model_engine.as_deref())?;
+    let (models, efforts) = filed_task_defaults(p.model.as_deref(), p.effort.as_deref(), p.model_engine.as_deref())?;
     let creds =
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
 
@@ -16587,6 +17183,13 @@ fn create_subtask_core(
     };
 
     // Step 2 — create the task row. Server assigns the UUID.
+    let mut metadata = json!({ "filer": filer });
+    if let Some(models) = models {
+        metadata[crate::models::TASK_MODELS_METADATA_KEY] = models;
+    }
+    if let Some(efforts) = efforts {
+        metadata[crate::models::TASK_EFFORTS_METADATA_KEY] = efforts;
+    }
     let mut body = json!({
         "repo_url": repo_url,
         "repo_branch": repo_branch,
@@ -16596,10 +17199,7 @@ fn create_subtask_core(
         "slug": unique_slug,
         "source": "claude",
         "is_cloud": false,
-        "metadata": match models {
-            Some(models) => json!({ "filer": filer, crate::models::TASK_MODELS_METADATA_KEY: models }),
-            None => json!({ "filer": filer }),
-        },
+        "metadata": metadata,
         // null when the parent was deleted (top-level fallback) — never a
         // dangling FK that the API insert would reject.
         "parent_task_id": effective_parent_id,
@@ -16806,6 +17406,9 @@ struct ForkSessionParams {
     /// landing task's default → the engine default.
     #[serde(default)]
     model: Option<String>,
+    /// The fork's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     /// Operator callers (the TUI) pre-mint the uid they will attach to.
     #[serde(default)]
     uid: Option<String>,
@@ -16825,6 +17428,11 @@ struct ForkSource {
     task_id: Option<String>,
     label: String,
     model: Option<String>,
+    model_source: Option<String>,
+    effort: Option<String>,
+    effort_source: Option<String>,
+    /// The source conversation's transcript file, for the model it ran.
+    transcript_file: Option<PathBuf>,
 }
 
 /// `"source"` / `"trunk"` (case-insensitive, default source).
@@ -16843,7 +17451,7 @@ fn fork_base_choice(raw: Option<&str>) -> Result<bool, (ErrorCode, String)> {
 /// the newest exit tombstone. Fails for bash, for a session with no bound
 /// transcript yet, and for ids that could escape the transcript dirs.
 fn resolve_fork_source(state: &DaemonState, uid: &str) -> Result<ForkSource, (ErrorCode, String)> {
-    let (engine, transcript_path, workspace_id, task_id, label, tomb_worktree, model) =
+    let (engine, transcript_path, workspace_id, task_id, label, tomb_worktree, (model, model_source, effort, effort_source)) =
         if let Some(s) = state.sessions.get(uid) {
             (
                 s.session_type.clone(),
@@ -16852,7 +17460,7 @@ fn resolve_fork_source(state: &DaemonState, uid: &str) -> Result<ForkSource, (Er
                 s.task_id.clone(),
                 s.title.clone(),
                 None,
-                s.model.clone(),
+                (s.model.clone(), s.model_source.clone(), s.effort.clone(), s.effort_source.clone()),
             )
         } else if let Some(t) = state.recently_exited.iter().rev().find(|t| t.session_uid == uid) {
             (
@@ -16862,7 +17470,7 @@ fn resolve_fork_source(state: &DaemonState, uid: &str) -> Result<ForkSource, (Er
                 t.task_id.clone(),
                 t.label.clone(),
                 t.worktree_path.clone().map(PathBuf::from),
-                t.model.clone(),
+                (t.model.clone(), t.model_source.clone(), t.effort.clone(), t.effort_source.clone()),
             )
         } else {
             return Err((
@@ -16895,7 +17503,20 @@ fn resolve_fork_source(state: &DaemonState, uid: &str) -> Result<ForkSource, (Er
             ErrorCode::NotFound,
             format!("session '{}' has no worktree on this host", uid),
         ))?;
-    Ok(ForkSource { engine, transcript_id, workspace_id, worktree_path, task_id, label, model })
+    let transcript_file = transcript_path.map(PathBuf::from).filter(|p| p.is_file());
+    Ok(ForkSource {
+        engine,
+        transcript_id,
+        workspace_id,
+        worktree_path,
+        task_id,
+        label,
+        model,
+        model_source,
+        effort,
+        effort_source,
+        transcript_file,
+    })
 }
 
 /// Completed / in-flight forks by `(caller, request_id)`. A client whose
@@ -16985,6 +17606,11 @@ fn session_fork_once(
     let prompt = p.prompt.as_deref().filter(|s| !s.trim().is_empty()).map(str::to_string);
     if let Some(m) = p.model.as_deref().filter(|m| !m.trim().is_empty()) {
         crate::models::validate_model(m).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    }
+    // The level is checked against the source's engine once it is known
+    // (codex has no max); this rejects unknown levels before any work.
+    if let Some(e) = p.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+        crate::models::validate_effort("claude", e).map_err(|e| (ErrorCode::InvalidParams, e))?;
     }
     if prompt.as_ref().is_some_and(|s| s.len() > MAX_SEND_INPUT_BYTES) {
         return Err((
@@ -17178,6 +17804,7 @@ fn session_fork_once(
                     base: Some(base_sha.clone()),
                     // The fork runs the source's model; the new task sets no default.
                     model: None,
+                    effort: None,
                     model_engine: None,
                 };
                 let (base, leaf_slug) = validate_create_subtask(&subtask)?;
@@ -17308,14 +17935,19 @@ fn session_fork_once(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| task_name.clone());
-    let model = match resolve_spawn_model(
-        state_arc,
+    // A fork continues the source conversation: its recorded model and
+    // effort, else what its transcript names, else the new task's default.
+    let (model, effort) = match resolve_respawn_pick(
+        &session_uid,
         &source.engine,
         p.model.as_deref(),
-        source.model.as_deref(),
-        Some(task_id.as_str()),
+        p.effort.as_deref(),
+        source.model.as_deref().map(|m| (m, source.model_source.as_deref())),
+        source.effort.as_deref().map(|e| (e, source.effort_source.as_deref())),
+        Some(source.transcript_file.as_deref()),
+        &mut || task_defaults(state_arc, Some(task_id.as_str()), &source.engine),
     ) {
-        Ok(m) => m.map(|(m, _)| m),
+        Ok(m) => m,
         Err(e) => {
             rollback(state_arc);
             return Err(e);
@@ -17333,7 +17965,8 @@ fn session_fork_once(
         server_path.as_deref(),
         caller_uid,
         cap_inherit.as_ref(),
-        model.as_deref(),
+        &model,
+        &effort,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -17441,7 +18074,10 @@ fn session_fork_once(
         "base": if use_trunk { "trunk" } else { "source" },
         "base_sha": base_sha_out,
         "engine": source.engine,
-        "model": model,
+        "model": model.as_ref().map(|(m, _)| m.clone()),
+        "model_source": model.as_ref().map(|(_, src)| src.as_str()),
+        "effort": effort.as_ref().map(|(e, _)| e.clone()),
+        "effort_source": effort.as_ref().map(|(_, src)| src.as_str()),
         "label": label,
         "transcript_id": forked_transcript_id,
         "forked_from": {
@@ -17555,7 +18191,8 @@ fn compose_fork_spawn_params(
     server_path: Option<&str>,
     managed_by: Option<&str>,
     cap: Option<&InheritedCap>,
-    model: Option<&str>,
+    model: &Resolved,
+    effort: &Resolved,
 ) -> MethodResult {
     let (program, tail, pin) = crate::mcp_config::build_launch_args(
         &source.engine,
@@ -17563,7 +18200,8 @@ fn compose_fork_spawn_params(
         None,
         server_path,
         crate::mcp_config::Launch::Fork(&source.transcript_id),
-        model,
+        model.as_ref().map(|(m, _)| m.as_str()),
+        effort.as_ref().map(|(e, _)| e.as_str()),
     )
     .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
     let (program, tail) = match cap {
@@ -17597,8 +18235,8 @@ fn compose_fork_spawn_params(
         "rows": rows,
         "task_id": task_id,
     });
-    if let Some(m) = model {
-        full["model"] = json!(m);
+    if let Value::Object(obj) = &mut full {
+        insert_pick(obj, model, effort);
     }
     if let Some(path) = pin
         .as_deref()
@@ -18583,36 +19221,53 @@ fn local_machine_hostname() -> Option<String> {
         })
 }
 
+/// `metadata.models` / `metadata.efforts` for a task an agent files with a
+/// `model` and/or `effort`, in one engine slot: `model_engine` (claude /
+/// codex), else the engine the model's id names
+/// (`models::task_model_slot`). An effort alone needs `model_engine`: the
+/// levels don't name an engine. Each is `None` when not given. The TUI's
+/// `create_subtask` twin uses it too.
+pub fn filed_task_defaults(
+    model: Option<&str>,
+    effort: Option<&str>,
+    model_engine: Option<&str>,
+) -> Result<(Option<Value>, Option<Value>), (ErrorCode, String)> {
+    let invalid = |e: String| (ErrorCode::InvalidParams, e);
+    let model_engine = model_engine.map(str::trim).filter(|e| !e.is_empty());
+    let model = model.filter(|m| !m.trim().is_empty());
+    let effort = effort.filter(|e| !e.trim().is_empty());
+    let (slot, models) = match model {
+        Some(model) => {
+            let (slot, model) = crate::models::task_model_slot(model, model_engine).map_err(invalid)?;
+            (Some(slot), Some(json!({ slot: model })))
+        }
+        None => match model_engine {
+            Some(e) => {
+                let slot = crate::models::engine_key(e)
+                    .ok_or_else(|| invalid(format!("model_engine must be \"claude\" or \"codex\", not '{e}'")))?;
+                (Some(slot), None)
+            }
+            None => (None, None),
+        },
+    };
+    let efforts = match (effort, slot) {
+        (None, _) => None,
+        (Some(e), Some(slot)) => Some(json!({ slot: crate::models::validate_effort(slot, e).map_err(invalid)? })),
+        (Some(_), None) => {
+            return Err(invalid("an effort without a model needs model_engine=\"claude\" or \"codex\"".into()))
+        }
+    };
+    if models.is_none() && efforts.is_none() && model_engine.is_some() {
+        return Err(invalid("model_engine needs a model or an effort".into()));
+    }
+    Ok((models, efforts))
+}
+
 /// Build the persisted `metadata.filer` object from daemon-known caller
 /// identity (daemon-owned session first, then the TUI-pushed snapshot). No
 /// filer identity is accepted from request params: session, task, workspace,
 /// workflow, and continuous-task ids are authoritative snapshots of the
 /// caller that authenticated the RPC.
-/// `metadata.models` for a task an agent files with a `model`: one slot,
-/// `model_engine` (claude / codex) or else the filer's own engine. `None`
-/// when no model was given.
-fn filed_task_models(
-    filer: &Value,
-    model: Option<&str>,
-    model_engine: Option<&str>,
-) -> Result<Option<Value>, (ErrorCode, String)> {
-    let model_engine = model_engine.map(str::trim).filter(|e| !e.is_empty());
-    let Some(model) = model.filter(|m| !m.trim().is_empty()) else {
-        if model_engine.is_some() {
-            return Err((ErrorCode::InvalidParams, "model_engine needs a model".into()));
-        }
-        return Ok(None);
-    };
-    let model = crate::models::validate_model(model).map_err(|e| (ErrorCode::InvalidParams, e))?;
-    let engine = model_engine
-        .or_else(|| filer.get("agent").and_then(Value::as_str))
-        .and_then(crate::models::engine_key)
-        .ok_or((
-            ErrorCode::InvalidParams,
-            "model_engine must be \"claude\" or \"codex\" (the caller's own engine is unknown)".to_string(),
-        ))?;
-    Ok(Some(json!({ engine: model })))
-}
 
 fn filer_metadata(
     state: &DaemonState,
@@ -19430,6 +20085,7 @@ mod tests {
             "label": label,
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.display().to_string(),
         })
     }
@@ -19474,6 +20130,7 @@ mod tests {
             "label": "x",
             "argv": [],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let err = start_session(&state, &params).expect_err("empty argv");
@@ -19987,6 +20644,7 @@ mod tests {
             "label": "x",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": "/tmp",
         });
         let err = start_session(&state, &params).expect_err("missing ws");
@@ -20021,6 +20679,7 @@ mod tests {
             "label": "shell",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": worktree_path,
             "worktree_path": worktree_path,
         });
@@ -20059,6 +20718,7 @@ mod tests {
             "label": "x",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": "/tmp",
             // intentionally no worktree_path
         });
@@ -20091,6 +20751,7 @@ mod tests {
             "label": "reviewer",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "session_type": "claude-code",
             "workflow_run_id": "wf_add",
@@ -20151,6 +20812,7 @@ mod tests {
             "label": "worker",
             "argv": ["/bin/sleep", "120"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "task_id": "task-launch",
         });
@@ -20202,6 +20864,7 @@ mod tests {
             "label": "relaunch",
             "argv": ["/bin/sleep", "120"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "task_id": "task-done",
         });
@@ -20249,6 +20912,7 @@ mod tests {
             "label": "watcher",
             "argv": ["/bin/sleep", "120"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "task_id": "task-bt",
         });
@@ -20286,6 +20950,7 @@ mod tests {
             "label": "restored",
             "argv": ["/bin/sleep", "120"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "task_id": "task-restored",
             "skip_task_status_promotion": true,
@@ -20386,7 +21051,7 @@ mod tests {
             let cloned_path = seed.0.as_ref().unwrap().transcript_path.clone();
             let state = Arc::new(Mutex::new(DaemonState::new()));
             let full = compose_daemon_spawn_params(&state, &fresh_test_uid(), "ws-seed", "agent", "claude-code", &target,
-                None, 80, 24, None, seed.id(), Some("test-model")).unwrap();
+                None, 80, 24, None, seed.id(), &explicit("test-model"), &explicit("xhigh")).unwrap();
             let argv = full["argv"].as_array().unwrap();
             assert!(argv.windows(2).any(|args| args[0] == "--resume" && args[1] == seed.id().unwrap()));
             assert_eq!(full["transcript_path"], cloned_path.to_string_lossy().as_ref());
@@ -20693,7 +21358,7 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
 
         let full = compose_daemon_spawn_params(
-            &state, &uid, "ws-c", "label", "claude-code", &wt, None, 100, 40, Some(&wt), None, Some("test-model"),
+            &state, &uid, "ws-c", "label", "claude-code", &wt, None, 100, 40, Some(&wt), None, &explicit("test-model"), &explicit("xhigh"),
         )
         .expect("compose ok");
 
@@ -20890,6 +21555,7 @@ mod tests {
             "label": "x",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             // A different path — must be ignored.
             "worktree_path": other.path().display().to_string(),
@@ -20957,6 +21623,7 @@ mod tests {
             "label": "x",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let result = start_session(&state, &params)
@@ -21014,6 +21681,7 @@ mod tests {
             "label": "passthrough",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let result = start_session(&state, &params).expect("spawn");
@@ -21051,6 +21719,7 @@ mod tests {
             "label": "first",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let _ok = start_session(&state, &params).expect("first spawn");
@@ -21062,6 +21731,7 @@ mod tests {
             "label": "duplicate",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let err = start_session(&state, &dup_params).expect_err("duplicate uid");
@@ -21123,6 +21793,7 @@ mod tests {
                     "label": format!("race-{}", i),
                     "argv": ["/bin/bash"],
                     "model": "test-model",
+                    "effort": "xhigh",
                     "working_dir": wd_c,
                 });
                 start_session(&state_c, &params)
@@ -21193,6 +21864,7 @@ mod tests {
                 "label": "x",
                 "argv": ["/bin/bash"],
                 "model": "test-model",
+                "effort": "xhigh",
                 "working_dir": dir.path().display().to_string(),
             });
             let err = start_session(&state, &params).expect_err(
@@ -21274,6 +21946,7 @@ mod tests {
             "label": "outside-scope-test",
             "argv": ["/bin/sleep", "30"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
             "memory_cap_hard_bytes": 128 * 1024 * 1024u64,
@@ -21330,6 +22003,7 @@ mod tests {
             "label": "forged-path-test",
             "argv": ["/bin/sleep", "30"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
             "memory_cap_hard_bytes": 128 * 1024 * 1024u64,
@@ -21400,6 +22074,7 @@ mod tests {
             "label": "watcher-fail-test",
             "argv": ["/bin/sleep", "30"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
         });
@@ -21595,6 +22270,7 @@ mod tests {
             "label": "env-inj",
             "argv": argv,
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             // Workflow context — exercises the CM_WORKFLOW_RUN_ID /
             // CM_ROLE injection branch.
@@ -21752,6 +22428,7 @@ mod tests {
             "label": "empty-cfg",
             "argv": argv,
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let _r = start_session(&state, &params).expect("ok");
@@ -21870,6 +22547,7 @@ mod tests {
             "label": "abs-paths",
             "argv": argv,
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let _result = start_session(&state, &params).expect("spawn ok");
@@ -22304,6 +22982,9 @@ mod tests {
             s.workspaces.get_mut("ws-10e-a-t1").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
                     model: None,
+                    model_source: None,
+                    effort: None,
+                    effort_source: None,
                     transcript_path: None,
                     reported_done_at: None,
                     report_reason: None,
@@ -22556,6 +23237,9 @@ mod tests {
             s.workspaces.get_mut("ws-10e-a-cap").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
                     model: None,
+                    model_source: None,
+                    effort: None,
+                    effort_source: None,
                     transcript_path: None,
                     reported_done_at: None,
                     report_reason: None,
@@ -22759,6 +23443,9 @@ mod tests {
             s.workspaces.get_mut("ws-10e-a-opkill").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
                     model: None,
+                    model_source: None,
+                    effort: None,
+                    effort_source: None,
                     transcript_path: None,
                     reported_done_at: None,
                     report_reason: None,
@@ -23146,6 +23833,7 @@ while True:
             "label": "x",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let result = start_session(&state, &params).expect("spawn");
@@ -23198,6 +23886,7 @@ while True:
             "label": "x",
             "argv": ["/bin/bash"],
             "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "cols": 120u16,
             "rows": 40u16,
@@ -24328,6 +25017,9 @@ while True:
     fn me(uid: &str, session_type: &str) -> crate::manifest::ManifestEntry {
         crate::manifest::ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: uid.into(),
             managed_by_uid: None,
@@ -24356,12 +25048,17 @@ while True:
         }
     }
 
-    /// CM never relies on an engine's default model. Every spawn composer
-    /// names the model both in the argv and in the `start_session` params
-    /// (where it is recorded for revive/resume), the argv builders refuse an
-    /// agent spawn without one, and the shared spawn core refuses an agent
-    /// spawn that names none. A spawn route that forgets the model fails
-    /// here. (`mcp_start_session` is pinned by
+    fn explicit(v: &str) -> Resolved {
+        Some((v.to_string(), crate::models::ModelSource::Explicit))
+    }
+
+    /// CM never relies on an engine's default model or effort. Every spawn
+    /// composer names both in the argv and in the `start_session` params
+    /// (where they are recorded for revive/resume), the argv builders refuse
+    /// an agent spawn without them, and the shared spawn core refuses an
+    /// agent spawn that names none. A spawn route that forgets either fails
+    /// here, and a NEW argv-building call site fails the census at the end
+    /// until it is added to this test. (`mcp_start_session` is pinned by
     /// `mcp_start_session_records_and_returns_the_resolved_model`.)
     #[test]
     fn every_spawn_path_names_its_model() {
@@ -24369,42 +25066,42 @@ while True:
             let state = make_state_arc();
             let wt = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("wt");
             std::fs::create_dir_all(&wt).unwrap();
-            let check = |what: &str, engine: &str, v: &Value, want: &str| {
-                let argv: Vec<String> = v["argv"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|a| a.as_str().unwrap().to_string())
-                    .collect();
-                assert_eq!(
-                    crate::models::argv_model(engine, &argv),
-                    Some(want),
-                    "{what} ({engine}): argv {argv:?}"
-                );
-                assert_eq!(v["model"], want, "{what} ({engine}): start_session params");
+            let argv_of = |v: &Value| -> Vec<String> {
+                v["argv"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect()
+            };
+            let check = |what: &str, engine: &str, v: &Value, model: &str, effort: &str| {
+                let argv = argv_of(v);
+                assert_eq!(crate::models::argv_model(engine, &argv), Some(model), "{what} ({engine}): argv {argv:?}");
+                assert_eq!(crate::models::argv_effort(engine, &argv).as_deref(), Some(effort), "{what} ({engine}): argv {argv:?}");
+                assert_eq!(v["model"], model, "{what} ({engine}): start_session params");
+                assert_eq!(v["effort"], effort, "{what} ({engine}): start_session params");
+                assert!(v["model_source"].is_string() && v["effort_source"].is_string(), "{what}: sources recorded: {v}");
                 start_session_model(engine, v["model"].as_str(), &argv).expect(what);
+                start_session_effort(engine, v["effort"].as_str(), &argv).expect(what);
             };
             for engine in ["claude-code", "codex"] {
                 let default = crate::models::default_model(engine).unwrap();
+                let default_effort = crate::models::default_effort(engine).unwrap();
                 let v = compose_daemon_spawn_params(
                     &state, &fresh_test_uid(), "ws", "l", engine, &wt, None, 80, 24, Some(&wt), None,
-                    Some("explicit-1"),
+                    &explicit("explicit-1"), &explicit("low"),
                 )
                 .unwrap();
-                check("create/add/resume", engine, &v, "explicit-1");
+                check("create/add/resume", engine, &v, "explicit-1", "low");
 
                 let mut e = me(&fresh_test_uid(), engine);
                 let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
-                check("restore/revive, nothing recorded", engine, &v, &default);
+                check("restore/revive, nothing recorded", engine, &v, &default, &default_effort);
                 e.model = Some("recorded-1".into());
+                e.effort = Some("medium".into());
                 let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
-                check("restore/revive, recorded", engine, &v, "recorded-1");
+                check("restore/revive, recorded", engine, &v, "recorded-1", "medium");
 
                 let v = compose_continuous_spawn_params(
                     &state, &fresh_test_uid(), "ws", "l", engine, &wt, None, "ct-unknown", None, 80, 24,
                 )
                 .unwrap();
-                check("continuous fire", engine, &v, &default);
+                check("continuous fire", engine, &v, &default, &default_effort);
 
                 let source = ForkSource {
                     engine: engine.into(),
@@ -24414,31 +25111,41 @@ while True:
                     task_id: None,
                     label: "src".into(),
                     model: Some("source-m".into()),
+                    model_source: None,
+                    effort: None,
+                    effort_source: None,
+                    transcript_file: None,
                 };
                 let v = compose_fork_spawn_params(
                     &fresh_test_uid(), "ws", "l", &source, &wt, "task-1", 80, 24, None, None, None,
-                    Some("fork-m"),
+                    &explicit("fork-m"), &explicit("high"),
                 )
                 .unwrap();
-                check("fork", engine, &v, "fork-m");
+                check("fork", engine, &v, "fork-m", "high");
 
                 let meta = crate::mcp_config::WorkflowMeta { run_id: "run-1", role: "worker" };
-                let (_, tail) =
-                    resolve_workflow_spawn_program(engine, &fresh_test_uid(), Some(&meta), None, Some("role-m"))
-                        .unwrap();
+                let (_, tail) = resolve_workflow_spawn_program(
+                    engine, &fresh_test_uid(), Some(&meta), None, Some("role-m"), Some("high"),
+                )
+                .unwrap();
                 assert_eq!(crate::models::argv_model(engine, &tail), Some("role-m"), "workflow role");
+                assert_eq!(crate::models::argv_effort(engine, &tail).as_deref(), Some("high"), "workflow role");
 
                 for launch in [
                     crate::mcp_config::Launch::Fresh,
                     crate::mcp_config::Launch::Resume("0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f"),
                     crate::mcp_config::Launch::Fork("0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f"),
                 ] {
-                    let err = crate::mcp_config::build_launch_args(engine, &fresh_test_uid(), None, None, launch, None)
+                    let uid = fresh_test_uid();
+                    let err = crate::mcp_config::build_launch_args(engine, &uid, None, None, launch, None, Some("high"))
                         .expect_err("an agent argv without a model");
                     assert!(err.to_string().contains("model"), "{err}");
+                    let err = crate::mcp_config::build_launch_args(engine, &uid, None, None, launch, Some("m"), None)
+                        .expect_err("an agent argv without an effort");
+                    assert!(err.to_string().contains("effort"), "{err}");
                 }
 
-                // The spawn core: no model anywhere → refused; a mismatch → refused.
+                // The spawn core: no model / effort anywhere → refused; a mismatch → refused.
                 let base = json!({
                     "uid": fresh_test_uid(), "workspace_id": "ws", "label": "l",
                     "argv": ["/bin/true"], "working_dir": wt, "worktree_path": wt,
@@ -24446,19 +25153,332 @@ while True:
                 });
                 let err = start_session(&state, &base).unwrap_err();
                 assert!(matches!(err.0, ErrorCode::InvalidParams) && err.1.contains("must name its model"), "{err:?}");
+                let mut with_model = base.clone();
+                with_model["model"] = json!("m");
+                with_model["uid"] = json!(fresh_test_uid());
+                let err = start_session(&state, &with_model).unwrap_err();
+                assert!(matches!(err.0, ErrorCode::InvalidParams) && err.1.contains("must name its effort"), "{err:?}");
                 let flag = if engine == "codex" { "-m" } else { "--model" };
                 let argv = vec!["x".to_string(), flag.to_string(), "a".to_string()];
                 assert!(start_session_model(engine, Some("b"), &argv).is_err(), "declared vs argv mismatch");
                 assert_eq!(start_session_model(engine, None, &argv).unwrap().as_deref(), Some("a"));
                 assert!(start_session_model(engine, Some("bad model"), &[]).is_err());
+                let argv = crate::models::effort_args(engine, "low");
+                assert!(start_session_effort(engine, Some("high"), &argv).is_err(), "declared vs argv mismatch");
+                assert_eq!(start_session_effort(engine, None, &argv).unwrap().as_deref(), Some("low"));
+                assert!(start_session_effort(engine, Some("extreme"), &[]).is_err());
             }
+            assert!(start_session_effort("codex", Some("max"), &[]).is_err(), "codex has no max");
             assert_eq!(start_session_model("bash", None, &["/bin/bash".into()]).unwrap(), None);
             assert!(start_session_model("bash", Some("m"), &["/bin/bash".into()]).is_err());
+            assert_eq!(start_session_effort("bash", None, &["/bin/bash".into()]).unwrap(), None);
+            assert!(start_session_effort("bash", Some("high"), &["/bin/bash".into()]).is_err());
             let v = compose_daemon_spawn_params(
-                &state, &fresh_test_uid(), "ws", "l", "bash", &wt, None, 80, 24, Some(&wt), None, None,
+                &state, &fresh_test_uid(), "ws", "l", "bash", &wt, None, 80, 24, Some(&wt), None, &None, &None,
             )
             .unwrap();
-            assert!(v.get("model").is_none(), "bash carries no model: {v}");
+            assert!(v.get("model").is_none() && v.get("effort").is_none(), "bash carries neither: {v}");
+        });
+
+        // Census: the production call sites that build an agent argv. Each
+        // is covered above (or, for mcp_start_session, by its own test). A
+        // new one fails here until it is checked and listed.
+        let mut sites = Vec::new();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path.ends_with("mcp_config.rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let production = text.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+                let mut current_fn = String::new();
+                for line in production.lines() {
+                    let t = line.trim_start();
+                    if let Some(rest) = t.split("fn ").nth(1).filter(|_| !t.starts_with("//") && t.contains("fn ")) {
+                        current_fn = rest.split(['(', '<']).next().unwrap_or("").to_string();
+                    }
+                    if !t.starts_with("//")
+                        && (t.contains("mcp_config::build_args(") || t.contains("mcp_config::build_launch_args("))
+                    {
+                        sites.push(current_fn.clone());
+                    }
+                }
+            }
+        }
+        sites.sort();
+        assert_eq!(
+            sites,
+            [
+                "compose_daemon_spawn_params",
+                "compose_fork_spawn_params",
+                "mcp_start_session",
+                "resolve_workflow_spawn_program",
+            ],
+            "a new agent-argv call site: cover it in this test, then list it here"
+        );
+    }
+
+    fn tombstone(uid: &str, engine: &str) -> crate::state::ExitedTombstone {
+        crate::state::ExitedTombstone {
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
+            incarnation: None,
+            status_lost: false,
+            session_uid: uid.into(),
+            transcript_path: None,
+            generation: 0,
+            session_type: engine.into(),
+            workspace_id: "ws".into(),
+            task_id: None,
+            managed_by_uid: None,
+            continuous_task_id: None,
+            label: "l".into(),
+            workflow_run_id: None,
+            workflow_role: None,
+            worktree_path: None,
+            global_perms: false,
+            exited_at: 1.0,
+            killed: false,
+            killed_by: None,
+            reported_done_at: None,
+            report_reason: None,
+        }
+    }
+
+    /// Revive keeps what the session ran: the caller's value (viewer record
+    /// or explicit change) → the entry's record → the tombstone's; nothing
+    /// sent leaves the record alone.
+    #[test]
+    fn revive_merges_the_recorded_and_sent_model_and_effort() {
+        let pairs = |e: &crate::manifest::ManifestEntry| {
+            (e.model.clone(), e.model_source.clone(), e.effort.clone(), e.effort_source.clone())
+        };
+        let some = |v: &str| Some(v.to_string());
+        // Tombstone only: the entry has nothing, the tombstone has both.
+        let mut tomb = tombstone("ts-r", "codex");
+        tomb.model = some("gpt-6-luna");
+        tomb.model_source = some("task");
+        tomb.effort = some("high");
+        tomb.effort_source = some("transcript");
+        let mut e = me("ts-r", "codex");
+        merge_revive_settings(&mut e, Some(&tomb), [(None, None), (None, None)]);
+        assert_eq!(pairs(&e), (some("gpt-6-luna"), some("task"), some("high"), some("transcript")));
+        // Without p.model / p.effort: the entry's own record stands.
+        let mut e2 = e.clone();
+        let mut other = tomb.clone();
+        other.model = some("gpt-6-astra");
+        merge_revive_settings(&mut e2, Some(&other), [(None, None), (None, None)]);
+        assert_eq!(pairs(&e2), pairs(&e));
+        // The same value sent back keeps its source unless one is sent.
+        let mut e3 = e.clone();
+        merge_revive_settings(&mut e3, None, [(Some("gpt-6-luna"), None), (Some("high"), Some("explicit"))]);
+        assert_eq!(pairs(&e3), (some("gpt-6-luna"), some("task"), some("high"), some("explicit")));
+        // A different value: the sent source, else explicit; effort normalized.
+        let mut e4 = e.clone();
+        merge_revive_settings(&mut e4, None, [(Some(" gpt-6-astra "), Some("recorded")), (Some("LOW"), None)]);
+        assert_eq!(pairs(&e4), (some("gpt-6-astra"), some("recorded"), some("low"), some("explicit")));
+        // Nothing anywhere stays unset for compose_restore_params to resolve.
+        let mut e5 = me("ts-r", "codex");
+        merge_revive_settings(&mut e5, Some(&tombstone("ts-r", "codex")), [(None, None), (None, None)]);
+        assert_eq!(pairs(&e5), (None, None, None, None));
+    }
+
+    /// A session from before CM recorded models/efforts resumes on what its
+    /// transcript says it ran (`transcript`), never silently on a default;
+    /// with no transcript value it takes the default, marked
+    /// `default_on_resume`. Restore and revive share this composer.
+    #[test]
+    fn restore_of_an_unrecorded_session_keeps_its_transcript_model_and_effort() {
+        let _home = with_temp_home(|| {
+            let state = make_state_arc();
+            let wt = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("wt-unrec");
+            std::fs::create_dir_all(&wt).unwrap();
+            let id = "0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f";
+            let path = crate::transcript_detect::claude_transcript_path(&wt, id).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                "{\"type\":\"assistant\",\"effort\":\"medium\",\"message\":{\"model\":\"claude-sonnet-5-5\"}}\n",
+            )
+            .unwrap();
+            let mut e = me(&fresh_test_uid(), "claude-code");
+            e.transcript_id = Some(id.into());
+            let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
+            assert_eq!((v["model"].as_str(), v["model_source"].as_str()), (Some("claude-sonnet-5-5"), Some("transcript")));
+            assert_eq!((v["effort"].as_str(), v["effort_source"].as_str()), (Some("medium"), Some("transcript")));
+
+            std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
+            let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
+            assert_eq!(v["model"], crate::models::DEFAULT_CLAUDE_MODEL);
+            assert_eq!(v["model_source"], "default_on_resume");
+            assert_eq!((v["effort"].as_str(), v["effort_source"].as_str()), (Some("xhigh"), Some("default_on_resume")));
+
+            // A recorded value wins over the transcript and keeps its source.
+            e.model = Some("claude-opus-5-5".into());
+            e.model_source = Some("explicit".into());
+            let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
+            assert_eq!((v["model"].as_str(), v["model_source"].as_str()), (Some("claude-opus-5-5"), Some("explicit")));
+        });
+    }
+
+    /// Adoption (holder adopt-at-boot, monolith re-exec) records the model
+    /// and effort of carried sessions: the registry entry's first, else the
+    /// transcript's. One with neither stays unrecorded.
+    #[test]
+    fn backfill_records_adopted_settings_from_the_registry_then_the_transcript() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let _home = with_temp_home(|| {
+            let state = make_state_arc();
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = dir.path().join("rollout-2026-10-22T00-00-00-0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f.jsonl");
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\",\"effort\":\"high\"}}\n",
+            )
+            .unwrap();
+            {
+                let mut s = state.lock().unwrap();
+                for (uid, path) in [("ts-bf00000000000001-0", Some(&transcript)), ("ts-bf00000000000002-0", None)] {
+                    let mut sp = SpawnParams::new(uid, "bf", "/bin/sleep");
+                    sp.args = vec!["120".to_string()];
+                    sp.session_type = "codex".into();
+                    sp.transcript_path = path.map(|p| p.to_string_lossy().into_owned());
+                    s.sessions.insert(uid.into(), DaemonSession::spawn(sp).expect("spawn"));
+                }
+                s.recently_exited.push_back(tombstone("ts-bf00000000000003-0", "claude-code"));
+            }
+            let mut manifest = crate::manifest::Manifest::default();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            let mut entry = me("ts-bf00000000000003-0", "claude-code");
+            entry.model = Some("claude-opus-5-5".into());
+            entry.model_source = Some("explicit".into());
+            entry.effort = Some("max".into());
+            entry.effort_source = Some("task".into());
+            ws.sessions = vec![entry];
+            manifest.workspaces.insert("ws".into(), ws);
+
+            assert_eq!(backfill_session_models(&state, Some(&manifest)), 4);
+            let mut s = state.lock().unwrap();
+            let live = s.sessions.get("ts-bf00000000000001-0").unwrap();
+            assert_eq!((live.model.as_deref(), live.model_source.as_deref()), (Some("gpt-6-astra"), Some("transcript")));
+            assert_eq!((live.effort.as_deref(), live.effort_source.as_deref()), (Some("high"), Some("transcript")));
+            let bare = s.sessions.get("ts-bf00000000000002-0").unwrap();
+            assert_eq!((bare.model.as_deref(), bare.effort.as_deref()), (None, None), "no record: left unrecorded");
+            let t = s.recently_exited.iter().find(|t| t.session_uid == "ts-bf00000000000003-0").unwrap();
+            assert_eq!((t.model.as_deref(), t.model_source.as_deref()), (Some("claude-opus-5-5"), Some("explicit")));
+            assert_eq!((t.effort.as_deref(), t.effort_source.as_deref()), (Some("max"), Some("task")));
+            s.sessions.clear();
+        });
+    }
+
+    /// Restore never stalls on an unreachable planning API: the task
+    /// lookups run concurrently under one total budget, and the ones that
+    /// didn't answer fall back to the config defaults.
+    #[test]
+    fn restore_task_lookups_are_bounded_when_the_api_hangs() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept and never answer.
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&held);
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                sink.lock().unwrap().push(conn);
+            }
+        });
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{port}");
+            s.config.api_token = "tok".into();
+        }
+        let keys: Vec<(String, &'static str)> =
+            (0..6).map(|i| (format!("task-{i}"), if i % 2 == 0 { "claude" } else { "codex" })).collect();
+        let started = std::time::Instant::now();
+        let cache = prefetch_task_models(&state, keys, std::time::Duration::from_millis(300));
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "bounded by the budget, not 6 × the 3 s timeout: {took:?}");
+        assert_eq!(cache.len(), 6);
+        assert!(cache.values().all(|d| *d == TaskDefaults::default()), "unanswered → config defaults");
+    }
+
+    /// `start_workflow` resolves each fresh role's model and effort: the
+    /// launch's `role_models` / `role_efforts` → the role's TOML values →
+    /// the config defaults, recorded on each participant with its source.
+    #[test]
+    fn start_workflow_resolves_role_models_and_efforts() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Transition, TriggerOn, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt-models");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let role = |engine, model: Option<&str>, effort: Option<&str>| Role {
+                    engine,
+                    context: Context::Persistent,
+                    activation_prompt: None,
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                    model: model.map(str::to_string),
+                    effort: effort.map(str::to_string),
+                };
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), role(Engine::Codex, Some("gpt-6-astra"), Some("high")));
+                roles.insert("reviewer".to_string(), role(Engine::ClaudeCode, Some("claude-sonnet-5-5"), None));
+                roles.insert("manager".to_string(), role(Engine::ClaudeCode, None, None));
+                s.base_workflow_definitions.insert("models".to_string(), Workflow {
+                    name: "models".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
+                    transitions: vec![
+                        Transition { from: "worker".into(), on: TriggerOn::Idle, to: "reviewer".into() },
+                    ],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "models",
+                "goal": "g",
+                "worktree": wt.to_str().unwrap(),
+                "workspace_id": "ws-1",
+                "role_models": { "reviewer": "claude-opus-5-5" },
+                "role_efforts": { "reviewer": "max", "manager": "low" },
+            })).expect("start_workflow ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+            let mut s = state.lock().unwrap();
+            let by_role: BTreeMap<String, (Option<String>, Option<String>, Option<String>, Option<String>)> = s
+                .sessions
+                .values()
+                .filter_map(|x| {
+                    Some((x.workflow_role.clone()?, (x.model.clone(), x.model_source.clone(), x.effort.clone(), x.effort_source.clone())))
+                })
+                .collect();
+            let some = |v: &str| Some(v.to_string());
+            assert_eq!(by_role["worker"], (some("gpt-6-astra"), some("explicit"), some("high"), some("explicit")), "TOML role values");
+            assert_eq!(by_role["reviewer"], (some("claude-opus-5-5"), some("explicit"), some("max"), some("explicit")), "launch overrides win");
+            assert_eq!(
+                by_role["manager"],
+                (some(crate::models::DEFAULT_CLAUDE_MODEL), some("engine_default"), some("low"), some("explicit")),
+                "config defaults fill the rest",
+            );
+            s.sessions.clear();
         });
     }
 
@@ -25018,6 +26038,9 @@ while True:
             s.workspaces.insert("ws-rv".into(), ws);
             s.record_exited(crate::state::ExitedTombstone {
                 model: None,
+                model_source: None,
+                effort: None,
+                effort_source: None,
                 incarnation: None,
                 status_lost: false,
                 session_uid: uid.into(),
@@ -25195,6 +26218,9 @@ while True:
         let state = make_state_arc();
         state.lock().unwrap().record_exited(crate::state::ExitedTombstone {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             incarnation: None,
             status_lost: false,
             session_uid: uid.into(),
@@ -26950,6 +27976,7 @@ while True:
                     "label": "esmisc",
                     "argv": ["/bin/sleep", "120"],
                     "model": "test-model",
+                    "effort": "xhigh",
                 }),
             )
             .expect("start_session ok");
@@ -27462,7 +28489,7 @@ while True:
             seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
             let stub = spawn_routed_stub(|method, path, _b| {
                 if method == "GET" && path.starts_with("/tasks/task-1/model") {
-                    (200, r#"{"engine":"codex","model":"gpt-6-luna","source_task_id":"root-task"}"#.into())
+                    (200, r#"{"engine":"codex","model":"gpt-6-luna","source_task_id":"root-task","effort":"medium","effort_source_task_id":"root-task"}"#.into())
                 } else if method == "GET" && path.starts_with("/tasks/task-2/model") {
                     (200, r#"{"engine":"codex","model":null,"source_task_id":null}"#.into())
                 } else {
@@ -27477,13 +28504,18 @@ while True:
             }
             set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
             let spawn = |params: Value| mcp_start_session(&state, &params, Some("ts-caller"));
-            let explicit = spawn(json!({"type": "codex", "label": "a", "model": "gpt-6-astra"})).unwrap();
+            let explicit = spawn(json!({"type": "codex", "label": "a", "model": "gpt-6-astra", "effort": "LOW"})).unwrap();
             let task = spawn(json!({"type": "codex", "label": "b"})).unwrap();
             let engine = spawn(json!({"type": "codex", "label": "c", "task_id": "task-2",
                                       "allow_shared_workspace": true})).unwrap();
             let bad = spawn(json!({"type": "codex", "label": "d", "model": "two words"})).unwrap_err();
             let bash = spawn(json!({"type": "bash", "label": "e", "model": "gpt-6-luna"})).unwrap_err();
+            let max = spawn(json!({"type": "codex", "label": "f", "effort": "max"})).unwrap_err();
             set_spawn_program_override_for_test(None);
+            assert!(matches!(max.0, ErrorCode::InvalidParams) && max.1.contains("codex"), "{max:?}");
+            assert_eq!((explicit["effort"].as_str(), explicit["effort_source"].as_str()), (Some("low"), Some("explicit")));
+            assert_eq!((task["effort"].as_str(), task["effort_source"].as_str()), (Some("medium"), Some("task")));
+            assert_eq!((engine["effort"].as_str(), engine["effort_source"].as_str()), (Some("xhigh"), Some("engine_default")));
 
             assert_eq!((explicit["model"].as_str(), explicit["model_source"].as_str()), (Some("gpt-6-astra"), Some("explicit")));
             assert_eq!((task["model"].as_str(), task["model_source"].as_str()), (Some("gpt-6-luna"), Some("task")));
@@ -27810,7 +28842,7 @@ while True:
                     activation_prompt: Some("a".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             let wf_a = Workflow {
@@ -27849,7 +28881,7 @@ while True:
                     activation_prompt: Some("b".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                 },
             );
             let wf_b = Workflow {
@@ -27901,7 +28933,7 @@ while True:
                         activation_prompt: None,
                         subsequent_activation_prompt: None,
                     needs_mcp: false,
-                    model: None,
+                    model: None, effort: None,
                     },
                 );
                 s.workflow_definitions.insert(
@@ -27943,7 +28975,7 @@ while True:
                 let mut roles = BTreeMap::new();
                 roles.insert("worker".to_string(), Role {
                     engine: Engine::ClaudeCode, context: Context::Persistent,
-                    activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None,
+                    activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
                 });
                 Workflow {
                     name: "feedback".to_string(), description: String::new(), roles,
@@ -28008,9 +29040,9 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 // BASE layer only — no TUI override.
                 s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
                     name: "feedback".to_string(), description: String::new(), roles,
@@ -28108,9 +29140,9 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
                     name: "feedback".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
@@ -28174,8 +29206,8 @@ while True:
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
                 // Both roles declare claude-code in the TOML.
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("review".to_string(), Workflow {
                     name: "review".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "reviewer".into()],
@@ -28241,7 +29273,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-own".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28295,7 +29327,7 @@ while True:
                 s.task_tree.insert("task-child".to_string(), Some("task-parent".to_string()));
                 s.task_workspaces.insert("task-child".to_string(), "ws-child".to_string());
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28347,8 +29379,8 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("two".to_string(), Workflow {
                     name: "two".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "manager".into()], transitions: vec![],
@@ -28399,7 +29431,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28457,7 +29489,7 @@ while True:
                 // Codex: the only engine that still arms a spawn-time detector
                 // (its rollout exists from boot). Claude roles bind at
                 // activation via the drainer and never reach this path.
-                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28553,7 +29585,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28612,7 +29644,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28677,7 +29709,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28730,7 +29762,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28783,10 +29815,10 @@ while True:
                     s.workspaces.insert(id.to_string(), ws);
                 }
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("worker2".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("w2".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: true, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("worker2".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("w2".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: true, model: None , effort: None});
                 s.base_workflow_definitions.insert("multi".to_string(), Workflow {
                     name: "multi".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "worker2".into(), "reviewer".into(), "manager".into()],
@@ -28874,7 +29906,7 @@ while True:
                 s.task_tree.insert("task-A".to_string(), None);
                 s.task_tree.insert("task-B".to_string(), None);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28934,8 +29966,8 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
                     name: "feedback".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "reviewer".into()],
@@ -29031,7 +30063,7 @@ while True:
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
                 // No activation_prompt on the initial role.
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -29074,7 +30106,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -29118,7 +30150,7 @@ while True:
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
                 // Whitespace-only activation_prompt on the initial role.
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("   ".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("   ".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -29159,7 +30191,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("  \n ".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("  \n ".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -29206,7 +30238,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-cap".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -29270,7 +30302,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-op".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -29332,7 +30364,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-op".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -29381,7 +30413,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],

@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mcp_server.native_codex import (
-    apply_launch_model, apply_launch_permissions, launch_model, launch_permissions, split_args,
+    apply_launch_model, apply_launch_permissions, launch_effort, launch_model, launch_permissions, split_args,
 )
 
 BYPASS = "--dangerously-bypass-approvals-and-sandbox"
@@ -132,6 +132,42 @@ class CodexResumeArgsTests(unittest.TestCase):
                          {"threadId": "saved", "model": "gpt-6-luna"})
         self.assertEqual(params["model"], "gpt-6-astra", "the request is copied, not mutated")
         self.assertIs(apply_launch_model(params, None), params)
+
+    def test_effort_reaches_frontend_backend_and_thread_requests(self):
+        effort = ["-c", 'model_reasoning_effort="xhigh"']
+        cases = (
+            [BYPASS, "--no-alt-screen", "-m", "gpt-6-luna", *effort],
+            ["resume", "--no-alt-screen", "-m", "gpt-6-luna", *effort, "saved-thread"],
+            ["fork", "--no-alt-screen", "-m", "gpt-6-luna", *effort, "src-thread"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv[0]), patch(
+                "mcp_server.native_codex.os.getcwd", return_value="/work/fork"
+            ):
+                backend, frontend = split_args(argv)
+                self.assertEqual(launch_effort(argv), "xhigh")
+                self.assertEqual(launch_model(argv), "gpt-6-luna")
+                # Both sides: the frontend sends each turn's effort from its
+                # own config, the backend's default matches it.
+                self.assertIn('model_reasoning_effort="xhigh"', backend)
+                self.assertIn('model_reasoning_effort="xhigh"', frontend)
+                self.assertIn('model="gpt-6-luna"', backend)
+                self.assertEqual(frontend[frontend.index("-m") + 1], "gpt-6-luna")
+                if argv[0] in ("resume", "fork"):
+                    self.assertEqual(frontend[-2:], [argv[0], argv[-1]])
+        self.assertIsNone(launch_effort([BYPASS, "-c", "x=1"]))
+        self.assertEqual(launch_effort(["-c", "model_reasoning_effort=low"]), "low")
+        params = {"threadId": "saved", "config": {"x": 1}}
+        self.assertEqual(
+            apply_launch_model(params, "gpt-6-luna", "high"),
+            {"threadId": "saved", "model": "gpt-6-luna",
+             "config": {"x": 1, "model_reasoning_effort": "high"}},
+        )
+        self.assertEqual(params["config"], {"x": 1}, "the request is copied, not mutated")
+        self.assertEqual(
+            apply_launch_model({"config": None}, None, "low"),
+            {"config": {"model_reasoning_effort": "low"}},
+        )
 
 
 if __name__ == "__main__":

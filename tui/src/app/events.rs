@@ -1492,6 +1492,7 @@ impl App {
         prompt: Option<&str>,
         global_perms: bool,
         model: Option<&str>,
+        effort: Option<&str>,
     ) -> std::io::Result<String> {
         // 12e-r8 F1: derive the target host from the CALLER's
         // pinned host_id, NOT from `self.active_host`.
@@ -1575,6 +1576,7 @@ impl App {
             // the child runs ungranted, no second RPC to lose.
             global_perms,
             model,
+            effort,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -1618,6 +1620,9 @@ impl App {
         }
         let ts = TerminalSession {
             model: session.spawn_model.clone(),
+            model_source: session.spawn_model_source.clone(),
+            effort: session.spawn_effort.clone(),
+            effort_source: session.spawn_effort_source.clone(),
             color: None,
             uid: session_uid.clone(),
             label: label.to_string(),
@@ -2525,6 +2530,9 @@ impl App {
         let op_token = self.host_pool.operator_token_for(&host_id);
         let config = crate::client_session::ClientSessionConfig {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             daemon_socket: &socket,
             operator_token_id: &op_token,
             uid,
@@ -5689,6 +5697,9 @@ pub(super) mod pending_workflow_events_tests {
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
             model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -5899,6 +5910,7 @@ pub(super) mod pending_workflow_events_tests {
         let before = app.workspaces.len();
         app.create_local_session(
             &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, None, true, None,
+            None,
         );
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5917,6 +5929,7 @@ pub(super) mod pending_workflow_events_tests {
         let before = app.workspaces.len();
         app.create_local_session(
             &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, Some("snap-1"), false, None,
+            None,
         );
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5936,6 +5949,7 @@ pub(super) mod pending_workflow_events_tests {
         let chosen = cm_daemon::host_id::HostId::local();
         app.create_local_session(
             &chosen, "no-such-repo-xyz", "label", LaunchEngine::default(), None, 0, None, true, None,
+            None,
         );
         let st = status_text(&app);
         assert!(
@@ -5969,7 +5983,7 @@ pub(super) mod pending_workflow_events_tests {
             seed_from: None,
             in_place: true,
             host_id: cm_daemon::host_id::HostId::new("manager"),
-            model: None,
+            model: None, effort: None,
         });
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5989,7 +6003,7 @@ pub(super) mod pending_workflow_events_tests {
             seed_from: None,
             in_place: true,
             host_id: cm_daemon::host_id::HostId::local(),
-            model: None,
+            model: None, effort: None,
         });
         assert_eq!(
             status_text(&app),
@@ -6014,7 +6028,7 @@ pub(super) mod pending_workflow_events_tests {
             None,
             Some("snap-2"),
             None,
-            None,
+            None, None,
         );
         assert!(
             status_text(&app).contains("not reachable"),
@@ -6160,6 +6174,9 @@ pub(super) mod pending_workflow_events_tests {
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
             model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6339,6 +6356,9 @@ pub(super) mod pending_workflow_events_tests {
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
             model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6368,6 +6388,9 @@ pub(super) mod pending_workflow_events_tests {
         // "manager".
         let entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6558,6 +6581,9 @@ pub(super) mod pending_workflow_events_tests {
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
             model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6586,6 +6612,9 @@ pub(super) mod pending_workflow_events_tests {
         // (no active runs exist → it's Detached/Done from the TUI's POV).
         let entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6774,6 +6803,9 @@ pub(super) mod pending_workflow_events_tests {
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
             model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid_live,
@@ -6801,6 +6833,9 @@ pub(super) mod pending_workflow_events_tests {
         // Manifest: [gone, live] — gone FIRST so its failure precedes live.
         let mk = |uid: &str| ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6956,6 +6991,9 @@ pub(super) mod pending_workflow_events_tests {
 
         let mk = |uid: &str| ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -7103,6 +7141,9 @@ pub(super) mod pending_workflow_events_tests {
 
         let entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -7369,6 +7410,9 @@ pub(super) mod pending_workflow_events_tests {
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
             model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -7455,6 +7499,9 @@ pub(super) mod pending_workflow_events_tests {
         });
         let entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,

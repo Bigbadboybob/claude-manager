@@ -2310,8 +2310,13 @@ fn adopted_meta_from_record(
         workflow_run_id: rec.workflow_run_id.clone(),
         workflow_role: rec.workflow_role.clone(),
         continuous_task_id: rec.continuous_task_id.clone(),
-        // The frozen holder record has no model; revive re-resolves it.
+        // The handoff record has no model; `backfill_session_models` (run
+        // right after the handoff) restores it from the durable registry,
+        // else from the transcript.
         model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
         global_perms: rec.global_perms,
         generation: rec.generation,
         last_activity_at: cell(rec.last_activity_age_s),
@@ -2508,8 +2513,13 @@ fn swap_exit_tombstone(
         task_id: rec.task_id.clone(),
         managed_by_uid: rec.managed_by_uid.clone(),
         continuous_task_id: rec.continuous_task_id.clone(),
-        // The frozen holder record has no model; revive re-resolves it.
+        // The handoff record has no model; `backfill_session_models` (run
+        // right after the handoff) restores it from the durable registry,
+        // else from the transcript.
         model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
         label: rec.title.clone(),
         workflow_run_id: rec.workflow_run_id.clone(),
         workflow_role: rec.workflow_role.clone(),

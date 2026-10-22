@@ -1,12 +1,34 @@
-# Explicit model choice
+# Explicit model and effort
 
-CM never leaves a session on its engine's own default model. Every Claude or
-Codex spawn names its model in the argv (`claude --model <id>`, `codex -m <id>`),
+CM never leaves a session on its engine's own default model or reasoning
+effort. Every Claude or Codex spawn names both in the argv (`claude --model
+<id> --effort <level>`, `codex -m <id> -c model_reasoning_effort="<level>"`),
 including fresh starts, resumes, `A-R` revive/restart, startup restore, forks,
 continuous orchestrators and workers, workflow roles, and MCP
 `start_session` / `create_subtask`. The daemon's `start_session` refuses an
-agent spawn that names no model; a viewer older than the daemon gets that
-refusal and must be updated. Bash sessions have no model.
+agent spawn that names no model or no effort; a viewer older than the daemon
+gets that refusal and must be updated. Bash sessions have neither.
+
+Effort works exactly like the model: the same resolution order, recorded on
+the session the same way, shown beside it, and set the same ways. The
+sections below name the model; each applies to the effort too.
+
+## Effort levels
+
+| CM level | Claude (`--effort`) | Codex (`-c model_reasoning_effort=`) |
+|---|---|---|
+| `low` | `low` | `low` |
+| `medium` | `medium` | `medium` |
+| `high` | `high` | `high` |
+| `xhigh` (default) | `xhigh` | `xhigh` |
+| `max` | `max` | refused: codex has no `max` |
+
+Levels are case-insensitive on input and stored lowercase. A Codex spawn also
+carries the level to the CM-owned app-server: `native_codex` passes the `-c`
+override to both the frontend and the backend and sets
+`config.model_reasoning_effort` on every thread start, resume and fork, so a
+thread never falls back to `~/.codex/config.toml`'s `model_reasoning_effort`
+(per-spawn flags override that file, which stays as it is).
 
 ## Defaults: `[models]`
 
@@ -21,6 +43,8 @@ claude = "claude-opus-5-5"          # default for claude sessions (full id, not 
 codex = "gpt-6.1-sol"               # default for codex sessions (codex-lb)
 claude_choices = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
 codex_choices = ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"]
+claude_effort = "xhigh"             # default effort for claude sessions
+codex_effort = "xhigh"              # default effort for codex sessions (no "max")
 ```
 
 Every value is checked when the config loads, so a bad entry fails the load,
@@ -28,41 +52,66 @@ not a later spawn. `gpt-6-luna` is the cheap Codex option.
 
 ## Resolution
 
-1. **Explicit**: MCP `model=` on `start_session`, `fork_session`; a TUI form's
-   edited Model field.
-2. **Task default**: `metadata.models.<claude|codex>` on the task, else on the
-   nearest ancestor that sets one (subtasks inherit).
+1. **Explicit**: MCP `model=` / `effort=` on `start_session`, `fork_session`;
+   a TUI form's edited Model or Effort.
+2. **Task default**: `metadata.models.<claude|codex>` (effort:
+   `metadata.efforts.<claude|codex>`) on the task, else on the nearest
+   ancestor that sets one (subtasks inherit).
 3. **Engine default** from `[models]`.
 
-A respawn of an existing session (revive, resume, restore, workflow `fresh`
-activation, continuous re-fire) reuses the model recorded on the session.
-Sessions adopted across a brain restart that predate recording re-resolve
-through the same order.
+A respawn of an existing session (revive, resume, restore, fork, workflow
+`fresh` activation, continuous re-fire) reuses the value recorded on the
+session. A session that predates recording (adopted across a brain restart,
+restored from an old manifest) takes what its transcript last ran on —
+Claude's assistant entries carry `message.model` and `effort`, Codex's
+`turn_context` carries `payload.model` and `payload.effort` — else the task or
+engine default, reported as `default_on_resume` because the conversation may
+have run something else. The task lookup is bounded: restore prefetches task
+defaults concurrently with a 5 s budget, then falls back to `[models]`.
 
-The resolved model is recorded on the session and shown in `list_sessions`
-(`model`, plus `model_source` = `explicit` / `task` / `recorded` /
-`engine_default` on spawn results), the `A-i` peek and the F6 info pane.
+The resolved values are recorded on the session and shown in `list_sessions`
+(`model` / `model_source`, `effort` / `effort_source`; sources are `explicit`,
+`task`, `recorded`, `engine_default`, `transcript`, `default_on_resume`), the
+`A-i` peek and the F6 info pane. The `A-i` peek on a task shows its resolved
+Models and Efforts per engine.
 
 ## Setting a task's default
 
-- MCP: `propose_task(model=..., model_engine=...)` and
-  `create_subtask(model=..., model_engine=...)` store the default for one
-  engine (`model_engine` defaults to the caller's own engine).
-- API: `POST /tasks/{id}/model {"engine": "codex", "model": "gpt-6-luna"}`;
-  `"model": null` clears it. `GET /tasks/{id}/model?engine=codex` returns the
-  inherited value. Never PATCH `metadata` for this; PATCH replaces the whole bag.
-- TUI: `A-e` on a task has Claude and Codex rows. Empty means inherit, and the
-  row shows what it inherits.
-- Continuous tasks: `continuous.create` / `continuous.update` take `model`
-  (`""` clears it). Workflow roles take an optional `model` in the TOML.
+- MCP: `propose_task(model=, effort=, model_engine=)` and
+  `create_subtask(model=, effort=, model_engine=)` store the defaults for one
+  engine slot: `model_engine` if given, else the engine the model id names
+  (`claude-*` → claude; `gpt-*`, `luna`, `sol`, `astra` → codex). An id that
+  names no engine, or an effort without a model, needs `model_engine`; a
+  model that contradicts `model_engine` is refused.
+- API: `POST /tasks/{id}/model {"engine": "codex", "model": "gpt-6-luna",
+  "effort": "medium"}` sets either or both; a field sent as `null` clears it
+  and an absent field is left alone. `GET /tasks/{id}/model?engine=codex`
+  returns the inherited values. Never PATCH `metadata` for this; PATCH
+  replaces the whole bag.
+- TUI: `A-e` on a task has Claude and Codex rows, each with its Effort
+  (Shift+←/→). Empty means inherit, and the row shows what it inherits.
+- Continuous tasks: `continuous.create` / `continuous.update` take `model` and
+  `effort` (`""` clears). Workflow roles take optional `model` and `effort` in
+  the TOML; `start_workflow` takes `role_models` / `role_efforts`.
+
+## Cloud workers
+
+Dispatch passes the task's own Claude model and effort to a worker VM as
+instance metadata (`claude-model` / `claude-effort`, else `CM_WORKER_CLAUDE_MODEL` / `CM_WORKER_CLAUDE_EFFORT`, default `claude-opus-5-5` / `xhigh`),
+and `worker/startup.sh` launches `claude --model … --effort …`; a resumed
+worker keeps what its transcript ran on unless the task names a value. Warm
+pool workers start Claude before a task is assigned, so they always run the
+configured worker default, not the task's.
 
 ## TUI forms
 
 `A-n`, `A-s`, `A-F` and the `A-f` launch dialogs have a Model row prefilled
-with the task default, else the engine default (shown dimmed with its origin).
-On the row, ←/→ cycle the presets and typing edits freely; in the `A-f`
-dialogs, Alt+o cycles the presets. An untouched prefill sends no explicit
-model, so the spawn resolves it again on the host. A new subtask under
+with the task default, else the engine default (shown dimmed with its origin),
+and the Effort on the same row. On the row, ←/→ cycle the model presets,
+typing edits the model freely, and Shift+←/→ step the effort (no wrap); in
+the `A-f` dialogs, Alt+o cycles the presets. An untouched prefill sends no
+explicit value, so the spawn resolves it again on the host. A fork's row
+starts from the source session's recorded values. A new subtask under
 "Reports to" still picks up its parent's default.
 
 ## Validation and unknown models

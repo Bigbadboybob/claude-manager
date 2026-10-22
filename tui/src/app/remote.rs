@@ -224,6 +224,9 @@ impl App {
     ) -> TerminalSession {
         TerminalSession {
             model: entry.model.clone(),
+            model_source: entry.model_source.clone(),
+            effort: entry.effort.clone(),
+            effort_source: entry.effort_source.clone(),
             color: entry.color.clone(),
             uid: entry.uid.clone(),
             label: entry.label.clone(),
@@ -1718,6 +1721,9 @@ mod remote_reconnect_tests {
     ) -> TerminalSession {
         TerminalSession {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: uid.into(),
             label: "claude".into(),
@@ -2194,6 +2200,9 @@ mod remote_reconnect_tests {
         assert!(rendered.contains("(no session)"), "sessionless row must actually render");
         let summary = crate::client_session::DaemonSessionSummary {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             session_uid: "orch-new".into(), label: "orchestrator".into(), session_type: "codex".into(),
             managed_by_uid: None, workspace_id: Some("orch-ws".into()), task_id: Some("orch-task".into()),
             workflow_run_id: None, workflow_role: None, worktree_path: None,
@@ -2757,7 +2766,8 @@ mod remote_reconnect_tests {
         app.workspaces.push(ws);
 
         app.launch_into_workspace(
-            "ws-mgr", "task-1", "Title", "https://repo", "proj", "do x", None, "claude", None,
+            "ws-mgr", "task-1", "Title", "https:,
+            None,//repo", "proj", "do x", None, "claude", None, None,
         );
 
         let (msg, _) = app.status_msg.clone().expect("a status message was set");
@@ -4202,6 +4212,9 @@ mod remote_reconnect_tests {
         ) -> crate::client_session::ClientSessionConfig<'a> {
             crate::client_session::ClientSessionConfig {
                 model: None,
+                model_source: None,
+                effort: None,
+                effort_source: None,
                 daemon_socket: sock,
                 operator_token_id: crate::daemon_launch::operator_token(),
                 uid,

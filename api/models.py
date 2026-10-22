@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class TaskCreate(BaseModel):
@@ -72,24 +72,53 @@ MODEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._\-:/@+\[\]]{0,127}$"
 MODEL_ENGINES = ("claude", "codex")
 
 
-class TaskModelUpdate(BaseModel):
-    """Set (or with null, clear) a task's default model for one engine.
+# CM's effort levels (daemon/src/models.rs::EFFORTS); codex has no "max".
+EFFORT_PATTERN = r"^(low|medium|high|xhigh|max)$"
 
-    Stored at ``metadata.models.<engine>``; subtasks inherit it.
+
+def _strip_or_none(value):
+    """Trim a string field; an emptied one means "clear" (None)."""
+    if isinstance(value, str):
+        return value.strip() or None
+    return value
+
+
+class TaskModelUpdate(BaseModel):
+    """Set (or with null, clear) a task's default model and/or effort for
+    one engine.
+
+    Stored at ``metadata.models.<engine>`` / ``metadata.efforts.<engine>``;
+    subtasks inherit them. Only the fields sent are touched, so
+    ``{"engine": "codex", "effort": "high"}`` keeps the codex model.
     """
 
     engine: str = Field(pattern=r"^(claude|codex)$")
     model: str | None = Field(default=None, pattern=MODEL_PATTERN)
+    effort: str | None = Field(default=None, pattern=EFFORT_PATTERN)
+
+    @field_validator("model", "effort", mode="before")
+    @classmethod
+    def _trim(cls, value):
+        return _strip_or_none(value)
+
+    @field_validator("effort")
+    @classmethod
+    def _codex_has_no_max(cls, value, info):
+        if value == "max" and info.data.get("engine") == "codex":
+            raise ValueError("codex has no max effort; its highest is xhigh")
+        return value
 
 
 class TaskModelResolution(BaseModel):
-    """The default model a task's sessions get for one engine."""
+    """The default model and effort a task's sessions get for one engine."""
 
     engine: str
     # None: neither the task nor any ancestor sets one (use the engine default).
     model: str | None = None
     # The task (this one or an ancestor) whose metadata supplied ``model``.
     source_task_id: str | None = None
+    effort: str | None = None
+    effort_source_task_id: str | None = None
 
 
 class TaskLeadUpdate(BaseModel):

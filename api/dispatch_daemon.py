@@ -536,6 +536,7 @@ def _launch_worker_sync(task, branch):
         repo_branch=branch,
         prompt=task["prompt"],
         manager_callback_url=MANAGER_URL,
+        task_metadata=task.get("metadata"),
     )
 
 
@@ -545,7 +546,7 @@ def _launch_warm_vm_sync(wp, vm_name):
     The caller pre-generates ``vm_name`` and persists the warm_vms row so
     concurrent dispatchers can't race on the same instance name.
     """
-    from dispatch.vm import launch_worker
+    from dispatch.vm import claude_launch_metadata, launch_worker
     from pathlib import Path
 
     warm_startup = (Path(__file__).parent.parent / "worker" / "warm_startup.sh").read_text()
@@ -581,6 +582,7 @@ def _launch_warm_vm_sync(wp, vm_name):
             compute_v1.Items(key="manager-callback-url", value=MANAGER_URL),
             compute_v1.Items(key="api-token", value=API_TOKEN),
             compute_v1.Items(key="pool-id", value=str(wp["id"])),
+            *(compute_v1.Items(key=k, value=v) for k, v in claude_launch_metadata(None).items()),
         ]),
         service_accounts=[compute_v1.ServiceAccount(
             email="default",

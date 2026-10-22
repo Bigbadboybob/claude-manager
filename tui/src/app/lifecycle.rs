@@ -50,6 +50,9 @@ pub(crate) fn remote_revive_entry(
 ) -> cm_daemon::manifest::ManifestEntry {
     let mut entry = tomb.entry.clone().unwrap_or_else(|| cm_daemon::manifest::ManifestEntry {
         model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
         transcript_path: None,
         reported_done_at: None,
         report_reason: None,
@@ -171,6 +174,9 @@ pub(crate) fn attach_via_daemon(
     let operator_token_id = host_pool.operator_token_for(host_id);
     let cs_config = crate::client_session::ClientSessionConfig {
         model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
         daemon_socket: &daemon_socket,
         operator_token_id: &operator_token_id,
         uid: session_uid,
@@ -359,6 +365,12 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
     // model, or the task default). `None` takes the configured engine
     // default: CM never leaves the model to the engine.
     model: Option<&str>,
+    // Where `model` came from (`ModelSource::as_str`), recorded with it.
+    model_source: Option<&str>,
+    // The reasoning effort and its source, like `model`. `None` takes the
+    // configured default.
+    effort: Option<&str>,
+    effort_source: Option<&str>,
 ) -> Option<anyhow::Result<Session>> {
     // 10f: daemon-eligibility is now driven solely by
     // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
@@ -388,6 +400,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
         _ => None,
     };
     let resolved_model = spawn_model(internal_session_type, model);
+    let resolved_effort = spawn_effort(internal_session_type, effort);
     let argv_result = match internal_session_type {
         "claude" => crate::mcp_config::build_args(
             crate::mcp_config::SpawnTarget::Daemon,
@@ -396,6 +409,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
             workflow_meta.clone(),
             resume_session_id,
             resolved_model.as_deref().unwrap_or_default(),
+            resolved_effort.as_deref().unwrap_or_default(),
         ),
         "codex" => crate::mcp_config::build_args(
             crate::mcp_config::SpawnTarget::Daemon,
@@ -404,6 +418,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
             workflow_meta.clone(),
             resume_session_id,
             resolved_model.as_deref().unwrap_or_default(),
+            resolved_effort.as_deref().unwrap_or_default(),
         ),
         "bash" => Ok(("/bin/bash".to_string(), Vec::new())),
         _ => return None,
@@ -518,8 +533,32 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
         workflow_role,
         global_perms,
         model: resolved_model.as_deref(),
+        model_source: match (model, resolved_model.is_some()) {
+            (_, false) => None,
+            (Some(_), true) => model_source,
+            (None, true) => Some(cm_daemon::models::ModelSource::Engine.as_str()),
+        },
+        effort: resolved_effort.as_deref(),
+        effort_source: match (effort, resolved_effort.is_some()) {
+            (_, false) => None,
+            (Some(_), true) => effort_source,
+            (None, true) => Some(cm_daemon::models::ModelSource::Engine.as_str()),
+        },
     };
     Some(crate::session::Session::new_attached(cs_config))
+}
+
+/// The effort a TUI spawn of `session_type` runs: the caller's choice,
+/// else the configured default. `None` for bash.
+pub(crate) fn spawn_effort(session_type: &str, chosen: Option<&str>) -> Option<String> {
+    let engine = normalize_session_type_to_internal(session_type);
+    if !cm_daemon::models::takes_model(engine) {
+        return None;
+    }
+    match chosen.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => Some(e.to_ascii_lowercase()),
+        None => cm_daemon::models::default_effort(engine),
+    }
 }
 
 /// The model a TUI spawn of `session_type` runs: the caller's choice, else
@@ -537,31 +576,54 @@ pub(crate) fn spawn_model(session_type: &str, chosen: Option<&str>) -> Option<St
 }
 
 impl App {
-    /// The task's default model for `session_type` from the planning rows
-    /// (its own, else inherited from its nearest ancestor).
-    pub(crate) fn task_default_model(&self, task_id: &str, session_type: &str) -> Option<String> {
+    /// The task's default model or effort for `session_type` (its own,
+    /// else inherited from its nearest ancestor).
+    pub(crate) fn task_default(
+        &self,
+        task_id: &str,
+        session_type: &str,
+        setting: cm_daemon::models::Setting,
+    ) -> Option<String> {
         let engine = normalize_session_type_to_internal(session_type);
-        self.planning.task_model(task_id, engine).map(|(m, _)| m)
+        self.planning.task_default(task_id, engine, setting).map(|(v, _)| v)
     }
 
     /// The A-e task form's model slots: the task's own defaults, and what
     /// each would inherit (its parent's, else the engine default).
     pub(super) fn task_models_edit(&self, task_id: &str) -> super::model_field::TaskModelsEdit {
-        let own = self.planning.task_own_models(task_id);
+        use cm_daemon::models::Setting;
+        let own = self.planning.task_own(task_id, Setting::Model);
+        let own_efforts = self.planning.task_own(task_id, Setting::Effort);
         let parent = self.planning.task_parent_id(task_id);
         let engines = super::model_field::TASK_MODEL_ENGINES;
-        super::model_field::TaskModelsEdit::new(
+        super::model_field::TaskModelsEdit::with_efforts(
             engines.map(|e| own.get(e).cloned()),
-            engines.map(|e| parent.as_deref().and_then(|p| self.task_default_model(p, e))),
+            engines.map(|e| parent.as_deref().and_then(|p| self.task_default(p, e, Setting::Model))),
+            engines.map(|e| own_efforts.get(e).cloned()),
+            engines.map(|e| parent.as_deref().and_then(|p| self.task_default(p, e, Setting::Effort))),
         )
     }
 
-    /// The task's inherited default per engine, for prefilling a Model field.
-    pub(crate) fn task_models(&self, task_id: &str) -> std::collections::BTreeMap<String, String> {
+    /// The task's inherited default model or effort per engine.
+    pub(crate) fn task_defaults(
+        &self,
+        task_id: &str,
+        setting: cm_daemon::models::Setting,
+    ) -> std::collections::BTreeMap<String, String> {
         ["claude", "codex"]
             .into_iter()
-            .filter_map(|e| Some((e.to_string(), self.task_default_model(task_id, e)?)))
+            .filter_map(|e| Some((e.to_string(), self.task_default(task_id, e, setting)?)))
             .collect()
+    }
+
+    /// A Model field (with its Effort) prefilled from the task's defaults.
+    pub(crate) fn model_field_for_task(&self, session_type: &str, task_id: Option<&str>) -> super::model_field::ModelField {
+        use cm_daemon::models::Setting;
+        super::model_field::ModelField::for_task(
+            session_type,
+            task_id.map(|t| self.task_defaults(t, Setting::Model)).unwrap_or_default(),
+            task_id.map(|t| self.task_defaults(t, Setting::Effort)).unwrap_or_default(),
+        )
     }
 
     /// Slice 10c-e-3: opt-in daemon spawn branch.
@@ -647,12 +709,15 @@ impl App {
         // Explicit or recorded model; `None` = this task's default
         // (inherited through its parents), else the engine default.
         model: Option<&str>,
+        // Explicit or recorded effort, resolved the same way.
+        effort: Option<&str>,
     ) -> Option<anyhow::Result<Session>> {
-        let task_model = match model {
-            Some(_) => None,
-            None => task_id.and_then(|t| self.task_default_model(t, session_type)),
-        };
-        let model = model.or(task_model.as_deref());
+        use cm_daemon::models::Setting;
+        let resume = resume_session_id.map(|id| (worktree_path, transcript_path, id));
+        let (model, model_source) = self.pick_spawn_setting(Setting::Model, session_type, model, task_id, resume);
+        let (effort, effort_source) = self.pick_spawn_setting(Setting::Effort, session_type, effort, task_id, resume);
+        let model = model.as_deref();
+        let effort = effort.as_deref();
         // migrate-tui-local: thin wrapper around the free
         // `try_spawn_via_daemon_with_deps` helper so workflow
         // respawn paths (which don't have `&App`) can share the
@@ -677,7 +742,52 @@ impl App {
             transcript_path,
             global_perms,
             model,
+            model_source,
+            effort,
+            effort_source,
         )
+    }
+
+    /// Resolve a TUI-composed spawn's model and where it came from: the
+    /// caller's model (`explicit` for a new spawn, `recorded` for a
+    /// resume) → when resuming, the model the conversation's transcript
+    /// names (`transcript`) → the task default (inherited) → the engine
+    /// default. A resume that falls back to a default is
+    /// `default_on_resume`: the conversation may have run another model.
+    /// The effort resolves the same way.
+    pub(crate) fn pick_spawn_setting(
+        &self,
+        setting: cm_daemon::models::Setting,
+        session_type: &str,
+        given: Option<&str>,
+        task_id: Option<&str>,
+        resume: Option<(&Path, Option<&str>, &str)>,
+    ) -> (Option<String>, Option<&'static str>) {
+        use cm_daemon::models::{ModelSource, Setting};
+        let engine = normalize_session_type_to_internal(session_type);
+        if !cm_daemon::models::takes_model(engine) {
+            return (None, None);
+        }
+        if let Some(m) = given.map(str::trim).filter(|m| !m.is_empty()) {
+            let src = if resume.is_some() { ModelSource::Recorded } else { ModelSource::Explicit };
+            return (Some(m.to_string()), Some(src.as_str()));
+        }
+        if let Some((worktree, path, id)) = resume {
+            let file = cm_daemon::models::session_transcript(engine, Some(worktree), path, Some(id));
+            if let Some(m) = file.and_then(|f| setting.from_transcript(engine, &f)) {
+                return (Some(m), Some(ModelSource::Transcript.as_str()));
+            }
+        }
+        let config_default = match setting {
+            Setting::Model => cm_daemon::models::default_model(engine),
+            Setting::Effort => cm_daemon::models::default_effort(engine),
+        };
+        let (m, src) = match task_id.and_then(|t| self.task_default(t, session_type, setting)) {
+            Some(m) => (Some(m), ModelSource::Task),
+            None => (config_default, ModelSource::Engine),
+        };
+        let src = if resume.is_some() { ModelSource::DefaultOnResume } else { src };
+        (m, Some(src.as_str()))
     }
 
     /// List all .jsonl file stems in the Claude project directory for a worktree.
@@ -1013,6 +1123,7 @@ impl App {
                         pre_spawn_transcript.as_deref(),
                         false, // global_perms
                         tomb.entry.as_ref().and_then(|e| e.model.as_deref()),
+                        tomb.entry.as_ref().and_then(|e| e.effort.as_deref()),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => {
@@ -1213,6 +1324,7 @@ impl App {
             let label = tomb.label.clone();
             let task_id = tomb.task_id.clone();
             let tomb_model = tomb.entry.as_ref().and_then(|e| e.model.clone());
+            let tomb_effort = tomb.entry.as_ref().and_then(|e| e.effort.clone());
 
             let Some(wt_path) = worktree_path.as_deref() else {
                 // No worktree — can't daemon-spawn. Leave tombstone
@@ -1248,6 +1360,7 @@ impl App {
                 pre_spawn_transcript.as_deref(),
                 false, // global_perms
                 tomb_model.as_deref(),
+                tomb_effort.as_deref(),
             ) {
                 Some(Ok(s)) => {
                     let mut ts = make_simple_session_with_uid(
@@ -1378,10 +1491,8 @@ impl App {
         // by submit time.
         let workspace_id = self.workspaces[wi].id.clone();
         self.session_form_host = Some(self.workspaces[wi].host_id.clone());
-        self.form_model = super::model_field::ModelField::for_task(
-            LaunchEngine::default().as_session_type(),
-            task_id.as_deref().map(|t| self.task_models(t)).unwrap_or_default(),
-        );
+        self.form_model =
+            self.model_field_for_task(LaunchEngine::default().as_session_type(), task_id.as_deref());
         self.input_mode = InputMode::NewTerminalSession {
             workspace_id,
             session_type: LaunchEngine::default().as_session_type().to_string(),
@@ -2054,6 +2165,7 @@ impl App {
         in_place: bool,
         // The form's explicit Model; `None` = engine default.
         model: Option<&str>,
+        effort: Option<&str>,
     ) {
         // Host-picker (A-n): the host is now an explicit per-A-n choice on the
         // form (defaulting to `active_host`), passed in as `chosen_host` —
@@ -2083,7 +2195,7 @@ impl App {
                 idle_timeout_secs,
                 seed_from,
                 in_place,
-                model,
+                model, effort,
             );
             return;
         }
@@ -2208,8 +2320,9 @@ impl App {
             None,
             &active_host,
             pre_spawn_transcript.as_deref(),
-            false,
-            model, // global_perms
+            false, // global_perms
+            model,
+            effort,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -2237,6 +2350,9 @@ impl App {
 
         let ts = TerminalSession {
             model: s.spawn_model.clone(),
+            model_source: s.spawn_model_source.clone(),
+            effort: s.spawn_effort.clone(),
+            effort_source: s.spawn_effort_source.clone(),
             color: None,
             uid: session_uid,
             label: session_type.to_string(),
@@ -2345,6 +2461,7 @@ impl App {
         seed_from: Option<&str>,
         in_place: bool,
         model: Option<&str>,
+        effort: Option<&str>,
     ) {
         let slug = worktree::slugify(label);
         if slug.is_empty() {
@@ -2369,7 +2486,7 @@ impl App {
             uid: new_session_uid(),
             workspace_id: new_workspace_id(),
             section,
-            model: model.map(str::to_owned),
+            model: model.map(str::to_owned), effort: effort.map(str::to_owned),
         });
     }
 
@@ -2620,6 +2737,7 @@ impl App {
                     None,
                     false, // global_perms
                     None,
+                    None,
                 ) {
                     Some(Ok(s)) => Some(make_simple_session_with_uid(
                         session_uid,
@@ -2794,6 +2912,7 @@ impl App {
         resume_from: Option<&str>,
         // The form's Model field; `None` = task default, else engine default.
         model: Option<&str>,
+        effort: Option<&str>,
     ) {
         // Host is a property of the WORKSPACE, not the global active_host
         // (which only seeds NEW workspaces). The spawn host is resolved and
@@ -2873,7 +2992,7 @@ impl App {
                 task_id,
                 seed_from,
                 resume_from,
-                model,
+                model, effort,
             );
             return;
         }
@@ -2988,8 +3107,9 @@ impl App {
             None,
             &spawn_host,
             pre_spawn_transcript.as_deref(),
-            false,
-            model, // global_perms
+            false, // global_perms
+            model,
+            effort,
         ) {
             Some(Ok(s)) => Ok(s),
             Some(Err(e)) => {
@@ -3092,6 +3212,7 @@ impl App {
         seed_from: Option<&str>,
         resume_from: Option<&str>,
         model: Option<&str>,
+        effort: Option<&str>,
     ) {
         // An unconfigured host fails now. Warming its tunnel, the add RPC
         // and the attach run on a worker (`restart.rs`): over a slow link
@@ -3109,7 +3230,7 @@ impl App {
             task_id,
             seed_from: seed_from.map(str::to_owned),
             resume_from: resume_from.map(str::to_owned),
-            model: model.map(str::to_owned),
+            model: model.map(str::to_owned), effort: effort.map(str::to_owned),
             cols,
             rows,
         });
@@ -3171,6 +3292,9 @@ impl App {
             ts.seeded_from_snapshot = job.seed_from.clone();
             ts.host_id = host.clone();
             ts.model = res.model.clone();
+            ts.model_source = res.model_source.clone();
+            ts.effort = res.effort.clone();
+            ts.effort_source = res.effort_source.clone();
             ts
         };
         self.workspaces[ws_index].is_closed = false;
@@ -3619,6 +3743,7 @@ impl App {
         // The dialog's explicit Model; `None` = the task default, else the
         // engine default.
         model: Option<&str>,
+        effort: Option<&str>,
     ) {
         let active_host = chosen_host.clone();
         let repo_url = match self.config.repos.get(project) {
@@ -3637,7 +3762,7 @@ impl App {
             in_place, engine: engine.into(), host: active_host.clone(),
             repo_url: repo_url.clone(), uid: session_uid.clone(),
             workspace_id: workspace_id_pre.clone(), start_branch: start_branch.map(str::to_owned),
-            model: model.map(str::to_owned),
+            model: model.map(str::to_owned), effort: effort.map(str::to_owned),
         };
         if active_host != cm_daemon::host_id::HostId::local() {
             self.start_remote_plan_launch(spec);
@@ -3707,6 +3832,7 @@ impl App {
             None,
             false, // global_perms
             model,
+            effort,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -3728,7 +3854,7 @@ impl App {
             session: new_sess,
             pending: Some(pending),
             remote_branch: None,
-            model: None,
+            model: None, effort: None,
         });
     }
 
@@ -3738,7 +3864,7 @@ impl App {
         prepared: super::plan_launch::PreparedPlanLaunch,
     ) {
         let super::plan_launch::PreparedPlanLaunch {
-            main_repo, worktree_path, session: new_sess, pending, remote_branch, model,
+            main_repo, worktree_path, session: new_sess, pending, remote_branch, model, effort,
         } = prepared;
         let project = spec.project.as_str();
         let slug = spec.slug.as_str();
@@ -3775,6 +3901,9 @@ impl App {
         ts.host_id = active_host.clone();
         if model.is_some() {
             ts.model = model;
+        }
+        if effort.is_some() {
+            ts.effort = effort;
         }
         if !prompt.trim().is_empty() {
             ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
@@ -3895,8 +4024,9 @@ impl App {
         engine: &str,
         seed_from: Option<&str>,
         then: Option<Box<dyn FnOnce(&mut App, String) + Send>>,
-        // Explicit model; `None` = the host's engine default.
+        // Explicit model and effort; `None` = the host's defaults.
         model: Option<&str>,
+        effort: Option<&str>,
     ) {
         let Some(source) = self.workspaces.iter().find(|ws| ws.id == source_id) else { return };
         let Some(repo) = source.repo_url.clone() else {
@@ -3913,6 +4043,7 @@ impl App {
         let engine = engine.to_owned();
         let seed_from = seed_from.map(str::to_owned);
         let model = model.map(str::to_owned);
+        let effort = effort.map(str::to_owned);
         let started = self.run_in_background(Some(format!("new_workspace:{source_id}:{host}")), move || {
             let fail = |msg: String| -> super::background::Apply { Box::new(move |app: &mut App| app.set_status_msg(&msg)) };
             let Some(socket) = pool.live_socket_path(&host) else {
@@ -3921,7 +4052,8 @@ impl App {
             let token = pool.operator_token_for(&host);
             let result = match crate::client_session::rpc_create_session_with_options(&socket, &token,
                 &uid, &ws_id, &engine, if engine == "claude" { "claude-code" } else { &engine },
-                &repo, None, &slug, None, cols, rows, false, seed_from.as_deref(), model.as_deref()) {
+                &repo, None, &slug, None, cols, rows, false, seed_from.as_deref(), model.as_deref(),
+                effort.as_deref()) {
                 Ok(result) => result,
                 Err(e) => return fail(format!("New workspace: {}", e)),
             };
@@ -3939,6 +4071,9 @@ impl App {
                 ts.host_id = host.clone();
                 ts.seeded_from_snapshot = seed_from;
                 ts.model = result.model;
+                ts.model_source = result.model_source;
+                ts.effort = result.effort;
+                ts.effort_source = result.effort_source;
                 if engine == "claude" { ts.transcript_id = result.resume_id; }
                 let wi = app.workspaces.len();
                 app.workspaces.push(Workspace {
@@ -4009,6 +4144,7 @@ impl App {
         engine: &str,
         // The dialog's explicit Model; `None` = task default, else engine default.
         model: Option<&str>,
+        effort: Option<&str>,
     ) {
         // Planning A-l into an existing workspace → use THAT workspace's host
         // (not the global active_host — the old read mistagged a session when
@@ -4068,6 +4204,7 @@ impl App {
             None,
             false, // global_perms
             model,
+            effort,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -5595,6 +5732,7 @@ mod slice_12e_tests {
             None,
             false,
             None,
+            None,
         );
         match result {
             Err(e) => {
@@ -5888,6 +6026,9 @@ mod slice_12e_tests {
         let mut workspaces = HashMap::new();
         let local_entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -5916,6 +6057,9 @@ mod slice_12e_tests {
         };
         let remote_entry = ManifestEntry {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6263,7 +6407,8 @@ remote_socket = "/remote/manager.sock"
         let (mut app, tmp) = build_app_with_hosts(&[("local", false), ("manager", true)], &guard);
         app.config.repos.insert("example".into(), "https://github.com/example/example.git".into());
         app.launch_from_plan("example", "fresh-task", "prompt", None, false, "task-1", None,
-            false, "codex", &HostId::new("manager"), None);
+            false, "codex", &HostId::new("manager"), None,
+            None,);
         assert!(app.workspaces.is_empty());
         assert!(!tmp.path().join(".cm/worktrees").exists());
         app.start_new_session();
@@ -8096,6 +8241,9 @@ pub(crate) mod revive_session_tests {
         session.exited = exited;
         TerminalSession {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: uid.into(),
             label: "claude".into(),
@@ -8336,7 +8484,7 @@ pub(crate) mod revive_session_tests {
         let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0e-0");
         let host = app.workspaces[0].host_id.clone();
         let started = Instant::now();
-        app.add_remote_session(&host, 0, "codex", None, None, None, None);
+        app.add_remote_session(&host, 0, "codex", None, None, None, None, None);
         assert!(started.elapsed() < Duration::from_millis(500), "A-s blocked input for {:?}", started.elapsed());
         assert!(status_text(&app).starts_with("Starting codex on `slow`"), "{}", status_text(&app));
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -8416,7 +8564,7 @@ pub(crate) mod revive_session_tests {
         let id = app.workspaces[0].id.clone();
         let host = app.workspaces[0].host_id.clone();
         let started = Instant::now();
-        app.new_workspace_on_host(&id, &host, "bash", None, None, None);
+        app.new_workspace_on_host(&id, &host, "bash", None, None, None, None);
         assert_prompt(started, "new workspace on host");
         assert!(status_text(&app).starts_with("Creating the workspace"), "{}", status_text(&app));
         assert_eq!(app.workspaces.len(), 1, "nothing added until the host answers");

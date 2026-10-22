@@ -115,17 +115,44 @@ def apply_launch_permissions(params, policy):
     return params
 
 
-def apply_launch_model(params, model):
-    """Pin CM's resolved model on a thread start/resume/fork request.
+def apply_launch_model(params, model, effort=None):
+    """Pin CM's resolved model and effort on a thread start/resume/fork.
 
-    CM never leaves a session on Codex's default model; a resumed thread
-    would otherwise keep whatever it was last using.
+    CM never leaves a session on Codex's default model or reasoning
+    effort; a resumed thread would otherwise keep whatever it was last
+    using. The thread RPCs carry no effort field, so the effort rides as
+    the ``model_reasoning_effort`` config override.
     """
-    if not model:
+    if not model and not effort:
         return params
     params = dict(params)
-    params["model"] = model
+    if model:
+        params["model"] = model
+    if effort:
+        config = params.get("config")
+        params["config"] = {
+            **(config if isinstance(config, dict) else {}),
+            "model_reasoning_effort": effort,
+        }
     return params
+
+
+EFFORT_OVERRIDE = "model_reasoning_effort="
+
+
+def launch_effort(args):
+    """The effort a CM Codex argv selects (``-c model_reasoning_effort=``)."""
+    for index, arg in enumerate(args):
+        if arg in ("-c", "--config") and index + 1 < len(args):
+            value = args[index + 1]
+            if value.startswith(EFFORT_OVERRIDE):
+                value = value[len(EFFORT_OVERRIDE):].strip()
+                try:
+                    parsed = json.loads(value)
+                except ValueError:
+                    parsed = value
+                return parsed if isinstance(parsed, str) and parsed else None
+    return None
 
 
 def launch_model(args):
@@ -167,9 +194,12 @@ def selectable(thread):
 class Relay:
     engine = "codex"
 
-    def __init__(self, socket: str, queue: Queue, permissions=None, model=None):
+    def __init__(
+        self, socket: str, queue: Queue, permissions=None, model=None, effort=None
+    ):
         self.socket = socket
         self.launch_model = model
+        self.launch_effort = effort
         self.queue = queue
         self.upstream = None
         self.frontend = None
@@ -660,6 +690,7 @@ class Relay:
                                 message.get("params", {}), self.launch_permissions
                             ),
                             self.launch_model,
+                            self.launch_effort,
                         )
                     self.requests[request_id] = (method, message.get("params", {}))
                     if method in {
@@ -763,6 +794,12 @@ def split_args(args, permissions=None):
         arg = args[index]
         if arg == "-c":
             backend.extend(args[index : index + 2])
+            if args[index + 1 : index + 2] and args[index + 1].startswith(
+                EFFORT_OVERRIDE
+            ):
+                # The frontend sends each turn's effort from its own config:
+                # without the same override it would use ~/.codex/config.toml.
+                frontend.extend(args[index : index + 2])
             index += 2
         elif arg == "--dangerously-bypass-approvals-and-sandbox":
             # Fresh sessions retain CM's launch policy. A remote resume must
@@ -894,7 +931,13 @@ async def launch(args):
                 raise RuntimeError(
                     f"Codex app-server startup timed out; see {log_path}"
                 )
-            relay = Relay(backend_socket, queue, permissions, launch_model(args.codex_args))
+            relay = Relay(
+                backend_socket,
+                queue,
+                permissions,
+                launch_model(args.codex_args),
+                launch_effort(args.codex_args),
+            )
             await relay.connect()
             async with unix_serve(
                 relay.serve_frontend,

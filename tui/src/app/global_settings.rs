@@ -255,6 +255,7 @@ impl GlobalSettings {
 
     /// The `[models]` section: engine default models for TUI-composed
     /// spawns and the Model field's presets.
+    #[cfg(test)]
     pub(super) fn models(&self) -> &cm_daemon::models::ModelConfig {
         &self.models
     }

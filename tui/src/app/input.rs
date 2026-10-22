@@ -497,6 +497,7 @@ pub(crate) enum SubmitAction {
         parent: crate::task_picker::TaskChoice,
         /// Explicit Model field value; `None` = task default, else engine default.
         model: Option<String>,
+        effort: Option<String>,
     },
     CreateLocalSession {
         engine: LaunchEngine,
@@ -515,6 +516,7 @@ pub(crate) enum SubmitAction {
         host_id: cm_daemon::host_id::HostId,
         /// Explicit Model field value; `None` = engine default.
         model: Option<String>,
+        effort: Option<String>,
     },
     SpawnSessionOnWorkspace {
         workspace_id: String,
@@ -527,6 +529,7 @@ pub(crate) enum SubmitAction {
         /// Explicit Model field value; `None` = the recorded model of a
         /// resumed row, else the task default, else the engine default.
         model: Option<String>,
+        effort: Option<String>,
     },
     /// Open the snapshot catalog in picker mode from the A-n form. Carries
     /// the form state so the catalog can re-open the form (with seed_from
@@ -625,6 +628,8 @@ pub(crate) enum SubmitAction {
         lead: Option<Option<String>>,
         /// Changed default models, `(engine, Some(model) | None = clear)`.
         models: Vec<(String, Option<String>)>,
+        /// Changed default efforts, the same shape.
+        efforts: Vec<(String, Option<String>)>,
     },
     EnterWorkflowLaunchConfirm {
         ws_id: String,
@@ -1174,6 +1179,7 @@ pub(crate) fn handle_new_session(
                 Ok(m) => m,
                 Err(e) => return InputOutcome::Status(e),
             };
+            let effort = state.model.effort_value();
             if !state.label_text.trim().is_empty() {
                 // Branch field semantics:
                 //   "."   → in-place: run in the main repo, no worktree/branch.
@@ -1208,7 +1214,7 @@ pub(crate) fn handle_new_session(
                         in_place,
                         host_id: state.host_id.clone(),
                         parent,
-                        model,
+                        model, effort,
                     });
                 }
                 InputOutcome::Submit(SubmitAction::CreateLocalSession {
@@ -1220,7 +1226,7 @@ pub(crate) fn handle_new_session(
                     seed_from: state.seed_from.clone(),
                     in_place,
                     host_id: state.host_id.clone(),
-                    model,
+                    model, effort,
                 })
             } else {
                 // Empty Name field: pre-fix this was a silent no-op (Enter did
@@ -1356,13 +1362,14 @@ pub(crate) fn handle_new_terminal_session(
                 Ok(m) => m,
                 Err(e) => return InputOutcome::Status(e),
             };
+            let effort = state.model.effort_value();
             InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
                 workspace_id: state.workspace_id.to_string(),
                 session_type: state.session_type.clone(),
                 task_id: state.task_id.clone(),
                 seed_from: state.seed_from.clone(),
                 resume_from: state.resume_from.clone(),
-                model,
+                model, effort,
             })
         }
         _ => InputOutcome::Consumed,
@@ -1969,6 +1976,7 @@ pub(crate) fn handle_task_settings(
                 section: state.section.clone(),
                 lead: (state.lead.as_deref() != state.lead_pinned).then(|| state.lead.clone()),
                 models,
+                efforts: state.models.effort_changes(),
             })
         }
         KeyCode::Backspace if *state.active_field == 0 => {
@@ -3137,7 +3145,7 @@ impl App {
                     engine,
                     host_id,
                     reparent,
-                    model,
+                    model, effort,
                 } => {
                     if reparent {
                         self.set_task_parent(&task_id, parent_task_id.as_deref());
@@ -3153,7 +3161,7 @@ impl App {
                         in_place,
                         engine.as_session_type(),
                         &host_id,
-                        model.as_deref(),
+                        model.as_deref(), effort.as_deref(),
                     );
                     return true;
                 }
@@ -3167,7 +3175,7 @@ impl App {
                     parent_task_id,
                     engine,
                     reparent,
-                    model,
+                    model, effort,
                 } => {
                     if reparent {
                         self.set_task_parent(&task_id, parent_task_id.as_deref());
@@ -3181,7 +3189,7 @@ impl App {
                         &prompt,
                         parent_task_id.as_deref(),
                         engine.as_session_type(),
-                        model.as_deref(),
+                        model.as_deref(), effort.as_deref(),
                     );
                     return true;
                 }
@@ -4357,10 +4365,10 @@ impl App {
                 in_place,
                 host_id,
                 parent,
-                model,
+                model, effort,
             } => {
                 self.create_reporting_workspace(
-                    engine, &repo_url, &label, branch, in_place, host_id, parent, model,
+                    engine, &repo_url, &label, branch, in_place, host_id, parent, model, effort,
                 );
             }
             SubmitAction::CreateLocalSession {
@@ -4372,7 +4380,7 @@ impl App {
                 seed_from,
                 in_place,
                 host_id,
-                model,
+                model, effort,
             } => {
                 self.create_local_session(
                     &host_id,
@@ -4383,7 +4391,7 @@ impl App {
                     idle_timeout_secs,
                     seed_from.as_deref(),
                     in_place,
-                    model.as_deref(),
+                    model.as_deref(), effort.as_deref(),
                 );
             }
             SubmitAction::SpawnSessionOnWorkspace {
@@ -4392,10 +4400,10 @@ impl App {
                 task_id,
                 seed_from,
                 resume_from,
-                model,
+                model, effort,
             } => {
                 if let Some(host) = self.alternate_form_host(&workspace_id) {
-                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref(), None, model.as_deref());
+                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref(), None, model.as_deref(), effort.as_deref());
                     return;
                 }
                 self.spawn_session_on_workspace(
@@ -4404,7 +4412,7 @@ impl App {
                     task_id,
                     seed_from.as_deref(),
                     resume_from.as_deref(),
-                    model.as_deref(),
+                    model.as_deref(), effort.as_deref(),
                 );
             }
             SubmitAction::OpenSnapshotPickerForNewSession {
@@ -4572,11 +4580,17 @@ impl App {
                 // emits it.
                 let _ = name;
             }
-            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section, lead, models } => {
+            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section, lead, models, efforts } => {
                 // Each changed default goes through `POST /tasks/{id}/model`,
-                // which touches only `metadata.models.<engine>`.
-                for (engine, model) in models {
-                    self.backend.set_task_model(task_id.clone(), engine, model);
+                // which touches only `metadata.models.<engine>` (or
+                // `metadata.efforts.<engine>`).
+                use cm_daemon::models::Setting;
+                let changed = models
+                    .into_iter()
+                    .map(|c| (Setting::Model, c))
+                    .chain(efforts.into_iter().map(|c| (Setting::Effort, c)));
+                for (setting, (engine, value)) in changed {
+                    self.backend.set_task_default(task_id.clone(), engine, setting, value);
                 }
                 // The lead pin goes through its own endpoint, which changes
                 // only that metadata key. Applied locally at once so the ★
@@ -4645,7 +4659,7 @@ impl App {
                     let launch: Box<dyn FnOnce(&mut App, String) + Send> = Box::new(move |app, new_id| {
                         app.launch_workflow_via_daemon(&new_id, &workflow_name, &slots, goal, None);
                     });
-                    self.new_workspace_on_host(&ws_id, &host, "bash", None, Some(launch), None);
+                    self.new_workspace_on_host(&ws_id, &host, "bash", None, Some(launch), None, None);
                     return;
                 }
 
@@ -4777,6 +4791,9 @@ mod yank_clipboard_tests {
         .expect("session for test");
         TerminalSession {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: "yank-uid".into(),
             label: "yank-test".into(),
@@ -5327,9 +5344,10 @@ mod input_handler_tests {
                 seed_from,
                 in_place,
                 host_id,
-                model,
+                model, effort,
             }) => {
                 assert_eq!(model, None, "an untouched Model field leaves resolution to the spawn");
+                assert_eq!(effort, None, "an untouched Effort leaves resolution to the spawn");
                 assert_eq!(engine, LaunchEngine::Codex);
                 assert_eq!(repo_url, "https://github.com/a/b");
                 assert_eq!(label, "my-task");
@@ -7420,6 +7438,9 @@ mod input_handler_tests {
             .expect("dummy session for fixture");
             out.sessions.push(TerminalSession {
                 model: None,
+                model_source: None,
+                effort: None,
+                effort_source: None,
                 color: None,
                 uid: (*uid).into(),
                 label: (*uid).into(),

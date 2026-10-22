@@ -1109,6 +1109,9 @@ impl App {
     ) -> TerminalSession {
         TerminalSession {
             model: s.model.clone().or_else(|| session.spawn_model.clone()),
+            model_source: s.model_source.clone().or_else(|| session.spawn_model_source.clone()),
+            effort: s.effort.clone().or_else(|| session.spawn_effort.clone()),
+            effort_source: s.effort_source.clone().or_else(|| session.spawn_effort_source.clone()),
             color: None,
             uid: s.session_uid.clone(),
             label: s.label.clone(),
@@ -1153,6 +1156,9 @@ impl App {
     ) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
             model: s.model.clone(),
+            model_source: s.model_source.clone(),
+            effort: s.effort.clone(),
+            effort_source: s.effort_source.clone(),
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -1462,6 +1468,7 @@ impl App {
                         pre_spawn_transcript.as_deref(),
                         entry.global_perms, // global_perms
                         entry.model.as_deref(),
+                        entry.effort.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),
@@ -1493,6 +1500,7 @@ impl App {
                         pre_spawn_transcript.as_deref(),
                         entry.global_perms, // global_perms
                         entry.model.as_deref(),
+                        entry.effort.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),
@@ -1537,6 +1545,9 @@ impl App {
         // fresh one here.
         let ts = TerminalSession {
             model: s.spawn_model.clone().or_else(|| entry.model.clone()),
+            model_source: s.spawn_model_source.clone().or_else(|| entry.model_source.clone()),
+            effort: s.spawn_effort.clone().or_else(|| entry.effort.clone()),
+            effort_source: s.spawn_effort_source.clone().or_else(|| entry.effort_source.clone()),
             color: entry.color.clone(),
             uid: restored_uid,
             label: entry.label.clone(),
@@ -1589,6 +1600,9 @@ mod adopt_daemon_session_tests {
     fn summary(uid: &str, managed_by_uid: Option<&str>) -> DaemonSessionSummary {
         DaemonSessionSummary {
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             session_uid: uid.to_string(),
             label: "w".to_string(),
             session_type: "claude-code".to_string(),

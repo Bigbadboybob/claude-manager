@@ -376,6 +376,17 @@ pub struct ManifestEntry {
     /// sessions recorded before models were.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Where `model` came from ([`crate::models::ModelSource::as_str`]):
+    /// `explicit`, `task`, `engine_default`, `transcript`, … `None` when
+    /// unknown (bash, or recorded before sources were).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default)]
@@ -1031,6 +1042,9 @@ mod tests {
             workflow_role: None,
             continuous_task_id: None,
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -1141,6 +1155,9 @@ mod tests {
             workflow_role: None,
             continuous_task_id: Some("bug-triage".into()),
             model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,

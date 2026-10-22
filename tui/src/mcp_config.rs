@@ -288,11 +288,13 @@ pub fn claude_args(
     mcp_config_path: &Path,
     resume_session_id: Option<&str>,
     model: &str,
+    effort: &str,
     extra: &[String],
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     args.push("--dangerously-skip-permissions".to_string());
     args.extend(cm_daemon::models::model_args("claude-code", model));
+    args.extend(cm_daemon::models::effort_args("claude-code", effort));
     args.push("--mcp-config".to_string());
     args.push(mcp_config_path.to_string_lossy().to_string());
     args.extend(cm_daemon::claude_channels::args(mcp_config_path));
@@ -326,6 +328,7 @@ pub fn codex_args(
     workflow: Option<WorkflowMeta>,
     resume_session_id: Option<&str>,
     model: &str,
+    effort: &str,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     if resume_session_id.is_some() {
@@ -340,6 +343,7 @@ pub fn codex_args(
         cm_daemon::mcp_config::codex_inline_scrollback(),
     ));
     args.extend(cm_daemon::models::model_args("codex", model));
+    args.extend(cm_daemon::models::effort_args("codex", effort));
     // Disable codex's startup update check: when a new version is published,
     // accepting the popup tears down the TUI and exits with "Please restart
     // Codex", which inside our PTY looks like a blank/dead session.
@@ -357,8 +361,9 @@ pub fn codex_args(
 /// spawn path. `target` declares whether this spawn is daemon-side or
 /// TUI-local — see [`SpawnTarget`] for the per-spawn routing rationale.
 ///
-/// `model` is the resolved model (`cm_daemon::models`); every agent argv
-/// names it explicitly, so an invalid one is an `InvalidInput` error.
+/// `model` and `effort` are the resolved values (`cm_daemon::models`);
+/// every agent argv names both explicitly, so an invalid one is an
+/// `InvalidInput` error.
 pub fn build_args(
     target: SpawnTarget,
     engine: &Engine,
@@ -366,18 +371,24 @@ pub fn build_args(
     workflow: Option<WorkflowMeta>,
     resume_session_id: Option<&str>,
     model: &str,
+    effort: &str,
 ) -> std::io::Result<(String, Vec<String>)> {
-    let model = cm_daemon::models::validate_model(model)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let invalid = |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+    let model = cm_daemon::models::validate_model(model).map_err(invalid)?;
+    let session_type = match engine {
+        Engine::ClaudeCode => "claude-code",
+        Engine::Codex => "codex",
+    };
+    let effort = cm_daemon::models::validate_effort(session_type, effort).map_err(invalid)?;
     match engine {
         Engine::ClaudeCode => {
             let cfg = write_claude_mcp_config(target, session_uid, workflow)?;
-            let args = claude_args(&cfg, resume_session_id, &model, &[]);
+            let args = claude_args(&cfg, resume_session_id, &model, &effort, &[]);
             Ok(("claude".to_string(), args))
         }
         Engine::Codex => {
             let env = build_env(target, session_uid, workflow.as_ref());
-            let args = codex_args(target, session_uid, workflow, resume_session_id, &model);
+            let args = codex_args(target, session_uid, workflow, resume_session_id, &model, &effort);
             let server = crate::workflow::spawn::mcp_server_path();
             cm_daemon::mcp_config::native_codex_command(session_uid, &env, args,
                 server.as_deref().and_then(|p| p.to_str()))
@@ -613,7 +624,7 @@ mod tests {
 
     #[test]
     fn codex_args_no_resume_subcommand_when_none() {
-        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None, "test-model");
+        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None, "test-model", "xhigh");
         assert!(!args.iter().any(|a| a == "resume"));
     }
 
@@ -627,7 +638,7 @@ mod tests {
                 run_id: "wf",
                 role: "manager",
             }),
-            Some(sid), "test-model",
+            Some(sid), "test-model", "xhigh",
         );
         assert_eq!(args.first().map(|s| s.as_str()), Some("resume"));
         let sid_pos = args.iter().position(|a| a == sid).unwrap();
@@ -646,7 +657,7 @@ mod tests {
 
     #[test]
     fn codex_args_daemon_resume_inherits_saved_permissions() {
-        let args = codex_args(SpawnTarget::Daemon, "uid-x", None, Some("saved-id"), "test-model");
+        let args = codex_args(SpawnTarget::Daemon, "uid-x", None, Some("saved-id"), "test-model", "xhigh");
         assert_eq!(args.first().map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some("saved-id"));
         assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
@@ -655,9 +666,9 @@ mod tests {
     #[test]
     fn codex_args_launch_inline_for_scrollback_fresh_and_resume() {
         for target in [SpawnTarget::TuiLocal, SpawnTarget::Daemon] {
-            let fresh = codex_args(target, "uid-x", None, None, "test-model");
+            let fresh = codex_args(target, "uid-x", None, None, "test-model", "xhigh");
             assert!(fresh.iter().any(|a| a == "--no-alt-screen"), "{:?}", fresh);
-            let resumed = codex_args(target, "uid-x", None, Some("saved-id"), "test-model");
+            let resumed = codex_args(target, "uid-x", None, Some("saved-id"), "test-model", "xhigh");
             let flag = resumed.iter().position(|a| a == "--no-alt-screen").expect("resume inline");
             assert_eq!(resumed.first().map(String::as_str), Some("resume"));
             assert_eq!(resumed.last().map(String::as_str), Some("saved-id"));
@@ -667,7 +678,7 @@ mod tests {
 
     #[test]
     fn codex_args_bypass_trust_prompt() {
-        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None, "test-model");
+        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None, "test-model", "xhigh");
         assert!(args
             .iter()
             .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
@@ -675,7 +686,7 @@ mod tests {
 
     #[test]
     fn codex_args_disable_update_check() {
-        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None, "test-model");
+        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None, "test-model", "xhigh");
         assert!(args
             .windows(2)
             .any(|w| w[0] == "-c" && w[1] == "check_for_update_on_startup=false"));
@@ -683,7 +694,7 @@ mod tests {
 
     #[test]
     fn claude_args_include_mcp_config() {
-        let args = claude_args(Path::new("/tmp/x.json"), None, "test-model", &[]);
+        let args = claude_args(Path::new("/tmp/x.json"), None, "test-model", "xhigh", &[]);
         assert!(args.contains(&"--mcp-config".to_string()));
         assert!(args.contains(&"/tmp/x.json".to_string()));
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
@@ -695,14 +706,14 @@ mod tests {
         let path = dir.path().join("claude.json");
         std::fs::write(&path, r#"{"mcpServers":{"claude-manager":{"env":{"CM_CLAUDE_CHANNEL":"1"}}}}"#).unwrap();
         for resume in [None, Some("saved")] {
-            let args = claude_args(&path, resume, "test-model", &[]);
+            let args = claude_args(&path, resume, "test-model", "xhigh", &[]);
             assert!(args.windows(2).any(|w| w[0] == cm_daemon::claude_channels::FLAG && w[1] == cm_daemon::claude_channels::ENTRY));
         }
     }
 
     #[test]
     fn claude_args_include_resume() {
-        let args = claude_args(Path::new("/tmp/x.json"), Some("sid-123"), "test-model", &[]);
+        let args = claude_args(Path::new("/tmp/x.json"), Some("sid-123"), "test-model", "xhigh", &[]);
         assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-123"));
     }
 
@@ -805,7 +816,7 @@ mod tests {
                 &Engine::ClaudeCode,
                 "uid-parity-cl",
                 None,
-                sid, "test-model",
+                sid, "test-model", "xhigh",
             )
             .expect("build_args local");
             let (daemon_prog, daemon_args) = build_args(
@@ -813,7 +824,7 @@ mod tests {
                 &Engine::ClaudeCode,
                 "uid-parity-cl",
                 None,
-                sid, "test-model",
+                sid, "test-model", "xhigh",
             )
             .expect("build_args daemon");
             assert_eq!(local_prog, daemon_prog, "claude program (resume={:?})", sid);
@@ -842,7 +853,7 @@ mod tests {
             &Engine::Codex,
             "uid-parity-cx",
             None,
-            None, "test-model",
+            None, "test-model", "xhigh",
         )
         .expect("build_args local");
         let (daemon_prog, daemon_args) = build_args(
@@ -850,7 +861,7 @@ mod tests {
             &Engine::Codex,
             "uid-parity-cx",
             None,
-            None, "test-model",
+            None, "test-model", "xhigh",
         )
         .expect("build_args daemon");
         assert_eq!(local_prog, daemon_prog, "codex program");

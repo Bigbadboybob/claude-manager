@@ -434,12 +434,20 @@ impl ApiClient {
     /// `POST /tasks/{id}/model`: set (`Some`) or clear (`None`) the task's
     /// default model for `engine` (`claude` / `codex`), touching only
     /// `metadata.models.<engine>`. Subtasks inherit it.
-    pub fn set_task_model(&self, task_id: &str, engine: &str, model: Option<&str>) -> anyhow::Result<Option<Task>> {
+    /// Set (or with `None`, clear) one of the task's own defaults for
+    /// `engine`; the other setting is left as it is.
+    pub fn set_task_default(
+        &self,
+        task_id: &str,
+        engine: &str,
+        setting: cm_daemon::models::Setting,
+        value: Option<&str>,
+    ) -> anyhow::Result<Option<Task>> {
         let body: serde_json::Value = self
             .agent
             .post(&self.url(&format!("/tasks/{}/model", task_id)))
             .header("Authorization", &self.auth_header())
-            .send_json(serde_json::json!({ "engine": engine, "model": model }))?
+            .send_json(serde_json::json!({ "engine": engine, setting.name(): value }))?
             .body_mut()
             .read_json()?;
         Ok(serde_json::from_value(body).ok())

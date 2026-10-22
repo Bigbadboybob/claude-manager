@@ -1179,7 +1179,11 @@ pub fn run() -> anyhow::Result<()> {
                     // Phase 4g (audit gap 2): the non-spawning half of
                     // restore — see the outcome comment above. The
                     // children are alive; only derived maps are rebuilt.
-                    control::methods::rehydrate_derived_state(&state);
+                    let manifest = control::methods::rehydrate_derived_state(&state);
+                    // The handoff record carries no model: take each
+                    // adopted session's from the registry, else its
+                    // transcript.
+                    control::methods::backfill_session_models(&state, manifest.as_ref());
                 }
                 reexec::HandoffOutcome::TerminalFallback { killed, total } => {
                     eprintln!(

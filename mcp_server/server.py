@@ -1031,6 +1031,7 @@ def propose_task(
     reports_to: str | None = None,
     model: str | None = None,
     model_engine: str | None = None,
+    effort: str | None = None,
 ) -> str:
     """Propose a new task to the project backlog.
 
@@ -1074,7 +1075,13 @@ def propose_task(
             used by its sessions and inherited by its subtasks. Omitted: it
             inherits its parent's, else the engine default.
         model_engine: "claude" or "codex": which engine `model` is for.
-            Defaults to your own engine.
+            Inferred from the model id (claude-* is claude; gpt-*, luna,
+            sol and astra are codex); required when the id doesn't say.
+        effort: Optional default reasoning effort for the task
+            (`metadata.efforts.<engine>`): "low" | "medium" | "high" |
+            "xhigh" | "max" (claude only). Inherited like `model`; the slot
+            is `model_engine`, else the engine `model` names, so an effort
+            alone needs `model_engine`.
     """
     _check_parameter_confusion("description", description)
     _check_parameter_confusion("prompt", prompt)
@@ -1125,6 +1132,8 @@ def propose_task(
             params["reports_to"] = reports_to
         if model and model.strip():
             params["model"] = model.strip()
+        if effort and effort.strip():
+            params["effort"] = effort.strip()
         if model_engine:
             params["model_engine"] = model_engine
         try:
@@ -1137,13 +1146,13 @@ def propose_task(
         client = PlanningClient()
         filer = _caller_filer_context("mcp.propose_task")
         metadata: dict = {"filer": filer}
-        if model and model.strip():
-            engine = model_engine or filer.get("agent")
-            slot = {"claude-code": "claude", "claude": "claude", "codex": "codex"}.get(str(engine))
-            if slot is None:
-                return ('propose_task failed: model_engine must be "claude" or "codex" '
-                        "(your own engine is unknown)")
-            metadata["models"] = {slot: model.strip()}
+        models, efforts, error = _filed_task_defaults(model, effort, model_engine)
+        if error:
+            return f"propose_task failed: {error}"
+        if models:
+            metadata["models"] = models
+        if efforts:
+            metadata["efforts"] = efforts
         parent_task_id = reports_to
         if reports_to and reports_to.strip().lower() == "me":
             parent_task_id = filer.get("task_id")
@@ -1904,6 +1913,7 @@ async def start_session(
     notify_until: str = "turn_end",
     allow_shared_workspace: bool = False,
     model: str | None = None,
+    effort: str | None = None,
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
 
@@ -1987,6 +1997,11 @@ async def start_session(
             leaves the choice to the engine. The result reports `model` and
             `model_source` ("explicit" | "task" | "engine_default"). Not
             valid for bash. An unknown model fails when the engine starts.
+        effort: The worker's reasoning effort: "low" | "medium" | "high" |
+            "xhigh" | "max" (claude only; codex's highest is xhigh).
+            Omitted: the task's default effort, else the host's `[models]`
+            default (xhigh). Reported as `effort` / `effort_source`, like
+            the model. Not valid for bash.
         global_perms: Grant the new session global permissions (it can
             then prompt/read/control ANY session). **Only honored if YOU
             already hold global permissions** (check `ping().global_perms`);
@@ -2138,6 +2153,8 @@ async def start_session(
         params["allow_shared_workspace"] = True
     if model and model.strip():
         params["model"] = model.strip()
+    if effort and effort.strip():
+        params["effort"] = effort.strip()
     # Sub-2c review-2: single-decision binding (restoring the
     # round-8 #2 fix). `resolve_socket_route()` is called ONCE
     # to get both the chosen path AND the route-chose-daemon
@@ -2222,6 +2239,8 @@ async def start_session(
                 "worktree_warning",
                 "model",
                 "model_source",
+                "effort",
+                "effort_source",
             ):
                 if spawn.get(key) is not None and d.get(key) is None:
                     d[key] = spawn[key]
@@ -2306,6 +2325,7 @@ async def fork_session(
     notify_on_done: bool = True,
     notify_until: str = "turn_end",
     model: str | None = None,
+    effort: str | None = None,
 ) -> dict:
     """Fork a Claude or Codex session's conversation into a task.
 
@@ -2337,6 +2357,7 @@ async def fork_session(
             retry with the same key returns the first fork.
         label: Sidebar label for the new session (default: the task name).
         model: The fork's model; omitted = the source session's model.
+        effort: The fork's reasoning effort; omitted = the source's.
         notify_on_done / notify_until: As for `start_session` — with a
             prompt, a self-waking monitor is registered on the fork.
 
@@ -2358,6 +2379,7 @@ async def fork_session(
         ("task_name", task_name), ("task_id", task_id),
         ("parent_task_id", parent_task_id), ("label", label),
         ("model", model.strip() if model else None),
+        ("effort", effort.strip() if effort else None),
     ):
         if value:
             params[key] = value
@@ -4051,6 +4073,7 @@ def create_subtask(
     base: str | None = None,
     model: str | None = None,
     model_engine: str | None = None,
+    effort: str | None = None,
 ) -> dict:
     """Create a subtask under your current task. Creates the task (and,
     in branch mode, its worktree) and STOPS — nothing is running until
@@ -4090,7 +4113,13 @@ def create_subtask(
             `metadata.models.<engine>`); its sessions and its own subtasks
             use it unless a spawn names another. Omitted: it inherits your
             task's default. `model_engine` ("claude" | "codex") picks the
-            slot; it defaults to your own engine.
+            slot; it is inferred from the model id (claude-* is claude;
+            gpt-*, luna, sol and astra are codex) and required when the id
+            doesn't say.
+        effort: Optional default reasoning effort for the subtask
+            (`metadata.efforts.<engine>`): "low" | "medium" | "high" |
+            "xhigh" | "max" (claude only). Same slot rule as `model`; an
+            effort alone needs `model_engine`.
 
     Returns: {"task_id": "<uuid>", "worktree_path": "<absolute path>",
     "base_sha": "<commit sha the checkout sits on, or null>",
@@ -4113,6 +4142,8 @@ def create_subtask(
         params["base"] = base
     if model and model.strip():
         params["model"] = model.strip()
+    if effort and effort.strip():
+        params["effort"] = effort.strip()
     if model_engine:
         params["model_engine"] = model_engine
     result = control_client.call("create_subtask", params)
@@ -4496,6 +4527,74 @@ def _normalize_filer_agent(session_type: str | None) -> str:
         "codex": "codex",
         "bash": "bash",
     }.get((session_type or "").strip().lower(), "unknown")
+
+
+def _infer_model_engine(model: str) -> str | None:
+    """The engine a model id obviously belongs to (mirrors the daemon's
+    ``models::infer_engine`` family rules), else None."""
+    lower = model.strip().lower()
+    words = re.split(r"[-./:@]", lower)
+    first = words[0] if words else ""
+    if lower.startswith("claude") or first in ("opus", "sonnet", "haiku", "fable"):
+        return "claude"
+    o_series = len(first) >= 2 and first[0] == "o" and first[1:].isdigit()
+    if (lower.startswith(("gpt-", "codex")) or o_series
+            or any(w in ("luna", "sol", "astra") for w in words)):
+        return "codex"
+    return None
+
+
+def _task_model_slot(model: str, model_engine: str | None) -> tuple[str | None, str | None]:
+    """The ``metadata.models`` slot for a filed model, or an error: the
+    named ``model_engine`` (refusing an obvious mismatch), else the
+    engine the model id names."""
+    slots = {"claude-code": "claude", "claude": "claude", "codex": "codex"}
+    inferred = _infer_model_engine(model)
+    if model_engine:
+        slot = slots.get(model_engine.strip())
+        if slot is None:
+            return None, f'model_engine must be "claude" or "codex", not {model_engine!r}'
+        if inferred and inferred != slot:
+            return None, f"model '{model}' is a {inferred} model, but model_engine is {slot}"
+        return slot, None
+    if inferred is None:
+        return None, (f"can't tell which engine model '{model}' is for; "
+                      'pass model_engine="claude" or "codex"')
+    return inferred, None
+
+
+# CM's effort levels (daemon/src/models.rs::EFFORT_LEVELS); codex has no max.
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _filed_task_defaults(
+    model: str | None, effort: str | None, model_engine: str | None,
+) -> tuple[dict | None, dict | None, str | None]:
+    """``metadata.models`` / ``metadata.efforts`` for a filed task, or an
+    error (mirrors the daemon's ``filed_task_defaults``): one engine slot,
+    ``model_engine`` else the engine the model names."""
+    model = (model or "").strip() or None
+    effort = (effort or "").strip().lower() or None
+    slot = None
+    models = None
+    if model:
+        slot, error = _task_model_slot(model, model_engine)
+        if error:
+            return None, None, error
+        models = {slot: model}
+    elif model_engine:
+        slot = {"claude-code": "claude", "claude": "claude", "codex": "codex"}.get(model_engine.strip())
+        if slot is None:
+            return None, None, f'model_engine must be "claude" or "codex", not {model_engine!r}'
+    efforts = None
+    if effort:
+        if slot is None:
+            return None, None, 'an effort without a model needs model_engine="claude" or "codex"'
+        if effort not in _EFFORT_LEVELS or (slot == "codex" and effort == "max"):
+            levels = _EFFORT_LEVELS[:4] if slot == "codex" else _EFFORT_LEVELS
+            return None, None, f"effort '{effort}' is not a {slot} level; use one of {', '.join(levels)}"
+        efforts = {slot: effort}
+    return models, efforts, None
 
 
 def _caller_filer_context(submitted_via: str = "mcp.submit_backtest") -> dict:

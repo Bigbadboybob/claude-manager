@@ -193,7 +193,8 @@ pub enum BackendCommand {
     SetTaskModel {
         id: String,
         engine: String,
-        model: Option<String>,
+        setting: cm_daemon::models::Setting,
+        value: Option<String>,
     },
     /// Delete a planning task from the DB.
     DeletePlanTask {
@@ -356,8 +357,14 @@ impl BackendHandle {
         self.try_send_or_warn(BackendCommand::SetTaskLead { id, session_uid, previous }, "set_task_lead");
     }
 
-    pub fn set_task_model(&self, id: String, engine: String, model: Option<String>) {
-        self.try_send_or_warn(BackendCommand::SetTaskModel { id, engine, model }, "set_task_model");
+    pub fn set_task_default(
+        &self,
+        id: String,
+        engine: String,
+        setting: cm_daemon::models::Setting,
+        value: Option<String>,
+    ) {
+        self.try_send_or_warn(BackendCommand::SetTaskModel { id, engine, setting, value }, "set_task_model");
     }
 
     pub fn delete_plan_task(&self, id: String) {
@@ -510,8 +517,8 @@ fn backend_loop(
                     }
                 }
             }
-            Ok(BackendCommand::SetTaskModel { id, engine, model }) => {
-                match client.set_task_model(&id, &engine, model.as_deref()) {
+            Ok(BackendCommand::SetTaskModel { id, engine, setting, value }) => {
+                match client.set_task_default(&id, &engine, setting, value.as_deref()) {
                     Ok(task) => {
                         if let Some(task) = task {
                             let _ = event_tx.send(BackendEvent::PlanTaskUpdated(task));
@@ -520,7 +527,7 @@ fn backend_loop(
                     }
                     Err(e) => {
                         let _ = event_tx.send(BackendEvent::ApiError(format!(
-                            "Task {engine} model not saved: {e}"
+                            "Task {engine} {} not saved: {e}", setting.name()
                         )));
                     }
                 }

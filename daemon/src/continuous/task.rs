@@ -283,6 +283,10 @@ pub struct ContinuousTask {
     /// own through `start_session(model=…)` or their task's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The reasoning effort its orchestrator sessions launch with. `None`
+    /// → the task default → the `[models]` config default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub run_mode: RunMode,
     pub schedule: Schedule,
     #[serde(default)]
@@ -435,6 +439,7 @@ impl ContinuousTask {
         ContinuousTask {
             task_id,
             model: None,
+            effort: None,
             planning_task_id: None,
             messaging: None,
             task_channel: TaskChannelPolicy::Auto,

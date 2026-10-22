@@ -31,7 +31,9 @@ task's default (`metadata.models`, inherited by subtasks), else the host's
 `[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-sol`).
 Give routine, well-specified work a cheaper model (`model="gpt-6-luna"`), and
 set a task default with `create_subtask(model=...)` so a whole subtree
-inherits it. See [explicit model choice](models.md).
+inherits it. Effort works the same way (`effort=`, default `xhigh`; levels
+low/medium/high/xhigh, plus max on Claude): lower it for mechanical work.
+See [explicit model and effort](models.md).
 
 ## 2. Reuse sessions that hold good context
 
