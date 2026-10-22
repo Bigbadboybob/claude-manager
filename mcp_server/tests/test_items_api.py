@@ -593,6 +593,47 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(e["item_number"], e["actor_pid"]) for e in events],
                          [(1, LANE["pid"]), (2, steward["pid"])])
 
+    async def test_bulk_edit_each_returns_a_result_per_item(self):
+        await self.create("a", "b", "c", actor=LANE)
+        await self.patch(3, actor=LANE, status="done")
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": LANE, "ns": [1, 2, 99, 3], "set": {"status": "blocked_on_owner"},
+            "each": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        results = {x["n"]: x for x in r.json()["results"]}
+        self.assertFalse(results[99]["ok"])
+        self.assertEqual(results[99]["error"]["code"], "not_found")
+        self.assertFalse(results[1]["ok"], "blocked_on_owner needs the decision named")
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": LANE, "ns": [1, 2, 99], "set": {"status": "waiting", "eta": "40m"},
+            "each": True})
+        body = r.json()
+        self.assertEqual([x["ok"] for x in body["results"]], [True, True, False])
+        self.assertEqual(sorted(i["n"] for i in body["items"]), [1, 2])
+        statuses = {i["n"]: i["status"] for i in (await self.read())["items"]}
+        self.assertEqual((statuses[1], statuses[2]), ("waiting", "waiting"))
+        # Without each, one refused item still refuses the whole call.
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": LANE, "ns": [1, 99], "set": {"status": "active"}})
+        self.assertEqual(r.status_code, 404)
+
+    async def test_chat_touch_keyword_suggests_and_apply_confirms(self):
+        await self.create("fuse", actor=LANE)
+        r = await self.post("/items/chat-touch", {
+            "actor": LANE, "ns": [1], "message_id": "m-1", "excerpt": "#1 DONE",
+            "suggest": {"keyword": "DONE", "status": "done"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        item = next(i for i in (await self.read())["items"] if i["n"] == 1)
+        self.assertEqual(item["status"], "active")
+        self.assertIn("suggested_transition", item["flags"])
+        bad = await self.post("/items/chat-touch", {
+            "actor": LANE, "ns": [1], "suggest": {"keyword": "DONE", "status": "dropped"}})
+        self.assertEqual(bad.status_code, 422, "only done or blocked can be suggested")
+        r = await self.post(f"/boards/{self.ref}/items/1/resolve", {"actor": LANE, "action": "apply"})
+        self.assertEqual(r.status_code, 200, r.text)
+        closed = (await self.read())["recently_closed"]
+        self.assertEqual(closed[0]["status"], "done")
+
     async def test_chat_touch_counts_the_picked_orchestrator(self):
         now = datetime.now(timezone.utc)
         async with self.pool.acquire() as conn:

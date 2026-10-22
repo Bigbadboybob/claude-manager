@@ -650,13 +650,17 @@ review of `4b6d422`):
   inside that root after canonicalisation (no `..`, no absolute path, no
   symlink escape); if it cannot be derived (unset root, no registered
   worktree, an escape) the input is `self_supplied_unverified` and
-  INCOMPLETE. The daemon then rehashes it (`sha256:` for a file; for a dir `tree:` = sha256 of the
+  INCOMPLETE. A TUI-owned session has no process the daemon can read, so
+  its `root_env` inputs are always unverifiable (INCOMPLETE); run gates
+  that need them from a daemon-owned session, or declare the input by
+  worktree-relative `path`. The daemon then rehashes it (`sha256:` for a file; for a dir `tree:` = sha256 of the
   `relpath\tsize\tsha256` lines, files of a directory before its
   subdirectories, symlinks skipped; cm-gate uses the same manifest). Only
   those inputs are `hashed_at_run`; a typed id that differs is kept as
   `poster_content_id`, and a path that is not there is `missing` (VOID)
   whatever id was typed. Hashing is capped per report at 64 GiB, 500 000
-  files and 300 s (the RPC allows 900 s); hitting a cap leaves the input
+  files and 300 s (the RPC allows 900 s), with the deadline also checked
+  between 8 MiB chunks of a single large file; hitting a cap leaves the input
   unverifiable, so INCOMPLETE. The receipt's `worktree.path` is likewise the
   caller's registered worktree, not the poster's. Everything else (gcs, db, inputs without a local
   path) is `self_supplied_unverified` and binds only when the profile's
@@ -693,8 +697,9 @@ review of `4b6d422`):
   naming those nodes.
 - **Program.** The executed program must be the granted token itself, or
   the same basename resolving to the caller's worktree venv
-  (`<worktree>/.venv/bin/<name>`, `venv/bin`) or to the registered runner's
-  path in that worktree. Any other spelling (`/tmp/x/pytest`) is weakened.
+  (`<worktree>/.venv/bin/<name>`, `venv/bin`) or to the path of the
+  profile's `runner_ref` in that worktree (never a runner the receipt
+  names). Any other spelling (`/tmp/x/pytest`) is weakened.
 - **The class is the item's.** A receipt naming another class is refused
   (`class_mismatch`). Changing an item's `gate_class`, the board's
   `gate_default_class`, or setting a profile as the default restales the

@@ -96,6 +96,8 @@ class ItemsPatchBody(_Strict):
     add_holders: list[Holder] | None = Field(default=None, max_length=50)
     remove_holders: list[Short] | None = Field(default=None, max_length=50)
     reason: Reason | None = None
+    # Per-item results: each item is written on its own (bulk edits).
+    each: bool = False
 
 
 class ItemsTouchBody(_Strict):
@@ -106,6 +108,11 @@ class ItemsTouchBody(_Strict):
     excerpt: str | None = Field(default=None, max_length=1000)
 
 
+class Suggest(_Strict):
+    keyword: str = Field(max_length=20)
+    status: str = Field(pattern="^(done|blocked)$")
+
+
 class ItemsChatTouchBody(_Strict):
     actor: Actor
     ns: list[ItemNumber] = Field(min_length=1, max_length=50)
@@ -113,6 +120,7 @@ class ItemsChatTouchBody(_Strict):
     source: str = Field(default="chat", pattern="^[a-z_]{1,32}$")
     message_id: Short | None = None
     excerpt: str | None = Field(default=None, max_length=1000)
+    suggest: Suggest | None = None
 
 
 class ItemResolveBody(_Strict):

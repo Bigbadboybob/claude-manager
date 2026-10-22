@@ -306,6 +306,7 @@ def item_set(
     mf: str | None = None,
     ruling: str | None = None,
     gate_class: str | None = None,
+    each: bool = False,
 ) -> dict:
     """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
     note="needs EP GO"), item_set(15, blocked_by=[14]),
@@ -322,13 +323,19 @@ def item_set(
     remove_holder adjust them. An empty string clears note, group or
     blocked_on; blocked_by=[] clears blockers. head / mf / ruling move the
     item's gate bindings (full SHAs, a ruling id; "" clears) and make older
-    gate receipts STALE; gate_class picks its gate profile. Marking an item done unblocks
+    gate receipts STALE; gate_class picks its gate profile. With a list of n,
+    the change is all-or-nothing; each=True writes every item on its own and
+    returns results [{n, ok, error?}], so one refused item doesn't block the
+    rest (bulk housekeeping). Marking an item done unblocks
     items waiting only on it and wakes their holders. Anyone on the board may
     edit any item; history is kept, so give a reason for drops and handoffs.
 
     Returns {board, items, unblocked?, warnings?}.
     """
-    return _items_call("item.set", locals())
+    params = dict(locals())
+    if not each:
+        params.pop("each")
+    return _items_call("item.set", params)
 
 
 @mcp.tool()
@@ -383,6 +390,9 @@ def item_resolve(
     - drop: cancel it with a reason;
     - answer: record Owner's answer (`message`) to an item blocked on Owner,
       which returns it to active.
+    - apply / dismiss: confirm or reject a suggested_transition flag, raised
+      when a holder's or the steward's post about the item says DONE, GREEN,
+      deployed (→ done) or STOP (→ blocked). Nothing changes until you do.
 
     kind limits the action to one flag kind; by default it resolves all of
     the item's open flags. A launch retried with the same request_id reassigns

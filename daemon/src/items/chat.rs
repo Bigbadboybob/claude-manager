@@ -50,6 +50,47 @@ pub(crate) fn unquoted_refs(text: &str) -> Vec<i64> {
     refs(&own.join("\n"))
 }
 
+/// A result word in the sender's own (unquoted) text that suggests a status
+/// (Board-Steward, 2026-10-20). `GREEN`, `DONE` and `STOP` count only in
+/// capitals, `deployed` in any case; a negation just before the word
+/// (`not DONE`, `isn't deployed`) cancels it. Only a suggestion: the holder
+/// or steward confirms it on the board.
+pub(crate) fn suggestion(text: &str) -> Option<(&'static str, &'static str)> {
+    const WORDS: &[(&str, bool, &str, &str)] = &[
+        ("DONE", true, "DONE", "done"),
+        ("GREEN", true, "GREEN", "done"),
+        ("deployed", false, "deployed", "done"),
+        ("STOP", true, "STOP", "blocked"),
+    ];
+    const NEGATIONS: &[&str] = &["not", "no", "isn't", "isnt", "never", "un", "aren't", "wasn't", "nor"];
+    let own: Vec<&str> = text.lines().filter(|l| !l.trim_start().starts_with('>')).collect();
+    let mut found: Option<(&'static str, &'static str)> = None;
+    for line in own {
+        let tokens: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || ",.;:!?()[]*_`\"".contains(c))
+            .filter(|t| !t.is_empty())
+            .collect();
+        for (i, tok) in tokens.iter().enumerate() {
+            for (word, exact, keyword, status) in WORDS {
+                let hit = if *exact { tok == word } else { tok.eq_ignore_ascii_case(word) };
+                if !hit {
+                    continue;
+                }
+                let negated = i > 0 && NEGATIONS.contains(&tokens[i - 1].to_lowercase().as_str());
+                if negated {
+                    continue;
+                }
+                match found {
+                    // Conflicting words (DONE … STOP) suggest nothing.
+                    Some((_, s)) if s != *status => return None,
+                    _ => found = Some((keyword, status)),
+                }
+            }
+        }
+    }
+    found
+}
+
 struct Job {
     api: Api,
     actor: Value,
@@ -57,6 +98,7 @@ struct Job {
     channel: Option<String>,
     message_id: Option<String>,
     excerpt: String,
+    suggest: Option<(&'static str, &'static str)>,
 }
 
 fn worker() -> &'static SyncSender<Job> {
@@ -75,8 +117,11 @@ fn worker() -> &'static SyncSender<Job> {
 /// One call: the API resolves boards and applies the sender rules. An API
 /// that predates it (404) gets the holder-only touches below.
 fn run(job: &Job) {
-    let body = json!({"actor": job.actor, "ns": job.ns, "channel": job.channel, "source": "chat",
-                      "message_id": job.message_id, "excerpt": job.excerpt});
+    let mut body = json!({"actor": job.actor, "ns": job.ns, "channel": job.channel, "source": "chat",
+                          "message_id": job.message_id, "excerpt": job.excerpt});
+    if let Some((keyword, status)) = job.suggest {
+        body["suggest"] = json!({"keyword": keyword, "status": status});
+    }
     if let Err((crate::control::protocol::ErrorCode::NotFound, _)) = job.api.post("/items/chat-touch", &body) {
         run_holder_only(job);
     }
@@ -142,6 +187,8 @@ pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply
         return;
     }
     let Ok(api) = Api::from_config(&api_url, &api_token) else { return };
+    // Suggest only when the post is about exactly one item.
+    let suggest = if ns.len() == 1 { suggestion(body) } else { None };
     let job = Job {
         api: api.with_timeout(TIMEOUT),
         actor: json!({"pid": format!("agent:{daemon_id}:{uid}"), "name": name.unwrap_or(title),
@@ -150,6 +197,7 @@ pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply
         channel,
         message_id: reply["event_id"].as_str().or_else(|| reply["event"]["id"].as_str()).map(str::to_owned),
         excerpt: body.chars().take(EXCERPT_CHARS).collect(),
+        suggest,
     };
     match worker().try_send(job) {
         Ok(()) => {}
@@ -161,6 +209,20 @@ pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keywords_suggest_a_status_only_when_unambiguous() {
+        assert_eq!(suggestion("#14 gate GREEN on a1b2c3d"), Some(("GREEN", "done")));
+        assert_eq!(suggestion("#14 DONE."), Some(("DONE", "done")));
+        assert_eq!(suggestion("#14 Deployed to cm-manager"), Some(("deployed", "done")));
+        assert_eq!(suggestion("#14 STOP: OOM on devbox6"), Some(("STOP", "blocked")));
+        assert_eq!(suggestion("#14 not DONE yet"), None, "negated");
+        assert_eq!(suggestion("#14 isn't deployed"), None);
+        assert_eq!(suggestion("#14 almost done, green-ish"), None, "lowercase done/green are prose");
+        assert_eq!(suggestion("> #14 DONE\nthat was yesterday"), None, "quoted");
+        assert_eq!(suggestion("#14 GREEN but STOP the deploy"), None, "conflicting words");
+        assert_eq!(suggestion("#14 DONEish"), None, "whole words only");
+    }
 
     use crate::control::protocol::{Caller, Request};
     use std::io::{BufRead, BufReader, Read, Write};

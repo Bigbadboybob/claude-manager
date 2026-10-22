@@ -275,6 +275,27 @@ pub(crate) fn stamp_inputs(inputs: &mut [Value], decls: &[Value], site: &CallerS
     }
 }
 
+/// Reads in chunks and checks the deadline between them, so one huge
+/// file cannot run past the budget.
+pub(crate) fn file_sha(path: &Path, deadline: std::time::Instant) -> Result<String, String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(format!("hashing timed out after {}s", HASH_DEADLINE.as_secs()));
+        }
+        let n = file.read(&mut buf).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// `sha256:<hex>` for a file; for a directory `tree:<sha256 of the sorted
 /// (relpath, size, sha256) lines>`, the same manifest cm-gate computes
 /// (files of a directory first, then its subdirectories, symlinks skipped).
@@ -294,12 +315,7 @@ pub(crate) fn content_hash(path: &Path, budget: &mut Budget) -> Hashed {
         budget.bytes -= size;
         Ok(())
     }
-    fn file_sha(path: &Path) -> Result<String, String> {
-        let mut file = std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        Ok(format!("{:x}", hasher.finalize()))
-    }
+
     fn walk(root: &Path, dir: &Path, lines: &mut Vec<String>, total: &mut u64, budget: &mut Budget) -> Result<(), String> {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
             .map_err(|e| format!("cannot list {}: {e}", dir.display()))?
@@ -320,7 +336,7 @@ pub(crate) fn content_hash(path: &Path, budget: &mut Budget) -> Hashed {
                 take(budget, size)?;
                 *total += size;
                 let rel = p.strip_prefix(root).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
-                lines.push(format!("{rel}\t{size}\t{}", file_sha(&p)?));
+                lines.push(format!("{rel}\t{size}\t{}", file_sha(&p, budget.deadline)?));
             }
         }
         for d in subdirs {
@@ -333,7 +349,7 @@ pub(crate) fn content_hash(path: &Path, budget: &mut Budget) -> Hashed {
         if let Err(why) = take(budget, meta.len()) {
             return Hashed::Capped(why);
         }
-        return match file_sha(path) {
+        return match file_sha(path, budget.deadline) {
             Ok(sha) => Hashed::Bound(format!("sha256:{sha}"), meta.len()),
             Err(why) => Hashed::Capped(why),
         };
@@ -881,6 +897,12 @@ mod tests {
         let mut late = Budget { deadline: std::time::Instant::now() - Duration::from_secs(1), ..Budget::new() };
         assert!(matches!(content_hash(dir.path(), &mut late), Hashed::Capped(m) if m.contains("timed out")));
         assert!(matches!(content_hash(dir.path(), &mut Budget::new()), Hashed::Bound(..)));
+        // A single file is checked between its read chunks too, not only
+        // before it starts.
+        let past = std::time::Instant::now() - Duration::from_secs(1);
+        assert!(file_sha(&dir.path().join("a"), past).unwrap_err().contains("timed out"));
+        let future = std::time::Instant::now() + Duration::from_secs(60);
+        assert_eq!(file_sha(&dir.path().join("a"), future).unwrap().len(), 64);
     }
 
     #[test]

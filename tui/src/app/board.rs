@@ -402,6 +402,13 @@ impl App {
                 (Menu::Resolve, KeyCode::Char('4'), Some(_)) => {
                     self.board.prompt = Some((PromptKind::ResolveDrop, String::new()))
                 }
+                // A suggested transition (a DONE/STOP post): confirm or reject.
+                (Menu::Resolve, KeyCode::Char('5'), Some(n)) => {
+                    self.board_write("item.resolve", json!({"n": n, "action": "apply"}))
+                }
+                (Menu::Resolve, KeyCode::Char('6'), Some(n)) => {
+                    self.board_write("item.resolve", json!({"n": n, "action": "dismiss"}))
+                }
                 _ => {}
             }
             return true;
@@ -896,7 +903,7 @@ impl App {
             return Line::styled(
                 match menu {
                     Menu::Status => "Status: o open \u{00b7} a active \u{00b7} w waiting \u{00b7} b blocked \u{00b7} O on Owner \u{00b7} d done",
-                    Menu::Resolve => "Resolve flag: 1 nudge \u{00b7} 2 reassign \u{00b7} 3 block \u{00b7} 4 drop",
+                    Menu::Resolve => "Resolve flag: 1 nudge \u{00b7} 2 reassign \u{00b7} 3 block \u{00b7} 4 drop \u{00b7} 5 apply suggestion \u{00b7} 6 dismiss",
                 },
                 bold,
             );

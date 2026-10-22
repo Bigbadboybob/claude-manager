@@ -29,6 +29,8 @@ class ItemToolsTests(unittest.TestCase):
         self.assertEqual(params, {"n": 14, "status": "done", "note": ""})
         _, params = self.call(server.item_set, [14, 15], blocked_by=[])
         self.assertEqual(params, {"n": [14, 15], "blocked_by": []})
+        _, params = self.call(server.item_set, [14, 15], "done", each=True)
+        self.assertEqual(params, {"n": [14, 15], "status": "done", "each": True})
 
     def test_gate_tools_route_to_the_daemon(self):
         method, params = self.call(server.gate_report, 14, [], "a" * 40, klass="py")

@@ -513,6 +513,14 @@ class Hardening(unittest.TestCase):
         self.assertIn("is not the granted 'pytest'", texts(run("/tmp/evil/pytest")))
         self.assertEqual(run("/w/lane/.venv/bin/pytest")["verdict"], "PASS")
         self.assertEqual(run("/w/lane/.venv/bin/../../../tmp/pytest")["verdict"], "FAIL")
+        # The registered runner is the profile's runner_ref, never the receipt's.
+        forged = receipt(runner={"ref": "origin/main:evil/pytest", "sha": RUNNER})
+        step(forged, "pytest")["effective_cmd"]["argv"][0] = "/w/lane/evil/pytest"
+        self.assertEqual(verdict(forged)["verdict"], "FAIL")
+        prof = g.validate_profile(dict(PROFILE_RAW, runner_ref="origin/main:tools/pytest"))
+        ok = receipt()
+        step(ok, "pytest")["effective_cmd"]["argv"][0] = "/w/lane/tools/pytest"
+        self.assertEqual(g.evaluate(ok, prof, [])["verdict"], "PASS", texts(g.evaluate(ok, prof, [])))
         r = receipt(worktree=dict(receipt()["worktree"], path=None))
         step(r, "pytest")["effective_cmd"]["argv"][0] = "/w/lane/.venv/bin/pytest"
         self.assertEqual(verdict(r)["verdict"], "FAIL", "no daemon-known worktree, no venv match")

@@ -426,6 +426,10 @@ fn item_set(ctx: &Ctx, params: &Value) -> RpcResult {
     if let Some(reason) = present(params, "reason") {
         body["reason"] = reason;
     }
+    // Bulk edits: each item on its own, with a result per item.
+    if params["each"] == true {
+        body["each"] = json!(true);
+    }
     if body["set"].as_object().is_some_and(Map::is_empty)
         && body.get("add_holders").is_none()
         && body.get("remove_holders").is_none()
@@ -436,7 +440,11 @@ fn item_set(ctx: &Ctx, params: &Value) -> RpcResult {
     authorize_edit(ctx, params, &board)?;
     let slug = slug(&board)?;
     let reply = ctx.api.patch(&format!("/boards/{slug}/items"), &body)?;
-    Ok(write_reply(&slug, &reply, "items"))
+    let mut out = write_reply(&slug, &reply, "items");
+    if let Some(results) = reply["results"].as_array() {
+        out["results"] = json!(results);
+    }
+    Ok(out)
 }
 
 fn normalize_engine(engine: &str) -> RpcResult<&'static str> {
@@ -1106,6 +1114,25 @@ mod tests {
         let seen = seen.lock().unwrap();
         let (_, _, body) = seen.iter().find(|(_, p, _)| p.ends_with("/grants")).unwrap();
         assert_eq!(body["message_check"], json!({"found": false}), "the caller cannot supply the check");
+    }
+
+    #[test]
+    fn item_set_each_forwards_and_returns_per_item_results() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[{"n":1,"status":"done"}],"results":[{"n":1,"ok":true},{"n":9,"ok":false,"error":{"code":"not_found"}}],"unblocked":[],"warnings":[]}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let resp = call(&state, "me-uid", "item.set", json!({"n":[1,9],"status":"done","each":true}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let out = resp.result.unwrap();
+        assert_eq!(out["results"][1], json!({"n":9,"ok":false,"error":{"code":"not_found"}}));
+        let seen = seen.lock().unwrap();
+        let (_, _, body) = seen.iter().find(|(m, _, _)| m == "PATCH").unwrap();
+        assert_eq!(body["each"], true);
     }
 
     #[test]

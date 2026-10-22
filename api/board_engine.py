@@ -20,7 +20,12 @@ import uuid
 from datetime import datetime, timedelta
 
 from dispatch import items_db
-from dispatch.gate_rules import GATE_FLAG_KINDS, HOLDER_ONLY_FLAGS
+from dispatch.gate_rules import GATE_FLAG_KINDS, HOLDER_ONLY_FLAGS as GATE_HOLDER_ONLY
+from dispatch.items_rules import SUGGESTED
+
+# Flags only the item's holders (and steward) hear about, never the
+# orchestrator or Owner: a stale receipt to rerun, a suggestion to confirm.
+HOLDER_ONLY_FLAGS = GATE_HOLDER_ONLY | {SUGGESTED}
 from dispatch.items_rules import CLOSED, OWNER_BLOCKED, BoardTx, Item, iso
 
 logger = logging.getLogger("cm.board_engine")
@@ -332,6 +337,8 @@ def describe(flag: dict, item: Item | None, states: dict, now: datetime) -> str:
         why = f"no holder {_short(_seconds(now - touched))}"
     elif kind == "check_back" and item is not None:
         why = f"check back on \"{item.blocked_on}\""
+    elif kind == SUGGESTED:
+        why = f"{detail.get('by')} posted {detail.get('keyword')}: {detail.get('to')}?"
     elif kind in ("runner_void", "input_void"):
         what = (f"runner {detail.get('runner_sha')}" if kind == "runner_void"
                 else f"input {detail.get('input')}")
@@ -585,7 +592,7 @@ async def _escalate(conn, board, items, orch, now, summary) -> None:
     flags = await _open_flags(conn, board["id"])
     threshold = timedelta(seconds=board["escalate_s"])
     stuck = [f for f in flags if f["escalated_at"] is None and now - f["raised_at"] >= threshold
-             and f["kind"] not in GATE_FLAG_KINDS
+             and f["kind"] not in GATE_FLAG_KINDS and f["kind"] not in HOLDER_ONLY_FLAGS
              and _due(f, items.get(f["n"]), ":escalated")]
     if not stuck:
         return

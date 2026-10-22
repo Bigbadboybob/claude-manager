@@ -18,7 +18,12 @@ OWNER_PID = "owner"
 # Owner's answer with item_resolve(n, "answer", message=...).
 OWNER_BLOCKED = "blocked_on_owner"
 CLOSED = frozenset({"done", "dropped"})
-RESOLVE_ACTIONS = ("nudge", "reassign", "launch", "block", "drop", "answer")
+RESOLVE_ACTIONS = ("nudge", "reassign", "launch", "block", "drop", "answer", "apply", "dismiss")
+# A keyword in a holder's or the steward's progress post suggests a status;
+# the holder or steward confirms it (item_resolve "apply") or dismisses it.
+# Never applied automatically (Board-Steward, 2026-10-20).
+SUGGESTED = "suggested_transition"
+SUGGEST_STATUSES = frozenset({"done", "blocked"})
 
 MAX_TITLE = 200
 MAX_NOTE = 500
@@ -530,6 +535,10 @@ class BoardTx:
             self._check_cycles(it)
             self._clear_blocker_dropped(it)
 
+        # Any status change settles a pending suggestion: it was acted on.
+        if status != prev_status and not creating:
+            self.resolve_flag(it, SUGGESTED, "cleared")
+
         # Close and reopen (rules 5-7).
         was_closed = prev_status in CLOSED
         if status in CLOSED and not was_closed:
@@ -601,7 +610,8 @@ class BoardTx:
             self.dirty.add(dep.n)
 
     def touch(self, ns: list[int], *, source: str, message_id: str | None = None,
-              excerpt: str | None = None, any_item: bool = False) -> tuple[list[int], list[dict]]:
+              excerpt: str | None = None, any_item: bool = False,
+              suggest: dict | None = None) -> tuple[list[int], list[dict]]:
         """Observed activity on items (a holder's chat post naming `#N`):
         reset the stale clock and append history. Never changes status or
         note. Only open items the actor holds are touched. With `any_item`
@@ -626,7 +636,34 @@ class BoardTx:
                     "excerpt": (excerpt or "")[:200] or None,
                 })
                 touched.append(n)
+                if suggest:
+                    self._suggest(it, suggest, message_id)
         return touched, skipped
+
+    def _suggest(self, it: Item, suggest: dict, message_id: str | None):
+        """Raise a suggested transition from a keyword in a progress post;
+        only the holders and the steward hear about it."""
+        to = suggest.get("status")
+        keyword = str(suggest.get("keyword") or "")[:20]
+        if to not in SUGGEST_STATUSES or it.status == to or not keyword:
+            return
+        who = self.actor.get("name") or self.actor["pid"]
+        detail = {"to": to, "keyword": keyword, "by": who, "message_id": message_id}
+        fresh = SUGGESTED not in it.open_flags
+        self.raise_flag(it, SUGGESTED, detail)
+        if not fresh:
+            return
+        text = (f"{self._prefix()} #{it.n} \"{it.title}\": {who} posted {keyword}. Mark it {to}? "
+                f"item_resolve({it.n}, \"apply\") or item_resolve({it.n}, \"dismiss\").")
+        audience = list(it.holders)
+        steward = self.board.get("steward_pid")
+        if steward and steward not in [h["pid"] for h in audience]:
+            parts = steward.split(":")
+            if len(parts) == 3 and parts[0] == "agent":
+                audience.append({"pid": steward, "daemon_id": parts[1], "session_uid": parts[2]})
+        for h in audience:
+            if h["pid"] != self.actor["pid"]:
+                self._push(it, h, SUGGESTED, text)
 
     def resolve(self, n: int, action: str, *, kind: str | None = None, holders=None,
                 blocked_by=None, blocked_on=None, check_back=None, reason=None,
@@ -651,6 +688,17 @@ class BoardTx:
             self._event(it, "resolved", new={"action": action, "flags": resolved},
                         reason=f"answer: {answer}")
             return resolved
+        if action in ("apply", "dismiss"):
+            flag = it.open_flags.get(SUGGESTED)
+            if not flag:
+                raise invalid("invalid_field", f"#{n} has no suggested transition", field="action")
+            to = (flag.get("detail") or {}).get("to")
+            self.resolve_flag(it, SUGGESTED, action)
+            if action == "apply":
+                self.apply(n, {"status": to}, reason=reason or
+                           f"confirmed suggestion ({(flag.get('detail') or {}).get('keyword')})")
+            self._event(it, "resolved", new={"action": action, "flags": [SUGGESTED]}, reason=reason)
+            return [SUGGESTED]
         kinds = [kind] if kind else sorted(it.open_flags)
         resolved: list[str] = []
 

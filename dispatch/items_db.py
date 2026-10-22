@@ -419,6 +419,31 @@ async def update_items(pool, ref: str, actor: dict, ns: list[int], fields: dict,
     return _write_reply(tx, done)
 
 
+async def update_items_each(pool, ref: str, actor: dict, ns: list[int], fields: dict, *,
+                            add_holders=None, remove_holders=None, reason=None) -> dict:
+    """Bulk edit with per-item results (Board-Steward's ask): each item is
+    its own write, so one refused item never blocks the rest."""
+    results, items, warnings, unblocked = [], [], [], set()
+    for n in dict.fromkeys(ns):
+        try:
+            reply = await update_items(pool, ref, actor, [n], dict(fields),
+                                       add_holders=add_holders, remove_holders=remove_holders,
+                                       reason=reason)
+        except ItemsError as exc:
+            results.append({"n": n, "ok": False, "error": exc.detail()})
+            continue
+        results.append({"n": n, "ok": True})
+        items += reply["items"]
+        warnings += reply["warnings"]
+        unblocked.update(reply["unblocked"])
+        board = reply["board"]
+    out = {"items": items, "results": results, "unblocked": sorted(unblocked),
+           "warnings": warnings}
+    if items:
+        out["board"] = board
+    return out
+
+
 async def touch_items(pool, ref: str, actor: dict, ns: list[int], *, source: str,
                       message_id: str | None = None, excerpt: str | None = None) -> dict:
     """Observed activity (doc §4): reset the stale clock of open items the
@@ -442,7 +467,7 @@ async def _stewards(conn, board: dict, pid: str, now: datetime) -> bool:
 
 async def chat_touch(pool, actor: dict, ns: list[int], *, channel: str | None,
                      source: str = "chat", message_id: str | None = None,
-                     excerpt: str | None = None) -> dict:
+                     excerpt: str | None = None, suggest: dict | None = None) -> dict:
     """A chat post naming `#N` (doc §4): refresh item N when the sender holds
     it or is the board's steward or orchestrator. N is resolved on the board
     bound to `channel`, else on the only board where it is open and the
@@ -486,7 +511,7 @@ async def chat_touch(pool, actor: dict, ns: list[int], *, channel: str | None,
             pool, board_id, actor, board_ns,
             lambda tx, any_item=privileged[board_id], board_ns=board_ns: tx.touch(
                 board_ns, source=source, message_id=message_id, excerpt=excerpt,
-                any_item=any_item))
+                any_item=any_item, suggest=suggest))
         if done:
             touched[tx.board["slug"]] = done
         skipped += [{**s, "board": tx.board["slug"]} for s in skip]

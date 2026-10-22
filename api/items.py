@@ -89,7 +89,8 @@ async def create_items(ref: str, body: ItemsCreateBody, request: Request):
 @router.patch("/boards/{ref}/items")
 async def update_items(ref: str, body: ItemsPatchBody, request: Request):
     fields = body.set.model_dump(exclude_unset=True)
-    return await _call(items_db.update_items(
+    write = items_db.update_items_each if body.each else items_db.update_items
+    return await _call(write(
         _pool(request), ref, body.actor.model_dump(), body.ns, fields,
         add_holders=[h.model_dump() for h in body.add_holders or []],
         remove_holders=body.remove_holders, reason=body.reason))
@@ -106,7 +107,8 @@ async def touch_items(ref: str, body: ItemsTouchBody, request: Request):
 async def chat_touch(body: ItemsChatTouchBody, request: Request):
     return await _call(items_db.chat_touch(
         _pool(request), body.actor.model_dump(), body.ns, channel=body.channel,
-        source=body.source, message_id=body.message_id, excerpt=body.excerpt))
+        source=body.source, message_id=body.message_id, excerpt=body.excerpt,
+        suggest=body.suggest.model_dump() if body.suggest else None))
 
 
 @router.post("/boards/{ref}/items/{n}/resolve")

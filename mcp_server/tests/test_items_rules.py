@@ -534,3 +534,60 @@ class Resolve(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuggestedTransitions(unittest.TestCase):
+    """Board-Steward's keyword hints: a suggestion to confirm, never a change."""
+
+    STEWARD = agent("steward", daemon="d3")
+
+    def setUp(self):
+        self.b = Board()
+        self.b.board["steward_pid"] = self.STEWARD["pid"]
+        self.b.create("fuse SEJD", actor=LANE)
+
+    def touch(self, actor=LANE, keyword="DONE", status="done"):
+        tx = self.b.tx(actor)
+        tx.touch([1], source="chat", message_id="m-1", excerpt="#1 DONE",
+                 any_item=actor is not LANE, suggest={"keyword": keyword, "status": status})
+        return tx
+
+    def test_a_keyword_raises_a_quiet_suggestion_and_changes_nothing(self):
+        tx = self.touch()
+        it = self.b[1]
+        self.assertEqual(it.status, "active", "never applied automatically")
+        self.assertEqual(it.open_flags["suggested_transition"]["detail"],
+                         {"to": "done", "keyword": "DONE", "by": "lane", "message_id": "m-1"})
+        # The holder posted it; the steward is the one who hears.
+        self.assertEqual([p["pid"] for p in tx.pushes], [self.STEWARD["pid"]])
+        self.assertIn('item_resolve(1, "apply")', tx.pushes[0]["text"])
+
+    def test_apply_confirms_and_dismiss_rejects(self):
+        self.touch()
+        tx = self.b.tx(self.STEWARD)
+        self.assertEqual(tx.resolve(1, "apply"), ["suggested_transition"])
+        self.assertEqual(self.b[1].status, "done")
+        b = Board()
+        b.create("x", actor=LANE)
+        b.tx(LANE).touch([1], source="chat", suggest={"keyword": "STOP", "status": "blocked"})
+        b.tx(LANE).resolve(1, "dismiss")
+        self.assertEqual((b[1].status, b[1].open_flags), ("active", {}))
+        with self.assertRaises(ItemsError):
+            b.tx(LANE).resolve(1, "apply")
+
+    def test_any_status_change_settles_it_and_a_matching_status_raises_none(self):
+        self.touch(keyword="STOP", status="blocked")
+        self.b.set(1, actor=LANE, status="waiting", eta="40m")
+        self.assertNotIn("suggested_transition", self.b[1].open_flags)
+        self.b.set(1, actor=LANE, status="blocked", blocked_on="EP GO", check_back="1h")
+        self.touch(keyword="STOP", status="blocked")
+        self.assertNotIn("suggested_transition", self.b[1].open_flags)
+
+    def test_a_non_holder_steward_post_suggests_but_resets_no_clock(self):
+        before = self.b[1].touched_at
+        later = NOW + timedelta(hours=1)
+        tx = BoardTx(self.b.board, self.b.items, self.STEWARD, later)
+        tx.touch([1], source="chat", any_item=True, suggest={"keyword": "GREEN", "status": "done"})
+        self.assertEqual(self.b[1].touched_at, before)
+        self.assertIn("suggested_transition", self.b[1].open_flags)
+        self.assertEqual([p["pid"] for p in tx.pushes], [LANE["pid"]])

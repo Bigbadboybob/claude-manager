@@ -875,7 +875,7 @@ def _pytest_diff(granted: list[str], effective: list[str]) -> list[str]:
 
 
 def command_diff(step_profile: dict, step: dict, allowed_env: set[str],
-                 receipt: dict | None = None) -> list[str]:
+                 receipt: dict | None = None, runner_ref: str | None = None) -> list[str]:
     """Why the executed command needs grantor review ([] = within the grant)."""
     granted = step_profile.get("argv")
     if not granted:
@@ -884,8 +884,8 @@ def command_diff(step_profile: dict, step: dict, allowed_env: set[str],
     if not cmd or not cmd.get("argv"):
         return ["no effective command recorded"]
     worktree = ((receipt or {}).get("worktree") or {}).get("path")
-    runner_ref = ((receipt or {}).get("runner") or {}).get("ref") or ""
-    runner_path = runner_ref.partition(":")[2] or None
+    # The registered runner is the profile's runner_ref, never the receipt's.
+    runner_path = (runner_ref or "").partition(":")[2] or None
     problems, effective = _strip_wrappers(cmd["argv"], granted, allowed_env, worktree, runner_path)
     if effective:
         k = _program_len(granted)
@@ -1253,7 +1253,7 @@ def evaluate(receipt: dict, profile: dict | None, grants: list[dict], *,
             step_reasons.append(_r("incomplete", f"{name}: {st['state'].replace('_', ' ')}"
                                    + (f" ({st['reason']})" if st.get("reason") else ""), name))
         else:
-            weak = command_diff(sp, st, allowed_env, receipt)
+            weak = command_diff(sp, st, allowed_env, receipt, profile.get("runner_ref"))
             shrink: list[str] = []
             if sp["kind"] == "pytest":
                 selections, _ = _covering(grants, receipt, name, "selection")
