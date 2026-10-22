@@ -804,6 +804,96 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
 }
 
 // ---------------------------------------------------------------------------
+// send_key
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SendKeyTargets {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct SendKeyParams {
+    session_uids: SendKeyTargets,
+    key: String,
+}
+
+/// Press exactly one key (no body, no Enter) in each target session: the
+/// TUI twin of the daemon's `session.send_key` (daemon/src/control/send_key.rs),
+/// with `send_input`'s scope. Each target gets its own result (`ok`,
+/// `not_found`, `unauthorized`, `exited`, `error`); one bad target never stops
+/// the rest. The key is encoded by the shared `cm_daemon::keys::key_bytes`
+/// for the keyboard mode of the session's own terminal.
+pub fn send_key(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
+    use cm_daemon::control::send_key::MAX_TARGETS;
+    let p: SendKeyParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    cm_daemon::keys::parse_key(&p.key).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    let mut uids: Vec<String> = Vec::new();
+    for uid in match p.session_uids {
+        SendKeyTargets::One(u) => vec![u],
+        SendKeyTargets::Many(v) => v,
+    } {
+        let uid = uid.trim().to_owned();
+        if !uid.is_empty() && !uids.contains(&uid) {
+            uids.push(uid);
+        }
+    }
+    if uids.is_empty() {
+        return Err((ErrorCode::InvalidParams, "send_key needs at least one session uid".into()));
+    }
+    if uids.len() > MAX_TARGETS {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("send_key takes at most {MAX_TARGETS} sessions per call, got {}", uids.len()),
+        ));
+    }
+    let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
+    let outcome = |uid: &str, status: &str, message: String| json!({"session_uid": uid, "status": status, "message": message});
+    let mut results = Vec::new();
+    for uid in &uids {
+        let Some((wi, si)) = find_live_session(&app.workspaces, uid) else {
+            results.push(if find_tombstone(&app.workspaces, uid).is_some() {
+                outcome(uid, "exited", missing_session_message(&app.workspaces, uid))
+            } else {
+                outcome(uid, "not_found", format!("session '{uid}' not found"))
+            });
+            continue;
+        };
+        let target_task = app.workspaces[wi].sessions[si].task_id.clone();
+        if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
+            results.push(outcome(uid, "unauthorized", "session is outside the caller's scope".into()));
+            continue;
+        }
+        let ts = &mut app.workspaces[wi].sessions[si];
+        if session_runtime_state(ts).kind == RuntimeStateKind::Exited {
+            results.push(outcome(uid, "exited", format!("session '{uid}' has exited; PTY no longer writable")));
+            continue;
+        }
+        let mode = *ts.session.term.lock().mode();
+        let bytes = match cm_daemon::keys::key_bytes(&p.key, mode) {
+            Ok(b) => b,
+            Err(e) => {
+                results.push(outcome(uid, "error", e));
+                continue;
+            }
+        };
+        results.push(match ts.session.write(&bytes) {
+            Ok(()) => json!({
+                "session_uid": uid,
+                "status": "ok",
+                "keyboard": if cm_daemon::keys::is_kitty(mode) { "kitty" } else { "legacy" },
+            }),
+            Err(e) => outcome(uid, "error", format!("write to PTY: {e}")),
+        });
+    }
+    let sent = results.iter().filter(|r| r["status"] == "ok").count();
+    Ok(json!({"key": p.key, "sent": sent, "results": results}))
+}
+
+// ---------------------------------------------------------------------------
 // notify_user
 // ---------------------------------------------------------------------------
 

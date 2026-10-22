@@ -102,6 +102,9 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # first three require the Operator, owner.board_token the strong one.
     "owner_attention.list", "owner.notifications.next", "session.viewed",
     "owner.board_token",
+    # One key to one or more sessions, for direct daemon clients. The MCP
+    # tool calls `send_key` (TUI-routed, like send_input).
+    "session.send_key",
     "sidebar.list",
     "sidebar.assign",
     "sidebar.publish",
@@ -364,6 +367,11 @@ DAEMON_METHODS: frozenset[str] = frozenset({
 # route there.
 DAEMON_DISPATCHED_BUT_TUI_ROUTED: frozenset[str] = frozenset({
     "send_input",
+    # Same routing as send_input: the laptop TUI holds every session it
+    # shows (local and remote) and writes the key through its own terminal,
+    # in that terminal's keyboard mode; a headless host pins CM_TUI_SOCKET
+    # to its daemon, which serves `send_key` too (daemon/src/control/send_key.rs).
+    "send_key",
     # Subtask CRUD: daemon-dispatched (API-backed, so headless orchestrators
     # work — CM_TUI_SOCKET is pinned to daemon.sock on a headless host), but
     # the TUI ALSO serves them on a laptop (it owns the task tree there), so

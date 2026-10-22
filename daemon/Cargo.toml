@@ -98,6 +98,9 @@ rustls-pki-types = "1"
 # here we need the grid solely as a mode sink, with a `VoidListener` and no
 # `EventLoop`.
 alacritty_terminal = "0.25"
+# Key encoding for `session.send_key` (src/keys.rs): the same encoder the
+# TUI uses for Owner's keystrokes, so a sent key matches a typed one.
+terminput = "0.5"
 # Phase 7 (review F13): the brain-deploy preflight's per-invocation
 # unbindable sentinel path is a NamedTempFile — promoted from
 # dev-dependencies.

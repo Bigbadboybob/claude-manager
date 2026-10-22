@@ -401,6 +401,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "terminput",
  "toml",
  "unicode-casefold",
  "unicode-normalization",

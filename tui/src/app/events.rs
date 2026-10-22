@@ -99,6 +99,16 @@ fn activity_summary_for(
             let target = params.get("session_uid").and_then(V::as_str).unwrap_or("?");
             Some(format!("kill_session({})", short(target)))
         }
+        "send_key" => {
+            let key = params.get("key").and_then(V::as_str).unwrap_or("?");
+            let targets = match params.get("session_uids") {
+                Some(V::String(uid)) => short(uid),
+                Some(V::Array(uids)) if uids.len() == 1 => short(uids[0].as_str().unwrap_or("?")),
+                Some(V::Array(uids)) => format!("{} sessions", uids.len()),
+                _ => "?".into(),
+            };
+            Some(format!("send_key {key} ({targets})"))
+        }
         "notify_user" => {
             let msg = params.get("message").and_then(V::as_str).unwrap_or("");
             if msg.trim().is_empty() {
@@ -1403,6 +1413,7 @@ impl App {
             "get_caller_task" => methods::get_caller_task(self, caller, &req.params),
             "list_sessions" => methods::list_sessions(self, caller, &req.params),
             "send_input" => methods::send_input(self, caller, &req.params),
+            "send_key" => methods::send_key(self, caller, &req.params),
             "kill_session" => methods::kill_session(self, caller, &req.params),
             "start_session" => methods::start_session(self, caller, &req.params),
             // Phase 4 §D: start_workflow relocated to the daemon socket; the TUI
@@ -8417,5 +8428,84 @@ mod backtest_group_tests {
             assert!(app.backtest_rows.is_empty());
             assert_eq!(app.cursor, Cursor::Workspace(0));
         });
+    }
+}
+
+/// `send_key` over the TUI socket (Owner 2026-10-22): one key per target,
+/// encoded for that session's keyboard mode, never a trailing Enter, with
+/// per-target results and send_input's scope.
+#[cfg(test)]
+mod send_key_tests {
+    use super::super::sections::layout_tests::{bare_ws, test_app};
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A session that records the bytes it receives into `file`, after
+    /// printing `preamble` (a kitty keyboard push, say).
+    fn recorder(app: &mut App, wi: usize, uid: &str, engine: &str, preamble: &str, file: &std::path::Path) {
+        let script = format!("printf '{preamble}'; stty raw -echo; exec cat > '{}'", file.display());
+        let pty = crate::session::Session::new("/bin/sh", &["-c".into(), script], 80, 24, None, HashMap::new(), None).unwrap();
+        let mut ts = super::super::model::make_simple_session_with_uid(uid.into(), uid, engine, pty, None);
+        ts.session.exited = false;
+        app.workspaces[wi].sessions.push(ts);
+    }
+
+    fn read(file: &std::path::Path, len: usize) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read(file).unwrap_or_default();
+            if got.len() >= len || Instant::now() > deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn kitty(app: &App, uid: &str) -> bool {
+        let (wi, si) = crate::control::methods::find_live_session(&app.workspaces, uid).unwrap();
+        cm_daemon::keys::is_kitty(*app.workspaces[wi].sessions[si].session.term.lock().mode())
+    }
+
+    #[test]
+    fn send_key_encodes_per_session_mode_and_reports_each_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app();
+        app.workspaces = vec![bare_ws("a"), bare_ws("b")];
+        let (plain, agent, outside) = (dir.path().join("plain"), dir.path().join("agent"), dir.path().join("outside"));
+        recorder(&mut app, 0, "ts-1-0", "bash", "", &plain); // the caller, and a target
+        recorder(&mut app, 0, "ts-2-0", "codex", "\\033[>1u", &agent);
+        recorder(&mut app, 1, "ts-3-0", "bash", "", &outside);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !kitty(&app, "ts-2-0") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(kitty(&app, "ts-2-0"), "the agent's terminal saw its kitty push");
+        std::thread::sleep(Duration::from_millis(200));
+        for key in ["escape", "enter"] {
+            let reply = crate::control::methods::send_key(
+                &mut app,
+                "ts-1-0",
+                &serde_json::json!({"session_uids": ["ts-1-0", "ts-2-0", "ts-3-0", "ts-gone"], "key": key}),
+            )
+            .unwrap();
+            let statuses: Vec<&str> = reply["results"].as_array().unwrap().iter().map(|r| r["status"].as_str().unwrap()).collect();
+            assert_eq!(statuses, ["ok", "ok", "unauthorized", "not_found"], "{reply}");
+            assert_eq!(reply["sent"], 2);
+        }
+        assert_eq!(read(&plain, 2), b"\x1b\r", "legacy, and no extra Enter");
+        assert_eq!(read(&agent, 12), b"\x1b[27u\x1b[13u", "kitty: CSI 27 u then CSI 13 u, nothing more");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(std::fs::read(&outside).unwrap_or_default().is_empty(), "out of scope: nothing written");
+        // Bad key: the call is refused before anything is written.
+        let err = crate::control::methods::send_key(&mut app, "ts-1-0", &serde_json::json!({"session_uids": "ts-2-0", "key": "enter please"})).unwrap_err();
+        assert_eq!(err.0, crate::control::protocol::ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn send_key_shows_in_the_activity_feed_by_key() {
+        let one = activity_summary_for("send_key", &serde_json::json!({"session_uids": "ts-123456789-0", "key": "enter"}), &serde_json::Value::Null);
+        assert_eq!(one.as_deref(), Some("send_key enter (ts-12345)"));
+        let many = activity_summary_for("send_key", &serde_json::json!({"session_uids": ["a", "b", "c"], "key": "down"}), &serde_json::Value::Null);
+        assert_eq!(many.as_deref(), Some("send_key down (3 sessions)"));
     }
 }
