@@ -1,10 +1,9 @@
 # Claude account switcher (design, not yet built)
 
 Status: design draft 2026-10-22 from an Owner discussion on cm-sessions
-(branch `cm/claudelb`). Nothing is implemented. The first step is the
-laptop test in [Validation](#1-validation-on-the-laptop-do-this-first);
-several details below are marked **verify** and must be confirmed there
-before building.
+(branch `cm/claudelb`). Nothing is implemented. The laptop validation ran
+on 2026-10-22; see [Validation results](#validation-results-laptop-2026-10-22).
+Details still marked **verify** below are the ones it did not settle.
 
 ## Goal
 
@@ -33,8 +32,8 @@ in purpose, but deliberately **not** in mechanism (see below).
    what a manual `/login` does, faster.
 2. **Running sessions are not restarted.** Owner has observed that after
    `/login` in one session, other running sessions on the same machine
-   start using the new account. The design relies on this (verify it holds
-   for a direct file swap, not only for `/login`).
+   start using the new account. The design relies on this. Confirmed on the
+   laptop for a direct in-place file swap without `/login`.
 3. **Inactive accounts show last-known usage (option "a").** The tool does
    not refresh inactive accounts' tokens or poll them. It shows the last
    reading taken while each account was active, plus its known reset times.
@@ -72,7 +71,8 @@ Key names only; never print values.
 ```
 claudeAiOauth:
   accessToken, refreshToken, expiresAt, refreshTokenExpiresAt,
-  scopes (list), subscriptionType, rateLimitTier
+  scopes (list), subscriptionType, rateLimitTier,
+  subscriptionTypeSource (laptop)
 ```
 
 `~/.claude.json` contains `oauthAccount` with `accountUuid`,
@@ -117,9 +117,10 @@ Commands:
 
 The main pitfall is token refresh. Claude Code refreshes the access token
 in the background and writes the new tokens back to `.credentials.json`.
-If the refresh token also rotates on use (**verify**), a saved copy goes
-stale as soon as Claude Code refreshes it, and switching back to it later
-would need a new `/login`.
+The refresh token rotates on every refresh, and the previous access token
+is revoked at once (validated). A saved copy therefore goes stale as soon
+as Claude Code refreshes it, and switching back to a stale copy would need
+a new `/login`.
 
 **Identifying the login in the file.** If refresh tokens rotate, the live
 `refreshToken` usually matches no saved copy, so token matching alone
@@ -145,21 +146,32 @@ needed.
 
 `switch <target>` under the lock:
 
-1. **Quiet point.** Claude Code refreshes an access token shortly before
-   `expiresAt` (**verify** how long before). If the active token is inside
-   that window, wait until a session has refreshed it (the file changes)
-   before switching. After this, no session should be refreshing the old
-   account during the switch.
+1. **Take Claude Code's refresh lock.** Claude Code serialises refreshes
+   across processes with `~/.claude/.oauth_refresh.lock` (proper-lockfile:
+   a `mkdir`'d directory, stale after 60 s; an older `~/.claude.lock` also
+   exists). Under the lock a refresher re-reads `.credentials.json` and, if
+   the access token there differs from the one it held, adopts the file
+   instead of refreshing. Holding this lock for steps 2–4 therefore keeps
+   any session from refreshing the old account mid-switch. (The lock
+   mechanism is read from the 2.1.308 binary; a session was observed
+   holding it while refreshing. Release it promptly: it is stale after
+   60 s.) The old quiet-point wait is then only a fallback.
 2. **Write back.** Read `.credentials.json`, identify it with the rules
-   above, and save it as that account's latest copy.
-3. **Swap credentials.** Write the target's `claudeAiOauth` block to a temp
-   file in `~/.claude/` with mode 0600, then `rename` over
-   `.credentials.json`. (Verify Claude Code notices a rename; if it watches
-   the inode, write in place instead.)
+   above, and save its `claudeAiOauth` block as that account's latest copy.
+   Keep the account's `oauthAccount` from `capture`; never take it from the
+   live `~/.claude.json` here, which can lag the credentials (validation
+   saved one account's tokens with another's profile this way).
+3. **Swap credentials.** Write the target's `claudeAiOauth` block into
+   `.credentials.json` in place (truncate + write, mode 0600), as `/login`
+   does (it kept the inode). Running sessions followed an in-place write.
+   Claude Code's own refresh replaces the file by rename; whether running
+   sessions also follow a rename swap was not tested, so use in-place.
 4. **Swap account metadata.** Replace only the `oauthAccount` key in
    `~/.claude.json` with the target's saved block: read, modify, write to a
-   temp file, rename, and retry if the file changed underneath. Needed for
-   identity rule 3 even if running sessions only use it for display.
+   temp file, rename, and retry if the file changed underneath. Validated:
+   it only affects display (`/status` keeps naming the old account if it is
+   skipped; billing follows `.credentials.json`). Still needed for identity
+   rule 3 and for a correct `/status`.
 5. **Expect the target's refresh.** The target's saved access token has
    probably expired while it was inactive, so a session will refresh it
    and rewrite the file within moments. That is the target's own refresh:
@@ -182,13 +194,15 @@ or the first request after a switch fails authentication, mark the account
 
 ### Usage, dashboard and alerts
 
-- **Active account:** poll the usage data that `/usage` shows (5-hour and
-  weekly utilization and reset times) with the access token already in
-  `.credentials.json`. The endpoint and headers are not documented;
-  **verify** what Claude Code 2.1.x calls (e.g. by tracing `/usage`). If
-  polling with the in-file token is not workable, fall back to reading the
-  numbers a session already displays, or run `claude` non-interactively to
-  print usage.
+- **Active account:** poll the usage data that `/usage` shows with the
+  access token already in `.credentials.json`:
+  `GET https://api.anthropic.com/api/oauth/usage` with
+  `Authorization: Bearer <accessToken>` (no beta header needed; validated,
+  HTTP 200). The response has `five_hour` and `seven_day`, each with
+  `utilization` (whole percent) and `resets_at`, plus model-specific and
+  spend fields. Undocumented, so tolerate it changing shape. Never poll an
+  inactive account's saved token (decision 3); it only stays valid until
+  that account's next refresh anyway.
 - **Inactive accounts:** last reading taken while active, its timestamp,
   and the reset times from that reading. An account whose weekly reset has
   passed since its last reading is shown as "likely refilled".
@@ -257,6 +271,29 @@ the old account failing.
    and whether several sessions refreshing at once each write the file.
 
 Write the findings into this doc and resolve each **verify**.
+
+### Validation results (laptop, 2026-10-22)
+
+Laptop (pop-os), Claude Code 2.1.308, no `CLAUDE_CODE_OAUTH_TOKEN`,
+`ANTHROPIC_*` or `apiKeyHelper` set. Accounts: A = an account at ~10%
+(also active on another machine, so its usage was not a clean signal),
+B = an account at 94% five-hour and otherwise idle, used as the clean
+signal. Tokens were handled only as 8-hex SHA-256 fingerprints.
+
+| Step | Result |
+|---|---|
+| 1. Save logins | `/login` wrote `.credentials.json` **in place** (same inode) plus `oauthAccount`. `/login` to B did not invalidate A's saved tokens. |
+| 2. Swap without `/login` | **Works.** With two sessions running on A, an in-place swap to B: their next prompts were billed to B (B 94% → 95%, the sessions showed B's 94% warning); swapping back to A stopped B's usage. A session running before an earlier swap A ← B also followed it. No session rewrote the file after a swap. Rename swap not tested. |
+| 3. `oauthAccount` | **Display only.** With credentials on A and `oauthAccount` still B, `/status` showed B's email while usage went to A. |
+| 4. Refresh rotation | Setting `expiresAt` to the past made a running session refresh within ~1 s, unprompted, holding `~/.claude/.oauth_refresh.lock`. **Both tokens rotated**; the old access token returned 401 immediately. The refresh rewrote the file by **rename** (new inode). Reusing the pre-refresh refresh token was deliberately not tested (reuse detection could revoke the whole login); treat saved copies as single-use after any refresh. |
+| 5. Usage source | `GET /api/oauth/usage` (see Usage above). |
+| 6. Refresh lead time | **Not measured.** Normal refresh happens some time before `expiresAt` (access tokens last 8 h); an `expiresAt` in the past triggers an immediate refresh. Concurrent refreshes: the lock serialises them and a waiter adopts the winner's file rather than refreshing again (from the binary; only one refresher was observed). |
+
+Implications for the build: write back before every switch, swap in place
+under Claude Code's refresh lock, keep each account's `oauthAccount` from
+`capture`, and still rewrite `oauthAccount` for `/status` and identity.
+Open: whether long-running sessions later rewrite `~/.claude.json` with a
+stale in-memory `oauthAccount` (a written value held for 60 s here).
 
 ### 2. Build
 
