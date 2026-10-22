@@ -43,6 +43,13 @@ def _serialize(row: dict) -> dict:
     return {k: str(v) if isinstance(v, uuid.UUID) else v for k, v in row.items()}
 
 
+def _event_value(values: dict) -> dict:
+    """JSON-safe copy of an event's previous/new values. The jsonb codec uses
+    plain json.dumps, so a UUID (e.g. coordinator_task_id) or timestamp in an
+    audit row used to fail the whole update with a 500."""
+    return json.loads(json.dumps(values, default=str))
+
+
 async def _init_connection(conn: asyncpg.Connection) -> None:
     """Per-connection setup. Registers a JSONB codec so columns like
     `metadata` and `resume_metadata` round-trip as Python dicts in both
@@ -590,7 +597,8 @@ async def update_initiative(
                    VALUES ($1,$2,$3,$4,$5,$6)""",
                 current["id"], actor,
                 "status_changed" if "status" in fields else "updated",
-                {key: current[key] for key in fields}, fields, reason,
+                _event_value({key: current[key] for key in fields}),
+                _event_value(fields), reason,
             )
         result = _serialize(dict(row))
         result["projects"] = await _initiative_projects_conn(conn, result["id"])
@@ -670,7 +678,8 @@ async def update_initiative_project(
                     previous_value, new_value, reason)
                    VALUES ($1,$2,'project_updated',$3,$4,$5,$6)""",
                 initiative["id"], actor, project,
-                {key: current[key] for key in fields}, fields, reason,
+                _event_value({key: current[key] for key in fields}),
+                _event_value(fields), reason,
             )
         return _serialize(dict(row))
 
