@@ -18,7 +18,8 @@ from fastapi.responses import JSONResponse
 from api.auth import verify_token
 from api.models import (
     TaskCreate, TaskUpdate, TaskResponse, ArtifactCreate, ArtifactResponse,
-    BacktestPhaseUpdate, TaskLeadUpdate, InitiativeCreate, InitiativeUpdate,
+    BacktestPhaseUpdate, TaskLeadUpdate, TaskModelUpdate, TaskModelResolution,
+    InitiativeCreate, InitiativeUpdate,
     InitiativeProjectCreate, InitiativeProjectUpdate, InitiativeResponse,
     TaskChangesResponse,
 )
@@ -801,6 +802,37 @@ def _keep_lead_pin(task: dict, new_metadata: dict | None) -> dict | None:
     merged = dict(new_metadata or {})
     merged[LEAD_PIN_KEY] = pin
     return merged
+
+
+@app.post("/tasks/{task_id}/model", response_model=TaskResponse,
+          dependencies=[Depends(verify_token)])
+async def set_task_model(task_id: str, body: TaskModelUpdate, pool=Depends(get_pool)):
+    """Set a task's default model for one engine, or clear it with null.
+
+    Touches only ``metadata.models.<engine>`` (``PATCH`` replaces the whole
+    bag). Subtasks inherit it: see ``GET /tasks/{id}/model``.
+    """
+    task = await _get_task_or_error(pool, task_id)
+    model = (body.model or "").strip() or None
+    updated = await db.set_task_model(pool, str(task["id"]), body.engine, model)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return updated
+
+
+@app.get("/tasks/{task_id}/model", response_model=TaskModelResolution,
+         dependencies=[Depends(verify_token)])
+async def resolve_task_model(task_id: str, engine: str = Query(..., pattern=r"^(claude|codex)$"),
+                             pool=Depends(get_pool)):
+    """The default model for ``engine`` on this task: its own
+    ``metadata.models.<engine>``, else the nearest ancestor's. ``model`` is
+    null when none sets one; callers then use their engine default.
+    """
+    task = await _get_task_or_error(pool, task_id)
+    resolved = await db.resolve_task_model(pool, str(task["id"]), engine)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"engine": engine, **resolved}
 
 
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])

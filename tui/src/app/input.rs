@@ -194,7 +194,8 @@ pub(super) enum InputMode {
         lead_choices: Vec<(String, String)>,
         /// The pin when the form opened; a save changes it only if it moved.
         lead_pinned: Option<String>,
-        /// 0 = name, 1 = color, 2 = section, 3 = lead
+        /// 0 = name, 1 = color, 2 = section, 3 = lead, 4/5 = default
+        /// claude/codex model (`App::task_form_models`)
         active_field: u8,
     },
     /// Picking which workflow to launch when more than one is defined.
@@ -494,6 +495,8 @@ pub(crate) enum SubmitAction {
         in_place: bool,
         host_id: cm_daemon::host_id::HostId,
         parent: crate::task_picker::TaskChoice,
+        /// Explicit Model field value; `None` = task default, else engine default.
+        model: Option<String>,
     },
     CreateLocalSession {
         engine: LaunchEngine,
@@ -510,6 +513,8 @@ pub(crate) enum SubmitAction {
         /// create path pins the new workspace to THIS host — local →
         /// existing local create path, remote → `create_remote_session`.
         host_id: cm_daemon::host_id::HostId,
+        /// Explicit Model field value; `None` = engine default.
+        model: Option<String>,
     },
     SpawnSessionOnWorkspace {
         workspace_id: String,
@@ -519,6 +524,9 @@ pub(crate) enum SubmitAction {
         /// proper-resume: resume this transcript instead of starting a
         /// fresh conversation (see `InputMode::NewTerminalSession`).
         resume_from: Option<String>,
+        /// Explicit Model field value; `None` = the recorded model of a
+        /// resumed row, else the task default, else the engine default.
+        model: Option<String>,
     },
     /// Open the snapshot catalog in picker mode from the A-n form. Carries
     /// the form state so the catalog can re-open the form (with seed_from
@@ -615,6 +623,8 @@ pub(crate) enum SubmitAction {
         section: Option<String>,
         /// `Some(pin)` when the lead pin changed (`Some(None)` clears it).
         lead: Option<Option<String>>,
+        /// Changed default models, `(engine, Some(model) | None = clear)`.
+        models: Vec<(String, Option<String>)>,
     },
     EnterWorkflowLaunchConfirm {
         ws_id: String,
@@ -670,6 +680,8 @@ pub(crate) struct NewSessionMut<'a> {
     pub reports_to: &'a mut crate::task_picker::ReportsTo,
     pub picker: &'a mut Option<crate::task_picker::TaskPicker>,
     pub report_tasks: &'a [crate::task_picker::TaskChoice],
+    /// Field 8 (`App::form_model`).
+    pub model: &'a mut super::model_field::ModelField,
 }
 
 pub(crate) struct NewTerminalSessionMut<'a> {
@@ -679,6 +691,8 @@ pub(crate) struct NewTerminalSessionMut<'a> {
     pub seed_from: &'a mut Option<String>,
     pub resume_from: &'a mut Option<String>,
     pub active_field: &'a mut u8,
+    /// Field 3 (`App::form_model`).
+    pub model: &'a mut super::model_field::ModelField,
 }
 
 pub(crate) struct SessionSettingsMut<'a> {
@@ -999,6 +1013,8 @@ pub(crate) struct TaskSettingsMut<'a> {
     pub lead_choices: &'a [(String, String)],
     pub lead_pinned: Option<&'a str>,
     pub active_field: &'a mut u8,
+    /// Fields 4 (claude) and 5 (codex): the task's default models.
+    pub models: &'a mut super::model_field::TaskModelsEdit,
 }
 
 pub(crate) struct WorkflowLaunchConfirmMut<'a> {
@@ -1032,7 +1048,7 @@ pub(crate) fn handle_new_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    const FIELD_COUNT: u8 = 8; // repo, label, branch, idle, seed-from, host, engine, reports-to
+    const FIELD_COUNT: u8 = 9; // repo, label, branch, idle, seed-from, host, engine, reports-to, model
     use crate::task_picker::{PickerKey, ReportsTo, TaskPicker};
     if let Some(picker) = state.picker.as_mut() {
         match picker.key(*key) {
@@ -1043,6 +1059,9 @@ pub(crate) fn handle_new_session(
                 *state.picker = None;
             }
         }
+        return InputOutcome::Consumed;
+    }
+    if *state.active_field == 8 && state.model.key(*key) {
         return InputOutcome::Consumed;
     }
     if *state.active_field == 7 {
@@ -1131,6 +1150,7 @@ pub(crate) fn handle_new_session(
             *state.engine = state.engine.cycle();
             // A snapshot is specific to its engine, as in the A-s form.
             *state.seed_from = None;
+            state.model.retarget(state.engine.as_session_type());
             InputOutcome::Consumed
         }
         KeyCode::Enter if *state.active_field == 4 => {
@@ -1150,6 +1170,10 @@ pub(crate) fn handle_new_session(
             })
         }
         KeyCode::Enter => {
+            let model = match state.model.value() {
+                Ok(m) => m,
+                Err(e) => return InputOutcome::Status(e),
+            };
             if !state.label_text.trim().is_empty() {
                 // Branch field semantics:
                 //   "."   → in-place: run in the main repo, no worktree/branch.
@@ -1184,6 +1208,7 @@ pub(crate) fn handle_new_session(
                         in_place,
                         host_id: state.host_id.clone(),
                         parent,
+                        model,
                     });
                 }
                 InputOutcome::Submit(SubmitAction::CreateLocalSession {
@@ -1195,6 +1220,7 @@ pub(crate) fn handle_new_session(
                     seed_from: state.seed_from.clone(),
                     in_place,
                     host_id: state.host_id.clone(),
+                    model,
                 })
             } else {
                 // Empty Name field: pre-fix this was a silent no-op (Enter did
@@ -1244,10 +1270,13 @@ pub(crate) fn handle_new_terminal_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    // Three fields: 0 = session type, 1 = seed-from, 2 = resume-from.
-    // Tab/BackTab cycle between them; j/k cycle the session type when
-    // field 0 is active (within-field). j/k on the picker fields are
-    // no-ops (would conflict with the picker selection later).
+    // Four fields: 0 = session type, 1 = seed-from, 2 = resume-from,
+    // 3 = model. Tab/BackTab cycle between them; j/k cycle the session
+    // type when field 0 is active (within-field). j/k on the picker
+    // fields are no-ops (would conflict with the picker selection later).
+    if *state.active_field == 3 && state.model.key(*key) {
+        return InputOutcome::Consumed;
+    }
     match (key.code, *state.active_field) {
         (KeyCode::Esc, 1) if state.seed_from.is_some() => {
             *state.seed_from = None;
@@ -1259,11 +1288,11 @@ pub(crate) fn handle_new_terminal_session(
         }
         (KeyCode::Esc, _) => InputOutcome::Cancel,
         (KeyCode::Tab, _) => {
-            *state.active_field = (*state.active_field + 1) % 3;
+            *state.active_field = (*state.active_field + 1) % 4;
             InputOutcome::Consumed
         }
         (KeyCode::BackTab, _) => {
-            *state.active_field = (*state.active_field + 2) % 3;
+            *state.active_field = (*state.active_field + 3) % 4;
             InputOutcome::Consumed
         }
         (KeyCode::Char('j') | KeyCode::Down, 0) => {
@@ -1277,6 +1306,7 @@ pub(crate) fn handle_new_terminal_session(
             // longer applies.
             *state.seed_from = None;
             *state.resume_from = None;
+            state.model.retarget(state.session_type);
             InputOutcome::Consumed
         }
         (KeyCode::Char('k') | KeyCode::Up, 0) => {
@@ -1287,6 +1317,7 @@ pub(crate) fn handle_new_terminal_session(
             };
             *state.seed_from = None;
             *state.resume_from = None;
+            state.model.retarget(state.session_type);
             InputOutcome::Consumed
         }
         (KeyCode::Enter, 1) => {
@@ -1321,12 +1352,17 @@ pub(crate) fn handle_new_terminal_session(
             )
         }
         (KeyCode::Enter, _) => {
+            let model = match state.model.value() {
+                Ok(m) => m,
+                Err(e) => return InputOutcome::Status(e),
+            };
             InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
                 workspace_id: state.workspace_id.to_string(),
                 session_type: state.session_type.clone(),
                 task_id: state.task_id.clone(),
                 seed_from: state.seed_from.clone(),
                 resume_from: state.resume_from.clone(),
+                model,
             })
         }
         _ => InputOutcome::Consumed,
@@ -1885,10 +1921,17 @@ pub(crate) fn handle_task_settings(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    if matches!(*state.active_field, 4 | 5) && state.models.key(*state.active_field as usize - 4, *key) {
+        return InputOutcome::Consumed;
+    }
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
-        KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 4;
+        KeyCode::Tab => {
+            *state.active_field = (*state.active_field + 1) % 6;
+            InputOutcome::Consumed
+        }
+        KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + 5) % 6;
             InputOutcome::Consumed
         }
         KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left if *state.active_field == 3 => {
@@ -1913,14 +1956,21 @@ pub(crate) fn handle_task_settings(
                 cycle_section_choice(state.section.as_deref(), ctx.section_ids, false);
             InputOutcome::Consumed
         }
-        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveTaskName {
-            task_id: state.task_id.to_string(),
-            workspace_id: state.workspace_id.to_string(),
-            name: state.name.trim().to_string(),
-            color: state.color.clone(),
-            section: state.section.clone(),
-            lead: (state.lead.as_deref() != state.lead_pinned).then(|| state.lead.clone()),
-        }),
+        KeyCode::Enter => {
+            let models = match state.models.changes() {
+                Ok(m) => m,
+                Err(e) => return InputOutcome::Status(e),
+            };
+            InputOutcome::Submit(SubmitAction::SaveTaskName {
+                task_id: state.task_id.to_string(),
+                workspace_id: state.workspace_id.to_string(),
+                name: state.name.trim().to_string(),
+                color: state.color.clone(),
+                section: state.section.clone(),
+                lead: (state.lead.as_deref() != state.lead_pinned).then(|| state.lead.clone()),
+                models,
+            })
+        }
         KeyCode::Backspace if *state.active_field == 0 => {
             state.name.pop();
             InputOutcome::Consumed
@@ -2757,6 +2807,7 @@ impl App {
                 let workspace_id = ws.id.clone();
                 let current_section = self.workspace_sections.get(&workspace_id).cloned();
                 let (lead_choices, lead_pinned) = self.lead_choices(&task_id);
+                self.task_form_models = self.task_models_edit(&task_id);
                 self.input_mode = InputMode::TaskSettings {
                     task_id,
                     workspace_id,
@@ -3086,6 +3137,7 @@ impl App {
                     engine,
                     host_id,
                     reparent,
+                    model,
                 } => {
                     if reparent {
                         self.set_task_parent(&task_id, parent_task_id.as_deref());
@@ -3101,6 +3153,7 @@ impl App {
                         in_place,
                         engine.as_session_type(),
                         &host_id,
+                        model.as_deref(),
                     );
                     return true;
                 }
@@ -3114,6 +3167,7 @@ impl App {
                     parent_task_id,
                     engine,
                     reparent,
+                    model,
                 } => {
                     if reparent {
                         self.set_task_parent(&task_id, parent_task_id.as_deref());
@@ -3127,6 +3181,7 @@ impl App {
                         &prompt,
                         parent_task_id.as_deref(),
                         engine.as_session_type(),
+                        model.as_deref(),
                     );
                     return true;
                 }
@@ -3970,6 +4025,7 @@ impl App {
                     reports_to: &mut self.new_session_reports_to,
                     picker: &mut self.new_session_picker,
                     report_tasks: &report_tasks,
+                    model: &mut self.form_model,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
@@ -3989,6 +4045,7 @@ impl App {
                     seed_from,
                     resume_from,
                     active_field,
+                    model: &mut self.form_model,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
@@ -4105,6 +4162,7 @@ impl App {
                         lead_choices,
                         lead_pinned: lead_pinned.as_deref(),
                         active_field,
+                        models: &mut self.task_form_models,
                     },
                     InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                     event,
@@ -4299,9 +4357,10 @@ impl App {
                 in_place,
                 host_id,
                 parent,
+                model,
             } => {
                 self.create_reporting_workspace(
-                    engine, &repo_url, &label, branch, in_place, host_id, parent,
+                    engine, &repo_url, &label, branch, in_place, host_id, parent, model,
                 );
             }
             SubmitAction::CreateLocalSession {
@@ -4313,6 +4372,7 @@ impl App {
                 seed_from,
                 in_place,
                 host_id,
+                model,
             } => {
                 self.create_local_session(
                     &host_id,
@@ -4323,6 +4383,7 @@ impl App {
                     idle_timeout_secs,
                     seed_from.as_deref(),
                     in_place,
+                    model.as_deref(),
                 );
             }
             SubmitAction::SpawnSessionOnWorkspace {
@@ -4331,9 +4392,10 @@ impl App {
                 task_id,
                 seed_from,
                 resume_from,
+                model,
             } => {
                 if let Some(host) = self.alternate_form_host(&workspace_id) {
-                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref(), None);
+                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref(), None, model.as_deref());
                     return;
                 }
                 self.spawn_session_on_workspace(
@@ -4342,6 +4404,7 @@ impl App {
                     task_id,
                     seed_from.as_deref(),
                     resume_from.as_deref(),
+                    model.as_deref(),
                 );
             }
             SubmitAction::OpenSnapshotPickerForNewSession {
@@ -4509,7 +4572,12 @@ impl App {
                 // emits it.
                 let _ = name;
             }
-            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section, lead } => {
+            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section, lead, models } => {
+                // Each changed default goes through `POST /tasks/{id}/model`,
+                // which touches only `metadata.models.<engine>`.
+                for (engine, model) in models {
+                    self.backend.set_task_model(task_id.clone(), engine, model);
+                }
                 // The lead pin goes through its own endpoint, which changes
                 // only that metadata key. Applied locally at once so the ★
                 // moves now; the API row confirms it.
@@ -4577,7 +4645,7 @@ impl App {
                     let launch: Box<dyn FnOnce(&mut App, String) + Send> = Box::new(move |app, new_id| {
                         app.launch_workflow_via_daemon(&new_id, &workflow_name, &slots, goal, None);
                     });
-                    self.new_workspace_on_host(&ws_id, &host, "bash", None, Some(launch));
+                    self.new_workspace_on_host(&ws_id, &host, "bash", None, Some(launch), None);
                     return;
                 }
 
@@ -4708,6 +4776,7 @@ mod yank_clipboard_tests {
         )
         .expect("session for test");
         TerminalSession {
+            model: None,
             color: None,
             uid: "yank-uid".into(),
             label: "yank-test".into(),
@@ -5179,6 +5248,7 @@ mod input_handler_tests {
             new_session_state("hello", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5205,6 +5275,7 @@ mod input_handler_tests {
             new_session_state("foo", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5230,6 +5301,7 @@ mod input_handler_tests {
             new_session_state("my-task", "feat/x", "10", "https://github.com/a/b", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5255,7 +5327,9 @@ mod input_handler_tests {
                 seed_from,
                 in_place,
                 host_id,
+                model,
             }) => {
+                assert_eq!(model, None, "an untouched Model field leaves resolution to the spawn");
                 assert_eq!(engine, LaunchEngine::Codex);
                 assert_eq!(repo_url, "https://github.com/a/b");
                 assert_eq!(label, "my-task");
@@ -5280,6 +5354,7 @@ mod input_handler_tests {
                 new_session_state("my-task", raw, "10", "https://github.com/a/b", 1);
             let outcome = handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -5311,6 +5386,7 @@ mod input_handler_tests {
             new_session_state("my-task", "./foo", "10", "https://github.com/a/b", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5346,6 +5422,7 @@ mod input_handler_tests {
             new_session_state("   ", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5377,6 +5454,7 @@ mod input_handler_tests {
             new_session_state("", "", "2", "", 2);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5404,6 +5482,7 @@ mod input_handler_tests {
             new_session_state("", "", "2", "b", 0);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5446,6 +5525,7 @@ mod input_handler_tests {
                          picker: &mut Option<TaskPicker>| {
             handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -5499,22 +5579,23 @@ mod input_handler_tests {
     }
 
     #[test]
-    fn new_session_tab_cycles_through_eight_fields() {
+    fn new_session_tab_cycles_through_nine_fields() {
         // Engine is field 6, Reports to field 7; both directions wrap through every field.
         let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("", "", "", "", 0);
         let mut seed: Option<String> = None;
-        for (code, expected) in [1, 2, 3, 4, 5, 6, 7, 0]
+        for (code, expected) in [1, 2, 3, 4, 5, 6, 7, 8, 0]
             .into_iter()
             .map(|field| (KeyCode::Tab, field))
             .chain(
-                [7, 6, 5, 4, 3, 2, 1, 0]
+                [8, 7, 6, 5, 4, 3, 2, 1, 0]
                     .into_iter()
                     .map(|field| (KeyCode::BackTab, field)),
             )
         {
             handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -5541,6 +5622,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = None;
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5590,6 +5672,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = Some("reviewer".into());
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5617,6 +5700,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = None;
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5642,6 +5726,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = Some("reviewer-strict".into());
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5678,6 +5763,7 @@ mod input_handler_tests {
         ] {
             let outcome = handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut engine,
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -5699,6 +5785,7 @@ mod input_handler_tests {
         }
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut engine,
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5731,6 +5818,7 @@ mod input_handler_tests {
             new_session_state("task", "feat/x", "12", "https://github.com/a/b", 4);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::Codex,
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5800,6 +5888,7 @@ mod input_handler_tests {
         let mut press = |code: KeyCode, host: &mut cm_daemon::host_id::HostId| {
             handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -5842,6 +5931,7 @@ mod input_handler_tests {
         // Cycle to the remote host, then submit from the host field.
         handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5859,6 +5949,7 @@ mod input_handler_tests {
         );
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5890,6 +5981,7 @@ mod input_handler_tests {
             new_session_state("task", "", "2", "https://github.com/a/b", 5);
         handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5918,6 +6010,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-7",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5940,6 +6033,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-4",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5975,6 +6069,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -6001,6 +6096,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -6025,6 +6121,7 @@ mod input_handler_tests {
         for expected in [1u8, 2, 0] {
             handle_new_terminal_session(
                 NewTerminalSessionMut {
+                    model: &mut Default::default(),
                     workspace_id: "ws-0",
                     session_type: &mut session_type,
                     task_id: &task_id,
@@ -6047,6 +6144,7 @@ mod input_handler_tests {
         let mut active = 1u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -6068,6 +6166,7 @@ mod input_handler_tests {
         let mut active = 1u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-9",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -6107,6 +6206,7 @@ mod input_handler_tests {
         let mut active = 1u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -6129,6 +6229,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-1",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -6220,6 +6321,7 @@ mod input_handler_tests {
         macro_rules! st {
             () => {
                 NewTerminalSessionMut {
+                    model: &mut Default::default(),
                     workspace_id: "ws-1",
                     session_type: &mut st,
                     task_id: &None,
@@ -7317,6 +7419,7 @@ mod input_handler_tests {
             )
             .expect("dummy session for fixture");
             out.sessions.push(TerminalSession {
+                model: None,
                 color: None,
                 uid: (*uid).into(),
                 label: (*uid).into(),
@@ -7949,6 +8052,7 @@ mod input_handler_tests {
         let mut section: Option<String> = None;
         let outcome = handle_task_settings(
             TaskSettingsMut {
+                models: &mut Default::default(),
                 task_id: task_id.as_str(),
                 workspace_id: "ws-task",
                 name: &mut name,
@@ -7974,6 +8078,7 @@ mod input_handler_tests {
         let mut section: Option<String> = None;
         let outcome = handle_task_settings(
             TaskSettingsMut {
+                models: &mut Default::default(),
                 task_id: task_id.as_str(),
                 workspace_id: "ws-task",
                 name: &mut name,
@@ -8008,6 +8113,7 @@ mod input_handler_tests {
         let mut section: Option<String> = None;
         let _ = handle_task_settings(
             TaskSettingsMut {
+                models: &mut Default::default(),
                 task_id: task_id.as_str(),
                 workspace_id: "ws-task",
                 name: &mut name,

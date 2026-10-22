@@ -14,6 +14,22 @@ alone rejects tools that still need approval; pair it with their explicit
 `default_tools_approval_mode="approve"` settings. See
 [Codex permissions and live repair](doc/messaging/NATIVE_NOTIFICATIONS.md#codex-restart-permissions-cli-0154).
 
+## Explicit models
+
+CM never relies on an engine's default model: every Claude/Codex spawn passes
+`--model` / `-m`. Fresh spawns, resumes, `A-R`, restore, forks, continuous
+tasks, workflow roles (optional `model` per role) and MCP spawns all do this.
+Resolution: explicit `model=` / form field → the task default
+(`metadata.models.<engine>`, inherited from ancestors; set via
+`POST /tasks/{id}/model`, `A-e` on a task, or `propose_task` /
+`create_subtask(model=, model_engine=)`) → `[models] claude` / `codex` in
+`daemon.toml` and `tui-settings.toml` (defaults `claude-opus-5-5`,
+`gpt-6.1-sol`; `claude_choices` / `codex_choices` are the form presets, with
+`gpt-6-luna` as the cheap option). The resolved model is recorded on the
+session, reused by revive/resume, and shown in `list_sessions`, `A-i` and F6.
+The Model row is in `A-n`, `A-s`, `A-F` and the `A-f` dialogs (Alt+o). See
+[explicit model choice](doc/models.md).
+
 ## Repository workflow
 
 Work on branches and merge tested changes directly into `main`. Owner does not use pull requests in this repository; do not create them.

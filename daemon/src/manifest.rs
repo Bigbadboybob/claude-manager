@@ -371,6 +371,11 @@ pub struct ManifestEntry {
     /// `workflow_run_id`'s daemon→manifest→TUI threading exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default)]
@@ -1025,6 +1030,7 @@ mod tests {
             workflow_run_id: None,
             workflow_role: None,
             continuous_task_id: None,
+            model: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -1134,6 +1140,7 @@ mod tests {
             workflow_run_id: None,
             workflow_role: None,
             continuous_task_id: Some("bug-triage".into()),
+            model: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,

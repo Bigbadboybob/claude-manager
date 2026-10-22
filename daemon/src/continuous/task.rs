@@ -278,6 +278,11 @@ pub struct ContinuousTask {
     pub worktree_path: String,
     // ----- config (Phase 2) -----
     pub engine: Engine,
+    /// The model its orchestrator sessions launch with. `None` → the
+    /// engine default from `daemon.toml` `[models]`. Workers pick their
+    /// own through `start_session(model=…)` or their task's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub run_mode: RunMode,
     pub schedule: Schedule,
     #[serde(default)]
@@ -429,6 +434,7 @@ impl ContinuousTask {
     ) -> Self {
         ContinuousTask {
             task_id,
+            model: None,
             planning_task_id: None,
             messaging: None,
             task_channel: TaskChannelPolicy::Auto,

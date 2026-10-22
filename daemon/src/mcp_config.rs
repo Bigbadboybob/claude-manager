@@ -759,18 +759,33 @@ pub fn codex_overrides(
 /// Restricted to the three Python MCP tool types. Anything else
 /// → `Err(io::Error::Other)` so callers surface `InvalidParams`
 /// at the wire boundary.
+///
+/// `model` is required for `claude-code` and `codex` (resolved by the
+/// caller, see `crate::models`) and ignored for `bash`: CM never leaves an
+/// agent on its engine's default model.
 pub fn build_args(
     session_type: &str,
     session_uid: &str,
     workflow: Option<&WorkflowMeta>,
     server_path_override: Option<&str>,
     resume_session_id: Option<&str>,
+    model: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>, Option<String>)> {
     let launch = match resume_session_id {
         Some(id) => Launch::Resume(id),
         None => Launch::Fresh,
     };
-    build_launch_args(session_type, session_uid, workflow, server_path_override, launch)
+    build_launch_args(session_type, session_uid, workflow, server_path_override, launch, model)
+}
+
+/// The validated model for an agent argv, or an `InvalidInput` error
+/// naming the omission.
+fn required_model(session_type: &str, model: Option<&str>) -> std::io::Result<String> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
+    let m = model.ok_or_else(|| {
+        invalid(format!("a {session_type} spawn must name its model explicitly"))
+    })?;
+    crate::models::validate_model(m).map_err(invalid)
 }
 
 /// How an agent conversation starts: fresh, continuing a transcript in
@@ -800,6 +815,7 @@ pub fn build_launch_args(
     workflow: Option<&WorkflowMeta>,
     server_path_override: Option<&str>,
     launch: Launch<'_>,
+    model: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>, Option<String>)> {
     let resume_session_id = match launch {
         Launch::Resume(id) => Some(id),
@@ -807,9 +823,11 @@ pub fn build_launch_args(
     };
     match session_type {
         "claude-code" => {
+            let model = required_model(session_type, model)?;
             let cfg = write_claude_mcp_config(session_uid, workflow, server_path_override)?;
             let mut args = Vec::new();
             args.push("--dangerously-skip-permissions".to_string());
+            args.extend(crate::models::model_args(session_type, &model));
             args.push("--mcp-config".to_string());
             args.push(cfg.to_string_lossy().to_string());
             args.extend(crate::claude_channels::args(&cfg));
@@ -855,6 +873,7 @@ pub fn build_launch_args(
             Ok(("claude".to_string(), args, pinned))
         }
         "codex" => {
+            let model = required_model(session_type, model)?;
             let mut args = Vec::new();
             // P0 S3 (resume): codex resumes via the `resume` SUBCOMMAND
             // (must be the first arg) with the SESSION_ID positional at the
@@ -875,6 +894,9 @@ pub fn build_launch_args(
                 args.push("--dangerously-bypass-approvals-and-sandbox".into());
             }
             args.extend(codex_screen_args(codex_inline_scrollback()));
+            // `native_codex.py::split_args` gives `-m` to the frontend and
+            // mirrors it as the backend's `model` default.
+            args.extend(crate::models::model_args(session_type, &model));
             // Same update-check disable the TUI applies — prevents
             // codex's popup from tearing down the PTY.
             args.push("-c".into());
@@ -1276,7 +1298,7 @@ mod tests {
             "ts-hooky",
             None,
             Some(server.to_str().unwrap()),
-            None,
+            None, Some("test-model"),
         )
         .expect("build_args");
         let pos = args
@@ -1733,7 +1755,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args, _pin) = build_args("bash", "ts-bash-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("bash", "ts-bash-1", None, None, None, Some("test-model")).expect("ok");
         assert_eq!(prog, "/bin/bash");
         assert!(args.is_empty(), "bash spawns raw with no args");
     }
@@ -1743,7 +1765,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args, _pin) = build_args("claude-code", "ts-claude-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("claude-code", "ts-claude-1", None, None, None, Some("test-model")).expect("ok");
         assert_eq!(prog, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         let mcp_idx = args
@@ -1787,7 +1809,7 @@ mod tests {
         for transport in ["channel", "socket"] {
             std::fs::write(&preference, format!(r#"{{"transport":"{transport}"}}"#)).unwrap();
             for resume in [None, Some("saved-claude-session")] {
-                let (_, args, pin) = build_args("claude-code", "ts-channel-1", None, None, resume).unwrap();
+                let (_, args, pin) = build_args("claude-code", "ts-channel-1", None, None, resume, Some("test-model")).unwrap();
                 let cfg = Path::new(&args[args.iter().position(|a| a == "--mcp-config").unwrap() + 1]);
                 let json: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg).unwrap()).unwrap();
                 assert_eq!(json["mcpServers"]["claude-manager"]["env"]["CM_CLAUDE_CHANNEL"] == "1", transport == "channel");
@@ -1809,7 +1831,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, _pin) =
-            build_args("claude-code", "ts-rsm-1", None, None, Some("sid-abc")).expect("ok");
+            build_args("claude-code", "ts-rsm-1", None, None, Some("sid-abc"), Some("test-model")).expect("ok");
         assert_eq!(prog, "claude");
         assert!(
             args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-abc"),
@@ -1831,7 +1853,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, pin) =
-            build_args("claude-code", "ts-pin-1", None, None, None).expect("ok");
+            build_args("claude-code", "ts-pin-1", None, None, None, Some("test-model")).expect("ok");
         assert_eq!(prog, "claude");
         let pin = pin.expect("fresh claude spawn must return the minted pin");
         assert!(
@@ -1851,11 +1873,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (_p, codex_args, codex_pin) =
-            build_args("codex", "ts-pin-2", None, None, None).expect("ok");
+            build_args("codex", "ts-pin-2", None, None, None, Some("test-model")).expect("ok");
         assert!(codex_pin.is_none());
         assert!(!codex_args.iter().any(|a| a == "--session-id"));
         let (_p2, bash_args, bash_pin) =
-            build_args("bash", "ts-pin-3", None, None, None).expect("ok");
+            build_args("bash", "ts-pin-3", None, None, None, Some("test-model")).expect("ok");
         assert!(bash_pin.is_none() && bash_args.is_empty());
     }
 
@@ -1865,7 +1887,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, _pin) =
-            build_args("codex", "ts-rsm-2", None, None, Some("sid-xyz")).expect("ok");
+            build_args("codex", "ts-rsm-2", None, None, Some("sid-xyz"), Some("test-model")).expect("ok");
         assert!(prog.ends_with("launcher.sh"));
         assert_eq!(args[0], "native_codex.py");
         assert_eq!(
@@ -1891,7 +1913,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, pin) = build_launch_args(
-            "claude-code", "ts-fork-1", None, None, Launch::Fork("src-sid"),
+            "claude-code", "ts-fork-1", None, None, Launch::Fork("src-sid"), Some("test-model"),
         )
         .expect("ok");
         assert_eq!(prog, "claude");
@@ -1916,7 +1938,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, pin) = build_launch_args(
-            "codex", "ts-fork-2", None, None, Launch::Fork("src-thread"),
+            "codex", "ts-fork-2", None, None, Launch::Fork("src-thread"), Some("test-model"),
         )
         .expect("ok");
         assert!(prog.ends_with("launcher.sh"));
@@ -1934,9 +1956,9 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (_, resumed, _) = build_args("codex", "ts-v-1", None, None, Some("x")).unwrap();
+        let (_, resumed, _) = build_args("codex", "ts-v-1", None, None, Some("x"), Some("test-model")).unwrap();
         let (_, launched, _) =
-            build_launch_args("codex", "ts-v-1", None, None, Launch::Resume("x")).unwrap();
+            build_launch_args("codex", "ts-v-1", None, None, Launch::Resume("x"), Some("test-model")).unwrap();
         assert_eq!(resumed, launched);
     }
 
@@ -1946,7 +1968,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         for resume in [None, Some("sid-inline")] {
-            let (_p, args, _pin) = build_args("codex", "ts-inl-1", None, None, resume).expect("ok");
+            let (_p, args, _pin) = build_args("codex", "ts-inl-1", None, None, resume, Some("test-model")).expect("ok");
             let engine = &args[args.iter().position(|a| a == "--").unwrap() + 1..];
             let flag = engine.iter().position(|a| a == "--no-alt-screen");
             assert!(flag.is_some(), "codex must launch inline (scrollback): {:?}", engine);
@@ -1966,13 +1988,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (_p, claude, _pin) =
-            build_args("claude-code", "ts-nr-1", None, None, None).expect("ok");
+            build_args("claude-code", "ts-nr-1", None, None, None, Some("test-model")).expect("ok");
         assert!(
             !claude.iter().any(|a| a == "--resume"),
             "no `--resume` when not resuming: {:?}",
             claude,
         );
-        let (_p2, codex, _pin) = build_args("codex", "ts-nr-2", None, None, None).expect("ok");
+        let (_p2, codex, _pin) = build_args("codex", "ts-nr-2", None, None, None, Some("test-model")).expect("ok");
         assert_ne!(
             codex.first().map(String::as_str),
             Some("resume"),
@@ -1986,7 +2008,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args, _pin) = build_args("codex", "ts-codex-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("codex", "ts-codex-1", None, None, None, Some("test-model")).expect("ok");
         assert!(prog.ends_with("launcher.sh"));
         assert_eq!(args[0], "native_codex.py");
         assert!(
@@ -2077,7 +2099,7 @@ mod tests {
         let _h = HomeGuard::set(dir.path());
         let meta = WorkflowMeta { run_id: "wf_42", role: "reviewer" };
         let (_prog, args, _pin) =
-            build_args("claude-code", "ts-wf-1", Some(&meta), None, None).expect("ok");
+            build_args("claude-code", "ts-wf-1", Some(&meta), None, None, Some("test-model")).expect("ok");
         let mcp_idx = args
             .iter()
             .position(|a| a == "--mcp-config")
@@ -2166,7 +2188,7 @@ mod tests {
         let _h = HomeGuard::set(dir.path());
         let meta = WorkflowMeta { run_id: "wf_99", role: "manager" };
         let (_prog, args, _pin) =
-            build_args("codex", "ts-wf-codex", Some(&meta), None, None).expect("ok");
+            build_args("codex", "ts-wf-codex", Some(&meta), None, None, Some("test-model")).expect("ok");
         assert!(
             args.iter().any(|a| a.contains("CM_WORKFLOW_RUN_ID=\"wf_99\"")),
             "codex overrides must register the run id in the MCP env: {:?}",
@@ -2193,7 +2215,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let err = build_args("gcloud", "ts-x", None, None, None).expect_err("must reject");
+        let err = build_args("gcloud", "ts-x", None, None, None, Some("test-model")).expect_err("must reject");
         assert!(
             err.to_string().contains("claude-code | codex | bash"),
             "error must list supported types: {}",

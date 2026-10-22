@@ -2310,6 +2310,8 @@ fn adopted_meta_from_record(
         workflow_run_id: rec.workflow_run_id.clone(),
         workflow_role: rec.workflow_role.clone(),
         continuous_task_id: rec.continuous_task_id.clone(),
+        // The frozen holder record has no model; revive re-resolves it.
+        model: None,
         global_perms: rec.global_perms,
         generation: rec.generation,
         last_activity_at: cell(rec.last_activity_age_s),
@@ -2506,6 +2508,8 @@ fn swap_exit_tombstone(
         task_id: rec.task_id.clone(),
         managed_by_uid: rec.managed_by_uid.clone(),
         continuous_task_id: rec.continuous_task_id.clone(),
+        // The frozen holder record has no model; revive re-resolves it.
+        model: None,
         label: rec.title.clone(),
         workflow_run_id: rec.workflow_run_id.clone(),
         workflow_role: rec.workflow_role.clone(),

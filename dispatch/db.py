@@ -754,6 +754,74 @@ async def set_task_lead(pool: asyncpg.Pool, task_id: str, session_uid: str | Non
     return await get_task(pool, task_id)
 
 
+async def set_task_model(pool: asyncpg.Pool, task_id: str, engine: str, model: str | None) -> dict | None:
+    """Set or (with None) remove ``metadata.models.<engine>`` in one statement.
+
+    Every other metadata key, and the other engine's default, is preserved.
+    An emptied ``models`` object is dropped. Returns the full task row, or
+    None if missing.
+    """
+    task_id = normalize_task_id(task_id)
+    async with pool.acquire() as conn:
+        if model is None:
+            updated = await conn.fetchval(
+                """UPDATE tasks SET metadata = CASE
+                           WHEN (COALESCE(metadata->'models', '{}'::jsonb) - $2) = '{}'::jsonb
+                           THEN COALESCE(metadata, '{}'::jsonb) - 'models'
+                           ELSE jsonb_set(metadata, '{models}', (metadata->'models') - $2)
+                       END,
+                       updated_at = now()
+                   WHERE id = $1 RETURNING id""",
+                task_id, engine,
+            )
+        else:
+            updated = await conn.fetchval(
+                """UPDATE tasks SET metadata = jsonb_set(
+                           COALESCE(metadata, '{}'::jsonb), '{models}',
+                           CASE WHEN jsonb_typeof(metadata->'models') = 'object'
+                                THEN metadata->'models' ELSE '{}'::jsonb END
+                           || jsonb_build_object($2::text, $3::text),
+                           true),
+                       updated_at = now()
+                   WHERE id = $1 RETURNING id""",
+                task_id, engine, model,
+            )
+    if not updated:
+        return None
+    return await get_task(pool, task_id)
+
+
+async def resolve_task_model(pool: asyncpg.Pool, task_id: str, engine: str) -> dict | None:
+    """The nearest ``metadata.models.<engine>`` up the parent chain.
+
+    Returns ``{"model": str|None, "source_task_id": str|None}``, or None if
+    the task itself is missing. The walk stops at 64 levels and never
+    revisits a task, so a parent cycle can't loop.
+    """
+    task_id = normalize_task_id(task_id)
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM tasks WHERE id = $1", task_id)
+        if not exists:
+            return None
+        row = await conn.fetchrow(
+            """WITH RECURSIVE chain(id, parent_task_id, model, depth, seen) AS (
+                   SELECT id, parent_task_id, metadata->'models'->>$2, 0, ARRAY[id]
+                   FROM tasks WHERE id = $1
+                 UNION ALL
+                   SELECT t.id, t.parent_task_id, t.metadata->'models'->>$2, c.depth + 1, c.seen || t.id
+                   FROM tasks t JOIN chain c ON t.id = c.parent_task_id
+                   WHERE c.depth < 64 AND NOT t.id = ANY(c.seen)
+               )
+               SELECT id, model FROM chain
+               WHERE model IS NOT NULL AND btrim(model) <> ''
+               ORDER BY depth LIMIT 1""",
+            task_id, engine,
+        )
+    if row is None:
+        return {"model": None, "source_task_id": None}
+    return {"model": row["model"].strip(), "source_task_id": str(row["id"])}
+
+
 async def merge_task_metadata_backtest(
     pool: asyncpg.Pool, task_id: str, fields: dict
 ) -> dict | None:

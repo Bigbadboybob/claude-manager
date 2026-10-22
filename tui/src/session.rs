@@ -108,6 +108,10 @@ pub struct Session {
     /// — without this, dropping the session would just close the
     /// attach socket while the daemon's session keeps running.
     pub daemon_session_uid: Option<String>,
+    /// The model a daemon spawn's argv named (`ClientSessionConfig::model`);
+    /// `None` for bash, local PTYs and plain re-attaches. TerminalSession
+    /// constructors record it so revive / restart reuse it.
+    pub spawn_model: Option<String>,
     /// Latched `memory_cap_kill` flag for daemon-attached
     /// sessions (slice 10c-e-3b-fix4b). The attach-stream reader
     /// half stores `true` here when the daemon's `End` frame
@@ -326,6 +330,7 @@ impl Session {
             pty_writer: Some(pty_writer),
             event_rx,
             title: format!("{} {}", shell, args.join(" ")),
+            spawn_model: None,
             exited: false,
             wakeup_times: Vec::new(),
             memory_cap,
@@ -380,6 +385,7 @@ impl Session {
         how: crate::client_session::AttachHow,
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
+        let spawn_model = config.model.map(str::to_string);
         // A bounded raw replay can start after the application's last complete
         // screen. Codex and Claude Code rebuild their screen on resize; defer
         // that until this pane is viewed, rather than repainting the fleet.
@@ -399,6 +405,7 @@ impl Session {
             pty_writer: None,
             event_rx: cs.event_rx,
             title: format!("{} (daemon:{})", title_label, cs.session_uid),
+            spawn_model: spawn_model.clone(),
             exited: false,
             wakeup_times: Vec::new(),
             memory_cap: None,
@@ -423,6 +430,7 @@ impl Session {
         config: crate::client_session::ClientSessionConfig,
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
+        let spawn_model = config.model.map(str::to_string);
         let cs = crate::client_session::ClientSession::new(config)?;
         // Mirror the daemon-echoed cgroup_path so the local
         // Session has parity with what `Session::new` would
@@ -444,6 +452,7 @@ impl Session {
             pty_writer: None,
             event_rx: cs.event_rx,
             title: format!("{} (daemon:{})", title_label, cs.session_uid),
+            spawn_model: spawn_model.clone(),
             exited: false,
             wakeup_times: Vec::new(),
             // Daemon-spawned sessions: the memory-cap watcher

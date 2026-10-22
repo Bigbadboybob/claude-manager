@@ -647,6 +647,10 @@ pub struct SpawnParams {
     /// funnel that sets it lands in Phase 2. See
     /// DESIGN_CONTINUOUS_TASKS.md §6.
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    pub model: Option<String>,
     /// Global-permissions grant. When `true`, this session's
     /// Session-caller auth checks (`auth::check_session_caller` and
     /// `check_session_caller_for_exited`) short-circuit to `Allow`
@@ -749,6 +753,7 @@ impl SpawnParams {
             workflow_role: None,
             // Phase-1 continuous wire field: non-continuous default.
             continuous_task_id: None,
+            model: None,
             // Global perms default to off — descendant-only scope is
             // the safe baseline. Only the operator (TUI) or a global
             // caller can flip this true at spawn time.
@@ -1150,6 +1155,10 @@ pub struct DaemonSession {
     /// session is a tick of, carried through from `SpawnParams`.
     /// `None` for ordinary sessions. See DESIGN_CONTINUOUS_TASKS.md §6.
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    pub model: Option<String>,
     /// Global-permissions grant for this session's Session-caller
     /// auth. When `true`, `auth::check_session_caller` /
     /// `check_session_caller_for_exited` short-circuit to `Allow`
@@ -1473,6 +1482,7 @@ impl DaemonSession {
             workflow_run_id: self.workflow_run_id.clone(),
             workflow_role: self.workflow_role.clone(),
             continuous_task_id: self.continuous_task_id.clone(),
+            model: self.model.clone(),
             task_id: self.task_id.clone(),
             notify_on_idle: false,
             // TUI-only presentation field (see doc comment above).
@@ -1574,6 +1584,7 @@ struct PendingSessionInner {
     /// Phase-1 continuous wire field, carried SpawnParams →
     /// DaemonSession alongside the workflow tags.
     continuous_task_id: Option<String>,
+    model: Option<String>,
     /// Global-perms grant, carried SpawnParams → DaemonSession.
     global_perms: bool,
     /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
@@ -1916,6 +1927,7 @@ impl PendingSession {
                 workflow_run_id: params.workflow_run_id,
                 workflow_role: params.workflow_role,
                 continuous_task_id: params.continuous_task_id,
+                model: params.model,
                 global_perms: params.global_perms,
                 last_activity_at,
                 title: params.title,
@@ -1983,6 +1995,7 @@ impl PendingSession {
             workflow_run_id,
             workflow_role,
             continuous_task_id,
+            model,
             global_perms,
             last_activity_at,
             title,
@@ -2084,6 +2097,7 @@ impl PendingSession {
             workflow_run_id,
             workflow_role,
             continuous_task_id,
+            model,
             global_perms,
             // Sub-2b-1 review-r#2 #2: generation starts at 0;
             // `session.set_transcript_path` increments on
@@ -2403,6 +2417,10 @@ pub struct AdoptedSessionMeta {
     pub workflow_role: Option<String>,
     /// Continuous-task tag.
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    pub model: Option<String>,
     /// Global-permissions grant — an orchestrator must not lose its
     /// scope across a deploy.
     pub global_perms: bool,
@@ -2633,6 +2651,7 @@ impl AdoptedSessionBuild {
             workflow_run_id: meta.workflow_run_id,
             workflow_role: meta.workflow_role,
             continuous_task_id: meta.continuous_task_id,
+            model: meta.model,
             global_perms: meta.global_perms,
             generation: meta.generation,
             last_activity_at,

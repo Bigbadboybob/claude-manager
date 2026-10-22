@@ -474,7 +474,7 @@ impl App {
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 11u16;
+        let height = 13u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -515,6 +515,8 @@ impl App {
                 Span::styled(lead.to_string(), white),
                 Span::styled(if active_field == 3 { "  \u{2190}/\u{2192}" } else { "" }, dim),
             ]),
+            self.task_form_models.line(0, " Claude: ", active_field == 4),
+            self.task_form_models.line(1, "  Codex: ", active_field == 5),
             Line::from(""),
             Line::from(Span::styled(
                 "Tab next \u{00b7} Enter save \u{00b7} Esc cancel",
@@ -661,7 +663,7 @@ impl App {
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 16u16;
+        let height = 17u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -781,6 +783,7 @@ impl App {
                 Span::styled(self.new_session_reports_to.label(), reports_style),
                 Span::styled(reports_hint, dim),
             ]),
+            self.form_model.line("   Model: ", active_field == 8),
             Line::from(""),
             Line::from(Span::styled(
                 "Tab switch field \u{00b7} Enter start \u{00b7} Esc cancel",
@@ -805,8 +808,8 @@ impl App {
         active_field: u8,
     ) {
         let width = 50u16.min(area.width.saturating_sub(4));
-        // +2 rows for the seed-from line, +1 for resume-from.
-        let height = 13u16;
+        // +2 rows for the seed-from line, +1 for resume-from, +1 model.
+        let height = 14u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -904,6 +907,7 @@ impl App {
             Span::styled(resume_label, resume_style),
             Span::styled(resume_hint, dim),
         ]));
+        lines.push(self.form_model.line(" Model: ", active_field == 3));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Tab field \u{00b7} j/k type \u{00b7} Enter start \u{00b7} Esc cancel",

@@ -40,7 +40,8 @@ const F_TARGET: u8 = 0;
 const F_TASK: u8 = 1;
 const F_PARENT: u8 = 2;
 const F_BASE: u8 = 3;
-const FIELDS: u8 = 4;
+const F_MODEL: u8 = 4;
+const FIELDS: u8 = 5;
 
 pub(crate) use crate::task_picker::TaskChoice;
 
@@ -94,6 +95,8 @@ pub(crate) struct ForkForm {
     /// Tasks offered by the pickers, captured at open.
     pub tasks: Vec<TaskChoice>,
     pub picker: Option<TaskPicker>,
+    /// The fork's model: the source's recorded one unless changed.
+    pub model: super::model_field::ModelField,
 }
 
 impl ForkForm {
@@ -118,6 +121,7 @@ impl ForkForm {
             error: None,
             tasks: Vec::new(),
             picker: None,
+            model: super::model_field::ModelField::new(session_type),
         }
     }
 
@@ -165,6 +169,10 @@ impl ForkForm {
         if self.picker.is_some() {
             return self.picker_key(key);
         }
+        if self.active_field == F_MODEL && self.model.key(key) {
+            self.error = None;
+            return InputOutcome::Consumed;
+        }
         let plain = !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
         let toggle = matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' '));
         match key.code {
@@ -186,6 +194,11 @@ impl ForkForm {
                 if self.existing && self.existing_task.is_none() {
                     self.error = Some("Pick the task to fork into (Enter on Task)".into());
                     self.active_field = F_TASK;
+                    return InputOutcome::Consumed;
+                }
+                if let Err(e) = self.model.value() {
+                    self.error = Some(e);
+                    self.active_field = F_MODEL;
                     return InputOutcome::Consumed;
                 }
                 return InputOutcome::Submit(SubmitAction::ForkSession);
@@ -247,6 +260,9 @@ impl ForkForm {
             "cols": cols,
             "rows": rows,
         });
+        if let Ok(Some(model)) = self.model.value() {
+            params["model"] = json!(model);
+        }
         if self.existing {
             if let Some(t) = &self.existing_task {
                 params["task_id"] = json!(t.task_id);
@@ -267,7 +283,7 @@ impl ForkForm {
 
     pub(crate) fn draw(&self, frame: &mut Frame, area: Rect) {
         let width = 76u16.min(area.width.saturating_sub(4));
-        let height = if self.error.is_some() { 16u16 } else { 14u16 };
+        let height = if self.error.is_some() { 17u16 } else { 15u16 };
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let dialog = Rect::new(x, y, width, height.min(area.height));
@@ -341,6 +357,8 @@ impl ForkForm {
             Span::styled("   ", dim),
             Span::styled(format!("{} trunk", radio(self.use_trunk)), pick(self.use_trunk)),
         ]));
+        let model_label = if self.active_field == F_MODEL { "> Model:  " } else { "  Model:  " };
+        lines.push(self.model.line(model_label, self.active_field == F_MODEL));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  Uncommitted changes in the source stay behind; the source is untouched.",
@@ -401,6 +419,8 @@ pub(crate) struct ForkReply {
     /// lacks (capped by the host; `commits_truncated` marks more).
     pub commits_not_carried: Vec<String>,
     pub commits_truncated: bool,
+    /// The model the host spawned the fork with.
+    pub model: Option<String>,
 }
 
 pub(crate) fn parse_fork_reply(v: &Value) -> anyhow::Result<ForkReply> {
@@ -414,6 +434,7 @@ pub(crate) fn parse_fork_reply(v: &Value) -> anyhow::Result<ForkReply> {
         worktree_path: PathBuf::from(need("worktree_path")?),
         label: s("label").unwrap_or_default(),
         branch: s("branch"),
+        model: s("model"),
         transcript_id: s("transcript_id"),
         source_transcript_id: v
             .get("forked_from")
@@ -534,6 +555,7 @@ impl App {
             return;
         }
         let mut form = ForkForm::new(&ws.id, &ts.uid, &ts.label, &ts.session_type);
+        form.model = super::model_field::ModelField::recorded(&ts.session_type, ts.model.as_deref());
         form.tasks = self
             .tasks
             .iter()
@@ -629,6 +651,7 @@ impl App {
         );
         ts.task_id = Some(reply.task_id.clone());
         ts.host_id = host.clone();
+        ts.model = reply.model.clone().or_else(|| form.model.value().ok().flatten());
         // Bound to the FORK's own conversation, never the source's: claude's
         // id is pinned at spawn; codex's arrives with the host's transcript
         // broadcast once the forked thread starts.
@@ -780,7 +803,9 @@ mod tests {
         assert!(f.use_trunk);
         f.key(key(KeyCode::Char(' ')));
         assert!(!f.use_trunk);
-        // No Prompt row: Tab from Base wraps to Into.
+        // No Prompt row: Tab from Base reaches Model, then wraps to Into.
+        f.key(key(KeyCode::Tab));
+        assert_eq!(f.active_field, F_MODEL);
         f.key(key(KeyCode::Tab));
         assert_eq!(f.active_field, F_TARGET);
         f.active_field = F_TASK;

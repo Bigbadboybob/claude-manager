@@ -1766,6 +1766,9 @@ impl App {
         };
         let (mark, mark_style) = symbols::engine(&ts.session_type);
         lines.push(Line::from(vec![label("engine"), Span::styled(format!("{mark} "), mark_style), text(symbols::engine_name(&ts.session_type).to_owned())]));
+        if let Some(model) = ts.model.as_deref() {
+            lines.push(Line::from(vec![label("model"), text(model.to_owned())]));
+        }
         lines.push(Line::from(vec![label("status"), text(status)]));
         // The activity badge in full, F9 toggle or not.
         if let Some(b) = self.session_badge(ts) {

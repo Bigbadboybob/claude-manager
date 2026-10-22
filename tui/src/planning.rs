@@ -134,6 +134,9 @@ pub struct PlanTask {
     pub bt_label: Option<String>,
     /// Agent/session/task/workspace provenance (`metadata.filer`).
     pub filer: Option<FilerMetadata>,
+    /// Per-engine default model (`metadata.models`: `{"claude": .., "codex": ..}`).
+    /// Subtasks without their own inherit through `parent_task_id`.
+    pub models: std::collections::BTreeMap<String, String>,
 }
 
 /// Pull a `"vm"` / `"backtest"` string field out of a task's free-form
@@ -145,6 +148,23 @@ fn meta_str(metadata: &Option<serde_json::Value>, group: &str, key: &str) -> Opt
         .and_then(|g| g.get(key))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// `metadata.models` as an engine → model map (invalid entries dropped).
+pub(crate) fn meta_models(metadata: &Option<serde_json::Value>) -> std::collections::BTreeMap<String, String> {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get(cm_daemon::models::TASK_MODELS_METADATA_KEY))
+        .and_then(|m| m.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let model = cm_daemon::models::validate_model(v.as_str()?).ok()?;
+                    Some((k.clone(), model))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
@@ -199,6 +219,7 @@ impl PlanTask {
             run_key: meta_str(&task.metadata, "backtest", "run_key"),
             bt_label: meta_str(&task.metadata, "backtest", "label"),
             filer: FilerMetadata::from_metadata(&task.metadata),
+            models: meta_models(&task.metadata),
         }
     }
 }
@@ -587,6 +608,9 @@ pub enum PlanAction {
         /// The A-f "Reports to" row changed the parent: PATCH
         /// `parent_task_id` (to the value above) with the launch.
         reparent: bool,
+        /// Model picked with Alt+o; `None` = the task default, else the
+        /// engine default.
+        model: Option<String>,
     },
     /// Bind a task to an existing workspace and spawn a session there
     /// (no new worktree, no branch input).
@@ -612,6 +636,8 @@ pub enum PlanAction {
         engine: LaunchEngine,
         /// See `LaunchTask::reparent`.
         reparent: bool,
+        /// See `LaunchTask::model`.
+        model: Option<String>,
     },
     /// Clear a task's `workspace_id`. Task status is not affected.
     UnbindTask {
@@ -1163,6 +1189,8 @@ pub struct PlanningView {
     /// row's current parent when the dialog opens; a change is PATCHed as
     /// `parent_task_id` on launch (`reparent` on the action).
     launch_reports_to: crate::task_picker::ReportsTo,
+    /// The launch dialogs' Model row (Alt+o cycles presets).
+    launch_model: crate::app::model_field::ModelField,
     launch_reports_to_orig: crate::task_picker::ReportsTo,
     /// Open Alt+r picker over the launch dialogs.
     launch_picker: Option<crate::task_picker::TaskPicker>,
@@ -1250,6 +1278,40 @@ impl PlanningView {
         None
     }
 
+    /// The models the task itself sets (not inherited).
+    pub fn task_own_models(&self, task_id: &str) -> std::collections::BTreeMap<String, String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .find(|t| t.id == task_id)
+            .map(|t| t.models.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn task_parent_id(&self, task_id: &str) -> Option<String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .find(|t| t.id == task_id)
+            .and_then(|t| t.parent_task_id.clone())
+    }
+
+    /// The task's default model for `engine` (its own, else its nearest
+    /// ancestor's), with the task that set it.
+    pub fn task_model(&self, task_id: &str, engine: &str) -> Option<(String, String)> {
+        let key = cm_daemon::models::engine_key(engine)?;
+        let find = |id: &str| self.project_data.iter().flat_map(|pd| &pd.tasks).find(|t| t.id == id);
+        let mut current = find(task_id);
+        for _ in 0..64 {
+            let task = current?;
+            if let Some(m) = task.models.get(key) {
+                return Some((m.clone(), task.id.clone()));
+            }
+            current = task.parent_task_id.as_deref().and_then(find);
+        }
+        None
+    }
+
     pub fn new() -> Self {
         PlanningView {
             keybinding_helper_visible: true,
@@ -1257,6 +1319,7 @@ impl PlanningView {
             launch_hosts: vec![crate::hosts::HostId::local()],
             default_launch_host: crate::hosts::HostId::local(),
             launch_reports_to: Default::default(),
+            launch_model: Default::default(),
             launch_reports_to_orig: Default::default(),
             launch_picker: None,
             projects: vec![],
@@ -1613,6 +1676,7 @@ impl PlanningView {
                 task.is_cloud = api_task.is_cloud;
                 task.parent_task_id = api_task.parent_task_id.clone();
                 task.filer = FilerMetadata::from_metadata(&api_task.metadata);
+                task.models = meta_models(&api_task.metadata);
                 self.recompute_conflicts();
                 self.needs_redraw = true;
                 return;
@@ -2830,6 +2894,9 @@ impl PlanningView {
                 self.cycle_launch_host();
                 return PlanAction::Consumed;
             }
+            if self.launch_model_key(key) {
+                return PlanAction::Consumed;
+            }
 
             match key.code {
                 KeyCode::Esc => {
@@ -2857,6 +2924,7 @@ impl PlanningView {
                 // toggles. j/k stay reserved for the workspace list.
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                     engine = engine.cycle();
+                    self.launch_model.retarget(engine.as_session_type());
                     self.input_mode = PlanInputMode::WorkspacePicker {
                         project_idx,
                         task_idx,
@@ -2912,6 +2980,7 @@ impl PlanningView {
                                     parent_task_id: task.parent_task_id.clone(),
                                     engine,
                                     reparent,
+                                    model: self.launch_model.value().unwrap_or(None),
                                 };
                             }
                         }
@@ -2932,6 +3001,9 @@ impl PlanningView {
             }
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
                 self.cycle_launch_host();
+                return PlanAction::Consumed;
+            }
+            if self.launch_model_key(key) {
                 return PlanAction::Consumed;
             }
 
@@ -2981,6 +3053,7 @@ impl PlanningView {
                                 engine,
                                 host_id: self.launch_host.clone(),
                                 reparent,
+                                model: self.launch_model.value().unwrap_or(None),
                             };
                         }
                     }
@@ -2989,6 +3062,7 @@ impl PlanningView {
                 // use letters — arrows (unused by this dialog) and Tab do it.
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                     engine = engine.cycle();
+                    self.launch_model.retarget(engine.as_session_type());
                     self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
                 }
                 KeyCode::Backspace => {
@@ -3917,6 +3991,33 @@ impl PlanningView {
         true
     }
 
+    /// Alt+o / Alt+Shift+o step the Model row through the presets.
+    fn launch_model_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('o' | 'O')) {
+            let back = key.code == KeyCode::Char('O') || key.modifiers.contains(KeyModifiers::SHIFT);
+            self.launch_model.cycle(!back);
+            return true;
+        }
+        false
+    }
+
+    /// Per-engine default models for a task, inherited through its parents.
+    fn task_models_of(&self, pi: usize, ti: usize) -> std::collections::BTreeMap<String, String> {
+        let Some(id) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)).map(|t| t.id.clone()) else {
+            return Default::default();
+        };
+        ["claude", "codex"]
+            .into_iter()
+            .filter_map(|e| Some((e.to_string(), self.task_model(&id, e)?.0)))
+            .collect()
+    }
+
+    fn launch_model_line(&self) -> Line<'static> {
+        let mut line = self.launch_model.line("  Model: ", false);
+        line.spans.push(Span::styled("  (Alt+o change)", Style::default().fg(theme::MUTED)));
+        line
+    }
+
     fn reports_to_line(&self) -> Line<'static> {
         Line::from(Span::styled(
             format!("  Reports to: {}  (Alt+r change)", self.launch_reports_to.label()),
@@ -3930,6 +4031,10 @@ impl PlanningView {
         if let Some((pi, ti)) = self.selected_task_loc() {
             self.launch_reports_to = self.reports_to_of(pi, ti);
             self.launch_reports_to_orig = self.launch_reports_to.clone();
+            self.launch_model = crate::app::model_field::ModelField::for_task(
+                LaunchEngine::default().as_session_type(),
+                self.task_models_of(pi, ti),
+            );
             self.input_mode = PlanInputMode::WorkspacePicker {
                 project_idx: pi,
                 task_idx: ti,
@@ -5052,8 +5157,8 @@ impl PlanningView {
             .map(|t| t.title.as_str())
             .unwrap_or("?");
         let candidates = self.candidates_for(project_idx, task_idx);
-        // +2 for the engine row and its blank separator; +1 Reports to.
-        let rows = 5 + candidates.len() as u16 + 2 + 3 + 1;
+        // +2 for the engine row and its blank separator; +1 Reports to; +1 Model.
+        let rows = 5 + candidates.len() as u16 + 2 + 3 + 1 + 1;
         let (w, h) = (60u16.min(area.width.saturating_sub(4)), rows);
         let dialog = Rect::new(
             (area.width - w) / 2,
@@ -5107,6 +5212,7 @@ impl PlanningView {
         }
         lines.push(Line::from(""));
         lines.push(engine_line(engine));
+        lines.push(self.launch_model_line());
         lines.push(self.launch_host_line());
         lines.push(self.reports_to_line());
         lines.push(Line::from(""));
@@ -5148,8 +5254,8 @@ impl PlanningView {
             .and_then(|pd| pd.tasks.get(task_idx))
             .map(|t| t.title.as_str())
             .unwrap_or("?");
-        // +2 rows for the engine line and its blank separator; +1 Reports to.
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 13u16);
+        // +2 rows for the engine line and its blank separator; +1 Reports to; +1 Model.
+        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 14u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
         let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
@@ -5179,6 +5285,7 @@ impl PlanningView {
             ]),
             Line::from(""),
             engine_line(engine),
+            self.launch_model_line(),
             self.launch_host_line(),
             self.reports_to_line(),
             Line::from(""),
@@ -5280,6 +5387,7 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
         }
     }
 
@@ -5852,6 +5960,7 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
@@ -5911,6 +6020,7 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view
@@ -6034,6 +6144,7 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view
@@ -6100,6 +6211,7 @@ mod tests {
                 run_key: None,
                 bt_label: None,
                 filer: None,
+                models: Default::default(),
             });
             view.project_data.push(pd);
             view.projects = view
@@ -6178,6 +6290,7 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view
@@ -6379,6 +6492,7 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
         }
     }
 

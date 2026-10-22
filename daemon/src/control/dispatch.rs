@@ -4782,6 +4782,7 @@ mod tests {
                 "workspace_id": "ws-ghost",
                 "label": "x",
                 "argv": ["/bin/bash"],
+                "model": "test-model",
                 "working_dir": "/tmp",
             }),
         );
@@ -10130,6 +10131,7 @@ mod tests {
                 scheduler: Default::default(),
                 notify_command: None,
                 codex_inline_scrollback: true,
+                models: Default::default(),
             };
         }
         let resp = dispatch_request(
@@ -10235,6 +10237,7 @@ mod tests {
             scheduler: Default::default(),
             notify_command: None,
             codex_inline_scrollback: true,
+            models: Default::default(),
         };
     }
 
@@ -10684,6 +10687,7 @@ mod tests {
                     "workspace_id": "ws-trsc",
                     "label": "trsc",
                     "argv": ["/bin/sleep", "30"],
+                    "model": "test-model",
                     "working_dir": worktree,
                     "worktree_path": worktree,
                     "transcript_path": "/tmp/x.jsonl",

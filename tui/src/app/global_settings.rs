@@ -55,6 +55,23 @@ mod tests {
     }
 
     #[test]
+    fn global_settings_models_section_defaults_overrides_and_rejects() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        let settings = GlobalSettings::load_from(path.clone());
+        assert_eq!(settings.models(), &cm_daemon::models::ModelConfig::default());
+        std::fs::write(&path, "[models]\ncodex = \"gpt-6-luna\"\n").unwrap();
+        let settings = GlobalSettings::load_from(path.clone());
+        assert_eq!(settings.models().codex, "gpt-6-luna");
+        assert_eq!(settings.models().claude, cm_daemon::models::DEFAULT_CLAUDE_MODEL);
+        assert!(settings.load_error.is_none());
+        std::fs::write(&path, "[models]\nclaude = \"opus latest\"\n").unwrap();
+        let settings = GlobalSettings::load_from(path.clone());
+        assert_eq!(settings.models(), &cm_daemon::models::ModelConfig::default());
+        assert!(settings.load_error.as_deref().unwrap().contains("models.claude"));
+    }
+
+    #[test]
     fn global_settings_preview_cancel_save_reload_and_preserve_other_keys() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.toml");
@@ -166,8 +183,20 @@ struct Dialog {
 pub(super) struct GlobalSettings {
     path: PathBuf,
     saved: Preferences,
+    /// File-only `[models]` section (no F9 row). See `cm_daemon::models`.
+    models: cm_daemon::models::ModelConfig,
     load_error: Option<String>,
     dialog: Option<Dialog>,
+}
+
+/// Parse and validate `[models]`; a missing section means the defaults.
+fn load_models(path: &Path) -> anyhow::Result<cm_daemon::models::ModelConfig> {
+    let models = match read_document(path)?.remove("models") {
+        Some(value) => value.try_into().context("Invalid [models] section")?,
+        None => cm_daemon::models::ModelConfig::default(),
+    };
+    models.validate().map_err(anyhow::Error::msg)?;
+    Ok(models)
 }
 
 fn read_document(path: &Path) -> anyhow::Result<toml::Table> {
@@ -190,6 +219,7 @@ impl GlobalSettings {
         cm_daemon::mcp_config::set_codex_inline_scrollback(
             settings.saved.codex_inline_scrollback,
         );
+        cm_daemon::models::set_models(settings.models.clone());
         settings
     }
 
@@ -203,16 +233,30 @@ impl GlobalSettings {
             );
             Ok(preferences)
         });
-        let (saved, load_error) = match loaded {
+        let (saved, mut load_error) = match loaded {
             Ok(p) => (p, None),
             Err(e) => (Preferences::default(), Some(format!("{e:#}"))),
+        };
+        let models = match load_models(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                load_error.get_or_insert(format!("{e:#}"));
+                cm_daemon::models::ModelConfig::default()
+            }
         };
         Self {
             path,
             saved,
+            models,
             load_error,
             dialog: None,
         }
+    }
+
+    /// The `[models]` section: engine default models for TUI-composed
+    /// spawns and the Model field's presets.
+    pub(super) fn models(&self) -> &cm_daemon::models::ModelConfig {
+        &self.models
     }
 
     pub(super) fn tint_strength(&self) -> f64 {

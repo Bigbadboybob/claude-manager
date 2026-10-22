@@ -16,6 +16,7 @@ pub(super) struct PendingReportLaunch {
     pub engine: LaunchEngine,
     pub host_id: cm_daemon::host_id::HostId,
     pub parent_task_id: String,
+    pub model: Option<String>,
 }
 
 impl App {
@@ -44,6 +45,7 @@ impl App {
         in_place: bool,
         host_id: cm_daemon::host_id::HostId,
         parent: TaskChoice,
+        model: Option<String>,
     ) {
         let Some(project) = self
             .config
@@ -66,6 +68,7 @@ impl App {
                 engine,
                 host_id,
                 parent_task_id: parent.task_id.clone(),
+                model,
             },
         );
         self.backend.create_reporting_task(
@@ -102,6 +105,7 @@ impl App {
                     pending.in_place,
                     pending.engine.as_session_type(),
                     &pending.host_id,
+                    pending.model.as_deref(),
                 );
             }
         }

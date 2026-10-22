@@ -232,6 +232,9 @@ pub struct ClientSessionConfig<'a> {
     /// re-grant compared against the TUI's stale `true` and never
     /// fired (the 2026-08-21 planning-session incident).
     pub global_perms: bool,
+    /// The model the argv names (`None` only for bash). Recorded by the
+    /// daemon so revive / restore / resume reuse it.
+    pub model: Option<&'a str>,
 }
 
 /// Daemon-attached terminal session. Field shape mirrors
@@ -929,6 +932,9 @@ pub(crate) fn rpc_start_session_full(
     if config.global_perms {
         params["global_perms"] = serde_json::Value::Bool(true);
     }
+    if let Some(model) = config.model {
+        params["model"] = serde_json::Value::String(model.to_string());
+    }
     // Slice 10d watcher-fix #1: `cgroup_path` is NO LONGER
     // sent on the wire. The daemon discovers the actual cgroup
     // from `/proc/<spawn-pid>/cgroup` post-spawn (see
@@ -970,6 +976,8 @@ pub(crate) struct CreateSessionResult {
     pub session_uid: String,
     pub worktree_path: String,
     pub workspace_id: String,
+    /// The model the host resolved and spawned with (`None` from an older daemon).
+    pub model: Option<String>,
 }
 
 /// `create_session` RPC — A-n on a (possibly remote) daemon host. Unlike
@@ -993,7 +1001,7 @@ pub fn rpc_create_session(
     rows: u16,
 ) -> anyhow::Result<CreateSessionResult> {
     rpc_create_session_with_options(daemon_socket, operator_token_id, uid, workspace_id,
-        label, engine, repo_url, start_branch, slug, task_id, cols, rows, false, None)
+        label, engine, repo_url, start_branch, slug, task_id, cols, rows, false, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1012,10 +1020,11 @@ pub fn rpc_create_session_with_options(
     rows: u16,
     in_place: bool,
     seed_from: Option<&str>,
+    model: Option<&str>,
 ) -> anyhow::Result<CreateSessionResult> {
     rpc_create_session_with_timeout(daemon_socket, operator_token_id, uid, workspace_id,
         label, engine, repo_url, start_branch, slug, task_id, cols, rows, in_place,
-        seed_from, DEFAULT_RPC_READ_TIMEOUT)
+        seed_from, model, DEFAULT_RPC_READ_TIMEOUT)
 }
 
 /// Checkout setup can take longer than ordinary control RPCs. Long budgets
@@ -1036,6 +1045,8 @@ pub(crate) fn rpc_create_session_with_timeout(
     rows: u16,
     in_place: bool,
     seed_from: Option<&str>,
+    // `None` lets the host resolve it (task default, else its engine default).
+    model: Option<&str>,
     timeout: Duration,
 ) -> anyhow::Result<CreateSessionResult> {
     let mut params = serde_json::json!({
@@ -1059,6 +1070,9 @@ pub(crate) fn rpc_create_session_with_timeout(
     }
     if in_place {
         params["in_place"] = serde_json::json!(true);
+    }
+    if let Some(model) = model {
+        params["model"] = serde_json::json!(model);
     }
     let req = Request {
         id: next_request_id(),
@@ -1088,6 +1102,7 @@ pub(crate) fn rpc_create_session_with_timeout(
             .as_str()
             .unwrap_or(workspace_id)
             .to_string(),
+        model: result["model"].as_str().map(str::to_owned),
     })
 }
 
@@ -1098,6 +1113,8 @@ pub(crate) struct AddSessionResult {
     pub resume_id: Option<String>,
     pub session_uid: String,
     pub worktree_path: String,
+    /// The model the host spawned with (a resume reports the entry's).
+    pub model: Option<String>,
 }
 
 /// `add_session` RPC — A-s on a remote-hosted workspace. Reuses the
@@ -1128,6 +1145,7 @@ pub fn rpc_add_session(
         rows,
         None,
         None,
+        None,
     )
 }
 
@@ -1144,6 +1162,8 @@ pub fn rpc_add_session_with_resume(
     rows: u16,
     resume_id: Option<&str>,
     seed_from: Option<&str>,
+    // `None` lets the host resolve it; a resume keeps the recorded model.
+    model: Option<&str>,
 ) -> anyhow::Result<AddSessionResult> {
     let mut params = serde_json::json!({
         "uid": uid,
@@ -1161,6 +1181,9 @@ pub fn rpc_add_session_with_resume(
     }
     if let Some(id) = resume_id {
         params["resume_id"] = serde_json::json!(id);
+    }
+    if let Some(model) = model {
+        params["model"] = serde_json::json!(model);
     }
     let req = Request {
         id: next_request_id(),
@@ -1180,7 +1203,10 @@ pub fn rpc_add_session_with_resume(
             "Resume response contains inconsistent session identities");
         anyhow::ensure!(result["workspace_id"].is_string(), "Resume response lacks original workspace");
     }
+    let model = result["model"].as_str().map(str::to_owned)
+        .or_else(|| entry.as_ref().and_then(|e| e.model.clone()));
     Ok(AddSessionResult {
+        model,
         entry,
         workspace_id: result["workspace_id"].as_str().map(str::to_owned),
         resume_id: result["resume_id"].as_str().map(str::to_owned),
@@ -1534,6 +1560,8 @@ pub struct DaemonSessionSummary {
     /// through adoption so a surfaced daemon-owned session keeps its
     /// grant in the TUI's in-memory model + manifest.
     pub global_perms: bool,
+    /// The model the session runs (`list_sessions` projects it).
+    pub model: Option<String>,
 }
 
 /// Parse one `list_sessions` array entry into a [`DaemonSessionSummary`].
@@ -1570,6 +1598,7 @@ pub fn parse_daemon_session_summary(entry: &serde_json::Value) -> Option<DaemonS
             .get("global_perms")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        model: str_field("model"),
     })
 }
 
@@ -1601,10 +1630,10 @@ pub fn rpc_list_daemon_sessions(
 /// The `list_sessions` row fields [`parse_daemon_session_summary`] reads.
 /// Asking for only these drops `agent_state` (three quarters of the reply;
 /// the TUI gets it from `manifest.watch`). Older daemons ignore the list.
-const SUMMARY_FIELDS: [&str; 13] = [
+const SUMMARY_FIELDS: [&str; 14] = [
     "session_uid", "label", "type", "managed_by_uid", "workspace_id", "task_id",
     "workflow_run_id", "workflow_role", "worktree_path", "continuous_task_id", "cols",
-    "rows", "global_perms",
+    "rows", "global_perms", "model",
 ];
 
 /// [`rpc_list_daemon_sessions`] for a poller: pass the etag of the list it
@@ -2661,6 +2690,7 @@ pub(crate) mod tests {
         rows: u16,
     ) -> ClientSessionConfig<'a> {
         ClientSessionConfig {
+            model: None,
             daemon_socket: socket,
             operator_token_id: token,
             uid,
@@ -2743,6 +2773,7 @@ time.sleep(60)
         let argv = vec!["/usr/bin/python3".to_string(), "-c".to_string(), script];
         let uid = test_uid();
         let config = ClientSessionConfig {
+            model: None,
             daemon_socket: &socket,
             operator_token_id: "op-graphics",
             uid: &uid,
@@ -2991,6 +3022,7 @@ time.sleep(60)
             start_test_daemon("ws-revive");
         let uid = test_uid();
         let entry = cm_daemon::manifest::ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -4630,11 +4662,11 @@ while True:
             requests
         });
         let created = rpc_create_session_with_options(&socket, "op-test", "ts-abcd-0", "ws-test", "agent",
-            "claude-code", "repo", None, "label", None, 100, 30, true, Some("reviewer")).unwrap();
+            "claude-code", "repo", None, "label", None, 100, 30, true, Some("reviewer"), Some("claude-sonnet-5-5")).unwrap();
         assert_eq!(created.main_repo_path.as_deref(), Some("/remote/repo"));
         assert_eq!(created.resume_id.as_deref(), Some("conversation-id"));
         let added = rpc_add_session_with_resume(&socket, "op-test", "ts-abcd-0", "ws-test", "agent",
-            "claude-code", None, 100, 30, Some("conversation-id"), None).unwrap();
+            "claude-code", None, 100, 30, Some("conversation-id"), None, None).unwrap();
         assert_eq!(added.resume_id.as_deref(), Some("conversation-id"));
         assert_eq!(added.session_uid, "ts-aaaa-0");
         let entry = added.entry.unwrap();
@@ -4646,6 +4678,8 @@ while True:
         assert_eq!(requests[0].method, "create_session");
         assert_eq!(requests[0].params["in_place"], true);
         assert_eq!(requests[0].params["seed_from"], "reviewer");
+        assert_eq!(requests[0].params["model"], "claude-sonnet-5-5");
+        assert!(requests[1].params.get("model").is_none(), "a resume keeps the recorded model");
         assert_eq!(requests[1].method, "session.resume");
         assert_eq!(requests[1].params["resume_id"], "conversation-id");
         assert!(requests.iter().all(|r| r.params.get("argv").is_none() && r.params.get("env").is_none()));
@@ -4991,6 +5025,7 @@ while True:
             let argv = vec!["/bin/bash".to_string()];
             let uid = test_uid();
             let config = ClientSessionConfig {
+                model: None,
                 daemon_socket: &socket_path,
                 operator_token_id: "op-gp",
                 uid: &uid,
@@ -5139,6 +5174,7 @@ while True:
             "/sys/fs/cgroup/user.slice/HOSTILE-CALLER-SUPPLIED.scope",
         );
         let config = ClientSessionConfig {
+            model: None,
             daemon_socket: &socket_path,
             operator_token_id: "op-memcap",
             uid: &uid,
@@ -5228,6 +5264,7 @@ while True:
         let argv = vec!["/bin/cat".to_string()];
         let uid_pre = test_uid();
         let config = ClientSessionConfig {
+            model: None,
             daemon_socket: &socket,
             operator_token_id: "op-chunk",
             uid: &uid_pre,

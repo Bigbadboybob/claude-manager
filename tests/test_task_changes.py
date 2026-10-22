@@ -412,6 +412,52 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         r = await self.client.post(f"/tasks/{uuid.uuid4()}/lead", json={"session_uid": "x"})
         self.assertEqual(r.status_code, 404, r.text)
 
+    async def test_task_model_default_is_atomic_and_inherited(self):
+        root = await self.create("root", metadata={"filer": {"session_uid": "ts-1-1"}})
+        mid = await self.create("mid", parent_task_id=root["id"])
+        leaf = await self.create("leaf", parent_task_id=mid["id"])
+
+        async def resolved(task, engine):
+            r = await self.client.get(f"/tasks/{task['id']}/model", params={"engine": engine})
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()
+
+        self.assertEqual(await resolved(leaf, "codex"),
+                         {"engine": "codex", "model": None, "source_task_id": None})
+        r = await self.client.post(f"/tasks/{root['id']}/model",
+                                   json={"engine": "codex", "model": "gpt-6-luna"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"},
+                                                "models": {"codex": "gpt-6-luna"}})
+        r = await self.client.post(f"/tasks/{root['id']}/model",
+                                   json={"engine": "claude", "model": "claude-opus-5-5"})
+        self.assertEqual(r.json()["metadata"]["models"],
+                         {"codex": "gpt-6-luna", "claude": "claude-opus-5-5"})
+        # The leaf inherits from the root, per engine.
+        self.assertEqual(await resolved(leaf, "codex"),
+                         {"engine": "codex", "model": "gpt-6-luna", "source_task_id": root["id"]})
+        # The nearest ancestor wins.
+        await self.client.post(f"/tasks/{mid['id']}/model", json={"engine": "codex", "model": "gpt-6.1-sol"})
+        self.assertEqual((await resolved(leaf, "codex"))["source_task_id"], mid["id"])
+        self.assertEqual((await resolved(leaf, "claude"))["model"], "claude-opus-5-5")
+        # Clearing one engine keeps the other; clearing both drops the key.
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": None})
+        self.assertEqual(r.json()["metadata"]["models"], {"claude": "claude-opus-5-5"})
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "claude", "model": None})
+        self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"}})
+        # A parent cycle can't loop the resolver.
+        await self.client.patch(f"/tasks/{root['id']}", json={"parent_task_id": leaf["id"]})
+        self.assertEqual((await resolved(root, "codex"))["source_task_id"], mid["id"])
+        # Bad input.
+        for body in ({"engine": "bash", "model": "x"}, {"engine": "codex", "model": "a b"},
+                     {"engine": "codex", "model": "-m"}):
+            r = await self.client.post(f"/tasks/{root['id']}/model", json=body)
+            self.assertEqual(r.status_code, 422, body)
+        r = await self.client.get(f"/tasks/{root['id']}/model", params={"engine": "bash"})
+        self.assertEqual(r.status_code, 422)
+        r = await self.client.get(f"/tasks/{uuid.uuid4()}/model", params={"engine": "codex"})
+        self.assertEqual(r.status_code, 404)
+
     async def test_expired_foreign_and_future_cursors_resnapshot(self):
         a = await self.create("a")
         snap = await self.snapshot()

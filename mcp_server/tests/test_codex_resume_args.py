@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mcp_server.native_codex import (
-    apply_launch_permissions, launch_permissions, split_args,
+    apply_launch_model, apply_launch_permissions, launch_model, launch_permissions, split_args,
 )
 
 BYPASS = "--dangerously-bypass-approvals-and-sandbox"
@@ -114,6 +114,24 @@ class CodexResumeArgsTests(unittest.TestCase):
                     "-c", 'mcp_servers.claude-manager.command="launcher.sh"',
                 ])
                 self.assertEqual(frontend, ["--no-alt-screen", "resume", "saved-thread"])
+
+    def test_model_reaches_frontend_backend_and_thread_requests(self):
+        for argv in ([BYPASS, "--no-alt-screen", "-m", "gpt-6-luna"],
+                     ["resume", "--no-alt-screen", "-m", "gpt-6-luna", "saved-thread"]):
+            with self.subTest(argv=argv):
+                backend, frontend = split_args(argv)
+                self.assertEqual(launch_model(argv), "gpt-6-luna")
+                self.assertIn('model="gpt-6-luna"', backend)
+                self.assertEqual(frontend[frontend.index("-m") + 1], "gpt-6-luna")
+                if argv[0] == "resume":
+                    self.assertEqual(frontend[-2:], ["resume", "saved-thread"])
+        self.assertIsNone(launch_model([BYPASS]))
+        self.assertEqual(launch_model(["--model=x1"]), "x1")
+        params = {"threadId": "saved", "model": "gpt-6-astra"}
+        self.assertEqual(apply_launch_model(params, "gpt-6-luna"),
+                         {"threadId": "saved", "model": "gpt-6-luna"})
+        self.assertEqual(params["model"], "gpt-6-astra", "the request is copied, not mutated")
+        self.assertIs(apply_launch_model(params, None), params)
 
 
 if __name__ == "__main__":

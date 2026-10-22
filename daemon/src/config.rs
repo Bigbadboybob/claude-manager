@@ -498,6 +498,13 @@ pub struct DaemonConfig {
     /// the next Codex spawn or A-R revive, never on a running session.
     #[serde(default = "default_codex_inline_scrollback")]
     pub codex_inline_scrollback: bool,
+    /// `[models]` — the engine default models every spawn falls back to
+    /// when neither the caller nor the task names one, plus the presets
+    /// the TUI offers (`crate::models`). CM never relies on an engine's
+    /// own default. Applies to the next spawn; `daemon.reload_config`
+    /// picks up edits.
+    #[serde(default)]
+    pub models: crate::models::ModelConfig,
 }
 
 fn default_presence_idle_enabled() -> bool { true }
@@ -538,6 +545,7 @@ impl Default for DaemonConfig {
             scheduler: SchedulerConfig::default(),
             notify_command: None,
             codex_inline_scrollback: true,
+            models: crate::models::ModelConfig::default(),
         }
     }
 }
@@ -555,6 +563,9 @@ pub enum ConfigError {
         path: PathBuf,
         mode: u32,
     },
+    /// A value parsed but is unusable (e.g. a `[models]` entry that
+    /// isn't a safe model string).
+    Invalid(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -562,6 +573,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "daemon.toml I/O error: {}", e),
             ConfigError::Parse(e) => write!(f, "daemon.toml parse error: {}", e),
+            ConfigError::Invalid(e) => write!(f, "daemon.toml invalid value: {}", e),
             ConfigError::InsecurePermsWithSecret { path, mode } => write!(
                 f,
                 "daemon.toml at {} is world- or group-readable \
@@ -600,6 +612,7 @@ pub fn load_or_default(path: &Path) -> Result<DaemonConfig, ConfigError> {
 
     let cfg: DaemonConfig =
         toml::from_str(&contents).map_err(ConfigError::Parse)?;
+    cfg.models.validate().map_err(ConfigError::Invalid)?;
 
     // Security gate: world- or group-readable file + non-empty
     // api_token = bearer-leak risk. Refuse to load.
@@ -833,6 +846,7 @@ mode = "ssh-trust"
             scheduler: SchedulerConfig::default(),
             notify_command: None,
             codex_inline_scrollback: true,
+            models: Default::default(),
         };
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =

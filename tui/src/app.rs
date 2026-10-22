@@ -50,6 +50,7 @@ use events::*;
 mod lifecycle;
 mod plan_launch;
 mod reports_to;
+pub(crate) mod model_field;
 mod remote_create;
 mod restart;
 mod background;
@@ -305,6 +306,11 @@ pub struct App {
     /// preserves it; `start_new_session` resets both.
     new_session_reports_to: crate::task_picker::ReportsTo,
     new_session_picker: Option<crate::task_picker::TaskPicker>,
+    /// The open launch form's Model field (A-n, A-s, A-f, A-F); each form
+    /// re-seeds it when it opens. See `model_field.rs`.
+    form_model: model_field::ModelField,
+    /// The A-e task form's per-engine default models.
+    task_form_models: model_field::TaskModelsEdit,
     /// A-n forms with a "Reports to" parent, parked until their task row
     /// exists (`BackendEvent::ReportingTaskCreated`), keyed by request id.
     pending_report_launches: HashMap<String, reports_to::PendingReportLaunch>,
@@ -1025,6 +1031,8 @@ impl App {
             session_form_host: None,
             new_session_reports_to: Default::default(),
             new_session_picker: None,
+            form_model: Default::default(),
+            task_form_models: Default::default(),
             pending_report_launches: HashMap::new(),
             start_time: Instant::now(),
             sessions_restored: false,

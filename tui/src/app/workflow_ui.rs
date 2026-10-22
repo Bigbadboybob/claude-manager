@@ -247,6 +247,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         &ts.host_id,
         pre_spawn_transcript.as_deref(),
         false, // global_perms
+        ts.model.as_deref(),
     ) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
@@ -1119,6 +1120,7 @@ mod stop_workflow_local_cleanup_tests {
 
     fn entry_with_workflow(run_id: Option<&str>) -> ManifestEntry {
         ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -1294,6 +1296,7 @@ mod rotation_binding_tests {
         workflow: Option<(&str, &str)>,
     ) -> TerminalSession {
         TerminalSession {
+            model: None,
             color: None,
             uid: "uid".into(),
             label: "test".into(),

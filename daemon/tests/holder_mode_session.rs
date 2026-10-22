@@ -73,6 +73,7 @@ fn test_meta(title: &str) -> AdoptedSessionMeta {
     AdoptedSessionMeta {
         title: title.into(),
         session_type: "bash".into(),
+        model: None,
         workspace_id: "ws-test".into(),
         managed_by_uid: None,
         task_id: None,

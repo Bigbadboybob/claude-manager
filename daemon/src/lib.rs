@@ -77,6 +77,7 @@ pub mod manifest;
 pub mod messaging;
 pub mod mcp_config;
 pub mod migrate;
+pub mod models;
 pub mod notify;
 pub mod org;
 pub mod owner_attention;
@@ -718,6 +719,7 @@ pub fn run() -> anyhow::Result<()> {
     // env-injection step can read it (mcp_server_path /
     // api_url / api_token).
     crate::mcp_config::set_codex_inline_scrollback(daemon_config.codex_inline_scrollback);
+    crate::models::set_models(daemon_config.models.clone());
     initial_state.config = daemon_config;
     // Phase 3b: the dev flag (read once above) and the listener's
     // raw fd — the latter is MANIFEST INPUT ONLY (see the field doc):

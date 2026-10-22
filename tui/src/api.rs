@@ -431,6 +431,20 @@ impl ApiClient {
         Ok(serde_json::from_value(body).ok())
     }
 
+    /// `POST /tasks/{id}/model`: set (`Some`) or clear (`None`) the task's
+    /// default model for `engine` (`claude` / `codex`), touching only
+    /// `metadata.models.<engine>`. Subtasks inherit it.
+    pub fn set_task_model(&self, task_id: &str, engine: &str, model: Option<&str>) -> anyhow::Result<Option<Task>> {
+        let body: serde_json::Value = self
+            .agent
+            .post(&self.url(&format!("/tasks/{}/model", task_id)))
+            .header("Authorization", &self.auth_header())
+            .send_json(serde_json::json!({ "engine": engine, "model": model }))?
+            .body_mut()
+            .read_json()?;
+        Ok(serde_json::from_value(body).ok())
+    }
+
     pub fn delete_task(&self, task_id: &str) -> anyhow::Result<()> {
         self.agent
             .delete(&self.url(&format!("/tasks/{}", task_id)))

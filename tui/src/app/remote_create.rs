@@ -23,6 +23,8 @@ pub(super) struct RemoteCreateSpec {
     pub workspace_id: String,
     /// Captured at request time; the cursor may move while the host works.
     pub section: Option<String>,
+    /// Explicit model; `None` = the host's engine default.
+    pub model: Option<String>,
 }
 
 pub(super) struct PreparedRemoteCreate {
@@ -30,6 +32,8 @@ pub(super) struct PreparedRemoteCreate {
     pub worktree_path: PathBuf,
     pub main_repo_path: Option<PathBuf>,
     pub resume_id: Option<String>,
+    /// The model the host spawned with.
+    pub model: Option<String>,
 }
 
 pub(super) struct RemoteCreateFlight {
@@ -80,13 +84,15 @@ fn run_remote_create(
         rows,
         job.in_place,
         job.seed_from.as_deref(),
+        job.model.as_deref(),
         timeout,
     );
-    let (worktree_path, main_repo_path, resume_id) = match created {
+    let (worktree_path, main_repo_path, resume_id, model) = match created {
         Ok(r) => (
             PathBuf::from(r.worktree_path),
             r.main_repo_path.map(PathBuf::from),
             r.resume_id,
+            r.model,
         ),
         // The daemon answered with a refusal: nothing was spawned.
         Err(e) if e.downcast_ref::<crate::client_session::DaemonRpcError>().is_some() => {
@@ -99,7 +105,7 @@ fn run_remote_create(
                 .and_then(|rows| rows.into_iter().find(|s| s.session_uid == job.uid))
                 .and_then(|s| s.worktree_path);
             match found {
-                Some(path) => (PathBuf::from(path), None, None),
+                Some(path) => (PathBuf::from(path), None, None, job.model.clone()),
                 None => return Err(discard(e)),
             }
         }
@@ -125,6 +131,7 @@ fn run_remote_create(
         worktree_path,
         main_repo_path,
         resume_id,
+        model,
     })
 }
 
@@ -205,6 +212,7 @@ impl App {
     fn finish_remote_create(&mut self, spec: RemoteCreateSpec, prepared: PreparedRemoteCreate) {
         let session_type = spec.engine.as_session_type();
         let ts = TerminalSession {
+            model: prepared.model.clone(),
             color: None,
             uid: spec.uid,
             label: session_type.to_string(),
@@ -316,6 +324,7 @@ mod tests {
             uid: "create-uid".into(),
             workspace_id: "create-ws".into(),
             section: None,
+            model: None,
         }
     }
 

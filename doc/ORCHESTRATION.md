@@ -26,6 +26,13 @@ question was buried in a progress log. The rules below exist to close those gaps
 either one. `isolated=true` (or a `task_id` with its own worktree) keeps workers
 out of each other's checkouts; share a checkout only when you mean to.
 
+Pick the model too. Every spawn names one: the `model=` you pass, else the
+task's default (`metadata.models`, inherited by subtasks), else the host's
+`[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-sol`).
+Give routine, well-specified work a cheaper model (`model="gpt-6-luna"`), and
+set a task default with `create_subtask(model=...)` so a whole subtree
+inherits it. See [explicit model choice](models.md).
+
 ## 2. Reuse sessions that hold good context
 
 A session that just finished a piece of work in an area knows that area. Give

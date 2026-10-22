@@ -68,6 +68,11 @@ pub struct ExitedTombstone {
     /// Retain scheduler ownership on exits and across brain restarts.
     #[serde(default)]
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub label: String,
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
@@ -1503,6 +1508,7 @@ mod tests {
             task_id: None,
             managed_by_uid: None,
             continuous_task_id: None,
+            model: None,
             label: uid.to_string(),
             workflow_run_id: None,
             workflow_role: None,
@@ -1603,6 +1609,7 @@ mod tests {
             workflow_run_id: None,
             workflow_role: None,
             continuous_task_id: None,
+            model: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,

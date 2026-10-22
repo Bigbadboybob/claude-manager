@@ -1491,6 +1491,7 @@ impl App {
         task_id: Option<String>,
         prompt: Option<&str>,
         global_perms: bool,
+        model: Option<&str>,
     ) -> std::io::Result<String> {
         // 12e-r8 F1: derive the target host from the CALLER's
         // pinned host_id, NOT from `self.active_host`.
@@ -1573,6 +1574,7 @@ impl App {
             // `control::methods::start_session`) — no window where
             // the child runs ungranted, no second RPC to lose.
             global_perms,
+            model,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -1615,6 +1617,7 @@ impl App {
             }
         }
         let ts = TerminalSession {
+            model: session.spawn_model.clone(),
             color: None,
             uid: session_uid.clone(),
             label: label.to_string(),
@@ -2521,6 +2524,7 @@ impl App {
 
         let op_token = self.host_pool.operator_token_for(&host_id);
         let config = crate::client_session::ClientSessionConfig {
+            model: None,
             daemon_socket: &socket,
             operator_token_id: &op_token,
             uid,
@@ -5684,6 +5688,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: None,
             daemon_socket: &sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -5893,7 +5898,7 @@ pub(super) mod pending_workflow_events_tests {
         let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
         app.create_local_session(
-            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, None, true,
+            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, None, true, None,
         );
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5911,7 +5916,7 @@ pub(super) mod pending_workflow_events_tests {
         let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
         app.create_local_session(
-            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, Some("snap-1"), false,
+            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, Some("snap-1"), false, None,
         );
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5930,7 +5935,7 @@ pub(super) mod pending_workflow_events_tests {
         let mut app = build_app_for_buffer_tests();
         let chosen = cm_daemon::host_id::HostId::local();
         app.create_local_session(
-            &chosen, "no-such-repo-xyz", "label", LaunchEngine::default(), None, 0, None, true,
+            &chosen, "no-such-repo-xyz", "label", LaunchEngine::default(), None, 0, None, true, None,
         );
         let st = status_text(&app);
         assert!(
@@ -5964,6 +5969,7 @@ pub(super) mod pending_workflow_events_tests {
             seed_from: None,
             in_place: true,
             host_id: cm_daemon::host_id::HostId::new("manager"),
+            model: None,
         });
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5983,6 +5989,7 @@ pub(super) mod pending_workflow_events_tests {
             seed_from: None,
             in_place: true,
             host_id: cm_daemon::host_id::HostId::local(),
+            model: None,
         });
         assert_eq!(
             status_text(&app),
@@ -6006,6 +6013,7 @@ pub(super) mod pending_workflow_events_tests {
             "claude",
             None,
             Some("snap-2"),
+            None,
             None,
         );
         assert!(
@@ -6151,6 +6159,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6329,6 +6338,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6357,6 +6367,7 @@ pub(super) mod pending_workflow_events_tests {
         // Manifest on disk: workspace ws-r with one session pinned to host
         // "manager".
         let entry = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6546,6 +6557,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6573,6 +6585,7 @@ pub(super) mod pending_workflow_events_tests {
         // Manifest entry pinned to "manager" with a STALE workflow_run_id
         // (no active runs exist → it's Detached/Done from the TUI's POV).
         let entry = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6760,6 +6773,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid_gone = new_session_uid(); // never spawned → attach will fail
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid_live,
@@ -6786,6 +6800,7 @@ pub(super) mod pending_workflow_events_tests {
 
         // Manifest: [gone, live] — gone FIRST so its failure precedes live.
         let mk = |uid: &str| ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6940,6 +6955,7 @@ pub(super) mod pending_workflow_events_tests {
         std::fs::create_dir_all(&cm_dir).unwrap();
 
         let mk = |uid: &str| ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -7086,6 +7102,7 @@ pub(super) mod pending_workflow_events_tests {
         let local_sock = cm_dir.join("daemon.sock");
 
         let entry = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -7351,6 +7368,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -7436,6 +7454,7 @@ pub(super) mod pending_workflow_events_tests {
             tombstones: Vec::new(),
         });
         let entry = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,

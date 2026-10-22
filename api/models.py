@@ -66,6 +66,32 @@ class TaskUpdate(BaseModel):
     metadata: dict | None = None
 
 
+# A model string is opaque: only non-empty and argv-safe (mirrors
+# daemon/src/models.rs::validate_model). Unknown models fail in the engine.
+MODEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._\-:/@+\[\]]{0,127}$"
+MODEL_ENGINES = ("claude", "codex")
+
+
+class TaskModelUpdate(BaseModel):
+    """Set (or with null, clear) a task's default model for one engine.
+
+    Stored at ``metadata.models.<engine>``; subtasks inherit it.
+    """
+
+    engine: str = Field(pattern=r"^(claude|codex)$")
+    model: str | None = Field(default=None, pattern=MODEL_PATTERN)
+
+
+class TaskModelResolution(BaseModel):
+    """The default model a task's sessions get for one engine."""
+
+    engine: str
+    # None: neither the task nor any ancestor sets one (use the engine default).
+    model: str | None = None
+    # The task (this one or an ancestor) whose metadata supplied ``model``.
+    source_task_id: str | None = None
+
+
 class TaskLeadUpdate(BaseModel):
     """Pin (or with null, clear) ``metadata.lead_session_uid`` on a task."""
 

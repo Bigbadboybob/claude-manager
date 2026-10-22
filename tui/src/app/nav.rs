@@ -1883,6 +1883,24 @@ impl App {
     /// when a task resolves (session's `task_id` or the Task cursor's),
     /// the workspace fallback otherwise; Session cursors get an identity
     /// header block on top either way.
+    /// `claude: X (task) · codex: Y (inherited)` for the peek: each
+    /// engine's default as a spawn on this task would resolve it.
+    pub(crate) fn task_models_summary(&self, task_id: &str) -> String {
+        let own = self.planning.task_own_models(task_id);
+        ["claude", "codex"]
+            .into_iter()
+            .map(|engine| {
+                let (model, from) = match (own.get(engine), self.task_default_model(task_id, engine)) {
+                    (Some(m), _) => (m.clone(), "task"),
+                    (None, Some(m)) => (m, "inherited"),
+                    (None, None) => (cm_daemon::models::default_model(engine).unwrap_or_default(), "engine default"),
+                };
+                format!("{engine}: {model} ({from})")
+            })
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ")
+    }
+
     pub(crate) fn build_peek_lines(&self) -> Vec<PeekLine> {
         let mut out: Vec<PeekLine> = Vec::new();
         match &self.cursor {
@@ -1900,6 +1918,9 @@ impl App {
                     ts.seeded_from_snapshot.as_deref(),
                     ts.last_delivery.as_ref().map(|(s, _)| s.as_str()),
                 ));
+                if let Some(model) = ts.model.as_deref() {
+                    out.push(PeekLine::Field { label: "Model".into(), value: model.to_string() });
+                }
                 if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
                     out.push(PeekLine::Field { label: "Status".into(), value: note.to_string() });
                 }
@@ -1923,7 +1944,11 @@ impl App {
                         .as_deref()
                         .and_then(|p| self.find_task_entry(p))
                         .map(|t| t.name.as_str());
-                    out.extend(peek_task_lines(task, parent));
+                    let mut lines = peek_task_lines(task, parent);
+                    // Default models sit with the task's fields, before the prompt.
+                    let at = lines.iter().position(|l| *l == PeekLine::Blank).unwrap_or(lines.len());
+                    lines.insert(at, PeekLine::Field { label: "Models".into(), value: self.task_models_summary(task_id) });
+                    out.extend(lines);
                 }
                 None => {
                     if let Some(ws) = self.workspaces.get(*ws_idx) {

@@ -188,6 +188,13 @@ pub enum BackendCommand {
         /// The pin before this change, restored if the call fails.
         previous: Option<String>,
     },
+    /// Set or clear a task's default model for one engine
+    /// (`POST /tasks/{id}/model`).
+    SetTaskModel {
+        id: String,
+        engine: String,
+        model: Option<String>,
+    },
     /// Delete a planning task from the DB.
     DeletePlanTask {
         id: String,
@@ -349,6 +356,10 @@ impl BackendHandle {
         self.try_send_or_warn(BackendCommand::SetTaskLead { id, session_uid, previous }, "set_task_lead");
     }
 
+    pub fn set_task_model(&self, id: String, engine: String, model: Option<String>) {
+        self.try_send_or_warn(BackendCommand::SetTaskModel { id, engine, model }, "set_task_model");
+    }
+
     pub fn delete_plan_task(&self, id: String) {
         self.try_send_or_warn(BackendCommand::DeletePlanTask { id }, "delete_plan_task");
     }
@@ -496,6 +507,21 @@ fn backend_loop(
                             previous,
                             error: e.to_string(),
                         });
+                    }
+                }
+            }
+            Ok(BackendCommand::SetTaskModel { id, engine, model }) => {
+                match client.set_task_model(&id, &engine, model.as_deref()) {
+                    Ok(task) => {
+                        if let Some(task) = task {
+                            let _ = event_tx.send(BackendEvent::PlanTaskUpdated(task));
+                        }
+                        after_write(&client);
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::ApiError(format!(
+                            "Task {engine} model not saved: {e}"
+                        )));
                     }
                 }
             }

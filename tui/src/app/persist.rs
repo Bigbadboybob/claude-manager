@@ -1108,6 +1108,7 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> TerminalSession {
         TerminalSession {
+            model: s.model.clone().or_else(|| session.spawn_model.clone()),
             color: None,
             uid: s.session_uid.clone(),
             label: s.label.clone(),
@@ -1151,6 +1152,7 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
+            model: s.model.clone(),
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -1459,6 +1461,7 @@ impl App {
                         &entry.host_id,
                         pre_spawn_transcript.as_deref(),
                         entry.global_perms, // global_perms
+                        entry.model.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),
@@ -1489,6 +1492,7 @@ impl App {
                         &entry.host_id,
                         pre_spawn_transcript.as_deref(),
                         entry.global_perms, // global_perms
+                        entry.model.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),
@@ -1532,6 +1536,7 @@ impl App {
         // value used in `session_uid_for_mcp` above. Don't generate a
         // fresh one here.
         let ts = TerminalSession {
+            model: s.spawn_model.clone().or_else(|| entry.model.clone()),
             color: entry.color.clone(),
             uid: restored_uid,
             label: entry.label.clone(),
@@ -1583,6 +1588,7 @@ mod adopt_daemon_session_tests {
 
     fn summary(uid: &str, managed_by_uid: Option<&str>) -> DaemonSessionSummary {
         DaemonSessionSummary {
+            model: None,
             session_uid: uid.to_string(),
             label: "w".to_string(),
             session_type: "claude-code".to_string(),

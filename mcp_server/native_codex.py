@@ -115,6 +115,29 @@ def apply_launch_permissions(params, policy):
     return params
 
 
+def apply_launch_model(params, model):
+    """Pin CM's resolved model on a thread start/resume/fork request.
+
+    CM never leaves a session on Codex's default model; a resumed thread
+    would otherwise keep whatever it was last using.
+    """
+    if not model:
+        return params
+    params = dict(params)
+    params["model"] = model
+    return params
+
+
+def launch_model(args):
+    """The model a CM Codex argv selects (``-m``/``--model``), if any."""
+    for index, arg in enumerate(args):
+        if arg in ("-m", "--model") and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--model="):
+            return arg.split("=", 1)[1]
+    return None
+
+
 class NativeRPCError(RuntimeError):
     def __init__(self, error):
         super().__init__("Codex rejected native RPC")
@@ -144,8 +167,9 @@ def selectable(thread):
 class Relay:
     engine = "codex"
 
-    def __init__(self, socket: str, queue: Queue, permissions=None):
+    def __init__(self, socket: str, queue: Queue, permissions=None, model=None):
         self.socket = socket
+        self.launch_model = model
         self.queue = queue
         self.upstream = None
         self.frontend = None
@@ -631,8 +655,11 @@ class Relay:
                         await ws.send(json.dumps(request))
                 if "id" in message and method:
                     if method in {"thread/start", "thread/resume", "thread/fork"}:
-                        message["params"] = apply_launch_permissions(
-                            message.get("params", {}), self.launch_permissions
+                        message["params"] = apply_launch_model(
+                            apply_launch_permissions(
+                                message.get("params", {}), self.launch_permissions
+                            ),
+                            self.launch_model,
                         )
                     self.requests[request_id] = (method, message.get("params", {}))
                     if method in {
@@ -756,6 +783,13 @@ def split_args(args, permissions=None):
         elif arg == "--no-alt-screen":
             frontend.append(arg)
             index += 1
+        elif arg in ("-m", "--model") and index + 1 < len(args):
+            # The frontend starts/resumes the thread with it; the backend's
+            # default matches so nothing falls back to Codex's own default.
+            model = args[index + 1]
+            frontend.extend(["-m", model])
+            backend.extend(["-c", "model=" + json.dumps(model)])
+            index += 2
         else:
             raise ValueError(f"unsupported CM Codex launch argument: {arg}")
     if resume:
@@ -860,7 +894,7 @@ async def launch(args):
                 raise RuntimeError(
                     f"Codex app-server startup timed out; see {log_path}"
                 )
-            relay = Relay(backend_socket, queue, permissions)
+            relay = Relay(backend_socket, queue, permissions, launch_model(args.codex_args))
             await relay.connect()
             async with unix_serve(
                 relay.serve_frontend,

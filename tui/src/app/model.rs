@@ -106,6 +106,10 @@ pub struct TerminalSession {
     /// or propagated from a global caller via `start_session`.
     /// Persisted in the manifest. Off by default (safe baseline).
     pub global_perms: bool,
+    /// The model this session was spawned with (`None` for bash, or a row
+    /// restored from a manifest older than the field). Persisted in the
+    /// manifest so revive / restart reuse it.
+    pub model: Option<String>,
     /// Marker that an Enter keystroke is queued to be written to the PTY at
     /// or after `fire_at`. Used to introduce a deliberate gap between the body
     /// of a multi-KB workflow prompt and the trailing Enter so the receiving
@@ -228,6 +232,7 @@ impl TerminalSession {
             notify_on_idle: self.notify_on_idle,
             color: self.color.clone(),
             global_perms: self.global_perms,
+            model: self.model.clone(),
             seeded_from_snapshot: self.seeded_from_snapshot.clone(),
             // Read-modify-write the daemon-owned `last_exit`. The TUI
             // never inspects or mutates it — just hands it back
@@ -510,6 +515,7 @@ pub(super) fn make_simple_session_with_uid(
     pending_jsonl_files: Option<Vec<String>>,
 ) -> TerminalSession {
     TerminalSession {
+        model: session.spawn_model.clone(),
         color: None,
         uid,
         label: label.to_string(),
@@ -623,6 +629,7 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn seeded_from_snapshot_round_trips() {
         let entry = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -675,6 +682,7 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn none_does_not_serialize() {
         let entry = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -742,6 +750,7 @@ mod manifest_entry_seeded_from_tests {
         // the round-trip preserves the flag so the toast renders
         // correctly post-restart.
         let entry = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -813,6 +822,7 @@ mod manifest_entry_seeded_from_tests {
             exited_at: 1_700_000_000.0,
         };
         let initial = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -864,6 +874,7 @@ mod manifest_entry_seeded_from_tests {
         // the pre-fix `last_exit: None`, the assertion at the end of
         // this test would fail.
         let rebuilt = ManifestEntry {
+            model: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -925,6 +936,7 @@ mod transcript_rebind_tests {
             crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
                 .expect("session for test");
         TerminalSession {
+            model: None,
             color: None,
             uid: "uid".into(),
             label: "test".into(),

@@ -1029,6 +1029,8 @@ def propose_task(
     depends: list[str] | None = None,
     initiative_id: str | None = None,
     reports_to: str | None = None,
+    model: str | None = None,
+    model_engine: str | None = None,
 ) -> str:
     """Propose a new task to the project backlog.
 
@@ -1068,6 +1070,11 @@ def propose_task(
         initiative_id: Existing initiative UUID or slug to attach this task to
         reports_to: Reporting line: "me" (your own task) or a task id. Sets
             the draft's parent task; omit for a standalone task.
+        model: Optional default model for the task (`metadata.models.<engine>`),
+            used by its sessions and inherited by its subtasks. Omitted: it
+            inherits its parent's, else the engine default.
+        model_engine: "claude" or "codex": which engine `model` is for.
+            Defaults to your own engine.
     """
     _check_parameter_confusion("description", description)
     _check_parameter_confusion("prompt", prompt)
@@ -1116,6 +1123,10 @@ def propose_task(
             params["initiative_id"] = initiative_id
         if reports_to:
             params["reports_to"] = reports_to
+        if model and model.strip():
+            params["model"] = model.strip()
+        if model_engine:
+            params["model_engine"] = model_engine
         try:
             task = control_client.call("propose_task", params, socket_path=route.path)
         except control_client.ControlError as e:
@@ -1125,6 +1136,14 @@ def propose_task(
     else:
         client = PlanningClient()
         filer = _caller_filer_context("mcp.propose_task")
+        metadata: dict = {"filer": filer}
+        if model and model.strip():
+            engine = model_engine or filer.get("agent")
+            slot = {"claude-code": "claude", "claude": "claude", "codex": "codex"}.get(str(engine))
+            if slot is None:
+                return ('propose_task failed: model_engine must be "claude" or "codex" '
+                        "(your own engine is unknown)")
+            metadata["models"] = {slot: model.strip()}
         parent_task_id = reports_to
         if reports_to and reports_to.strip().lower() == "me":
             parent_task_id = filer.get("task_id")
@@ -1146,7 +1165,7 @@ def propose_task(
             depends=depends,
             initiative_id=initiative_id,
             parent_task_id=parent_task_id,
-            metadata={"filer": filer},
+            metadata=metadata,
         )
     # Inline round-trip preview so the caller sees what actually landed
     # without an extra get_task. Truncated to keep the response readable.
@@ -1884,6 +1903,7 @@ async def start_session(
     notify_on_done: bool = True,
     notify_until: str = "turn_end",
     allow_shared_workspace: bool = False,
+    model: str | None = None,
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
 
@@ -1960,6 +1980,13 @@ async def start_session(
             carries `shared_workspace: true`, a `warning`, and
             `workspace_shared_with` listing the other sessions in that
             checkout. Ignored when the task already has a workspace.
+        model: The worker's model id (e.g. "gpt-6-luna" for cheap codex
+            work, "claude-sonnet-5-5"). Omitted: the task's default model
+            (inherited through parent tasks), else the engine default from
+            the host's `[models]` config. CM always passes a model; it never
+            leaves the choice to the engine. The result reports `model` and
+            `model_source` ("explicit" | "task" | "engine_default"). Not
+            valid for bash. An unknown model fails when the engine starts.
         global_perms: Grant the new session global permissions (it can
             then prompt/read/control ANY session). **Only honored if YOU
             already hold global permissions** (check `ping().global_perms`);
@@ -2109,6 +2136,8 @@ async def start_session(
     # serves the default mint path.
     if allow_shared_workspace:
         params["allow_shared_workspace"] = True
+    if model and model.strip():
+        params["model"] = model.strip()
     # Sub-2c review-2: single-decision binding (restoring the
     # round-8 #2 fix). `resolve_socket_route()` is called ONCE
     # to get both the chosen path AND the route-chose-daemon
@@ -2191,6 +2220,8 @@ async def start_session(
                 "workspace_shared_with",
                 "worktree_recreated",
                 "worktree_warning",
+                "model",
+                "model_source",
             ):
                 if spawn.get(key) is not None and d.get(key) is None:
                     d[key] = spawn[key]
@@ -2274,6 +2305,7 @@ async def fork_session(
     label: str | None = None,
     notify_on_done: bool = True,
     notify_until: str = "turn_end",
+    model: str | None = None,
 ) -> dict:
     """Fork a Claude or Codex session's conversation into a task.
 
@@ -2304,6 +2336,7 @@ async def fork_session(
         request_id: Idempotency key; generated per call when omitted. A
             retry with the same key returns the first fork.
         label: Sidebar label for the new session (default: the task name).
+        model: The fork's model; omitted = the source session's model.
         notify_on_done / notify_until: As for `start_session` — with a
             prompt, a self-waking monitor is registered on the fork.
 
@@ -2324,6 +2357,7 @@ async def fork_session(
     for key, value in (
         ("task_name", task_name), ("task_id", task_id),
         ("parent_task_id", parent_task_id), ("label", label),
+        ("model", model.strip() if model else None),
     ):
         if value:
             params[key] = value
@@ -4015,6 +4049,8 @@ def create_subtask(
     worktree_mode: str = "inherit",
     project: str | None = None,
     base: str | None = None,
+    model: str | None = None,
+    model_engine: str | None = None,
 ) -> dict:
     """Create a subtask under your current task. Creates the task (and,
     in branch mode, its worktree) and STOPS — nothing is running until
@@ -4050,6 +4086,11 @@ def create_subtask(
             `base '<x>' does not resolve to a commit`.
         project: Optional explicit project; defaults to the parent's
             project.
+        model: Optional default model for the subtask (stored as
+            `metadata.models.<engine>`); its sessions and its own subtasks
+            use it unless a spawn names another. Omitted: it inherits your
+            task's default. `model_engine` ("claude" | "codex") picks the
+            slot; it defaults to your own engine.
 
     Returns: {"task_id": "<uuid>", "worktree_path": "<absolute path>",
     "base_sha": "<commit sha the checkout sits on, or null>",
@@ -4070,6 +4111,10 @@ def create_subtask(
         params["project"] = project
     if base:
         params["base"] = base
+    if model and model.strip():
+        params["model"] = model.strip()
+    if model_engine:
+        params["model_engine"] = model_engine
     result = control_client.call("create_subtask", params)
     # Version skew: a daemon predating `base` deserializes params
     # leniently, so it would ignore the argument and cut from the

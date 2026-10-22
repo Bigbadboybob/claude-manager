@@ -1035,6 +1035,29 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
 // start_session
 // ---------------------------------------------------------------------------
 
+/// Resolve an MCP spawn's model the way the daemon's `resolve_spawn_model`
+/// does: explicit → task default (inherited) → engine default. Bash takes
+/// none; a bad explicit model is refused before anything spawns.
+fn tui_spawn_model(
+    app: &App,
+    session_type: &str,
+    explicit: Option<&str>,
+    task_id: Option<&str>,
+) -> Result<(Option<String>, Option<&'static str>), (ErrorCode, String)> {
+    use cm_daemon::models::ModelSource;
+    let inherited = task_id.and_then(|t| app.task_default_model(t, session_type));
+    let resolved = cm_daemon::models::resolve(
+        session_type,
+        explicit,
+        inherited.as_deref().map(|m| (m, ModelSource::Task)),
+    )
+    .map_err(|e| (ErrorCode::InvalidParams, e))?;
+    Ok(match resolved {
+        Some((m, src)) => (Some(m), Some(src.as_str())),
+        None => (None, None),
+    })
+}
+
 #[derive(Deserialize)]
 struct StartSessionParams {
     #[serde(default)]
@@ -1059,6 +1082,11 @@ struct StartSessionParams {
     /// instead. Mirrors the daemon's `mcp_start_session`.
     #[serde(default)]
     allow_shared_workspace: bool,
+    /// The child's model; absent = the task default (inherited through
+    /// its parents), else the engine default. Mirrors the daemon's
+    /// `mcp_start_session`.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// ux-5c (TUI twin of the daemon's `task_autodelivery_prompt`):
@@ -1220,6 +1248,7 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
         .map(|p| p.to_string_lossy().into_owned());
     let task_id_for_response = task_id_for_new.clone();
 
+    let (model, model_source) = tui_spawn_model(app, &p.type_, p.model.as_deref(), task_id_for_new.as_deref())?;
     let new_uid = app.spawn_managed_session(
         target_wi,
         caller_uid,
@@ -1228,6 +1257,7 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
         task_id_for_new,
         effective_prompt.as_deref(),
         p.global_perms,
+        model.as_deref(),
     )
     .map_err(|e| (ErrorCode::Internal, format!("spawn: {}", e)))?;
     // ux-1c / ux-5c: same enriched shape the daemon's
@@ -1236,6 +1266,8 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     let mut resp = json!({
         "session_uid": new_uid,
         "prompt_source": prompt_source,
+        "model": model,
+        "model_source": model_source,
     });
     if let Some(wt) = worktree_path.as_deref() {
         resp["worktree_path"] = Value::String(wt.to_string());
@@ -1669,6 +1701,12 @@ struct CreateSubtaskParams {
     /// resolution when present; absent keeps the parent-branch default.
     #[serde(default)]
     base: Option<String>,
+    /// The subtask's default model (`metadata.models.<engine>`); the slot is
+    /// `model_engine`, else the caller's engine. Mirrors the daemon.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    model_engine: Option<String>,
 }
 
 fn default_subtask_worktree_mode() -> String {
@@ -1682,6 +1720,31 @@ pub(crate) struct CreatedSubtask {
 }
 
 pub(crate) type SubtaskJob = Box<dyn FnOnce() -> Result<CreatedSubtask, (ErrorCode, String)> + Send>;
+
+/// `metadata.models` for a subtask filed with a `model` (twin of the
+/// daemon's `filed_task_models`).
+fn filed_task_models(
+    filer: &Value,
+    model: Option<&str>,
+    model_engine: Option<&str>,
+) -> Result<Option<Value>, (ErrorCode, String)> {
+    let model_engine = model_engine.map(str::trim).filter(|e| !e.is_empty());
+    let Some(model) = model.filter(|m| !m.trim().is_empty()) else {
+        if model_engine.is_some() {
+            return Err((ErrorCode::InvalidParams, "model_engine needs a model".into()));
+        }
+        return Ok(None);
+    };
+    let model = cm_daemon::models::validate_model(model).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    let engine = model_engine
+        .or_else(|| filer.get("agent").and_then(Value::as_str))
+        .and_then(cm_daemon::models::engine_key)
+        .ok_or((
+            ErrorCode::InvalidParams,
+            "model_engine must be \"claude\" or \"codex\" (the caller's own engine is unknown)".to_string(),
+        ))?;
+    Ok(Some(json!({ engine: model })))
+}
 
 pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
     let created = prepare_create_subtask(app, caller_uid, params)?()?;
@@ -1748,6 +1811,7 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
         caller_uid,
         "mcp.create_subtask",
     );
+    let models = filed_task_models(&filer, p.model.as_deref(), p.model_engine.as_deref())?;
 
     // Subtasks need a parent. Taskless callers should call propose_task
     // (the existing tool) to add a top-level task instead.
@@ -2033,7 +2097,10 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
             worktree_mode: Some(p.worktree_mode.clone()),
             initiative_id: None,
             wip_branch: branch_name_for_new.clone(),
-            metadata: Some(json!({ "filer": filer })),
+            metadata: Some(match &models {
+                Some(models) => json!({ "filer": filer, cm_daemon::models::TASK_MODELS_METADATA_KEY: models }),
+                None => json!({ "filer": filer }),
+            }),
         };
         let new_task = api_client
             .create_task(&body)
@@ -2924,6 +2991,7 @@ mod tests {
 
     fn live_ts(uid: &str, task_id: Option<&str>) -> TerminalSession {
         TerminalSession {
+            model: None,
             color: None,
             uid: uid.into(),
             label: "test".into(),
