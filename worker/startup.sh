@@ -122,7 +122,11 @@ if [ -n "$SESSION_ID" ]; then
     echo "[cm-worker] Will resume session $SESSION_ID"
     TRANSCRIPT="$WORKER_HOME/.claude/projects/-workspace/$SESSION_ID.jsonl"
     if [ -f "$TRANSCRIPT" ]; then
-        RAN_MODEL=$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -o '"model":"[A-Za-z0-9._:/@+-]*"' | grep -v synthetic | tail -1 | cut -d'"' -f4)
+        # requestedModel keeps a context suffix (claude-opus-5-5[1m]) that
+        # message.model drops; older transcripts only have message.model.
+        LAST_TURN=$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -v '"model":"<synthetic>"' | tail -1)
+        RAN_MODEL=$(printf '%s' "$LAST_TURN" | grep -o '"requestedModel":"[]A-Za-z0-9._:/@+[-]*"' | head -1 | cut -d'"' -f4)
+        [ -n "$RAN_MODEL" ] || RAN_MODEL=$(printf '%s' "$LAST_TURN" | grep -o '"model":"[A-Za-z0-9._:/@+-]*"' | head -1 | cut -d'"' -f4)
         RAN_EFFORT=$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -o '"effort":"[a-z]*"' | tail -1 | cut -d'"' -f4)
         [ "$CLAUDE_MODEL_SOURCE" != "task" ] && [ -n "$RAN_MODEL" ] && CLAUDE_MODEL="$RAN_MODEL"
         [ "$CLAUDE_EFFORT_SOURCE" != "task" ] && [ -n "$RAN_EFFORT" ] && CLAUDE_EFFORT="$RAN_EFFORT"

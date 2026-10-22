@@ -10910,14 +10910,29 @@ pub fn backfill_session_models(
             }
         }
     }
-    let found: Vec<(Setting, String, String)> = wanted
-        .into_iter()
-        .filter_map(|(setting, uid, engine, path, worktree)| {
-            let id = path.as_deref().and_then(crate::session::transcript_id_from_path);
-            let file = crate::models::session_transcript(&engine, worktree.as_deref(), path.as_deref(), id.as_deref())?;
-            Some((setting, uid, setting.from_transcript(&engine, &file)?))
-        })
-        .collect();
+    // This runs before the brain serves. Each read is a bounded tail of
+    // one transcript, but there can be dozens of multi-GB ones, so they
+    // run on a few threads.
+    let read = |(setting, uid, engine, path, worktree): &(Setting, String, String, Option<String>, Option<std::path::PathBuf>)| {
+        let id = path.as_deref().and_then(crate::session::transcript_id_from_path);
+        let file = crate::models::session_transcript(engine, worktree.as_deref(), path.as_deref(), id.as_deref())?;
+        Some((*setting, uid.clone(), setting.from_transcript(engine, &file)?))
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let found: Vec<(Setting, String, String)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..wanted.len().min(BACKFILL_READERS))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    while let Some(w) = wanted.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        out.extend(read(w));
+                    }
+                    out
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap_or_default()).collect()
+    });
     let from_transcript = found.len();
     if from_registry + from_transcript > 0 {
         let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -10946,6 +10961,9 @@ pub fn backfill_session_models(
     }
     from_registry + from_transcript
 }
+
+/// Transcript readers for [`backfill_session_models`].
+const BACKFILL_READERS: usize = 8;
 
 pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
     // The NON-SPAWNING half (shared with the re-exec Adopted path — see
@@ -11047,7 +11065,7 @@ fn restore_needs_task_model(
         crate::models::session_transcript(&e.session_type, Some(worktree), e.transcript_path.as_deref(), Some(id))
     });
     let needs = |setting: Setting| {
-        let recorded = entry_slot(e, setting).is_some_and(|(v, _)| setting.validate(&e.session_type, v).is_ok());
+        let recorded = recorded_slot(setting, &e.session_type, entry_slot(e, setting)).is_some();
         !recorded && !transcript.as_deref().is_some_and(|p| setting.from_transcript(&e.session_type, p).is_some())
     };
     (needs(Setting::Model) || needs(Setting::Effort)).then(|| (task.to_string(), key))
@@ -11116,7 +11134,7 @@ fn compose_restore_params_with(
         if t.engine.as_session_type() != e.session_type || (t.current_session_uid.as_deref() != Some(&e.uid) && t.in_flight.as_ref().map(|f| f.session_uid.as_str()) != Some(&e.uid)) {
             return Err((ErrorCode::Conflict, "Stale continuous session identity or engine; restore is refused.".into()));
         }
-        continuous = TaskDefaults { model: t.model.clone(), effort: t.effort.clone() };
+        continuous = TaskDefaults { model: t.model.clone(), effort: t.effort.clone(), timed_out: false };
     }
     // S3 (resume): a persisted transcript_id means "continue this
     // conversation" — the argv gets `--resume <id>` (claude) / the `resume`
@@ -11140,6 +11158,7 @@ fn compose_restore_params_with(
         TaskDefaults {
             model: continuous.model.clone().or(task.model),
             effort: continuous.effort.clone().or(task.effort),
+            timed_out: task.timed_out,
         }
     };
     let (model, effort) = resolve_respawn_pick(
@@ -16286,6 +16305,10 @@ fn api_set_task_lead(
 pub(crate) struct TaskDefaults {
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The lookup didn't answer in time (the restore budget, or the
+    /// request's own timeout): a config default it leads to is recorded
+    /// as `lookup_timeout` and resolved again on the next respawn.
+    pub timed_out: bool,
 }
 
 impl TaskDefaults {
@@ -16320,7 +16343,7 @@ fn api_resolve_task_defaults(
         .map_err(map_ureq_err)?;
     let row: Value = crate::planning_client::decode_json_response(resp, "resolve_task_model")?;
     let field = |k: &str| row.get(k).and_then(Value::as_str).map(str::to_string);
-    Ok(TaskDefaults { model: field("model"), effort: field("effort") })
+    Ok(TaskDefaults { model: field("model"), effort: field("effort"), timed_out: false })
 }
 
 /// The task default step of the resolution order: the task's (or nearest
@@ -16349,7 +16372,9 @@ fn task_defaults(
                 "cm-daemon: task '{}' default model/effort lookup failed ({:?}); using the {} config defaults",
                 task_id, e, key,
             );
-            TaskDefaults::default()
+            let timed_out = matches!(&e, PlanningClientError::Transport(m) if m.to_ascii_lowercase().contains("timeout")
+                || m.to_ascii_lowercase().contains("timed out"));
+            TaskDefaults { timed_out, ..TaskDefaults::default() }
         }
     }
 }
@@ -16379,7 +16404,7 @@ pub(crate) fn resolve_spawn_pick(
     explicit_effort: Option<&str>,
     task_id: Option<&str>,
 ) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
-    use crate::models::{ModelSource, Setting};
+    use crate::models::Setting;
     let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
     let task = if crate::models::takes_model(engine) && (blank(explicit_model) || blank(explicit_effort)) {
         task_defaults(state_arc, task_id, engine)
@@ -16387,12 +16412,42 @@ pub(crate) fn resolve_spawn_pick(
         TaskDefaults::default()
     };
     let one = |setting: Setting, explicit: Option<&str>| {
-        let from_task = task.get(setting);
-        setting
-            .resolve(engine, explicit, from_task.as_deref().map(|v| (v, ModelSource::Task)))
-            .map_err(|e| (ErrorCode::InvalidParams, e))
+        if explicit.is_some_and(|v| !v.trim().is_empty()) {
+            return setting.resolve(engine, explicit, None).map_err(|e| (ErrorCode::InvalidParams, e));
+        }
+        resolve_default(setting, task_id.unwrap_or("-"), engine, &task)
     };
     Ok((one(Setting::Model, explicit_model)?, one(Setting::Effort, explicit_effort)?))
+}
+
+/// The default step of the order: the task's (inherited) default, else
+/// the config default. A task value the engine can't take (a codex
+/// `max` effort) is logged and replaced (`task_invalid_fallback`); a
+/// config default reached because the lookup timed out is
+/// `lookup_timeout`. `who` names the session or task for the log.
+fn resolve_default(
+    setting: crate::models::Setting,
+    who: &str,
+    engine: &str,
+    task: &TaskDefaults,
+) -> Resolved2 {
+    use crate::models::ModelSource;
+    let from_task = task.get(setting);
+    let resolved = setting
+        .resolve(engine, None, from_task.as_deref().map(|v| (v, ModelSource::Task)))
+        .map_err(|e| (ErrorCode::InvalidParams, e))?;
+    Ok(resolved.map(|(v, source)| match source {
+        ModelSource::TaskInvalidFallback => {
+            eprintln!(
+                "cm-daemon: {who}: task default {name} '{}' is not valid for {engine}; using '{v}'",
+                from_task.as_deref().unwrap_or_default(),
+                name = setting.name(),
+            );
+            (v, source)
+        }
+        ModelSource::Engine if task.timed_out => (v, ModelSource::LookupTimeout),
+        _ => (v, source),
+    }))
 }
 
 /// Per-restore cache of task defaults, keyed by `(task_id, engine slot)`.
@@ -16445,7 +16500,7 @@ pub(crate) fn prefetch_task_models(
         );
     }
     for key in keys {
-        cache.entry(key).or_default();
+        cache.entry(key).or_insert_with(|| TaskDefaults { timed_out: true, ..TaskDefaults::default() });
     }
     cache
 }
@@ -16467,32 +16522,28 @@ pub(crate) fn resolve_respawn(
     explicit: Option<&str>,
     recorded: Option<(&str, Option<&str>)>,
     resume: Option<Option<&std::path::Path>>,
-    task_default: &mut dyn FnMut() -> Option<String>,
+    task_default: &mut dyn FnMut() -> TaskDefaults,
 ) -> Resolved2 {
     use crate::models::ModelSource;
     let invalid = |e: String| (ErrorCode::InvalidParams, e);
     if !crate::models::takes_model(engine) || explicit.is_some_and(|m| !m.trim().is_empty()) {
         return setting.resolve(engine, explicit, None).map_err(invalid);
     }
-    if let Some((v, source)) = recorded {
-        if let Ok(v) = setting.validate(engine, v) {
-            let source = source.and_then(ModelSource::parse).unwrap_or(ModelSource::Recorded);
-            return Ok(Some((v, source)));
-        }
+    if let Some((v, source)) = recorded_slot(setting, engine, recorded) {
+        return Ok(Some((v, source)));
     }
     let Some(transcript) = resume else {
-        let task = task_default();
-        let inherited = task.as_deref().map(|v| (v, ModelSource::Task));
-        return setting.resolve(engine, None, inherited).map_err(invalid);
+        return resolve_default(setting, uid, engine, &task_default());
     };
     if let Some(v) = transcript.and_then(|t| setting.from_transcript(engine, t)) {
         return Ok(Some((v, ModelSource::Transcript)));
     }
-    let task = task_default();
-    let fallback = setting
-        .resolve(engine, None, task.as_deref().map(|v| (v, ModelSource::Task)))
-        .map_err(invalid)?;
+    let fallback = resolve_default(setting, uid, engine, &task_default())?;
     Ok(fallback.map(|(v, from)| {
+        // An invalid task value or a timed-out lookup says so instead.
+        if from != ModelSource::Task && from != ModelSource::Engine {
+            return (v, from);
+        }
         eprintln!(
             "cm-daemon: session {uid}: no recorded {name} and none in its transcript ({}); \
              resuming on the {} default '{v}'",
@@ -16505,6 +16556,22 @@ pub(crate) fn resolve_respawn(
 }
 
 type Resolved2 = Result<Resolved, (ErrorCode, String)>;
+
+/// A session's recorded value, if it still stands: valid for the engine
+/// and not provisional (a `lookup_timeout` stand-in is resolved again).
+fn recorded_slot(
+    setting: crate::models::Setting,
+    engine: &str,
+    recorded: Option<(&str, Option<&str>)>,
+) -> Option<(String, crate::models::ModelSource)> {
+    use crate::models::ModelSource;
+    let (v, source) = recorded?;
+    let source = source.and_then(ModelSource::parse).unwrap_or(ModelSource::Recorded);
+    if source.is_provisional() {
+        return None;
+    }
+    Some((setting.validate(engine, v).ok()?, source))
+}
 
 /// [`resolve_respawn`] for both settings, sharing one lazy task lookup.
 /// `recorded_*` are the session's recorded value and source.
@@ -16521,13 +16588,9 @@ pub(crate) fn resolve_respawn_pick(
 ) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
     use crate::models::Setting;
     let mut cached: Option<TaskDefaults> = None;
-    let mut lookup = |s: Setting| cached.get_or_insert_with(&mut *task_defaults).get(s);
-    let model = resolve_respawn(Setting::Model, uid, engine, explicit_model, recorded_model, resume, &mut || {
-        lookup(Setting::Model)
-    })?;
-    let effort = resolve_respawn(Setting::Effort, uid, engine, explicit_effort, recorded_effort, resume, &mut || {
-        lookup(Setting::Effort)
-    })?;
+    let mut lookup = || cached.get_or_insert_with(&mut *task_defaults).clone();
+    let model = resolve_respawn(Setting::Model, uid, engine, explicit_model, recorded_model, resume, &mut lookup)?;
+    let effort = resolve_respawn(Setting::Effort, uid, engine, explicit_effort, recorded_effort, resume, &mut lookup)?;
     Ok((model, effort))
 }
 
@@ -25380,6 +25443,39 @@ while True:
         });
     }
 
+    /// Timing for the adopt-at-boot backfill against real transcripts:
+    /// `CM_BACKFILL_BENCH` names a file of `<engine> <transcript path>`
+    /// lines, one adopted session each. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn backfill_timing_on_real_transcripts() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let Some(list) = std::env::var_os("CM_BACKFILL_BENCH") else { return };
+        let lines: Vec<(String, String)> = std::fs::read_to_string(list)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.split_once(' ').map(|(e, p)| (e.to_string(), p.to_string())))
+            .collect();
+        let _home = with_temp_home(|| {
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                for (i, (engine, path)) in lines.iter().enumerate() {
+                    let uid = format!("ts-be{i:014}-0");
+                    let mut sp = SpawnParams::new(&uid, "be", "/bin/sleep");
+                    sp.args = vec!["300".to_string()];
+                    sp.session_type = engine.clone();
+                    sp.transcript_path = Some(path.clone());
+                    s.sessions.insert(uid, DaemonSession::spawn(sp).expect("spawn"));
+                }
+            }
+            let started = std::time::Instant::now();
+            let n = backfill_session_models(&state, None);
+            eprintln!("BENCH backfill: {} sessions, {n} values recorded in {:?}", lines.len(), started.elapsed());
+            state.lock().unwrap().sessions.clear();
+        });
+    }
+
     /// Restore never stalls on an unreachable planning API: the task
     /// lookups run concurrently under one total budget, and the ones that
     /// didn't answer fall back to the config defaults.
@@ -25408,7 +25504,42 @@ while True:
         let took = started.elapsed();
         assert!(took < std::time::Duration::from_secs(2), "bounded by the budget, not 6 × the 3 s timeout: {took:?}");
         assert_eq!(cache.len(), 6);
-        assert!(cache.values().all(|d| *d == TaskDefaults::default()), "unanswered → config defaults");
+        assert!(
+            cache.values().all(|d| d.timed_out && d.model.is_none() && d.effort.is_none()),
+            "unanswered → config defaults, marked timed out"
+        );
+        // A default reached that way is recorded as lookup_timeout.
+        let d = cache.values().next().unwrap();
+        let (_, src) = resolve_default(crate::models::Setting::Effort, "s", "codex", d).unwrap().unwrap();
+        assert_eq!(src, crate::models::ModelSource::LookupTimeout);
+    }
+
+    /// The default step says why a config default applied: a task value
+    /// the engine can't take (codex `max`) is `task_invalid_fallback`; a
+    /// timed-out lookup is `lookup_timeout`, which a later respawn resolves
+    /// again instead of reusing.
+    #[test]
+    fn task_default_fallbacks_are_recorded_and_provisional_ones_re_resolve() {
+        use crate::models::{ModelSource as S, Setting};
+        let codex_max = TaskDefaults { effort: Some("max".into()), ..TaskDefaults::default() };
+        let pick = |task: TaskDefaults, recorded: Option<(&str, Option<&str>)>| {
+            resolve_respawn(Setting::Effort, "u", "codex", None, recorded, None, &mut || task.clone()).unwrap().unwrap()
+        };
+        assert_eq!(pick(codex_max.clone(), None), (crate::models::DEFAULT_EFFORT.into(), S::TaskInvalidFallback));
+        // On a resume with nothing in the transcript the specific reason wins over default_on_resume.
+        let resumed =
+            resolve_respawn(Setting::Effort, "u", "codex", None, None, Some(None), &mut || codex_max.clone()).unwrap().unwrap();
+        assert_eq!(resumed.1, S::TaskInvalidFallback);
+        let ok = TaskDefaults { effort: Some("low".into()), ..TaskDefaults::default() };
+        // A recorded lookup_timeout stand-in is looked up again…
+        assert_eq!(pick(ok.clone(), Some(("xhigh", Some("lookup_timeout")))), ("low".into(), S::Task));
+        // …while any other recorded value stands.
+        assert_eq!(pick(ok.clone(), Some(("high", Some("engine_default")))), ("high".into(), S::Engine));
+        assert_eq!(pick(ok, Some(("high", None))), ("high".into(), S::Recorded));
+        let timed_out = TaskDefaults { timed_out: true, ..TaskDefaults::default() };
+        assert_eq!(pick(timed_out.clone(), None).1, S::LookupTimeout);
+        let resumed = resolve_respawn(Setting::Model, "u", "codex", None, None, Some(None), &mut || timed_out.clone());
+        assert_eq!(resumed.unwrap().unwrap().1, S::LookupTimeout);
     }
 
     /// `start_workflow` resolves each fresh role's model and effort: the

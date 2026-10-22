@@ -62,18 +62,40 @@ not a later spawn. `gpt-6-luna` is the cheap Codex option.
 A respawn of an existing session (revive, resume, restore, fork, workflow
 `fresh` activation, continuous re-fire) reuses the value recorded on the
 session. A session that predates recording (adopted across a brain restart,
-restored from an old manifest) takes what its transcript last ran on —
-Claude's assistant entries carry `message.model` and `effort`, Codex's
-`turn_context` carries `payload.model` and `payload.effort` — else the task or
-engine default, reported as `default_on_resume` because the conversation may
-have run something else. The task lookup is bounded: restore prefetches task
-defaults concurrently with a 5 s budget, then falls back to `[models]`.
+restored from an old manifest) takes what its transcript last ran on, else the
+task or engine default, reported as `default_on_resume` because the
+conversation may have run something else. In the transcript:
+
+- Claude's assistant entries carry `requestedModel` (the id the session asked
+  for, with any context suffix such as `claude-opus-5-5[1m]`), `message.model`
+  (the bare id the API answered as) and `effort`. CM reads `requestedModel`
+  and falls back to `message.model` for older transcripts; reading only
+  `message.model` would resume a 1M session at the default context.
+- Codex's `turn_context` carries `payload.model` and `payload.effort`.
+
+Adopted sessions are backfilled once, before the brain serves, by up to 8
+transcript readers (each reads a bounded tail). Measured on cm-sessions
+against its 70 largest real transcripts (19 GB, up to 3.2 GB each): 0.3-1.2 s.
+
+The task lookup is bounded: restore prefetches task defaults concurrently with
+a 5 s budget (each request also times out at 3 s), then falls back to
+`[models]`.
 
 The resolved values are recorded on the session and shown in `list_sessions`
-(`model` / `model_source`, `effort` / `effort_source`; sources are `explicit`,
-`task`, `recorded`, `engine_default`, `transcript`, `default_on_resume`), the
-`A-i` peek and the F6 info pane. The `A-i` peek on a task shows its resolved
-Models and Efforts per engine.
+(`model` / `model_source`, `effort` / `effort_source`), the `A-i` peek and the
+F6 info pane. The `A-i` peek on a task shows its resolved Models and Efforts
+per engine. Sources:
+
+| Source | Meaning |
+|---|---|
+| `explicit` | Named by the caller (`model=` / `effort=`, an edited form field). |
+| `task` | The task's default, or its nearest ancestor's. |
+| `recorded` | Recorded on the session being respawned. |
+| `engine_default` | `[models]` config default. |
+| `transcript` | Read from the conversation's transcript. |
+| `default_on_resume` | A resume with nothing recorded or in the transcript: the task or config default, logged. |
+| `task_invalid_fallback` | The task's default is not valid for this engine (a codex task default of `max` effort): the config default, logged. The form prefill skips such a value too. |
+| `lookup_timeout` | The task default lookup missed the restore budget or timed out: the config default for now. Provisional: the next respawn looks the task up again instead of reusing it. |
 
 ## Setting a task's default
 

@@ -763,7 +763,7 @@ impl App {
         task_id: Option<&str>,
         resume: Option<(&Path, Option<&str>, &str)>,
     ) -> (Option<String>, Option<&'static str>) {
-        use cm_daemon::models::{ModelSource, Setting};
+        use cm_daemon::models::ModelSource;
         let engine = normalize_session_type_to_internal(session_type);
         if !cm_daemon::models::takes_model(engine) {
             return (None, None);
@@ -778,15 +778,18 @@ impl App {
                 return (Some(m), Some(ModelSource::Transcript.as_str()));
             }
         }
-        let config_default = match setting {
-            Setting::Model => cm_daemon::models::default_model(engine),
-            Setting::Effort => cm_daemon::models::default_effort(engine),
+        // The shared resolver replaces a task value the engine can't take
+        // (a codex `max` effort) with the config default, reported as
+        // `task_invalid_fallback`, instead of spawning with it.
+        let task = task_id.and_then(|t| self.task_default(t, session_type, setting));
+        let (m, src) = match setting.resolve(engine, None, task.as_deref().map(|v| (v, ModelSource::Task))) {
+            Ok(Some((m, src))) => (Some(m), src),
+            _ => (None, ModelSource::Engine),
         };
-        let (m, src) = match task_id.and_then(|t| self.task_default(t, session_type, setting)) {
-            Some(m) => (Some(m), ModelSource::Task),
-            None => (config_default, ModelSource::Engine),
+        let src = match src {
+            ModelSource::Task | ModelSource::Engine if resume.is_some() => ModelSource::DefaultOnResume,
+            src => src,
         };
-        let src = if resume.is_some() { ModelSource::DefaultOnResume } else { src };
         (m, Some(src.as_str()))
     }
 

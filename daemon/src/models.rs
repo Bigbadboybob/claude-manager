@@ -257,13 +257,15 @@ pub fn resolve_effort(
     if let Some(e) = explicit.filter(|e| !e.trim().is_empty()) {
         return validate_effort(engine, e).map(|e| Some((e, ModelSource::Explicit)));
     }
+    let mut fallback = ModelSource::Engine;
     if let Some((e, source)) = inherited {
-        if let Ok(e) = validate_effort(engine, e) {
-            return Ok(Some((e, source)));
+        match validate_effort(engine, e) {
+            Ok(e) => return Ok(Some((e, source))),
+            Err(_) => fallback = invalid_inherited(source),
         }
     }
     let e = default_effort(engine).expect("agent engine has a default effort");
-    validate_effort(engine, &e).map(|e| Some((e, ModelSource::Engine)))
+    validate_effort(engine, &e).map(|e| Some((e, fallback)))
 }
 
 /// The two per-session agent settings CM resolves and records the same
@@ -407,6 +409,12 @@ pub enum ModelSource {
     /// A resume or revive of a conversation with no recorded model and no
     /// model in its transcript: the task or config default, logged.
     DefaultOnResume,
+    /// The task's default is not valid for this engine (a codex task
+    /// default of `max` effort): the config default, logged.
+    TaskInvalidFallback,
+    /// The task default lookup missed the restore's time budget: the
+    /// config default for now. Provisional: the next respawn looks again.
+    LookupTimeout,
 }
 
 impl ModelSource {
@@ -418,7 +426,15 @@ impl ModelSource {
             ModelSource::Engine => "engine_default",
             ModelSource::Transcript => "transcript",
             ModelSource::DefaultOnResume => "default_on_resume",
+            ModelSource::TaskInvalidFallback => "task_invalid_fallback",
+            ModelSource::LookupTimeout => "lookup_timeout",
         }
+    }
+
+    /// A stand-in recorded only because the real answer wasn't available
+    /// yet; a respawn resolves again instead of reusing it.
+    pub fn is_provisional(self) -> bool {
+        self == ModelSource::LookupTimeout
     }
 
     /// The inverse of [`ModelSource::as_str`], for persisted sources.
@@ -430,6 +446,8 @@ impl ModelSource {
             ModelSource::Engine,
             ModelSource::Transcript,
             ModelSource::DefaultOnResume,
+            ModelSource::TaskInvalidFallback,
+            ModelSource::LookupTimeout,
         ]
         .into_iter()
         .find(|m| m.as_str() == s)
@@ -528,8 +546,9 @@ enum TranscriptField {
 fn transcript_value(engine: &str, path: &std::path::Path, field: TranscriptField) -> Option<String> {
     use std::io::{BufRead, Read, Seek, SeekFrom};
     let engine = engine_key(engine)?;
+    // `Model"` also matches claude's `requestedModel"`.
     let needle = match field {
-        TranscriptField::Model => "\"model\"",
+        TranscriptField::Model => "odel\"",
         TranscriptField::Effort => "\"effort\"",
     };
     let value_of = |line: &str| -> Option<String> {
@@ -538,9 +557,14 @@ fn transcript_value(engine: &str, path: &std::path::Path, field: TranscriptField
         }
         let v: Value = serde_json::from_str(line).ok()?;
         let x = match (engine, field) {
-            ("claude", TranscriptField::Model) if v.get("type")?.as_str()? == "assistant" => {
-                v.get("message")?.get("model")?
-            }
+            // `requestedModel` is the id the session asked for, with any
+            // context suffix (`claude-opus-5-5[1m]`); `message.model` is
+            // the bare id the API answered with, so resuming on it would
+            // drop a 1M session to the default context.
+            ("claude", TranscriptField::Model) if v.get("type")?.as_str()? == "assistant" => v
+                .get("requestedModel")
+                .filter(|m| m.as_str().is_some_and(|m| m != "<synthetic>" && validate_model(m).is_ok()))
+                .or_else(|| v.get("message")?.get("model"))?,
             ("claude", TranscriptField::Effort) if v.get("type")?.as_str()? == "assistant" => v.get("effort")?,
             ("codex", TranscriptField::Model) if v.get("type")?.as_str()? == "turn_context" => {
                 v.get("payload")?.get("model")?
@@ -654,13 +678,26 @@ pub fn resolve(
         check_engine(engine, &m)?;
         return Ok(Some((m, ModelSource::Explicit)));
     }
+    let mut fallback = ModelSource::Engine;
     if let Some((m, source)) = inherited {
-        if let Ok(m) = validate_model(m) {
-            return Ok(Some((m, source)));
+        match validate_model(m) {
+            Ok(m) => return Ok(Some((m, source))),
+            Err(_) => fallback = invalid_inherited(source),
         }
     }
     let m = default_model(engine).expect("agent engine has a default");
-    validate_model(&m).map(|m| Some((m, ModelSource::Engine)))
+    validate_model(&m).map(|m| Some((m, fallback)))
+}
+
+/// The source of the config default that replaces an inherited value the
+/// engine can't take: a task default is reported as such, so the caller
+/// can log it and `list_sessions` shows why the default applied.
+fn invalid_inherited(source: ModelSource) -> ModelSource {
+    if source == ModelSource::Task {
+        ModelSource::TaskInvalidFallback
+    } else {
+        ModelSource::Engine
+    }
 }
 
 #[cfg(test)]
@@ -730,8 +767,10 @@ mod tests {
         );
         assert_eq!(r("claude-code", None, None), Some((DEFAULT_CLAUDE_MODEL.into(), ModelSource::Engine)));
         assert_eq!(r("codex", None, None), Some((DEFAULT_CODEX_MODEL.into(), ModelSource::Engine)));
-        // A bad inherited value falls through; a bad explicit one is an error.
-        assert_eq!(r("codex", None, Some(("bad model", ModelSource::Task))).unwrap().1, ModelSource::Engine);
+        // A bad inherited value falls through (a task's says so); a bad
+        // explicit one is an error.
+        assert_eq!(r("codex", None, Some(("bad model", ModelSource::Task))).unwrap().1, ModelSource::TaskInvalidFallback);
+        assert_eq!(r("codex", None, Some(("bad model", ModelSource::Recorded))).unwrap().1, ModelSource::Engine);
         assert!(resolve("codex", Some("bad model"), None).is_err());
     }
 
@@ -787,7 +826,20 @@ mod tests {
         assert!(resolve_effort("bash", Some("high"), None).is_err());
         assert_eq!(r("codex", Some("low"), Some(("high", ModelSource::Task))), Some(("low".into(), ModelSource::Explicit)));
         assert_eq!(r("codex", None, Some(("high", ModelSource::Task))), Some(("high".into(), ModelSource::Task)));
-        assert_eq!(r("codex", None, Some(("max", ModelSource::Task))), Some((DEFAULT_EFFORT.into(), ModelSource::Engine)));
+        // A task default the engine can't take is replaced, and says so.
+        assert_eq!(
+            r("codex", None, Some(("max", ModelSource::Task))),
+            Some((DEFAULT_EFFORT.into(), ModelSource::TaskInvalidFallback))
+        );
+        assert_eq!(r("claude-code", None, Some(("max", ModelSource::Task))), Some(("max".into(), ModelSource::Task)));
+        assert_eq!(
+            resolve("codex", None, Some(("-bad", ModelSource::Task))).unwrap().map(|(_, s)| s),
+            Some(ModelSource::TaskInvalidFallback)
+        );
+        for s in [ModelSource::TaskInvalidFallback, ModelSource::LookupTimeout] {
+            assert_eq!(ModelSource::parse(s.as_str()), Some(s));
+        }
+        assert!(ModelSource::LookupTimeout.is_provisional() && !ModelSource::Engine.is_provisional());
         assert_eq!(r("claude-code", None, None), Some((DEFAULT_EFFORT.into(), ModelSource::Engine)));
         assert!(resolve_effort("codex", Some("max"), None).is_err());
         assert_eq!(task_effort(&json!({"efforts": {"codex": "low"}}), "codex"), Some("low"));
@@ -824,5 +876,32 @@ mod tests {
         assert_eq!(transcript_model("codex", none.path()), None);
         assert_eq!(transcript_effort("claude-code", none.path()), None);
         assert_eq!(transcript_model("claude-code", std::path::Path::new("/nonexistent/x.jsonl")), None);
+    }
+
+    /// A 1M-context session asks for `claude-opus-5-5[1m]` (recorded as
+    /// `requestedModel`) while the API answers as the bare id in
+    /// `message.model`. Detection must keep the suffix, or a revive
+    /// resumes the session at the default context.
+    #[test]
+    fn transcript_detection_keeps_the_requested_context_suffix() {
+        let one_m = write_jsonl(&[
+            json!({"type": "assistant", "requestedModel": "claude-opus-5-5[1m]", "effort": "xhigh",
+                   "message": {"model": "claude-opus-5-5"}}),
+        ]);
+        assert_eq!(transcript_model("claude-code", one_m.path()).as_deref(), Some("claude-opus-5-5[1m]"));
+        // Older transcripts carry no requestedModel: message.model stands.
+        let old = write_jsonl(&[json!({"type": "assistant", "message": {"model": "claude-sonnet-5-5"}})]);
+        assert_eq!(transcript_model("claude-code", old.path()).as_deref(), Some("claude-sonnet-5-5"));
+        // A synthetic requestedModel falls back too.
+        let synth = write_jsonl(&[
+            json!({"type": "assistant", "requestedModel": "<synthetic>", "message": {"model": "claude-haiku-5-5"}}),
+        ]);
+        assert_eq!(transcript_model("claude-code", synth.path()).as_deref(), Some("claude-haiku-5-5"));
+        // The real shape: the newest turn wins and its suffix survives.
+        let mixed = write_jsonl(&[
+            json!({"type": "assistant", "requestedModel": "claude-opus-5-5", "message": {"model": "claude-opus-5-5"}}),
+            json!({"type": "assistant", "requestedModel": "claude-opus-5-5[1m]", "message": {"model": "claude-opus-5-5"}}),
+        ]);
+        assert_eq!(transcript_model("claude-code", mixed.path()).as_deref(), Some("claude-opus-5-5[1m]"));
     }
 }

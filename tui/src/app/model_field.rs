@@ -81,7 +81,10 @@ impl ModelField {
             Some(m) => (m.clone(), "task default"),
             None => (cm_daemon::models::default_model(engine).unwrap_or_default(), "engine default"),
         };
-        let (effort, effort_origin) = match self.task_efforts.get(engine) {
+        // A task effort this engine can't take (codex `max`) isn't what
+        // the spawn will use, so it isn't offered as the prefill.
+        let task_effort = self.task_efforts.get(engine).filter(|e| cm_daemon::models::validate_effort(engine, e).is_ok());
+        let (effort, effort_origin) = match task_effort {
             Some(e) => (e.clone(), "task default"),
             None => (cm_daemon::models::default_effort(engine).unwrap_or_default(), "default"),
         };
@@ -468,5 +471,16 @@ mod tests {
         assert!(e.key(0, shift(KeyCode::Left)), "low → inherit");
         assert_eq!(e.effort_changes(), vec![("claude".into(), None), ("codex".into(), Some("xhigh".into()))]);
         assert_eq!(e.changes(), Ok(vec![]), "models untouched");
+    }
+
+    #[test]
+    fn a_task_effort_the_engine_cant_take_is_not_prefilled() {
+        let efforts: std::collections::BTreeMap<_, _> =
+            [("claude".to_string(), "max".to_string()), ("codex".to_string(), "max".to_string())].into();
+        let mut f = ModelField::for_task("codex", Default::default(), efforts);
+        assert_eq!((f.effort.as_str(), f.effort_origin), (cm_daemon::models::DEFAULT_EFFORT, Some("default")));
+        assert_eq!(f.effort_value(), None, "untouched: the host resolves it");
+        f.retarget("claude-code");
+        assert_eq!((f.effort.as_str(), f.effort_origin), ("max", Some("task default")));
     }
 }
