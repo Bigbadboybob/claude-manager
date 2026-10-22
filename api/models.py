@@ -38,6 +38,9 @@ class TaskUpdate(BaseModel):
     priority: int | None = None
     name: str | None = None
     prompt: str | None = None
+    # Correctable: a task filed from a checkout of another repo inherited
+    # that repo's URL, and every subtask/worktree minted from it followed.
+    repo_url: str | None = None
     repo_branch: str | None = None
     worker_vm: str | None = None
     worker_zone: str | None = None
