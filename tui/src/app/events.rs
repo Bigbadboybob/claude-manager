@@ -5688,7 +5688,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
-            model: None,
+            model: Some("test-model"),
             daemon_socket: &sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6159,7 +6159,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
-            model: None,
+            model: Some("test-model"),
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6338,7 +6338,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
-            model: None,
+            model: Some("test-model"),
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6557,7 +6557,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
-            model: None,
+            model: Some("test-model"),
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
@@ -6773,7 +6773,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid_gone = new_session_uid(); // never spawned → attach will fail
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
-            model: None,
+            model: Some("test-model"),
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid_live,
@@ -7368,7 +7368,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
-            model: None,
+            model: Some("test-model"),
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,

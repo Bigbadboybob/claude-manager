@@ -6117,8 +6117,8 @@ mod input_handler_tests {
         let task_id = None;
         let mut seed: Option<String> = None;
         let mut active = 0u8;
-        // proper-resume: three fields now (type, seed, resume).
-        for expected in [1u8, 2, 0] {
+        // Four fields: type, seed, resume, model.
+        for expected in [1u8, 2, 3, 0] {
             handle_new_terminal_session(
                 NewTerminalSessionMut {
                     model: &mut Default::default(),
@@ -6367,8 +6367,8 @@ mod input_handler_tests {
             handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Enter)),
             InputOutcome::Consumed
         ));
-        // Tab wraps over three fields.
-        field = 2;
+        // Tab wraps over four fields (bash shows the Model row as n/a).
+        field = 3;
         handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Tab));
         assert_eq!(field, 0);
     }

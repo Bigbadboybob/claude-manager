@@ -19429,6 +19429,7 @@ mod tests {
             "workspace_id": workspace_id,
             "label": label,
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": dir.display().to_string(),
         })
     }
@@ -19472,6 +19473,7 @@ mod tests {
             "workspace_id": "ws-empty-argv",
             "label": "x",
             "argv": [],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
         });
         let err = start_session(&state, &params).expect_err("empty argv");
@@ -19984,6 +19986,7 @@ mod tests {
             "workspace_id": "ws-does-not-exist",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": "/tmp",
         });
         let err = start_session(&state, &params).expect_err("missing ws");
@@ -20017,6 +20020,7 @@ mod tests {
             "workspace_id": workspace_id,
             "label": "shell",
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": worktree_path,
             "worktree_path": worktree_path,
         });
@@ -20054,6 +20058,7 @@ mod tests {
             "workspace_id": "ws-unknown",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": "/tmp",
             // intentionally no worktree_path
         });
@@ -20884,6 +20889,7 @@ mod tests {
             "workspace_id": "ws-existing",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
             // A different path — must be ignored.
             "worktree_path": other.path().display().to_string(),
@@ -20950,6 +20956,7 @@ mod tests {
             "workspace_id": "ws-cloud",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
         });
         let result = start_session(&state, &params)
@@ -21006,6 +21013,7 @@ mod tests {
             "workspace_id": "ws-uid-passthrough",
             "label": "passthrough",
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
         });
         let result = start_session(&state, &params).expect("spawn");
@@ -21042,6 +21050,7 @@ mod tests {
             "workspace_id": "ws-uid-dup",
             "label": "first",
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
         });
         let _ok = start_session(&state, &params).expect("first spawn");
@@ -21052,6 +21061,7 @@ mod tests {
             "workspace_id": "ws-uid-dup",
             "label": "duplicate",
             "argv": ["/bin/bash"],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
         });
         let err = start_session(&state, &dup_params).expect_err("duplicate uid");
@@ -21182,6 +21192,7 @@ mod tests {
                 "workspace_id": "ws-bad-uid",
                 "label": "x",
                 "argv": ["/bin/bash"],
+                "model": "test-model",
                 "working_dir": dir.path().display().to_string(),
             });
             let err = start_session(&state, &params).expect_err(
@@ -21262,6 +21273,7 @@ mod tests {
             "workspace_id": "ws-outside-scope",
             "label": "outside-scope-test",
             "argv": ["/bin/sleep", "30"],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
             "memory_cap_hard_bytes": 128 * 1024 * 1024u64,
@@ -21317,6 +21329,7 @@ mod tests {
             "workspace_id": "ws-forged-path",
             "label": "forged-path-test",
             "argv": ["/bin/sleep", "30"],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
             "memory_cap_hard_bytes": 128 * 1024 * 1024u64,
@@ -21386,6 +21399,7 @@ mod tests {
             "workspace_id": "ws-watcher-fail",
             "label": "watcher-fail-test",
             "argv": ["/bin/sleep", "30"],
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
         });
@@ -21580,6 +21594,7 @@ mod tests {
             "workspace_id": "ws-envinj",
             "label": "env-inj",
             "argv": argv,
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
             // Workflow context — exercises the CM_WORKFLOW_RUN_ID /
             // CM_ROLE injection branch.
@@ -21736,6 +21751,7 @@ mod tests {
             "workspace_id": "ws-empty-cfg",
             "label": "empty-cfg",
             "argv": argv,
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
         });
         let _r = start_session(&state, &params).expect("ok");
@@ -21853,6 +21869,7 @@ mod tests {
             "workspace_id": "ws-abs",
             "label": "abs-paths",
             "argv": argv,
+            "model": "test-model",
             "working_dir": dir.path().display().to_string(),
         });
         let _result = start_session(&state, &params).expect("spawn ok");
@@ -23245,7 +23262,6 @@ while True:
             "workspace_id": ws_id,
             "label": "test-bash",
             "argv": ["/bin/bash", "--noprofile", "--norc"],
-            "model": "test-model",
             "session_type": "bash",
             "working_dir": working_dir,
         });
@@ -26933,6 +26949,7 @@ while True:
                     "worktree_path": wt.to_str().unwrap(),
                     "label": "esmisc",
                     "argv": ["/bin/sleep", "120"],
+                    "model": "test-model",
                 }),
             )
             .expect("start_session ok");
@@ -31627,7 +31644,16 @@ while True:
 
             // Wire shape: claim (max_items = batch_max, claimed_by = task#seq)
             // then ack (both ids).
-            let reqs = stub.requests.lock().unwrap();
+            // The fire also looks up the task's default model; only the
+            // queue calls matter here.
+            let reqs: Vec<_> = stub
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path.starts_with("/queues/"))
+                .cloned()
+                .collect();
             assert_eq!(reqs.len(), 2, "claim then ack: {:?}", reqs);
             assert_eq!(reqs[0].path, "/queues/props/claim");
             let claim_body: Value = serde_json::from_str(&reqs[0].body).unwrap();
@@ -31701,7 +31727,16 @@ while True:
             assert_eq!(err.0, ErrorCode::Internal);
 
             // Claim was released, guard cleared.
-            let reqs = stub.requests.lock().unwrap();
+            // The fire also looks up the task's default model; only the
+            // queue calls matter here.
+            let reqs: Vec<_> = stub
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path.starts_with("/queues/"))
+                .cloned()
+                .collect();
             assert_eq!(reqs.len(), 2, "claim then requeue: {:?}", reqs);
             assert_eq!(reqs[1].path, "/queues/props/requeue");
             let rq_body: Value = serde_json::from_str(&reqs[1].body).unwrap();
@@ -31770,7 +31805,16 @@ while True:
 
             // The batch WAS staged (claim succeeded), then the boot failed →
             // the claim is released via requeue, not left stranded.
-            let reqs = stub.requests.lock().unwrap();
+            // The fire also looks up the task's default model; only the
+            // queue calls matter here.
+            let reqs: Vec<_> = stub
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path.starts_with("/queues/"))
+                .cloned()
+                .collect();
             assert_eq!(reqs.len(), 2, "claim then requeue: {:?}", reqs);
             assert_eq!(reqs[0].path, "/queues/props/claim");
             assert_eq!(reqs[1].path, "/queues/props/requeue");
