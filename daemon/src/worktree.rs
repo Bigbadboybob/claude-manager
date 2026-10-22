@@ -1485,6 +1485,126 @@ pub fn find_local_repo(repo_url: &str) -> Option<PathBuf> {
     None
 }
 
+/// A repo URL reduced to what names the repo: `host/owner/name`,
+/// lower-cased, without scheme, user or `.git`, so the ssh and https forms
+/// of one GitHub repo compare equal. A bare shortname stays just the name.
+pub fn repo_identity(repo_url: &str) -> String {
+    let mut u = repo_url.trim().trim_end_matches('/').trim_end_matches(".git").to_string();
+    if let Some((_, rest)) = u.split_once("://") {
+        u = rest.to_string();
+    }
+    if let Some((_, rest)) = u.split_once('@') {
+        u = rest.to_string();
+    }
+    // scp form `host:owner/name` → `host/owner/name`.
+    if let Some((host, path)) = u.split_once(':') {
+        if !host.contains('/') {
+            u = format!("{}/{}", host, path.trim_start_matches('/'));
+        }
+    }
+    u.to_ascii_lowercase()
+}
+
+/// Whether two repo URLs name the same repo. A bare shortname on either
+/// side (`predictionTrading`) compares by repo name alone.
+pub fn same_repo(a: &str, b: &str) -> bool {
+    let (ia, ib) = (repo_identity(a), repo_identity(b));
+    if !ia.contains('/') || !ib.contains('/') {
+        return repo_name(&ia) == repo_name(&ib);
+    }
+    ia == ib
+}
+
+/// `git remote get-url origin` of a checkout.
+pub fn origin_url(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !url.is_empty()).then_some(url)
+}
+
+/// Whether the checkout at `repo` is a clone of `repo_url`: its origin
+/// names the same repo. A checkout with no origin matches by its
+/// directory name.
+pub fn checkout_is_repo(repo: &Path, repo_url: &str) -> bool {
+    match origin_url(repo) {
+        Some(origin) => same_repo(&origin, repo_url),
+        None => repo
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == repo_name(repo_url)),
+    }
+}
+
+/// The main checkout a linked worktree belongs to, read from its `.git`
+/// file (`gitdir: <main>/.git/worktrees/<name>`) without running git. A
+/// main checkout (a `.git` directory) is its own.
+pub fn main_checkout_of(path: &Path) -> Option<PathBuf> {
+    let dotgit = path.join(".git");
+    if dotgit.is_dir() {
+        return Some(path.to_path_buf());
+    }
+    let text = std::fs::read_to_string(&dotgit).ok()?;
+    let gitdir = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    let gitdir = if gitdir.is_absolute() { gitdir } else { path.join(gitdir) };
+    // <main>/.git/worktrees/<name>
+    let common = gitdir.parent()?.parent()?;
+    (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
+}
+
+/// Find a local clone of `repo_url` to cut a task's worktree from, never
+/// trusting a recorded path without checking its origin:
+///   1. `candidates`, in order (the caller's main checkout, then the main
+///      checkouts of the host's other workspaces);
+///   2. [`resolve_repo`]: `~/code/projects/<name>`, `repos_dir/<name>`
+///      (`~/.cm/repos`), or a permitted clone.
+/// Each must actually be a clone of `repo_url` ([`checkout_is_repo`]).
+/// `Err` is a message naming what was tried; there is no fallback to some
+/// other repo.
+pub fn locate_repo_clone(
+    repo_url: &str,
+    candidates: &[PathBuf],
+    repos_dir: &Path,
+    allow_clone: bool,
+    allowlist: &[RepoAllow],
+) -> Result<PathBuf, String> {
+    let mut seen: Vec<&Path> = Vec::new();
+    for c in candidates {
+        if seen.contains(&c.as_path()) || !c.is_dir() {
+            continue;
+        }
+        seen.push(c);
+        if checkout_is_repo(c, repo_url) {
+            return Ok(c.clone());
+        }
+    }
+    match resolve_repo(repo_url, repos_dir, allow_clone, allowlist) {
+        Ok(p) if checkout_is_repo(&p, repo_url) => Ok(p),
+        Ok(p) => Err(format!(
+            "no local clone of {} on this host: {} has origin {}, a different repo",
+            repo_url,
+            p.display(),
+            origin_url(&p).unwrap_or_else(|| "(none)".into()),
+        )),
+        Err(RepoResolveError::NotPermitted(name)) => Err(format!(
+            "no local clone of {} on this host (checked {} workspace checkouts, \
+             ~/code/projects/{}, {}/{}; cloning it is not permitted)",
+            repo_url,
+            seen.len(),
+            name,
+            repos_dir.display(),
+            name,
+        )),
+        Err(RepoResolveError::CloneFailed { repo, detail }) => {
+            Err(format!("clone of repo '{}' failed: {}", repo, detail))
+        }
+    }
+}
+
 /// An allowlist entry the daemon may clone (borrowed view of
 /// `config::RepoAllowEntry`, so this module stays free of a config
 /// dependency).
@@ -2259,6 +2379,53 @@ mod tests {
     /// policy (the ux note's incident was a worker "branching off main"
     /// inside the proposer's WIP checkout). `repo_with_history` leaves
     /// `main` at `second`, so that's the commit the mint must land on.
+    #[test]
+    fn repo_identity_equates_ssh_and_https_forms() {
+        let ssh = "git@github.com:Bigbadboybob/predictionTrading.git";
+        let https = "https://github.com/Bigbadboybob/predictionTrading.git";
+        assert_eq!(repo_identity(ssh), "github.com/bigbadboybob/predictiontrading");
+        assert!(same_repo(ssh, https));
+        assert!(same_repo("ssh://git@github.com/Bigbadboybob/predictionTrading", https));
+        assert!(same_repo("predictionTrading", https), "a bare name compares by name");
+        assert!(!same_repo(ssh, "git@github.com:Bigbadboybob/claude-manager.git"));
+        assert!(!same_repo(ssh, "git@github.com:someone-else/predictionTrading.git"));
+    }
+
+    #[test]
+    fn locate_repo_clone_checks_origin_and_never_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, origin: &str| {
+            let p = tmp.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            git(&p, &["init", "-q"]);
+            git(&p, &["remote", "add", "origin", origin]);
+            p
+        };
+        let cm = mk("cm", "git@github.com:o/claude-manager.git");
+        let pt = mk("pt-clone", "https://github.com/o/predictionTrading.git");
+        let repos_dir = tmp.path().join("repos");
+        let found = locate_repo_clone(
+            "git@github.com:o/predictionTrading.git",
+            &[cm.clone(), pt.clone()],
+            &repos_dir,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(found, pt, "skips the caller's claude-manager checkout");
+        let err = locate_repo_clone("git@github.com:o/elsewhere.git", &[cm.clone()], &repos_dir, false, &[])
+            .expect_err("no clone");
+        assert!(err.contains("no local clone of git@github.com:o/elsewhere.git"), "{}", err);
+        // A worktree leads back to its main checkout.
+        git(&cm, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let wt = tmp.path().join("cm-wt");
+        git(&cm, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+        assert_eq!(
+            main_checkout_of(&wt).map(|p| p.canonicalize().unwrap()),
+            Some(cm.canonicalize().unwrap())
+        );
+    }
+
     #[test]
     fn mint_task_worktree_cuts_from_project_main() {
         with_home(|_home| {

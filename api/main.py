@@ -903,17 +903,19 @@ async def list_projects(pool=Depends(get_pool)):
     # proposed from a different repo's context, e.g. an agent running in the
     # claude-manager repo proposing a predictionTrading task — that row carries
     # the WRONG repo_url). So the tasks-table value is only a fallback.
-    seen = {}
-    for r in rows:
-        if r["project"] not in seen:
-            seen[r["project"]] = r["repo_url"]
+    # list_projects already picks each project's most common repo.
+    seen = {r["project"]: {"repo_url": r["repo_url"],
+                           "repo_branch": r["repo_branch"] or "main"}
+            for r in rows}
     # Authoritative override: ~/.cm/projects/<name>/repo_url is the canonical
     # clone URL for a project (REPOS, discovered at daemon start). This is what
-    # submit_backtest resolves against, so it must be right regardless of what
-    # stray tasks carry.
+    # submit_backtest and propose_task resolve against, so it must be right
+    # regardless of what stray tasks carry.
     for name, url in REPOS.items():
-        seen[name] = url
-    return [{"name": name, "repo_url": url} for name, url in seen.items()]
+        prior = seen.get(name)
+        branch = prior["repo_branch"] if prior and prior["repo_url"] == url else "main"
+        seen[name] = {"repo_url": url, "repo_branch": branch}
+    return [{"name": name, **repo} for name, repo in seen.items()]
 
 
 # ---------------------------------------------------------------------------

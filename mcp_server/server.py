@@ -1079,11 +1079,11 @@ def propose_task(
     # when no daemon socket is configured — ad-hoc CLI usage,
     # tests, agents not spawned through the TUI.
     #
-    # Wire shape: daemon's propose_task expects `repo_url`
-    # explicitly (the daemon doesn't know the agent's cwd, so
-    # it can't auto-detect via `git remote get-url origin` the
-    # way the local PlanningClient does). We detect here and
-    # forward.
+    # Wire shape: `repo_url` is the CALLER's checkout (the daemon doesn't
+    # know the agent's cwd). It is only a fallback: the row gets the target
+    # project's repo, and the caller's only for the caller's own project
+    # when that project has no repo yet (`_propose_repo` here, the
+    # daemon's `resolve_propose_repo` there).
     #
     # Sub-2c review-2: single-decision binding (restoring the
     # round-8 #2 fix). `resolve_socket_route()` is called ONCE
@@ -1098,20 +1098,16 @@ def propose_task(
         # (cm-manager) and made propose_task fail there even though the daemon
         # path needs nothing else from `cli`. Raises RuntimeError with no origin
         # remote and OSError (FileNotFoundError) if git is absent.
-        try:
-            repo_url = _git_origin_url()
-        except (RuntimeError, OSError) as e:
-            return (
-                f"propose_task: could not detect the repo URL from the current "
-                f"directory (no git 'origin' remote?): {e}"
-            )
         params = {
             "project": project,
             "name": name,
             "description": description,
             "prompt": prompt,
-            "repo_url": repo_url,
         }
+        try:
+            params["repo_url"] = _git_origin_url()
+        except (RuntimeError, OSError):
+            pass  # the daemon resolves the project's repo without it
         if difficulty is not None:
             params["difficulty"] = difficulty
         if depends:
@@ -1135,11 +1131,17 @@ def propose_task(
             if not parent_task_id:
                 return ("propose_task failed: reports_to=\"me\" needs a caller bound "
                         "to a task; pass a task id or omit reports_to")
+        try:
+            repo_url, repo_branch = _propose_repo(client, project, filer.get("task_id"))
+        except ValueError as e:
+            return f"propose_task failed: {e}"
         task = client.propose_task(
             project=project,
             name=name,
             description=description,
             prompt=prompt,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
             difficulty=difficulty,
             depends=depends,
             initiative_id=initiative_id,
@@ -1154,6 +1156,39 @@ def propose_task(
         f"Proposed task '{name}' in project '{project}' (id: {task['id']})\n"
         f"  description ({len(description)} chars): {desc_preview}{'...' if len(description) > 140 else ''}\n"
         f"  prompt ({len(prompt)} chars): {prompt_preview}{'...' if len(prompt) > 140 else ''}"
+    )
+
+
+def _propose_repo(client, project: str, caller_task_id: str | None) -> tuple[str, str]:
+    """(repo_url, repo_branch) for a task proposed into `project`.
+
+    The project's own repo always wins; the caller's checkout stands in only
+    when the caller's task is in that same project and the project has no
+    repo yet. Anything else raises ValueError: a guessed repo propagates to
+    every subtask and minted worktree. Mirrors the daemon's
+    `resolve_propose_repo`.
+    """
+    for p in client.list_projects():
+        if p.get("name") == project and (p.get("repo_url") or "").strip():
+            return p["repo_url"].strip(), (p.get("repo_branch") or "main")
+    caller_project = None
+    if caller_task_id:
+        try:
+            caller_project = client.get_task(caller_task_id).get("project")
+        except Exception:
+            caller_project = None
+    if caller_project == project:
+        try:
+            return _git_origin_url(), "main"
+        except (RuntimeError, OSError):
+            pass
+    raise ValueError(
+        f"project '{project}' has no known repo (no project record and no tasks "
+        f"yet), and the caller's own project is "
+        f"{repr(caller_project) if caller_project else 'unknown'}, so its checkout "
+        f"can't stand in. Check the name with list_projects, file from a session "
+        f"working in '{project}', or add ~/.cm/projects/{project}/repo_url on the "
+        f"planning API host"
     )
 
 

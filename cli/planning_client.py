@@ -71,6 +71,7 @@ class PlanningClient:
         description: str = "",
         prompt: str = "",
         repo_url: str | None = None,
+        repo_branch: str = "main",
         difficulty: int | None = None,
         depends: list[str] | None = None,
         metadata: dict | None = None,
@@ -83,7 +84,7 @@ class PlanningClient:
 
         body = {
             "repo_url": repo_url,
-            "repo_branch": "main",
+            "repo_branch": repo_branch,
             "name": name,
             "project": project,
             "description": description,

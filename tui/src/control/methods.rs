@@ -1351,14 +1351,28 @@ fn ensure_target_worktree(
     if worktree_path.is_dir() && cm_daemon::worktree::is_git_worktree_root(&worktree_path) {
         return Ok(WorktreeReport::default());
     }
+    // A task with a repo heals only from a clone of THAT repo.
+    let task_repo_url: Option<String> = task_id.and_then(|tid| {
+        app.tasks
+            .iter()
+            .find(|t| t.task_id.as_deref() == Some(tid))
+            .and_then(|t| t.repo_url.clone())
+            .filter(|u| !u.trim().is_empty())
+    });
+    let of_task_repo = |p: &std::path::PathBuf| {
+        task_repo_url.as_deref().is_none_or(|u| cm_daemon::worktree::checkout_is_repo(p, u))
+    };
     let main_repo = ws
         .main_repo_path
         .clone()
         .filter(|p| p.is_dir())
+        .filter(&of_task_repo)
         .or_else(|| {
-            ws.repo_url
+            task_repo_url
                 .as_deref()
+                .or(ws.repo_url.as_deref())
                 .and_then(cm_daemon::worktree::find_local_repo)
+                .filter(&of_task_repo)
         })
         .or_else(|| {
             // Any known main repo that still lists the path as a
@@ -1367,6 +1381,7 @@ fn ensure_target_worktree(
                 .iter()
                 .filter_map(|w| w.main_repo_path.clone())
                 .filter(|p| p.is_dir())
+                .filter(&of_task_repo)
                 .find(|r| {
                     cm_daemon::worktree::registered_branch_for_path(r, &worktree_path).is_some()
                 })
@@ -1478,12 +1493,11 @@ fn mint_workspace_for_task(
                 task_id, OVERRIDE_HINT
             ),
         ))?;
-    let caller_repo_url = app.workspaces[caller_wi].repo_url.clone();
+    // The task's own repo, never the caller's checkout.
     let repo_url = task
         .repo_url
         .clone()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| caller_repo_url.clone())
         .ok_or((
             ErrorCode::Conflict,
             format!(
@@ -1492,22 +1506,24 @@ fn mint_workspace_for_task(
                 task_id, OVERRIDE_HINT
             ),
         ))?;
-    // Prefer the caller's own main repo, but only when the task names the
-    // SAME repo — otherwise a caller in repo A would drag a task in repo
-    // B into A's checkout. Falling back to the on-disk lookup mirrors the
-    // daemon's `resolve_repo` fast path.
-    let caller_repo_matches = caller_repo_url.as_deref() == Some(repo_url.as_str());
-    let main_repo = app.workspaces[caller_wi]
-        .main_repo_path
-        .clone()
-        .filter(|_| caller_repo_matches)
-        .or_else(|| cm_daemon::worktree::find_local_repo(&repo_url))
-        .ok_or((
+    // A local clone of the task's repo, verified by origin: the caller's
+    // own checkout first, then the other workspaces', then
+    // ~/code/projects (the daemon's `locate_repo_clone`). A caller in repo
+    // A never drags a task in repo B into A's checkout.
+    let caller = &app.workspaces[caller_wi];
+    let candidates: Vec<std::path::PathBuf> = [caller]
+        .into_iter()
+        .chain(app.workspaces.iter())
+        .flat_map(|w| w.main_repo_path.iter().chain(w.worktree_path.iter()))
+        .filter_map(|p| cm_daemon::worktree::main_checkout_of(p))
+        .collect();
+    let repos_dir = cm_daemon::path::dot_cm_dir().join("repos");
+    let main_repo = cm_daemon::worktree::locate_repo_clone(&repo_url, &candidates, &repos_dir, false, &[])
+        .map_err(|detail| (
             ErrorCode::Conflict,
             format!(
-                "task {} has no workspace and repo '{}' isn't checked out on this \
-                 machine, so a worktree can't be minted for it{}",
-                task_id, repo_url, OVERRIDE_HINT
+                "task {} has no workspace and one can't be minted: {}{}",
+                task_id, detail, OVERRIDE_HINT
             ),
         ))?;
 
@@ -1769,7 +1785,21 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
         ErrorCode::Conflict,
         "parent task has no repo_url".into(),
     ))?;
+    // The parent's checkout counts only when it is a clone of the task's
+    // repo; otherwise branch mode cuts from a located clone's trunk.
     let parent_main_repo = app.workspaces[parent_wi].main_repo_path.clone();
+    let parent_checkout = parent_main_repo.clone().or_else(|| {
+        app.workspaces[parent_wi].worktree_path.as_deref().and_then(cm_daemon::worktree::main_checkout_of)
+    });
+    let parent_in_repo = parent_checkout
+        .clone()
+        .filter(|c| cm_daemon::worktree::checkout_is_repo(c, &parent_repo_url));
+    let clone_candidates: Vec<std::path::PathBuf> = app
+        .workspaces
+        .iter()
+        .flat_map(|w| w.main_repo_path.iter().chain(w.worktree_path.iter()))
+        .filter_map(|p| cm_daemon::worktree::main_checkout_of(p))
+        .collect();
 
     // Slug for the new task. Same encoding as `worktree::slugify`.
     let leaf_slug = cm_daemon::worktree::slugify(&p.name);
@@ -1785,6 +1815,22 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
     // Without this, subtasks created without an explicit `project`
     // arg get filtered out of the planning view by
     // `backend.rs::filter_project_tasks` after the next refresh.
+    if let (Some(pj), parent_pj) = (p.project.as_deref(), parent.project.as_deref()) {
+        if parent_pj != Some(pj) {
+            // The TUI has no project→repo lookup; the daemon route has.
+            return Err((
+                ErrorCode::InvalidParams,
+                format!(
+                    "create_subtask: project '{}' differs from the parent's ({}), and a \
+                     TUI-owned session can't resolve another project's repo; use \
+                     propose_task(project='{}', reports_to='me') and start_session(task_id=…)",
+                    pj,
+                    parent_pj.unwrap_or("none"),
+                    pj,
+                ),
+            ));
+        }
+    }
     let project = p.project.clone().or_else(|| parent.project.clone());
     // Cloned for the local TaskEntry insert below — `project` itself
     // gets moved into the API body.
@@ -1831,13 +1877,34 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
         } else {
             None
         };
-        let branch_main_repo: Option<std::path::PathBuf> = if p.worktree_mode == "branch" {
+        if p.worktree_mode == "inherit" && parent_checkout.is_some() && parent_in_repo.is_none() {
+            return Err((
+                ErrorCode::InvalidParams,
+                format!(
+                    "create_subtask: worktree_mode='inherit' would run the subtask (repo {}) \
+                     in its parent's checkout of another repo; use worktree_mode='branch'",
+                    parent_repo_url,
+                ),
+            ));
+        }
+        let branch_main_repo: Option<std::path::PathBuf> = if p.worktree_mode != "branch" {
+            None
+        } else if let Some(mr) = parent_in_repo.clone() {
+            Some(mr)
+        } else if parent_checkout.is_some() {
+            Some(cm_daemon::worktree::locate_repo_clone(
+                &parent_repo_url,
+                &clone_candidates,
+                &cm_daemon::path::dot_cm_dir().join("repos"),
+                false,
+                &[],
+            )
+            .map_err(|detail| (ErrorCode::Conflict, format!("create_subtask: {}", detail)))?)
+        } else {
             Some(parent_main_repo.clone().ok_or((
                 ErrorCode::Conflict,
                 "parent workspace has no main_repo_path; cannot branch".into(),
             ))?)
-        } else {
-            None
         };
         // In-place mode: the subtask runs directly in the parent's MAIN repo
         // checkout — no worktree, no branch. Resolve that path upfront so the
@@ -1859,6 +1926,13 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
             (Some(b), Some(main_repo)) => Some(
                 cm_daemon::worktree::resolve_base_commit(main_repo, b)
                     .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?,
+            ),
+            // Not the parent's repo: its branch means nothing here; cut
+            // from this repo's trunk.
+            (None, Some(main_repo)) if Some(main_repo) != parent_in_repo.as_deref() => Some(
+                cm_daemon::worktree::resolve_project_main(main_repo)
+                    .map(|(_, sha)| sha)
+                    .map_err(|e| (ErrorCode::Conflict, format!("create_subtask: {}", e)))?,
             ),
             _ => None,
         };
@@ -1884,7 +1958,7 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
             parent_worktree.as_deref()
                 .and_then(cm_daemon::worktree::worktree_current_branch)
         });
-        if p.worktree_mode == "branch" && base.is_none() && parent_branch_resolved.is_none() {
+        if p.worktree_mode == "branch" && resolved_base.is_none() && parent_branch_resolved.is_none() {
             return Err((
                 ErrorCode::Conflict,
                 "cannot determine parent's base branch (no wip_branch and worktree HEAD is detached or unreadable)".into(),

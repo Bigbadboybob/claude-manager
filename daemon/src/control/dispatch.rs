@@ -10001,29 +10001,9 @@ mod tests {
         assert!(err.message.contains("name"), "msg: {}", err.message);
     }
 
-    #[test]
-    fn propose_task_rejects_missing_repo_url() {
-        let state = make_state();
-        let resp = dispatch_request(
-            &state,
-            &operator_request(
-                "propose_task",
-                serde_json::json!({
-                    "project": "p",
-                    "name": "n",
-                    "repo_url": "",
-                }),
-            ),
-        ).into_response();
-        assert!(!resp.ok);
-        let err = resp.error.unwrap();
-        assert_eq!(err.code, ErrorCode::InvalidParams);
-        assert!(
-            err.message.contains("repo_url"),
-            "must explain why the daemon can't auto-detect: {}",
-            err.message,
-        );
-    }
+    /// `GET /projects` naming project `p`, for propose_task's repo lookup.
+    const PROJECT_P: &str =
+        r#"[{"name":"p","repo_url":"git@x.com:a/p.git","repo_branch":"main"}]"#;
 
     /// No `CM_API_URL`/`CM_API_TOKEN` in the test env → the
     /// method body's HTTP call fails with `MissingConfig`,
@@ -10125,11 +10105,10 @@ mod tests {
             std::env::set_var("CM_API_URL", "http://127.0.0.1:1");
             std::env::set_var("CM_API_TOKEN", "env-bogus");
         }
-        let (port, captured) =
-            crate::planning_client::spawn_stub_api_for_test(
-                200,
-                r#"{"id":"task-cfg-threaded"}"#,
-            );
+        let (port, captured) = crate::planning_client::spawn_stub_api_seq_for_test(vec![
+            (200, PROJECT_P),
+            (200, r#"{"id":"task-cfg-threaded"}"#),
+        ]);
         let cfg_url = format!("http://127.0.0.1:{}", port);
         let state = make_state();
         {
@@ -10177,6 +10156,8 @@ mod tests {
         let (method, path) = cap.method_and_path();
         assert_eq!(method, "POST");
         assert_eq!(path, "/tasks");
+        // The row carries project p's repo, not the caller's checkout.
+        assert_eq!(cap.body_json()["repo_url"], "git@x.com:a/p.git");
         // Authorization header MUST carry the config token,
         // not the env token.
         assert_eq!(
@@ -10196,8 +10177,10 @@ mod tests {
     #[test]
     fn propose_task_reports_to_sets_parent_task_id() {
         let _g = crate::planning_client::test_env_lock();
-        let (port, captured) =
-            crate::planning_client::spawn_stub_api_for_test(200, r#"{"id":"task-report"}"#);
+        let (port, captured) = crate::planning_client::spawn_stub_api_seq_for_test(vec![
+            (200, PROJECT_P),
+            (200, r#"{"id":"task-report"}"#),
+        ]);
         let state = make_state();
         {
             let mut st = state.lock().unwrap();

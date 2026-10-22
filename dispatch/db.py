@@ -907,12 +907,22 @@ async def delete_task(pool: asyncpg.Pool, task_id: str):
 
 
 async def list_projects(pool: asyncpg.Pool) -> list[dict]:
-    """Return distinct project names with their repo URLs."""
+    """One row per project: the repo most of its tasks carry.
+
+    A task can be filed into a project from another repo's checkout and
+    carry the wrong repo_url, so a project's repo is its most common
+    (repo_url, repo_branch) pair, the newest row breaking ties, never
+    whichever row a DISTINCT happens to return first.
+    """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT DISTINCT project, repo_url FROM tasks
-               WHERE project IS NOT NULL
-               ORDER BY project""",
+            """SELECT DISTINCT ON (project) project, repo_url, repo_branch
+               FROM (SELECT project, repo_url, repo_branch,
+                            count(*) AS n, max(created_at) AS newest
+                       FROM tasks
+                      WHERE project IS NOT NULL AND repo_url <> ''
+                      GROUP BY project, repo_url, repo_branch) per_repo
+               ORDER BY project, n DESC, newest DESC""",
         )
         return [dict(r) for r in rows]
 

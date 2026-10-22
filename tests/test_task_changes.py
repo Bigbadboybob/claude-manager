@@ -672,6 +672,28 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         single = (await self.client.get(f"/tasks/{a['id']}")).json()
         self.assertEqual(single["status"], "archived")
 
+    async def test_projects_name_the_repo_most_rows_carry(self):
+        from unittest import mock
+        pt = "git@github.com:o/predictionTrading.git"
+        for n in range(3):
+            await self.create(f"pt{n}", project="predictionTrading", repo_url=pt,
+                              repo_branch="trunk")
+        # One stray row filed from another checkout, newest of all.
+        await self.create("stray", project="predictionTrading",
+                          repo_url="git@github.com:o/claude-manager.git")
+        with mock.patch.dict(api_main.REPOS, {}, clear=True):
+            listed = (await self.client.get("/projects")).json()
+        by_name = {p["name"]: p for p in listed}
+        self.assertEqual(by_name["predictionTrading"],
+                         {"name": "predictionTrading", "repo_url": pt, "repo_branch": "trunk"})
+        # The project record on the API host still wins over rows.
+        record = "https://github.com/o/predictionTrading.git"
+        with mock.patch.dict(api_main.REPOS, {"predictionTrading": record}, clear=True):
+            listed = (await self.client.get("/projects")).json()
+        by_name = {p["name"]: p for p in listed}
+        self.assertEqual(by_name["predictionTrading"]["repo_url"], record)
+        self.assertEqual(by_name["predictionTrading"]["repo_branch"], "main")
+
 
 if __name__ == "__main__":
     unittest.main()

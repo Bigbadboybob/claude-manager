@@ -5704,12 +5704,12 @@ struct ProposeTaskParams {
     description: String,
     #[serde(default)]
     prompt: String,
-    /// Git remote URL the task is for. The Python tool today
-    /// auto-detects via `git remote get-url origin` if missing;
-    /// the daemon doesn't know the agent's cwd, so we require
-    /// the caller to send it. The Python tool wrapper is
-    /// responsible for inferring + filling this when the agent
-    /// omitted it.
+    /// The CALLER's checkout (`git remote get-url origin`, detected by
+    /// the Python tool). Only a fallback: the row gets the target
+    /// project's repo, and the caller's only when the caller works in
+    /// that same project and the project has no known repo yet
+    /// (`resolve_propose_repo`).
+    #[serde(default)]
     repo_url: String,
     #[serde(default)]
     difficulty: Option<i32>,
@@ -5722,6 +5722,51 @@ struct ProposeTaskParams {
     /// inheritance/validation). Absent = a top-level draft, as before.
     #[serde(default)]
     reports_to: Option<String>,
+}
+
+/// The repo a task proposed into `project` is stamped with. The project's
+/// own repo (its record, else the repo most of its rows carry) always wins;
+/// the caller's checkout is used only when the caller's task is in that same
+/// project and the project has no repo yet. Anything else is refused: a
+/// guessed repo propagates to every subtask and minted worktree.
+fn resolve_propose_repo(
+    creds: &PlanningApiCreds,
+    project: &str,
+    caller_repo_url: &str,
+    caller_task_id: Option<&str>,
+) -> Result<crate::planning_client::ProjectRepo, (ErrorCode, String)> {
+    let projects = api_list_projects(creds).map_err(|e| e.to_method_err())?;
+    if let Some(repo) = crate::planning_client::project_repo(&projects, project) {
+        return Ok(repo);
+    }
+    let caller_project = match caller_task_id {
+        None => None,
+        Some(id) => match api_get_task(creds, id) {
+            Ok(row) => row.get("project").and_then(Value::as_str).map(str::to_string),
+            Err(PlanningClientError::ApiError { status: 404, .. }) => None,
+            Err(e) => return Err(e.to_method_err()),
+        },
+    };
+    let caller_repo_url = caller_repo_url.trim();
+    if caller_project.as_deref() == Some(project) && !caller_repo_url.is_empty() {
+        return Ok(crate::planning_client::ProjectRepo {
+            repo_url: caller_repo_url.to_string(),
+            repo_branch: "main".to_string(),
+        });
+    }
+    Err((
+        ErrorCode::InvalidParams,
+        format!(
+            "propose_task: project '{}' has no known repo (no project record and no \
+             tasks yet), and the caller's own project is {}, so its checkout can't \
+             stand in. Check the name with list_projects, file from a session working \
+             in '{}', or add ~/.cm/projects/{}/repo_url on the planning API host",
+            project,
+            caller_project.map(|p| format!("'{}'", p)).unwrap_or_else(|| "unknown".into()),
+            project,
+            project,
+        ),
+    ))
 }
 
 pub fn propose_task(
@@ -5743,22 +5788,17 @@ pub fn propose_task(
             "propose_task: 'name' is required and non-empty".into(),
         ));
     }
-    if p.repo_url.trim().is_empty() {
-        return Err((
-            ErrorCode::InvalidParams,
-            "propose_task: 'repo_url' is required (the Python tool wrapper \
-             should auto-detect via `git remote get-url origin` and forward; \
-             daemon doesn't know the agent's cwd)".into(),
-        ));
-    }
     // 12f F2: pass daemon.toml-sourced credentials as
     // overrides. Empty fields fall through to env in the
     // resolver — preserves the local-workstation case
     // (daemon launched from a shell with CM_API_URL /
     // CM_API_TOKEN exported, no daemon.toml on disk).
     let machine = local_machine_hostname();
-    let (metadata, api_url_cfg, api_token_cfg, parent_task_id) = {
+    let (metadata, api_url_cfg, api_token_cfg, parent_task_id, caller_task_id) = {
         let st = state_arc.lock().expect("state mutex");
+        let caller_task_id = caller_uid
+            .and_then(|cuid| st.lookup_session_any(cuid))
+            .and_then(|view| view.task_id);
         let parent_task_id = match p.reports_to.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(me) if me.eq_ignore_ascii_case("me") => Some(
@@ -5786,14 +5826,19 @@ pub fn propose_task(
             st.config.api_url.clone(),
             st.config.api_token.clone(),
             parent_task_id,
+            caller_task_id,
         )
     };
+    let creds =
+        PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+    let repo = resolve_propose_repo(&creds, &p.project, &p.repo_url, caller_task_id.as_deref())?;
     let req = crate::planning_client::ProposeTaskRequest {
         project: &p.project,
         name: &p.name,
         description: &p.description,
         prompt: &p.prompt,
-        repo_url: &p.repo_url,
+        repo_url: &repo.repo_url,
+        repo_branch: &repo.repo_branch,
         difficulty: p.difficulty,
         depends: p.depends.as_deref(),
         initiative_id: p.initiative_id.as_deref(),
@@ -8365,11 +8410,14 @@ enum WorkspaceResolution {
 struct MintContext {
     /// A retained binding must recover its prior branch, never mint empty work.
     recover_existing: bool,
-    /// The caller workspace's repo + main checkout. Used only when the
-    /// task's own `repo_url` matches, so a caller in repo A can't drag a
-    /// task in repo B into A's checkout.
-    caller_repo_url: Option<String>,
-    caller_main_repo: Option<PathBuf>,
+    /// The caller's (or fork source's) checkout paths: its main repo and
+    /// worktree. Tried first as the task repo's clone, but only when its
+    /// origin really is the task's repo, so a caller in repo A can't drag
+    /// a task in repo B into A's checkout.
+    caller_paths: Vec<PathBuf>,
+    /// Main repos and worktrees of the host's other workspaces: where
+    /// [`crate::worktree::locate_repo_clone`] looks next.
+    workspace_paths: Vec<PathBuf>,
     repos_dir: PathBuf,
     allow_clone: bool,
     allow_entries: Vec<(String, String)>,
@@ -8378,6 +8426,12 @@ struct MintContext {
     /// Cut point for a fresh mint (`None` = the project's trunk). Set by
     /// `session.fork` into a never-run task with `base="source"`.
     base: Option<String>,
+}
+
+/// A workspace's checkout paths (main repo, worktree), for locating a
+/// repo's local clone.
+fn workspace_paths_of(ws: &crate::manifest::ManifestWorkspace) -> Vec<PathBuf> {
+    ws.main_repo_path.iter().chain(ws.worktree_path.iter()).cloned().collect()
 }
 
 /// Result of minting a workspace for a workspace-less task.
@@ -8496,60 +8550,60 @@ fn mint_task_workspace(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let repo_url = field("repo_url")
-        .or_else(|| ctx.caller_repo_url.clone())
-        .ok_or((
-            ErrorCode::Conflict,
-            format!(
-                "task '{}' has neither a workspace nor a repo_url, so there is nothing \
-                 to cut a worktree from{}",
-                task_id,
-                override_hint()
-            ),
-        ))?;
+    // The task's repo: its row, else its project's. Never the caller's
+    // checkout, which may be another repo entirely.
+    let repo_url = match field("repo_url") {
+        Some(url) => url,
+        None => field("project")
+            .and_then(|pj| {
+                let projects = api_list_projects(&creds).ok()?;
+                crate::planning_client::project_repo(&projects, &pj)
+            })
+            .map(|r| r.repo_url)
+            .ok_or((
+                ErrorCode::Conflict,
+                format!(
+                    "task '{}' has neither a workspace nor a repo_url (nor a project with \
+                     a known repo), so there is nothing to cut a worktree from{}",
+                    task_id,
+                    override_hint()
+                ),
+            ))?,
+    };
     let task_name = field("name").unwrap_or_else(|| task_id.to_string());
 
-    // Main repo. The caller's own is preferred — it's the checkout this
-    // orchestrator is already working in — but ONLY when the task names
-    // the same repo; otherwise resolve the task's repo on the daemon's
-    // filesystem the way `create_subtask` does.
-    let caller_repo_matches = ctx.caller_repo_url.as_deref() == Some(repo_url.as_str());
-    let main_repo = match ctx.caller_main_repo.clone().filter(|_| caller_repo_matches) {
-        Some(mr) => mr,
-        None => {
-            let allowlist: Vec<crate::worktree::RepoAllow> = ctx
-                .allow_entries
-                .iter()
-                .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
-                .collect();
-            crate::worktree::resolve_repo(
-                &repo_url,
-                &ctx.repos_dir,
-                ctx.allow_clone,
-                &allowlist,
-            )
-            .map_err(|e| {
-                let detail = match e {
-                    crate::worktree::RepoResolveError::NotPermitted(name) => format!(
-                        "repo '{}' is not resolvable on this daemon host",
-                        name
-                    ),
-                    crate::worktree::RepoResolveError::CloneFailed { repo, detail } => {
-                        format!("clone of repo '{}' failed: {}", repo, detail)
-                    }
-                };
-                (
-                    ErrorCode::Conflict,
-                    format!(
-                        "task '{}' has no workspace and one could not be minted: {}{}",
-                        task_id,
-                        detail,
-                        override_hint()
-                    ),
-                )
-            })?
-        }
-    };
+    // Main repo: a local clone of the TASK's repo, verified by origin. The
+    // caller's own checkout is tried first (it's usually the right one),
+    // then the host's other workspaces, ~/code/projects and ~/.cm/repos.
+    let caller_main = ctx.caller_paths.iter().find_map(|p| crate::worktree::main_checkout_of(p));
+    let mut candidates: Vec<PathBuf> = caller_main.iter().cloned().collect();
+    candidates.extend(ctx.workspace_paths.iter().filter_map(|p| crate::worktree::main_checkout_of(p)));
+    let allowlist: Vec<crate::worktree::RepoAllow> = ctx
+        .allow_entries
+        .iter()
+        .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
+        .collect();
+    let main_repo = crate::worktree::locate_repo_clone(
+        &repo_url,
+        &candidates,
+        &ctx.repos_dir,
+        ctx.allow_clone,
+        &allowlist,
+    )
+    .map_err(|detail| {
+        (
+            ErrorCode::Conflict,
+            format!(
+                "task '{}' has no workspace and one could not be minted: {}{}",
+                task_id,
+                detail,
+                override_hint()
+            ),
+        )
+    })?;
+    // A cut point from the caller's checkout (fork base=source) only means
+    // something in that same repo; in another one the cut is its trunk.
+    let base = ctx.base.as_deref().filter(|_| caller_main.as_deref() == Some(main_repo.as_path()));
 
     // Cut the worktree. `mint_task_worktree` resolves the project's trunk
     // to a concrete sha FIRST, so an unresolvable main (or a git failure)
@@ -8574,7 +8628,7 @@ fn mint_task_workspace(
         task_id,
         &task_name,
         wip_branch_hint.as_deref(),
-        ctx.base.as_deref(),
+        base,
     )
         .map_err(|e| {
             (
@@ -8745,24 +8799,47 @@ fn ensure_ready_worktree(
             state.config.api_token.clone(),
         )
     };
-    let url_resolved: Option<PathBuf> = ws_repo_url.as_deref().and_then(|u| {
+    // The task's planning row, best-effort: its repo decides which clone
+    // may heal the checkout, and its `wip_branch` is a branch hint.
+    let task_row: Option<Value> = task_id.and_then(|tid| {
+        let creds = PlanningApiCreds::from_config(&api_url, &api_token).ok()?;
+        api_get_task(&creds, tid).ok()
+    });
+    let row_field = |k: &str| {
+        task_row
+            .as_ref()
+            .and_then(|row| row.get(k))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let task_repo_url = row_field("repo_url");
+    let url_resolved: Option<PathBuf> = task_repo_url.as_deref().or(ws_repo_url.as_deref()).and_then(|u| {
         // Never clone on this path — empty allowlist + allow_clone=false
         // makes this "find on disk / reuse a prior clone" only.
         crate::worktree::resolve_repo(u, &repos_dir, false, &[]).ok()
     });
     // Candidate main repos, most specific first. When the workspace row
     // itself doesn't say, any repo that still LISTS the path as a
-    // (prunable) worktree is the owner.
+    // (prunable) worktree is the owner. A task with a repo heals only from
+    // a clone of THAT repo, never from whatever checkout the workspace
+    // happens to record.
     let mut candidates: Vec<PathBuf> = Vec::new();
     for c in ws_main_repo
         .iter()
         .chain(url_resolved.iter())
         .chain(other_main_repos.iter())
     {
-        if c.is_dir() && !candidates.contains(c) {
+        if c.is_dir()
+            && !candidates.contains(c)
+            && task_repo_url.as_deref().is_none_or(|u| crate::worktree::checkout_is_repo(c, u))
+        {
             candidates.push(c.clone());
         }
     }
+    let ws_main_repo = ws_main_repo.filter(|r| candidates.contains(r));
+    let url_resolved = url_resolved.filter(|r| candidates.contains(r));
     let main_repo = candidates
         .iter()
         .find(|r| crate::worktree::branch_for_worktree_dir(r, working_dir).is_some()
@@ -8794,12 +8871,12 @@ fn ensure_ready_worktree(
             ErrorCode::Conflict,
             format!(
                 "worktree {} for workspace '{}' does not exist on disk and cannot be \
-                 re-created: the daemon has no main repo to re-create it from \
-                 (workspace main_repo_path={:?}, repo_url={:?}) — refusing to spawn a \
+                 re-created: the daemon has no local clone of the task's repo to re-create \
+                 it from (task repo_url={:?}, workspace repo_url={:?}) — refusing to spawn a \
                  session into a nonexistent cwd",
                 working_dir.display(),
                 workspace_id,
-                ws_main_repo,
+                task_repo_url,
                 ws_repo_url,
             ),
         ));
@@ -8808,15 +8885,7 @@ fn ensure_ready_worktree(
     // Best-effort `wip_branch` hint from the planning row. It ranks LAST
     // in the heal's branch resolution (it is sometimes a zero-commit
     // decoy), so a failed lookup costs nothing but a cross-check.
-    let wip_branch_hint: Option<String> = task_id.and_then(|tid| {
-        let creds = PlanningApiCreds::from_config(&api_url, &api_token).ok()?;
-        let row = api_get_task(&creds, tid).ok()?;
-        row.get("wip_branch")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    });
+    let wip_branch_hint: Option<String> = row_field("wip_branch");
 
     let health = crate::worktree::ensure_worktree_materialized(
         &main_repo,
@@ -9098,8 +9167,8 @@ pub fn mcp_start_session(
                     task_id: req_task.to_string(),
                     ctx: MintContext {
                         recover_existing,
-                        caller_repo_url: caller_ws.and_then(|w| w.repo_url.clone()),
-                        caller_main_repo: caller_ws.and_then(|w| w.main_repo_path.clone()),
+                        caller_paths: caller_ws.map(workspace_paths_of).unwrap_or_default(),
+                        workspace_paths: state.workspaces.values().flat_map(workspace_paths_of).collect(),
                         repos_dir: state.config.repos_dir_or_default(),
                         allow_clone: state.config.allow_clone,
                         allow_entries: state
@@ -15888,6 +15957,7 @@ fn create_subtask_core(
         filer,
         api_url_cfg,
         api_token_cfg,
+        workspace_paths,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let ws = state.workspaces.get(&parent_workspace_id);
@@ -15915,6 +15985,7 @@ fn create_subtask_core(
             filer_metadata(&state, caller_uid, machine.as_deref(), submitted_via),
             state.config.api_url.clone(),
             state.config.api_token.clone(),
+            state.workspaces.values().flat_map(workspace_paths_of).collect::<Vec<PathBuf>>(),
         )
     };
 
@@ -15953,13 +16024,12 @@ fn create_subtask_core(
     // The FK we actually write into the new row: Some(parent) only when the
     // parent row exists; None (top-level) when it was deleted.
     let effective_parent_id: Option<String> = parent_exists.then(|| parent_task_id.clone());
-    let parent_repo_url: String = parent_row
+    let parent_repo_url: Option<String> = parent_row
         .get("repo_url")
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| parent_ws_repo_url.clone())
-        .filter(|s| !s.is_empty())
-        .ok_or((ErrorCode::Conflict, "parent task has no repo_url".into()))?;
+        .filter(|s| !s.is_empty());
     let parent_project = parent_row
         .get("project")
         .and_then(Value::as_str)
@@ -15968,6 +16038,58 @@ fn create_subtask_core(
         .get("wip_branch")
         .and_then(Value::as_str)
         .map(str::to_string);
+
+    // A subtask filed into ANOTHER project gets that project's repo and
+    // checkout, never the parent's (the row's repo is what every later
+    // subtask and minted worktree inherits). Unknown repo → refuse.
+    let other_project: Option<crate::planning_client::ProjectRepo> = match p.project.as_deref() {
+        // No parent row (a top-level fork) leaves nothing to differ from.
+        Some(pj) if parent_exists && parent_project.as_deref() != Some(pj) => {
+            let projects = api_list_projects(&creds).map_err(|e| e.to_method_err())?;
+            let repo = crate::planning_client::project_repo(&projects, pj).ok_or((
+                ErrorCode::InvalidParams,
+                format!(
+                    "create_subtask: project '{}' has no known repo (no project record \
+                     and no tasks yet), and a subtask in another project can't use its \
+                     parent's repo ({}); check the name with list_projects",
+                    pj,
+                    parent_repo_url.as_deref().unwrap_or("none"),
+                ),
+            ))?;
+            Some(repo)
+        }
+        _ => None,
+    };
+    let (repo_url, repo_branch): (String, String) = match &other_project {
+        Some(r) => (r.repo_url.clone(), r.repo_branch.clone()),
+        None => (
+            parent_repo_url
+                .clone()
+                .ok_or((ErrorCode::Conflict, "parent task has no repo_url".into()))?,
+            "main".to_string(),
+        ),
+    };
+
+    // The parent's checkout counts only when it IS a clone of the
+    // subtask's repo (a lead can run in another repo's checkout than its
+    // task's). Otherwise the subtask's repo is located on this host and
+    // cut from its trunk, and `inherit` (the parent's checkout) is refused.
+    let parent_checkout: Option<PathBuf> = parent_main_repo_path
+        .clone()
+        .or_else(|| parent_worktree_path.as_deref().and_then(crate::worktree::main_checkout_of));
+    let parent_in_repo: Option<PathBuf> = parent_checkout
+        .clone()
+        .filter(|c| other_project.is_none() && crate::worktree::checkout_is_repo(c, &repo_url));
+    if p.worktree_mode == "inherit" && (other_project.is_some() || (parent_checkout.is_some() && parent_in_repo.is_none())) {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "create_subtask: worktree_mode='inherit' would run the subtask (repo {}) \
+                 in its parent's checkout of another repo; use worktree_mode='branch'",
+                repo_url,
+            ),
+        ));
+    }
 
     // Project: explicit arg > inherit from parent.
     let project = p.project.clone().or(parent_project);
@@ -15989,22 +16111,46 @@ fn create_subtask_core(
     // the daemon's filesystem from the parent's `repo_url` — the
     // `create_session` pattern.
     let resolve_main_repo = || -> Result<PathBuf, (ErrorCode, String)> {
-        if let Some(mr) = parent_main_repo_path.clone() {
+        if let Some(mr) = parent_in_repo.clone() {
             return Ok(mr);
         }
         let allowlist: Vec<crate::worktree::RepoAllow> = allow_entries
             .iter()
             .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
             .collect();
-        crate::worktree::resolve_repo(&parent_repo_url, &repos_dir, allow_clone, &allowlist).map_err(
+        if parent_checkout.is_some() || other_project.is_some() {
+            // Not the parent's repo: an origin-verified clone, or refuse.
+            let candidates: Vec<PathBuf> = workspace_paths
+                .iter()
+                .filter_map(|p| crate::worktree::main_checkout_of(p))
+                .collect();
+            return crate::worktree::locate_repo_clone(
+                &repo_url,
+                &candidates,
+                &repos_dir,
+                allow_clone,
+                &allowlist,
+            )
+            .map_err(|detail| (ErrorCode::Conflict, format!("create_subtask: {}", detail)));
+        }
+        crate::worktree::resolve_repo(&repo_url, &repos_dir, allow_clone, &allowlist).map_err(
             |e| match e {
                 crate::worktree::RepoResolveError::NotPermitted(name) => (
                     ErrorCode::Conflict,
-                    format!(
-                        "parent workspace has no main_repo_path and repo '{}' is not \
-                         resolvable on the daemon host; cannot branch/launch in-place",
-                        name
-                    ),
+                    if other_project.is_some() {
+                        format!(
+                            "repo '{}' of project '{}' is not resolvable on the daemon \
+                             host; cannot branch/launch in-place",
+                            name,
+                            p.project.as_deref().unwrap_or_default(),
+                        )
+                    } else {
+                        format!(
+                            "parent workspace has no main_repo_path and repo '{}' is not \
+                             resolvable on the daemon host; cannot branch/launch in-place",
+                            name
+                        )
+                    },
                 ),
                 crate::worktree::RepoResolveError::CloneFailed { repo, detail } => (
                     ErrorCode::Internal,
@@ -16038,23 +16184,30 @@ fn create_subtask_core(
     // concrete commit HERE, before the POST, so a typo'd ref fails as
     // invalid_params instead of minting a `running` row that then has to
     // be rolled back. The cut below reuses the resolved sha.
+    // In another repo than the parent's, the parent's branch means
+    // nothing: the cut defaults to that repo's trunk.
     let resolved_base: Option<String> = match (base.as_deref(), branch_main_repo.as_deref()) {
         (Some(b), Some(main_repo)) => Some(
             crate::worktree::resolve_base_commit(main_repo, b)
                 .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?,
+        ),
+        (None, Some(main_repo)) if Some(main_repo) != parent_in_repo.as_deref() => Some(
+            crate::worktree::resolve_project_main(main_repo)
+                .map(|(_, sha)| sha)
+                .map_err(|e| (ErrorCode::Conflict, format!("create_subtask: {}", e)))?,
         ),
         _ => None,
     };
 
     // Parent's base branch: wip_branch, else the worktree's actual HEAD.
     // Branch mode REQUIRES this (never falls back to "main") — UNLESS an
-    // explicit `base` was passed, which replaces this resolution outright.
+    // explicit `base` (or another project's branch) replaces it outright.
     let parent_branch_resolved: Option<String> = parent_wip_branch.clone().or_else(|| {
         parent_worktree_path
             .as_deref()
             .and_then(crate::worktree::worktree_current_branch)
     });
-    if p.worktree_mode == "branch" && base.is_none() && parent_branch_resolved.is_none() {
+    if p.worktree_mode == "branch" && resolved_base.is_none() && parent_branch_resolved.is_none() {
         return Err((
             ErrorCode::Conflict,
             "cannot determine parent's base branch (no wip_branch and worktree HEAD is \
@@ -16075,8 +16228,8 @@ fn create_subtask_core(
 
     // Step 2 — create the task row. Server assigns the UUID.
     let mut body = json!({
-        "repo_url": parent_repo_url,
-        "repo_branch": "main",
+        "repo_url": repo_url,
+        "repo_branch": repo_branch,
         "name": p.name,
         "priority": 0,
         "status": "running",
@@ -16152,7 +16305,7 @@ fn create_subtask_core(
                 let ws = crate::manifest::ManifestWorkspace {
                     id: uuid::Uuid::new_v4().simple().to_string(),
                     name: leaf_slug.clone(),
-                    repo_url: Some(parent_repo_url.clone()),
+                    repo_url: Some(repo_url.clone()),
                     worktree_path: Some(wt.clone()),
                     main_repo_path: Some(main_repo.clone()),
                     ..Default::default()
@@ -16168,7 +16321,7 @@ fn create_subtask_core(
                 let ws = crate::manifest::ManifestWorkspace {
                     id: uuid::Uuid::new_v4().simple().to_string(),
                     name: leaf_slug.clone(),
-                    repo_url: Some(parent_repo_url.clone()),
+                    repo_url: Some(repo_url.clone()),
                     worktree_path: Some(main_repo.clone()),
                     main_repo_path: Some(main_repo.clone()),
                     ..Default::default()
@@ -16686,8 +16839,8 @@ fn session_fork_once(
                 // path, cut at the requested base.
                 let ctx = MintContext {
                     recover_existing,
-                    caller_repo_url: source_ws.as_ref().and_then(|w| w.repo_url.clone()),
-                    caller_main_repo: source_ws.as_ref().and_then(|w| w.main_repo_path.clone()),
+                    caller_paths: source_ws.as_ref().map(workspace_paths_of).unwrap_or_default(),
+                    workspace_paths: Vec::new(),
                     repos_dir: Default::default(),
                     allow_clone: false,
                     allow_entries: Vec::new(),
@@ -16698,6 +16851,7 @@ fn session_fork_once(
                 let ctx = {
                     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
                     MintContext {
+                        workspace_paths: state.workspaces.values().flat_map(workspace_paths_of).collect(),
                         repos_dir: state.config.repos_dir_or_default(),
                         allow_clone: state.config.allow_clone,
                         allow_entries: state
@@ -34757,6 +34911,92 @@ while True:
         });
     }
 
+    /// Add a second clone, `~/code/projects/<name>` with `origin` set and
+    /// a commit of its own (file `<name>.md`) on `main`; returns its path.
+    fn seed_other_clone(home: &std::path::Path, name: &str, origin: &str) -> std::path::PathBuf {
+        let other = home.join("code/projects").join(name);
+        std::fs::create_dir_all(&other).unwrap();
+        run_git(&other, &["init", "-q"]);
+        run_git(&other, &["config", "user.email", "t@example.com"]);
+        run_git(&other, &["config", "user.name", "t"]);
+        std::fs::write(other.join(format!("{}.md", name)), name).unwrap();
+        run_git(&other, &["add", "-A"]);
+        run_git(&other, &["commit", "-q", "-m", "other init"]);
+        run_git(&other, &["branch", "-M", "main"]);
+        run_git(&other, &["remote", "add", "origin", origin]);
+        other
+    }
+
+    /// Prob Pipeline (be324b86): the lead runs in a claude-manager checkout
+    /// whose workspace even RECORDS the task's predictionTrading URL. A task
+    /// in predictionTrading must still mint from a predictionTrading clone
+    /// (verified by origin, ssh vs https alike) at ITS trunk, and a task
+    /// whose repo has no clone on the host is refused, never minted in the
+    /// caller's repo.
+    #[test]
+    fn mcp_start_session_mints_from_the_task_repos_clone_not_the_callers() {
+        with_home_and_repo("cmrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["remote", "add", "origin", "git@github.com:o/claude-manager.git"]);
+            let pt = seed_other_clone(home, "predictionTrading", "https://github.com/o/predictionTrading.git");
+            let pt_main = git_sha(&pt, "main");
+            let state = make_state_arc();
+            let caller_wt = seed_mint_fixture(
+                &state,
+                &repo,
+                "https://github.com/o/predictionTrading.git",
+                "task-pt",
+            );
+            state.lock().unwrap().record_agent_task_edge("task-gone", "task-parent");
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-pt") => (
+                    200,
+                    r#"{"id":"task-pt","name":"Pipeline","repo_url":"git@github.com:o/predictionTrading.git","project":"predictionTrading","status":"backlog"}"#.to_string(),
+                ),
+                ("GET", "/tasks/task-gone") => (
+                    200,
+                    r#"{"id":"task-gone","name":"Elsewhere","repo_url":"git@github.com:o/nowhere.git","status":"backlog"}"#.to_string(),
+                ),
+                ("PATCH", _) => (200, "{}".to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "w", "task_id": "task-pt", "prompt": "go" }),
+                Some("ts-orch"),
+            );
+            let refused = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "w2", "task_id": "task-gone", "prompt": "go" }),
+                Some("ts-orch"),
+            );
+            set_spawn_program_override_for_test(None);
+            let resp = resp.expect("mint from the predictionTrading clone");
+            let minted = std::path::PathBuf::from(resp["worktree_path"].as_str().unwrap());
+            assert_ne!(minted, caller_wt);
+            assert!(minted.join("predictionTrading.md").exists(), "a predictionTrading checkout");
+            assert!(!minted.join("README.md").exists(), "not the caller's claude-manager repo");
+            assert_eq!(crate::worktree::worktree_head_sha(&minted).as_deref(), Some(pt_main.as_str()));
+            {
+                let s = state.lock().unwrap();
+                let ws = &s.workspaces[&s.task_workspaces["task-pt"]];
+                assert_eq!(ws.main_repo_path.as_deref(), Some(pt.as_path()));
+            }
+
+            let err = refused.expect_err("no clone of the task's repo");
+            assert_eq!(err.0, ErrorCode::Conflict);
+            assert!(err.1.contains("no local clone of git@github.com:o/nowhere.git"), "{}", err.1);
+            assert!(!state.lock().unwrap().task_workspaces.contains_key("task-gone"));
+            kill_all_sessions(&state);
+        });
+    }
+
     /// The mint is once per task, not once per spawn: a second
     /// `start_session` on the same task resolves through the ordinary
     /// binding and lands in the SAME checkout. (A per-spawn mint would
@@ -35418,6 +35658,211 @@ while True:
         });
     }
 
+    /// A caller in one project proposing into another: the row gets the
+    /// TARGET project's repo and branch (Prob Pipeline, be324b86, came up
+    /// with the proposer's claude-manager repo). The caller's checkout
+    /// stands in only for its own project when that project has no repo
+    /// yet; any other unknown project is refused before the POST.
+    #[test]
+    fn propose_task_stamps_the_target_projects_repo_not_the_callers() {
+        let _g = crate::test_support::env_lock();
+        let state = make_state_arc();
+        seed_tasked_caller(&state, "ts-prop", "ws-cm", "task-cm");
+        let stub = spawn_routed_stub(|method, path, _body| match (method, path) {
+            ("GET", "/projects") => (
+                200,
+                r#"[{"name":"claude-manager","repo_url":"git@x.com:o/claude-manager.git","repo_branch":"main"},
+                    {"name":"predictionTrading","repo_url":"https://x.com/o/predictionTrading.git","repo_branch":"trunk"}]"#
+                    .to_string(),
+            ),
+            ("GET", "/tasks/task-cm") => (200, r#"{"id":"task-cm","project":"fresh"}"#.to_string()),
+            ("POST", "/tasks") => (200, r#"{"id":"task-new"}"#.to_string()),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        set_api_env(stub.port);
+        let propose = |project: &str| {
+            propose_task(
+                &state,
+                &json!({"project": project, "name": "n",
+                        "repo_url": "git@x.com:o/claude-manager.git"}),
+                Some("ts-prop"),
+            )
+        };
+        let posted = || -> Vec<Value> {
+            stub.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .map(|r| serde_json::from_str(&r.body).unwrap())
+                .collect()
+        };
+
+        propose("predictionTrading").expect("known project");
+        let body = posted().pop().unwrap();
+        assert_eq!(body["repo_url"], "https://x.com/o/predictionTrading.git");
+        assert_eq!(body["repo_branch"], "trunk");
+        assert_eq!(body["project"], "predictionTrading");
+
+        // The caller's own project has no repo yet: its checkout stands in.
+        propose("fresh").expect("caller's own project");
+        let body = posted().pop().unwrap();
+        assert_eq!(body["repo_url"], "git@x.com:o/claude-manager.git");
+        assert_eq!(body["repo_branch"], "main");
+
+        // Someone else's project with no repo: refused, nothing created.
+        let err = propose("elsewhere").expect_err("unknown project refused");
+        assert_eq!(err.0, ErrorCode::InvalidParams);
+        assert!(err.1.contains("'elsewhere' has no known repo"), "{}", err.1);
+        assert!(err.1.contains("'fresh'"), "names the caller's project: {}", err.1);
+        assert_eq!(posted().len(), 2, "no row for the refused proposal");
+        clear_api_env();
+    }
+
+    /// A subtask filed into ANOTHER project than its parent's takes that
+    /// project's repo, checkout and branch, never the parent's; `inherit`
+    /// (the parent's checkout) and an unknown project are refused before
+    /// any row is created.
+    #[test]
+    fn create_subtask_in_another_project_uses_that_projects_repo() {
+        with_home_and_repo("cmrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let other = home.join("code/projects/ptrepo");
+            std::fs::create_dir_all(&other).unwrap();
+            run_git(&other, &["init", "-q"]);
+            run_git(&other, &["config", "user.email", "t@example.com"]);
+            run_git(&other, &["config", "user.name", "t"]);
+            std::fs::write(other.join("PT.md"), "pt").unwrap();
+            run_git(&other, &["add", "-A"]);
+            run_git(&other, &["commit", "-q", "-m", "pt init"]);
+            run_git(&other, &["branch", "-M", "main"]);
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some(name.to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _body| match (method, path) {
+                ("GET", "/tasks/task-parent") => (
+                    200,
+                    format!(
+                        r#"{{"id":"task-parent","name":"Parent","repo_url":"{}","project":"claude-manager","status":"running","wip_branch":null,"parent_task_id":null}}"#,
+                        name_owned
+                    ),
+                ),
+                ("GET", "/projects") => (
+                    200,
+                    r#"[{"name":"predictionTrading","repo_url":"ptrepo","repo_branch":"main"}]"#.to_string(),
+                ),
+                ("POST", "/tasks") => (
+                    200,
+                    r#"{"id":"task-pt","status":"running","parent_task_id":"task-parent"}"#.to_string(),
+                ),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+            let posts = || {
+                stub.requests.lock().unwrap().iter().filter(|r| r.method == "POST").count()
+            };
+
+            let err = create_subtask(
+                &state,
+                &json!({"name": "pt work", "project": "predictionTrading", "worktree_mode": "inherit"}),
+                Some("ts-orch"),
+            )
+            .expect_err("inherit across projects refused");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+            assert!(err.1.contains("worktree_mode='branch'"), "{}", err.1);
+            let err = create_subtask(
+                &state,
+                &json!({"name": "x", "project": "nowhere", "worktree_mode": "branch"}),
+                Some("ts-orch"),
+            )
+            .expect_err("unknown project refused");
+            assert!(err.1.contains("'nowhere' has no known repo"), "{}", err.1);
+            assert_eq!(posts(), 0, "refusals create no row");
+
+            let result = create_subtask(
+                &state,
+                &json!({"name": "pt work", "project": "predictionTrading", "worktree_mode": "branch"}),
+                Some("ts-orch"),
+            )
+            .expect("cross-project branch subtask");
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert!(wt.join("PT.md").exists(), "cut from the project's repo: {}", wt.display());
+            assert!(!wt.join("README.md").exists(), "not from the parent's repo");
+            assert_eq!(result["base_sha"], json!(git_sha(&other, "main")));
+            let reqs = stub.requests.lock().unwrap();
+            let post = reqs.iter().find(|r| r.method == "POST").unwrap();
+            let body: Value = serde_json::from_str(&post.body).unwrap();
+            assert_eq!(body["repo_url"], "ptrepo");
+            assert_eq!(body["project"], "predictionTrading");
+            assert_eq!(body["parent_task_id"], "task-parent");
+            drop(reqs);
+            let s = state.lock().unwrap();
+            let ws_id = s.task_workspaces.get("task-pt").unwrap();
+            let ws = s.workspaces.get(ws_id).unwrap();
+            assert_eq!(ws.repo_url.as_deref(), Some("ptrepo"));
+            assert_eq!(ws.main_repo_path.as_deref(), Some(other.as_path()));
+            drop(s);
+            clear_api_env();
+        });
+    }
+
+    /// `isolated=true` under a lead whose checkout is another repo than its
+    /// task's (the Prob Pipeline lead: claude-manager checkout, task in
+    /// predictionTrading): the subtask is cut from a predictionTrading
+    /// clone's trunk, not from the lead's branch in claude-manager, and
+    /// `inherit` is refused.
+    #[test]
+    fn create_subtask_under_a_lead_in_another_repo_cuts_from_the_task_repo() {
+        with_home_and_repo("cmrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["remote", "add", "origin", "git@github.com:o/claude-manager.git"]);
+            let pt = seed_other_clone(home, "predictionTrading", "git@github.com:o/predictionTrading.git");
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some("git@github.com:o/claude-manager.git".to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-parent") => (
+                    200,
+                    r#"{"id":"task-parent","name":"Lead","repo_url":"https://github.com/o/predictionTrading.git","project":"predictionTrading","status":"running","wip_branch":null,"parent_task_id":null}"#.to_string(),
+                ),
+                ("POST", "/tasks") => (200, r#"{"id":"task-sub","status":"running"}"#.to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+            let err = create_subtask(&state, &json!({"name": "w", "worktree_mode": "inherit"}), Some("ts-orch"))
+                .expect_err("inherit into another repo's checkout");
+            assert!(err.1.contains("worktree_mode='branch'"), "{}", err.1);
+            let result = create_subtask(&state, &json!({"name": "w", "worktree_mode": "branch"}), Some("ts-orch"))
+                .expect("branch subtask");
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert!(wt.join("predictionTrading.md").exists(), "{}", wt.display());
+            assert_eq!(result["base_sha"], json!(git_sha(&pt, "main")));
+            let s = state.lock().unwrap();
+            let ws = &s.workspaces[&s.task_workspaces["task-sub"]];
+            assert_eq!(ws.main_repo_path.as_deref(), Some(pt.as_path()));
+            assert_eq!(ws.repo_url.as_deref(), Some("https://github.com/o/predictionTrading.git"));
+            drop(s);
+            clear_api_env();
+        });
+    }
+
     /// HARDENING: when the parent planning row is GONE (404 on
     /// `GET /tasks/{parent}` — e.g. an `A-x` board delete hard-removed it),
     /// create_subtask must NOT fail. It falls back to creating a TOP-LEVEL
@@ -35526,6 +35971,8 @@ while True:
                     r#"{"id":"task-proposed-1","name":"lane d","status":"draft","parent_task_id":null}"#
                         .to_string(),
                 )
+            } else if method == "GET" && path == "/projects" {
+                (200, r#"[{"name":"proj","repo_url":"git@x.com:a/b.git"}]"#.to_string())
             } else {
                 (404, r#"{"detail":"unexpected"}"#.to_string())
             }

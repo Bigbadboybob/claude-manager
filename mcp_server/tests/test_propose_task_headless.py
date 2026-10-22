@@ -55,9 +55,9 @@ class ProposeTaskHeadlessTests(unittest.TestCase):
         self.assertEqual(captured["params"]["project"], "y")
         self.assertIn("task-123", out)
 
-    def test_daemon_path_repo_url_detect_failure_is_clean(self):
-        """If git can't detect an origin, propose_task returns a clear message
-        and does NOT dial the daemon."""
+    def test_daemon_path_without_an_origin_lets_the_daemon_resolve(self):
+        """The caller's origin is only a hint: with none, the daemon still gets
+        the call and resolves the project's repo itself."""
         from mcp_server import server, control_client
 
         route = types.SimpleNamespace(chose_daemon=True, path="/tmp/fake.sock")
@@ -69,13 +69,14 @@ class ProposeTaskHeadlessTests(unittest.TestCase):
             control_client, "resolve_socket_route", return_value=route
         ), mock.patch.object(
             server, "_git_origin_url", side_effect=boom
-        ), mock.patch.object(control_client, "call") as call_mock:
+        ), mock.patch.object(control_client, "call", return_value={"id": "t-1"}) as call_mock:
             out = server.propose_task(
                 project="y", name="fix", description="d", prompt="p"
             )
 
-        call_mock.assert_not_called()
-        self.assertIn("could not detect the repo URL", out)
+        params = call_mock.call_args.args[1]
+        self.assertNotIn("repo_url", params)
+        self.assertIn("t-1", out)
 
     def test_direct_api_fallback_stamps_filer_metadata(self):
         """Ad-hoc/TUI-socket callers that bypass the daemon still persist the
@@ -85,6 +86,9 @@ class ProposeTaskHeadlessTests(unittest.TestCase):
         captured: dict = {}
 
         class FakePlanningClient:
+            def list_projects(self):
+                return [{"name": "y", "repo_url": "git@github.com:x/y.git"}]
+
             def propose_task(self, **kwargs):
                 captured.update(kwargs)
                 return {"id": "task-local"}
@@ -110,7 +114,49 @@ class ProposeTaskHeadlessTests(unittest.TestCase):
 
         filer_context.assert_called_once_with("mcp.propose_task")
         self.assertEqual(captured["metadata"], {"filer": filer})
+        self.assertEqual(captured["repo_url"], "git@github.com:x/y.git")
         self.assertIn("task-local", out)
+
+    def test_direct_api_path_uses_the_target_projects_repo(self):
+        """A caller in another repo's checkout gets the TARGET project's repo;
+        its own checkout stands in only for its own repo-less project; any
+        other unknown project is refused without a POST."""
+        from mcp_server import server, control_client
+
+        posted: list = []
+
+        class FakePlanningClient:
+            def list_projects(self):
+                return [{"name": "predictionTrading",
+                         "repo_url": "https://github.com/o/predictionTrading.git",
+                         "repo_branch": "main"}]
+
+            def get_task(self, task_id):
+                return {"id": task_id, "project": "fresh"}
+
+            def propose_task(self, **kwargs):
+                posted.append(kwargs)
+                return {"id": "task-local"}
+
+        route = types.SimpleNamespace(chose_daemon=False, path="/tmp/tui.sock")
+        filer = {"schema_version": 1, "task_id": "caller-task"}
+        with mock.patch.object(
+            control_client, "resolve_socket_route", return_value=route
+        ), mock.patch.object(
+            server, "PlanningClient", return_value=FakePlanningClient()
+        ), mock.patch.object(
+            server, "_caller_filer_context", return_value=filer
+        ), mock.patch.object(
+            server, "_git_origin_url", return_value="git@github.com:o/claude-manager.git"
+        ):
+            server.propose_task(project="predictionTrading", name="a", description="d", prompt="p")
+            server.propose_task(project="fresh", name="b", description="d", prompt="p")
+            out = server.propose_task(project="elsewhere", name="c", description="d", prompt="p")
+
+        self.assertEqual(posted[0]["repo_url"], "https://github.com/o/predictionTrading.git")
+        self.assertEqual(posted[1]["repo_url"], "git@github.com:o/claude-manager.git")
+        self.assertEqual(len(posted), 2)
+        self.assertIn("'elsewhere' has no known repo", out)
 
 
 if __name__ == "__main__":
