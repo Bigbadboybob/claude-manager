@@ -1219,24 +1219,32 @@ def org(
     Reporting lines follow the task tree: a task reports to its parent task,
     and a task with no parent is standalone. Each task's lead is its pinned
     `metadata.lead_session_uid` if that session is live, else its
-    earliest-spawned live claude/codex session. Views return names and ids
-    only; reporting is not approval authority. Leads are resolved from
-    sessions on this host, so a remote lead reads as `lead: null` (the raw
-    pin is in `pinned_lead_session_uid`).
+    earliest-spawned live claude/codex session. Owner can lead too: a pin of
+    "owner" names Owner, and a division's root task with no live lead has
+    Owner as stand-in. An Owner lead reads `{"owner": true, "stand_in": ...}`.
+    Views return names and ids only; reporting is not approval authority.
+    Leads are resolved from sessions on this host, so a remote lead reads as
+    `lead: null` (the raw pin is in `pinned_lead_session_uid`).
 
     Views (open to every agent):
       - `view="me"` (default): your task and lead, your boss (the parent
-        task and its lead, which is whom you report to), the chain up to the
-        root, and your division (or initiative).
+        task and its lead), `boss_lead` (whom you report to: the nearest
+        lead up the chain, `{"owner": true, ...}` when that is Owner; then
+        escalate to Owner as your boss), the chain up to the root, and your
+        division (or initiative).
       - `view="reports", task_id=None`: child tasks of your task (or of
         `task_id`) with their leads.
       - `view="division", division=None`: the task tree under your division
-        (or the given initiative id/slug), rooted at its coordinator task.
+        (or the given initiative id/slug), rooted at its coordinator task,
+        with the division's `leader`.
 
     Actions (your own task only):
       - `action="set_lead", session_uid=None`: pin the lead of your task to
         `session_uid` (default: you). It must be a live claude/codex session
         bound to your task.
+      - `action="set_lead", session_uid="owner", task_id=...`: make Owner the
+        lead of `task_id`. Only an orchestrator may (global permissions, or
+        a task above `task_id`), and never on its own task.
       - `action="clear_lead"`: remove the pin, so the fallback rule applies.
     """
     params = {key: value for key, value in {

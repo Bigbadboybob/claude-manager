@@ -402,9 +402,15 @@ impl App {
                             .map_or_else(|| uid.clone(), |(_, label)| label.clone()),
                         None => {
                             // What the rule picks with no pin.
-                            let rule = self.task_leads().get(task_id.as_str()).and_then(|uid| {
-                                lead_choices.iter().find(|(u, _)| u == uid).map(|(_, l)| l.clone())
-                            });
+                            let rule = match self.all_leads().get(task_id.as_str()) {
+                                Some(super::tree::Lead::Session(uid)) => {
+                                    lead_choices.iter().find(|(u, _)| u == uid).map(|(_, l)| l.clone())
+                                }
+                                Some(super::tree::Lead::Owner { stand_in }) => {
+                                    Some(super::symbols::owner_label(*stand_in).to_owned())
+                                }
+                                _ => None,
+                            };
                             format!("auto ({})", rule.as_deref().unwrap_or("no live agent"))
                         }
                     };
@@ -1966,6 +1972,18 @@ impl App {
         };
         // Leader marks: the lead of each task with subtasks, by level.
         let marks = tree.as_ref().map_or_else(HashMap::new, |t| self.leader_marks(&t.org));
+        // Owner-led tasks (pinned, or standing in for a division root): their
+        // header carries the level's leader mark with Owner's ♔ beside it.
+        let owner_led = if tree.is_some() { self.owner_leads() } else { HashMap::new() };
+        let owner_mark = |task_id: &str| -> Option<Vec<Span<'static>>> {
+            owner_led.get(task_id)?;
+            let level = tree.as_ref().map_or(1, |t| t.org.level(task_id));
+            Some(vec![
+                Span::styled(super::tree::leader_glyph(level), Style::default().fg(theme::LEAD)),
+                Span::styled(super::symbols::OWNER, super::symbols::owner_style()),
+                Span::raw(" "),
+            ])
+        };
 
         let section_backgrounds = self.sidebar_section_backgrounds(&visual, &block_root);
         for (vi, background) in visual.iter().zip(section_backgrounds) {
@@ -2357,10 +2375,12 @@ impl App {
                     let folded = self.tree_folded(&node);
                     let has_reports = tree.as_ref().is_some_and(|t| t.org.has_reports(task_id));
                     let tail = fold_tail(&node);
+                    let owner = owner_mark(task_id);
                     let prefix = tree_prefix(vi, *ws_idx);
                     let prefix_width: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
                     let max_name = (inner.width as usize).saturating_sub(
-                        prefix_width + 3 + initiative_marker.chars().count() + tail.chars().count(),
+                        prefix_width + 3 + initiative_marker.chars().count() + tail.chars().count()
+                            + owner.as_ref().map_or(0, |o| o.len()),
                     );
                     let name = crate::planning::truncate_with_ellipsis(&name, max_name);
                     // Style lives on the ListItem so selection highlight can
@@ -2387,6 +2407,7 @@ impl App {
                         (true, true) => " \u{25b8} ",
                         (true, false) => " \u{25be} ",
                     }));
+                    spans.extend(owner.into_iter().flatten());
                     spans.push(Span::raw(initiative_marker));
                     spans.push(Span::raw(name));
                     spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
@@ -2401,7 +2422,10 @@ impl App {
                     let glyph = if self.tree_folded(&node) { "\u{25b8}" } else { "\u{25be}" };
                     let tail = fold_tail(&node);
                     let prefix = tree_prefix(vi, usize::MAX);
-                    let max_name = (inner.width as usize).saturating_sub(5 + tail.chars().count());
+                    // Led by Owner when its root task is.
+                    let owner = self.planning.division_root(id).and_then(|root| owner_mark(&root));
+                    let max_name = (inner.width as usize)
+                        .saturating_sub(5 + tail.chars().count() + owner.as_ref().map_or(0, |o| o.len()));
                     let name = division.as_ref().map_or_else(|| "division".to_string(), |d| d.name.clone());
                     let name = crate::planning::truncate_with_ellipsis(&name, max_name);
                     let accent = division.as_ref().and_then(|d| d.color.as_deref()).and_then(theme::user_color);
@@ -2411,7 +2435,9 @@ impl App {
                         Style::default().fg(accent.unwrap_or(theme::HEADER)).add_modifier(Modifier::BOLD)
                     };
                     let mut spans = prefix;
-                    spans.push(Span::raw(format!("{glyph} \u{25c6} {name}")));
+                    spans.push(Span::raw(format!("{glyph} \u{25c6} ")));
+                    spans.extend(owner.into_iter().flatten());
+                    spans.push(Span::raw(name));
                     spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
                     items.push(ListItem::new(Line::from(spans)).style(base_style));
                 }

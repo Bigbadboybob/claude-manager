@@ -65,6 +65,19 @@ pub(crate) fn board_status(status: &str) -> (&'static str, Style) {
 pub(crate) const HEADER_BOX: &str = "\u{229e}";
 pub(crate) const DIVISION: &str = "\u{25c6}";
 
+/// Owner leads this task or division (pinned, or standing in for a division
+/// root with no live lead): beside the level's leader mark.
+pub(crate) const OWNER: &str = "\u{2654}";
+
+pub(crate) fn owner_style() -> Style {
+    Style::default().fg(theme::LEAD).add_modifier(Modifier::BOLD)
+}
+
+/// "Owner" or "Owner (stand-in)", as a box or field names Owner as lead.
+pub(crate) fn owner_label(stand_in: bool) -> &'static str {
+    if stand_in { "Owner (stand-in)" } else { "Owner" }
+}
+
 /// A board item that carries a flag (holder idle, overdue, …).
 pub(crate) const FLAG: &str = "\u{2691}";
 
@@ -161,6 +174,7 @@ pub(crate) fn legend() -> Vec<(String, Style, &'static str)> {
         out.push((s.to_owned(), st, word));
     }
     out.push((FLAG.to_owned(), flag_style(), "flagged"));
+    out.push((OWNER.to_owned(), owner_style(), "Owner leads"));
     out
 }
 

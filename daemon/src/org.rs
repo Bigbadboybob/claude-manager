@@ -6,6 +6,11 @@
 //! MCP tool reports it — so it lives here once and the TUI calls it directly
 //! (the TUI already depends on this crate).
 //!
+//! Owner can lead too (2026-10-22): `metadata.lead_session_uid = "owner"`
+//! names Owner explicitly, and a division root with no live lead falls back
+//! to Owner as stand-in. [`task_lead`] is the full rule, typed so callers can
+//! tell an explicit Owner from the fallback.
+//!
 //! Reporting is not approval authority: nothing here grants control rights.
 
 use serde_json::Value;
@@ -13,6 +18,39 @@ use serde_json::Value;
 /// `tasks.metadata` key holding the explicitly chosen lead session uid
 /// (set from the task header's A-e form or `org(action="set_lead")`).
 pub const LEAD_SESSION_METADATA_KEY: &str = "lead_session_uid";
+
+/// The `lead_session_uid` value meaning "Owner leads this task".
+pub const OWNER_LEAD: &str = "owner";
+
+/// Whether a pin names Owner (case-insensitive, trimmed).
+pub fn is_owner_pin(pinned: &str) -> bool {
+    pinned.trim().eq_ignore_ascii_case(OWNER_LEAD)
+}
+
+/// Who leads a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lead {
+    /// A live agent session.
+    Session(String),
+    /// Owner: pinned explicitly (`stand_in: false`), or standing in for a
+    /// division root that has no live lead (`stand_in: true`).
+    Owner { stand_in: bool },
+    /// Nobody (a non-division task with no live agent session).
+    None,
+}
+
+impl Lead {
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Lead::Session(uid) => Some(uid),
+            _ => None,
+        }
+    }
+
+    pub fn is_owner(&self) -> bool {
+        matches!(self, Lead::Owner { .. })
+    }
+}
 
 /// One session bound to the task whose lead is being resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +125,32 @@ pub fn lead_session_uid(pinned: Option<&str>, candidates: &[LeadCandidate<'_>]) 
                 .then_with(|| a.uid.cmp(b.uid))
         })
         .map(|c| c.uid.to_string())
+}
+
+/// The lead of one task, Owner included:
+///   1. a pin of `"owner"` → Owner (explicit);
+///   2. else the session rule ([`lead_session_uid`]);
+///   3. else, for a division root (the `coordinator_task_id` of an
+///      initiative with `kind = 'division'`), Owner as stand-in;
+///   4. else nobody.
+pub fn task_lead(pinned: Option<&str>, candidates: &[LeadCandidate<'_>], division_root: bool) -> Lead {
+    if pinned.is_some_and(is_owner_pin) {
+        return Lead::Owner { stand_in: false };
+    }
+    match lead_session_uid(pinned, candidates) {
+        Some(uid) => Lead::Session(uid),
+        None if division_root => Lead::Owner { stand_in: true },
+        None => Lead::None,
+    }
+}
+
+/// Whether a task row (the planning API's shape: `id`, and an embedded
+/// `initiative` with `kind` and `coordinator_task_id`) is a division root.
+pub fn is_division_root(task: &Value) -> bool {
+    let init = &task["initiative"];
+    init["kind"].as_str() == Some("division")
+        && init["coordinator_task_id"].as_str().is_some()
+        && init["coordinator_task_id"].as_str() == task["id"].as_str()
 }
 
 #[cfg(test)]
@@ -181,6 +245,37 @@ mod tests {
             lead_session_uid(None, &[c("legacy-b", "codex", true), c("legacy-a", "codex", true)]),
             Some("legacy-a".into())
         );
+    }
+
+    /// Owner as lead (2026-10-22): explicit pin, stand-in for division roots
+    /// only, and a live session overriding the stand-in.
+    #[test]
+    fn owner_leads_when_pinned_or_standing_in_for_a_division_root() {
+        let live = [c("ts-10-0", "codex", true)];
+        let bash = [c("ts-10-0", "bash", true)];
+        // Explicit Owner wins over live sessions, in any case and spacing.
+        for pin in ["owner", " Owner ", "OWNER"] {
+            assert_eq!(task_lead(Some(pin), &live, false), Lead::Owner { stand_in: false }, "{pin:?}");
+        }
+        assert_eq!(task_lead(Some("owner"), &[], true), Lead::Owner { stand_in: false });
+        // A division root with no live agent: Owner stands in.
+        assert_eq!(task_lead(None, &[], true), Lead::Owner { stand_in: true });
+        assert_eq!(task_lead(None, &bash, true), Lead::Owner { stand_in: true });
+        assert_eq!(task_lead(Some("ts-gone-0"), &[], true), Lead::Owner { stand_in: true });
+        // ...but a live session overrides the fallback.
+        assert_eq!(task_lead(None, &live, true), Lead::Session("ts-10-0".into()));
+        // Any other task with no lead keeps having none.
+        assert_eq!(task_lead(None, &[], false), Lead::None);
+        assert_eq!(task_lead(None, &bash, false), Lead::None);
+        assert_eq!(task_lead(None, &live, false), Lead::Session("ts-10-0".into()));
+        // The session rule itself never treats "owner" as a session.
+        assert_eq!(lead_session_uid(Some("owner"), &live), Some("ts-10-0".into()));
+        // Division roots come from the task row.
+        let root = json!({"id": "t1", "initiative": {"kind": "division", "coordinator_task_id": "t1"}});
+        let member = json!({"id": "t2", "initiative": {"kind": "division", "coordinator_task_id": "t1"}});
+        let plain = json!({"id": "t1", "initiative": {"kind": "initiative", "coordinator_task_id": "t1"}});
+        assert!(is_division_root(&root));
+        assert!(!is_division_root(&member) && !is_division_root(&plain) && !is_division_root(&json!({"id": "t1"})));
     }
 
     #[test]

@@ -195,3 +195,14 @@ lists your reports, and `org(view="division")` shows the whole tree. A task's
 lead is the session you pin with `org(action="set_lead")`. Without a pin, it is
 the earliest-spawned live Claude or Codex session on the task. Reporting lines
 say who to tell. They don't grant approval or merge authority.
+
+Owner can lead too. A task pinned to `"owner"` is led by Owner, and a
+division's root task with no live lead has Owner as stand-in (misc divisions
+such as `pt-misc` and `cm-misc` have no session on their root, so Owner leads
+them). `org()` then reports your `boss_lead` as `{"owner": true, "stand_in":
+...}`: in an Owner-led division, Owner is your boss, so escalate to Owner
+(`notify_user`, or the channel Owner reads) rather than looking for a lead
+session. Only an orchestrator can make Owner a task's lead
+(`org(action="set_lead", session_uid="owner", task_id=...)` on a task below
+its own, or with global permissions), and never on its own task; Owner does it
+from A-e.

@@ -1506,7 +1506,19 @@ impl App {
         c.oy.set(oy);
     }
 
+    /// Whether Owner leads this box, and if so whether only as stand-in: a
+    /// division box by its root task, any other box by its own task.
+    pub(super) fn chart_owner_lead(&self, node: &ChartNode, owner_led: &HashMap<String, bool>) -> Option<bool> {
+        // Division boxes are keyed `div:<project>:<division id>`.
+        let task = match node.key.strip_prefix("div:").and_then(|rest| rest.rsplit(':').next()) {
+            Some(div) => self.planning.division_root(div)?,
+            None => node.task_id.clone()?,
+        };
+        owner_led.get(&task).copied()
+    }
+
     fn draw_chart_body(&self, buf: &mut ratatui::buffer::Buffer, area: Rect, model: &ChartModel, lay: &ChartLayout, focus: usize) {
+        let owner_led = self.owner_leads();
         let (ox, oy) = (self.orgchart.ox.get(), self.orgchart.oy.get());
         let put = |buf: &mut ratatui::buffer::Buffer, x: i32, y: i32, s: &str, style: Style| {
             let (vy, mut vx) = (y - oy, x - ox);
@@ -1537,6 +1549,7 @@ impl App {
             let node = &model.nodes[i];
             let focused = i == focus;
             let selected = focused.then(|| self.orgchart_selected(node));
+            let owner = self.chart_owner_lead(node, &owner_led);
             let folded = self.orgchart.folds.contains(&node.key) && !node.children.is_empty();
             let hidden = if folded { model.subtree_sessions(i) - node.sessions.len() } else { 0 };
             let header = matches!(node.kind, NodeKind::Owner | NodeKind::Project | NodeKind::Org);
@@ -1558,7 +1571,12 @@ impl App {
                     }
                 }
                 Detail::Compact => {
-                    let mark = node.sessions.first().and_then(|s| s.mark).unwrap_or(" ");
+                    let mark = node.sessions.first().and_then(|s| s.mark);
+                    let (mark, mark_style) = match (mark, owner) {
+                        (Some(m), _) => (m, Style::default().fg(theme::ATTN)),
+                        (None, Some(_)) => (symbols::OWNER, symbols::owner_style()),
+                        (None, None) => (" ", Style::default()),
+                    };
                     let extra = node.sessions.len().saturating_sub(1) + hidden;
                     let tail = match (folded, extra) {
                         (true, _) => format!(" \u{25b8}{extra}"),
@@ -1569,7 +1587,7 @@ impl App {
                     let name = crate::planning::truncate_with_ellipsis(&node.title, room);
                     let text_style = if header { Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::TEXT) };
                     put(buf, p.x, p.y, &" ".repeat(p.w as usize), focus_bg(Style::default()));
-                    put(buf, p.x, p.y, mark, focus_bg(Style::default().fg(theme::ATTN)));
+                    put(buf, p.x, p.y, mark, focus_bg(mark_style));
                     put(buf, p.x + 1, p.y, head_glyph.0, focus_bg(head_glyph.1));
                     put(buf, p.x + 3, p.y, &name, focus_bg(text_style));
                     put(buf, p.x + p.w - tail.chars().count() as i32, p.y, &tail, focus_bg(Style::default().fg(theme::MUTED)));
@@ -1584,11 +1602,17 @@ impl App {
                     };
                     let w = p.w as usize;
                     let fold_tag = if folded { format!(" \u{25b8} {hidden} below") } else { String::new() };
-                    let title = crate::planning::truncate_with_ellipsis(&node.title, w.saturating_sub(5 + fold_tag.chars().count()));
+                    // An Owner-led box opens its title with ♔.
+                    let crown = if owner.is_some() { 2 } else { 0 };
+                    let title = crate::planning::truncate_with_ellipsis(&node.title, w.saturating_sub(5 + crown + fold_tag.chars().count()));
                     put(buf, p.x, p.y, &format!("\u{256d}{}\u{256e}", "\u{2500}".repeat(w - 2)), border);
                     let title_style = if header { Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) };
-                    put(buf, p.x + 2, p.y, &format!(" {title} "), title_style);
-                    put(buf, p.x + 3 + title.chars().count() as i32, p.y, &fold_tag, Style::default().fg(theme::MUTED));
+                    if owner.is_some() {
+                        put(buf, p.x + 2, p.y, " ", title_style);
+                        put(buf, p.x + 3, p.y, symbols::OWNER, symbols::owner_style());
+                    }
+                    put(buf, p.x + 2 + crown as i32, p.y, &format!(" {title} "), title_style);
+                    put(buf, p.x + 3 + crown as i32 + title.chars().count() as i32, p.y, &fold_tag, Style::default().fg(theme::MUTED));
                     for row in 1..p.h - 1 {
                         put(buf, p.x, p.y + row, "\u{2502}", border);
                         put(buf, p.x + 1, p.y + row, &" ".repeat(w - 2), Style::default());
@@ -1602,7 +1626,21 @@ impl App {
                             NodeKind::Org => format!("{} \u{00b7} {}", plural(node.children.len(), "report"), plural(model.subtree_sessions(i), "session")),
                             _ => "no session here".into(),
                         };
-                        put(buf, p.x + 2, p.y + 1, &crate::planning::truncate_with_ellipsis(&text, w - 4), focus_bg(Style::default().fg(theme::DIM)));
+                        // An Owner-led box says so at the top: "Owner" or
+                        // "Owner (stand-in)", then its usual summary.
+                        let text = match owner {
+                            Some(stand_in) => {
+                                let who = symbols::owner_label(stand_in);
+                                put(buf, p.x + 2, p.y + 1, &crate::planning::truncate_with_ellipsis(who, w - 4), focus_bg(symbols::owner_style()));
+                                let rest = if matches!(node.kind, NodeKind::Task) { String::new() } else { text };
+                                (!rest.is_empty()).then(|| format!(" \u{00b7} {rest}")).map(|r| (who.chars().count(), r))
+                            }
+                            None => Some((0, text)),
+                        };
+                        if let Some((skip, text)) = text {
+                            let room = (w - 4).saturating_sub(skip);
+                            put(buf, p.x + 2 + skip as i32, p.y + 1, &crate::planning::truncate_with_ellipsis(&text, room), focus_bg(Style::default().fg(theme::DIM)));
+                        }
                         if focused {
                             put(buf, p.x + 1, p.y + 1, " ", focus_bg(Style::default()));
                         }
@@ -1700,6 +1738,9 @@ impl App {
                 _ => "task (no session)",
             };
             lines.push(Line::from(vec![label("kind"), text(kind.into())]));
+            if let Some(stand_in) = self.chart_owner_lead(node, &self.owner_leads()) {
+                lines.push(Line::from(vec![label("lead"), Span::styled(format!("{} {}", symbols::OWNER, symbols::owner_label(stand_in)), symbols::owner_style())]));
+            }
             if let Some(b) = boss {
                 lines.push(Line::from(vec![label("reports"), text(format!("to {}", boss_text(b)))]));
             }
@@ -1752,6 +1793,9 @@ impl App {
         lines.push(Line::from(vec![label("activity"), text(last)]));
         let task = node.task_id.as_ref().or(ts.task_id.as_ref());
         lines.push(Line::from(vec![label("task"), text(task.map_or_else(|| "none (workspace session)".into(), |_| node.title.clone()))]));
+        if let Some(stand_in) = self.chart_owner_lead(node, &self.owner_leads()) {
+            lines.push(Line::from(vec![label("lead"), Span::styled(format!("{} {}", symbols::OWNER, symbols::owner_label(stand_in)), symbols::owner_style())]));
+        }
         if let Some(b) = boss {
             lines.push(Line::from(vec![label("boss"), text(boss_text(b))]));
         }
@@ -2003,6 +2047,36 @@ mod tests {
         // The info pane names the division.
         let lines: Vec<String> = app.orgchart_info_lines(&m, div, 50).iter().map(|l| l.to_string()).collect();
         assert!(lines.iter().any(|l| l.contains("division")), "{lines:?}");
+    }
+
+    /// Owner as leader (2026-10-22): an Owner-led division box says so at
+    /// the top, "Owner (stand-in)" when Owner only stands in for a root with
+    /// no live lead, "Owner" when pinned; the info pane names Owner as lead.
+    #[test]
+    fn an_owner_led_division_box_names_owner_at_the_top() {
+        let mut app = org_app();
+        app.planning.update_from_api(vec![
+            division_task("root", None, true),
+            division_task("mid", Some("root"), false),
+        ]);
+        // The root's sessions are gone: nobody live leads it.
+        app.workspaces[0].sessions.clear();
+        assert_eq!(app.owner_leads().get("root"), Some(&true));
+        app.handle_event(&key(KeyCode::F(6)));
+        app.orgchart.hide_info = true;
+        let s = screen(&mut app, 200, 40);
+        assert!(s.contains("\u{2654} Trader "), "division box title: {s}");
+        assert!(s.contains("\u{2654} Root lead "), "root box title: {s}");
+        assert!(s.contains("Owner (stand-in) \u{00b7} 1 r"), "{s}");
+        assert!(s.contains("mid-1"), "the reports still show: {s}");
+        let m = app.org_model(false);
+        let div = m.find("div::div-1").unwrap();
+        let info = app.orgchart_info_lines(&m, div, 60).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(info.contains("lead     \u{2654} Owner (stand-in)"), "{info}");
+        // Pinned explicitly: plain "Owner".
+        app.tasks[0].metadata = Some(json!({"lead_session_uid": "owner"}));
+        let s = screen(&mut app, 200, 40);
+        assert!(s.contains("Owner \u{00b7} 1 report") && !s.contains("stand-in"), "{s}");
     }
 
     #[test]

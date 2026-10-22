@@ -110,6 +110,8 @@ pub struct PlanTask {
     /// The initiative's `kind`: `"division"` for a permanent division,
     /// else an ordinary initiative (also when the API predates the field).
     pub initiative_kind: Option<String>,
+    /// `metadata.lead_session_uid`: a pinned lead session, or `"owner"`.
+    pub lead_pin: Option<String>,
     /// Task kind from the API row ("oneshot" | "continuous" | "backtest").
     /// The `A-w` watch action fires only on `"backtest"`.
     pub kind: String,
@@ -188,6 +190,7 @@ impl PlanTask {
                     .and_then(|v| v.as_str()) == Some(task.id.as_str()),
             initiative_kind: task.initiative.as_ref()
                 .and_then(|v| v.get("kind")).and_then(|v| v.as_str()).map(str::to_string),
+            lead_pin: task.metadata.as_ref().and_then(cm_daemon::org::pinned_lead).map(str::to_owned),
             kind: task.kind.clone(),
             worker_vm: task.worker_vm.clone().filter(|s| !s.is_empty()),
             vm_project: meta_str(&task.metadata, "vm", "project"),
@@ -1326,6 +1329,24 @@ impl PlanningView {
                     coordinator: t.is_initiative_coordinator,
                 }))
             })
+            .collect()
+    }
+
+    /// A division's root task (its coordinator task), if loaded.
+    pub(crate) fn division_root(&self, id: &str) -> Option<String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .find(|t| t.initiative_id.as_deref() == Some(id) && t.initiative_kind.as_deref() == Some("division") && t.is_initiative_coordinator)
+            .map(|t| t.id.clone())
+    }
+
+    /// Each loaded task's lead pin (a session uid, or `"owner"`).
+    pub(crate) fn lead_pins(&self) -> HashMap<String, String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .filter_map(|t| Some((t.id.clone(), t.lead_pin.clone()?)))
             .collect()
     }
 
@@ -5250,6 +5271,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
             initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
@@ -5821,6 +5843,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
             initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
@@ -5879,6 +5902,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
             initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
@@ -6001,6 +6025,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
             initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
@@ -6066,6 +6091,7 @@ mod tests {
                 initiative_status: None,
                 initiative_color: None,
                 is_initiative_coordinator: false,
+                lead_pin: None,
                 initiative_kind: None,
                 kind: "oneshot".to_string(),
                 worker_vm: None,
@@ -6143,6 +6169,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
             initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
@@ -6343,6 +6370,7 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
             initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,

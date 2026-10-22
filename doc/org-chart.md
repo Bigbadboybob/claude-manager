@@ -28,6 +28,14 @@ the chart's focused session selected.
 - A task box lists the task's sessions. The lead session comes first; it is
   chosen by the shared lead rule (`task_leads`). The other sessions follow in
   spawn order.
+- **Owner as leader.** A task pinned to `"owner"` (A-e Lead, or an
+  orchestrator's `org(action="set_lead", session_uid="owner")`) is led by
+  Owner, and a division root with no live lead has Owner as stand-in. Such a
+  box opens its title with ♔, and a division box says "Owner (stand-in)" or
+  "Owner" at the top; the info pane's `lead` line names it. Sessions under it
+  keep their own leads and marks. The Sessions sidebar shows the same on task
+  and division headers: the level's leader mark with ♔ (`★♔`). One rule
+  decides it on both sides: `cm_daemon::org::task_lead`.
 - **Leader marks.** Only the lead of a task with live reports carries a
   mark, and the mark gives its level below Owner: ★ for a root task
   (level 1), ☆ for its subtask (level 2), ✦ for level 3, and ✧ for level 4

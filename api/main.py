@@ -757,10 +757,14 @@ async def set_task_lead(task_id: str, body: TaskLeadUpdate, pool=Depends(get_poo
     field and the ``org(action="set_lead")`` tool never clobber
     ``metadata.filer`` or anything else (``PATCH /tasks/{id}`` replaces the
     whole bag). Whether the uid is live and bound to the task is the readers'
-    concern: the shared lead rule ignores a pin that isn't.
+    concern: the shared lead rule ignores a pin that isn't. ``"owner"`` pins
+    Owner as the task's lead (``cm_daemon::org::task_lead``).
     """
     task = await _get_task_or_error(pool, task_id)
     uid = (body.session_uid or "").strip() or None
+    # "owner" (any case) means Owner leads the task; stored in one spelling.
+    if uid is not None and uid.lower() == "owner":
+        uid = "owner"
     updated = await db.set_task_lead(pool, str(task["id"]), uid)
     if not updated:
         raise HTTPException(status_code=404, detail="Task not found")

@@ -13,7 +13,7 @@
 //!   stay), and shows the hidden subtree's rollup.
 //! - The focused group draws a narrow coloured strip at the sidebar's left
 //!   edge (no tint).
-//! - The lead session (see [`lead_session_uid`]) of a task with subtasks
+//! - The lead session (see [`task_lead`]) of a task with subtasks
 //!   carries its level's leader mark ([`leader_glyph`]); leaves carry none.
 //!
 //! Sections still group top-level blocks; a nested block follows its root
@@ -610,8 +610,8 @@ impl App {
         true
     }
 
-    /// The A-e Lead field: the task's live agent sessions as `(uid, label)`
-    /// in spawn order (a pinned session that no longer qualifies is listed
+    /// The A-e Lead field: Owner, then the task's live agent sessions as
+    /// `(uid, label)` in spawn order (a pinned session that no longer qualifies is listed
     /// too, marked, so the form shows it), and the current pin.
     pub(super) fn lead_choices(&self, task_id: &str) -> (Vec<(String, String)>, Option<String>) {
         let pinned = self
@@ -633,6 +633,9 @@ impl App {
                 .cmp(&spawn_order(&b.0))
                 .then_with(|| a.0.cmp(&b.0))
         });
+        // Owner can lead any task (shown first after auto).
+        choices.insert(0, (OWNER_LEAD.to_owned(), "Owner".to_owned()));
+        let pinned = pinned.map(|p| if is_owner_pin(&p) { OWNER_LEAD.to_owned() } else { p });
         if let Some(p) = pinned
             .as_ref()
             .filter(|p| !choices.iter().any(|(u, _)| u == *p))
@@ -759,9 +762,11 @@ impl App {
             .collect()
     }
 
-    /// Lead session of every task with sessions in the sidebar, by the
-    /// shared rule ([`lead_session_uid`]).
-    pub(super) fn task_leads(&self) -> HashMap<String, String> {
+    /// Every task's lead by the shared rule ([`task_lead`]): tasks with
+    /// sessions, division roots (Owner stands in when nobody is live) and
+    /// tasks pinned to Owner. A task's pin comes from its work-list row (which
+    /// A-e updates at once), else from the planning row.
+    pub(crate) fn all_leads(&self) -> HashMap<String, Lead> {
         let mut by_task: HashMap<&str, Vec<LeadCandidate>> = HashMap::new();
         for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
             for ts in &ws.sessions {
@@ -774,19 +779,49 @@ impl App {
                 }
             }
         }
-        let entries: HashMap<&str, &TaskEntry> = self
-            .tasks
-            .iter()
-            .filter_map(|t| Some((t.task_id.as_deref()?, t)))
-            .collect();
-        by_task
+        let mut pins = self.planning.lead_pins();
+        for t in &self.tasks {
+            if let Some(id) = t.task_id.as_ref() {
+                match t.metadata.as_ref().and_then(pinned_lead) {
+                    Some(pin) => pins.insert(id.clone(), pin.to_owned()),
+                    None => pins.remove(id),
+                };
+            }
+        }
+        let roots: HashSet<String> = self
+            .planning
+            .divisions_by_task()
             .into_iter()
-            .filter_map(|(t, candidates)| {
-                let pinned = entries
-                    .get(t)
-                    .and_then(|e| e.metadata.as_ref())
-                    .and_then(pinned_lead);
-                Some((t.to_owned(), lead_session_uid(pinned, &candidates)?))
+            .filter(|(_, d)| d.coordinator)
+            .map(|(t, _)| t)
+            .collect();
+        let mut ids: HashSet<&str> = by_task.keys().copied().collect();
+        ids.extend(roots.iter().map(String::as_str));
+        ids.extend(pins.iter().filter(|(_, p)| is_owner_pin(p)).map(|(t, _)| t.as_str()));
+        ids.into_iter()
+            .map(|t| {
+                let candidates = by_task.get(t).map_or(&[][..], Vec::as_slice);
+                (t.to_owned(), task_lead(pins.get(t).map(String::as_str), candidates, roots.contains(t)))
+            })
+            .filter(|(_, lead)| *lead != Lead::None)
+            .collect()
+    }
+
+    /// Lead session of every task whose lead is a session.
+    pub(super) fn task_leads(&self) -> HashMap<String, String> {
+        self.all_leads()
+            .into_iter()
+            .filter_map(|(t, lead)| Some((t, lead.session()?.to_owned())))
+            .collect()
+    }
+
+    /// Tasks Owner leads, with whether Owner only stands in.
+    pub(crate) fn owner_leads(&self) -> HashMap<String, bool> {
+        self.all_leads()
+            .into_iter()
+            .filter_map(|(t, lead)| match lead {
+                Lead::Owner { stand_in } => Some((t, stand_in)),
+                _ => None,
             })
             .collect()
     }
@@ -1016,7 +1051,8 @@ pub(crate) fn leader_glyph(level: usize) -> &'static str {
 
 // The lead rule is shared with the daemon's `org` tool: one function.
 pub(crate) use cm_daemon::org::{
-    is_agent_engine, lead_session_uid, pinned_lead, spawn_order, LeadCandidate,
+    is_agent_engine, is_owner_pin, pinned_lead, spawn_order, task_lead, Lead,
+    LeadCandidate, OWNER_LEAD,
 };
 
 #[cfg(test)]
@@ -1491,6 +1527,110 @@ mod tree_tests {
         .unwrap()
     }
 
+    fn owner_division_app() -> App {
+        let mut app = org_app();
+        app.planning.update_from_api(vec![
+            division_task("tr", None, true),
+            division_task("tc", Some("tr"), false),
+            division_task("tl", None, false),
+        ]);
+        app
+    }
+
+    /// Owner as leader (2026-10-22): the TUI's leads are the daemon's
+    /// `task_lead` over the same inputs. Explicit Owner, the stand-in for a
+    /// division root only, and a live session overriding the stand-in.
+    #[test]
+    fn owner_leads_match_the_shared_rule() {
+        let mut app = owner_division_app();
+        let rows: HashMap<&str, serde_json::Value> = [
+            ("tr", serde_json::json!({"id": "tr", "initiative": {"kind": "division", "coordinator_task_id": "tr"}})),
+            ("tc", serde_json::json!({"id": "tc", "initiative": {"kind": "division", "coordinator_task_id": "tr"}})),
+            ("tl", serde_json::json!({"id": "tl", "initiative": {"kind": "division", "coordinator_task_id": "tr"}})),
+            ("tg", serde_json::json!({"id": "tg"})),
+        ]
+        .into();
+        let check = |app: &App, why: &str| {
+            let leads = app.all_leads();
+            for (t, row) in &rows {
+                let owned: Vec<(String, String, bool)> = app
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| &w.sessions)
+                    .filter(|s| s.task_id.as_deref() == Some(*t))
+                    .map(|s| (s.uid.clone(), s.session_type.clone(), !s.session.exited))
+                    .collect();
+                let candidates: Vec<LeadCandidate> =
+                    owned.iter().map(|(uid, engine, live)| LeadCandidate { uid, engine, live: *live }).collect();
+                let pin = app.find_task_entry(t).and_then(|e| e.metadata.as_ref()).and_then(pinned_lead).map(str::to_owned);
+                let want = task_lead(pin.as_deref(), &candidates, cm_daemon::org::is_division_root(row));
+                assert_eq!(leads.get(*t).cloned().unwrap_or(Lead::None), want, "{why}: {t}");
+            }
+        };
+        check(&app, "every task has a live session");
+        assert!(app.owner_leads().is_empty());
+        // The root loses its session: Owner stands in; a member doesn't.
+        app.workspaces[0].sessions.retain(|s| s.uid != "ts-10-0");
+        app.workspaces[4].sessions.clear(); // tl
+        check(&app, "root and tl without a session");
+        assert_eq!(app.owner_leads(), HashMap::from([("tr".to_string(), true)]));
+        assert!(!app.all_leads().contains_key("tl"), "a non-root task with no lead has none");
+        // A live session overrides the stand-in again.
+        let pty = crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None).unwrap();
+        let mut ts = super::super::model::make_simple_session_with_uid("ts-30-0".into(), "ts-30-0", "claude", pty, None);
+        ts.task_id = Some("tr".into());
+        ts.session.exited = false;
+        app.workspaces[0].sessions.push(ts);
+        assert_eq!(app.all_leads()["tr"], Lead::Session("ts-30-0".into()));
+        // Explicit Owner on tc: Owner leads even with tc's live session, and
+        // that session loses its ★ (sessions only lead when Owner doesn't).
+        app.set_local_lead_pin("tc", Some("owner".into()));
+        check(&app, "tc pinned to Owner");
+        assert_eq!(app.all_leads()["tc"], Lead::Owner { stand_in: false });
+        assert!(!app.task_leads().contains_key("tc"));
+        assert!(!app.leader_marks(&app.task_tree().org).contains_key("ts-12-0"));
+        assert_eq!(app.leader_marks(&app.task_tree().org).get("ts-30-0"), Some(&"\u{2605}"), "tr's lead keeps its mark");
+    }
+
+    /// The A-e Lead field offers Owner first after auto, and saving it pins
+    /// "owner".
+    #[test]
+    fn the_lead_field_offers_owner() {
+        let mut app = owner_division_app();
+        let (choices, pinned) = app.lead_choices("tc");
+        assert_eq!(choices[0], ("owner".to_string(), "Owner".to_string()));
+        assert_eq!(pinned, None);
+        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tc".into() };
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert!(app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT))));
+        for _ in 0..3 {
+            app.handle_event(&key(KeyCode::Tab));
+        }
+        app.handle_event(&key(KeyCode::Right));
+        let InputMode::TaskSettings { lead, .. } = &app.input_mode else { panic!("open") };
+        assert_eq!(lead.as_deref(), Some("owner"));
+        app.handle_event(&key(KeyCode::Enter));
+        let meta = app.find_task_entry("tc").and_then(|t| t.metadata.as_ref()).unwrap();
+        assert_eq!(pinned_lead(meta), Some("owner"));
+        assert_eq!(app.lead_choices("tc").1.as_deref(), Some("owner"));
+    }
+
+    /// The sidebar: an Owner-led division and task header carry the level's
+    /// mark with ♔.
+    #[test]
+    fn owner_led_headers_carry_the_level_mark_with_the_owner_crown() {
+        let mut app = owner_division_app();
+        app.workspaces[0].sessions.retain(|s| s.uid != "ts-10-0"); // tr: stand-in
+        app.set_local_lead_pin("tc", Some("owner".into()));
+        let buffer = sidebar_buffer(&mut app, 30);
+        let rows: Vec<String> = (0..30u16).map(|y| (0..40u16).map(|x| buffer[(x, y)].symbol().to_string()).collect()).collect();
+        let joined = rows.join("\n");
+        assert!(joined.contains("\u{25c6} \u{2605}\u{2654} Trader"), "division header: {joined}");
+        assert!(rows.iter().any(|r| r.contains("\u{2605}\u{2654} \u{25c6} tr")), "root task header (level 1, coordinator ◆): {joined}");
+        assert!(rows.iter().any(|r| r.contains("\u{2606}\u{2654} tc")), "tc header (level 2): {joined}");
+        assert!(!rows.iter().any(|r| r.contains("\u{2654} tl")), "tl is led by its session: {joined}");
+    }
+
     #[test]
     fn a_division_header_groups_its_top_level_blocks_and_folds() {
         let mut app = org_app();
@@ -1560,8 +1700,8 @@ mod tree_tests {
         let uids: Vec<&str> = lead_choices.iter().map(|(u, _)| u.as_str()).collect();
         assert_eq!(
             uids,
-            ["ts-12-0", "ts-20-0"],
-            "live agents only, in spawn order"
+            ["owner", "ts-12-0", "ts-20-0"],
+            "Owner, then live agents only, in spawn order"
         );
         for _ in 0..3 {
             app.handle_event(&key(KeyCode::Tab));
