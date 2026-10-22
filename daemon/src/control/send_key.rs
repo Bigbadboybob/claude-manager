@@ -9,10 +9,15 @@
 //!   `not_found`, `unauthorized`, `exited`, or `error` for a failed write);
 //!   one bad target never stops the rest. At most [`MAX_TARGETS`] per call.
 //! - The key is encoded for the target's keyboard mode by
-//!   [`crate::keys::key_bytes`] (the mapping the TUI's handler and its own
-//!   keystrokes share). The mode comes from replaying the session's output
-//!   ring; when the ring has been trimmed and shows no kitty mode, an agent
-//!   is assumed to be in kitty mode, as the prompt-delivery path assumes.
+//!   [`crate::keys::key_bytes`] (the mapping Owner's own keystrokes share).
+//!   The mode is the session's tracked kitty state
+//!   ([`crate::keys::KeyboardTracker`], fed by every output chunk and carried
+//!   across brain restarts). When it is unknown (a session adopted from a
+//!   brain that did not persist it, whose output has not set it since), the
+//!   engine default prompt delivery uses applies: kitty for an agent, legacy
+//!   for bash; the result then says `mode: "assumed"`.
+//! - A key is not new work: the write stamps nothing, so it neither
+//!   supersedes a `reported` status nor re-arms watches.
 //! - Lock order: the state lock only to authorize and clone the session's
 //!   input handle, released before the write; the write takes the retirement
 //!   gate, then the writer permit and the session's writer (gate → slot →
@@ -105,38 +110,31 @@ fn send_one(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, key: &str, caller_ui
         }
         (session.input_handle(), session.fanout.clone(), session.session_type != "bash")
     };
-    let mode = keyboard_mode(&fanout, is_agent);
+    let (mode, source) = keyboard_mode(&fanout, is_agent);
     let bytes = match crate::keys::key_bytes(key, mode) {
         Ok(b) => b,
         Err(e) => return outcome(uid, "error", e),
     };
-    if let Err(e) = handle.write_and_stamp(&bytes) {
+    if let Err(e) = handle.write_key(&bytes) {
         return outcome(uid, "error", format!("write to PTY: {e}"));
     }
     json!({
         "session_uid": uid,
         "status": "ok",
         "keyboard": if crate::keys::is_kitty(mode) { "kitty" } else { "legacy" },
+        "mode": source,
     })
 }
 
-/// The target's keyboard mode, from its output ring. A trimmed ring may have
-/// lost the program's mode switch, so an agent whose ring shows no kitty mode
-/// then counts as kitty (the delivery path's default for agents).
-fn keyboard_mode(fanout: &crate::session::PtyByteFanout, is_agent: bool) -> TermMode {
-    let snap = fanout.snapshot_since(None);
-    let mode = observed_mode(&snap.bytes);
-    if is_agent && !crate::keys::is_kitty(mode) && snap.start_offset > 0 {
-        mode | TermMode::DISAMBIGUATE_ESC_CODES
-    } else {
-        mode
+/// The target's keyboard mode and how we know it: `"observed"` from its
+/// tracked state, else `"assumed"` from its engine (kitty for an agent,
+/// as prompt delivery assumes; legacy for bash).
+fn keyboard_mode(fanout: &crate::session::PtyByteFanout, is_agent: bool) -> (TermMode, &'static str) {
+    match fanout.keyboard().0 {
+        Some(mode) => (mode, "observed"),
+        None if is_agent => (TermMode::DISAMBIGUATE_ESC_CODES, "assumed"),
+        None => (TermMode::empty(), "assumed"),
     }
-}
-
-fn observed_mode(ring: &[u8]) -> TermMode {
-    let mut tracker = crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
-    tracker.feed(ring, std::time::Instant::now());
-    tracker.term_mode()
 }
 
 #[cfg(test)]
@@ -211,6 +209,10 @@ mod tests {
             assert_eq!((reply["results"][0]["keyboard"].as_str(), reply["results"][1]["keyboard"].as_str()), (Some("legacy"), Some("kitty")));
         }
         assert_eq!(wait_for(&legacy, 6), b"\x1b[By\x1b\r", "bash: legacy bytes, nothing more");
+        // A key is not new work: no input stamp, so a done report stands.
+        for uid in ["ts-1-0", "ts-2-0"] {
+            assert!(state.lock().unwrap().sessions[uid].last_input_at.lock().unwrap().is_none(), "{uid}");
+        }
         assert_eq!(wait_for(&kitty, 14), b"\x1b[By\x1b[27u\x1b[13u", "codex in kitty mode");
         // Give a stray trailing Enter time to show up: none does.
         std::thread::sleep(Duration::from_millis(300));
@@ -283,11 +285,44 @@ mod tests {
         kill_all(&state);
     }
 
+    /// Review of a41f14d (1): the mode survives a brain restart, a wrapped
+    /// ring never flips a legacy agent to kitty, and an unknown mode is
+    /// assumed from the engine and said so.
     #[test]
-    fn the_ring_decides_the_mode_and_a_trimmed_agent_ring_defaults_to_kitty() {
-        assert!(!crate::keys::is_kitty(observed_mode(b"$ ls\r\n")));
-        // claude/codex push kitty flags with CSI > 1 u; CSI < u pops them.
-        assert!(crate::keys::is_kitty(observed_mode(b"\x1b[>1uhello")));
-        assert!(!crate::keys::is_kitty(observed_mode(b"\x1b[>1uhello\x1b[<u")));
+    fn the_tracked_mode_survives_restarts_and_wrapped_rings() {
+        use crate::session::PtyByteFanout;
+        // A kitty agent whose push scrolled out of a small ring long ago.
+        let live = PtyByteFanout::new(64);
+        live.push(b"\x1b[>1u");
+        for _ in 0..50 {
+            live.push(b"lots of output that wraps the ring ");
+        }
+        assert!(!live.snapshot_since(None).bytes.windows(4).any(|w| w == b"[>1u"), "the push is gone from the ring");
+        assert_eq!(keyboard_mode(&live, true), (TermMode::DISAMBIGUATE_ESC_CODES, "observed"));
+        // Restart: the next brain seeds the tail and the persisted mode.
+        let ring = live.snapshot_since(None).bytes;
+        let (_, saved) = live.keyboard();
+        let adopted = PtyByteFanout::new(64);
+        adopted.seed_adopted(Some(&ring), Some(saved));
+        assert_eq!(keyboard_mode(&adopted, true), (TermMode::DISAMBIGUATE_ESC_CODES, "observed"));
+        // A brain that saved no mode: the tail alone can't tell. Assumed
+        // from the engine, until the program sets its mode again.
+        let old = PtyByteFanout::new(64);
+        old.seed_adopted(Some(&ring), None);
+        assert_eq!(keyboard_mode(&old, true), (TermMode::DISAMBIGUATE_ESC_CODES, "assumed"));
+        assert_eq!(keyboard_mode(&old, false), (TermMode::empty(), "assumed"));
+        old.push(b"\x1b[<u\x1b[=0;1u");
+        assert_eq!(keyboard_mode(&old, true), (TermMode::empty(), "observed"));
+        // A legacy agent (claude without kitty) whose ring wrapped stays legacy.
+        let plain = PtyByteFanout::new(64);
+        for _ in 0..50 {
+            plain.push(b"claude output with no keyboard push ");
+        }
+        assert_eq!(keyboard_mode(&plain, true), (TermMode::empty(), "observed"));
+        // A push split across two pushes is still seen.
+        let split = PtyByteFanout::new(64);
+        split.push(b"abc\x1b[>");
+        split.push(b"1u");
+        assert_eq!(keyboard_mode(&split, true).0, TermMode::DISAMBIGUATE_ESC_CODES);
     }
 }

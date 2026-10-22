@@ -1911,10 +1911,13 @@ pub fn adopt_at_boot(
         // Seed BEFORE arm: the fanout has no reader yet, so the
         // carried tail lands ahead of the kernel-buffered bytes the
         // new reader is about to drain.
-        if let Some(ring) = crate::fanout_persist::take_ring(&rings_dir, &rec.uid) {
-            build.seed_replay(&ring);
+        // The keyboard mode comes with it (send_key encodes by it).
+        let ring = crate::fanout_persist::take_ring(&rings_dir, &rec.uid);
+        let keyboard = crate::fanout_persist::take_keyboard(&rings_dir, &rec.uid);
+        if ring.is_some() {
             seeded += 1;
         }
+        build.seed_adopted(ring.as_deref(), keyboard);
         let pending = HolderPending {
             build: Some(build),
             uid: rec.uid.clone(),

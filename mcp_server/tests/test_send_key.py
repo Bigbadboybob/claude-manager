@@ -69,6 +69,7 @@ class SendKeyToolTests(unittest.TestCase):
         doc = inspect.getdoc(send_key)
         self.assertIn("exactly ONE key", doc)
         self.assertIn("no Enter after it", doc)
+        self.assertIn("A key is not new work", doc)
         for name in ["enter", "escape", "tab", "shift-tab", "up", "down", "left", "right", "home", "end",
                      "pageup", "pagedown", "backspace", "delete", "space", "ctrl-c", "ctrl-d"]:
             self.assertIn(name, doc)

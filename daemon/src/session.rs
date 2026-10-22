@@ -178,6 +178,11 @@ struct FanoutInner {
     /// only comparable within one stream: a respawn or a brain restart
     /// builds a new fanout, whose offsets restart.
     stream_id: u64,
+    /// The program's kitty keyboard mode, followed as output passes
+    /// through `push` (used to encode `send_key`). A fresh fanout has seen
+    /// every byte; an adopted one restores the mode its previous brain
+    /// persisted ([`PtyByteFanout::seed_adopted`]).
+    keyboard: crate::keys::KeyboardTracker,
 }
 
 /// What [`PtyByteFanout::subscribe_output_for`] queued for a viewer.
@@ -234,9 +239,39 @@ impl PtyByteFanout {
                 closed: false,
                 bytes_written: 0,
                 stream_id: new_stream_id(),
+                keyboard: crate::keys::KeyboardTracker::fresh(),
             }),
             last_activity_at,
         }
+    }
+
+    /// Seed an adopted session's fanout: its keyboard mode, then its replay
+    /// tail. The mode the previous brain persisted wins; without one, the
+    /// tail is scanned from an unknown start (it rarely holds the program's
+    /// startup push, so the mode usually stays unknown until the program
+    /// sets it again). Before any reader thread exists, like `seed_replay`.
+    pub fn seed_adopted(&self, ring: Option<&[u8]>, keyboard: Option<crate::keys::KeyboardSnapshot>) {
+        let tracker = match keyboard {
+            Some(saved) => crate::keys::KeyboardTracker::restored(saved),
+            None => {
+                let mut t = crate::keys::KeyboardTracker::unknown();
+                if let Some(ring) = ring {
+                    t.feed(ring);
+                }
+                t
+            }
+        };
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).keyboard = tracker;
+        if let Some(ring) = ring {
+            self.seed_replay(ring);
+        }
+    }
+
+    /// The program's keyboard mode now (None = unknown) and the state to
+    /// persist across a brain restart.
+    pub fn keyboard(&self) -> (Option<alacritty_terminal::term::TermMode>, crate::keys::KeyboardSnapshot) {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        (inner.keyboard.mode(), inner.keyboard.snapshot())
     }
 
     /// Seed the ring with a replay tail carried over from a previous
@@ -315,6 +350,7 @@ impl PtyByteFanout {
         // `snapshot_since` uses this to detect cursors that point
         // at evicted data.
         inner.bytes_written = inner.bytes_written.saturating_add(bytes.len() as u64);
+        inner.keyboard.feed(bytes);
 
         // Broadcast the *whole* incoming chunk (not the ring) to live
         // subscribers. `retain` drops senders whose receiver has been
@@ -2455,6 +2491,12 @@ impl AdoptedSessionBuild {
         self.fanout.seed_replay(bytes);
     }
 
+    /// Seed the adopted fanout's keyboard mode and replay tail; see
+    /// [`PtyByteFanout::seed_adopted`]. Safe before `arm` only.
+    pub fn seed_adopted(&self, ring: Option<&[u8]>, keyboard: Option<crate::keys::KeyboardSnapshot>) {
+        self.fanout.seed_adopted(ring, keyboard);
+    }
+
     /// The ARM stage: start the two threads and produce the armed
     /// `DaemonSession`. **This is the moment kill-on-drop semantics
     /// BEGIN**, deliberately: a session that made it through the
@@ -2934,6 +2976,20 @@ impl InputHandle {
             stamp_now(&self.last_input_at);
         }
         Ok(())
+    }
+
+    /// Write one `send_key` key. Same gate, permit and writer as
+    /// [`write_and_stamp`](Self::write_and_stamp), but it stamps nothing:
+    /// a key is not new work, so it neither supersedes the agent's done
+    /// report (`last_input_at`) nor re-arms watches, nor counts as typing.
+    pub fn write_key(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let _permit = crate::writer_gate::write_permit();
+        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        w.write_all(bytes)?;
+        w.flush()
     }
 
     /// A recovery Enter must not touch a draft typed since the agent paste.

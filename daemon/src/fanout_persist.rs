@@ -52,6 +52,12 @@ fn ring_path(dir: &Path, uid: &str) -> PathBuf {
     dir.join(format!("{uid}.bin"))
 }
 
+/// The session's kitty keyboard mode (`crate::keys::KeyboardSnapshot`),
+/// beside its ring: the next brain cannot rebuild it from the ring's tail.
+fn keyboard_path(dir: &Path, uid: &str) -> PathBuf {
+    dir.join(format!("{uid}.kbd.json"))
+}
+
 /// Snapshot every live session's ring into `dir`, replacing whatever
 /// the directory held (a previous generation's leftovers are stale by
 /// definition). Returns the number of rings written; per-file
@@ -72,6 +78,16 @@ pub fn save_rings(st: &DaemonState, dir: &Path) -> std::io::Result<usize> {
     sweep(dir);
     let mut written = 0usize;
     for (uid, sess) in &st.sessions {
+        // The keyboard mode first, even for an empty ring.
+        let (_, keyboard) = sess.fanout.keyboard();
+        if let Ok(json) = serde_json::to_vec(&keyboard) {
+            let path = keyboard_path(dir, uid);
+            let tmp = dir.join(format!("{uid}.kbd.json.tmp"));
+            if let Err(e) = write_private(&tmp, &json).and_then(|()| std::fs::rename(&tmp, &path)) {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("cm-daemon: keyboard mode for session '{uid}' not persisted ({e}) — send_key will assume it");
+            }
+        }
         let bytes = sess.fanout.snapshot_since(None).bytes;
         if bytes.is_empty() {
             continue;
@@ -126,6 +142,14 @@ pub fn take_ring(dir: &Path, uid: &str) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
+/// Read and unlink the persisted keyboard mode for `uid`, if any.
+pub fn take_keyboard(dir: &Path, uid: &str) -> Option<crate::keys::KeyboardSnapshot> {
+    let path = keyboard_path(dir, uid);
+    let bytes = std::fs::read(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Remove every file in `dir` (missing dir is fine). Used after
 /// adoption so a ring for a session this generation did not adopt
 /// can never be replayed later, and before a save to drop leftovers.
@@ -144,6 +168,18 @@ pub fn sweep(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keyboard mode rides beside the ring and is taken once.
+    #[test]
+    fn keyboard_mode_round_trips_and_is_taken_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = crate::keys::KeyboardSnapshot { stack: vec![1], floor_unknown: false };
+        std::fs::write(keyboard_path(dir.path(), "s1"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(take_keyboard(dir.path(), "s1"), Some(saved));
+        assert_eq!(take_keyboard(dir.path(), "s1"), None, "consumed");
+        std::fs::write(keyboard_path(dir.path(), "bad"), b"{not json").unwrap();
+        assert_eq!(take_keyboard(dir.path(), "bad"), None);
+    }
 
     #[test]
     fn take_is_destructive_and_absent_is_none() {

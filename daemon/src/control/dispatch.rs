@@ -4971,6 +4971,38 @@ mod tests {
         );
     }
 
+    /// Review of a41f14d (4): both send_key method names route through the
+    /// dispatcher with a Session caller; an out-of-scope target is refused
+    /// on its own, the caller's own session still gets the key.
+    #[test]
+    fn send_key_routes_with_a_session_caller_and_refuses_out_of_scope_targets() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-1");
+        add_session(&state, "ts-target", "ws-2");
+        for method in ["send_key", "session.send_key"] {
+            let resp = dispatch_request(
+                &state,
+                &session_request(
+                    method,
+                    serde_json::json!({ "session_uids": ["ts-caller", "ts-target"], "key": "escape" }),
+                    "ts-caller",
+                ),
+            )
+            .into_response();
+            assert!(resp.ok, "{method}: {:?}", resp.error);
+            let result = resp.result.expect("result");
+            let statuses: Vec<&str> = result["results"].as_array().unwrap().iter().map(|r| r["status"].as_str().unwrap()).collect();
+            assert_eq!(statuses, ["ok", "unauthorized"], "{method}: {result}");
+            assert_eq!(result["sent"], 1);
+        }
+        // A caller the daemon doesn't know is refused outright.
+        let resp = dispatch_request(
+            &state,
+            &session_request("session.send_key", serde_json::json!({ "session_uids": "ts-target", "key": "enter" }), "ts-ghost"),
+        )
+        .into_response();
+        assert_eq!(resp.error.expect("error").code, ErrorCode::Unauthorized);
+    }
+
     #[test]
     fn send_input_operator_caller_routes_to_methods_layer() {
         let state = state_with_session("ts-live");

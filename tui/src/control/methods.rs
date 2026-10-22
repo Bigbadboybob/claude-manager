@@ -821,11 +821,14 @@ struct SendKeyParams {
 }
 
 /// Press exactly one key (no body, no Enter) in each target session: the
-/// TUI twin of the daemon's `session.send_key` (daemon/src/control/send_key.rs),
-/// with `send_input`'s scope. Each target gets its own result (`ok`,
-/// `not_found`, `unauthorized`, `exited`, `error`); one bad target never stops
-/// the rest. The key is encoded by the shared `cm_daemon::keys::key_bytes`
-/// for the keyboard mode of the session's own terminal.
+/// TUI-socket route of `send_key`, with `send_input`'s scope. Scope and
+/// liveness are checked here; the allowed targets are then forwarded, per
+/// host, to that daemon's `session.send_key` (operator), which encodes the
+/// key for the session's tracked keyboard mode and writes it without
+/// stamping input. Writing through the attach stream instead would count an
+/// Enter as Owner submitting. Each target gets its own result (`ok`,
+/// `not_found`, `unauthorized`, `exited`, `error`); one bad target or host
+/// never stops the rest.
 pub fn send_key(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
     use cm_daemon::control::send_key::MAX_TARGETS;
     let p: SendKeyParams = serde_json::from_value(params.clone())
@@ -852,43 +855,65 @@ pub fn send_key(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult
     }
     let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
     let outcome = |uid: &str, status: &str, message: String| json!({"session_uid": uid, "status": status, "message": message});
-    let mut results = Vec::new();
+    let mut results: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    // host → [(our uid, the daemon's uid)]
+    let mut by_host: Vec<(cm_daemon::host_id::HostId, Vec<(String, String)>)> = Vec::new();
     for uid in &uids {
         let Some((wi, si)) = find_live_session(&app.workspaces, uid) else {
-            results.push(if find_tombstone(&app.workspaces, uid).is_some() {
+            let r = if find_tombstone(&app.workspaces, uid).is_some() {
                 outcome(uid, "exited", missing_session_message(&app.workspaces, uid))
             } else {
                 outcome(uid, "not_found", format!("session '{uid}' not found"))
-            });
+            };
+            results.insert(uid.clone(), r);
             continue;
         };
         let target_task = app.workspaces[wi].sessions[si].task_id.clone();
         if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
-            results.push(outcome(uid, "unauthorized", "session is outside the caller's scope".into()));
+            results.insert(uid.clone(), outcome(uid, "unauthorized", "session is outside the caller's scope".into()));
             continue;
         }
-        let ts = &mut app.workspaces[wi].sessions[si];
+        let ts = &app.workspaces[wi].sessions[si];
         if session_runtime_state(ts).kind == RuntimeStateKind::Exited {
-            results.push(outcome(uid, "exited", format!("session '{uid}' has exited; PTY no longer writable")));
+            results.insert(uid.clone(), outcome(uid, "exited", format!("session '{uid}' has exited; PTY no longer writable")));
             continue;
         }
-        let mode = *ts.session.term.lock().mode();
-        let bytes = match cm_daemon::keys::key_bytes(&p.key, mode) {
-            Ok(b) => b,
-            Err(e) => {
-                results.push(outcome(uid, "error", e));
-                continue;
-            }
+        let Some(daemon_uid) = ts.session.daemon_session_uid.clone() else {
+            results.insert(uid.clone(), outcome(uid, "error", "session is not attached to a daemon".into()));
+            continue;
         };
-        results.push(match ts.session.write(&bytes) {
-            Ok(()) => json!({
-                "session_uid": uid,
-                "status": "ok",
-                "keyboard": if cm_daemon::keys::is_kitty(mode) { "kitty" } else { "legacy" },
-            }),
-            Err(e) => outcome(uid, "error", format!("write to PTY: {e}")),
-        });
+        match by_host.iter_mut().find(|(h, _)| *h == ts.host_id) {
+            Some((_, v)) => v.push((uid.clone(), daemon_uid)),
+            None => by_host.push((ts.host_id.clone(), vec![(uid.clone(), daemon_uid)])),
+        }
     }
+    for (host, targets) in by_host {
+        let daemon_uids: Vec<String> = targets.iter().map(|(_, d)| d.clone()).collect();
+        let reply = app
+            .host_pool
+            .for_host(&host)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .and_then(|h| h.socket_path().ok_or_else(|| anyhow::anyhow!("no live socket for host {}", host.as_str())))
+            .and_then(|socket| {
+                crate::client_session::rpc_send_key(&socket, &app.host_pool.operator_token_for(&host), &daemon_uids, &p.key)
+            });
+        for (uid, daemon_uid) in targets {
+            let r = match &reply {
+                Ok(v) => v["results"]
+                    .as_array()
+                    .and_then(|rs| rs.iter().find(|r| r["session_uid"] == daemon_uid.as_str()))
+                    .map(|r| {
+                        let mut r = r.clone();
+                        r["session_uid"] = json!(uid);
+                        r
+                    })
+                    .unwrap_or_else(|| outcome(&uid, "error", "no result from the host daemon".into())),
+                Err(e) => outcome(&uid, "error", format!("host {}: {e:#}", host.as_str())),
+            };
+            results.insert(uid, r);
+        }
+    }
+    let results: Vec<Value> = uids.iter().filter_map(|u| results.remove(u)).collect();
     let sent = results.iter().filter(|r| r["status"] == "ok").count();
     Ok(json!({"key": p.key, "sent": sent, "results": results}))
 }

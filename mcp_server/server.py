@@ -2402,12 +2402,18 @@ async def send_key(
             right, home, end, pageup, pagedown, backspace, delete, space,
             ctrl-c, ctrl-d — or any single printable character (`1`, `y`).
             It is encoded for each session's keyboard mode (kitty or
-            legacy), the bytes a real keypress would send.
+            legacy), the bytes a real keypress would send. Each result
+            says the `keyboard` used and its `mode`: "observed" (tracked
+            from the session's output) or "assumed" (unknown after a
+            restart; the engine's default is used).
         notify_on_done: Register an async monitor on the sessions that got
             the key, waking you when they finish the turn it starts (all of
             them, when there are several). Default false: a key often
             starts no turn at all (menu navigation).
         notify_until: "turn_end" (default) or "final"; see `monitor_sessions`.
+
+    A key is not new work: it does not supersede a session's `reported`
+    status (`report_done`) and does not re-arm watches on it.
 
     Scope is send_input's: your own task's sessions and its descendants
     (any session with global permissions). Every session gets its own
