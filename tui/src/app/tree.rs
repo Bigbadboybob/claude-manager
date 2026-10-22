@@ -764,8 +764,9 @@ impl App {
 
     /// Every task's lead by the shared rule ([`task_lead`]): tasks with
     /// sessions, division roots (Owner stands in when nobody is live) and
-    /// tasks pinned to Owner. A task's pin comes from its work-list row (which
-    /// A-e updates at once), else from the planning row.
+    /// tasks pinned to Owner. A task's pin comes from its work-list row's
+    /// metadata (which A-e updates at once) when that is loaded, else from
+    /// the planning row.
     pub(crate) fn all_leads(&self) -> HashMap<String, Lead> {
         let mut by_task: HashMap<&str, Vec<LeadCandidate>> = HashMap::new();
         for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
@@ -780,9 +781,11 @@ impl App {
             }
         }
         let mut pins = self.planning.lead_pins();
+        // A work-list row's metadata (which A-e updates at once) wins; a row
+        // without metadata (not loaded) leaves the planning row's pin.
         for t in &self.tasks {
-            if let Some(id) = t.task_id.as_ref() {
-                match t.metadata.as_ref().and_then(pinned_lead) {
+            if let (Some(id), Some(meta)) = (t.task_id.as_ref(), t.metadata.as_ref()) {
+                match pinned_lead(meta) {
                     Some(pin) => pins.insert(id.clone(), pin.to_owned()),
                     None => pins.remove(id),
                 };
@@ -1590,6 +1593,21 @@ mod tree_tests {
         assert!(!app.task_leads().contains_key("tc"));
         assert!(!app.leader_marks(&app.task_tree().org).contains_key("ts-12-0"));
         assert_eq!(app.leader_marks(&app.task_tree().org).get("ts-30-0"), Some(&"\u{2605}"), "tr's lead keeps its mark");
+    }
+
+    /// Review of 3c8d674: a work-list row without metadata doesn't hide the
+    /// planning row's Owner pin.
+    #[test]
+    fn a_planning_pin_shows_when_the_work_list_row_has_no_metadata() {
+        let mut app = org_app();
+        let mut pinned = division_task("tc", Some("tr"), false);
+        pinned.metadata = Some(serde_json::json!({"lead_session_uid": "owner"}));
+        app.planning.update_from_api(vec![division_task("tr", None, true), pinned]);
+        assert!(app.find_task_entry("tc").unwrap().metadata.is_none());
+        assert_eq!(app.all_leads()["tc"], Lead::Owner { stand_in: false });
+        // Loaded work-list metadata wins, both ways.
+        app.set_local_lead_pin("tc", None);
+        assert_eq!(app.all_leads()["tc"], Lead::Session("ts-12-0".into()));
     }
 
     /// The A-e Lead field offers Owner first after auto, and saving it pins

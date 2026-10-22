@@ -31,7 +31,8 @@ the chart's focused session selected.
 - **Owner as leader.** A task pinned to `"owner"` (A-e Lead, or an
   orchestrator's `org(action="set_lead", session_uid="owner")`) is led by
   Owner, and a division root with no live lead has Owner as stand-in. Such a
-  box opens its title with ♔, and a division box says "Owner (stand-in)" or
+  box opens its title with ♔ (who may set or clear an Owner pin: see Known
+  limits), and a division box says "Owner (stand-in)" or
   "Owner" at the top; the info pane's `lead` line names it. Sessions under it
   keep their own leads and marks. The Sessions sidebar shows the same on task
   and division headers: the level's leader mark with ♔ (`★♔`). One rule
@@ -146,6 +147,15 @@ flight at a time, and only while the chart is open.
 
 For Owner, an org or a division, the pane shows the box's kind, its boss, its
 number of reports and how many sessions are under it.
+
+## Known limits
+
+- An Owner pin is set, cleared or overridden only by Owner (A-e) or an
+  orchestrator: a session with global permissions, or one whose task sits
+  above the target in its `parent_task_id` chain (at most 32 steps, stopping
+  at a loop). A metadata PATCH can't touch the pin; it is kept as stored. But
+  an agent can still re-parent a task under its own with `parent_task_id`
+  (`update_task`) and so become "above" it; that gap is tracked separately.
 
 ## Code
 

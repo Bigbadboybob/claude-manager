@@ -771,6 +771,38 @@ async def set_task_lead(task_id: str, body: TaskLeadUpdate, pool=Depends(get_poo
     return updated
 
 
+LEAD_PIN_KEY = "lead_session_uid"
+
+
+def _keep_lead_pin(task: dict, new_metadata: dict | None) -> dict | None:
+    """A metadata PATCH replaces the whole bag, but never the lead pin:
+    ``metadata.lead_session_uid`` changes only through ``POST /tasks/{id}/lead``
+    (the A-e Lead field, ``org(action="set_lead")``), which enforces who may
+    set or clear an Owner pin. The stored pin is carried into the new bag; a
+    bag naming a different pin is refused. Re-sending the same pin is fine.
+    """
+    old = task.get("metadata") or {}
+    if isinstance(old, str):
+        try:
+            old = json.loads(old) or {}
+        except ValueError:
+            old = {}
+    pin = old.get(LEAD_PIN_KEY) if isinstance(old, dict) else None
+    if new_metadata is not None and LEAD_PIN_KEY in new_metadata and new_metadata[LEAD_PIN_KEY] != pin:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "metadata.lead_session_uid can't be set through PATCH; use "
+                "POST /tasks/{id}/lead (org(action=\"set_lead\") for agents, A-e Lead for Owner)"
+            ),
+        )
+    if pin is None:
+        return new_metadata
+    merged = dict(new_metadata or {})
+    merged[LEAD_PIN_KEY] = pin
+    return merged
+
+
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     task = await _get_task_or_error(pool, task_id)
@@ -796,6 +828,9 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
 
     if not fields:
         return task
+
+    if "metadata" in fields:
+        fields["metadata"] = _keep_lead_pin(task, fields["metadata"])
 
     # Reparenting inherits the new parent's initiative (and project, if the
     # task has none), mirroring create_task. Without this, moving a standalone
