@@ -17772,6 +17772,38 @@ pub fn org(
     }
 }
 
+/// Whether `caller` may make Owner the lead of `target`, or undo that: a
+/// session with global permissions, or one whose task is strictly above
+/// `target` (its parent chain, walked at most [`ORG_CHAIN_MAX`] steps and
+/// stopping at a loop). The operator is checked by the callers.
+fn org_owner_authority(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    creds: &PlanningApiCreds,
+    caller: &str,
+    caller_task: Option<&str>,
+    target: &str,
+) -> bool {
+    let global = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.sessions.get(caller).is_some_and(|s| s.global_perms)
+    };
+    if global {
+        return true;
+    }
+    let Some(own) = caller_task else { return false };
+    let mut seen = std::collections::HashSet::from([target.to_string()]);
+    let mut cur = target.to_string();
+    for _ in 0..ORG_CHAIN_MAX {
+        let Ok(row) = api_get_task(creds, &cur) else { return false };
+        match row.get("parent_task_id").and_then(Value::as_str) {
+            Some(parent) if parent == own => return true,
+            Some(parent) if seen.insert(parent.to_string()) => cur = parent.to_string(),
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// `org(action="set_lead" | "clear_lead")`: only on the caller's own task,
 /// and only naming a live agent session bound to it on this host.
 ///
@@ -17799,24 +17831,7 @@ fn org_set_lead(
                     "org: an agent can't make Owner the lead of its own task; ask your orchestrator or Owner".into(),
                 ));
             }
-            let global = {
-                let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                state.sessions.get(caller).is_some_and(|s| s.global_perms)
-            };
-            let ancestor = !global
-                && caller_task.as_deref().is_some_and(|own| {
-                    let mut cur = target.clone();
-                    for _ in 0..ORG_CHAIN_MAX {
-                        let Ok(row) = api_get_task(creds, &cur) else { return false };
-                        match row.get("parent_task_id").and_then(Value::as_str) {
-                            Some(parent) if parent == own => return true,
-                            Some(parent) => cur = parent.to_string(),
-                            None => return false,
-                        }
-                    }
-                    false
-                });
-            if !global && !ancestor {
+            if !org_owner_authority(state_arc, creds, caller, caller_task.as_deref(), &target) {
                 return Err((
                     ErrorCode::Unauthorized,
                     format!(
@@ -17843,6 +17858,17 @@ fn org_set_lead(
                 format!("org: set_lead only changes your own task ({}), not {}", own, t),
             ));
         }
+    }
+    // An Owner pin is changed (cleared or overridden by a session) only by
+    // whoever may set one: never by a worker on its own task.
+    let row = api_get_task(creds, &own).map_err(|e| e.to_method_err())?;
+    if row.get("metadata").and_then(crate::org::pinned_lead).is_some_and(crate::org::is_owner_pin)
+        && !org_owner_authority(state_arc, creds, caller, Some(own.as_str()), &own)
+    {
+        return Err((
+            ErrorCode::Unauthorized,
+            "org: Owner leads your task; only Owner or an orchestrator can change that".into(),
+        ));
     }
     let uid = if action == "clear_lead" {
         None
@@ -35705,6 +35731,61 @@ while True:
         assert_eq!(posts.len(), 3);
         assert_eq!(serde_json::from_str::<Value>(&posts[0].body).unwrap(), json!({"session_uid": "owner"}));
         drop(requests);
+        kill_all_sessions(&state);
+    }
+
+    /// Review of 3c8d674: a worker can't clear or override an Owner pin on
+    /// its own task; the "above the target" walk stops at a loop and at the
+    /// chain limit; the division leader is right when the root isn't listed.
+    #[test]
+    fn owner_pins_resist_workers_and_the_authority_walk_is_bounded() {
+        let state = make_state_arc();
+        let stub = spawn_routed_stub(move |method, path, _body| match (method, path) {
+            // The worker's own task is pinned to Owner.
+            ("GET", "/tasks/task-me") => (200, r#"{"id":"task-me","name":"me","parent_task_id":null,
+                "metadata":{"lead_session_uid":"owner"}}"#.to_string()),
+            // loop-a → loop-b → loop-a: never reaches task-me.
+            ("GET", "/tasks/loop-a") => (200, r#"{"id":"loop-a","parent_task_id":"loop-b"}"#.to_string()),
+            ("GET", "/tasks/loop-b") => (200, r#"{"id":"loop-b","parent_task_id":"loop-a"}"#.to_string()),
+            // deep-0 → deep-1 → … → deep-40 → task-me: 41 steps up.
+            ("GET", p) if p.starts_with("/tasks/deep-") => {
+                let n: usize = p.trim_start_matches("/tasks/deep-").parse().unwrap();
+                let parent = if n == 40 { "task-me".to_string() } else { format!("deep-{}", n + 1) };
+                (200, format!(r#"{{"id":"deep-{n}","parent_task_id":"{parent}"}}"#))
+            }
+            ("GET", "/initiatives/pt-misc") => (200, r#"{"id":"div-1","slug":"pt-misc","name":"PT misc",
+                "kind":"division","coordinator_task_id":"task-root"}"#.to_string()),
+            // The list holds only a member, not the root.
+            ("GET", p) if p.starts_with("/tasks?") => (200, r#"[{"id":"task-m","name":"m","parent_task_id":"task-root"}]"#.to_string()),
+            ("POST", p) if p.ends_with("/lead") => (200, r#"{"id":"x","metadata":{}}"#.to_string()),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "test-token".to_string();
+        }
+        seed_tasked_caller(&state, "ts-10-0", "ws-me", "task-me");
+        state.lock().unwrap().sessions.get_mut("ts-10-0").unwrap().session_type = "codex".to_string();
+        let call = |params: Value| org(&state, &params, Some("ts-10-0"));
+
+        // Clearing, or overriding with your own session, is refused.
+        assert_eq!(call(json!({"action": "clear_lead"})).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(call(json!({"action": "set_lead"})).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(call(json!({"action": "set_lead", "session_uid": "ts-10-0"})).unwrap_err().0, ErrorCode::Unauthorized);
+        // A loop and an over-long chain never make you "above".
+        assert_eq!(call(json!({"action": "set_lead", "session_uid": "owner", "task_id": "loop-a"})).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(call(json!({"action": "set_lead", "session_uid": "owner", "task_id": "deep-0"})).unwrap_err().0, ErrorCode::Unauthorized);
+        assert!(stub.requests.lock().unwrap().iter().all(|r| r.method == "GET"), "nothing written");
+        // Within the limit it is: deep-20 is 21 steps below task-me.
+        call(json!({"action": "set_lead", "session_uid": "owner", "task_id": "deep-20"})).expect("within the limit");
+        // A global caller may clear the Owner pin on its own task.
+        state.lock().unwrap().sessions.get_mut("ts-10-0").unwrap().global_perms = true;
+        call(json!({"action": "clear_lead"})).expect("global clears");
+
+        // The division's leader, with the root missing from the list.
+        let division = call(json!({"view": "division", "division": "pt-misc"})).expect("division");
+        assert_eq!(division["division"]["leader"], json!({"owner": true, "stand_in": true}));
         kill_all_sessions(&state);
     }
 

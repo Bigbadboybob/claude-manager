@@ -1433,12 +1433,19 @@ def update_task(
         metadata: Free-form JSONB bag for skill/agent attachments. PATCH
             REPLACES the whole object — read the existing `metadata` via
             `get_current_task` (or `get_task`) first and re-send the
-            merged dict if you want to preserve other keys. The
+            merged dict if you want to preserve other keys. The one
+            exception is `lead_session_uid` (the task's lead): leave it out,
+            it is kept as stored; change it with `org(action="set_lead")`. The
             design-doc skills nest under a `resume` key
             (`metadata.resume.design_doc_path`,
             `metadata.resume.designer_session_uid`); other skills should
             namespace their own keys here rather than churn the schema.
     """
+    if metadata is not None and "lead_session_uid" in metadata:
+        raise ValueError(
+            "update_task can't set metadata.lead_session_uid (the task's lead); "
+            'use org(action="set_lead") — leave the key out and the stored lead is kept'
+        )
     fields: dict = {
         k: v for k, v in {
             "name": name,

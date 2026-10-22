@@ -202,7 +202,7 @@ such as `pt-misc` and `cm-misc` have no session on their root, so Owner leads
 them). `org()` then reports your `boss_lead` as `{"owner": true, "stand_in":
 ...}`: in an Owner-led division, Owner is your boss, so escalate to Owner
 (`notify_user`, or the channel Owner reads) rather than looking for a lead
-session. Only an orchestrator can make Owner a task's lead
+session. Only an orchestrator can make Owner a task's lead, or undo it
 (`org(action="set_lead", session_uid="owner", task_id=...)` on a task below
 its own, or with global permissions), and never on its own task; Owner does it
 from A-e.
