@@ -192,6 +192,10 @@ at the next TUI launch. A missing setting defaults to 2×:
 sidebar_tint_strength = 2.0
 ```
 
+The second row, **Activity badges**, is a checkbox (Space or ←/→ toggles it,
+↑/↓ moves between rows); it previews live and saves with the tint as
+`activity_badges = true|false` (default on).
+
 Invalid settings fall back to 2× and show an error in Global Settings. A malformed
 TOML file is preserved rather than overwritten on save; fix it before saving.
 Other settings keys are preserved when saving (TOML comments/formatting are not).
@@ -205,6 +209,37 @@ set `background-opacity-cells = true` to apply your existing
 `background-opacity` to colored cells as well. This affects all explicit cell
 backgrounds in the terminal, including other applications.
 
+### Activity badge
+
+Each live agent row ends with a short, right-aligned badge saying what the
+agent is doing right now. The F6 org chart cards show the same badge, and the
+F6 info pane's `doing` line spells it out in full (`waiting on permission:
+Bash for 1m`, `rate limited (usageLimitExceeded), resumes in 12m`).
+
+| Badge | Meaning |
+|---|---|
+| `⚙ 3m`, `⚙ 3m +2 bg` | working on its turn for 3 minutes (with two background jobs) |
+| `⧗ cargo test`, `⧗ 2 bg` | turn over, background jobs still running: the job's label, or how many |
+| `☛ Bash`, `☛ permission`, `☛ question` | waiting on a human: the tool asking permission, else what it waits for |
+| `⚠ rate limit 12m` | stopped on a rate or usage limit (Claude `rate_limit`, Codex `usageLimitExceeded`, quota/429), with the time until it resumes when known. Drawn reversed and bold so sessions that need waking stand out |
+| `✕ server error` | stopped on another error, by its `error_kind` |
+| `↻ retrying` | the engine is retrying a failed request |
+| `⏱ stalled 6m` | working, but no progress for 6 minutes |
+
+Idle, starting, unknown and exited sessions have no badge; their state glyph
+says enough. Rows that already carry a status (hidden, owner-blocked, revive
+failed) show none either. The badge takes the room the label doesn't need;
+the label keeps at least 8 cells, and a longer badge is cut with `…`.
+
+The badge reads only the daemon's `agent_state` (doc/SESSION_STATE.md),
+which the TUI already receives on `manifest.watch`; it adds no polling. The
+engines do not report the tool a working session is running (`open_tool` is
+filled only while a permission prompt is open), so a working badge shows how
+long the turn has run rather than the current tool. The marks live in
+`symbols::doing` (`tui/src/app/symbols.rs`), the label choice in
+`agent_state::badge`. Turn badges off with the second row of F9 Global
+Settings; the info pane keeps its `doing` line either way.
+
 ### Cursor and keys
 
 New `Cursor::Section(String)`. It is selectable; `active_workspace_index`, `active_session`, `cursor_task_id` return `None` for it, so task/session actions no-op with a status hint.
@@ -213,7 +248,7 @@ New `Cursor::Section(String)`. It is selectable; `active_workspace_index`, `acti
 |---|---|---|
 | `A-N` | new section | new section |
 | `A-e` | Section settings: name, color | Workspace/Task settings gain a **Section** field (←/→ cycles none + sections) |
-| `F9` | Global Settings: section tint strength | Applies across projects; live preview and persistent save |
+| `F9` | Global Settings: section tint strength, activity badges | Applies across projects; live preview and persistent save |
 | `A-x` | delete section (confirm; workspaces become loose) | unchanged |
 | `Space` / `Enter` | fold / unfold | unchanged |
 | `A-J` / `A-K` | move section down / up | unchanged |

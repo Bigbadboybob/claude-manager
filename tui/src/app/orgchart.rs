@@ -514,6 +514,16 @@ fn spawn_key(uid: &str) -> (u8, u128, u64, String) {
     }
 }
 
+/// `?`, second line: the activity badge's marks (`symbols::activity_legend`).
+fn orgchart_activity_legend_line() -> Line<'static> {
+    let mut spans = Vec::new();
+    for (sym, style, word) in symbols::activity_legend() {
+        spans.push(Span::styled(sym, style));
+        spans.push(Span::styled(format!(" {word}  "), Style::default().fg(theme::MUTED)));
+    }
+    Line::from(spans)
+}
+
 /// `?`: every symbol on the chart with its meaning, from `symbols::legend`.
 fn orgchart_legend_line() -> Line<'static> {
     let mut spans = Vec::new();
@@ -1425,11 +1435,11 @@ impl App {
             return;
         }
         let status_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-        let legend_rows = u16::from(self.orgchart.legend && inner.height > 4);
+        let legend_rows = if self.orgchart.legend && inner.height > 5 { 2 } else { 0 };
         let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1 - legend_rows);
-        if legend_rows == 1 {
-            let legend_area = Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1);
-            frame.render_widget(Paragraph::new(orgchart_legend_line()), legend_area);
+        if legend_rows == 2 {
+            let legend_area = Rect::new(inner.x, inner.y + inner.height - 3, inner.width, 2);
+            frame.render_widget(Paragraph::new(vec![orgchart_legend_line(), orgchart_activity_legend_line()]), legend_area);
         }
         let (chart_area, info_area) = if self.orgchart.hide_info {
             (body, None)
@@ -1620,13 +1630,26 @@ impl App {
                         // Right edge: held-item mark, engine, host, each one
                         // cell with a blank cell between, so a terminal that
                         // draws a mark two cells wide never covers the next.
-                        let label_room = w.saturating_sub(4 + 7);
+                        // The live activity badge (agent_state.rs) sits just
+                        // left of those, the label keeping at least 8 cells.
+                        let room = w.saturating_sub(4 + 7);
+                        let badge = self.row_badge(ts);
+                        let label_w = ts.label.chars().count();
+                        let badge_w = badge.as_ref().map_or(0, |b| super::agent_state::badge_width(b).min(room.saturating_sub(label_w.min(8) + 1)));
+                        let label_room = room.saturating_sub(badge_w + usize::from(badge_w > 0));
                         let label = crate::planning::truncate_with_ellipsis(&ts.label, label_room);
                         let label_style = if ts.session.exited { Style::default().fg(theme::DIM) } else { Style::default().fg(theme::TEXT) };
                         put(buf, p.x + 1, y, &" ".repeat(w - 2), bg(Style::default()));
                         put(buf, p.x + 1, y, s.mark.unwrap_or(" "), bg(Style::default().fg(theme::ATTN)));
                         put(buf, p.x + 2, y, g, bg(gs));
                         put(buf, p.x + 4, y, &label, bg(label_style));
+                        if let Some(b) = badge.filter(|_| badge_w > 0) {
+                            let mut x = p.x + 4 + room as i32 - badge_w as i32;
+                            for span in super::agent_state::badge_spans(&b, badge_w) {
+                                put(buf, x, y, &span.content, bg(span.style));
+                                x += span.width() as i32;
+                            }
+                        }
                         if let Some((m, ms)) = mark {
                             put(buf, p.x + p.w - 6, y, m, bg(ms));
                         }
@@ -1703,6 +1726,18 @@ impl App {
         let (mark, mark_style) = symbols::engine(&ts.session_type);
         lines.push(Line::from(vec![label("engine"), Span::styled(format!("{mark} "), mark_style), text(symbols::engine_name(&ts.session_type).to_owned())]));
         lines.push(Line::from(vec![label("status"), text(status)]));
+        // The activity badge in full, F9 toggle or not.
+        if let Some(b) = self.session_badge(ts) {
+            let (mark, mark_style) = symbols::doing(b.kind);
+            lines.push(Line::from(vec![
+                label("doing"),
+                Span::styled(format!("{mark} "), mark_style),
+                Span::styled(
+                    crate::planning::truncate_with_ellipsis(&b.full, width.saturating_sub(11)),
+                    symbols::doing_text(b.kind),
+                ),
+            ]));
+        }
         let age = spawned_at(&ts.uid).map(|t| board::age(board::now_unix() - t)).unwrap_or_else(|| board::age(ts.created_at.elapsed().as_secs() as i64));
         lines.push(Line::from(vec![label("age"), text(format!("{age} since spawn"))]));
         let last = if !ts.session.exited && self.display_running(ts) {
@@ -3041,8 +3076,47 @@ mod tests {
         for part in ["\u{273b} claude", "\u{2b21} codex", "\u{2302} local", "\u{27a4} active", "\u{229b} on Owner", "\u{2691} flagged", "\u{229e} org", "\u{25c6} division", "\u{25b8} folded"] {
             assert!(legend.contains(part), "{part}: {legend}");
         }
+        // The activity badge's marks, on the line below.
+        let activity = s.lines().find(|l| l.contains("rate limited")).unwrap_or_else(|| panic!("{s}"));
+        for part in ["\u{2699} working", "\u{29d7} background jobs", "\u{261b} waits on you", "\u{26a0} rate limited", "\u{23f1} stalled"] {
+            assert!(activity.contains(part), "{part}: {activity}");
+        }
         press(&mut app, "?");
         assert!(!screen(&mut app, 220, 40).contains("host initial"));
+    }
+
+    /// Owner 2026-10-22: cards carry the live activity badge (a rate limit
+    /// distinctly), the info pane spells it out, and F9's toggle hides it
+    /// on cards only.
+    #[test]
+    fn cards_and_info_pane_show_the_activity_badge() {
+        let mut app = org_app();
+        let now = board::now_unix() as f64;
+        app.apply_agent_state(&HostId::new("sessions"), "ts-40-0", &json!({"state":"errored","since":now - 120.0,
+            "detail":{"error_kind":"usageLimitExceeded","resumes_at":now + 900.0}}));
+        app.apply_agent_state(&HostId::new("manager"), "ts-50-0", &json!({"state":"working-background","since":now,
+            "background":{"jobs":[{"id":"1","label":"cargo test"}]}}));
+        app.cursor = Cursor::Session(1, 0); // mid-1
+        app.handle_event(&key(KeyCode::F(6)));
+        app.orgchart.hide_info = true;
+        let s = screen(&mut app, 200, 40);
+        let row = |s: &str, label: &str| s.lines().find(|l| l.contains(label)).unwrap_or_else(|| panic!("{label}:\n{s}")).to_owned();
+        assert!(row(&s, "mid-1").contains("\u{26a0} rate limit"), "{}", row(&s, "mid-1"));
+        assert!(row(&s, "leaf-1").contains("\u{29d7} cargo test"), "{}", row(&s, "leaf-1"));
+        assert!(!row(&s, "root-a").contains('\u{2699}'), "no state, no badge");
+        // Engine and host marks keep their cells.
+        assert!(row(&s, "mid-1").contains("\u{2b21} s"), "{}", row(&s, "mid-1"));
+        let m = app.org_model(false);
+        let info = app.orgchart_info_lines(&m, app.orgchart_focus(&m), 80).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(info.contains("doing    \u{26a0} rate limited (usageLimitExceeded), resumes in 1"), "{info}");
+        // F9 off: cards drop it, the info pane keeps it.
+        for c in [KeyCode::F(9), KeyCode::Down, KeyCode::Char(' '), KeyCode::Enter] {
+            app.global_settings.handle_event(&key(c));
+        }
+        let s = screen(&mut app, 200, 40);
+        assert!(!row(&s, "mid-1").contains('\u{26a0}'), "{}", row(&s, "mid-1"));
+        let info = app.orgchart_info_lines(&m, app.orgchart_focus(&m), 80).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(info.contains("doing"), "{info}");
     }
 
     #[test]

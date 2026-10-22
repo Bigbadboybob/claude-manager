@@ -107,6 +107,7 @@ view's A-i peek all use.
 | ◆ | a division (as in the sidebar; ◆ is otherwise only the owner-blocked blink) |
 | ∘ | a task box whose sessions are all further down its subtree |
 | ▸ | a folded box |
+| ⚙ ⧗ ☛ ⚠ ✕ ↻ ⏱ | the activity badge: working, background jobs, waits on you, rate limited, error, retrying, stalled (second legend line; see [activity badge](sidebar-sections.md#activity-badge)) |
 
 Cards use only the symbols. The info pane and the A-i peek keep the word
 beside each one (`⬡ codex`, `➤ sejd #14 ACTIVE`). The Sessions sidebar rows
@@ -114,8 +115,13 @@ show no engine name, so they are unchanged.
 
 ## Info pane
 
+Each session line on a full card carries the live activity badge between its
+label and the right-edge marks, as in the Sessions sidebar (`⚠ rate limit`,
+`⧗ cargo test`); F9 turns it off on cards.
+
 For the focused session, the pane shows:
 - name, engine, status and how long it has been in that status;
+- what it is doing (`doing`), the activity badge in full, F9 toggle or not;
 - age since spawn (taken from the uid, so it survives restarts) and last
   activity;
 - task, boss (the parent box and its lead), and the number of direct reports;

@@ -40,9 +40,10 @@ registration. See [task cleanup and recovery](doc/task-worktree-cleanup.md).
 ## Global TUI settings
 
 **F9** opens Global Settings in any view. Section tint strength defaults to 2×;
-arrow keys preview adjustments, Enter saves, and Esc cancels. Preferences live
-on the laptop in `~/.cm/tui-settings.toml` and apply immediately when saved.
-See [sidebar appearance settings](doc/sidebar-sections.md#layout).
+arrow keys preview adjustments, ↑/↓ move between rows, Enter saves, and Esc
+cancels. The second row turns the **activity badges** on or off (default on).
+Preferences live on the laptop in `~/.cm/tui-settings.toml` and apply
+immediately when saved. See [sidebar appearance settings](doc/sidebar-sections.md#layout).
 
 ## If you are running inside CM
 
@@ -205,7 +206,7 @@ Sessions view:
 
 **Transcript binding follows the daemon.** The daemon is the only party that learns about an in-pane `/resume` or `/clear` (the Stop hook reports the live transcript path every turn → `session.turn_ended` re-stamps the resume key) and about codex rollout rotations (the `/proc` watcher → `session.set_transcript_path`). Both now BROADCAST a manifest `Updated` carrying `transcript_path` + `transcript_id`, the TUI mirrors it onto the row (`apply_transcript_from_diff`, via `rebind_transcript`), and every `manifest.watch` (re)connect converges rows on the snapshot's ids. So `A-R`, a user-owned row's startup restore, tombstones, and `read_session_output` all resume the conversation the pane is actually in. Pre-fix the TUI's detector bound once at spawn and never looked again, so after an in-pane `/resume` every TUI-driven respawn resumed the throwaway spawn-time conversation and the operator had to `/resume` again (and the ESmisc codex row was revived into an unrelated test thread its spawn-time guess had picked). Needs the daemon rebuilt for the broadcast half; the TUI half is harmless against an old daemon (no diffs carry the field).
 
-Sidebar/pane state cues: idle sessions age through three visual buckets — just-finished "afterglow" (bright `●`, <2 min), settled (white `●`), and stale (>30 min, glyph + label dimmed). The status bar carries a session rollup (`⠹2 ●1 ⚑1` = running / idle / pending alerts) next to the task counts. The terminal pane's border tints by the active session's state (green running, yellow reconnecting, afterglow just-idle) and shows a right-aligned `▲ scrollback` tag whenever the view isn't at the live tail.
+Sidebar/pane state cues: idle sessions age through three visual buckets — just-finished "afterglow" (bright `●`, <2 min), settled (white `●`), and stale (>30 min, glyph + label dimmed). The status bar carries a session rollup (`⠹2 ●1 ⚑1` = running / idle / pending alerts) next to the task counts. The terminal pane's border tints by the active session's state (green running, yellow reconnecting, afterglow just-idle) and shows a right-aligned `▲ scrollback` tag whenever the view isn't at the live tail. A right-aligned **activity badge** says what each agent is doing right now: `⚙ 3m` (working, with `+2 bg` for background jobs), `⧗ cargo test` (only background jobs left), `☛ Bash` (waiting on a permission or other input), `⚠ rate limit 12m` (reversed and bold, so rate-limited sessions that need waking stand out), `✕ server error`, `↻ retrying`, `⏱ stalled 6m`. It comes from the daemon's `agent_state` on the existing manifest stream, with no extra polling; F6 cards show it too, and the F6 info pane spells it out. Toggle it in F9. See [activity badge](doc/sidebar-sections.md#activity-badge).
 
 Planning view:
 - `/` — incremental search: live-jumps to the first match as you type (Esc restores cursor + fold state, Enter commits). `n`/`N` cycle through matches afterwards with a `match i/N` echo; matching titles highlight; jumping to a folded subtask auto-unfolds its ancestors. The old always-on `[debug]` grid line is gone (re-enable with `CM_PLANNING_DEBUG=1`).

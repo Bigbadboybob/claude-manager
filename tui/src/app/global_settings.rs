@@ -18,6 +18,10 @@ struct Preferences {
     /// Messages view conversation sidebar width in cells; 0 fits the
     /// longest name. Set with `<` / `>` in Messages.
     messages_sidebar_width: u16,
+    /// The live activity badge on sidebar rows and org chart cards
+    /// (`⚙ 3m`, `⧗ cargo test`, `⚠ rate limit`). The info pane always
+    /// shows it.
+    activity_badges: bool,
 }
 
 #[cfg(test)]
@@ -81,6 +85,28 @@ mod tests {
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
+    /// The activity badge toggle: on by default, ↓ then Space flips it,
+    /// Enter saves both rows, and a reload keeps it.
+    #[test]
+    fn activity_badges_toggle_saves_and_reloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        let mut settings = GlobalSettings::load_from(path.clone());
+        assert!(settings.activity_badges());
+        settings.handle_event(&key(KeyCode::F(9)));
+        settings.handle_event(&key(KeyCode::Down));
+        settings.handle_event(&key(KeyCode::Char(' ')));
+        assert_eq!(settings.tint_strength(), 2.0, "the badge row leaves the tint alone");
+        settings.handle_event(&key(KeyCode::Up));
+        settings.handle_event(&key(KeyCode::Right));
+        settings.handle_event(&key(KeyCode::Enter));
+        let reloaded = GlobalSettings::load_from(path.clone());
+        assert!(!reloaded.activity_badges());
+        assert_eq!(reloaded.tint_strength(), 2.25);
+        std::fs::write(&path, "activity_badges = true\n").unwrap();
+        assert!(GlobalSettings::load_from(path).activity_badges());
+    }
+
     #[test]
     fn global_settings_save_failure_keeps_dialog_and_original_file() {
         let temp = tempfile::tempdir().unwrap();
@@ -125,6 +151,7 @@ impl Default for Preferences {
             sidebar_tint_strength: DEFAULT_TINT,
             codex_inline_scrollback: true,
             messages_sidebar_width: 0,
+            activity_badges: true,
         }
     }
 }
@@ -132,6 +159,8 @@ impl Default for Preferences {
 struct Dialog {
     draft: Preferences,
     error: Option<String>,
+    /// The focused row: 0 section tint, 1 activity badges.
+    row: u8,
 }
 
 pub(super) struct GlobalSettings {
@@ -194,6 +223,12 @@ impl GlobalSettings {
             })
     }
 
+    /// Whether rows and cards show the activity badge (the draft while
+    /// F9 is open, for a live preview).
+    pub(super) fn activity_badges(&self) -> bool {
+        self.dialog.as_ref().map_or(self.saved.activity_badges, |d| d.draft.activity_badges)
+    }
+
     pub(super) fn is_open(&self) -> bool {
         self.dialog.is_some()
     }
@@ -210,16 +245,22 @@ impl GlobalSettings {
     }
 
     fn save(&self, draft: Preferences) -> anyhow::Result<()> {
-        self.write_key(
-            "sidebar_tint_strength",
-            toml::Value::Float(draft.sidebar_tint_strength),
-        )
+        self.write_keys(&[
+            ("sidebar_tint_strength", toml::Value::Float(draft.sidebar_tint_strength)),
+            ("activity_badges", toml::Value::Boolean(draft.activity_badges)),
+        ])
     }
 
     fn write_key(&self, key: &str, value: toml::Value) -> anyhow::Result<()> {
+        self.write_keys(&[(key, value)])
+    }
+
+    fn write_keys(&self, keys: &[(&str, toml::Value)]) -> anyhow::Result<()> {
         // Read on save to preserve unrelated keys, and refuse malformed files.
         let mut document = read_document(&self.path)?;
-        document.insert(key.into(), value);
+        for (key, value) in keys {
+            document.insert((*key).into(), value.clone());
+        }
         let text = toml::to_string_pretty(&document)?;
         let parent = self.path.parent().context("Settings path has no parent")?;
         std::fs::create_dir_all(parent)?;
@@ -250,11 +291,20 @@ impl GlobalSettings {
             self.dialog = Some(Dialog {
                 draft: self.saved,
                 error: self.load_error.clone(),
+                row: 0,
             });
             return true;
         }
         let dialog = self.dialog.as_mut().unwrap();
         match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                dialog.row = 1 - dialog.row;
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Char('-') | KeyCode::Char('+')
+                if dialog.row == 1 =>
+            {
+                dialog.draft.activity_badges = !dialog.draft.activity_badges;
+            }
             KeyCode::Left | KeyCode::Char('-') => {
                 dialog.draft.sidebar_tint_strength =
                     (dialog.draft.sidebar_tint_strength - 0.25).max(0.0);
@@ -286,7 +336,7 @@ impl GlobalSettings {
             return;
         };
         let width = 60.min(area.width);
-        let height = (if dialog.error.is_some() { 16 } else { 12 }).min(area.height);
+        let height = (if dialog.error.is_some() { 19 } else { 15 }).min(area.height);
         let area = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -301,14 +351,17 @@ impl GlobalSettings {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let strength = dialog.draft.sidebar_tint_strength;
+        let row_style = |focused: bool| {
+            let s = Style::default().fg(theme::TEXT);
+            if focused { s.add_modifier(Modifier::BOLD) } else { s }
+        };
+        let pointer = |focused: bool| if focused { "› " } else { "  " };
         let mut lines = vec![
             Line::from("All projects on this laptop."),
             Line::from(""),
             Line::styled(
-                format!("Section tint:  ◀  {strength:.2}×  ▶"),
-                Style::default()
-                    .fg(theme::TEXT)
-                    .add_modifier(Modifier::BOLD),
+                format!("{}Section tint:  ◀  {strength:.2}×  ▶", pointer(dialog.row == 0)),
+                row_style(dialog.row == 0),
             ),
             Line::from("←/→ 0.25 steps · 0 off · Default 2×"),
             Line::from(""),
@@ -326,8 +379,18 @@ impl GlobalSettings {
                     .collect::<Vec<_>>(),
             ),
             Line::from(""),
+            Line::styled(
+                format!(
+                    "{}Activity badges:  [{}]",
+                    pointer(dialog.row == 1),
+                    if dialog.draft.activity_badges { "x" } else { " " }
+                ),
+                row_style(dialog.row == 1),
+            ),
+            Line::from("What each agent is doing, on rows and F6 cards."),
+            Line::from(""),
             Line::from("Live preview · Opacity unchanged."),
-            Line::from("Home reset · Enter save · Esc cancel"),
+            Line::from("↑/↓ row · Home reset · Enter save · Esc cancel"),
         ];
         if let Some(error) = &dialog.error {
             lines.push(Line::styled(

@@ -1,6 +1,6 @@
-//! One-cell symbols for engines, hosts and board items (Owner request
-//! 2026-10-21). This is the only mapping: the org chart, its legend and the
-//! A-i peek all read it. Every symbol is plain Unicode one terminal cell
+//! One-cell symbols for engines, hosts, board items and the live activity
+//! badge (Owner requests 2026-10-21/22). This is the only mapping: the
+//! sidebar, the org chart, its legend and the A-i peek all read it. Every symbol is plain Unicode one terminal cell
 //! wide, also in East Asian contexts (no Ambiguous-width characters, so
 //! nothing from U+25A0-25EF's ambiguous ranges), with no emoji presentation
 //! and no Nerd Font glyphs. ◆ stays reserved for divisions and the
@@ -94,6 +94,51 @@ pub(crate) fn held_mark<'a>(items: impl IntoIterator<Item = (&'a str, bool)>) ->
     Some(if flagged { (FLAG, flag_style()) } else { board_status(status) })
 }
 
+/// What a session is doing right now: the kind of its live activity badge
+/// (see `agent_state::badge`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Doing {
+    /// Its foreground turn is running.
+    Working,
+    /// Its turn has ended, with background jobs still running.
+    Background,
+    /// It waits on a human: a permission prompt, a question, input.
+    Waiting,
+    /// It stopped on a rate or usage limit and needs waking later.
+    RateLimited,
+    /// It stopped on any other error.
+    Errored,
+    /// The engine is retrying a failed request.
+    Retrying,
+    /// It is working, but has shown no progress for a while.
+    Stalled,
+}
+
+/// The badge's mark and style. A rate limit stands out (bold, reversed),
+/// since Owner scans for it to wake those sessions.
+pub(crate) fn doing(kind: Doing) -> (&'static str, Style) {
+    let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    match kind {
+        Doing::Working => ("\u{2699}", Style::default().fg(theme::OK)),
+        Doing::Background => ("\u{29d7}", Style::default().fg(theme::OK).add_modifier(Modifier::DIM)),
+        Doing::Waiting => ("\u{261b}", bold(theme::ATTN)),
+        Doing::RateLimited => ("\u{26a0}", bold(theme::ATTN).add_modifier(Modifier::REVERSED)),
+        Doing::Errored => ("\u{2715}", bold(theme::ERROR)),
+        Doing::Retrying => ("\u{21bb}", Style::default().fg(theme::ATTN)),
+        Doing::Stalled => ("\u{23f1}", Style::default().fg(theme::ATTN)),
+    }
+}
+
+/// The badge text's style: quiet for routine work, the mark's colour (not
+/// reversed) when the session needs someone.
+pub(crate) fn doing_text(kind: Doing) -> Style {
+    match kind {
+        Doing::Working | Doing::Background => Style::default().fg(theme::MUTED),
+        Doing::RateLimited => Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD),
+        other => doing(other).1,
+    }
+}
+
 /// Every mark with its meaning, for the legend (`?` in the org chart).
 pub(crate) fn legend() -> Vec<(String, Style, &'static str)> {
     let mut out = Vec::new();
@@ -119,6 +164,24 @@ pub(crate) fn legend() -> Vec<(String, Style, &'static str)> {
     out
 }
 
+/// The activity badge's marks with their meanings: the legend's second line.
+pub(crate) fn activity_legend() -> Vec<(String, Style, &'static str)> {
+    let mut out = Vec::new();
+    for (kind, word) in [
+        (Doing::Working, "working"),
+        (Doing::Background, "background jobs"),
+        (Doing::Waiting, "waits on you"),
+        (Doing::RateLimited, "rate limited"),
+        (Doing::Errored, "error"),
+        (Doing::Retrying, "retrying"),
+        (Doing::Stalled, "stalled"),
+    ] {
+        let (s, st) = doing(kind);
+        out.push((s.to_owned(), st, word));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,7 +190,7 @@ mod tests {
     #[test]
     fn every_symbol_is_one_cell_wide_even_in_cjk_terminals() {
         use unicode_width::UnicodeWidthStr;
-        let mut all: Vec<(String, &str)> = legend().into_iter().map(|(s, _, w)| (s, w)).collect();
+        let mut all: Vec<(String, &str)> = legend().into_iter().chain(activity_legend()).map(|(s, _, w)| (s, w)).collect();
         all.extend([(engine("other").0.to_owned(), "unknown engine"), (board_status("weird").0.to_owned(), "unknown status"), (HEADER_BOX.to_owned(), "header box")]);
         for (s, word) in all {
             assert_eq!(Span::raw(s.clone()).width(), 1, "{word}: {s:?}");
@@ -138,7 +201,7 @@ mod tests {
     #[test]
     fn glyphs_do_not_double_up() {
         // ◆ is the division header and the owner-blocked blink only.
-        let marks: Vec<String> = legend().into_iter().map(|(s, _, _)| s).collect();
+        let marks: Vec<String> = legend().into_iter().chain(activity_legend()).map(|(s, _, _)| s).collect();
         assert!(!marks.contains(&DIVISION.to_owned()), "{marks:?}");
         assert!(!marks.contains(&HEADER_BOX.to_owned()) && HEADER_BOX != DIVISION);
         let unique: std::collections::HashSet<&String> = marks.iter().collect();

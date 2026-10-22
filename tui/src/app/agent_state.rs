@@ -244,6 +244,211 @@ impl App {
     }
 }
 
+/// The live activity badge: what a session is doing right now, from its
+/// `agent_state` alone (no extra polling). `short` sits beside the row's
+/// state glyph in the sidebar and on org chart cards; `full` is the info
+/// pane's line. The mark and styles live in `symbols::doing`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Badge {
+    pub kind: symbols::Doing,
+    pub short: String,
+    pub full: String,
+}
+
+/// Whether an `error_kind` is a rate or usage limit: Claude's `rate_limit`
+/// / `rate_limited`, Codex's `usageLimitExceeded`, quota and HTTP 429
+/// spellings.
+pub(crate) fn is_rate_limit(kind: &str) -> bool {
+    let k: String = kind.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase();
+    ["ratelimit", "usagelimit", "quota", "toomanyrequests"].iter().any(|n| k.contains(n)) || k == "429"
+}
+
+/// `usageLimitExceeded` / `server_error` → `usage limit exceeded` / `server error`.
+fn humanize(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_lower = false;
+    for c in s.chars() {
+        if c == '_' || c == '-' {
+            out.push(' ');
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower {
+            out.push(' ');
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        out.extend(c.to_lowercase());
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a waiting session waits for, in a word or two.
+fn waiting_word(waiting_for: &str) -> String {
+    match waiting_for {
+        "permission_prompt" | "permission" | "Approval" | "approval" => "permission".into(),
+        "elicitation_dialog" | "Elicitation" | "elicitation" => "question".into(),
+        "UserInput" | "user_input" => "input".into(),
+        "ToolCall" | "tool_call" => "tool call".into(),
+        "AuthRefresh" | "auth_refresh" => "sign-in".into(),
+        other => humanize(other),
+    }
+}
+
+/// `45s`, `12m`, `3h`, `2d`.
+pub(crate) fn short_age(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// The badge for an engine state at `now` (Unix seconds), or None when
+/// there is nothing to say: idle, starting, unknown and exited sessions
+/// keep just their state glyph.
+pub(crate) fn badge(v: &AgentStateView, now: f64) -> Option<Badge> {
+    use symbols::Doing;
+    let detail = &v.raw["detail"];
+    let labels: Vec<String> = v.raw["background"]["jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|j| j["label"].as_str())
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect();
+    let jobs = v.jobs;
+    let age = now - v.since;
+    let (kind, short, full) = match v.activity {
+        Activity::Errored => {
+            let kind = v.error_kind.as_deref().unwrap_or("");
+            let resumes = detail["resumes_at"].as_f64().filter(|r| *r > now);
+            if is_rate_limit(kind) {
+                let (short, full) = match resumes {
+                    Some(r) => (
+                        format!("rate limit {}", short_age(r - now)),
+                        format!("rate limited ({kind}), resumes in {}", short_age(r - now)),
+                    ),
+                    None => ("rate limit".into(), format!("rate limited ({kind}) for {}", short_age(age))),
+                };
+                (Doing::RateLimited, short, full)
+            } else if kind.is_empty() {
+                (Doing::Errored, "error".into(), format!("errored {} ago", short_age(age)))
+            } else {
+                (Doing::Errored, humanize(kind), format!("error: {} ({kind}), {} ago", humanize(kind), short_age(age)))
+            }
+        }
+        Activity::Waiting => {
+            let reason = v.waiting_for.as_deref().map(waiting_word);
+            let tool = detail["open_tool"].as_str().filter(|t| !t.is_empty());
+            let short = tool.map(str::to_owned).or_else(|| reason.clone()).unwrap_or_else(|| "input".into());
+            let full = match (reason, tool) {
+                (Some(r), Some(t)) => format!("waiting on {r}: {t}"),
+                (Some(r), None) => format!("waiting on {r}"),
+                (None, Some(t)) => format!("waiting on {t}"),
+                (None, None) => "waiting on a human".into(),
+            };
+            (Doing::Waiting, short, format!("{full} for {}", short_age(age)))
+        }
+        Activity::Working if detail["retrying"].as_bool() == Some(true) => {
+            (Doing::Retrying, "retrying".into(), format!("retrying a failed request, {}", short_age(age)))
+        }
+        Activity::Working if v.stalled => {
+            let stalled_for = v.raw["stalled_since"].as_f64().map_or(age, |t| now - t);
+            (
+                Doing::Stalled,
+                format!("stalled {}", short_age(stalled_for)),
+                format!("working, no progress for {}", short_age(stalled_for)),
+            )
+        }
+        Activity::Working => {
+            let mut short = short_age(age);
+            let mut full = format!("working {}", short_age(age));
+            if jobs > 0 {
+                short.push_str(&format!(" +{jobs} bg"));
+                full.push_str(&format!(", {jobs} background: {}", labels.join(", ")));
+            }
+            (Doing::Working, short, full)
+        }
+        Activity::Background => {
+            let short = match (jobs, labels.first()) {
+                (1, Some(l)) => l.clone(),
+                (0, _) => "bg".into(),
+                (n, _) => format!("{n} bg"),
+            };
+            let full = if labels.is_empty() {
+                "background work".into()
+            } else {
+                format!("background: {}", labels.join(", "))
+            };
+            (Doing::Background, short, full)
+        }
+        Activity::Idle | Activity::Starting | Activity::Exited | Activity::Unknown => return None,
+    };
+    Some(Badge { kind, short, full })
+}
+
+/// The badge as spans at most `width` cells wide: mark, a space, then the
+/// text truncated with an ellipsis. Under three cells, the mark alone.
+pub(crate) fn badge_spans(b: &Badge, width: usize) -> Vec<Span<'static>> {
+    let (mark, mark_style) = symbols::doing(b.kind);
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![Span::styled(mark, mark_style)];
+    if width >= 3 {
+        out.push(Span::raw(" "));
+        out.push(Span::styled(fit(&b.short, width - 2), symbols::doing_text(b.kind)));
+    }
+    out
+}
+
+/// `s` cut to `width` cells, ending in `…` when cut.
+fn fit(s: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= width {
+        return s.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Cells the whole badge takes untruncated.
+pub(crate) fn badge_width(b: &Badge) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    2 + b.short.width()
+}
+
+impl App {
+    /// A session's live activity badge (ignores the F9 toggle; the info
+    /// pane always shows it). None for exited sessions and rows without
+    /// engine state.
+    pub(crate) fn session_badge(&self, ts: &TerminalSession) -> Option<Badge> {
+        if ts.session.exited {
+            return None;
+        }
+        badge(self.agent_view(ts)?, now_unix())
+    }
+
+    /// The badge for sidebar rows and org chart cards: as
+    /// [`App::session_badge`], when the F9 toggle is on.
+    pub(crate) fn row_badge(&self, ts: &TerminalSession) -> Option<Badge> {
+        self.global_settings.activity_badges().then(|| self.session_badge(ts)).flatten()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +493,148 @@ mod tests {
         assert!(!put(json!({"state":"idle","source":"hooks"}), false), "seeded idle never notified");
         assert!(put(json!({"state":"idle","source":"hooks"}), true));
         assert!(!covers_idle_notify(&HashMap::new(), &host, "u"), "no state: PTY decides");
+    }
+
+    fn b(state: Value, now: f64) -> Option<Badge> {
+        badge(&AgentStateView::parse(&state), now)
+    }
+
+    fn short(state: Value) -> (symbols::Doing, String) {
+        let x = b(state, 1000.0).expect("a badge");
+        (x.kind, x.short)
+    }
+
+    /// Owner 2026-10-22: what each state's badge says.
+    #[test]
+    fn badge_labels_follow_the_engine_state() {
+        use symbols::Doing::*;
+        // Working: time in the turn, plus any background jobs.
+        assert_eq!(short(json!({"state":"working","since":820.0})), (Working, "3m".into()));
+        let w = b(json!({"state":"working","since":995.0,"background":{"jobs":[
+            {"id":"1","label":"cargo test"},{"id":"2","label":"npm run build"}]}}), 1000.0).unwrap();
+        assert_eq!((w.short.as_str(), w.full.as_str()), ("5s +2 bg", "working 5s, 2 background: cargo test, npm run build"));
+        assert_eq!(short(json!({"state":"working","since":0.0,"detail":{"retrying":true}})), (Retrying, "retrying".into()));
+        assert_eq!(short(json!({"state":"working","since":0.0,"stalled_since":640.0})), (Stalled, "stalled 6m".into()));
+        // Background: one job by its label, several by count.
+        assert_eq!(short(json!({"state":"working-background","background":{"jobs":[{"id":"1","label":"cargo   test\n-p tui"}]}})),
+            (Background, "cargo test -p tui".into()));
+        assert_eq!(short(json!({"state":"working-background","background":{"jobs":[{"id":"1","label":"a"},{"id":"2","label":"b"}]}})),
+            (Background, "2 bg".into()));
+        assert_eq!(short(json!({"state":"working-background","background":{"complete":false,"jobs":[]}})), (Background, "bg".into()));
+        // Waiting: the tool asking permission, else what it waits for.
+        let p = b(json!({"state":"waiting-on-human","since":940.0,"detail":{"waiting_for":"permission_prompt","open_tool":"Bash"}}), 1000.0).unwrap();
+        assert_eq!((p.kind, p.short.as_str(), p.full.as_str()), (Waiting, "Bash", "waiting on permission: Bash for 1m"));
+        assert_eq!(short(json!({"state":"waiting-on-human","detail":{"waiting_for":"permission_prompt"}})), (Waiting, "permission".into()));
+        assert_eq!(short(json!({"state":"waiting-on-human","detail":{"waiting_for":"elicitation_dialog"}})), (Waiting, "question".into()));
+        assert_eq!(short(json!({"state":"waiting-on-human","detail":{"waiting_for":"UserInput"}})), (Waiting, "input".into()));
+        assert_eq!(short(json!({"state":"waiting-on-human"})), (Waiting, "input".into()));
+        // Other errors, by kind.
+        assert_eq!(short(json!({"state":"errored","detail":{"error_kind":"server_error"}})), (Errored, "server error".into()));
+        assert_eq!(short(json!({"state":"errored"})), (Errored, "error".into()));
+        // Nothing to add for quiet or unknown states.
+        for state in ["idle", "starting", "unknown", "exited", "something-new"] {
+            assert_eq!(b(json!({"state": state}), 1000.0), None, "{state}");
+        }
+    }
+
+    /// Owner 2026-10-22: a rate limit reads distinctly, so sessions that
+    /// need waking are easy to spot.
+    #[test]
+    fn rate_limits_are_recognized_and_drawn_distinctly() {
+        use symbols::Doing::*;
+        for kind in ["rate_limit", "rate_limited", "usageLimitExceeded", "RateLimitError", "quota_exceeded", "429", "too_many_requests"] {
+            assert!(is_rate_limit(kind), "{kind}");
+            assert_eq!(short(json!({"state":"errored","detail":{"error_kind": kind}})).0, RateLimited, "{kind}");
+        }
+        for kind in ["server_error", "authentication_failed", "api_error", "billing_error", "overloaded", ""] {
+            assert!(!is_rate_limit(kind), "{kind}");
+        }
+        // With a known resume time it counts down; without, it says so.
+        let r = b(json!({"state":"errored","since":400.0,"detail":{"error_kind":"usageLimitExceeded","resumes_at":1720.0}}), 1000.0).unwrap();
+        assert_eq!((r.short.as_str(), r.full.as_str()), ("rate limit 12m", "rate limited (usageLimitExceeded), resumes in 12m"));
+        let r = b(json!({"state":"errored","since":400.0,"detail":{"error_kind":"rate_limit","resumes_at":10.0}}), 1000.0).unwrap();
+        assert_eq!((r.short.as_str(), r.full.as_str()), ("rate limit", "rate limited (rate_limit) for 10m"));
+        // Its mark is reversed and bold; no other badge's is.
+        let (mark, style) = symbols::doing(RateLimited);
+        assert_eq!(mark, "\u{26a0}");
+        assert!(style.add_modifier.contains(Modifier::REVERSED | Modifier::BOLD));
+        for other in [Working, Background, Waiting, Errored, Retrying, Stalled] {
+            assert!(!symbols::doing(other).1.add_modifier.contains(Modifier::REVERSED), "{other:?}");
+            assert_ne!(symbols::doing(other).0, mark);
+        }
+    }
+
+    #[test]
+    fn badges_truncate_to_the_room_they_get() {
+        let x = Badge { kind: symbols::Doing::Background, short: "cargo test --workspace".into(), full: String::new() };
+        assert_eq!(badge_width(&x), 24);
+        let text = |w: usize| badge_spans(&x, w).iter().map(|s| s.content.to_string()).collect::<String>();
+        let width = |w: usize| badge_spans(&x, w).iter().map(|s| s.width()).sum::<usize>();
+        assert_eq!(text(24), "\u{29d7} cargo test --workspace");
+        assert_eq!(text(12), "\u{29d7} cargo tes\u{2026}");
+        for w in 0..30 {
+            assert!(width(w) <= w, "width {w}: {:?}", text(w));
+        }
+        assert_eq!(text(2), "\u{29d7}", "too narrow for text: the mark alone");
+        assert_eq!(text(0), "");
+        // Wide characters count as two cells.
+        let wide = Badge { short: "テストテスト".into(), ..x };
+        assert_eq!(badge_spans(&wide, 7).iter().map(|s| s.width()).sum::<usize>(), 7);
+    }
+
+    fn session(app: &mut App, wi: usize, uid: &str, label: &str) {
+        let pty = crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None).unwrap();
+        let mut ts = super::super::model::make_simple_session_with_uid(uid.to_string(), label, "codex", pty, None);
+        ts.session.exited = false;
+        app.workspaces[wi].sessions.push(ts);
+    }
+
+    fn rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        let area = buffer.area;
+        (0..area.height).map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect()).collect()
+    }
+
+    /// The sidebar row: the badge right-aligned, the label giving way, and
+    /// F9's toggle (previewed live) turning it off.
+    #[test]
+    fn sidebar_rows_show_the_badge_and_f9_turns_it_off() {
+        use super::super::sections::layout_tests::{bare_ws, sidebar_buffer, test_app};
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = vec![bare_ws("w")];
+        session(&mut app, 0, "ts-1-0", "worker");
+        session(&mut app, 0, "ts-2-0", "a-rather-long-session-label-here");
+        session(&mut app, 0, "ts-3-0", "quiet");
+        let host = HostId::local();
+        let now = now_unix();
+        app.apply_agent_state(&host, "ts-1-0", &json!({"state":"errored","since":now - 60.0,"detail":{"error_kind":"rate_limited"}}));
+        app.apply_agent_state(&host, "ts-2-0", &json!({"state":"working-background","since":now,
+            "background":{"jobs":[{"id":"1","label":"cargo test --workspace --all-features"}]}}));
+        app.apply_agent_state(&host, "ts-3-0", &json!({"state":"idle","since":now}));
+        let text = rows(&sidebar_buffer(&mut app, 12));
+        let row = |needle: &str| text.iter().find(|r| r.contains(needle)).cloned().unwrap_or_else(|| panic!("{needle}\n{}", text.join("\n")));
+        // Right-aligned against the border (column 39).
+        let rl = row("worker");
+        assert!(rl.trim_end_matches('\u{2502}').ends_with("\u{26a0} rate limit"), "{rl}");
+        // The long label and the long job share the row: both cut, the
+        // label keeping at least 8 cells.
+        let bg = row("\u{29d7}");
+        assert!(bg.contains("a-rat") && bg.contains("...") && bg.contains("\u{2026}"), "{bg}");
+        assert_eq!(bg.chars().count(), 40, "{bg}");
+        // Idle: no badge.
+        assert!(!row("quiet").contains(['\u{2699}', '\u{29d7}', '\u{26a0}']));
+        // F9 → ↓ → Space previews the toggle off; Esc restores it.
+        let key = |c| CrosstermEvent::Key(crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE));
+        assert!(app.global_settings.activity_badges(), "on by default");
+        for c in [KeyCode::F(9), KeyCode::Down, KeyCode::Char(' ')] {
+            app.global_settings.handle_event(&key(c));
+        }
+        assert!(!app.global_settings.activity_badges());
+        let off = rows(&sidebar_buffer(&mut app, 12)).join("\n");
+        assert!(!off.contains('\u{26a0}') && !off.contains('\u{29d7}'), "{off}");
+        assert!(off.contains("a-rather-long-session-label-here"), "the label gets its room back");
+        app.global_settings.handle_event(&key(KeyCode::Esc));
+        assert!(app.global_settings.activity_badges());
     }
 
     #[test]

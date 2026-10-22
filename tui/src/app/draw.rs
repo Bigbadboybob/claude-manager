@@ -1872,7 +1872,7 @@ impl App {
             ("A-O    reopen ws", "A-F  fork task"),
             ("A-N    +section", "A-J/K sect order"),
             ("PgUp/Dn scroll", "A-u/d half page"),
-            ("Spc    fold hdr", ""),
+            ("Spc    fold hdr", "F9   badges"),
             ("A-Ent  newline", "A-;  recent"),
             ("A-p    find", "A-i  info"),
             ("A-'    yank", "A-M  mouse"),
@@ -2193,20 +2193,55 @@ impl App {
                         spans.push(Span::raw(pad));
                         spans.push(Span::styled(format!("{glyph} "), Style::default().fg(theme::LEAD)));
                     }
-                    spans.push(Span::raw(display));
+                    let mut tail: Vec<Span> = Vec::new();
                     if owner_blocked {
-                        spans.push(super::owner_blocked::owner_tag());
+                        tail.push(super::owner_blocked::owner_tag());
                     }
                     if revive_failed {
-                        spans.push(Span::styled(
+                        tail.push(Span::styled(
                             " revive failed",
                             Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
                         ));
                     } else if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
-                        spans.push(Span::styled(format!(" {note}"), Style::default().fg(theme::DIM)));
+                        tail.push(Span::styled(format!(" {note}"), Style::default().fg(theme::DIM)));
                     }
                     if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
-                        spans.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
+                        tail.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
+                    }
+                    // Live activity badge (agent_state.rs), right-aligned.
+                    // It takes the room the label doesn't need, the label
+                    // keeping at least BADGE_MIN_LABEL cells; a shorter
+                    // badge is truncated. Rows that already carry a status
+                    // (hidden, owner-blocked, revive failed) show none.
+                    let badge = (!ts.hidden && !owner_blocked && !revive_failed)
+                        .then(|| self.row_badge(ts))
+                        .flatten();
+                    match badge {
+                        Some(b) => {
+                            const BADGE_MIN_LABEL: usize = 8;
+                            let width = |v: &[Span]| v.iter().map(|s| s.width()).sum::<usize>();
+                            let room = (inner.width as usize).saturating_sub(width(&spans) + width(&tail));
+                            let label_w = display.chars().count();
+                            let pad_w = label_w - display.trim_start().chars().count();
+                            let keep = pad_w + (label_w - pad_w).min(BADGE_MIN_LABEL);
+                            let badge_w = super::agent_state::badge_width(&b)
+                                .min(room.saturating_sub(keep + 1));
+                            let label_room = room.saturating_sub(badge_w + usize::from(badge_w > 0));
+                            let display = if label_w > label_room {
+                                crate::planning::truncate_with_ellipsis(&display, label_room)
+                            } else {
+                                display
+                            };
+                            let pad = room.saturating_sub(display.chars().count() + badge_w);
+                            spans.push(Span::raw(display));
+                            spans.extend(tail);
+                            spans.push(Span::raw(" ".repeat(pad)));
+                            spans.extend(super::agent_state::badge_spans(&b, badge_w));
+                        }
+                        None => {
+                            spans.push(Span::raw(display));
+                            spans.extend(tail);
+                        }
                     }
                     let line = Line::from(spans);
 
