@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS item_receipts (
     attestation       TEXT NOT NULL,
     computed          JSONB NOT NULL,            -- {verdict, reasons} at post time
     verdict           JSONB NOT NULL,            -- the latest evaluation (grants change it)
+    brief             JSONB NOT NULL DEFAULT '[]'::jsonb,  -- [{name, state, rc, parsed}] for board reads
     stale_at          TIMESTAMPTZ,
     stale_reason      JSONB,                     -- {reason, prev, new}
     checked_at        TIMESTAMPTZ,               -- last refresh observation
@@ -45,7 +46,9 @@ CREATE INDEX IF NOT EXISTS idx_item_receipts_poster
 CREATE UNIQUE INDEX IF NOT EXISTS idx_item_receipts_request
     ON item_receipts (board_id, request_id) WHERE request_id IS NOT NULL;
 
--- Input identities, for input_changed and the derived-artifact cascade.
+-- Input identities, for input_changed, input_void and the derived-artifact
+-- cascade.  `locator` is the scoping key: a resolved local path or object URL,
+-- else `item:<item id>:<name>`, so unrelated items never share a key.
 CREATE TABLE IF NOT EXISTS item_receipt_inputs (
     receipt_id    BIGINT NOT NULL REFERENCES item_receipts(id) ON DELETE CASCADE,
     name          TEXT NOT NULL,

@@ -35,7 +35,7 @@ class ItemToolsTests(unittest.TestCase):
         self.assertEqual(method, "gate.report")
         self.assertRegex(params.pop("request_id"), r"^[0-9a-f]{32}$")
         self.assertEqual(params, {"n": 14, "steps": [], "head": "a" * 40, "klass": "py",
-                                  "gate": "gate", "attestation": "self"})
+                                  "gate": "gate"})
         method, params = self.call(server.gate_waive, 14, "a" * 40, "mypy", "r", "k", "m-1")
         self.assertEqual((method, params["kind"], params["message_id"]), ("gate.waive", "waiver", "m-1"))
         method, params = self.call(server.gate_profile, klass="py")

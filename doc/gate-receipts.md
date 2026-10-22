@@ -85,7 +85,7 @@ A rerun writes a new receipt, and the old one stays in history.
 | `steps` | `[step]` ≤ 40 | **every** planned step, including failed, skipped and never-started ones |
 | `waivers` | `[grant id]` ≤ 20 | grants the runner **cites** (§4); citing proves nothing by itself |
 | `log_path` | str? | the full log on the posting host |
-| `attestation` | `cm-gate` \| `self` | `cm-gate` when CM's runner executed the steps (§9) |
+| `attestation` | `self` | always `self` in v1: never taken from the poster (§13) |
 | `poster`, `posted_at` | actor, ts | stamped by the daemon and the API clock |
 | `computed` | `{verdict, reasons}` | the verdict at post time, kept for history |
 
@@ -167,8 +167,9 @@ selection and the pass predicates that were approved (§5).
   the step INCOMPLETE. A skip with no reason is never allowed.
 - **Pass predicates** (`max_failed`, `xfail_counts_as_pass`, `max_errors`, …)
   come only from the profile. A run can't change them (§5).
-- **`require.attestation: "cm-gate"`** makes a `self` receipt INCOMPLETE. It
-  is off by default; EP wants it on for deploy-gate profiles first.
+- **`require.attestation: "cm-gate"`** needs CM-verified run evidence, which
+  v1 does not have: such a profile computes INCOMPLETE until it does (§13).
+  It is off by default; EP wants it on for deploy-gate profiles first.
 
 **Who edits profiles.** Owner, the board's orchestrator, and the pids in the
 board setting `gate_editors` (intended for EP). Nobody else, the steward
@@ -254,8 +255,8 @@ the rest:
 1. The grantor is in the board's `waiver_grantors`: Owner always, plus the
    listed pids (EP).
 2. `message_id` exists, its sender is the grantor, and its body contains the
-   grant's head SHA (at least 12 hex characters), and the base SHA when one is
-   given. A message the daemon can't read yet stays `verified: false` with
+   grant's full 40-character head SHA as a token (and the base SHA when one
+   is given), the step and the kind of grant (§13). A message the daemon can't read yet stays `verified: false` with
    `problems: ["message not found"]` and is rechecked on the next read.
 3. `reason` and `risk` are both non-empty. `step` names a step in the profile,
    and any `nodes` belong to that step's grant. A generic "the gate" waiver is
@@ -470,7 +471,7 @@ It reads the item's profile, then:
 - runs the profile's `closure_cmd`;
 - hashes the declared inputs;
 - captures the worktree and merge-tree identity before and after;
-- posts with `attestation: "cm-gate"`.
+- posts through the caller's daemon, which rehashes local inputs (§13).
 
 Every planned step is posted, so a step that never started appears as
 `not_run` rather than being left out.
@@ -571,12 +572,16 @@ answer is INCOMPLETE or an explicit "unchecked" note, never a silent PASS.
 | TUI | Alt+B gate cell, Gate detail section, banner counts |
 
 **Inputs in v1 (partial content hashing, stated explicitly).**
-- **Hashed by cm-gate at run time:** `file` (sha256), `dir` (manifest
-  digest), `gcs` (object generation plus md5/crc32c from metadata, without
-  downloading again), and `artifact` (hash plus `produced_by`).
+- **Rehashed by the reporting daemon:** `file` (sha256), `dir` (manifest
+  digest) and `artifact` inputs with a local path (hash plus `produced_by`).
+  Only these are `hashed_at_run`. `gcs` identities (generation plus
+  md5/crc32c, which cm-gate reads from object metadata) are self-supplied and
+  unverified, and bind only where the profile's `accept_unverified` lists
+  `gcs`.
 - **`db` inputs:** v1 accepts only `snapshot:` or `rows:` content ids that the
   step itself supplies. cm-gate doesn't compute them, and CM doesn't verify
-  them. A bare query/window is `unbound`, so the run is INCOMPLETE.
+  them, so they bind only where `accept_unverified` lists `db`. A bare
+  query/window is `unbound`, so the run is INCOMPLETE.
 - **Undeclared inputs:** inputs the run reads but the profile doesn't declare
   aren't detected. Coverage is only as good as the profile's `inputs` list.
 - **What a v1 PASS means for inputs:** the declared inputs had these content
@@ -626,40 +631,94 @@ the Alt+B view.
 
 ## 13. v1 implementation notes
 
-Where the code differs in detail from the sections above:
+Where the code differs in detail from the sections above (including the
+review of `4b6d422`):
 
-- **Input verification label** (EP, 2026-10-22). Every input in a receipt
-  carries `verification`: `hashed_at_run` when cm-gate hashed it itself
-  (file, dir, gcs, artifact), otherwise `self_supplied_unverified` (every db
-  input, anything passed with `--input`, every `self` receipt). CM computes
-  the label; the poster cannot set it.
-- **pytest evidence** comes from CM's plugin `scripts/cm_gate_pytest.py`
-  (loaded with `-p cm_gate_pytest`), not JUnit XML: it records node ids
-  exactly, the exception type of each failure (forwarded from xdist workers),
-  skip reasons, deselections and collection errors. The granted node set is
-  a `--collect-only` run of the profile's argv, without workers.
-- **The class is the item's.** A receipt naming another class than the
-  item's effective one is refused (`class_mismatch`), so a poster cannot
-  pick a laxer profile. Changing an item's `gate_class` restales its
-  receipts (`class_changed`).
+- **Attestation is never the poster's.** The daemon drops any posted
+  `attestation`, and the API stores every v1 receipt as `self`. v1 has no
+  daemon-verified evidence that a run happened as recorded, so a profile
+  with `require.attestation: "cm-gate"` always computes INCOMPLETE ("v1
+  cannot attest"). That requirement becomes satisfiable only when CM itself
+  verifies run evidence (deferred).
+- **Input verification** (EP, 2026-10-22). The reporting daemon drops any
+  posted `verification`, `hashed_by` or `daemon_hash`, then rehashes each
+  file, dir and artifact input from its absolute `resolved_path` on its own
+  host (`sha256:` for a file; for a dir `tree:` = sha256 of the
+  `relpath\tsize\tsha256` lines, files of a directory before its
+  subdirectories, symlinks skipped; cm-gate uses the same manifest). Only
+  those inputs are `hashed_at_run`; a typed id that differs is kept as
+  `poster_content_id`, and a path that is not there is `missing` (VOID)
+  whatever id was typed. Everything else (gcs, db, inputs without a local
+  path) is `self_supplied_unverified` and binds only when the profile's
+  `accept_unverified` lists its kind; otherwise it is INCOMPLETE.
+- **root_env + path.** cm-gate joins the root and `path` and resolves both;
+  an unset root or a missing sub-path is `missing` (VOID). The locator stored
+  is the resolved path, never `$ENV`.
+- **Input keys.** `input_changed` and `input_void` are keyed by the resolved
+  path or object URL; an input with neither (a db query, a bare name) is
+  keyed per item (`item:<id>:<name>`), so unrelated items never collide.
+- **Granted nodes.** The profile's `nodes` are the grant and are never
+  overridden. Only when a profile lists none is the runner's own collection
+  of the profile's argv used, and the verdict notes it as unverified.
+- **Dirty tree.** Modified, staged and untracked files count; gitignored
+  files do not.
+- **Wrappers.** Only bounded forms may precede the granted program:
+  `timeout [-s SIG] [-k D] D`, `nice [-n N]`, `ionice -c N [-n N]`,
+  `taskset [-c LIST | MASK]`, `numactl` with CPU/node/memory binding,
+  `systemd-run --user --scope [-q] [-p MemoryMax|MemoryHigh|CPUQuota|…=V] [--]`,
+  `env K=V` for `allowed_env` keys. A shell (`sh -c`, `bash -c`), any other
+  tool or option, or a bad value makes the run weakened (RED without a
+  grant).
+- **Variance scope.** A variance grant accepts exactly the argv/env change
+  whose digest it binds. Granted nodes that did not run still need a waiver
+  naming those nodes.
+- **The class is the item's.** A receipt naming another class is refused
+  (`class_mismatch`). Changing an item's `gate_class`, the board's
+  `gate_default_class`, or setting a profile as the default restales the
+  receipts of the items that use it (`class_changed`).
+- **Grant message checks.** The grantor's daemon reads the linked message by
+  id through its store's event index and requires: the grantor as sender;
+  the full 40-character head SHA as a token (and the base SHA for a
+  base→head grant); the step as a token; and the kind (`waive…` or
+  `variance`). Messages in the CM store are immutable (there are no edit or
+  retraction events), so the create event is the latest version. A message
+  not yet replicated to that host leaves the grant unverified, and
+  `gate_receipts` rechecks it on read.
+- **Refs and paths.** Base, runner and branch refs are validated (plain
+  characters, no leading `-`, no `..`, `git check-ref-format`) by the API,
+  cm-gate and the daemon, and every git call passes `--end-of-options`. The
+  refresh runs git only in a registered CM worktree (a workspace, TUI
+  session or recently exited session on that host) and skips anything else.
+- **Bounded reads.** Receipt reads select only the latest row per gate in
+  SQL; history is at most 50 rows without steps, inputs or closure. Board
+  reads use a small stored `brief` (step name, state, rc, parsed counts) and
+  never load steps or closures.
 - **Closure.** The receipt stores the closure paths (up to 20 000). The
-  refresh sends the base's changed paths and the API intersects them, so no
-  path list crosses the wire every five minutes. Without a `closure_cmd`,
-  cm-gate uses the tracked files under the steps' paths plus the files the
-  head changed against the base.
-- **Grant message checks.** `gate.waive` checks the linked message in the
-  grantor's daemon store (sender, and the head SHA's first 12 characters in
-  the body). If the message has not reached that host yet the grant is
-  stored unverified, and `gate_receipts` rechecks it on read.
+  refresh sends the base's changed paths and the API intersects them.
+  Without a `closure_cmd`, cm-gate uses the tracked files under the steps'
+  paths plus the files the head changed against the base.
+- **pytest evidence** comes from CM's plugin `scripts/cm_gate_pytest.py`
+  (`-p cm_gate_pytest`), not JUnit XML: exact node ids, each failure's
+  exception type (forwarded from xdist workers), skip reasons, deselections
+  and collection errors. The plugin writes its report to the path in
+  `CM_GATE_REPORT` and removes that variable from its own environment, so a
+  nested pytest the suite starts cannot overwrite the report. A suite that
+  sets `CM_GATE_REPORT` itself, or another plugin that writes to that path,
+  still could; the receipt is only as good as that file, which is one
+  reason v1 receipts stay self-attested.
+- **cm-gate output.** stdout and stderr are captured separately; a step's
+  summary is stdout's tail (both streams for plain rc steps), so stderr
+  noise cannot push pytest's result line out. Full output goes to the log.
 - **Void flags.** `runner_void` counts VOID receipts on the board with the
-  same runner SHA in 24 h; `input_void` counts receipts that had the same
-  input locator missing. Both resolve on the item's next non-VOID receipt.
-  Neither escalates to Owner; `receipt_stale` never reaches the orchestrator.
+  same runner SHA in 24 h; `input_void` counts receipts with the same input
+  key missing. Both resolve on the item's next non-VOID receipt. Neither
+  escalates to Owner; `receipt_stale` never reaches the orchestrator.
+- **Timeouts.** `gate.report` allows 900 s, since the daemon rehashes large
+  input directories before forwarding.
 - **cm-gate exit status**: 0 PASS, 1 FAIL, 2 VOID, 3 INCOMPLETE, 4 STALE,
   5 runner error. Logs go to `~/.local/share/cm-gate/logs/` (or
   `CM_GATE_LOG_DIR`) and are pruned after 14 days.
-- **Lane overrides** (`--override lane.toml|json`):
-  `[steps.<name>]` with `prefix`, `extra_args`, `env`,
-  `deselect = [{node, reason}]`, `skip` / `reason`. Each becomes part of the
-  effective command and goes through the §5 diff.
-
+- **Lane overrides** (`--override lane.toml|json`): `[steps.<name>]` with
+  `prefix`, `extra_args`, `env`, `deselect = [{node, reason}]`, `skip` /
+  `reason`. Each becomes part of the effective command and goes through the
+  §5 diff.

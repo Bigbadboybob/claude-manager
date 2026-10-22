@@ -58,8 +58,9 @@ def wire(head=HEAD, mf=None, **over) -> dict:
         "closure": {"paths": ["src/fuse.py", "tests/test_a.py"]},
         "worktree": {"head_before": head, "head_after": head, "dirty_before": False,
                      "dirty_after": False, "path": "/w/lane"},
-        "inputs": [{"name": "harvest", "kind": "dir", "locator": "/data/harvest",
-                    "content_id": "tree:" + "9" * 64, "hashed_by": "cm-gate"}],
+        # As the reporting daemon stamps it after rehashing the local path.
+        "inputs": [{"name": "harvest", "kind": "dir", "resolved_path": "/data/harvest",
+                    "daemon_hash": {"content_id": "tree:" + "9" * 64}}],
         "steps": [
             {"name": "pytest", "state": "ran", "rc": 0, "at_sha": head,
              "effective_cmd": {"argv": ["pytest", "tests"]},
@@ -161,7 +162,8 @@ class GateApiDb(unittest.IsolatedAsyncioTestCase):
     async def grant(self, actor=EP, ok=True, n=1, **body):
         payload = {"actor": actor, "head": HEAD, "step": "mypy", "reason": "stubs broken",
                    "risk": "type errors may slip", "message_id": "m-1",
-                   "message_check": {"found": True, "sender": actor["pid"], "contains_head": True}}
+                   "message_check": {"found": True, "sender": actor["pid"], "contains_head": True,
+                                     "contains_step": True, "contains_kind": True}}
         payload.update(body)
         r = await self.http.post(f"/boards/{self.ref}/items/{n}/grants", json=payload)
         if ok:
@@ -224,6 +226,7 @@ class GateApiDb(unittest.IsolatedAsyncioTestCase):
         rec = await self.post(wire())
         self.assertEqual(rec["id"], f"r-{self.ref}-1-1")
         self.assertEqual([i["verification"] for i in rec["inputs"]], ["hashed_at_run"])
+        self.assertEqual(rec["attestation"], "self")
         b = await self.board()
         self.assertGreater(b["board"]["version"], before)
         item = next(i for i in b["items"] if i["n"] == 1)
@@ -293,8 +296,8 @@ class GateApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertIn("fetch: void (FETCH_FAIL)", rec["headline"])
 
     async def test_missing_harvest_is_void_and_repeat_raises_input_void(self):
-        missing = wire(inputs=[{"name": "harvest", "kind": "dir", "locator": "/data/harvest",
-                                "state": "missing"}])
+        missing = wire(inputs=[{"name": "harvest", "kind": "dir", "resolved_path": "/data/harvest",
+                                "content_id": "tree:" + "0" * 64, "daemon_hash": {"missing": True}}])
         self.assertEqual((await self.post(missing))["verdict"], "VOID")
         await self.post(missing)
         self.assertEqual((await self.flags())["input_void"]["detail"]["input"], "harvest")
@@ -331,24 +334,92 @@ class GateApiDb(unittest.IsolatedAsyncioTestCase):
                                         summary="Found 2 errors in 1 file"))
         self.assertEqual(rec["verdict"], "FAIL")
         r = await self.http.patch(f"/boards/{self.ref}/items/1/grants/g-{self.ref}-1-1", json={
-            "actor": EP, "message_check": {"found": True, "sender": EP["pid"], "contains_head": True}})
+            "actor": EP, "message_check": {"found": True, "sender": EP["pid"], "contains_head": True,
+                                           "contains_step": True, "contains_kind": True}})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["grant"]["verified"])
         self.assertEqual((await self.receipts())["latest"]["gate"]["verdict"], "PASS")
 
-    async def test_shrunk_node_set_is_red_until_a_variance_grant(self):
+    async def test_shrunk_node_set_needs_a_node_waiver_not_just_a_variance(self):
         from dispatch.gate_rules import cmd_digest
 
+        await self.put_profile("py", dict(PROFILE, waivable=["mypy", "pytest"]))
+        argv = ["pytest", "tests", "-k", "one"]
         shrunk = with_step(wire(), "pytest", summary="== 1 passed in 1.00s ==",
                            nodes=[{"id": "tests/test_a.py::test_one", "outcome": "passed"}],
-                           effective_cmd={"argv": ["pytest", "tests", "-k", "one"]})
+                           effective_cmd={"argv": argv})
         rec = await self.post(shrunk)
         self.assertEqual(rec["verdict"], "FAIL")
         self.assertIn("weakened", rec["headline"])
-        g = await self.grant(kind="variance", step="pytest",
-                             cmd_digest=cmd_digest({"argv": ["pytest", "tests", "-k", "one"]}))
+        g = await self.grant(kind="variance", step="pytest", cmd_digest=cmd_digest({"argv": argv}))
         self.assertTrue(g["verified"], g["problems"])
-        self.assertEqual((await self.receipts())["latest"]["gate"]["verdict"], "PASS")
+        latest = (await self.receipts())["latest"]["gate"]
+        self.assertEqual(latest["verdict"], "FAIL", "the variance covers the -k, not test_two")
+        w = await self.grant(step="pytest", nodes=["tests/test_a.py::test_two"])
+        cited = await self.post(dict(shrunk, waivers=[w["id"]]))
+        self.assertEqual(cited["verdict"], "PASS", cited["headline"])
+
+    async def test_a_posted_attestation_or_typed_hash_never_binds(self):
+        forged = wire(attestation="cm-gate", inputs=[
+            {"name": "harvest", "kind": "dir", "locator": "/data/harvest",
+             "content_id": "tree:" + "0" * 64, "hashed_by": "cm-gate",
+             "verification": "hashed_at_run"}])
+        rec = await self.post(forged)
+        self.assertEqual(rec["attestation"], "self")
+        self.assertEqual(rec["inputs"][0]["verification"], "self_supplied_unverified")
+        self.assertEqual(rec["verdict"], "INCOMPLETE", rec["headline"])
+
+    async def test_input_keys_are_scoped_so_unrelated_items_never_collide(self):
+        await self.put_profile("py", dict(PROFILE, inputs=[{"name": "ticks", "kind": "db"}],
+                                          accept_unverified=["db"]))
+        db = lambda cid: wire(inputs=[{"name": "ticks", "kind": "db", "locator": "SELECT 1",
+                                       "content_id": cid}])
+        first = await self.post(db("snapshot:a"), n=1)
+        await self.post(db("snapshot:b"), n=2)  # another item, same query text
+        self.assertEqual((await self.receipts(n=1))["latest"]["gate"]["verdict"], "PASS",
+                         "a query is scoped to its own item")
+        async with self.pool.acquire() as conn:
+            keys = sorted(r["locator"] for r in await conn.fetch("SELECT locator FROM item_receipt_inputs"))
+        self.assertTrue(all(k.startswith("item:") and k.endswith(":ticks") for k in keys), keys)
+        self.assertEqual(first["verdict"], "PASS")
+        # Missing local paths count per resolved path across the board.
+        gone = lambda: wire(inputs=[{"name": "harvest", "kind": "dir", "resolved_path": "/data/h1",
+                                     "daemon_hash": {"missing": True}}])
+        await self.put_profile("py", PROFILE)
+        await self.post(gone(), n=1)
+        other = wire(inputs=[{"name": "harvest", "kind": "dir", "resolved_path": "/data/h2",
+                              "daemon_hash": {"missing": True}}])
+        await self.post(other, n=1)
+        self.assertNotIn("input_void", await self.flags(), "two different paths are not a repeat")
+        await self.post(gone(), n=1)
+        self.assertEqual((await self.flags())["input_void"]["detail"]["locator"], "/data/h1")
+
+    async def test_changing_the_default_class_restales_inheriting_items(self):
+        inherits = await self.post(wire(), n=1)
+        await self.put_profile("other", PROFILE)
+        await self.item_set(n=2, gate_class="other")
+        pinned = await self.post(wire(), n=2)
+        await self.patch_board(EP, gate_default_class="other")
+        self.assertEqual((await self.receipts(n=1))["latest"]["gate"]["stale"]["reason"], "class_changed")
+        self.assertEqual((await self.receipts(n=2))["latest"]["gate"]["verdict"], "PASS",
+                         "an item with its own class keeps its receipt")
+        again = await self.post(wire(), n=1)
+        out = (await self.put_profile("py", PROFILE, default=True)).json()
+        self.assertIn(again["id"], out["restaled"])
+        self.assertNotIn(pinned["id"], out["restaled"])
+        self.assertNotEqual(inherits["id"], again["id"])
+
+    async def test_list_receipts_reads_only_the_latest_rows(self):
+        for _ in range(3):
+            await self.post(wire())
+        out = await self.receipts()
+        self.assertEqual(list(out["latest"]), ["gate"])
+        self.assertEqual(out["latest"]["gate"]["id"], f"r-{self.ref}-1-3")
+        hist = (await self.receipts(history=True))["history"]
+        self.assertEqual([h["id"] for h in hist], [f"r-{self.ref}-1-{i}" for i in (3, 2, 1)])
+        self.assertTrue(all("inputs" not in h and "closure" not in h for h in hist))
+        item = next(i for i in (await self.board())["items"] if i["n"] == 1)
+        self.assertEqual([st["name"] for st in item["gate"]["gate"]["steps"]], ["pytest", "mypy", "fetch"])
 
     async def test_unbound_db_window_is_incomplete(self):
         await self.put_profile("py", dict(PROFILE, inputs=[{"name": "ticks", "kind": "db"}]))
@@ -367,10 +438,10 @@ class GateApiDb(unittest.IsolatedAsyncioTestCase):
     async def test_derived_artifacts_cascade_and_changed_inputs_restale(self):
         producer = await self.post(wire())
         consumer = await self.post(wire(inputs=[
-            {"name": "harvest", "kind": "dir", "locator": "/data/harvest",
-             "content_id": "tree:" + "9" * 64},
-            {"name": "harvest_json", "kind": "artifact", "locator": "/l4/harvest.json",
-             "content_id": "sha256:" + "7" * 64, "produced_by": producer["id"]}]), n=2)
+            {"name": "harvest", "kind": "dir", "resolved_path": "/data/harvest",
+             "daemon_hash": {"content_id": "tree:" + "9" * 64}},
+            {"name": "harvest_json", "kind": "artifact", "resolved_path": "/l4/harvest.json",
+             "daemon_hash": {"content_id": "sha256:" + "7" * 64}, "produced_by": producer["id"]}]), n=2)
         self.assertEqual(consumer["verdict"], "PASS", consumer["headline"])
         await self.post(wire(head=HEAD2))  # the producer's head moved
         latest = (await self.receipts(n=2))["latest"]["gate"]
@@ -379,8 +450,8 @@ class GateApiDb(unittest.IsolatedAsyncioTestCase):
         # Rebinding a locator with new content restales its earlier readers.
         before = await self.post(wire(head=HEAD2))
         await self.post(wire(head=HEAD2, inputs=[{"name": "harvest", "kind": "dir",
-                                                  "locator": "/data/harvest",
-                                                  "content_id": "tree:" + "8" * 64}]), n=2)
+                                                  "resolved_path": "/data/harvest",
+                                                  "daemon_hash": {"content_id": "tree:" + "8" * 64}}]), n=2)
         hist = {h["id"]: h for h in (await self.receipts(history=True))["history"]}
         self.assertEqual(hist[before["id"]]["stale"]["reason"], "input_changed")
 

@@ -588,6 +588,12 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
                     {k: prev[k] for k in changed}, changed, now,
                 )
                 board.update(changed)
+                if "gate_default_class" in changed:
+                    from dispatch import gate_db
+
+                    await gate_db.default_class_changed(conn, board, actor, now,
+                                                        prev["gate_default_class"],
+                                                        changed["gate_default_class"])
             return await _board_header(conn, board, now)
 
 

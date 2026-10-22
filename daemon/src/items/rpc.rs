@@ -1022,7 +1022,10 @@ mod tests {
         let d = daemon_id(&state);
         let resp = call_gate(&state, "me-uid", "gate.report", json!({
             "n": 14, "head": "a".repeat(40), "klass": "py", "steps": [], "request_id": "rq",
-            "attestation": "self", "verdict": "PASS"}));
+            "attestation": "cm-gate", "verdict": "PASS",
+            "inputs": [{"name": "t", "kind": "db", "content_id": "snapshot:x",
+                        "verification": "hashed_at_run", "hashed_by": "cm-gate",
+                        "daemon_hash": {"content_id": "snapshot:x"}}]}));
         assert!(resp.ok, "{:?}", resp.error);
         let out = resp.result.unwrap();
         assert_eq!(out["receipt"]["verdict"], "VOID", "the API's verdict, not the poster's");
@@ -1032,6 +1035,11 @@ mod tests {
         assert_eq!(body["actor"]["pid"], format!("agent:{d}:me-uid"));
         assert_eq!(body["receipt"]["class"], "py");
         assert!(body["receipt"].get("verdict").is_none(), "a posted verdict is never forwarded");
+        assert!(body["receipt"].get("attestation").is_none(), "nor a posted attestation");
+        let input = &body["receipt"]["inputs"][0];
+        for key in ["verification", "hashed_by", "daemon_hash"] {
+            assert!(input.get(key).is_none(), "poster's {key} dropped: {input}");
+        }
         assert_eq!(body["request_id"], "rq");
         let missing = call_gate(&state, "me-uid", "gate.report", json!({"n": 14, "steps": []}));
         assert!(!missing.ok && missing.error.unwrap().message.contains("head is required"));

@@ -25,6 +25,42 @@ GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 
 
+def daemon_stamp(raw: dict) -> dict:
+    """What the reporting daemon does before forwarding (gate.rs stamp_input):
+    rehash file/dir inputs from resolved_path, in the documented manifest
+    format (files of a directory, then its subdirectories)."""
+    import hashlib
+
+    def file_sha(p: Path) -> str:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def walk(root: Path, d: Path, lines: list, total: list):
+        entries = sorted(d.iterdir(), key=lambda e: e.name)
+        for e in entries:
+            if e.is_file() and not e.is_symlink():
+                total[0] += e.stat().st_size
+                lines.append(f"{e.relative_to(root).as_posix()}\t{e.stat().st_size}\t{file_sha(e)}")
+        for e in entries:
+            if e.is_dir() and not e.is_symlink():
+                walk(root, e, lines, total)
+
+    for inp in raw.get("inputs", []):
+        path = inp.get("resolved_path")
+        if inp["kind"] not in ("file", "dir", "artifact") or not path:
+            continue
+        p = Path(path)
+        if p.is_file():
+            inp["daemon_hash"] = {"content_id": "sha256:" + file_sha(p), "bytes": p.stat().st_size}
+        elif p.is_dir():
+            lines, total = [], [0]
+            walk(p, p, lines, total)
+            inp["daemon_hash"] = {"content_id": "tree:" + hashlib.sha256("\n".join(lines).encode()).hexdigest(),
+                                  "bytes": total[0]}
+        else:
+            inp["daemon_hash"] = {"missing": True}
+    return raw
+
+
 def sh(cwd, *argv):
     return subprocess.run(argv, cwd=cwd, env=GIT_ENV, check=True, capture_output=True,
                           text=True).stdout.strip()
@@ -52,6 +88,7 @@ class CmGateRun(unittest.TestCase):
         (r / "tests" / "test_new.py").write_text(
             "import pkg\n\ndef test_new():\n    assert pkg.f() == 2\n")
         (r / "conftest.py").write_text("")
+        (r / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n*.log\n")
         sh(r, "git", "add", ".")
         sh(r, "git", "commit", "-qm", "mf: new test fails")
         self.mf = sh(r, "git", "rev-parse", "HEAD")
@@ -72,14 +109,15 @@ class CmGateRun(unittest.TestCase):
                 {"name": "fetch", "kind": "rc", "argv": ["true"], "void_on_fail": True},
             ],
             "base": {"ref": "main", "scope": "paths"},
-            "inputs": [{"name": "harvest", "kind": "dir", "root_env": "HARVEST"}],
+            "inputs": [{"name": "harvest", "kind": "dir", "root_env": "HARVEST"},
+                       {"name": "nodes", "kind": "file", "root_env": "HARVEST", "path": "nodes.json"}],
             "allowed_env": ["HARVEST"],
         }
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_gate(self, profile=None, *extra, env=None):
+    def run_gate(self, profile=None, *extra, env=None, code=0, raw=False):
         pf = Path(self.tmp.name) / "profile.json"
         pf.write_text(json.dumps(profile or self.profile))
         proc = subprocess.run(
@@ -88,8 +126,13 @@ class CmGateRun(unittest.TestCase):
             cwd=self.repo, capture_output=True, text=True,
             env={**os.environ, "CM_GATE_LOG_DIR": str(self.logs), "HARVEST": str(self.harvest),
                  **(env or {})})
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        receipt = g.normalize_receipt(json.loads(proc.stdout))
+        self.assertEqual(proc.returncode, code, proc.stderr)
+        if code:
+            return proc
+        posted = json.loads(proc.stdout)
+        if raw:
+            return posted
+        receipt = g.normalize_receipt(daemon_stamp(posted))
         prof = g.validate_profile(profile or self.profile)
         return receipt, g.evaluate(receipt, prof, [])
 
@@ -108,8 +151,10 @@ class CmGateRun(unittest.TestCase):
         self.assertEqual(pt["skips"], [{"node": "tests/test_pkg.py::test_cuda",
                                         "reason": "requires CUDA"}])
         self.assertEqual(len(pt["granted_nodes"]), 4)
-        self.assertEqual(receipt["inputs"][0]["verification"], "hashed_at_run")
+        self.assertEqual([i["verification"] for i in receipt["inputs"]], ["hashed_at_run"] * 2)
         self.assertTrue(receipt["inputs"][0]["content_id"].startswith("tree:"))
+        self.assertNotIn("poster_content_id", receipt["inputs"][0], "cm-gate and the daemon agree")
+        self.assertEqual(receipt["attestation"], "self")
         self.assertFalse(receipt["worktree"]["dirty_before"])
         self.assertIn("pkg.py", receipt["closure"]["paths"])
         self.assertEqual(receipt["branch"], "lane")
@@ -148,6 +193,54 @@ class CmGateRun(unittest.TestCase):
                                                        "extra_args": ["-q"]}}}))
         _, v = self.run_gate(None, "--override", str(ov))
         self.assertEqual(v["verdict"], "PASS", self.texts(v))
+
+    def test_without_the_daemons_rehash_nothing_is_hashed_at_run(self):
+        posted = self.run_gate(raw=True)
+        self.assertNotIn("attestation", posted)
+        receipt = g.normalize_receipt(posted)
+        self.assertEqual({i["verification"] for i in receipt["inputs"]}, {"self_supplied_unverified"})
+        v = g.evaluate(receipt, g.validate_profile(self.profile), [])
+        self.assertEqual(v["verdict"], "INCOMPLETE")
+
+    def test_root_env_and_path_are_joined_and_resolved(self):
+        posted = self.run_gate(raw=True)
+        nodes = next(i for i in posted["inputs"] if i["name"] == "nodes")
+        want = str((self.harvest / "nodes.json").resolve())
+        self.assertEqual((nodes["locator"], nodes["resolved_path"]), (want, want))
+        harvest = next(i for i in posted["inputs"] if i["name"] == "harvest")
+        self.assertEqual(harvest["locator"], str(self.harvest.resolve()), "never the literal $HARVEST")
+        (self.harvest / "nodes.json").unlink()
+        receipt, v = self.run_gate()
+        self.assertEqual(v["verdict"], "VOID", self.texts(v))
+        self.assertIn("input nodes missing", self.texts(v))
+        _, v = self.run_gate(env={"HARVEST": ""})
+        self.assertEqual(v["verdict"], "VOID")
+
+    def test_untracked_files_make_the_tree_dirty_but_ignored_ones_do_not(self):
+        (self.repo / "run.log").write_text("ignored")
+        receipt, v = self.run_gate()
+        self.assertFalse(receipt["worktree"]["dirty_before"])
+        self.assertEqual(v["verdict"], "PASS", self.texts(v))
+        (self.repo / "stray.py").write_text("x = 1\n")
+        receipt, v = self.run_gate()
+        self.assertTrue(receipt["worktree"]["dirty_before"])
+        self.assertEqual(v["verdict"], "INCOMPLETE")
+
+    def test_stderr_noise_cannot_push_the_summary_out(self):
+        (self.repo / "conftest.py").write_text(
+            "import sys\n\ndef pytest_sessionfinish(session):\n"
+            "    for i in range(500):\n        print('noise', i, file=sys.stderr)\n")
+        sh(self.repo, "git", "commit", "-qam", "noisy")
+        receipt, v = self.run_gate()
+        self.assertEqual(v["verdict"], "PASS", self.texts(v))
+        pt = next(s for s in receipt["steps"] if s["name"] == "pytest")
+        self.assertNotIn("noise", pt["summary"])
+
+    def test_option_shaped_refs_are_refused_before_git_runs(self):
+        prof = json.loads(json.dumps(self.profile))
+        prof["base"]["ref"] = "--output=/tmp/x"
+        proc = self.run_gate(prof, code=5)
+        self.assertIn("is not a plain git ref", proc.stderr)
 
     def test_a_dirty_tree_is_incomplete(self):
         (self.repo / "pkg.py").write_text("def f():\n    return 2  # edited\n")

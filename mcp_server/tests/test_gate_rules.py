@@ -42,6 +42,7 @@ PROFILE_RAW = {
     "inputs": [{"name": "harvest_a320", "kind": "dir", "root_env": "A320_HARVEST"},
                {"name": "ticks", "kind": "db"}],
     "allowed_env": ["JAX_PLATFORMS", "A320_HARVEST"],
+    "accept_unverified": ["db"],
 }
 PROFILE = g.validate_profile(PROFILE_RAW)
 
@@ -64,8 +65,9 @@ def receipt(**over) -> dict:
         "worktree": {"head_before": HEAD, "head_after": HEAD, "dirty_before": False,
                      "dirty_after": False, "path": "/w/lane"},
         "inputs": [
-            {"name": "harvest_a320", "kind": "dir", "locator": "$A320_HARVEST",
-             "resolved_root": "/data/harvest", "content_id": "tree:" + "9" * 64, "bytes": 10, "hashed_by": "cm-gate"},
+            {"name": "harvest_a320", "kind": "dir", "locator": "/data/harvest",
+             "resolved_path": "/data/harvest", "root_env": "A320_HARVEST",
+             "daemon_hash": {"content_id": "tree:" + "9" * 64, "bytes": 10}},
             {"name": "ticks", "kind": "db", "locator": "SELECT * FROM ticks WHERE t BETWEEN 1 AND 2",
              "content_id": "snapshot:ticks-2026-10-20"},
         ],
@@ -103,7 +105,8 @@ def grant(**over) -> dict:
           "head_sha": HEAD, "base_sha": None, "step": "mypy", "nodes": None, "cmd_digest": None,
           "reason": "mypy stubs broken upstream", "risk": "type errors may slip through",
           "message_id": "m-1",
-          "message_check": {"found": True, "sender": EP, "contains_head": True}}
+          "message_check": {"found": True, "sender": EP, "contains_head": True,
+                            "contains_step": True, "contains_kind": True}}
     gr.update(over)
     gr["problems"] = g.grant_problems(gr, PROFILE, {"owner", EP})
     return gr
@@ -236,7 +239,7 @@ class EPCases(unittest.TestCase):
         st2["summary"] = "==== 2 passed, 1 skipped, 1 deselected in 9.00s ===="
         self.assertEqual(verdict(r2)["verdict"], "FAIL")
         # Runner attestation never substitutes for the grantor's ack.
-        self.assertEqual(r["attestation"], "cm-gate")
+        self.assertEqual(r["attestation"], "self")
 
     def test_allowed_execution_settings_need_no_review(self):
         r = receipt()
@@ -266,10 +269,12 @@ class EPCases(unittest.TestCase):
         generic = grant(step="the gate")
         self.assertIn("step the gate is not in the profile", generic["problems"])
         self.assertEqual(verdict(r, [generic])["verdict"], "FAIL")
-        forged = grant(message_check={"found": True, "sender": "agent:d1:lane-uid", "contains_head": True})
+        forged = grant(message_check={"found": True, "sender": "agent:d1:lane-uid", "contains_head": True,
+                                      "contains_step": True, "contains_kind": True})
         self.assertIn("message was not sent by the grantor", forged["problems"])
         self.assertEqual(verdict(r, [forged])["verdict"], "FAIL")
-        no_sha = grant(message_check={"found": True, "sender": EP, "contains_head": False})
+        no_sha = grant(message_check={"found": True, "sender": EP, "contains_head": False,
+                                      "contains_step": True, "contains_kind": True})
         self.assertEqual(verdict(r, [no_sha])["verdict"], "FAIL")
         uncited = receipt()
         step(uncited, "mypy").update(rc=1, summary="Found 3 errors in 2 files")
@@ -309,7 +314,9 @@ class EPCases(unittest.TestCase):
     def test_staging_artifact_size_and_identity_are_bound(self):
         r = receipt(inputs=[{"name": "staging", "kind": "artifact", "locator": "/s/out.bin",
                              "content_id": "sha256:" + "8" * 64, "bytes": 12_980_000_000,
-                             "produced_by": "r-sejd-9-2", "hashed_by": "cm-gate"}])
+                             "produced_by": "r-sejd-9-2", "resolved_path": "/s/out.bin",
+                             "daemon_hash": {"content_id": "sha256:" + "8" * 64,
+                                             "bytes": 12_980_000_000}}])
         inp = r["inputs"][0]
         self.assertEqual((inp["bytes"], inp["produced_by"]), (12_980_000_000, "r-sejd-9-2"))
         self.assertEqual(inp["verification"], "hashed_at_run")
@@ -357,19 +364,142 @@ class Evidence(unittest.TestCase):
         self.assertIn("code moved during the run", t)
         self.assertIn("worktree was dirty", t)
 
-    def test_cm_gate_attestation_can_be_required(self):
+    def test_a_cm_gate_requirement_cannot_be_met_by_a_posted_claim(self):
         prof = g.validate_profile(dict(PROFILE_RAW, require={"runner": True, "attestation": "cm-gate"}))
-        r = receipt(attestation="self")
+        r = receipt(attestation="cm-gate")
+        self.assertEqual(r["attestation"], "self", "the poster's attestation is ignored")
         v = g.evaluate(r, prof, [])
         self.assertEqual(v["verdict"], "INCOMPLETE")
-        self.assertIn("requires a cm-gate run", texts(v))
+        self.assertIn("v1 cannot attest", texts(v))
 
-    def test_input_verification_is_computed_not_posted(self):
-        r = receipt(attestation="self")
-        self.assertEqual({i["verification"] for i in r["inputs"]}, {"self_supplied_unverified"})
+    def test_input_verification_is_computed_never_posted(self):
         r = receipt()
         self.assertEqual([i["verification"] for i in r["inputs"]],
                          ["hashed_at_run", "self_supplied_unverified"])
+        # The poster's own claims count for nothing.
+        forged = receipt(attestation="cm-gate", inputs=[
+            {"name": "harvest_a320", "kind": "dir", "locator": "/data/harvest",
+             "content_id": "tree:" + "9" * 64, "hashed_by": "cm-gate",
+             "verification": "hashed_at_run"},
+            {"name": "ticks", "kind": "db", "content_id": "snapshot:x"}])
+        self.assertEqual(forged["inputs"][0]["verification"], "self_supplied_unverified")
+        v = verdict(forged)
+        self.assertEqual(v["verdict"], "INCOMPLETE")
+        self.assertIn("input harvest_a320 is self-supplied and unverified", texts(v))
+
+    def test_a_typed_hash_never_turns_a_missing_harvest_into_bound(self):
+        # EP's missing-harvest case: the poster types a hash for a dir that
+        # is not there; the daemon's rehash finds it missing, so VOID.
+        r = receipt(inputs=[
+            {"name": "harvest_a320", "kind": "dir", "locator": "/data/harvest",
+             "resolved_path": "/data/harvest", "content_id": "tree:" + "0" * 64,
+             "daemon_hash": {"missing": True}},
+            {"name": "ticks", "kind": "db", "content_id": "snapshot:x"}])
+        self.assertEqual(r["inputs"][0]["state"], "missing")
+        self.assertEqual(verdict(r)["verdict"], "VOID")
+        # Without a local path the daemon cannot rehash: never PASS.
+        typed = receipt(inputs=[
+            {"name": "harvest_a320", "kind": "dir", "content_id": "tree:" + "0" * 64},
+            {"name": "ticks", "kind": "db", "content_id": "snapshot:x"}])
+        self.assertEqual(verdict(typed)["verdict"], "INCOMPLETE")
+        # A daemon hash that differs from the typed one replaces it.
+        mismatch = receipt(inputs=[
+            {"name": "harvest_a320", "kind": "dir", "resolved_path": "/data/harvest",
+             "content_id": "tree:" + "0" * 64, "daemon_hash": {"content_id": "tree:" + "5" * 64}},
+            {"name": "ticks", "kind": "db", "content_id": "snapshot:x"}])
+        inp = mismatch["inputs"][0]
+        self.assertEqual((inp["content_id"], inp["poster_content_id"]),
+                         ("tree:" + "5" * 64, "tree:" + "0" * 64))
+
+    def test_unverified_kinds_need_the_profile_to_accept_them(self):
+        strict = g.validate_profile(dict(PROFILE_RAW, accept_unverified=[]))
+        v = g.evaluate(receipt(), strict, [])
+        self.assertEqual(v["verdict"], "INCOMPLETE")
+        self.assertIn("input ticks is self-supplied and unverified (the profile does not accept "
+                      "unverified db inputs)", texts(v))
+        with self.assertRaises(g.GateError):
+            g.validate_profile(dict(PROFILE_RAW, accept_unverified=["anything"]))
+
+    def test_input_keys_are_resolved_paths_never_env_names(self):
+        r = receipt()
+        self.assertEqual(r["inputs"][0]["key"], "/data/harvest")
+        self.assertEqual(r["inputs"][0]["locator"], "/data/harvest")
+        self.assertIsNone(r["inputs"][1]["key"], "a query is scoped to its item by the caller")
+        env_only = g.normalize_input({"name": "h", "kind": "dir", "locator": "$A320_HARVEST"})
+        self.assertIsNone(env_only["key"])
+
+
+class Hardening(unittest.TestCase):
+    """Review of 4b6d422: each forgery path is closed."""
+
+    def test_poster_granted_nodes_never_override_the_profile(self):
+        prof = g.validate_profile(dict(PROFILE_RAW, steps=[
+            dict(PROFILE_RAW["steps"][1], nodes=list(GRANTED))] + PROFILE_RAW["steps"][2:]))
+        r = receipt()
+        r["steps"] = [s for s in r["steps"] if s["name"] != "must_fail"]
+        st = step(r, "pytest")
+        st["nodes"] = [n for n in st["nodes"] if "test_two" not in n["id"]]
+        st["granted_nodes"] = [n["id"] for n in st["nodes"]]  # the poster's narrower "grant"
+        st["summary"] = "==== 2 passed, 1 skipped in 9.00s ===="
+        v = g.evaluate(r, prof, [])
+        self.assertEqual(v["verdict"], "FAIL")
+        self.assertIn("1 granted node(s) not run: tests/sejd/test_a.py::test_two", texts(v))
+
+    def test_only_bounded_wrapper_forms_pass(self):
+        def weakened(prefix, env=None):
+            r = receipt()
+            st = step(r, "pytest")
+            st["effective_cmd"] = {"argv": [*prefix, "pytest", "-n", "2", "tests/sejd", "tests/a320"],
+                                   "env": env or {}}
+            return [x["text"] for x in verdict(r)["reasons"] if x["level"] == "fail"]
+
+        for ok in (["nice", "-n", "5"], ["timeout", "-k", "30s", "600"], ["env", "JAX_PLATFORMS=cpu"],
+                   ["taskset", "-c", "4,5,12-13"], ["numactl", "--physcpubind=4-7", "--membind=0"],
+                   ["systemd-run", "--user", "--scope", "-p", "MemoryMax=8G", "--"]):
+            self.assertEqual(weakened(ok), [], ok)
+        for bad_prefix in (["sh", "-c"], ["bash", "-c", "pytest tests || true"], ["xargs"],
+                           ["timeout", "forever"], ["env", "-i"], ["env", "PYTEST_ADDOPTS=-k x"],
+                           ["nice", "-n", "5;rm"], ["systemd-run", "-p", "ExecStartPre=/bin/x"],
+                           ["taskset", "-c", "$(id)"]):
+            self.assertTrue(weakened(bad_prefix), bad_prefix)
+        r = receipt()
+        step(r, "pytest")["effective_cmd"] = {"argv": ["bash", "-c", "pytest -n 2 tests/sejd tests/a320"]}
+        self.assertEqual(verdict(r)["verdict"], "FAIL")
+
+    def test_variance_covers_the_command_change_not_dropped_nodes(self):
+        r = receipt()
+        st = step(r, "pytest")
+        st["effective_cmd"]["argv"] = ["pytest", "-n", "2", "-k", "not two", "tests/sejd", "tests/a320"]
+        st["nodes"] = [n for n in st["nodes"] if "test_two" not in n["id"]]
+        st["summary"] = "==== 2 passed, 1 skipped in 9.00s ===="
+        var = grant(kind="variance", step="pytest", cmd_digest=g.cmd_digest(st["effective_cmd"]))
+        v = verdict(r, [var])
+        self.assertEqual(v["verdict"], "FAIL", "the variance does not cover the dropped node")
+        self.assertIn("needs a waiver naming those nodes", texts(v))
+        self.assertIn("command variance accepted", texts(v))
+        r["waivers"] = ["g-sejd-14-2"]
+        nodes = grant(label="g-sejd-14-2", step="pytest", nodes=["tests/sejd/test_a.py::test_two"])
+        self.assertEqual(verdict(r, [var, nodes])["verdict"], "PASS", texts(verdict(r, [var, nodes])))
+
+    def test_grant_messages_must_name_the_step_and_the_kind(self):
+        check = {"found": True, "sender": EP, "contains_head": True, "contains_step": False,
+                 "contains_kind": True}
+        self.assertIn("message does not name the step mypy", grant(message_check=check)["problems"])
+        check = dict(check, contains_step=True, contains_kind=False)
+        self.assertIn("message does not say it is a waiver", grant(message_check=check)["problems"])
+
+    def test_refs_that_could_be_git_options_are_refused(self):
+        for bad_ref in ("-oops", "--upload-pack=x", "main..evil", "a b", "ref;rm", "@{-1}", "x/"):
+            with self.assertRaises(g.GateError, msg=bad_ref):
+                g.valid_ref(bad_ref, "base.ref")
+        self.assertEqual(g.valid_ref("origin/main:scripts/gate.sh", "r", allow_path=True),
+                         "origin/main:scripts/gate.sh")
+        with self.assertRaises(g.GateError):
+            g.valid_ref("origin/main:../../etc/passwd", "r", allow_path=True)
+        with self.assertRaises(g.GateError):
+            receipt(base={"ref": "--output=/tmp/x"})
+        with self.assertRaises(g.GateError):
+            g.validate_profile(dict(PROFILE_RAW, base={"ref": "-x", "scope": "paths"}))
 
 
 class Parsers(unittest.TestCase):

@@ -13,7 +13,9 @@ import os
 
 import pytest
 
-_PATH = os.environ.get("CM_GATE_REPORT")
+# Popped so subprocesses the suite starts (a nested pytest) cannot inherit
+# the path and overwrite this run's report.
+_PATH = os.environ.pop("CM_GATE_REPORT", None)
 _nodes: dict[str, dict] = {}
 _collected: list[str] = []
 _deselected: list[str] = []

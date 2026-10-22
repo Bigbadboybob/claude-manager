@@ -58,6 +58,17 @@ def _row_grant(row, slug: str, n: int) -> dict:
     }
 
 
+def input_key(inp: dict, item_id: int) -> str:
+    """Scope of an input's identity: its resolved path or object URL, else
+    this item and the input's name (never a bare name or "$ENV")."""
+    return inp.get("key") or f"item:{item_id}:{inp['name']}"
+
+
+def brief(steps: list[dict]) -> list[dict]:
+    return [{"name": st["name"], "state": st["state"], "rc": st.get("rc"),
+             "parsed": st.get("parsed")} for st in steps]
+
+
 def grantors(board: dict) -> set[str]:
     return {OWNER_PID, *(board.get("waiver_grantors") or [])}
 
@@ -192,12 +203,12 @@ async def _void_flags(conn, tx: BoardTx, board: dict, rec: dict, it):
                            f"runner VOID ×{len(rows)} on runner {gr.short(runner_sha)} in 24 h: "
                            "check the runner before another rerun.")
     for inp in rec["inputs"]:
-        if inp["state"] != "missing" or not inp["locator"]:
+        if inp["state"] != "missing":
             continue
         count = await conn.fetchval(
             """SELECT count(*) FROM item_receipt_inputs x JOIN item_receipts r ON r.id = x.receipt_id
                 WHERE r.board_id = $1 AND x.locator = $2 AND x.state = 'missing'
-                  AND r.posted_at >= $3""", _bid(board), inp["locator"], since)
+                  AND r.posted_at >= $3""", _bid(board), input_key(inp, rec["item_id"]), since)
         if count >= gr.VOID_REPEAT:
             fresh = "input_void" not in it.open_flags
             tx.raise_flag(it, "input_void", {"input": inp["name"], "locator": inp["locator"][:200],
@@ -298,9 +309,9 @@ async def post_receipt(pool, ref: str, actor: dict, n: int, raw: dict, *,
                 """INSERT INTO item_receipts (board_id, item_id, seq, gate, class, profile_version,
                        head_sha, mf_sha, runner, ruling_id, base, closure, worktree, inputs, steps,
                        waivers, repo, branch, log_path, attestation, computed, verdict,
-                       poster_pid, poster_daemon_id, request_id, posted_at)
+                       poster_pid, poster_daemon_id, request_id, posted_at, brief)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                           $21,$21,$22,$23,$24,$25) RETURNING id""",
+                           $21,$21,$22,$23,$24,$25,$26) RETURNING id""",
                 _bid(board), row["id"], seq, receipt["gate"], klass,
                 (profile or {}).get("version"), receipt["head_sha"], receipt["mf_sha"],
                 receipt["runner"], receipt["ruling_id"], receipt["base"], receipt["closure"],
@@ -308,14 +319,14 @@ async def post_receipt(pool, ref: str, actor: dict, n: int, raw: dict, *,
                                       for i in receipt["inputs"]],
                 receipt["steps"], receipt["waivers"], receipt["repo"], receipt["branch"],
                 receipt["log_path"], receipt["attestation"], verdict, actor["pid"],
-                actor.get("daemon_id"), request_id, now)
+                actor.get("daemon_id"), request_id, now, brief(receipt["steps"]))
             for inp in receipt["inputs"]:
                 await conn.execute(
                     """INSERT INTO item_receipt_inputs (receipt_id, name, locator, content_id, state,
                                                         produced_by)
                        VALUES ($1, $2, $3, $4, $5, $6)""",
-                    rid, inp["name"], inp["locator"] or f"(unnamed:{inp['name']})",
-                    inp["content_id"], inp["state"], inp.get("produced_by_id"))
+                    rid, inp["name"], input_key(inp, row["id"]), inp["content_id"], inp["state"],
+                    inp.get("produced_by_id"))
             rec = (await _receipts(conn, board, "r.id = $2", rid))[0]
             tx._event(it, "receipt_posted", new={
                 "receipt": rec["label"], "gate": rec["gate"], "verdict": verdict["verdict"],
@@ -331,14 +342,14 @@ async def post_receipt(pool, ref: str, actor: dict, n: int, raw: dict, *,
             # Any receipt on the board that bound another version of an input
             # this run read is stale (input_changed).
             for inp in rec["inputs"]:
-                if inp["state"] != "bound" or not inp["locator"]:
+                if inp["state"] != "bound":
                     continue
                 others = await _receipts(
                     conn, board,
                     """r.stale_at IS NULL AND r.id <> $2 AND r.id IN (
                            SELECT receipt_id FROM item_receipt_inputs
                             WHERE locator = $3 AND state = 'bound' AND content_id IS DISTINCT FROM $4)""",
-                    rid, inp["locator"], inp["content_id"])
+                    rid, input_key(inp, row["id"]), inp["content_id"])
                 for o in others:
                     await _mark_stale(conn, tx, board, [o], {
                         "reason": "input_changed", "prev": inp["name"], "new": rec["label"]})
@@ -393,6 +404,9 @@ async def _run_counts(conn, item_id: int, gate: str, head: str) -> dict:
 
 # ---- reading -------------------------------------------------------------------
 
+HISTORY_LIMIT = 50
+
+
 async def list_receipts(pool, ref: str, n: int, *, gate: str | None = None,
                         history: bool = False) -> dict:
     now = items_db.utcnow()
@@ -400,16 +414,17 @@ async def list_receipts(pool, ref: str, n: int, *, gate: str | None = None,
         board = await items_db._board_by_ref(conn, ref)
         row = await _item_row(conn, board, n)
         klass = effective_class(board, row)
-        recs = await _receipts(conn, board, "r.item_id = $2" + (" AND r.gate = $3" if gate else ""),
-                               row["id"], *([gate] if gate else []))
-        latest: dict[str, dict] = {}
-        for r in recs:
-            latest[r["gate"]] = r
+        gate_sql = " AND gate = $2" if gate else ""
+        args = [row["id"], *([gate] if gate else [])]
+        latest_rows = await conn.fetch(
+            f"""SELECT DISTINCT ON (gate) * FROM item_receipts
+                 WHERE item_id = $1{gate_sql} ORDER BY gate, id DESC""", *args)
         out_latest = {}
-        for g, r in latest.items():
-            pub = _public(r, now)
-            pub["runs"] = await _run_counts(conn, row["id"], g, r["head_sha"])
-            out_latest[g] = pub
+        for r in latest_rows:
+            rec = _row_receipt(r, board["slug"], n)
+            pub = _public(rec, now)
+            pub["runs"] = await _run_counts(conn, row["id"], rec["gate"], rec["head_sha"])
+            out_latest[rec["gate"]] = pub
         grants = (await _grants(conn, board, [row["id"]],
                                 {row["id"]: profile_for(board, klass)})).get(row["id"], [])
         out = {
@@ -418,8 +433,37 @@ async def list_receipts(pool, ref: str, n: int, *, gate: str | None = None,
             "grants": [_grant_public(x) for x in grants],
         }
         if history:
-            out["history"] = [_public(r, now, steps=False) for r in reversed(recs)]
+            # Bounded, and without the bulky evidence columns.
+            hist = await conn.fetch(
+                f"""SELECT id, item_id, seq, gate, class, profile_version, head_sha, mf_sha, runner,
+                           ruling_id, base, attestation, computed, verdict, stale_at, stale_reason,
+                           checked_at, poster_pid, posted_at, brief
+                      FROM item_receipts WHERE item_id = $1{gate_sql}
+                     ORDER BY id DESC LIMIT {HISTORY_LIMIT}""", *args)
+            out["history"] = [_compact(h, board["slug"], n, now) for h in hist]
         return out
+
+
+def _compact(r, slug: str, n: int, now: datetime) -> dict:
+    """A receipt row without steps, inputs or closure (board reads, history)."""
+    stale = r["stale_reason"] if r["stale_at"] else None
+    verdict = r["verdict"] or {}
+    out = {
+        "id": gr.receipt_label(slug, n, r["seq"]), "gate": r["gate"],
+        "verdict": "STALE" if stale else verdict.get("verdict"),
+        "was": verdict.get("verdict") if stale else None,
+        "headline": gr.headline(verdict, stale),
+        "reasons": [x for x in verdict.get("reasons", []) if x["level"] in gr.LEVELS][:5],
+        "stale": stale, "head": r["head_sha"], "attestation": r["attestation"],
+        "posted_at": iso(r["posted_at"]), "computed": (r["computed"] or {}).get("verdict"),
+        "steps": r["brief"] or [],
+    }
+    base = r["base"] or {}
+    if not stale and base.get("sha_after"):
+        age = int((now - (r["checked_at"] or r["posted_at"])).total_seconds())
+        if age >= gr.UNCHECKED_AFTER_S:
+            out["unchecked_s"] = age
+    return out
 
 
 def _grant_public(grant: dict) -> dict:
@@ -434,22 +478,19 @@ def _grant_public(grant: dict) -> dict:
 
 
 async def gate_summary(conn, board: dict, item_ids: list[int], now: datetime) -> dict:
-    """item_id -> {gate: compact latest receipt}, for board reads."""
+    """item_id -> {gate: compact latest receipt}, for board reads. Selects no
+    steps, inputs or closure: the stored `brief` carries the step lines."""
     if not item_ids:
         return {}
     rows = await conn.fetch(
-        """SELECT DISTINCT ON (r.item_id, r.gate) r.*, i.number FROM item_receipts r
-             JOIN items i ON i.id = r.item_id
+        """SELECT DISTINCT ON (r.item_id, r.gate) r.item_id, r.seq, r.gate, r.head_sha, r.base,
+                  r.attestation, r.computed, r.verdict, r.stale_at, r.stale_reason, r.checked_at,
+                  r.posted_at, r.brief, i.number
+             FROM item_receipts r JOIN items i ON i.id = r.item_id
             WHERE r.item_id = ANY($1::bigint[]) ORDER BY r.item_id, r.gate, r.id DESC""", item_ids)
     out: dict[int, dict] = {}
     for row in rows:
-        rec = _row_receipt(row, board["slug"], row["number"])
-        pub = _public(rec, now, steps=False)
-        out.setdefault(row["item_id"], {})[rec["gate"]] = {
-            k: pub.get(k) for k in ("id", "verdict", "was", "headline", "head", "stale",
-                                    "unchecked_s", "attestation", "posted_at")
-        } | {"reasons": [r for r in pub["reasons"] if r["level"] in gr.LEVELS][:5],
-             "steps": pub["steps"]}
+        out.setdefault(row["item_id"], {})[row["gate"]] = _compact(row, board["slug"], row["number"], now)
     return out
 
 
@@ -633,7 +674,8 @@ async def set_profile(pool, ref: str, actor: dict, klass: str, profile, *, reaso
                 profiles[klass] = norm
             else:
                 profiles.pop(klass, None)
-            default_class = klass if default and norm is not None else board.get("gate_default_class")
+            old_default = board.get("gate_default_class")
+            default_class = klass if default and norm is not None else old_default
             if norm is None and default_class == klass:
                 default_class = None
             await conn.execute(
@@ -648,10 +690,33 @@ async def set_profile(pool, ref: str, actor: dict, klass: str, profile, *, reaso
             restaled = await _mark_stale(conn, tx, board, live, {
                 "reason": "profile_changed", "prev": f"{klass} v{version - 1}",
                 "new": f"v{version}" if norm is not None else "deleted"})
+            if default_class != old_default:
+                restaled += await restale_default_change(conn, tx, board, old_default, default_class)
             await items_db._apply(conn, tx)
             return {"board": {"id": board["id"], "slug": board["slug"]}, "class": klass,
                     "profile": norm, "version": version, "default_class": default_class,
                     "restaled": restaled}
+
+
+async def restale_default_change(conn, tx: BoardTx, board: dict, old: str | None,
+                                 new: str | None) -> list[str]:
+    """A new default class changes the requirements of every item that
+    inherits it (no gate_class of its own): their live receipts are stale."""
+    live = await _receipts(
+        conn, board, """r.stale_at IS NULL AND r.item_id IN (
+            SELECT id FROM items WHERE board_id = $1 AND gate_class IS NULL)""")
+    return await _mark_stale(conn, tx, board, live, {
+        "reason": "class_changed", "prev": f"default {old or '(none)'}",
+        "new": f"default {new or '(none)'}"})
+
+
+async def default_class_changed(conn, board: dict, actor: dict, now: datetime,
+                                old: str | None, new: str | None) -> None:
+    """patch_board's hook, inside its transaction and board-row lock."""
+    items = await items_db._load_items(conn, board["id"])
+    tx = BoardTx(board, items, actor, now)
+    await restale_default_change(conn, tx, board, old, new)
+    await items_db._apply(conn, tx)
 
 
 # ---- item bindings (item_set head / mf / ruling / gate_class) --------------------------

@@ -28,7 +28,6 @@ NODE_OUTCOMES = ("passed", "failed", "error", "skipped", "xfailed", "xpassed", "
 RAN_OUTCOMES = frozenset({"passed", "failed", "error", "xfailed", "xpassed"})
 INPUT_KINDS = ("file", "dir", "gcs", "artifact", "db")
 INPUT_STATES = ("bound", "missing", "unbound")
-ATTESTATIONS = ("cm-gate", "self")
 GRANT_KINDS = ("waiver", "variance")
 SCOPES = ("paths", "tree")
 # Content-id prefixes each input kind accepts.
@@ -39,9 +38,10 @@ CONTENT_PREFIXES = {
     "artifact": ("sha256:", "tree:", "gcs:"),
     "db": ("snapshot:", "rows:"),
 }
-# v1 hashes these kinds itself when cm-gate runs (EP, 2026-10-22: every
-# receipt says which inputs are hashed at run time and which are not).
-CM_HASHED_KINDS = frozenset({"file", "dir", "gcs", "artifact"})
+# The reporting daemon rehashes these kinds itself from their local path
+# (EP, 2026-10-22: every receipt says which inputs are hashed at run time
+# and which are not; the poster's own claim never counts).
+DAEMON_HASHED_KINDS = frozenset({"file", "dir", "artifact"})
 DEFAULT_MF_EXC = "AssertionError"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_STEPS = 40
@@ -95,6 +95,26 @@ def _sha(value, name: str, *, required: bool = False) -> str | None:
     return text
 
 
+_REFNAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@+-]{0,199}$")
+_REFPATH_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._/@+-]{0,499}$")
+
+
+def valid_ref(value, name: str, *, allow_path: bool = False, required: bool = False) -> str | None:
+    """A git ref (`origin/main`, or `origin/main:scripts/gate.sh` with
+    allow_path) safe to hand to git: no leading `-`, no `..`, no odd
+    characters. The daemon also runs `git check-ref-format`."""
+    text = _str(value, name, 700, required=required)
+    if text is None:
+        return None
+    ref, _, path = text.partition(":") if allow_path else (text, "", "")
+    bad_ref = (not _REFNAME_RE.match(ref) or ".." in ref or "//" in ref or ref.endswith(("/", ".", ".lock"))
+               or "@{" in ref)
+    bad_path = bool(path) and (not _REFPATH_RE.match(path) or ".." in path.split("/"))
+    if bad_ref or bad_path or (":" in text and not allow_path):
+        raise bad(f"{name} {text!r} is not a plain git ref", name)
+    return text
+
+
 def _bool(value, name: str) -> bool:
     if not isinstance(value, bool):
         raise bad(f"{name} must be a boolean", name)
@@ -144,7 +164,7 @@ def short(sha: str | None) -> str:
 # ---- profiles --------------------------------------------------------------
 
 _PROFILE_KEYS = {"steps", "waivable", "require", "base", "inputs", "allowed_env", "closure_cmd",
-                 "runner_ref", "version", "class"}
+                 "runner_ref", "version", "class", "accept_unverified"}
 _STEP_KEYS = {"name", "kind", "required", "argv", "at", "nodes", "expect_fail", "min_passed",
               "max_failed", "xfail_counts_as_pass", "must_run", "skip_policy", "max_errors",
               "max_violations", "void_on_fail", "timeout_s", "cwd"}
@@ -245,7 +265,7 @@ def validate_profile(raw) -> dict:
         scope = base_raw.get("scope", "paths")
         if scope not in SCOPES:
             raise bad("base.scope is paths or tree", "base")
-        base = {"ref": _str(base_raw.get("ref"), "base.ref", 200, required=True), "scope": scope}
+        base = {"ref": valid_ref(base_raw.get("ref"), "base.ref", required=True), "scope": scope}
     inputs = []
     seen_inputs = set()
     for inp in raw.get("inputs") or []:
@@ -270,11 +290,16 @@ def validate_profile(raw) -> dict:
         "steps": steps, "waivable": waivable, "require": require, "base": base,
         "inputs": inputs,
         "allowed_env": _str_list(raw.get("allowed_env"), "allowed_env", 100, 200),
+        # Input kinds whose self-supplied identity this profile accepts as bound.
+        "accept_unverified": _str_list(raw.get("accept_unverified"), "accept_unverified", 5, 20),
     }
+    if set(out["accept_unverified"]) - set(INPUT_KINDS):
+        raise bad(f"accept_unverified takes input kinds ({', '.join(INPUT_KINDS)})",
+                  "accept_unverified")
     if raw.get("closure_cmd") is not None:
         out["closure_cmd"] = _str_list(raw["closure_cmd"], "closure_cmd", 100, 2000)
     if raw.get("runner_ref") is not None:
-        out["runner_ref"] = _str(raw["runner_ref"], "runner_ref", 500)
+        out["runner_ref"] = valid_ref(raw["runner_ref"], "runner_ref", allow_path=True)
     return out
 
 
@@ -367,7 +392,11 @@ def normalize_step(raw) -> dict:
     return step
 
 
-def normalize_input(raw, attestation: str) -> dict:
+def normalize_input(raw) -> dict:
+    """One input as stored. `verification` is computed here: an input is
+    `hashed_at_run` only when the reporting daemon rehashed it from its local
+    path (`daemon_hash`, which the daemon stamps after dropping anything the
+    poster sent under that name)."""
     if not isinstance(raw, dict):
         raise bad("inputs[] must be objects", "inputs")
     name = _str(raw.get("name"), "inputs[].name", 80, required=True)
@@ -378,30 +407,44 @@ def normalize_input(raw, attestation: str) -> dict:
     if state not in INPUT_STATES:
         raise bad(f"input {name}: state must be one of {', '.join(INPUT_STATES)}", "inputs")
     content_id = _str(raw.get("content_id"), "content_id", 300)
-    if state == "bound" and not content_id:
-        state = "unbound"
     produced_by = raw.get("produced_by")
     if produced_by is not None and not isinstance(produced_by, str):
         raise bad(f"input {name}: produced_by is a receipt id string", "inputs")
     size = raw.get("bytes")
     if size is not None:
         size = _int(size, "inputs[].bytes")
+    resolved = _str(raw.get("resolved_path"), "resolved_path", 1000)
+    verification = "self_supplied_unverified"
+    daemon = raw.get("daemon_hash")
+    poster_content_id = None
+    if isinstance(daemon, dict) and kind in DAEMON_HASHED_KINDS and resolved:
+        if daemon.get("missing"):
+            state, content_id = "missing", None
+        elif isinstance(daemon.get("content_id"), str):
+            if content_id and content_id != daemon["content_id"]:
+                poster_content_id = content_id
+            content_id, state = daemon["content_id"], "bound"
+            size = daemon.get("bytes") if isinstance(daemon.get("bytes"), int) else size
+            verification = "hashed_at_run"
+    if state == "bound" and not content_id:
+        state = "unbound"
+    locator = _str(raw.get("locator"), "locator", 1000) or ""
     out = {
         "name": name, "kind": kind, "state": state,
-        "locator": _str(raw.get("locator"), "locator", 1000) or "",
+        "locator": resolved or locator,
+        "resolved_path": resolved,
         "root_env": _str(raw.get("root_env"), "root_env", 200),
-        "resolved_root": _str(raw.get("resolved_root"), "resolved_root", 1000),
         "content_id": content_id,
         "bytes": size,
         "produced_by": produced_by,
+        "verification": verification,
     }
-    # Computed here, never taken from the poster.
-    # cm-gate marks the inputs it hashed itself; anything supplied on its
-    # command line, and every db identity, stays self-supplied.
-    out["verification"] = ("hashed_at_run"
-                           if attestation == "cm-gate" and raw.get("hashed_by") == "cm-gate"
-                           and kind in CM_HASHED_KINDS and state == "bound"
-                           else "self_supplied_unverified")
+    if poster_content_id:
+        out["poster_content_id"] = poster_content_id
+    # The key that scopes input_changed / input_void: a concrete local path
+    # or object URL; anything else is scoped to its item by the caller.
+    key = resolved or locator
+    out["key"] = key if key.startswith(("/", "gs://")) else None
     return out
 
 
@@ -412,9 +455,9 @@ def normalize_receipt(raw: dict) -> dict:
     verdict reason, not a refusal, so the evidence is kept."""
     if not isinstance(raw, dict):
         raise bad("receipt must be an object")
-    att = raw.get("attestation", "self")
-    if att not in ATTESTATIONS:
-        raise bad("attestation is cm-gate or self", "attestation")
+    # Attestation is never the poster's to claim: v1 has no daemon-verified
+    # run evidence, so every receipt is self-attested (doc §13).
+    att = "self"
     gate = raw.get("gate") or "gate"
     if not isinstance(gate, str) or not GATE_NAME_RE.match(gate):
         raise bad("gate must be lowercase [a-z0-9_.-], at most 40 characters", "gate")
@@ -427,20 +470,20 @@ def normalize_receipt(raw: dict) -> dict:
     inputs_raw = raw.get("inputs") or []
     if not isinstance(inputs_raw, list) or len(inputs_raw) > MAX_INPUTS:
         raise bad(f"inputs must be a list of at most {MAX_INPUTS}", "inputs")
-    inputs = [normalize_input(i, att) for i in inputs_raw]
+    inputs = [normalize_input(i) for i in inputs_raw]
     if len({i["name"] for i in inputs}) != len(inputs):
         raise bad("input names must be unique", "inputs")
     runner = raw.get("runner")
     if runner is not None:
         if not isinstance(runner, dict):
             raise bad("runner is {ref, sha}", "runner")
-        runner = {"ref": _str(runner.get("ref"), "runner.ref", 500, required=True),
+        runner = {"ref": valid_ref(runner.get("ref"), "runner.ref", allow_path=True, required=True),
                   "sha": _sha(runner.get("sha"), "runner.sha", required=True)}
     base = raw.get("base") or {}
     if not isinstance(base, dict):
         raise bad("base is an object", "base")
     base = {
-        "ref": _str(base.get("ref"), "base.ref", 200),
+        "ref": valid_ref(base.get("ref"), "base.ref"),
         "sha_before": _sha(base.get("sha_before"), "base.sha_before"),
         "sha_after": _sha(base.get("sha_after"), "base.sha_after"),
         "merge_tree_before": _tree(base.get("merge_tree_before"), "base.merge_tree_before"),
@@ -572,8 +615,17 @@ _OUTPUT_OPTS = {"-q", "-v", "-vv", "-vvv", "-s", "--tb", "-r", "--durations", "-
                 "-rs", "-rfE", "--basetemp", "-l", "--showlocals", "--log-level"}
 _FILTER_OPTS = {"-k", "-m", "--deselect", "--ignore", "--ignore-glob", "--lf", "--last-failed",
                 "--ff", "-x", "--exitfirst", "--maxfail", "--sw", "--stepwise"}
-_WRAPPERS = {"timeout", "taskset", "numactl", "systemd-run", "nice", "ionice", "env",
-             "chrt", "prlimit"}
+# Resource wrappers allowed before the granted program, each in a bounded
+# form only (§5). Anything else before the program (a shell, `sh -c`, an
+# unknown tool or option) is a weakened run.
+_DURATION_RE = re.compile(r"^\d+(\.\d+)?[smhd]?$")
+_INT_RE = re.compile(r"^-?\d{1,3}$")
+_CPUS_RE = re.compile(r"^(all|[0-9]{1,4}([,-][0-9]{1,4}){0,127})$")
+_MASK_RE = re.compile(r"^(0x)?[0-9a-fA-F]{1,64}$")
+_SIGNAL_RE = re.compile(r"^[A-Z0-9]{1,10}$")
+_PROP_RE = re.compile(r"^(MemoryMax|MemoryHigh|MemorySwapMax|CPUQuota|CPUWeight|TasksMax|IOWeight)"
+                      r"=[A-Za-z0-9.%]{1,20}$")
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
 def _split_opts(tokens: list[str], value_opts: set[str]) -> tuple[list[tuple[str, str | None]], list[str]]:
@@ -598,33 +650,154 @@ def _split_opts(tokens: list[str], value_opts: set[str]) -> tuple[list[tuple[str
     return opts, positional
 
 
-def _strip_wrappers(argv: list[str], program: str, allowed_env: set[str]) -> tuple[list[str], list[str]]:
-    """(problems, argv from the program on). Known resource wrappers before the
-    program are allowed; `env K=V` only for allowed keys."""
-    prog = os.path.basename(program)
-    idx = next((i for i, t in enumerate(argv) if os.path.basename(t) == prog), None)
-    if idx is None:
-        return [f"runs {argv[0] if argv else '(nothing)'} instead of {program}"], []
-    problems = []
-    prefix = argv[:idx]
-    i = 0
-    while i < len(prefix):
-        t = prefix[i]
-        base = os.path.basename(t)
-        if base not in _WRAPPERS:
-            problems.append(f"unrecognized command prefix {t!r}")
-            break
-        i += 1
-        # Consume the wrapper's own arguments: options, KEY=VALUE pairs,
-        # numbers/masks/durations, until the next wrapper.
-        while i < len(prefix) and os.path.basename(prefix[i]) not in _WRAPPERS:
-            arg = prefix[i]
-            if base == "env" and "=" in arg and not arg.startswith("-"):
-                key = arg.split("=", 1)[0]
-                if key not in allowed_env:
-                    problems.append(f"env {key} is not an allowed variable")
+def _opt_value(argv: list[str], i: int, short: str, long: str) -> tuple[str | None, int]:
+    """(value, next index) for `-x V`, `-xV` or `--long=V` at argv[i]."""
+    t = argv[i]
+    if long and t.startswith(long + "="):
+        return t[len(long) + 1:], i + 1
+    if t == short or (long and t == long):
+        return (argv[i + 1], i + 2) if i + 1 < len(argv) else (None, i + 1)
+    if short and t.startswith(short) and len(t) > len(short) and not t.startswith("--"):
+        return t[len(short):], i + 1
+    return None, i
+
+
+def _wrapper(argv: list[str], i: int, allowed_env: set[str]) -> tuple[int, list[str]]:
+    """Parse one wrapper at argv[i]; (index after it, problems)."""
+    name = os.path.basename(argv[i])
+    i += 1
+    problems: list[str] = []
+
+    def need(ok: bool, what: str):
+        if not ok:
+            problems.append(f"{name}: {what} is not an allowed form")
+
+    if name == "timeout":
+        while i < len(argv) and argv[i].startswith("-"):
+            t = argv[i]
+            if t in ("--preserve-status", "--foreground"):
+                i += 1
+                continue
+            v, j = _opt_value(argv, i, "-s", "--signal")
+            if j != i:
+                need(v is not None and _SIGNAL_RE.match(v) is not None, f"signal {v!r}")
+                i = j
+                continue
+            v, j = _opt_value(argv, i, "-k", "--kill-after")
+            if j != i:
+                need(v is not None and _DURATION_RE.match(v) is not None, f"kill-after {v!r}")
+                i = j
+                continue
+            need(False, f"option {t!r}")
+            return i + 1, problems
+        need(i < len(argv) and _DURATION_RE.match(argv[i]) is not None, "missing duration")
+        return i + 1, problems
+    if name == "nice":
+        if i < len(argv):
+            v, j = _opt_value(argv, i, "-n", "--adjustment")
+            if j != i:
+                need(v is not None and _INT_RE.match(v) is not None, f"adjustment {v!r}")
+                i = j
+            elif _INT_RE.match(argv[i]) and argv[i].startswith("-"):
+                i += 1  # old-style `nice -10`
+        return i, problems
+    if name == "ionice":
+        while i < len(argv) and argv[i].startswith("-"):
+            if argv[i] == "-t":
+                i += 1
+                continue
+            for short, long in (("-c", "--class"), ("-n", "--classdata")):
+                v, j = _opt_value(argv, i, short, long)
+                if j != i:
+                    need(v is not None and v.isdigit() and len(v) <= 2, f"{short} {v!r}")
+                    i = j
+                    break
+            else:
+                need(False, f"option {argv[i]!r}")
+                return i + 1, problems
+        return i, problems
+    if name == "taskset":
+        if i < len(argv) and argv[i] == "-a":
             i += 1
-    return problems, argv[idx:]
+        v, j = _opt_value(argv, i, "-c", "--cpu-list") if i < len(argv) else (None, i)
+        if j != i:
+            need(v is not None and _CPUS_RE.match(v) is not None, f"cpu list {v!r}")
+            return j, problems
+        need(i < len(argv) and _MASK_RE.match(argv[i]) is not None, "missing CPU mask")
+        return i + 1, problems
+    if name == "numactl":
+        while i < len(argv) and argv[i].startswith("-"):
+            if argv[i] in ("-l", "--localalloc"):
+                i += 1
+                continue
+            for short, long in (("-C", "--physcpubind"), ("-N", "--cpunodebind"),
+                                ("-m", "--membind"), ("-p", "--preferred"), ("-i", "--interleave")):
+                v, j = _opt_value(argv, i, short, long)
+                if j != i:
+                    need(v is not None and _CPUS_RE.match(v) is not None, f"{long} {v!r}")
+                    i = j
+                    break
+            else:
+                need(False, f"option {argv[i]!r}")
+                return i + 1, problems
+        return i, problems
+    if name == "systemd-run":
+        while i < len(argv) and argv[i].startswith("-"):
+            t = argv[i]
+            if t == "--":
+                return i + 1, problems
+            if t in ("--user", "--scope", "-q", "--quiet", "--collect", "-G"):
+                i += 1
+                continue
+            v, j = _opt_value(argv, i, "-p", "--property")
+            if j != i:
+                need(v is not None and _PROP_RE.match(v) is not None, f"property {v!r}")
+                i = j
+                continue
+            need(False, f"option {t!r}")
+            return i + 1, problems
+        return i, problems
+    if name == "env":
+        while i < len(argv) and "=" in argv[i] and not argv[i].startswith("-"):
+            key = argv[i].split("=", 1)[0]
+            if not _ENV_KEY_RE.match(key) or key not in allowed_env:
+                problems.append(f"env {key} is not an allowed variable")
+            i += 1
+        if i < len(argv) and argv[i].startswith("-"):
+            need(False, f"option {argv[i]!r}")
+            i += 1
+        return i, problems
+    return i, [f"unrecognized command prefix {argv[i - 1]!r}"]
+
+
+_WRAPPERS = {"timeout", "nice", "ionice", "taskset", "numactl", "systemd-run", "env"}
+
+
+def _program_len(granted: list[str]) -> int:
+    """`python -m pytest` is one program of three tokens."""
+    if len(granted) >= 3 and os.path.basename(granted[0]).startswith("python") \
+            and granted[1] == "-m":
+        return 3
+    return 1
+
+
+def _strip_wrappers(argv: list[str], granted: list[str], allowed_env: set[str]) -> tuple[list[str], list[str]]:
+    """(problems, argv from the program on). Only bounded wrapper forms may
+    precede the granted program; anything else is a weakened run."""
+    k = _program_len(granted)
+    problems: list[str] = []
+    i = 0
+    while i < len(argv):
+        if os.path.basename(argv[i]) == os.path.basename(granted[0]) and argv[i + 1:i + k] == granted[1:k]:
+            return problems, argv[i:]
+        if os.path.basename(argv[i]) not in _WRAPPERS:
+            problems.append(f"unrecognized command prefix {argv[i]!r} (shells and other tools "
+                            "before the program need a grant)")
+            break
+        i, more = _wrapper(argv, i, allowed_env)
+        problems += more
+    shown = " ".join(granted[:k])
+    return problems or [f"does not run the granted program {shown!r}"], []
 
 
 def _pytest_diff(granted: list[str], effective: list[str]) -> list[str]:
@@ -679,14 +852,14 @@ def command_diff(step_profile: dict, step: dict, allowed_env: set[str]) -> list[
     cmd = step.get("effective_cmd")
     if not cmd or not cmd.get("argv"):
         return ["no effective command recorded"]
-    problems, effective = _strip_wrappers(cmd["argv"], granted[0], allowed_env)
+    problems, effective = _strip_wrappers(cmd["argv"], granted, allowed_env)
     if effective:
+        k = _program_len(granted)
         if step_profile["kind"] == "pytest":
-            problems += _pytest_diff(granted, effective)
+            problems += _pytest_diff(granted[k - 1:], effective[k - 1:])
         else:
-            g = [t for t in granted[1:]]
-            e = [t for t in effective[1:] if t not in _OUTPUT_OPTS]
-            g = [t for t in g if t not in _OUTPUT_OPTS]
+            g = [t for t in granted[k:] if t not in _OUTPUT_OPTS]
+            e = [t for t in effective[k:] if t not in _OUTPUT_OPTS]
             if e != g:
                 problems.append(f"arguments {' '.join(e)!r} differ from the grant {' '.join(g)!r}")
     for key in sorted((cmd.get("env") or {})):
@@ -695,23 +868,30 @@ def command_diff(step_profile: dict, step: dict, allowed_env: set[str]) -> list[
     return problems
 
 
-def node_diff(step_profile: dict, step: dict, covered: set[str] = frozenset()) -> tuple[list[str], list[str]]:
-    """(shrinkage problems, incomplete reasons) of the executed node set.
-    Nodes a verified waiver covers are not counted as missing."""
+def node_diff(step_profile: dict, step: dict, covered: set[str] = frozenset()) -> tuple[list[str], list[str], list[str]]:
+    """(shrinkage, incomplete reasons, notes) of the executed node set.
+
+    The grant is the profile's `nodes` when it lists them; the runner's own
+    collection is used only when it does not, and is reported as such. Nodes
+    a verified waiver covers are not counted as missing."""
     nodes = step.get("nodes")
     if nodes is None:
-        return [], []
+        return [], [], []
     executed = {n["id"] for n in nodes if n["outcome"] != "deselected"}
-    granted = step.get("granted_nodes")
-    if granted is None and step_profile.get("nodes"):
-        granted = step_profile["nodes"]
-    if granted is None:
-        return [], ["granted node set was not collected, so the selection cannot be checked"]
+    notes: list[str] = []
+    if step_profile.get("nodes"):
+        granted = list(step_profile["nodes"])
+    elif step.get("granted_nodes") is not None:
+        granted = step["granted_nodes"]
+        notes.append("granted set is the runner's own collection of the profile's argv "
+                     "(unverified); list nodes in the profile to pin it")
+    else:
+        return [], ["granted node set was not collected, so the selection cannot be checked"], []
     missing = [g for g in granted if g not in executed and g not in covered]
     if not missing:
-        return [], []
+        return [], [], notes
     sample = ", ".join(missing[:3]) + (f" (+{len(missing) - 3})" if len(missing) > 3 else "")
-    return [f"{len(missing)} granted node(s) not run: {sample}"], []
+    return [f"{len(missing)} granted node(s) not run: {sample}"], [], notes
 
 
 # ---- grants (§4) -------------------------------------------------------------
@@ -730,9 +910,13 @@ def grant_problems(grant: dict, profile: dict | None, grantors: set[str]) -> lis
         if check.get("sender") != grant["grantor_pid"]:
             problems.append("message was not sent by the grantor")
         if not check.get("contains_head"):
-            problems.append("message does not name the head SHA")
+            problems.append("message does not name the full head SHA")
         if grant.get("base_sha") and not check.get("contains_base"):
-            problems.append("message does not name the base SHA")
+            problems.append("message does not name the full base SHA")
+        if not check.get("contains_step"):
+            problems.append(f"message does not name the step {grant['step']}")
+        if not check.get("contains_kind"):
+            problems.append(f"message does not say it is a {grant['kind']}")
     if not (grant.get("reason") or "").strip() or not (grant.get("risk") or "").strip():
         problems.append("reason and risk are required")
     step = profile_step(profile, grant["step"])
@@ -928,8 +1112,11 @@ def _eval_simple(sp: dict, st: dict) -> list[dict]:
 
 
 def _eval_inputs(receipt: dict, profile: dict) -> list[dict]:
+    """A required input is bound only when the reporting daemon hashed it
+    (`hashed_at_run`), or the profile accepts unverified inputs of its kind."""
     out = []
     have = {i["name"]: i for i in receipt["inputs"]}
+    accepted = set(profile.get("accept_unverified") or [])
     for decl in profile.get("inputs", []):
         inp = have.get(decl["name"])
         if not decl["required"]:
@@ -951,6 +1138,12 @@ def _eval_inputs(receipt: dict, profile: dict) -> list[dict]:
         elif not inp["content_id"].startswith(CONTENT_PREFIXES[inp["kind"]]):
             out.append(_r("incomplete", f"input {decl['name']}: content id must start with "
                           f"{' or '.join(CONTENT_PREFIXES[inp['kind']])}"))
+        elif inp["verification"] != "hashed_at_run" and inp["kind"] not in accepted:
+            how = ("the daemon could not rehash it from a local path"
+                   if inp["kind"] in DAEMON_HASHED_KINDS else
+                   f"the profile does not accept unverified {inp['kind']} inputs")
+            out.append(_r("incomplete", f"input {decl['name']} is self-supplied and unverified "
+                          f"({how})"))
     return out
 
 
@@ -965,8 +1158,10 @@ def evaluate(receipt: dict, profile: dict | None, grants: list[dict], *,
         reasons.append(_r("incomplete", f"no gate profile for class {klass or '(default)'}"))
         return _combine(reasons)
     req = profile["require"]
-    if req.get("attestation") == "cm-gate" and receipt["attestation"] != "cm-gate":
-        reasons.append(_r("incomplete", "profile requires a cm-gate run; this receipt is self-attested"))
+    if req.get("attestation") == "cm-gate":
+        reasons.append(_r("incomplete", "profile requires a CM-verified run, which v1 cannot "
+                          "attest (daemon-verified run evidence is deferred); this receipt is "
+                          "self-attested"))
     if req.get("mf_sha") and not receipt.get("mf_sha"):
         reasons.append(_r("incomplete", "no MF SHA"))
     if req.get("runner") and not receipt.get("runner"):
@@ -1023,21 +1218,29 @@ def evaluate(receipt: dict, profile: dict | None, grants: list[dict], *,
                                    + (f" ({st['reason']})" if st.get("reason") else ""), name))
         else:
             weak = command_diff(sp, st, allowed_env)
+            shrink: list[str] = []
             if sp["kind"] == "pytest":
-                shrink, unknown = node_diff(sp, st, covered_nodes)
-                weak += shrink
+                shrink, unknown, notes = node_diff(sp, st, covered_nodes)
                 step_reasons += [_r("incomplete", f"{name}: {u}", name) for u in unknown]
+                step_reasons += [_r("note", f"{name}: {n}", name) for n in notes]
             if weak:
+                # A variance grant accepts exactly the command change it
+                # names (argv/env digest), never dropped nodes.
                 variance, v_notes = _covering(grants, receipt, name, "variance")
                 digest = cmd_digest(st.get("effective_cmd"))
-                if any(g.get("cmd_digest") == digest for g in variance):
-                    reasons.append(_r("waived", f"{name}: variance accepted by "
-                                      f"{next(g['label'] for g in variance if g.get('cmd_digest') == digest)}",
-                                      name))
+                accepted = next((g for g in variance if g.get("cmd_digest") == digest), None)
+                if accepted:
+                    reasons.append(_r("waived", f"{name}: command variance accepted by "
+                                      f"{accepted['label']}", name))
                 else:
                     step_reasons.append(_r("fail", f"{name}: weakened: {'; '.join(weak)} "
                                            "(needs a variance grant)", name))
                     step_reasons += [_r("note", n, name) for n in v_notes]
+            if shrink:
+                # Dropped granted nodes need their own grantor coverage: a
+                # waiver naming those nodes.
+                step_reasons.append(_r("fail", f"{name}: weakened: {'; '.join(shrink)} "
+                                       "(needs a waiver naming those nodes)", name))
             if sp["kind"] == "pytest":
                 step_reasons += _eval_pytest(sp, st, receipt, covered_nodes)
             else:

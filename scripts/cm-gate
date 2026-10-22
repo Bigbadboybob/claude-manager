@@ -9,12 +9,13 @@ Run it from the item's checkout, inside a CM session (it posts through your
 daemon as you). It runs every step the item's gate profile declares, at the
 right commit, with CM's pytest plugin recording each node; captures the
 worktree, base and merge-tree identity before and after; hashes the declared
-inputs; and posts everything with attestation "cm-gate". CM computes the
-verdict. Exit status: 0 PASS, 1 FAIL, 2 VOID, 3 INCOMPLETE, 4 STALE, 5 error.
+inputs; and posts everything through your daemon, which rehashes local
+file/dir inputs itself. CM computes the verdict. Exit status: 0 PASS, 1 FAIL, 2 VOID, 3 INCOMPLETE, 4 STALE, 5 error.
 
-v1 hashes file, dir, gcs and artifact inputs at run time only; db inputs take
-the content id you pass with --input (snapshot:… or rows:…), which CM records
-as self-supplied and unverified.
+v1 binds by content only what the daemon rehashes at report time (local
+file, dir and artifact paths); gcs and db identities (--input name=snapshot:…
+or rows:…) are recorded as self-supplied and unverified, and bind only where
+the profile's accept_unverified lists their kind. Receipts are self-attested.
 """
 
 from __future__ import annotations
@@ -45,20 +46,38 @@ def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
                           check=check, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 
+def safe_ref(repo: Path, ref: str) -> bool:
+    """A ref git cannot read as an option: plain characters, no leading `-`,
+    no `..`, and `git check-ref-format` accepts the ref part."""
+    name, _, path = ref.partition(":")
+    plain = lambda s: bool(s) and not s.startswith("-") and ".." not in s and all(  # noqa: E731
+        c.isalnum() or c in "._/@+-" for c in s)
+    if not plain(name) or (path and not plain(path)):
+        return False
+    return git(repo, "check-ref-format", "--allow-onelevel", name, check=False).returncode == 0
+
+
+def checked_ref(repo: Path, ref: str | None, what: str) -> str | None:
+    if ref and not safe_ref(repo, ref):
+        raise ValueError(f"{what} {ref!r} is not a plain git ref")
+    return ref
+
+
 def rev(repo: Path, ref: str) -> str | None:
-    out = git(repo, "rev-parse", "--verify", "--quiet", ref, check=False)
+    out = git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", ref, check=False)
     sha = out.stdout.strip()
     return sha if out.returncode == 0 and len(sha) == 40 else None
 
 
 def dirty(repo: Path) -> bool:
-    return bool(git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip())
+    """Modified, staged or untracked files (gitignored ones excluded)."""
+    return bool(git(repo, "status", "--porcelain", "--untracked-files=normal").stdout.strip())
 
 
 def merge_tree(repo: Path, base: str | None, head: str) -> str | None:
     if not base:
         return None
-    out = git(repo, "merge-tree", "--write-tree", base, head, check=False)
+    out = git(repo, "merge-tree", "--write-tree", "--end-of-options", base, head, check=False)
     if out.returncode == 1:
         return "conflict"
     line = out.stdout.splitlines()[0].strip() if out.stdout else ""
@@ -69,7 +88,7 @@ def fetch(repo: Path, ref: str) -> None:
     refname = ref.split(":", 1)[0]
     if "/" in refname:
         remote, branch = refname.split("/", 1)
-        git(repo, "fetch", "--quiet", "--no-tags", remote, branch, check=False)
+        git(repo, "fetch", "--quiet", "--no-tags", "--end-of-options", remote, branch, check=False)
 
 
 # ---- inputs --------------------------------------------------------------------
@@ -110,39 +129,53 @@ def gcs_identity(url: str) -> tuple[str | None, int | None]:
     return f"gcs:{gen}/{digest}", int(meta.get("size") or 0) or None
 
 
+def resolve_input_path(decl: dict) -> tuple[str | None, str]:
+    """(resolved absolute path or None, locator). `root_env` and `path` are
+    joined, then resolved; an unset root is reported as missing."""
+    rel = decl.get("path")
+    if decl.get("root_env"):
+        root = os.environ.get(decl["root_env"])
+        if not root:
+            return None, f"${decl['root_env']} is not set"
+        target = Path(os.path.expanduser(root)).resolve() / (rel or "")
+    elif rel:
+        target = Path(os.path.expanduser(rel))
+    else:
+        return None, decl.get("locator") or ""
+    resolved = str(target.resolve())
+    return resolved, resolved
+
+
 def bind_input(decl: dict, supplied: dict, artifacts: dict) -> dict:
+    """The input as cm-gate sees it. The daemon rehashes file/dir inputs from
+    `resolved_path` itself; only that counts as hashed at run time."""
     name, kind = decl["name"], decl["kind"]
     out = {"name": name, "kind": kind, "root_env": decl.get("root_env")}
-    if name in supplied:
-        # Supplied on the command line: recorded, never claimed as hashed here.
-        out.update(locator=decl.get("locator") or decl.get("path") or f"--input {name}",
-                   content_id=supplied[name], state="bound")
+    if kind in ("file", "dir", "artifact"):
+        resolved, locator = resolve_input_path(decl)
+        out["locator"] = locator or name
+        if name in artifacts:
+            out["produced_by"] = artifacts[name]
+        if resolved is None or not Path(resolved).exists():
+            out.update(state="missing", resolved_path=resolved)
+            return out
+        out["resolved_path"] = resolved
+        path = Path(resolved)
+        if path.is_dir():
+            cid, size = dir_manifest(path)
+        else:
+            cid, size = "sha256:" + sha256_file(path), path.stat().st_size
+        out.update(content_id=supplied.get(name, cid), bytes=size, state="bound")
         return out
-    root = os.environ.get(decl["root_env"]) if decl.get("root_env") else None
-    locator = root or decl.get("path") or decl.get("locator") or ""
-    out["locator"] = (f"${decl['root_env']}" if decl.get("root_env") else locator) or name
-    if decl.get("root_env"):
-        out["resolved_root"] = root
-    if kind == "db":
-        out["locator"] = decl.get("locator") or out["locator"]
-        out["state"] = "unbound"
+    out["locator"] = decl.get("locator") or decl.get("path") or name
+    if name in supplied:
+        out.update(content_id=supplied[name], state="bound")
         return out
     if kind == "gcs":
-        cid, size = gcs_identity(locator) if locator else (None, None)
-        out.update(content_id=cid, bytes=size, state="bound" if cid else "missing",
-                   hashed_by="cm-gate" if cid else None)
+        cid, size = gcs_identity(out["locator"]) if out["locator"].startswith("gs://") else (None, None)
+        out.update(content_id=cid, bytes=size, state="bound" if cid else "missing")
         return out
-    path = Path(os.path.expanduser(locator)) if locator else None
-    if path is None or not path.exists():
-        out["state"] = "missing"
-        return out
-    if path.is_dir():
-        cid, size = dir_manifest(path)
-    else:
-        cid, size = "sha256:" + sha256_file(path), path.stat().st_size
-    out.update(content_id=cid, bytes=size, state="bound", hashed_by="cm-gate")
-    if kind == "artifact" and name in artifacts:
-        out["produced_by"] = artifacts[name]
+    out["state"] = "unbound"  # db: needs --input name=snapshot:… or rows:…
     return out
 
 
@@ -164,7 +197,11 @@ def tail(text: str) -> str:
     return "\n".join(text.splitlines()[-SUMMARY_LINES:])[-2000:]
 
 
-def run_cmd(argv: list[str], cwd: Path, env: dict, timeout: int | None, log: Path) -> dict:
+def run_cmd(argv: list[str], cwd: Path, env: dict, timeout: int | None, log: Path, *,
+            parse_stdout: bool = True) -> dict:
+    """Run one step. stdout and stderr are captured separately; the summary
+    is stdout's tail (so stderr noise cannot push a tool's result line out),
+    or both for plain rc steps."""
     start = dt.datetime.now(dt.timezone.utc)
     try:
         proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True,
@@ -173,12 +210,13 @@ def run_cmd(argv: list[str], cwd: Path, env: dict, timeout: int | None, log: Pat
         return {"state": "void", "reason": f"command not found: {argv[0]}",
                 "started_at": start.isoformat()}
     except subprocess.TimeoutExpired as exc:
-        log.write_text((exc.stdout or "") if isinstance(exc.stdout, str) else "")
+        log.write_text(exc.stdout if isinstance(exc.stdout, str) else "")
         return {"state": "void", "reason": f"timeout after {timeout}s",
                 "started_at": start.isoformat()}
-    output = (proc.stdout or "") + (proc.stderr or "")
-    log.write_text(output)
-    out = {"state": "ran", "rc": proc.returncode, "summary": tail(output),
+    stdout, stderr = proc.stdout or "", proc.stderr or ""
+    log.write_text(f"{stdout}\n--- stderr ---\n{stderr}")
+    summary = tail(stdout) if parse_stdout else tail(stdout + stderr)
+    out = {"state": "ran", "rc": proc.returncode, "summary": summary,
            "started_at": start.isoformat(),
            "ended_at": dt.datetime.now(dt.timezone.utc).isoformat()}
     if proc.returncode < 0 or proc.returncode == 137:
@@ -297,7 +335,8 @@ def gate_run(args) -> int:
     supplied = dict(kv.split("=", 1) for kv in args.input or [])
     artifacts = dict(kv.split("=", 1) for kv in args.artifact or [])
     base_cfg = profile.get("base") or {}
-    runner_ref = args.runner_ref or profile.get("runner_ref")
+    runner_ref = checked_ref(repo, args.runner_ref or profile.get("runner_ref"), "runner ref")
+    checked_ref(repo, base_cfg.get("ref"), "base ref")
     if not args.no_fetch:
         for ref in filter(None, [base_cfg.get("ref"), runner_ref]):
             fetch(repo, ref)
@@ -351,7 +390,8 @@ def gate_run(args) -> int:
                 granted = collect_granted(argv, cwd, env, tmp)
                 result = run_pytest(sp, effective, cwd, env, sp.get("timeout_s"), tmp, log, deselect)
             else:
-                result = run_cmd(effective, cwd, env, sp.get("timeout_s"), log)
+                result = run_cmd(effective, cwd, env, sp.get("timeout_s"), log,
+                                 parse_stdout=sp["kind"] != "rc")
             if result["state"] == "ran" and sp.get("void_on_fail") and result.get("rc"):
                 result.update(state="void", reason=f"rc {result['rc']} (void_on_fail)", rc=None)
             step = {"name": sp["name"], "at_sha": mf if at_mf else head,
@@ -371,7 +411,7 @@ def gate_run(args) -> int:
         shutil.rmtree(tmp, ignore_errors=True)
     receipt = {
         "n": args.item, "gate": args.gate, "head": head, "mf": mf, "ruling": ruling,
-        "runner": runner, "attestation": "cm-gate", "branch": branch,
+        "runner": runner, "branch": branch,
         "repo": git(repo, "remote", "get-url", "origin", check=False).stdout.strip() or None,
         "base": {"ref": base_ref, "sha_before": base_before, "sha_after": base_after,
                  "merge_tree_before": tree_before, "merge_tree_after": tree_after},
@@ -386,7 +426,7 @@ def gate_run(args) -> int:
         json.dump(receipt, sys.stdout, indent=1)
         print()
         return 0
-    out = daemon_call("gate.report", receipt, timeout=60)
+    out = daemon_call("gate.report", receipt, timeout=900)
     r = out["receipt"]
     print(f"{r['id']}: {r['headline']}")
     for reason in r.get("reasons", []):
@@ -412,9 +452,9 @@ def compute_closure(repo: Path, profile: dict, base: str | None, head: str) -> d
     if roots:
         paths.update(git(repo, "ls-files", "--", *roots).stdout.split())
     if base:
-        mb = git(repo, "merge-base", base, head, check=False).stdout.strip()
+        mb = git(repo, "merge-base", "--end-of-options", base, head, check=False).stdout.strip()
         if mb:
-            paths.update(git(repo, "diff", "--name-only", mb, head).stdout.split())
+            paths.update(git(repo, "diff", "--name-only", "--end-of-options", mb, head, "--").stdout.split())
     if not paths:
         return None
     return {"paths": sorted(paths),

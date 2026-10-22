@@ -231,6 +231,9 @@ _ITEMS_TIMEOUT_S = 90.0
 _ITEMS_LAUNCH_TIMEOUT_S = 180.0
 
 
+_GATE_REPORT_TIMEOUT_S = 900
+
+
 def _items_call(method: str, params: dict, timeout: float = _ITEMS_TIMEOUT_S) -> dict:
     params = {key: value for key, value in params.items() if value is not None}
     try:
@@ -411,13 +414,12 @@ def gate_report(
     log_path: str | None = None,
     repo: str | None = None,
     branch: str | None = None,
-    attestation: str = "self",
     board: str | None = None,
     request_id: str | None = None,
 ) -> dict:
     """Post a gate receipt on item n (doc/gate-receipts.md). Prefer
     `scripts/cm-gate run --item N`, which runs the item's gate profile and
-    posts everything below with attestation "cm-gate".
+    posts everything below.
 
     CM computes the verdict from the evidence: PASS / FAIL / VOID /
     INCOMPLETE, and STALE once a bound identity moves. Your own word is never
@@ -427,15 +429,19 @@ def gate_report(
     steps also need nodes [{id, outcome, exc_type?}], skips [{node, reason}]
     and deselected [{node, reason}] (an empty list is explicit; a missing one
     is INCOMPLETE). Inputs are {name, kind: file|dir|gcs|artifact|db,
-    locator, content_id, state, bytes?, produced_by?}; a missing input makes
-    the run VOID, an unbound one INCOMPLETE. waivers cite grant ids a grantor
-    attached with gate_waive.
+    locator, resolved_path, content_id, state, bytes?, produced_by?}. Your
+    daemon rehashes file/dir inputs from resolved_path itself; only those
+    count as hashed_at_run, anything else is self_supplied_unverified and
+    binds only where the profile accepts it. A missing input makes the run
+    VOID, an unbound one INCOMPLETE. Every receipt is self-attested in v1.
+    waivers cite grant ids a grantor attached with gate_waive.
 
     Returns {board, n, receipt: {id, verdict, headline, reasons, runs, stale?}}.
     """
     params = dict(locals())
     params["request_id"] = request_id or uuid.uuid4().hex
-    return _items_call("gate.report", params)
+    # The daemon rehashes local inputs before forwarding; large dirs take time.
+    return _items_call("gate.report", params, timeout=_GATE_REPORT_TIMEOUT_S)
 
 
 @mcp.tool()
@@ -464,10 +470,11 @@ def gate_waive(
     board: str | None = None,
 ) -> dict:
     """Grantors only (Owner and the board's waiver_grantors): attach a grant
-    to item n. First post the grant in chat, naming the exact HEAD SHA (at
-    least 12 characters; base→head if it depends on the base), the step or
-    node ids, the reason and the real risk; pass that message's id here.
-    Your daemon checks that you sent it and that it names the SHA.
+    to item n. First post the grant in chat, naming the full 40-character
+    HEAD SHA (and the base SHA for a base→head grant), the step, the kind
+    ("waive" / "variance"), the reason and the real risk; pass that
+    message's id here. Your daemon checks that you sent it and that it
+    names all of those.
 
     kind="waiver" lets a receipt that cites the grant id count `step` (or
     just `nodes`) as satisfied on exactly that head. kind="variance"
