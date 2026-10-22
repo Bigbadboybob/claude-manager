@@ -548,6 +548,10 @@ pub fn dispatch_request(
         // own locking inside `methods::*`; the dispatcher just
         // does the Caller-authorization shape check.
         "send_input" => DispatchOutcome::Done(dispatch_send_input(state, req)),
+        // One key (no body, no Enter) to one or more sessions; per-target
+        // results. `send_key` is the MCP tool's name for it (TUI-routed on
+        // a laptop, like send_input; a headless host's daemon serves it).
+        "session.send_key" | "send_key" => DispatchOutcome::Done(dispatch_send_key(state, req)),
         // Reliable out-of-band PTY resize. Operator-only — the TUI's
         // adopt scan re-asserts the pane size on any session whose
         // daemon PTY drifted (dropped attach-stream resize frame,
@@ -2968,6 +2972,19 @@ fn dispatch_send_input(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::send_input(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.send_key` — same caller shape as `dispatch_send_input`; scope is
+/// checked per target in the method body (see `control::send_key`).
+fn dispatch_send_key(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match super::send_key::send_key(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

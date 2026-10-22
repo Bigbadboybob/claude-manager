@@ -2364,6 +2364,65 @@ async def send_input(
     return res
 
 
+SEND_KEY_MAX_TARGETS = 50
+
+
+@mcp.tool()
+async def send_key(
+    session_uids: str | list[str],
+    key: str,
+    notify_on_done: bool = False,
+    notify_until: str = "turn_end",
+) -> dict:
+    """Press exactly ONE key in one or more sessions you can see.
+
+    It sends only that key: no text, and no Enter after it. Use it to
+    revive a rate-limited or errored session (`key="enter"` on its error
+    or limit screen), to answer a menu (`"1"`, `"y"`, `"down"` then
+    `"enter"`), or to back out of one (`"escape"`). To send a prompt, use
+    `send_input`.
+
+    Args:
+        session_uids: One session uid, or a list of up to 50.
+        key: A named key — enter, escape, tab, shift-tab, up, down, left,
+            right, home, end, pageup, pagedown, backspace, delete, space,
+            ctrl-c, ctrl-d — or any single printable character (`1`, `y`).
+            It is encoded for each session's keyboard mode (kitty or
+            legacy), the bytes a real keypress would send.
+        notify_on_done: Register an async monitor on the sessions that got
+            the key, waking you when they finish the turn it starts (all of
+            them, when there are several). Default false: a key often
+            starts no turn at all (menu navigation).
+        notify_until: "turn_end" (default) or "final"; see `monitor_sessions`.
+
+    Scope is send_input's: your own task's sessions and its descendants
+    (any session with global permissions). Every session gets its own
+    result in `results`: status `ok`, `not_found`, `unauthorized`,
+    `exited`, or `error`; one bad target never stops the rest.
+
+    State your intent and ask the user before calling this tool.
+    """
+    uids = [session_uids] if isinstance(session_uids, str) else list(session_uids)
+    if len(uids) > SEND_KEY_MAX_TARGETS:
+        return {
+            "error": "invalid_params",
+            "message": f"send_key takes at most {SEND_KEY_MAX_TARGETS} sessions per call, got {len(uids)}",
+        }
+    res = await asyncio.to_thread(control_client.call, "send_key", {"session_uids": uids, "key": key})
+    if notify_on_done and isinstance(res, dict) and "error" not in res:
+        sent = [r["session_uid"] for r in res.get("results", []) if r.get("status") == "ok"]
+        if sent:
+            try:
+                res["monitor"] = async_monitor.register_monitor(
+                    sent, mode="all", until=notify_until,
+                    note=f"turn after send_key {key} to {len(sent)} session(s)",
+                    source="auto",
+                )
+            except async_monitor.RegistrationError as e:
+                res["monitor"] = {"error": e.code, "message": str(e)}
+    return res
+
+
 @mcp.tool()
 def list_sidebar_sections() -> dict:
     """List Owner's work-sidebar subsections and caller-visible workspace choices.

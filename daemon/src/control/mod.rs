@@ -26,6 +26,7 @@ pub mod dispatch;
 pub mod methods;
 pub mod operator;
 pub mod protocol;
+pub mod send_key;
 pub mod stream;
 pub mod tls;
 pub mod wire;

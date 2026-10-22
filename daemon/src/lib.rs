@@ -70,6 +70,7 @@ pub mod control;
 pub mod holder_mode;
 pub mod host_id;
 pub mod items;
+pub mod keys;
 pub mod usage;
 pub mod worktree_watch;
 pub mod manifest;
