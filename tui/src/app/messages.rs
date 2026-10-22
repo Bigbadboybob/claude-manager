@@ -1618,9 +1618,10 @@ impl App {
         p["origin_daemon_id"] = json!(d.origin);
         p["reply_to"] = json!(d.reply_to);
         p["tags"] = json!(d.tags);
-        let (mentions, here) = d.mention_payload();
-        p["mentions"] = json!(mentions);
-        if here { p["mention_here"] = json!(true); }
+        // Picked mentions plus the ones the body types (@here, exact names).
+        let audience = self.messages.send_audience();
+        p["mentions"] = json!(audience.ids);
+        if audience.here { p["mention_here"] = json!(true); }
         p["links"] = json!(d.links);
         self.messages.pending_send = Some((self.messages.key(), d.request_id.clone()));
         self.messaging_request("messaging.send", p);
@@ -2161,10 +2162,9 @@ impl App {
                     self.messages.text.clone()
                 };
                 let title = if self.messages.mode.is_empty() || self.messages.mode == "compose" {
-                    let (mentions, here) = self.messages.draft().mention_payload();
-                    let audience = if here { " · @here".into() } else if !mentions.is_empty() {
-                        format!(" · {} mention{}", mentions.len(), if mentions.len() == 1 { "" } else { "s" })
-                    } else { String::new() };
+                    // Who a send notifies, before Owner sends it.
+                    let preview = self.messages.audience_preview();
+                    let audience = if preview.is_empty() { String::new() } else { format!(" {preview}") };
                     format!(
                         "Owner → {}{audience} · {}/3000 · Ctrl+s sends",
                         self.messages.target_label(),
