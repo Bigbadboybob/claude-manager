@@ -1,287 +1,513 @@
 # Gate receipts on board items: design
 
-Status: **design for review, no code yet** (2026-10-21, items lane). Implementation
-waits for Owner's go after execution-policy (EP) has checked it against its cases.
+**Status:** design revision 2 (2026-10-22, items lane). There is no code yet.
+Implementation waits for Owner's go.
 
-Source: EP's round-2 interview answers
-(`predictionTrading-swarm-focused-design/cm-initiative/shared/ep-interviews.md`,
-2026-10-21), Swarm-Gardener's summary in
-`#initiative/swarm-focused-design/claude-manager` at 14:03Z, and item 2 of
-`~/.local/share/swarm-coord/org-design/org-tools.md`. It builds on the items
-board contract in [items-board.md](items-board.md).
+**Sources:**
+- EP's round-2 and round-3 interview answers
+  (`predictionTrading-swarm-focused-design/cm-initiative/shared/ep-interviews.md`);
+- EP's review of revision 1 (`0e64d4a`), posted in
+  `#initiative/swarm-focused-design/claude-manager` at 2026-10-21 14:07Z;
+- Swarm-Gardener's posts in that channel (2026-10-21 14:03Z, 2026-10-22 14:03Z);
+- item 2 of `~/.local/share/swarm-coord/org-design/org-tools.md`.
+
+It builds on the items board contract in [items-board.md](items-board.md).
+
+**Changes since revision 1 (`0e64d4a`):**
+- **Waivers.** A waiver is now a grant: the grantor attaches it, and it links
+  the grantor's message (§4). A free-text or unattached waiver never satisfies
+  a step.
+- **VOID.** VOID is its own verdict, separate from INCOMPLETE. Repeated VOIDs
+  raise a flag (§3, §7).
+- **Grant vs executed.** The receipt records the effective command and the set
+  of test nodes that actually ran, and compares them with what was granted. A
+  weakened run is RED until the grantor acknowledges it (§5).
+- **Inputs.** External inputs and resolved roots are bound by content hash.
+  Derived artifacts also bind the receipt that produced them (§6).
+- **Must-fail.** Each MF node expects a declared exception type. Explicit
+  `skips` and `deselected` lists are required, and a missing list means
+  INCOMPLETE (§1, §2).
+- **Profiles.** Steward removed from the profile editors. Every profile edit is
+  logged, and every edit restales that class's receipts (§2).
+- **Base scope.** Defaults to `paths` over the gate's closure; `tree` is a
+  per-profile override (§8).
+- **Attestation.** A profile can require the cm-gate runner; this is off by
+  default (§2).
+- **New §11, v1 cut.**
 
 ## 0. The problem
 
 Today a gate result is a long prose post such as "GREEN: MF a1b2 fails, pytest
-412 passed, mypy clean". The reader has to work out three things from posts
-that are mixed in with everything else:
+412 passed, mypy clean". From posts mixed in with everything else, the reader
+has to work out four things:
 
-- Is this result for the current head? EP has ruled on superseded MF SHAs.
-- Did every step that matters actually run? In EP's cases, `device_budget` run 2
-  had FETCH_FAIL steps after a pytest pass, and the a320 nodes "passed" by
-  skipping on a host without the harvest.
-- Was it run under the ruling now in force? Integration started a gate 12 s
-  after EP posted a recompose ruling it hadn't seen.
+- Is this result for the current head?
+- Did every required step actually run, on the intended inputs?
+- Was it the granted command and test selection, or a narrowed one?
+- Was it run under the ruling now in force?
+
+EP has ruled on superseded MF SHAs. It has seen FETCH_FAIL after a pytest pass,
+and a320 nodes "pass" by skipping on a host without the harvest. And a gate
+started 12 s after a recompose ruling that its runner hadn't seen.
 
 A receipt is a structured record attached to the item. **CM** computes its
-verdict from the recorded steps and the board's declared requirements. The
-poster's word is not enough. CM also marks the receipt STALE, with a reason,
-as soon as any identity it was bound to changes.
+verdict from:
+
+- the recorded steps;
+- the board's declared requirements;
+- the grants that cover the run.
+
+The poster's word is never enough. CM marks the receipt STALE, with a reason,
+as soon as any identity or input it was bound to changes.
 
 ## 1. Data
 
 ### 1.1 Receipt
 
-One row per gate run, attached to `(board, item n)`. Receipts are append-only
-and never edited. A rerun writes a new receipt, and the old one stays in
-history.
+One row per gate run, attached to `(board, item n)`. Receipts are append-only.
+A rerun writes a new receipt, and the old one stays in history.
 
 | Field | Type | Notes |
 |---|---|---|
-| `id` | `r-<board>-<n>-<seq>` | stable, quotable in chat (`r-sejd-14-3`) |
-| `gate` | str ≤ 40 | default `gate`; an item can carry several gates (`gate`, `integration`, `bench`), each with its own latest receipt |
-| `class` | str ≤ 40 | which requirement profile applies (§2); default: the item's `gate_class`, else the board default |
-| `profile_version` | int | the profile version used at post time |
-| `repo` | str | repo identity (remote URL, normalized) |
-| `branch` | str? | the head branch, used by the refresh in §4 |
+| `id` | `r-<board>-<n>-<seq>` | stable and quotable (`r-sejd-14-3`) |
+| `gate` | str ≤ 40 | default `gate`; an item can carry several gates, each with its own latest receipt |
+| `class`, `profile_version` | str, int | the requirement profile (§2) and the version evaluated at post time |
+| `repo`, `branch` | str | `branch` drives the refresh (§8) |
 | `head_sha` | 40-hex | **required** |
-| `mf_sha` | 40-hex? | must-fail commit; required when the profile has a `must_fail` step |
-| `runner` | `{ref, sha}`? | the driver/runner script: `ref` like `origin/main:scripts/gate.sh`, `sha` = the blob or commit it resolved to |
-| `ruling_id` | str? ≤ 80 | the lane ruling the run was made under (`EP-A1021`); see §6 |
-| `base` | object | `{ref, sha_before, sha_after, merge_tree_before, merge_tree_after}`: base ref and SHA, plus the `git merge-tree --write-tree <base> <head>` tree OID, captured before the first step and after the last. A conflict is recorded as `merge_tree: "conflict"` |
-| `worktree` | `{head_before, head_after, dirty_before, dirty_after}` | identity of the checkout the steps ran in |
-| `steps` | `[step]` ≤ 40 | below. **Every** step that was planned is listed, including those that failed, were skipped or never started |
-| `waivers` | `[str]` ≤ 20 | waiver ids invoked (`EP-W0310`), each naming the step it covers: `{id, step}` |
-| `artifacts` | `[{path, bytes, sha256?}]` ≤ 20 | optional; covers cases like the 12.98 GB vs 6.55 GB staging mix-up |
-| `log_path` | str? | full log on the posting host |
-| `attestation` | `cm-gate` \| `self` | `cm-gate` when CM's runner executed the commands (§5); `self` when an agent typed the receipt |
-| `poster` | actor | stamped by the daemon, as for every item write |
-| `posted_at` | ts | API server clock |
-| `computed` | verdict | the verdict CM computed at post time (§3), kept for history |
+| `mf_sha` | 40-hex? | required when the profile has a must-fail step |
+| `runner` | `{ref, sha}` | runner/driver script, e.g. `origin/main:scripts/gate.sh` and the SHA it resolved to |
+| `ruling_id` | str? ≤ 80 | the lane ruling the run was made under (§10) |
+| `base` | object | `{ref, sha_before, sha_after, merge_tree_before, merge_tree_after}`; merge tree = `git merge-tree --write-tree <base> <head>` OID, or `"conflict"` |
+| `closure` | `{paths_digest, count, cmd}` | the gate's closure file set (identity-closure walker plus the gate's file list), digested; the paths themselves go to the log |
+| `worktree` | `{head_before, head_after, dirty_before, dirty_after}` | identity of the checkout the run used |
+| `inputs` | `[input]` ≤ 100 | §6 |
+| `steps` | `[step]` ≤ 40 | **every** planned step, including failed, skipped and never-started ones |
+| `waivers` | `[grant id]` ≤ 20 | grants the runner **cites** (§4); citing proves nothing by itself |
+| `log_path` | str? | the full log on the posting host |
+| `attestation` | `cm-gate` \| `self` | `cm-gate` when CM's runner executed the steps (§9) |
+| `poster`, `posted_at` | actor, ts | stamped by the daemon and the API clock |
+| `computed` | `{verdict, reasons}` | the verdict at post time, kept for history |
 
 ### 1.2 Step
 
 | Field | Type | Notes |
 |---|---|---|
-| `name` | str ≤ 40 | matches a profile step (`must_fail`, `pytest`, `mypy`, `ruff`, `fetch`, …); unknown names are kept and shown, and count only if the profile names them |
-| `cmd` | str ≤ 2000 | the exact command line, after expansion |
-| `cwd` | str? | |
-| `at_sha` | 40-hex? | the commit the step ran on; defaults to `head_sha`. The `must_fail` step runs at `mf_sha` |
-| `state` | `ran` \| `skipped` \| `not_run` \| `error` | `error` means the step never produced a result because of infra trouble (fetch failure, timeout, OOM), which EP calls VOID |
-| `rc` | int? | the step's own exit code; null unless `ran` |
+| `name` | str ≤ 40 | matches a profile step (`must_fail`, `pytest`, `mypy`, `ruff`, `closure`, `identity`, `fetch`, …) |
+| `effective_cmd` | `{argv, env, cwd}` | exactly what ran, after every override and expansion; `env` includes only the keys the run set or overrode |
+| `at_sha` | 40-hex? | defaults to `head_sha`; must-fail runs at `mf_sha` |
+| `state` | `ran` \| `skipped` \| `not_run` \| `void` | `void` = no result because of infra trouble or a missing input (FETCH_FAIL, missing harvest, timeout, OOM) |
+| `rc` | int? | the step's own exit code (`ran` only) |
 | `started_at`, `ended_at` | ts? | |
-| `summary` | str ≤ 2000 | the tool's own summary lines, verbatim (pytest's final line plus `-rs` skip reasons, mypy's `Success:`/`Found N errors`, ruff's last line) |
-| `parsed` | object | filled in by **CM** from `summary`, never by the poster: pytest `{passed, failed, errors, skipped, xfailed, xpassed, deselected, skips: [{reason, count, nodes?}]}`, mypy `{ok: bool, errors: N, files: M}`, ruff `{violations: N}` |
-| `reason` | str? ≤ 300 | why it was skipped, not run or errored |
+| `summary` | str ≤ 2000 | the tool's own summary lines, verbatim |
+| `nodes` | `[{id, outcome, exc_type?}]` | pytest steps only, and **required** for them: every collected node with its outcome (`passed`, `failed`, `error`, `skipped`, `xfailed`, `xpassed`, `deselected`), plus the exception type for failures. cm-gate takes this from JUnit XML |
+| `skips` | `[{node, reason}]` | **required** on pytest steps; `[]` = no skips. A missing list is INCOMPLETE |
+| `deselected` | `[{node, reason}]` | **required** on pytest steps; `[]` = nothing deselected. A missing list is INCOMPLETE |
+| `parsed` | object | filled by **CM**, never by the poster. pytest counts are derived from `nodes` and checked against `summary`; mypy `{ok, errors, files}`; ruff `{violations}` |
+| `inputs_used` | `[input name]` | which of the receipt's inputs this step read |
+| `reason` | str? ≤ 300 | why it was skipped, not run or void |
 
-CM parses the summary text itself and checks it against `rc`. If they disagree
-(for example `rc=0` while pytest reports failures, or `rc=1` with "Success: no
-issues"), the step is marked `inconsistent` and does not satisfy its
-requirement. If a summary can't be parsed for a step type the profile needs
-parsed, the step counts as **unparsed**, which is never a pass.
+CM checks three things against each other: `summary`, `rc` and `nodes`. Any
+disagreement marks the step `inconsistent`, and an inconsistent step never
+satisfies a requirement. Examples:
+- rc 0 while some nodes failed;
+- a count in `summary` that doesn't match `nodes`;
+- mypy reporting "Success" with rc 1.
 
-## 2. Requirements are declared, per board and per class
+If a step type the profile needs parsed can't be parsed, the step is
+`unparsed`, which is also never a pass.
 
-A **gate profile** belongs to the board. It is keyed by `class`, and the board
-names a default class. Items take `gate_class` (set with
-`item_set(n, gate_class="py-lane")`). A profile is the list of steps a valid
-run must contain:
+## 2. Requirements: gate profiles
+
+A board stores **gate profiles**, keyed by `class`. The board also names a
+default class, and an item can take `gate_class`. A profile lists everything a
+valid run must contain. It is also the **grant**: the commands, the test
+selection and the pass predicates that were approved (§5).
 
 ```json
 {"class": "py-lane", "version": 4,
  "steps": [
-   {"name": "must_fail", "kind": "pytest", "expect": "fail", "at": "mf",
-    "required": true},
-   {"name": "pytest", "kind": "pytest", "required": true, "min_passed": 1,
-    "max_failed": 0, "must_run": ["tests/a320/test_nodes.py"],
-    "skip_policy": {"allow_reasons": ["^requires CUDA$"], "otherwise": "incomplete"}},
+   {"name": "must_fail", "kind": "pytest", "at": "mf", "required": true,
+    "argv": ["pytest", "-p", "no:cacheprovider", "{mf_nodes}"],
+    "nodes": ["tests/sejd/test_fuse.py::test_new_path"],
+    "expect_fail": {"default": "AssertionError",
+                    "tests/sejd/test_fuse.py::test_new_path": ["AttributeError"]}},
+   {"name": "pytest", "kind": "pytest", "required": true,
+    "argv": ["pytest", "-n", "2", "tests/sejd", "tests/a320"],
+    "min_passed": 1, "max_failed": 0, "xfail_counts_as_pass": false,
+    "must_run": ["tests/a320/test_nodes.py"],
+    "skip_policy": {"allow_reasons": ["^requires CUDA$"]}},
    {"name": "mypy", "kind": "mypy", "required": true, "max_errors": 0},
    {"name": "ruff", "kind": "ruff", "required": true, "max_violations": 0},
-   {"name": "fetch", "kind": "rc", "required": true}
+   {"name": "closure", "kind": "rc", "required": true},
+   {"name": "identity", "kind": "rc", "required": true}
  ],
- "waivable": ["mypy", "ruff"],
- "require": {"mf_sha": true, "runner": true, "ruling_id": false},
- "base": {"ref": "origin/main", "scope": "tree"}}
+ "inputs": [{"name": "harvest_a320", "kind": "dir", "root_env": "A320_HARVEST",
+             "required": true}],
+ "require": {"mf_sha": true, "runner": true, "ruling_id": false,
+             "attestation": null},
+ "base": {"ref": "origin/main", "scope": "paths"}}
 ```
 
-- `kind` picks the parser and its pass test: `pytest`, `mypy`, `ruff`, or `rc`
-  (a plain exit code).
-- `expect: "fail"` turns a step around. The must-fail step passes only if it
-  **ran** at `mf_sha` and failed with test failures. Collection errors and
-  import errors don't count, so a broken tree can't pass as a red test.
-- `must_run` lists pytest node ids (or path prefixes) that must appear as run.
-  If one of them is skipped, deselected or absent, the step is
-  **incomplete**. This catches the a320 missing-harvest skip even when
-  `min_passed` is met by other tests.
-- `skip_policy` sets what a skip means: `allow_reasons` regexes, with
-  `otherwise` = `incomplete` (the default) or `fail`. A skip with no reason is
-  never allowed.
-- `waivable` names the steps a waiver may cover. A waiver for any other step is
-  refused when posted.
+- **Kinds.** `kind` picks the parser and the pass test: `pytest`, `mypy`,
+  `ruff`, or `rc` (exit code only).
+- **Must-fail.** A must-fail step passes only if both conditions hold:
+  - it **ran** at `mf_sha`;
+  - every listed node **failed** with its expected exception type. The
+    default is `AssertionError`; per-node alternatives are declared by node
+    id, e.g. `AttributeError` for a new symbol, or pytest's `Failed` for "DID
+    NOT RAISE".
 
-Profiles are stored with a version. A change is a board event, made through
-`PATCH /boards/{ref}` with `gate_profiles`. Allowed: Owner, the board's
-orchestrator, the steward, and the pids in a new board setting `gate_admins`
-(intended for EP), otherwise `403`. Receipts keep their raw steps, so CM
-**re-evaluates** the latest receipt under the current profile version. If a
-tightened profile turns a PASS into something else, the item shows the reason
-`profile py-lane v3 → v4`. `computed` keeps what the verdict was at post time.
+  Collection errors and import errors never count. Neither does a
+  missing-data `pytest.fail`: a node that can't run for lack of data must be
+  declared in `deselected` with a reason.
+- **`must_run`.** Lists node ids or path prefixes that must appear in `nodes`
+  as run. If one is skipped, deselected or absent, the step is INCOMPLETE.
+- **`skip_policy`.** A skip whose reason doesn't match `allow_reasons` makes
+  the step INCOMPLETE. A skip with no reason is never allowed.
+- **Pass predicates** (`max_failed`, `xfail_counts_as_pass`, `max_errors`, …)
+  come only from the profile. A run can't change them (§5).
+- **`require.attestation: "cm-gate"`** makes a `self` receipt INCOMPLETE. It
+  is off by default; EP wants it on for deploy-gate profiles first.
 
-A board with no profile has nothing declared, so CM can't call any receipt
-PASS. Its receipts compute INCOMPLETE ("no gate profile for class X"). This is
-deliberate: no requirements cannot mean everything passed.
+**Who edits profiles.** Owner, the board's orchestrator, and the pids in the
+board setting `gate_editors` (intended for EP). Nobody else, the steward
+included; anyone else gets `403`. Every edit:
+- needs a `reason`;
+- is written as an `item_events` row `gate_profile_changed` with who, the old
+  profile, the new profile and the reason;
+- bumps the version;
+- **restales every receipt of that class**, with reason
+  `profile_changed v3 → v4`, whether or not the verdict would change.
+
+A board with no profile for a class has nothing declared, so its receipts
+compute INCOMPLETE ("no gate profile for class X"). An empty profile can't
+mean everything passed.
 
 ## 3. Verdict
 
-CM computes the verdict, in this order, on post and on every re-evaluation:
+CM evaluates the verdict on post and again whenever a binding, grant or
+profile changes. Values, in order of precedence:
 
-1. **STALE** if any binding in §4 has changed. This rule overrides the others.
-   The verdict CM computed before the change is still shown, e.g.
+1. **STALE.** A binding changed (§8). The earlier verdict is still shown:
    `STALE (was PASS): head moved a1b2c3d → 9f8e7d6`.
-2. **FAIL** if any required step **ran** and missed its pass test: rc,
-   failures, mypy errors, ruff violations, a must-fail step that passed, or
-   `inconsistent`. Waived steps are exempt (rule 5). FAIL is EP's RED.
-3. **INCOMPLETE** if any required step is missing from `steps`, `skipped`,
-   `not_run`, `error` (EP's VOID, e.g. FETCH_FAIL after a pytest pass), or
-   `unparsed`. The same applies to a vacuous pytest result (`min_passed` not
-   met, or a `must_run` node not run), a skip that `skip_policy` doesn't
-   allow, or a missing required identity (`mf_sha`, `runner`). It also
-   applies when `worktree.head_before ≠ head_after`, when either side is
-   dirty, or when `base.merge_tree_before ≠ merge_tree_after`: the code
-   moved during the run, so the run tested nothing definite.
-4. **PASS** only if every required step is present, `ran`, and met its pass
-   test, or is covered by a waiver.
-5. **Waivers.** A waived required step counts as satisfied, and the verdict
-   names the waiver: `PASS · 1 waiver EP-W0310 (mypy)`. Until ruling records
-   exist (§6), CM can't check that a waiver id exists, so it is shown as
-   `waiver unverified`. Each waiver must name a step from the profile's
-   `waivable` list.
+2. **FAIL** (EP's RED). Any of:
+   - a required step **ran** and missed its pass test;
+   - an MF node passed, or failed with an undeclared exception type;
+   - a step is `inconsistent`;
+   - the run is **weakened** relative to the grant and the grantor hasn't
+     acknowledged it (§5). A weakened run is RED until acknowledged.
+3. **VOID.** A required step is `void` (FETCH_FAIL, timeout, OOM), or a
+   required input is missing or couldn't be fetched (§6). VOID never counts as
+   RED and doesn't use up a one-run budget. CM counts VOIDs per runner SHA and
+   per input and raises a flag on repeats (§7).
+4. **INCOMPLETE.** The run didn't establish the result, though nothing was
+   red or void. Any of:
+   - a required step missing, `skipped`, `not_run` or `unparsed`;
+   - a pytest step with no `nodes`, `skips` or `deselected` list;
+   - a vacuous pytest result (`min_passed` not met, or a `must_run` node not
+     run);
+   - a skip that `skip_policy` doesn't allow;
+   - a required identity missing (`mf_sha`, `runner`, `closure`);
+   - a required input present but not bound by content (§6);
+   - a `self` receipt where the profile requires `cm-gate`;
+   - code that moved during the run (`worktree.head_before ≠ head_after`, a
+     dirty worktree, or `merge_tree_before ≠ merge_tree_after`);
+   - a cited waiver that is unverified (§4) and is the only thing standing in
+     for its step.
+5. **PASS.** Every required step is present, `ran` and met its pass test, or
+   is covered by a **verified** waiver. In addition, every required input is
+   bound by content, and the run is within its grant.
 
-FAIL ranks above INCOMPLETE, so one red required step shows as FAIL even when
-other required steps are missing. Each verdict lists all of its reasons, for
-example `INCOMPLETE: fetch error (FETCH_FAIL), a320 nodes skipped "harvest
-missing"`. Non-required steps are shown but never change the verdict.
+Precedence is STALE > FAIL > VOID > INCOMPLETE > PASS. Each verdict lists
+**all** of its reasons, not just the winning one, e.g.
+`VOID: fetch void (FETCH_FAIL); also INCOMPLETE: a320 nodes skipped "harvest missing"`.
+Non-required steps are shown but don't affect the verdict.
 
-## 4. Staleness
+The verdict counts runs per `(item, gate, head)`: `FAIL ×1, VOID ×2`.
+Enforcing EP's one-run budget is EP's policy; CM just keeps the count visible.
 
-A receipt is bound to identities. When one changes, the receipt goes STALE
-automatically and records the reason, the old value and the new value:
+## 4. Waivers are grants
+
+A waiver stands in for a required step, or some of its nodes, on one exact run.
+The grantor (EP, or Owner for Owner-only items) posts it as a chat message
+naming:
+- the exact HEAD SHA, or base→head;
+- the exact check skipped (node ids or a step name);
+- the reason and the real risk.
+
+The **grantor** then attaches it:
+
+```
+gate_waive(n, head, step, nodes=None, base=None, reason, risk, message_id,
+           gate="gate", board=None) -> {grant: {id, verified, problems}}
+```
+
+The tool creates a grant `g-<board>-<n>-<seq>` with `kind: waiver`. The
+daemon stamps the caller as the grantor. **Only the grantor attaches**; a
+runner can only cite the grant id in a receipt's `waivers`.
+
+A grant is **verified** only if every check below holds. The daemon does the
+message checks against its own message store before forwarding; the API does
+the rest:
+
+1. The grantor is in the board's `waiver_grantors`: Owner always, plus the
+   listed pids (EP).
+2. `message_id` exists, its sender is the grantor, and its body contains the
+   grant's head SHA (at least 12 hex characters), and the base SHA when one is
+   given. A message the daemon can't read yet stays `verified: false` with
+   `problems: ["message not found"]` and is rechecked on the next read.
+3. `reason` and `risk` are both non-empty. `step` names a step in the profile,
+   and any `nodes` belong to that step's grant. A generic "the gate" waiver is
+   refused.
+4. The grant is not revoked. `gate_waive(..., revoke=g-…)` revokes one,
+   grantor only.
+
+A cited grant **covers** a receipt only if:
+- it is verified;
+- its head equals the receipt's `head_sha`, and its base matches when one is
+  given;
+- its step and nodes include what the receipt is missing.
+
+Otherwise it shows as `waiver g-sejd-14-2: unverified (head 9f8e… ≠ grant
+a1b2…)` and satisfies nothing. A wrong-SHA, generic or unattached waiver
+therefore can never yield PASS.
+
+Grants are also how the grantor acknowledges a weakened run (§5, `kind:
+variance`), so there is one mechanism. When ruling records arrive (§10),
+grants become ruling records of type `waiver` / `variance`.
+
+## 5. Grant vs executed
+
+The profile's steps are the granted commands and the granted test selection.
+Every step records `effective_cmd` and, for pytest, the executed `nodes`. CM
+diffs the run against the grant in two ways.
+
+**Node set.** cm-gate collects the granted selection at the run's SHA
+(`pytest --collect-only` with the granted argv) and stores it as
+`granted_nodes`. The executed set is every node in `nodes` that wasn't
+deselected. The rules:
+- A granted node that is missing from the executed set, or deselected, is
+  **shrinkage**.
+- Executed nodes outside the granted set are **additive**. They are allowed
+  within the grant's paths.
+
+For a `self` receipt with no `granted_nodes`, CM can't verify the selection.
+The step is INCOMPLETE, unless the profile lists nodes explicitly and the run
+covers all of them.
+
+**Command.** `effective_cmd.argv` and `env` are compared with the profile
+`argv`. These differences are **allowed** without review:
+
+| Allowed | Recognized as |
+|---|---|
+| worker count ≤ 2 | `-n N` / `--numprocesses N` with N ≤ 2 |
+| timeout, memory cap, CPU pinning | `--timeout`, `timeout N` prefix, `systemd-run … -p MemoryMax=`, `taskset`/`numactl` prefixes |
+| env needed to run | keys in the profile's `allowed_env` (`PATH`-like roots, `JAX_PLATFORMS`, fixture roots); their values are bound as inputs (§6) |
+| additive nodes/files | extra positional paths or node ids |
+
+**Review is forced** by any other difference, specifically:
+- a granted node or file removed or deselected;
+- a `-k`/`-m` filter narrower than granted (any added filter counts);
+- a changed MF SHA, base or comparison mode (e.g. HEAD_ONLY logic);
+- skipping the mypy, closure or identity step;
+- a changed pass predicate (XFAIL counted as pass, rc ignored, a
+  `|| true`-shaped wrapper);
+- any argv token CM doesn't recognize.
+
+A run needing review is **weakened**. Its verdict is FAIL with reason
+`weakened: <diff>` until the grantor attaches a `variance` grant:
+
+```
+gate_waive(n, head, step, kind="variance", cmd_digest=<sha256 of effective_cmd>,
+           reason, risk, message_id)
+```
+
+The grant is bound to that exact head and that exact effective command. A
+variance grant lets the step be judged on its own pass test; it doesn't make a
+red step green. **Runner attestation never substitutes:** a `cm-gate` receipt
+of a weakened run is FAIL until acknowledged, exactly like a `self` receipt.
+
+Lane-local override files (cm-gate `--override`) are simply a source of
+effective-command differences. They go through the same diff.
+
+## 6. Inputs bound by content
+
+A run's result depends on data that can change while the code SHA stays the
+same. Every external input the run reads is listed in `inputs`. Examples:
+- warm files and pin maps;
+- fixtures and tapes outside git;
+- ECFG and the release manifest;
+- captured roots;
+- harvested outputs from another run;
+- DB data.
+
+| Field | Notes |
+|---|---|
+| `name` | matches the profile's `inputs[].name`, or is free for an undeclared input |
+| `kind` | `file`, `dir`, `gcs`, `artifact`, `db` |
+| `locator` | how it was found: path, `gs://…`, or query + window |
+| `root_env`, `resolved_root` | for env-derived roots: the variable and the path it resolved to. The resolved path is bound along with its hash |
+| `content_id` | `sha256:<hex>` for a file; `tree:<sha256 of a sorted (path, size, sha256) manifest>` for a dir; `gcs:<generation>/<md5 or crc32c>`; for `db`, see below |
+| `bytes` | total size, to catch size mix-ups like 12.98 vs 6.55 GB |
+| `produced_by` | `artifact` only: the receipt id that produced it |
+| `state` | `bound`, `missing` (not there, or the fetch failed), `unbound` (present, but without a content id) |
+
+- **Missing or failed fetch.** A `missing` required input makes the run
+  **VOID**, never PASS. This covers FETCH_FAIL and a host without the harvest.
+- **Unbound.** An `unbound` required input makes the run INCOMPLETE. The run
+  happened, but CM can't say what it ran against.
+- **Changed.** If an input's content id differs from a later observation, the
+  receipt goes **STALE** with `input_changed <name>`. Observations come from a
+  later receipt on the same board binding the same locator, or from the
+  refresh in §8.
+- **Derived artifacts** carry `produced_by`. If the producing receipt is STALE,
+  FAIL or VOID, every receipt that consumed the artifact goes STALE with
+  `input_receipt_invalid r-…`. The consumer binds the id, so this cascade
+  happens in the database, with no rehashing.
+- **DB inputs** need an immutable identity. A query plus a time window is only
+  a `locator`: rows inside the window can still change, so on its own it is
+  `unbound`. Acceptable `content_id`s:
+  - `snapshot:<id>`, an immutable snapshot or export the profile names as
+    immutable, such as a dump file, recorded with its sha256;
+  - `rows:<sha256>`, a digest the step computes over the ordered result set
+    it actually read. The step records the digest query in `locator`.
+
+## 7. Flags
+
+These are new board flag kinds. They use the same lifecycle and `flag_pushed`
+dedupe as the existing flags in items-board.md §4.
+
+| Kind | Raised when | Goes to |
+|---|---|---|
+| `receipt_stale` | an open item's latest receipt for a gate went STALE | holders only; never escalated |
+| `runner_void` | ≥ 2 VOIDs on the same runner SHA within 24 h, on any item on the board (detail: `runner VOID ×N`, runner SHA, receipts) | holders and orchestrator |
+| `input_void` | ≥ 2 VOIDs on the same input locator within 24 h (detail: `input <name> VOID ×N`) | holders and orchestrator |
+
+`receipt_stale` resolves when a new receipt for that gate is posted or the
+item closes. The VOID flags resolve on the next non-VOID receipt that uses
+that runner or input. FAIL and INCOMPLETE don't raise flags, because the
+holder already knows; they show up in the board read.
+
+## 8. Staleness
 
 | Binding | Detected when | Reason |
 |---|---|---|
-| head SHA | a newer receipt for the same gate names another head, the item's head binding is set (`item_set(n, head=…)`), or the refresh sees `branch` move past `head_sha` | `head_moved` |
-| MF SHA | a newer receipt or `item_set(n, mf=…)` names another MF | `mf_moved` |
+| head SHA | a newer receipt names another head, `item_set(n, head=…)`, or the refresh sees `branch` move past `head_sha` | `head_moved` |
+| MF SHA | a newer receipt or `item_set(n, mf=…)` | `mf_moved` |
 | runner SHA | the refresh resolves `runner.ref` to another SHA | `runner_changed` |
-| ruling ID | the item's `ruling_id` (or, later, the lane's current ruling, §6) differs from the receipt's | `ruling_superseded` |
-| base / merge tree | the refresh finds `git merge-tree --write-tree <base ref now> <head>` ≠ `merge_tree_after` | `base_moved` (with both base SHAs) |
-| profile | the profile version changed and the re-evaluated verdict differs | `profile_changed` |
+| ruling ID | the item's `gate_binding.ruling_id` differs from the receipt's (§10) | `ruling_superseded` |
+| base | the base moved, as defined by the profile's `base.scope` (below) | `base_moved` |
+| profile | any edit of the receipt's class | `profile_changed` |
+| input | a changed content id, or an invalid producing receipt (§6) | `input_changed` / `input_receipt_invalid` |
+| grant | a cited grant was revoked | `grant_revoked` |
 
-- **Stale on arrival.** A receipt posted against a ruling, head or MF that the
-  item has already replaced is STALE at once. This is the compare-and-set that
-  catches "started g74 12 s after the recompose ruling".
-- **Base scope.** `scope: "tree"` (default) restales on any base move that
-  changes the merge tree. A base commit that head already contains, or that
-  merges to an identical tree, doesn't restale. `scope: "paths"` restales only
-  when the base change touches `watch_paths` (the gate's closure). That is
-  cheaper for lanes on a busy main, but it is a judgment call for EP (§8 Q1).
-- **Refresh.** The API server has no checkouts, so the **posting host's
-  daemon** checks the moving bindings. For each repo it runs one `git fetch` of
-  the base ref and runner ref every 5 minutes, covering every latest,
-  non-stale receipt on an open item. It then posts the resolved identities to
-  the API, which decides staleness. Other hosts with the same repo can take
-  over if the posting host stops. If no host has checked for 15 minutes, the
-  receipt keeps its verdict but shows `base unchecked 40m`. CM doesn't call it
-  STALE without evidence, and doesn't hide the gap either.
-- **One-way.** A stale receipt never becomes valid again. A rerun posts a new
-  receipt. This keeps "it was green once" out of the current view.
-- STALE is an `item_events` row (`receipt_stale`, with reason, prev and new),
-  so it moves the board version. Alt+B and `board()` pick it up on the next poll.
+- **Base scope.** The default is `paths`: the receipt goes stale only when the
+  base change since `base.sha_after` touches the gate's closure (the
+  identity-closure walker's file set plus the gate's file list, recomputed at
+  the receipt's head). EP chose this because `tree` would restale every gate on
+  every unrelated landing. Compose and deploy gates set `scope: "tree"`, which
+  restales on any base move that changes the merge tree, because those gates
+  must be exact on the final SHA.
+- **Stale on arrival.** A receipt posted against a head, MF or ruling that the
+  item has already replaced is STALE at once. This catches a gate started
+  12 s after a recompose ruling.
+- **Refresh.** The API server has no checkouts, so the posting host's daemon
+  checks the moving bindings.
+  - For each repo, it runs one `git fetch` of the base and runner refs every
+    5 minutes, covering every latest, non-stale receipt on an open item.
+  - It runs the closure/merge-tree check and posts what it observed.
+  - The API decides staleness.
 
-## 5. Tools
+  If no check has landed for 15 minutes, the receipt keeps its verdict but
+  shows `base unchecked 40m`. CM doesn't call it STALE without evidence, and
+  doesn't hide the gap either.
+- **One-way.** A stale receipt never becomes valid again; a rerun posts a new
+  one.
+- Each transition is an `item_events` row (`receipt_stale`, with reason, prev
+  and new), so it moves the board version.
+
+## 9. Tools
 
 **MCP** (daemon-routed like the other item tools; the daemon stamps `actor`):
 
 ```
-gate_report(n: int, steps: list[dict], head: str, mf: str | None = None,
-            runner: dict | None = None, ruling: str | None = None,
-            base: dict | None = None, worktree: dict | None = None,
-            waivers: list[dict] | None = None, gate: str = "gate",
-            klass: str | None = None, artifacts: list[dict] | None = None,
-            log_path: str | None = None, board: str | None = None,
-            request_id: str | None = None)
+gate_report(n, steps, head, mf=None, runner=None, ruling=None, base=None,
+            closure=None, worktree=None, inputs=None, waivers=None,
+            gate="gate", klass=None, log_path=None, board=None, request_id=None)
   -> {receipt: {id, verdict, reasons, stale?}, item}
 
-gate_receipts(n: int, gate: str | None = None, history: bool = False,
-              board: str | None = None)
-  -> {latest: {<gate>: receipt}, history?: [receipt]}
+gate_receipts(n, gate=None, history=False, board=None)
+  -> {latest: {<gate>: receipt}, history?, grants}
 
-gate_profile(klass: str, steps: list[dict] | None = None, waivable=None,
-             require=None, base=None, default: bool = False, board=None)
-  -> {profile}            # read when steps is None; write needs gate_admins
+gate_waive(n, head, step, reason, risk, message_id, kind="waiver",
+           nodes=None, base=None, cmd_digest=None, revoke=None, gate="gate",
+           board=None)
+  -> {grant: {id, verified, problems}}
+
+gate_profile(klass, profile=None, reason=None, default=False, board=None)
+  -> {profile}       # read when profile is None; write: editors only, reason required
 ```
 
 - `item_set` gains `head`, `mf`, `ruling` and `gate_class`. Setting `head`,
-  `mf` or `ruling` is how a lane or EP moves a binding without a rerun, and it
-  restales the current receipts.
-- `item(...)` and `board(view="slim")` render the latest receipt per gate on
-  the item line: `#14 active "fuse SEJD" … ✓PASS 9f8e7d6 r-sejd-14-3` or
-  `✗STALE head_moved (was PASS)`. `view="full"` and `gate_receipts` give the
+  `mf` or `ruling` moves a binding without a rerun, and restales the current
+  receipts.
+- `board(view="slim")` shows the latest receipt per gate on the item line:
+  `#14 active "fuse SEJD" … ✓PASS 9f8e7d6 r-sejd-14-3` or
+  `⟲STALE head_moved (was PASS)`. `view="full"` and `gate_receipts` show the
   steps.
 - `request_id` makes a retried `gate_report` return the first receipt.
 
-**`scripts/cm-gate`**, the recommended way to post. It reads the item's
-profile, runs each declared command at the right SHA, and captures what the
-receipt needs:
+**`scripts/cm-gate`**, the intended way to post:
 
-- the rc, the timestamps and the tail of each step's output;
-- `merge-tree` and worktree identity before and after the run;
-- the runner SHA.
+```
+cm-gate run --item 14 [--gate gate] [--override lane.toml]
+```
 
-It posts with `attestation: "cm-gate"`. Typed receipts are allowed but shown as
-`self`, and the verdict rules are identical: a typed receipt can't skip a
-required step. cm-gate lists every planned step, so a step that never started
-is recorded as `not_run` rather than omitted. Commands come from the profile
-(`steps[].cmd`, templated with `{head}`, `{mf}`, `{base}`) or from a lane's
-local override file, which is then recorded verbatim.
+It reads the item's profile, then:
+- runs each step's `argv` at the right SHA, with JUnit XML for pytest;
+- collects the granted node set;
+- runs the profile's `closure_cmd`;
+- hashes the declared inputs;
+- captures the worktree and merge-tree identity before and after;
+- posts with `attestation: "cm-gate"`.
+
+Every planned step is posted, so a step that never started appears as
+`not_run` rather than being left out.
 
 **Planning API** (`api/items.py`):
 
 | Method + path | Body | Returns |
 |---|---|---|
-| `POST /boards/{ref}/items/{n}/receipts` | `{actor, receipt…, request_id?}` | `{receipt, item}`; 422 `invalid_field` / `waiver_not_waivable` |
-| `GET /boards/{ref}/items/{n}/receipts` | `?gate=&history=0` | `{latest, history}` |
-| `POST /receipts/refresh` | `{daemon_id, observations: [{repo, ref, sha}], trees: [{receipt_id, base_sha, merge_tree}]}` | `{stale: [receipt_id], watch: [{repo, base_ref, head, runner_ref, receipt_id}]}`; the reply tells the daemon what to watch next, so the daemon keeps no state across brain restarts |
-| `PATCH /boards/{ref}` | `{gate_profiles?, gate_default_class?, gate_admins?}` | board header |
+| `POST /boards/{ref}/items/{n}/receipts` | `{actor, receipt…, request_id?}` | `{receipt, item}` |
+| `GET /boards/{ref}/items/{n}/receipts` | `?gate=&history=0` | `{latest, history, grants}` |
+| `POST /boards/{ref}/items/{n}/grants` | `{actor, kind, head, base?, step, nodes?, cmd_digest?, reason, risk, message_id, message_check: {found, sender, contains_head}}` or `{actor, revoke}` | `{grant}` (the daemon fills `message_check`) |
+| `POST /receipts/refresh` | `{daemon_id, observations: [{repo, ref, sha}], checks: [{receipt_id, base_sha, merge_tree, closure_hit: bool}], inputs: [{receipt_id, name, content_id}]}` | `{stale: [id], watch: [{receipt_id, repo, base_ref, head, runner_ref, closure_cmd, scope}]}`; the daemon keeps no state across brain restarts |
+| `PATCH /boards/{ref}` | `{gate_profiles?, gate_default_class?, gate_editors?, waiver_grantors?, reason}` | board header |
 
-**TUI (Alt+B).** The item row gets a gate cell after the status badge:
-`✓PASS` green, `✗FAIL` red, `◐INC` amber, `⟲STALE` dim with a strikethrough
-SHA. The detail pane gets a **Gate** section with one block per gate:
+**TUI (Alt+B).** A gate cell after the status badge: `✓PASS` green, `✗FAIL`
+red, `⊘VOID` magenta, `◐INC` amber, `⟲STALE` dim. The detail pane gets a
+**Gate** section with one block per gate:
+- the verdict and every reason;
+- the bound SHAs, with the stale reason highlighted;
+- one line per step, e.g. `✓ pytest 412 passed · 3 skipped (requires CUDA ×3)`
+  or `⊘ fetch void FETCH_FAIL`;
+- the inputs, with size and short content id;
+- the grants, with their verified state;
+- the receipt id and the run counts (`FAIL ×1 · VOID ×2 on 9f8e7d6`).
 
-- verdict and reasons;
-- the bound SHAs, short form, with the stale reason highlighted;
-- one line per step (`✓ pytest 412 passed · 3 skipped (requires CUDA ×3)`,
-  `✗ fetch error FETCH_FAIL`, `· mypy not run`);
-- the waivers and the receipt id.
+The banner adds `N stale receipts` and any `runner VOID ×N`.
 
-The banner adds `N stale receipts` when there are any.
+## 10. Storage (migration `023_item_receipts.sql`, number claimed at implementation)
 
-**Flags.** A new kind, `receipt_stale`, goes to the item's holders only. It is
-raised once per stale transition, using the `flag_pushed` dedupe, and is never
-escalated to the orchestrator. It resolves when a new receipt for that gate is
-posted or the item closes. INCOMPLETE and FAIL don't flag, since the holder
-already knows. They show up in the board read.
-
-## 6. Storage (migration `023_item_receipts.sql`, number claimed at implementation)
-
-Uses the items style: rerunnable DDL only, no row UPDATEs, writes inside the
-board-row lock, every change an `item_events` row.
+Uses the items style: rerunnable DDL only, no row UPDATEs, every write inside
+the board-row lock, and every change an `item_events` row.
 
 ```sql
 CREATE TABLE IF NOT EXISTS item_receipts (
     id            BIGSERIAL PRIMARY KEY,
     board_id      UUID NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
     item_id       BIGINT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-    seq           INTEGER NOT NULL,          -- per item, for r-<board>-<n>-<seq>
+    seq           INTEGER NOT NULL,
     gate          TEXT NOT NULL DEFAULT 'gate',
     class         TEXT,
     profile_version INTEGER,
@@ -290,16 +516,17 @@ CREATE TABLE IF NOT EXISTS item_receipts (
     runner        JSONB,
     ruling_id     TEXT,
     base          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    closure       JSONB,
     worktree      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    inputs        JSONB NOT NULL DEFAULT '[]'::jsonb,
     steps         JSONB NOT NULL,            -- incl. CM-parsed fields
-    waivers       JSONB NOT NULL DEFAULT '[]'::jsonb,
-    artifacts     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    waivers       TEXT[] NOT NULL DEFAULT '{}',
     repo          TEXT, branch TEXT, log_path TEXT,
     attestation   TEXT NOT NULL,
     computed      JSONB NOT NULL,            -- {verdict, reasons} at post time
     stale_at      TIMESTAMPTZ,
     stale_reason  JSONB,                     -- {reason, prev, new}
-    checked_at    TIMESTAMPTZ,               -- last refresh observation
+    checked_at    TIMESTAMPTZ,
     poster_pid    TEXT NOT NULL,
     request_id    TEXT,
     posted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -309,75 +536,146 @@ CREATE INDEX IF NOT EXISTS idx_item_receipts_latest
     ON item_receipts (item_id, gate, id DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_item_receipts_request
     ON item_receipts (board_id, request_id) WHERE request_id IS NOT NULL;
+-- input identities, for input_changed and the derived-artifact cascade
+CREATE TABLE IF NOT EXISTS item_receipt_inputs (
+    receipt_id    BIGINT NOT NULL REFERENCES item_receipts(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    locator       TEXT NOT NULL,
+    content_id    TEXT,
+    produced_by   BIGINT REFERENCES item_receipts(id) ON DELETE SET NULL,
+    PRIMARY KEY (receipt_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_item_receipt_inputs_locator ON item_receipt_inputs (locator);
+CREATE INDEX IF NOT EXISTS idx_item_receipt_inputs_producer ON item_receipt_inputs (produced_by);
+
+CREATE TABLE IF NOT EXISTS item_grants (
+    id            BIGSERIAL PRIMARY KEY,
+    board_id      UUID NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+    item_id       BIGINT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN ('waiver', 'variance')),
+    gate          TEXT NOT NULL DEFAULT 'gate',
+    grantor_pid   TEXT NOT NULL,
+    head_sha      TEXT NOT NULL,
+    base_sha      TEXT,
+    step          TEXT NOT NULL,
+    nodes         TEXT[],
+    cmd_digest    TEXT,
+    reason        TEXT NOT NULL,
+    risk          TEXT NOT NULL,
+    message_id    TEXT NOT NULL,
+    message_check JSONB NOT NULL,
+    revoked_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT item_grants_seq_key UNIQUE (item_id, seq)
+);
 
 ALTER TABLE items  ADD COLUMN IF NOT EXISTS gate_class TEXT;
 ALTER TABLE items  ADD COLUMN IF NOT EXISTS gate_binding JSONB NOT NULL DEFAULT '{}'::jsonb;
     -- {head, mf, ruling_id}: what the item says is current
 ALTER TABLE boards ADD COLUMN IF NOT EXISTS gate_profiles JSONB NOT NULL DEFAULT '{}'::jsonb;
-    -- {class: {version, steps, waivable, require, base}}
 ALTER TABLE boards ADD COLUMN IF NOT EXISTS gate_default_class TEXT;
-ALTER TABLE boards ADD COLUMN IF NOT EXISTS gate_admins TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS gate_editors TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS waiver_grantors TEXT[] NOT NULL DEFAULT '{}';
 ```
 
-The verdict logic is a pure function in `dispatch/items_rules.py`,
-`evaluate(receipt, profile, binding) -> {verdict, reasons}`, alongside the
-other BoardTx rules, so it can be tested without a database. The parsers are
-in `dispatch/gate_parse.py`.
+The verdict logic is a pure function in `dispatch/items_rules.py`:
+`evaluate(receipt, profile, binding, grants) -> {verdict, reasons}`. It sits
+beside the other BoardTx rules and can be tested without a database. The
+parsers and the grant diff go in `dispatch/gate_parse.py`.
 
-Size limits: a receipt is at most 64 KiB serialized. Summaries are tails, and
-full logs stay at `log_path`. A receipt in a closed item's history is kept
-with the item, and archiving the item archives its receipts.
+A receipt is at most 256 KiB serialized, since `nodes` can be large. Full
+logs stay at `log_path`. Archiving an item archives its receipts and grants.
 
-## 7. Later: question/ruling records (not this batch)
+**Later: question/ruling records (not this batch).** EP's companion ask is a
+record of question, asker, decision owner, status (open / answered /
+superseded), answer, ruling id with timestamp, and bound SHAs/items. How it
+connects to receipts:
+- **Until it exists**, `ruling_id` is free text, compared only with the item's
+  `gate_binding.ruling_id` (`item_set(n, ruling="EP-A1021")`).
+- **Once it exists**, the current ruling for an item is the newest answered,
+  non-superseded ruling that binds the item, its group or its lane.
+  - Answering a superseding ruling restales every receipt bound to the old
+    one.
+  - A receipt citing an unknown or still-open ruling computes INCOMPLETE.
+- **Grants become rulings** of type `waiver` / `variance`. The ruling record
+  replaces `message_id` as the link, and the head-SHA and step binding rules
+  of §4 carry over unchanged.
 
-EP's companion ask is a shared record with these fields:
+## 11. v1 cut
 
-- the question;
-- the asker;
-- the decision owner it's routed to;
-- status (`open` / `answered` / `superseded`);
-- the answer;
-- the ruling ID and timestamp;
-- the SHAs and items it binds.
+The goal: EP gets a trustworthy PASS / FAIL / INCOMPLETE / VOID / STALE on
+real sejd items with the least machinery. **Trustworthy** means a PASS in v1
+is never weaker than the full design's. Where v1 can't check something, the
+answer is INCOMPLETE or an explicit "unchecked" note, never a silent PASS.
 
-How receipts would connect to it:
+**In v1:**
 
-- **Until the record exists**, `ruling_id` is free text, checked only for
-  equality against the item's `gate_binding.ruling_id`. EP or the lane sets
-  that with `item_set(n, ruling="EP-A1021")`.
-- **Once the record exists**, the ruling ID is its key. The current ruling for
-  an item is the newest `answered` ruling that binds the item (or its group or
-  lane) and hasn't been superseded. Answering a superseding ruling then
-  restales every receipt bound to the old one, with no `item_set` step. A
-  receipt naming an unknown or `open` ruling computes INCOMPLETE
-  (`ruling not answered`).
-- **Waivers become rulings of type `waiver`**, each bound to a step name and
-  SHAs. `waiver unverified` disappears. A waiver bound to SHAs other than the
-  receipt's head doesn't apply, and a superseded waiver restales the receipt.
-- **The ruling record can also hold rulings that bind SHAs**, such as "MF is
-  now c3d4". Answering one moves `gate_binding.mf` through the same path.
-
-## 8. Questions for EP
-
-1. **Base scope.** Should any merge-tree change restale (`tree`), or only
-   base changes inside the gate's closure (`paths`)? Which one should be the
-   default for sejd lanes?
-2. **Infra errors (VOID).** Here they compute INCOMPLETE, not FAIL. Should a
-   VOID ever count as RED?
-3. **Must-fail.** The design requires real test failures at `mf_sha`, with
-   collection and import errors rejected. Is that EP's MF semantics, or can MF
-   legitimately be a collection failure?
-4. **Who edits profiles.** Owner, the orchestrator, the steward and
-   `gate_admins` (EP). Should it be narrower?
-5. **Self-attested receipts.** Should a board be able to require
-   `attestation: cm-gate` for PASS?
-
-## 9. Checked against EP's cases
-
-| EP case | Outcome under this design |
+| Area | v1 scope |
 |---|---|
-| Ruling on a stale MF SHA | A newer receipt or `item_set(mf=…)` restales the old one, shown as `STALE mf_moved a1b2 → c3d4`. A receipt posted against the old MF after the change is stale on arrival |
-| RED/VOID reruns | Each rerun is a new receipt, and the latest one per gate is shown. History keeps RED (FAIL) and VOID (INCOMPLETE `error`) runs with their reasons, so "3 reruns" can be counted, not reconstructed |
-| FETCH_FAIL after a pytest pass | The fetch step is required and its state is `error`, so the verdict is INCOMPLETE `fetch error (FETCH_FAIL)`. The pytest pass can't lift it to PASS |
-| Vacuous pass from missing-harvest skips | `must_run` lists the a320 nodes. They show as skipped (`harvest missing`), and that reason isn't in `allow_reasons`, so the verdict is INCOMPLETE `a320 nodes skipped`. Without `must_run`, the reasonless or non-allowed skip still blocks PASS |
-| Gate started just after a new ruling | The receipt's `ruling_id` ≠ the item's current one, so it is STALE on arrival with `ruling_superseded` |
+| Storage | migration 023 as in §10: receipts, receipt inputs, grants, and the item and board columns |
+| Profiles | `gate_profile` read/write by Owner, orchestrator and `gate_editors`; edit log; restale-all-of-class on edit; `require.attestation` |
+| Evaluator | the full §3 rules, in a pure function with unit tests for every EP case in §12 |
+| pytest evidence | per-node outcomes from JUnit XML (cm-gate), MF expected exception types, explicit `skips`/`deselected` with absent = INCOMPLETE, `must_run`, `skip_policy` |
+| mypy, ruff, rc steps | summary parsing plus rc cross-check |
+| Grant vs executed | granted node collection plus node-set diff; argv/env diff against the allowlist; any unrecognized token forces review; `variance` grants |
+| Waivers | `gate_waive` with daemon message verification (sender, head SHA in body); `waiver_grantors`; revoke |
+| Staleness | event-driven bindings (new receipt, `item_set` head/mf/ruling, profile edit, grant revoke, derived-artifact cascade); refresh from the posting host for base (`paths` and `tree`) and runner |
+| Inputs | **partial, see below** |
+| Flags | `receipt_stale`, `runner_void`, `input_void` |
+| Tools | `gate_report`, `gate_receipts`, `gate_waive`, `gate_profile`, `item_set` bindings, the slim-board gate cell, `scripts/cm-gate run` |
+| TUI | Alt+B gate cell, Gate detail section, banner counts |
+
+**Inputs in v1 (partial content hashing, stated explicitly).**
+- **Hashed by cm-gate at run time:** `file` (sha256), `dir` (manifest
+  digest), `gcs` (object generation plus md5/crc32c from metadata, without
+  downloading again), and `artifact` (hash plus `produced_by`).
+- **`db` inputs:** v1 accepts only `snapshot:` or `rows:` content ids that the
+  step itself supplies. cm-gate doesn't compute them, and CM doesn't verify
+  them. A bare query/window is `unbound`, so the run is INCOMPLETE.
+- **Undeclared inputs:** inputs the run reads but the profile doesn't declare
+  aren't detected. Coverage is only as good as the profile's `inputs` list.
+- **What a v1 PASS means for inputs:** the declared inputs had these content
+  ids **when the run happened**. An input that changes after the post is
+  caught only by a later receipt binding the same locator, or by the
+  derived-artifact cascade. v1 doesn't rehash or re-poll inputs in the
+  background. The Gate section prints this as `inputs checked at run time`.
+
+**Deferred** (each can follow without changing the v1 data):
+- background input re-verification in the §8 refresh (rehash dirs, poll GCS
+  generations);
+- cm-gate computing `rows:` digests for DB inputs, and CM verifying snapshot
+  ids;
+- detecting undeclared inputs (e.g. by tracing file opens);
+- refresh takeover by another host with the same repo. In v1, if the posting
+  host stops, the receipt shows `base unchecked Nm`;
+- question/ruling records (end of §10), and with them `ruling_superseded`
+  driven by the record instead of `item_set`;
+- grants that link ruling records instead of chat messages.
+
+**Order of work** (for the go):
+1. Migration and evaluator with EP-case tests.
+2. API routes and MCP tools.
+3. `cm-gate run`.
+4. Refresh and flags.
+5. TUI.
+
+Steps 1–3 give real receipts on sejd. Steps 4–5 add base/runner staleness and
+the Alt+B view.
+
+## 12. Checked against EP's cases
+
+| EP case | Outcome |
+|---|---|
+| Ruling on a stale MF SHA | `item_set(mf=…)` or a newer receipt gives `STALE mf_moved a1b2 → c3d4`; a receipt posted against the old MF is stale on arrival |
+| RED/VOID reruns | one receipt per run; history keeps each run as FAIL or VOID with its reasons, and the run counts show `FAIL ×1 · VOID ×2 on 9f8e7d6`. VOID doesn't use up the one-run budget |
+| FETCH_FAIL ×2 on the same runner | each run is VOID, and the second raises `runner_void` (`runner VOID ×2`) to holders and the orchestrator |
+| FETCH_FAIL after a pytest pass | the fetch step is `void`, so the run is VOID; the pytest pass can't lift it |
+| Vacuous pass from missing-harvest skips | the required input `harvest_a320` is `missing`, so VOID; also `must_run` a320 nodes skipped, so INCOMPLETE is listed as well; and a non-allowed skip reason. Never PASS |
+| MF failing by import error, or by a missing-data `pytest.fail` | the node's failure type isn't the declared one, so FAIL; a missing-data node must be listed in `deselected` |
+| Lane override drops nodes or adds `-k` | node-set shrinkage or a narrower filter makes the run weakened, so FAIL until EP attaches a `variance` grant for that head and command digest |
+| Worker count 2, a timeout and `JAX_PLATFORMS=cpu` | allowed differences; the value of `JAX_PLATFORMS` is recorded |
+| Waiver naming another SHA, or "the gate" | unverified: it doesn't cover the run, so not PASS |
+| Staging artifact 12.98 vs 6.55 GB | the input's `bytes` and `content_id` are bound; a consumer that read a different artifact binds a different id and `produced_by` |
+| Gate started just after a new ruling | the receipt's `ruling_id` differs from the item's, so STALE on arrival with `ruling_superseded` |
+| Unrelated landing on main | `paths` scope: no closure file touched, so the receipt stays valid; a deploy gate with `tree` scope restales |
