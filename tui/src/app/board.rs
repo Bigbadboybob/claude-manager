@@ -404,7 +404,15 @@ impl App {
                 }
                 // A suggested transition (a DONE/STOP post): confirm or reject.
                 (Menu::Resolve, KeyCode::Char('5'), Some(n)) => {
-                    self.board_write("item.resolve", json!({"n": n, "action": "apply"}))
+                    // Confirm exactly the target shown; the API refuses a
+                    // suggestion that changed since.
+                    let to = self.board.data["flags"].as_array().into_iter().flatten()
+                        .find(|f| f["n"] == n && f["kind"] == "suggested_transition")
+                        .and_then(|f| f["detail"]["to"].as_str().map(str::to_owned));
+                    match to {
+                        Some(to) => self.board_write("item.resolve", json!({"n": n, "action": "apply", "to": to})),
+                        None => self.board.status = format!("#{n} has no suggested transition"),
+                    }
                 }
                 (Menu::Resolve, KeyCode::Char('6'), Some(n)) => {
                     self.board_write("item.resolve", json!({"n": n, "action": "dismiss"}))

@@ -617,6 +617,41 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
             "actor": LANE, "ns": [1, 99], "set": {"status": "active"}})
         self.assertEqual(r.status_code, 404)
 
+    async def test_bulk_each_reports_a_lost_database_per_item(self):
+        import asyncpg
+
+        await self.create("a", "b", "c", actor=LANE)
+        real = items_db.update_items
+        calls = []
+
+        async def flaky(pool, ref, actor, ns, fields, **kw):
+            calls.append(ns[0])
+            if ns[0] == 2:
+                raise asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed")
+            return await real(pool, ref, actor, ns, fields, **kw)
+
+        with mock.patch.object(items_db, "update_items", flaky):
+            r = await self.http.patch(f"/boards/{self.ref}/items", json={
+                "actor": LANE, "ns": [1, 2, 3], "set": {"note": "wave"}, "each": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        results = r.json()["results"]
+        self.assertEqual([x["ok"] for x in results], [True, False, False])
+        self.assertEqual({x["error"]["code"] for x in results[1:]}, {"db_unavailable"})
+        self.assertEqual(calls, [1, 2], "nothing after the lost connection is attempted")
+        notes = {i["n"]: i["note"] for i in (await self.read())["items"]}
+        self.assertEqual((notes[1], notes[2], notes[3]), ("wave", None, None))
+
+        async def boom(pool, ref, actor, ns, fields, **kw):
+            if ns[0] == 1:
+                raise RuntimeError("unexpected")
+            return await real(pool, ref, actor, ns, fields, **kw)
+
+        with mock.patch.object(items_db, "update_items", boom):
+            r = await self.http.patch(f"/boards/{self.ref}/items", json={
+                "actor": LANE, "ns": [1, 3], "set": {"note": "x"}, "each": True})
+        self.assertEqual([x["ok"] for x in r.json()["results"]], [False, True])
+        self.assertEqual(r.json()["results"][0]["error"]["code"], "internal")
+
     async def test_chat_touch_keyword_suggests_and_apply_confirms(self):
         await self.create("fuse", actor=LANE)
         r = await self.post("/items/chat-touch", {
@@ -629,7 +664,14 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         bad = await self.post("/items/chat-touch", {
             "actor": LANE, "ns": [1], "suggest": {"keyword": "DONE", "status": "dropped"}})
         self.assertEqual(bad.status_code, 422, "only done or blocked can be suggested")
-        r = await self.post(f"/boards/{self.ref}/items/1/resolve", {"actor": LANE, "action": "apply"})
+        two = await self.post("/items/chat-touch", {
+            "actor": LANE, "ns": [1, 2], "suggest": {"keyword": "DONE", "status": "done"}})
+        self.assertEqual(two.status_code, 422, "a suggestion is for exactly one item")
+        r = await self.post(f"/boards/{self.ref}/items/1/resolve", {"actor": LANE, "action": "apply",
+                                                                   "to": "blocked"})
+        self.assertEqual(r.status_code, 409, "a stale target is refused")
+        r = await self.post(f"/boards/{self.ref}/items/1/resolve", {"actor": LANE, "action": "apply",
+                                                                   "to": "done"})
         self.assertEqual(r.status_code, 200, r.text)
         closed = (await self.read())["recently_closed"]
         self.assertEqual(closed[0]["status"], "done")

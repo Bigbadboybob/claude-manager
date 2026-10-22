@@ -107,6 +107,7 @@ class Item:
     created_at: datetime | None = None
     stale_nudged_at: datetime | None = None
     flag_pushed: dict = field(default_factory=dict)   # kind -> fingerprint at last push
+    gate_head: str | None = None                      # gate_binding.head (read-only here)
     holders: list = field(default_factory=list)       # [{pid, name, session_uid, daemon_id}]
     blocked_by: set = field(default_factory=set)      # item numbers
     open_flags: dict = field(default_factory=dict)    # kind -> {raised_at, detail}
@@ -642,19 +643,30 @@ class BoardTx:
 
     def _suggest(self, it: Item, suggest: dict, message_id: str | None):
         """Raise a suggested transition from a keyword in a progress post;
-        only the holders and the steward hear about it."""
+        only the holders and the steward hear about it. A suggestion with a
+        new target settles the old one and is raised (and pushed) afresh, so
+        `apply` can never execute a target nobody was shown. A dismissed
+        target is not suggested again until the item's status or head moves."""
         to = suggest.get("status")
         keyword = str(suggest.get("keyword") or "")[:20]
         if to not in SUGGEST_STATUSES or it.status == to or not keyword:
             return
-        who = self.actor.get("name") or self.actor["pid"]
-        detail = {"to": to, "keyword": keyword, "by": who, "message_id": message_id}
-        fresh = SUGGESTED not in it.open_flags
-        self.raise_flag(it, SUGGESTED, detail)
-        if not fresh:
+        if it.status == OWNER_BLOCKED:
+            return  # waiting on Owner's decision: not the poster's to close
+        dismissed = it.flag_pushed.get(f"{SUGGESTED}:dismissed:{to}")
+        if dismissed and dismissed.get("status") == it.status and dismissed.get("head") == it.gate_head:
             return
+        who = self.actor.get("name") or self.actor["pid"]
+        current = it.open_flags.get(SUGGESTED)
+        if current and (current.get("detail") or {}).get("to") != to:
+            self.resolve_flag(it, SUGGESTED, "superseded")
+            current = None
+        detail = {"to": to, "keyword": keyword, "by": who, "message_id": message_id}
+        self.raise_flag(it, SUGGESTED, detail)
+        if current:
+            return  # same target again: detail refreshed, no second push
         text = (f"{self._prefix()} #{it.n} \"{it.title}\": {who} posted {keyword}. Mark it {to}? "
-                f"item_resolve({it.n}, \"apply\") or item_resolve({it.n}, \"dismiss\").")
+                f"item_resolve({it.n}, \"apply\", to=\"{to}\") or item_resolve({it.n}, \"dismiss\").")
         audience = list(it.holders)
         steward = self.board.get("steward_pid")
         if steward and steward not in [h["pid"] for h in audience]:
@@ -667,7 +679,7 @@ class BoardTx:
 
     def resolve(self, n: int, action: str, *, kind: str | None = None, holders=None,
                 blocked_by=None, blocked_on=None, check_back=None, reason=None,
-                message=None) -> list[str]:
+                message=None, to: str | None = None) -> list[str]:
         it = self.item(n)
         if action not in RESOLVE_ACTIONS:
             raise invalid("invalid_field", f"action must be one of {', '.join(RESOLVE_ACTIONS)}",
@@ -692,10 +704,23 @@ class BoardTx:
             flag = it.open_flags.get(SUGGESTED)
             if not flag:
                 raise invalid("invalid_field", f"#{n} has no suggested transition", field="action")
-            to = (flag.get("detail") or {}).get("to")
-            self.resolve_flag(it, SUGGESTED, action)
+            target = (flag.get("detail") or {}).get("to")
             if action == "apply":
-                self.apply(n, {"status": to}, reason=reason or
+                # The caller confirms the target it was shown; a suggestion
+                # that changed since is refused, never executed.
+                if not to:
+                    raise invalid("invalid_field", f"apply needs to=\"{target}\" (the suggestion "
+                                  "you are confirming)", field="to")
+                if to != target:
+                    raise ItemsError(409, "suggestion_changed",
+                                     f"#{n}'s suggestion is now {target}, not {to}", n=n, to=target)
+            self.resolve_flag(it, SUGGESTED, action)
+            if action == "dismiss":
+                it.flag_pushed[f"{SUGGESTED}:dismissed:{target}"] = {
+                    "status": it.status, "head": it.gate_head, "at": iso(self.now)}
+                self.dirty.add(n)
+            if action == "apply":
+                self.apply(n, {"status": target}, reason=reason or
                            f"confirmed suggestion ({(flag.get('detail') or {}).get('keyword')})")
             self._event(it, "resolved", new={"action": action, "flags": [SUGGESTED]}, reason=reason)
             return [SUGGESTED]

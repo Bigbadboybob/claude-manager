@@ -376,6 +376,7 @@ def item_resolve(
     task_id: str | None = None,
     board: str | None = None,
     request_id: str | None = None,
+    to: str | None = None,
 ) -> dict:
     """Resolve an item's flags (orchestrators) with one action:
 
@@ -392,7 +393,10 @@ def item_resolve(
       which returns it to active.
     - apply / dismiss: confirm or reject a suggested_transition flag, raised
       when a holder's or the steward's post about the item says DONE, GREEN,
-      deployed (→ done) or STOP (→ blocked). Nothing changes until you do.
+      DEPLOYED (→ done) or STOP (→ blocked). Nothing changes until you do.
+      apply needs to=<the suggested status> and is refused if the suggestion
+      has changed since; a dismissed target is not suggested again until the
+      item's status or head moves.
 
     kind limits the action to one flag kind; by default it resolves all of
     the item's open flags. A launch retried with the same request_id reassigns

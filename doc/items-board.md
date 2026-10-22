@@ -177,7 +177,7 @@ also raised by the write path. Thresholds are per board:
 | `eta_passed` | `active` with an ETA (capped at `stale_background_s` after it was set, so a far ETA cannot silence an item for weeks), `now ≥ eta_at`, and no activity since (`max(touched_at, clock_reset_at) ≤ eta_at`); `ETA_STALE_GRACE_S` (1800, fixed) after the ETA, still without activity, `stale` too (detail `{eta_at}`, no nudge round). New activity or a new ETA clears both |
 | `check_back` | `blocked_on` set and `check_back_at` passed |
 | `blocker_dropped` | a blocker of this item was dropped |
-| `suggested_transition` | a holder's, the steward's or the orchestrator's post about this item (and no other) says `DONE`, `GREEN` or `deployed` (→ done) or `STOP` (→ blocked), outside quotes and not negated (`not DONE`). Detail `{to, keyword, by, message_id}`. A suggestion only: the holders and the steward get one push; it never reaches the orchestrator or Owner; any status change settles it; `item_resolve(n, "apply")` confirms it, `"dismiss"` rejects it (Alt+B `x` → 5 / 6) |
+| `suggested_transition` | a holder's, the steward's or the orchestrator's post about exactly one item (a thread reply must name that item itself) says `DONE`, `GREEN` or `DEPLOYED` (→ done) or `STOP` (→ blocked), in capitals. Never counted: quoted lines, code (fences, backticks), a word followed by `?`, "GREEN light", or a negation, condition or future (`not`, `don't`, `once`, `will be`, …) in the four words before it; conflicting words suggest nothing. Not raised on items blocked on Owner. Detail `{to, keyword, by, message_id}`. A suggestion only: the holders and the steward get one push per target (a new target settles the old suggestion and is pushed afresh); it never reaches the orchestrator or Owner; any status change settles it. `item_resolve(n, "apply", to=…)` confirms exactly that target (409 `suggestion_changed` if it moved); `"dismiss"` rejects it, and that target is not suggested again until the item's status or head changes (Alt+B `x` → 5 / 6) |
 
 "Held" means `active`, `waiting`, `blocked`, or `open` with holders: an
 `open` item that keeps holders gets the same holder and staleness flags as
@@ -385,7 +385,9 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"
 - A bare string as `item_set`'s second argument is `status`.
 - `item_set` on a list of `n` is all-or-nothing. `each=True` writes each item
   on its own and adds `results: [{n, ok, error?}]`, so one refused item does
-  not block the rest (bulk housekeeping, e.g. a wave of stale flags). API:
+  not block the rest (bulk housekeeping, e.g. a wave of stale flags). Every
+  failure is that item's result; if the database goes away mid-way, items
+  already written stay written and the rest report `db_unavailable`. API:
   `PATCH /boards/{ref}/items` with `"each": true`.
 - MCP arguments left out are unchanged. An empty string clears `note`,
   `group`, `blocked_on`, `check_back` or `eta`; `blocked_by=[]` clears

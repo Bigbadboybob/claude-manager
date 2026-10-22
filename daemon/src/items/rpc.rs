@@ -462,7 +462,7 @@ fn item_resolve(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> R
     authorize_edit(ctx, params, &board)?;
     let slug = slug(&board)?;
     let mut body = json!({"actor": ctx.actor(), "action": action});
-    for key in ["kind", "blocked_on", "check_back", "reason", "message"] {
+    for key in ["kind", "blocked_on", "check_back", "reason", "message", "to"] {
         if let Some(v) = present(params, key) {
             body[key] = v;
         }

@@ -133,6 +133,8 @@ class ItemResolveBody(_Strict):
     check_back: When | None = None
     reason: Reason | None = None
     message: str | None = Field(default=None, max_length=1000)
+    # apply: the suggested status being confirmed (refused if it changed).
+    to: str | None = Field(default=None, max_length=16)
 
 
 class HeartbeatBody(_Strict):

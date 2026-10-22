@@ -560,12 +560,14 @@ class SuggestedTransitions(unittest.TestCase):
                          {"to": "done", "keyword": "DONE", "by": "lane", "message_id": "m-1"})
         # The holder posted it; the steward is the one who hears.
         self.assertEqual([p["pid"] for p in tx.pushes], [self.STEWARD["pid"]])
-        self.assertIn('item_resolve(1, "apply")', tx.pushes[0]["text"])
+        self.assertIn('item_resolve(1, "apply", to="done")', tx.pushes[0]["text"])
 
     def test_apply_confirms_and_dismiss_rejects(self):
         self.touch()
         tx = self.b.tx(self.STEWARD)
-        self.assertEqual(tx.resolve(1, "apply"), ["suggested_transition"])
+        with self.assertRaises(ItemsError):
+            tx.resolve(1, "apply")  # must name the target it confirms
+        self.assertEqual(tx.resolve(1, "apply", to="done"), ["suggested_transition"])
         self.assertEqual(self.b[1].status, "done")
         b = Board()
         b.create("x", actor=LANE)
@@ -573,7 +575,7 @@ class SuggestedTransitions(unittest.TestCase):
         b.tx(LANE).resolve(1, "dismiss")
         self.assertEqual((b[1].status, b[1].open_flags), ("active", {}))
         with self.assertRaises(ItemsError):
-            b.tx(LANE).resolve(1, "apply")
+            b.tx(LANE).resolve(1, "apply", to="blocked")
 
     def test_any_status_change_settles_it_and_a_matching_status_raises_none(self):
         self.touch(keyword="STOP", status="blocked")
@@ -591,3 +593,57 @@ class SuggestedTransitions(unittest.TestCase):
         self.assertEqual(self.b[1].touched_at, before)
         self.assertIn("suggested_transition", self.b[1].open_flags)
         self.assertEqual([p["pid"] for p in tx.pushes], [LANE["pid"]])
+
+
+class SuggestionReview(unittest.TestCase):
+    """Review of 4194a21."""
+
+    STEWARD = agent("steward", daemon="d3")
+
+    def setUp(self):
+        self.b = Board()
+        self.b.board["steward_pid"] = self.STEWARD["pid"]
+        self.b.create("fuse SEJD", actor=LANE)
+
+    def post(self, keyword, status, actor=None):
+        tx = self.b.tx(actor or LANE)
+        tx.touch([1], source="chat", any_item=actor is not None,
+                 suggest={"keyword": keyword, "status": status})
+        return tx
+
+    def test_a_changed_target_is_raised_afresh_and_apply_checks_it(self):
+        self.post("GREEN", "done")
+        tx = self.post("STOP", "blocked")
+        flag = self.b[1].open_flags["suggested_transition"]
+        self.assertEqual(flag["detail"]["to"], "blocked")
+        self.assertEqual([f["resolution"] for f in tx.flags_resolved], ["superseded"])
+        self.assertEqual(len(tx.pushes), 1, "the new target gets its own push")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.tx(self.STEWARD).resolve(1, "apply", to="done")  # what the first push said
+        self.assertEqual(cm.exception.code, "suggestion_changed")
+        self.assertEqual(self.b[1].status, "active")
+        # The same target again refreshes the detail without a second push.
+        again = self.post("STOP", "blocked")
+        self.assertEqual(again.pushes, [])
+
+    def test_a_dismissed_target_stays_quiet_until_status_or_head_moves(self):
+        self.post("DONE", "done")
+        self.b.tx(self.STEWARD).resolve(1, "dismiss")
+        self.post("DONE", "done")
+        self.assertNotIn("suggested_transition", self.b[1].open_flags)
+        self.post("STOP", "blocked")
+        self.assertIn("suggested_transition", self.b[1].open_flags, "another target is news")
+        self.b.tx(self.STEWARD).resolve(1, "dismiss")
+        self.b[1].gate_head = "b" * 40  # a new head
+        self.post("DONE", "done")
+        self.assertIn("suggested_transition", self.b[1].open_flags)
+        self.b.tx(self.STEWARD).resolve(1, "dismiss")
+        self.b.set(1, actor=LANE, status="waiting", eta="1h")  # a status move
+        self.post("DONE", "done")
+        self.assertIn("suggested_transition", self.b[1].open_flags)
+
+    def test_items_blocked_on_owner_get_no_suggestion(self):
+        self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="approve 8xH100?")
+        self.post("DONE", "done")
+        self.post("STOP", "blocked", actor=self.STEWARD)
+        self.assertNotIn("suggested_transition", self.b[1].open_flags)

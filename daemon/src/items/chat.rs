@@ -50,45 +50,97 @@ pub(crate) fn unquoted_refs(text: &str) -> Vec<i64> {
     refs(&own.join("\n"))
 }
 
-/// A result word in the sender's own (unquoted) text that suggests a status
-/// (Board-Steward, 2026-10-20). `GREEN`, `DONE` and `STOP` count only in
-/// capitals, `deployed` in any case; a negation just before the word
-/// (`not DONE`, `isn't deployed`) cancels it. Only a suggestion: the holder
-/// or steward confirms it on the board.
+/// A result word in the sender's own text that suggests a status
+/// (Board-Steward, 2026-10-20): `DONE`, `GREEN` or `DEPLOYED` (→ done) and
+/// `STOP` (→ blocked), in capitals only. Never counted: quoted lines (`>`),
+/// code (fenced blocks and backtick spans), a word followed by `?`,
+/// "GREEN light", or a word with a negation, condition or future tense
+/// among the four words before it (`not yet DONE`, `don't STOP`,
+/// `once DEPLOYED`, `will be GREEN`).
+/// Conflicting words suggest nothing. Only a suggestion: the holder or
+/// steward confirms it on the board.
 pub(crate) fn suggestion(text: &str) -> Option<(&'static str, &'static str)> {
-    const WORDS: &[(&str, bool, &str, &str)] = &[
-        ("DONE", true, "DONE", "done"),
-        ("GREEN", true, "GREEN", "done"),
-        ("deployed", false, "deployed", "done"),
-        ("STOP", true, "STOP", "blocked"),
+    const WORDS: &[(&str, &str)] = &[("DONE", "done"), ("GREEN", "done"), ("DEPLOYED", "done"), ("STOP", "blocked")];
+    const BLOCKERS: &[&str] = &[
+        "not", "no", "never", "nor", "don't", "dont", "doesn't", "didn't", "isn't", "isnt", "aren't",
+        "wasn't", "won't", "can't", "cannot", "without", "if", "once", "when", "unless", "until", "before",
+        // Future or expected, not a result yet.
+        "will", "would", "should", "be", "expect", "expected", "awaiting", "waiting", "pending",
     ];
-    const NEGATIONS: &[&str] = &["not", "no", "isn't", "isnt", "never", "un", "aren't", "wasn't", "nor"];
-    let own: Vec<&str> = text.lines().filter(|l| !l.trim_start().starts_with('>')).collect();
+    const LOOKBACK: usize = 4;
     let mut found: Option<(&'static str, &'static str)> = None;
-    for line in own {
-        let tokens: Vec<&str> = line
-            .split(|c: char| c.is_whitespace() || ",.;:!?()[]*_`\"".contains(c))
-            .filter(|t| !t.is_empty())
-            .collect();
-        for (i, tok) in tokens.iter().enumerate() {
-            for (word, exact, keyword, status) in WORDS {
-                let hit = if *exact { tok == word } else { tok.eq_ignore_ascii_case(word) };
-                if !hit {
-                    continue;
+    let mut in_fence = false;
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || line.starts_with('>') {
+            continue;
+        }
+        // Drop inline `code` spans.
+        let mut plain = String::with_capacity(line.len());
+        let mut in_tick = false;
+        for c in line.chars() {
+            if c == '`' {
+                in_tick = !in_tick;
+                plain.push(' ');
+            } else if !in_tick {
+                plain.push(c);
+            }
+        }
+        // Words with the character right after each.
+        let chars: Vec<char> = plain.chars().collect();
+        let mut words: Vec<(String, Option<char>)> = vec![];
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphanumeric() || chars[i] == '\'' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '\'') {
+                    i += 1;
                 }
-                let negated = i > 0 && NEGATIONS.contains(&tokens[i - 1].to_lowercase().as_str());
-                if negated {
-                    continue;
-                }
-                match found {
-                    // Conflicting words (DONE … STOP) suggest nothing.
-                    Some((_, s)) if s != *status => return None,
-                    _ => found = Some((keyword, status)),
-                }
+                let next = chars[i..].iter().copied().find(|c| !c.is_whitespace());
+                words.push((chars[start..i].iter().collect(), next));
+            } else {
+                i += 1;
+            }
+        }
+        for (k, (word, next)) in words.iter().enumerate() {
+            let Some((keyword, status)) = WORDS.iter().find(|(w, _)| w == word).copied() else {
+                continue;
+            };
+            if *next == Some('?') {
+                continue;
+            }
+            if keyword == "GREEN" && words.get(k + 1).is_some_and(|(w, _)| w.eq_ignore_ascii_case("light")) {
+                continue;
+            }
+            let blocked = words[k.saturating_sub(LOOKBACK)..k]
+                .iter()
+                .any(|(w, _)| BLOCKERS.contains(&w.to_lowercase().as_str()));
+            if blocked {
+                continue;
+            }
+            match found {
+                Some((_, s)) if s != status => return None,
+                _ => found = Some((keyword, status)),
             }
         }
     }
     found
+}
+
+/// The suggestion a post makes, if any: only when the post is about exactly
+/// one item and, for a thread reply, its own text names that same item.
+pub(crate) fn post_suggestion(body: &str, ns: &[i64], is_reply: bool) -> Option<(&'static str, &'static str)> {
+    if ns.len() != 1 {
+        return None;
+    }
+    if is_reply && unquoted_refs(body) != ns {
+        return None;
+    }
+    suggestion(body)
 }
 
 struct Job {
@@ -187,8 +239,7 @@ pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply
         return;
     }
     let Ok(api) = Api::from_config(&api_url, &api_token) else { return };
-    // Suggest only when the post is about exactly one item.
-    let suggest = if ns.len() == 1 { suggestion(body) } else { None };
+    let suggest = post_suggestion(body, &ns, thread_root.is_some());
     let job = Job {
         api: api.with_timeout(TIMEOUT),
         actor: json!({"pid": format!("agent:{daemon_id}:{uid}"), "name": name.unwrap_or(title),
@@ -214,14 +265,39 @@ mod tests {
     fn keywords_suggest_a_status_only_when_unambiguous() {
         assert_eq!(suggestion("#14 gate GREEN on a1b2c3d"), Some(("GREEN", "done")));
         assert_eq!(suggestion("#14 DONE."), Some(("DONE", "done")));
-        assert_eq!(suggestion("#14 Deployed to cm-manager"), Some(("deployed", "done")));
+        assert_eq!(suggestion("#14 DEPLOYED to cm-manager"), Some(("DEPLOYED", "done")));
         assert_eq!(suggestion("#14 STOP: OOM on devbox6"), Some(("STOP", "blocked")));
-        assert_eq!(suggestion("#14 not DONE yet"), None, "negated");
-        assert_eq!(suggestion("#14 isn't deployed"), None);
-        assert_eq!(suggestion("#14 almost done, green-ish"), None, "lowercase done/green are prose");
-        assert_eq!(suggestion("> #14 DONE\nthat was yesterday"), None, "quoted");
-        assert_eq!(suggestion("#14 GREEN but STOP the deploy"), None, "conflicting words");
-        assert_eq!(suggestion("#14 DONEish"), None, "whole words only");
+        for prose in [
+            "#14 not DONE yet",
+            "#14 not yet DONE",
+            "#14 isn't DEPLOYED",
+            "#14 don't STOP the run",
+            "#14 will be DONE once the gate is GREEN... once GREEN",
+            "#14 needs to be deployed",
+            "#14 deployed to cm-manager",
+            "#14 almost done, green-ish",
+            "#14 DONE?",
+            "#14 is it GREEN ?",
+            "#14 got the GREEN light from EP",
+            "#14 run `make STOP` then check",
+            "#14 log:\n```\nstatus: DONE\n```",
+            "> #14 DONE\nthat was yesterday",
+            "#14 GREEN but STOP the deploy",
+            "#14 DONEish",
+        ] {
+            assert_eq!(suggestion(prose), None, "{prose}");
+        }
+    }
+
+    #[test]
+    fn a_reply_suggests_only_for_the_one_item_it_names_itself() {
+        assert_eq!(post_suggestion("#14 DONE", &[14], false), Some(("DONE", "done")));
+        assert_eq!(post_suggestion("#14 #15 DONE", &[14, 15], false), None, "more than one item");
+        // A reply in #14's thread: the keyword must sit in a reply that names #14 itself.
+        assert_eq!(post_suggestion("DONE", &[14], true), None);
+        assert_eq!(post_suggestion("#14 DONE", &[14], true), Some(("DONE", "done")));
+        assert_eq!(post_suggestion("#15 DONE", &[14], true), None, "names another item");
+        assert_eq!(post_suggestion("#14 DONE", &[14, 15], true), None);
     }
 
     use crate::control::protocol::{Caller, Request};

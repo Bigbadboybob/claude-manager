@@ -119,7 +119,7 @@ async def resolve_item(ref: str, body: ItemResolveBody, request: Request,
         kind=body.kind,
         holders=[h.model_dump() for h in body.holders] if body.holders is not None else None,
         blocked_by=body.blocked_by, blocked_on=body.blocked_on,
-        check_back=body.check_back, reason=body.reason, message=body.message))
+        check_back=body.check_back, reason=body.reason, message=body.message, to=body.to))
 
 
 # ---- gate receipts (doc/gate-receipts.md §9) ---------------------------------

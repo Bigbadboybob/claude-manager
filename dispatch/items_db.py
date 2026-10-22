@@ -155,6 +155,7 @@ def _item_from_row(row) -> Item:
         created_by=row["created_by"], created_at=row["created_at"],
         stale_nudged_at=row["stale_nudged_at"],
         flag_pushed=dict(row.get("flag_pushed") or {}),
+        gate_head=(row.get("gate_binding") or {}).get("head"),
     )
 
 
@@ -419,18 +420,37 @@ async def update_items(pool, ref: str, actor: dict, ns: list[int], fields: dict,
     return _write_reply(tx, done)
 
 
+# Errors that mean the database is gone, not that one item was refused.
+DB_LOST = (asyncpg.exceptions.ConnectionDoesNotExistError, asyncpg.exceptions.InterfaceError,
+           asyncpg.exceptions.PostgresConnectionError, OSError, TimeoutError)
+
+
 async def update_items_each(pool, ref: str, actor: dict, ns: list[int], fields: dict, *,
                             add_holders=None, remove_holders=None, reason=None) -> dict:
     """Bulk edit with per-item results (Board-Steward's ask): each item is
-    its own write, so one refused item never blocks the rest."""
+    its own write, so one refused item never blocks the rest. Any failure is
+    that item's result; if the database goes away mid-way, the items already
+    written stay written and every remaining item reports `db_unavailable`,
+    never a bare 500 after partial commits."""
     results, items, warnings, unblocked = [], [], [], set()
-    for n in dict.fromkeys(ns):
+    board = None
+    order = list(dict.fromkeys(ns))
+    for i, n in enumerate(order):
         try:
             reply = await update_items(pool, ref, actor, [n], dict(fields),
                                        add_holders=add_holders, remove_holders=remove_holders,
                                        reason=reason)
         except ItemsError as exc:
             results.append({"n": n, "ok": False, "error": exc.detail()})
+            continue
+        except DB_LOST as exc:
+            message = f"database unavailable ({type(exc).__name__}); not written"
+            results += [{"n": m, "ok": False, "error": {"code": "db_unavailable", "message": message}}
+                        for m in order[i:]]
+            break
+        except Exception as exc:  # noqa: BLE001 - reported per item, never a partial 500
+            results.append({"n": n, "ok": False,
+                            "error": {"code": "internal", "message": type(exc).__name__}})
             continue
         results.append({"n": n, "ok": True})
         items += reply["items"]
@@ -439,7 +459,7 @@ async def update_items_each(pool, ref: str, actor: dict, ns: list[int], fields: 
         board = reply["board"]
     out = {"items": items, "results": results, "unblocked": sorted(unblocked),
            "warnings": warnings}
-    if items:
+    if board:
         out["board"] = board
     return out
 
@@ -475,6 +495,9 @@ async def chat_touch(pool, actor: dict, ns: list[int], *, channel: str | None,
     is skipped. The daemon has already applied the thread and quote rules."""
     if not actor or not actor.get("pid"):
         raise ItemsError(422, "invalid_field", "actor.pid is required", field="actor")
+    if suggest and len(set(ns)) != 1:
+        raise ItemsError(422, "invalid_field", "a suggestion is for exactly one item",
+                         field="suggest")
     pid = actor["pid"]
     channel = (channel or "").strip().lstrip("#") or None
     now = utcnow()
