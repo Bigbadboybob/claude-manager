@@ -2793,12 +2793,10 @@ fn rehydrate_transaction(
             })?;
         // Seed before any thread exists (the reader starts at commit),
         // so the carried tail precedes the kernel-buffered bytes.
-        if let Some(ring) = rings_dir
-            .as_deref()
-            .and_then(|d| crate::fanout_persist::take_ring(d, &rec.uid))
-        {
-            build.seed_replay(&ring);
-        }
+        // The keyboard mode comes with it (send_key encodes by it).
+        let ring = rings_dir.as_deref().and_then(|d| crate::fanout_persist::take_ring(d, &rec.uid));
+        let keyboard = rings_dir.as_deref().and_then(|d| crate::fanout_persist::take_keyboard(d, &rec.uid));
+        build.seed_adopted(ring.as_deref(), keyboard);
         builds.push((i, build, checkpoint));
     }
     if let Some(d) = rings_dir.as_deref() {

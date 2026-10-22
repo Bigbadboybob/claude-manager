@@ -246,7 +246,7 @@ After dispatching, end your turn; the monitor, mention or board push wakes you. 
 | Work from a task | `start_session(type=..., label=..., task_id=...)`; an omitted prompt uses the named task's stored instructions when available |
 | Create a child task | `create_subtask`; creating a task does not start its session |
 | Assign follow-up work | `send_input(session_uid=..., text=...)`; check its schema for options |
-| Revive rate-limited or errored sessions, answer a menu | `send_key(session_uids=[...], key="enter")`: exactly one key per session (no text, no trailing Enter), encoded for each session's keyboard mode; also `escape`, arrows, `tab`, `ctrl-c`, or one character like `"1"`. Per-session results; send_input's scope |
+| Revive rate-limited or errored sessions, answer a menu | `send_key(session_uids=[...], key="enter")`: exactly one key per session (no text, no trailing Enter), encoded for each session's keyboard mode; also `escape`, arrows, `tab`, `ctrl-c`, or one character like `"1"`. Per-session results; send_input's scope. A key is not new work: it leaves a `reported` status and watches as they are |
 | Watch worker completion | `monitor_sessions(session_uids=[...], until="final")`; a prompted `start_session` / `send_input` already registers a watch by default |
 | Report your own completion | `report_done(reason="...")` when your assignment is actually finished |
 

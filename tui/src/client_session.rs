@@ -689,6 +689,24 @@ pub(crate) fn rpc_continuous_control(daemon_socket: &Path, token: &str, method: 
     response.result.ok_or_else(|| anyhow::anyhow!("daemon returned no result"))
 }
 
+/// `session.send_key` on a session's host daemon (operator): the TUI's
+/// `send_key` forwards there once it has checked the caller's scope, so the
+/// key is encoded by the daemon's tracked keyboard mode and written without
+/// an input stamp.
+pub(crate) fn rpc_send_key(socket: &Path, token: &str, uids: &[String], key: &str) -> anyhow::Result<serde_json::Value> {
+    let request = Request {
+        id: next_request_id(),
+        caller: Caller::operator(token),
+        method: "session.send_key".into(),
+        params: serde_json::json!({ "session_uids": uids, "key": key }),
+    };
+    let response = rpc_round_trip_with_read_timeout(socket, &request, Duration::from_secs(10))?;
+    if let Some(e) = response.error {
+        anyhow::bail!("{}", e.message);
+    }
+    response.result.context("send_key response missing result")
+}
+
 pub(crate) fn rpc_worktree_cleanup(socket: &Path, token: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
     let request = Request { id: next_request_id(), caller: Caller::operator(token), method: "worktree.cleanup".into(), params };
     rpc_round_trip_with_read_timeout(socket, &request, Duration::from_secs(10))?.result.context("cleanup response missing result")

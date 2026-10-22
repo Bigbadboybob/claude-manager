@@ -8431,21 +8431,22 @@ mod backtest_group_tests {
     }
 }
 
-/// `send_key` over the TUI socket (Owner 2026-10-22): one key per target,
-/// encoded for that session's keyboard mode, never a trailing Enter, with
-/// per-target results and send_input's scope.
+/// `send_key` over the TUI socket (Owner 2026-10-22; review of a41f14d):
+/// the TUI checks scope and liveness, then forwards each host's targets to
+/// that daemon's `session.send_key`, which encodes the key for the session's
+/// tracked keyboard mode and writes it without an input stamp.
 #[cfg(test)]
 mod send_key_tests {
     use super::super::sections::layout_tests::{bare_ws, test_app};
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// A session that records the bytes it receives into `file`, after
-    /// printing `preamble` (a kitty keyboard push, say).
-    fn recorder(app: &mut App, wi: usize, uid: &str, engine: &str, preamble: &str, file: &std::path::Path) {
-        let script = format!("printf '{preamble}'; stty raw -echo; exec cat > '{}'", file.display());
-        let pty = crate::session::Session::new("/bin/sh", &["-c".into(), script], 80, 24, None, HashMap::new(), None).unwrap();
-        let mut ts = super::super::model::make_simple_session_with_uid(uid.into(), uid, engine, pty, None);
+    /// A TUI row for `uid`, backed by a local sleeper (the TUI's own PTY is
+    /// never written: keys go to the daemon).
+    fn row(app: &mut App, wi: usize, uid: &str, daemon_uid: Option<&str>) {
+        let mut pty = crate::session::Session::new("/bin/sleep", &["30".into()], 80, 24, None, HashMap::new(), None).unwrap();
+        pty.daemon_session_uid = daemon_uid.map(str::to_owned);
+        let mut ts = super::super::model::make_simple_session_with_uid(uid.into(), uid, "codex", pty, None);
         ts.session.exited = false;
         app.workspaces[wi].sessions.push(ts);
     }
@@ -8461,44 +8462,60 @@ mod send_key_tests {
         }
     }
 
-    fn kitty(app: &App, uid: &str) -> bool {
-        let (wi, si) = crate::control::methods::find_live_session(&app.workspaces, uid).unwrap();
-        cm_daemon::keys::is_kitty(*app.workspaces[wi].sessions[si].session.term.lock().mode())
-    }
-
     #[test]
-    fn send_key_encodes_per_session_mode_and_reports_each_target() {
-        let dir = tempfile::tempdir().unwrap();
+    fn send_key_forwards_to_the_host_daemon_and_reports_each_target() {
+        let (socket, dir, state, stop, _handle) = crate::client_session::tests::start_test_daemon("ws-k");
+        // The daemon's session records its raw input, after a kitty push.
+        let file = dir.join("keys");
+        let mut sp = cm_daemon::session::SpawnParams::new("ts-31-0", "ts-31-0", "/bin/sh");
+        sp.args = vec!["-c".into(), format!("printf '\\033[>1u'; stty raw -echo; exec cat > '{}'", file.display())];
+        sp.workspace_id = "ws-k".into();
+        sp.session_type = "codex".into();
+        let sess = cm_daemon::session::DaemonSession::spawn(sp).unwrap();
+        state.lock().unwrap().sessions.insert("ts-31-0".into(), sess);
+        std::thread::sleep(Duration::from_millis(300));
+
         let mut app = test_app();
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![crate::hosts::HostConfig {
+                id: cm_daemon::host_id::HostId::local(),
+                transport: crate::hosts::HostTransport::Unix { socket: socket.clone() },
+                default: true,
+                operator_token: None,
+                operator_token_file: None,
+            }],
+        };
+        app.host_pool = std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).unwrap());
         app.workspaces = vec![bare_ws("a"), bare_ws("b")];
-        let (plain, agent, outside) = (dir.path().join("plain"), dir.path().join("agent"), dir.path().join("outside"));
-        recorder(&mut app, 0, "ts-1-0", "bash", "", &plain); // the caller, and a target
-        recorder(&mut app, 0, "ts-2-0", "codex", "\\033[>1u", &agent);
-        recorder(&mut app, 1, "ts-3-0", "bash", "", &outside);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !kitty(&app, "ts-2-0") && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(kitty(&app, "ts-2-0"), "the agent's terminal saw its kitty push");
+        row(&mut app, 0, "ts-1-0", None); // the caller
+        row(&mut app, 0, "ts-31-0", Some("ts-31-0"));
+        row(&mut app, 0, "ts-2-0", None); // in scope, not on a daemon
+        row(&mut app, 1, "ts-3-0", Some("ts-3-0"));
+        let reply = crate::control::methods::send_key(
+            &mut app,
+            "ts-1-0",
+            &serde_json::json!({"session_uids": ["ts-31-0", "ts-3-0", "ts-gone", "ts-2-0"], "key": "enter"}),
+        )
+        .unwrap();
+        let statuses: Vec<&str> = reply["results"].as_array().unwrap().iter().map(|r| r["status"].as_str().unwrap()).collect();
+        assert_eq!(statuses, ["ok", "unauthorized", "not_found", "error"], "{reply}");
+        assert_eq!(reply["results"][0]["session_uid"], "ts-31-0");
+        assert_eq!(reply["results"][0]["keyboard"], "kitty");
+        assert_eq!(reply["results"][0]["mode"], "observed");
+        assert_eq!(read(&file, 5), b"\x1b[13u", "the daemon's kitty Enter, nothing more");
         std::thread::sleep(Duration::from_millis(200));
-        for key in ["escape", "enter"] {
-            let reply = crate::control::methods::send_key(
-                &mut app,
-                "ts-1-0",
-                &serde_json::json!({"session_uids": ["ts-1-0", "ts-2-0", "ts-3-0", "ts-gone"], "key": key}),
-            )
-            .unwrap();
-            let statuses: Vec<&str> = reply["results"].as_array().unwrap().iter().map(|r| r["status"].as_str().unwrap()).collect();
-            assert_eq!(statuses, ["ok", "ok", "unauthorized", "not_found"], "{reply}");
-            assert_eq!(reply["sent"], 2);
-        }
-        assert_eq!(read(&plain, 2), b"\x1b\r", "legacy, and no extra Enter");
-        assert_eq!(read(&agent, 12), b"\x1b[27u\x1b[13u", "kitty: CSI 27 u then CSI 13 u, nothing more");
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(std::fs::read(&outside).unwrap_or_default().is_empty(), "out of scope: nothing written");
-        // Bad key: the call is refused before anything is written.
-        let err = crate::control::methods::send_key(&mut app, "ts-1-0", &serde_json::json!({"session_uids": "ts-2-0", "key": "enter please"})).unwrap_err();
+        assert_eq!(std::fs::read(&file).unwrap(), b"\x1b[13u");
+        assert!(
+            state.lock().unwrap().sessions["ts-31-0"].last_input_at.lock().unwrap().is_none(),
+            "a key is not new work: no input stamp"
+        );
+        // A bad key is refused before anything is sent.
+        let err = crate::control::methods::send_key(&mut app, "ts-1-0", &serde_json::json!({"session_uids": "ts-31-0", "key": "enter please"})).unwrap_err();
         assert_eq!(err.0, crate::control::protocol::ErrorCode::InvalidParams);
+        for (_, mut s) in state.lock().unwrap().sessions.drain() {
+            let _ = s.kill();
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[test]
