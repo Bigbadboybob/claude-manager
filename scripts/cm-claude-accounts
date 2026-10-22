@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Keep several Claude logins on this machine and switch the active one.
+
+Switching rewrites ~/.claude/.credentials.json in place, as /login does;
+running Claude Code sessions follow it. Saved logins live in
+~/.config/cm-claude-accounts/ (mode 0700) and are never printed.
+See doc/claude-account-switcher.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+
+
+LOCK_WAIT_SECONDS = 10.0
+# Claude Code's waiters give up after roughly 7.5 s; stay well inside that.
+MAX_HOLD_SECONDS = 3.0
+HISTORY_LIMIT = 200
+
+
+class AccountError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Paths:
+    claude_dir: Path
+    claude_json: Path
+    store: Path
+
+    @classmethod
+    def default(cls) -> "Paths":
+        home = Path.home()
+        return cls(home / ".claude", home / ".claude.json", home / ".config/cm-claude-accounts")
+
+    @property
+    def credentials(self) -> Path:
+        return self.claude_dir / ".credentials.json"
+
+    @property
+    def refresh_locks(self) -> tuple[Path, Path]:
+        # Claude Code 2.1.308: current lock, then the legacy <realpath>.lock.
+        return (self.claude_dir / ".oauth_refresh.lock",
+                Path(os.path.realpath(self.claude_dir) + ".lock"))
+
+    @property
+    def accounts(self) -> Path:
+        return self.store / "accounts"
+
+    @property
+    def state(self) -> Path:
+        return self.store / "state.json"
+
+
+# --- files -----------------------------------------------------------------
+
+def load_json(path: Path) -> dict:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise AccountError(f"{path} does not hold a JSON object")
+    return data
+
+
+def atomic_write(path: Path, data: dict, mode: int = 0o600, indent: int | None = None) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=indent)
+        os.chmod(tmp, mode)
+        os.rename(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def write_in_place(path: Path, data: dict) -> None:
+    """Rewrite keeping the inode, as /login does; running sessions follow it."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(data))
+        f.truncate()
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(path, 0o600)
+
+
+def read_login(paths: Paths) -> dict:
+    oauth = load_json(paths.credentials).get("claudeAiOauth")
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+        raise AccountError("no Claude login in .credentials.json; run /login first")
+    return oauth
+
+
+def read_profile(paths: Paths) -> dict | None:
+    profile = load_json(paths.claude_json).get("oauthAccount")
+    return profile if isinstance(profile, dict) and profile.get("accountUuid") else None
+
+
+def write_profile(paths: Paths, profile: dict, attempts: int = 20) -> None:
+    """Replace only oauthAccount; retry if a session rewrites the file meanwhile."""
+    for _ in range(attempts):
+        before = os.stat(paths.claude_json)
+        data = load_json(paths.claude_json)
+        data["oauthAccount"] = profile
+        if os.stat(paths.claude_json).st_mtime_ns != before.st_mtime_ns:
+            continue
+        atomic_write(paths.claude_json, data, before.st_mode & 0o777, indent=2)
+        return
+    raise AccountError(f"{paths.claude_json} kept changing; profile not updated")
+
+
+# --- store -----------------------------------------------------------------
+
+def init_store(paths: Paths) -> None:
+    paths.accounts.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(paths.store, 0o700)
+    os.chmod(paths.accounts, 0o700)
+
+
+def load_accounts(paths: Paths) -> dict[str, dict]:
+    out = {}
+    if paths.accounts.is_dir():
+        for path in sorted(paths.accounts.glob("*.json")):
+            record = load_json(path)
+            out[record["oauthAccount"]["accountUuid"]] = record
+    return out
+
+
+def save_account(paths: Paths, record: dict) -> None:
+    uuid = record["oauthAccount"]["accountUuid"]
+    atomic_write(paths.accounts / f"{uuid}.json", record)
+
+
+def label(record: dict) -> str:
+    profile = record["oauthAccount"]
+    return f"{profile.get('emailAddress') or '?'} ({profile['accountUuid'][:8]})"
+
+
+def record_history(state: dict, event: str, **fields) -> None:
+    history = state.setdefault("history", [])
+    history.append({"at": int(time.time()), "event": event, **fields})
+    del history[:-HISTORY_LIMIT]
+
+
+def resolve(accounts: dict[str, dict], name: str) -> str:
+    """Accept an email or a unique accountUuid prefix."""
+    matches = [uuid for uuid, rec in accounts.items()
+               if rec["oauthAccount"].get("emailAddress", "").lower() == name.lower()]
+    if not matches:
+        matches = [uuid for uuid in accounts if uuid.startswith(name)]
+    if len(matches) != 1:
+        raise AccountError(f"{name!r} matches {len(matches)} saved accounts; see `list`")
+    return matches[0]
+
+
+# --- Claude Code's refresh lock ---------------------------------------------
+
+class RefreshLock:
+    """Claude Code's proper-lockfile directories, taken in Claude Code's order.
+
+    No owner record is written, so waiters never take over early; if this
+    process dies, the 60 s staleness rule frees the directories.
+    """
+
+    def __init__(self, paths: Paths, wait: float = LOCK_WAIT_SECONDS):
+        self.dirs = paths.refresh_locks
+        self.wait = wait
+        self.held: list[Path] = []
+        self.acquired_at = 0.0
+
+    def __enter__(self) -> "RefreshLock":
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                for d in self.dirs:
+                    os.mkdir(d)
+                    self.held.append(d)
+                self.acquired_at = time.monotonic()
+                return self
+            except FileExistsError:
+                self._release()
+                if time.monotonic() >= deadline:
+                    raise AccountError("a Claude Code session is refreshing its token "
+                                       "(refresh lock busy); nothing changed, try again")
+                time.sleep(0.2)
+
+    def touch(self) -> None:
+        for d in self.held:
+            os.utime(d)
+
+    def __exit__(self, *exc) -> None:
+        self._release()
+
+    def _release(self) -> None:
+        while self.held:
+            try:
+                os.rmdir(self.held.pop())
+            except FileNotFoundError:
+                pass
+
+
+# --- identity ----------------------------------------------------------------
+
+def identify(login: dict, profile: dict | None, accounts: dict[str, dict], state: dict) -> tuple[str, str]:
+    """Return (accountUuid, rule) for the live login, per the doc's rules."""
+    for uuid, rec in accounts.items():
+        if rec["claudeAiOauth"].get("refreshToken") == login["refreshToken"]:
+            return uuid, "token"
+    live_uuid = profile["accountUuid"] if profile else None
+    active = state.get("active")
+    if active in accounts and live_uuid == active:
+        return active, "refreshed"
+    if live_uuid and live_uuid != active:
+        return live_uuid, "login"
+    raise AccountError("cannot tell which account the current login belongs to; "
+                       "run /login for it, then `capture`")
+
+
+def write_back(paths: Paths, accounts: dict[str, dict], state: dict) -> tuple[str, str]:
+    """Save the live login as its account's latest copy (doc: switch step 2)."""
+    login = read_login(paths)
+    profile = read_profile(paths)
+    uuid, rule = identify(login, profile, accounts, state)
+    if rule == "login":
+        # Owner ran /login outside the tool: the profile was written with it.
+        record = accounts.get(uuid, {"captured_at": int(time.time())})
+        record["oauthAccount"] = profile
+        record_history(state, "external-login", account=uuid)
+    else:
+        record = accounts[uuid]
+    record["claudeAiOauth"] = login
+    record["updated_at"] = int(time.time())
+    record.pop("needs_login", None)
+    accounts[uuid] = record
+    save_account(paths, record)
+    state["active"] = uuid
+    return uuid, rule
+
+
+# --- commands ------------------------------------------------------------------
+
+def cmd_capture(paths: Paths, state: dict, out) -> int:
+    accounts = load_accounts(paths)
+    with RefreshLock(paths):
+        login = read_login(paths)
+        profile = read_profile(paths)
+    if profile is None:
+        raise AccountError(f"no oauthAccount in {paths.claude_json}; run /login first")
+    uuid = profile["accountUuid"]
+    for other, rec in accounts.items():
+        if other != uuid and rec["claudeAiOauth"].get("refreshToken") == login["refreshToken"]:
+            raise AccountError(f"the login belongs to {label(rec)} but the profile names "
+                               f"{profile.get('emailAddress')}; run /login again, then `capture`")
+    now = int(time.time())
+    record = accounts.get(uuid, {"captured_at": now})
+    record.update(claudeAiOauth=login, oauthAccount=profile, updated_at=now)
+    record.pop("needs_login", None)
+    save_account(paths, record)
+    state["active"] = uuid
+    record_history(state, "capture", account=uuid)
+    print(f"captured {label(record)}; active", file=out)
+    return 0
+
+
+def cmd_list(paths: Paths, state: dict, out) -> int:
+    accounts = load_accounts(paths)
+    if not accounts:
+        print("no saved accounts; run /login, then `capture`", file=out)
+        return 0
+    now = time.time()
+    for uuid, rec in sorted(accounts.items(), key=lambda kv: label(kv[1])):
+        oauth = rec["claudeAiOauth"]
+        marker = "*" if uuid == state.get("active") else " "
+        expires = oauth.get("refreshTokenExpiresAt")
+        if rec.get("needs_login"):
+            login_state = "needs /login"
+        elif isinstance(expires, (int, float)):
+            days = (expires / 1000 - now) / 86400
+            login_state = f"login valid {days:.0f}d" if days > 0 else "login expired"
+        else:
+            login_state = "login expiry unknown"
+        age = (now - rec.get("updated_at", now)) / 3600
+        print(f"{marker} {label(rec):45} {oauth.get('subscriptionType', '?'):6} "
+              f"{login_state:20} saved {age:.1f}h ago", file=out)
+    return 0
+
+
+def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
+    accounts = load_accounts(paths)
+    target = resolve(accounts, target_name)
+    record = accounts[target]
+    with RefreshLock(paths) as lock:
+        current, rule = write_back(paths, accounts, state)
+        if current != target:
+            expires = record["claudeAiOauth"].get("refreshTokenExpiresAt")
+            if isinstance(expires, (int, float)) and expires / 1000 <= time.time():
+                record["needs_login"] = True
+                save_account(paths, record)
+                raise AccountError(f"{label(record)}'s saved login has expired; "
+                                   "run /login for it, then `capture`")
+            lock.touch()
+            creds = load_json(paths.credentials)
+            creds["claudeAiOauth"] = record["claudeAiOauth"]
+            write_in_place(paths.credentials, creds)
+        if time.monotonic() - lock.acquired_at > MAX_HOLD_SECONDS:
+            print("warning: refresh lock held longer than expected", file=sys.stderr)
+    profile = read_profile(paths)
+    if not profile or profile["accountUuid"] != target:
+        write_profile(paths, record["oauthAccount"])
+    if current == target:
+        print(f"already on {label(record)}", file=out)
+        return 0
+    state["active"] = target
+    record_history(state, "switch", account=target, previous=current, identified_by=rule)
+    print(f"switched {label(accounts[current])} -> {label(record)}", file=out)
+    return 0
+
+
+def cmd_remove(paths: Paths, state: dict, name: str, out) -> int:
+    accounts = load_accounts(paths)
+    uuid = resolve(accounts, name)
+    if uuid == state.get("active"):
+        raise AccountError("cannot remove the active account; switch away first")
+    (paths.accounts / f"{uuid}.json").unlink()
+    record_history(state, "remove", account=uuid)
+    print(f"removed {label(accounts[uuid])}", file=out)
+    return 0
+
+
+def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) -> int:
+    paths = paths or Paths.default()
+    out = out or sys.stdout
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("capture", help="save the current login (run right after /login)")
+    sub.add_parser("list", help="saved accounts; * marks the active one")
+    sub.add_parser("status", help="same as list")
+    switch = sub.add_parser("switch", help="make another saved account active")
+    switch.add_argument("account", help="email or accountUuid prefix")
+    remove = sub.add_parser("remove", help="delete a saved account")
+    remove.add_argument("account")
+    args = parser.parse_args(argv)
+    try:
+        init_store(paths)
+        fd = os.open(paths.store / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd) as store_lock:
+            fcntl.flock(store_lock, fcntl.LOCK_EX)
+            state = load_json(paths.state)
+            try:
+                if args.command == "capture":
+                    return cmd_capture(paths, state, out)
+                if args.command in ("list", "status"):
+                    return cmd_list(paths, state, out)
+                if args.command == "switch":
+                    return cmd_switch(paths, state, args.account, out)
+                return cmd_remove(paths, state, args.account, out)
+            finally:
+                # Keep what was learned (write-back, needs_login) even on refusal.
+                atomic_write(paths.state, state, indent=2)
+    except (AccountError, OSError, ValueError, KeyError) as exc:
+        # Messages name accounts and files only, never token values.
+        print(f"cm-claude-accounts: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
