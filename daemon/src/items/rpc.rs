@@ -1015,6 +1015,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (url, seen) = stub(|method, path, _| match (method, path) {
             ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("GET", p) if p.starts_with("/boards/sfd/gate-profiles") => (200, r#"{"profile":{"inputs":[]}}"#.into()),
             ("POST", "/boards/sfd/items/14/receipts") => (200, r#"{"receipt":{"id":"r-sfd-14-1","gate":"gate","verdict":"VOID","headline":"VOID: fetch: void (FETCH_FAIL)","head":"aaaa","runs":{"VOID":1},"reasons":[{"level":"void","text":"fetch: void (FETCH_FAIL)"},{"level":"note","text":"x"}],"inputs":[{"name":"h","state":"missing","verification":"self_supplied_unverified"}]}}"#.into()),
             _ => (500, "{}".into()),
         });
@@ -1043,6 +1044,48 @@ mod tests {
         assert_eq!(body["request_id"], "rq");
         let missing = call_gate(&state, "me-uid", "gate.report", json!({"n": 14, "steps": []}));
         assert!(!missing.ok && missing.error.unwrap().message.contains("head is required"));
+    }
+
+    #[test]
+    fn gate_report_derives_input_paths_and_refuses_unauthorized_callers_first() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("GET", p) if p.starts_with("/boards/sfd/gate-profiles") => (200, r#"{"profile":{"inputs":[{"name":"harvest","kind":"dir","path":"harvest"}]}}"#.into()),
+            ("POST", "/boards/sfd/items/14/receipts") => (200, r#"{"receipt":{"id":"r-sfd-14-1","verdict":"VOID"}}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        state.lock().unwrap().tui_sessions.get_mut("me-uid").unwrap().worktree_path = Some(wt.path().display().to_string());
+        let resp = call_gate(&state, "me-uid", "gate.report", json!({
+            "n": 14, "head": "a".repeat(40), "steps": [],
+            "worktree": {"path": "/somewhere/else"},
+            "inputs": [{"name": "harvest", "kind": "dir", "resolved_path": elsewhere.path(),
+                        "content_id": format!("tree:{}", "0".repeat(64))}]}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let seen_now = seen.lock().unwrap().clone();
+        let (_, _, body) = seen_now.iter().find(|(_, p, _)| p.ends_with("/receipts")).unwrap();
+        let wt_c = std::fs::canonicalize(wt.path()).unwrap();
+        assert_eq!(body["receipt"]["worktree"]["path"], json!(wt_c.display().to_string()));
+        let input = &body["receipt"]["inputs"][0];
+        assert_eq!(input["resolved_path"], json!(wt_c.join("harvest").display().to_string()));
+        assert_eq!(input["daemon_hash"], json!({"missing": true}));
+
+        // Another board, holding nothing there: refused before any profile
+        // read or hashing, so nothing about this host's files leaks.
+        let (url, seen) = stub(two_boards(r#"[{"board":"mine","n":1}]"#));
+        state.lock().unwrap().config.api_url = url;
+        let resp = call_gate(&state, "me-uid", "gate.report", json!({
+            "n": 1, "head": "a".repeat(40), "steps": [], "board": "other",
+            "inputs": [{"name": "harvest", "kind": "dir"}]}));
+        let err = resp.error.unwrap();
+        assert!(matches!(err.code, ErrorCode::Unauthorized), "{err:?}");
+        assert!(!err.message.contains("harvest") && !err.message.contains("missing"));
+        let seen = seen.lock().unwrap();
+        assert!(!seen.iter().any(|(_, p, _)| p.contains("gate-profiles") || p.contains("/receipts")), "{seen:?}");
     }
 
     #[test]

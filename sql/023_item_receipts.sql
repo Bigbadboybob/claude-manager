@@ -61,13 +61,13 @@ CREATE TABLE IF NOT EXISTS item_receipt_inputs (
 CREATE INDEX IF NOT EXISTS idx_item_receipt_inputs_locator ON item_receipt_inputs (locator);
 CREATE INDEX IF NOT EXISTS idx_item_receipt_inputs_producer ON item_receipt_inputs (produced_by);
 
--- Waiver and variance grants, attached only by their grantor.
+-- Waiver, variance and selection grants, attached only by their grantor.
 CREATE TABLE IF NOT EXISTS item_grants (
     id            BIGSERIAL PRIMARY KEY,
     board_id      UUID NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
     item_id       BIGINT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
     seq           INTEGER NOT NULL,              -- per item: g-<board>-<n>-<seq>
-    kind          TEXT NOT NULL CHECK (kind IN ('waiver', 'variance')),
+    kind          TEXT NOT NULL CHECK (kind IN ('waiver', 'variance', 'selection')),
     gate          TEXT NOT NULL DEFAULT 'gate',
     grantor_pid   TEXT NOT NULL,
     head_sha      TEXT NOT NULL,

@@ -25,10 +25,12 @@ GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 
 
-def daemon_stamp(raw: dict) -> dict:
-    """What the reporting daemon does before forwarding (gate.rs stamp_input):
-    rehash file/dir inputs from resolved_path, in the documented manifest
-    format (files of a directory, then its subdirectories)."""
+def daemon_stamp(raw: dict, profile: dict, worktree: Path, env: dict) -> dict:
+    """What the reporting daemon does before forwarding (gate.rs stamp_inputs):
+    ignore the posted resolved_path, derive the path from the profile's
+    declaration (root_env in the session environment, else the worktree
+    root, joined with path), and rehash it in the documented manifest format
+    (files of a directory, then its subdirectories)."""
     import hashlib
 
     def file_sha(p: Path) -> str:
@@ -44,11 +46,18 @@ def daemon_stamp(raw: dict) -> dict:
             if e.is_dir() and not e.is_symlink():
                 walk(root, e, lines, total)
 
+    decls = {d["name"]: d for d in profile.get("inputs", [])}
     for inp in raw.get("inputs", []):
-        path = inp.get("resolved_path")
-        if inp["kind"] not in ("file", "dir", "artifact") or not path:
+        inp.pop("resolved_path", None)
+        decl = decls.get(inp["name"])
+        if inp["kind"] not in ("file", "dir", "artifact") or not decl:
             continue
-        p = Path(path)
+        root = env.get(decl["root_env"]) if decl.get("root_env") else str(worktree)
+        if not root:
+            inp["daemon_hash"] = {"unverifiable": f"${decl['root_env']} is not set"}
+            continue
+        p = Path(root).resolve() / decl.get("path", "")
+        inp["resolved_path"] = str(p)
         if p.is_file():
             inp["daemon_hash"] = {"content_id": "sha256:" + file_sha(p), "bytes": p.stat().st_size}
         elif p.is_dir():
@@ -105,6 +114,8 @@ class CmGateRun(unittest.TestCase):
                  "nodes": ["tests/test_new.py::test_new"]},
                 {"name": "pytest", "kind": "pytest",
                  "argv": [sys.executable, "-m", "pytest", "tests"],
+                 "nodes": ["tests/test_new.py::test_new", "tests/test_pkg.py::test_cuda",
+                           "tests/test_pkg.py::test_f", "tests/test_pkg.py::test_g"],
                  "skip_policy": {"allow_reasons": ["^requires CUDA$"]}},
                 {"name": "fetch", "kind": "rc", "argv": ["true"], "void_on_fail": True},
             ],
@@ -132,7 +143,8 @@ class CmGateRun(unittest.TestCase):
         posted = json.loads(proc.stdout)
         if raw:
             return posted
-        receipt = g.normalize_receipt(daemon_stamp(posted))
+        run_env = {**os.environ, "HARVEST": str(self.harvest), **(env or {})}
+        receipt = g.normalize_receipt(daemon_stamp(posted, profile or self.profile, self.repo, run_env))
         prof = g.validate_profile(profile or self.profile)
         return receipt, g.evaluate(receipt, prof, [])
 
@@ -213,8 +225,10 @@ class CmGateRun(unittest.TestCase):
         receipt, v = self.run_gate()
         self.assertEqual(v["verdict"], "VOID", self.texts(v))
         self.assertIn("input nodes missing", self.texts(v))
+        # An unset root cannot be derived: unverifiable, never bound.
         _, v = self.run_gate(env={"HARVEST": ""})
-        self.assertEqual(v["verdict"], "VOID")
+        self.assertEqual(v["verdict"], "INCOMPLETE")
+        self.assertIn("HARVEST is not set", self.texts(v))
 
     def test_untracked_files_make_the_tree_dirty_but_ignored_ones_do_not(self):
         (self.repo / "run.log").write_text("ignored")

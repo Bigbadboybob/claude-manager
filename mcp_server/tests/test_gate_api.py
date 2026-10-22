@@ -36,7 +36,8 @@ STEWARD = agent("steward")
 
 PROFILE = {
     "steps": [
-        {"name": "pytest", "kind": "pytest", "argv": ["pytest", "tests"]},
+        {"name": "pytest", "kind": "pytest", "argv": ["pytest", "tests"],
+         "nodes": ["tests/test_a.py::test_one", "tests/test_a.py::test_two"]},
         {"name": "mypy", "kind": "mypy"},
         {"name": "fetch", "kind": "rc"},
     ],
@@ -420,6 +421,30 @@ class GateApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("inputs" not in h and "closure" not in h for h in hist))
         item = next(i for i in (await self.board())["items"] if i["n"] == 1)
         self.assertEqual([st["name"] for st in item["gate"]["gate"]["steps"]], ["pytest", "mypy", "fetch"])
+
+    async def test_selection_grants_supply_the_node_set_a_profile_lacks(self):
+        bare = dict(PROFILE, steps=[{"name": "pytest", "kind": "pytest", "argv": ["pytest", "tests"]},
+                                    *PROFILE["steps"][1:]])
+        await self.put_profile("py", bare)
+        rec = await self.post(wire())
+        self.assertEqual(rec["verdict"], "INCOMPLETE")
+        self.assertIn("no granted node set", rec["headline"])
+        r = await self.grant(kind="selection", step="pytest", ok=False)
+        self.assertEqual(r.status_code, 422, "a selection grant names its nodes")
+        g = await self.grant(kind="selection", step="pytest",
+                             nodes=["tests/test_a.py::test_one", "tests/test_a.py::test_two"])
+        self.assertTrue(g["verified"], g["problems"])
+        self.assertEqual((await self.receipts())["latest"]["gate"]["verdict"], "PASS")
+
+    async def test_a_posted_resolved_path_without_the_daemons_hash_is_ignored(self):
+        rec = await self.post(wire(inputs=[{"name": "harvest", "kind": "dir",
+                                            "resolved_path": "/tmp/empty",
+                                            "content_id": "tree:" + "1" * 64}]))
+        self.assertEqual(rec["verdict"], "INCOMPLETE")
+        self.assertEqual(rec["inputs"][0]["verification"], "self_supplied_unverified")
+        async with self.pool.acquire() as conn:
+            key = await conn.fetchval("SELECT locator FROM item_receipt_inputs")
+        self.assertTrue(key.startswith("item:"), "a poster path never becomes a shared key")
 
     async def test_unbound_db_window_is_incomplete(self):
         await self.put_profile("py", dict(PROFILE, inputs=[{"name": "ticks", "kind": "db"}]))

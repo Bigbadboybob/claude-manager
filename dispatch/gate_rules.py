@@ -28,7 +28,7 @@ NODE_OUTCOMES = ("passed", "failed", "error", "skipped", "xfailed", "xpassed", "
 RAN_OUTCOMES = frozenset({"passed", "failed", "error", "xfailed", "xpassed"})
 INPUT_KINDS = ("file", "dir", "gcs", "artifact", "db")
 INPUT_STATES = ("bound", "missing", "unbound")
-GRANT_KINDS = ("waiver", "variance")
+GRANT_KINDS = ("waiver", "variance", "selection")
 SCOPES = ("paths", "tree")
 # Content-id prefixes each input kind accepts.
 CONTENT_PREFIXES = {
@@ -413,19 +413,28 @@ def normalize_input(raw) -> dict:
     size = raw.get("bytes")
     if size is not None:
         size = _int(size, "inputs[].bytes")
-    resolved = _str(raw.get("resolved_path"), "resolved_path", 1000)
-    verification = "self_supplied_unverified"
+    # The daemon derives resolved_path itself (from the profile's path and
+    # root_env); without its daemon_hash a resolved_path is the poster's
+    # word and is ignored.
     daemon = raw.get("daemon_hash")
+    resolved = (_str(raw.get("resolved_path"), "resolved_path", 1000)
+                if isinstance(daemon, dict) else None)
+    verification = "self_supplied_unverified"
     poster_content_id = None
-    if isinstance(daemon, dict) and kind in DAEMON_HASHED_KINDS and resolved:
-        if daemon.get("missing"):
+    note = None
+    if isinstance(daemon, dict) and kind in DAEMON_HASHED_KINDS:
+        if daemon.get("missing") and resolved:
             state, content_id = "missing", None
-        elif isinstance(daemon.get("content_id"), str):
+        elif isinstance(daemon.get("content_id"), str) and resolved:
             if content_id and content_id != daemon["content_id"]:
                 poster_content_id = content_id
             content_id, state = daemon["content_id"], "bound"
             size = daemon.get("bytes") if isinstance(daemon.get("bytes"), int) else size
             verification = "hashed_at_run"
+        elif daemon.get("unverifiable"):
+            # Capped, escaping or underivable: the run cannot be pinned.
+            note = str(daemon["unverifiable"])[:200]
+            state, content_id = "unbound", None
     if state == "bound" and not content_id:
         state = "unbound"
     locator = _str(raw.get("locator"), "locator", 1000) or ""
@@ -441,10 +450,12 @@ def normalize_input(raw) -> dict:
     }
     if poster_content_id:
         out["poster_content_id"] = poster_content_id
-    # The key that scopes input_changed / input_void: a concrete local path
-    # or object URL; anything else is scoped to its item by the caller.
-    key = resolved or locator
-    out["key"] = key if key.startswith(("/", "gs://")) else None
+    if note:
+        out["note"] = note
+    # The key that scopes input_changed / input_void across items: only a
+    # path the daemon derived itself. A poster's locator is scoped to its own
+    # item by the caller, so it can never restale another item's receipts.
+    out["key"] = resolved if resolved and resolved.startswith("/") else None
     return out
 
 
@@ -781,7 +792,23 @@ def _program_len(granted: list[str]) -> int:
     return 1
 
 
-def _strip_wrappers(argv: list[str], granted: list[str], allowed_env: set[str]) -> tuple[list[str], list[str]]:
+def program_ok(token: str, granted: str, worktree: str | None, runner_path: str | None) -> bool:
+    """The executed program is the granted one: the same token, or the same
+    basename resolving to the worktree's venv or to the registered runner."""
+    if token == granted:
+        return True
+    if os.path.basename(token) != os.path.basename(granted) or not worktree:
+        return False
+    norm = os.path.normpath(token)
+    allowed = {os.path.join(worktree, venv, "bin", os.path.basename(granted))
+               for venv in (".venv", "venv")}
+    if runner_path:
+        allowed.add(os.path.normpath(os.path.join(worktree, runner_path)))
+    return norm in allowed
+
+
+def _strip_wrappers(argv: list[str], granted: list[str], allowed_env: set[str],
+                    worktree: str | None = None, runner_path: str | None = None) -> tuple[list[str], list[str]]:
     """(problems, argv from the program on). Only bounded wrapper forms may
     precede the granted program; anything else is a weakened run."""
     k = _program_len(granted)
@@ -789,6 +816,9 @@ def _strip_wrappers(argv: list[str], granted: list[str], allowed_env: set[str]) 
     i = 0
     while i < len(argv):
         if os.path.basename(argv[i]) == os.path.basename(granted[0]) and argv[i + 1:i + k] == granted[1:k]:
+            if not program_ok(argv[i], granted[0], worktree, runner_path):
+                return [f"program {argv[i]!r} is not the granted {granted[0]!r} (nor the worktree's "
+                        "venv or the registered runner)"], []
             return problems, argv[i:]
         if os.path.basename(argv[i]) not in _WRAPPERS:
             problems.append(f"unrecognized command prefix {argv[i]!r} (shells and other tools "
@@ -844,7 +874,8 @@ def _pytest_diff(granted: list[str], effective: list[str]) -> list[str]:
     return problems
 
 
-def command_diff(step_profile: dict, step: dict, allowed_env: set[str]) -> list[str]:
+def command_diff(step_profile: dict, step: dict, allowed_env: set[str],
+                 receipt: dict | None = None) -> list[str]:
     """Why the executed command needs grantor review ([] = within the grant)."""
     granted = step_profile.get("argv")
     if not granted:
@@ -852,7 +883,10 @@ def command_diff(step_profile: dict, step: dict, allowed_env: set[str]) -> list[
     cmd = step.get("effective_cmd")
     if not cmd or not cmd.get("argv"):
         return ["no effective command recorded"]
-    problems, effective = _strip_wrappers(cmd["argv"], granted, allowed_env)
+    worktree = ((receipt or {}).get("worktree") or {}).get("path")
+    runner_ref = ((receipt or {}).get("runner") or {}).get("ref") or ""
+    runner_path = runner_ref.partition(":")[2] or None
+    problems, effective = _strip_wrappers(cmd["argv"], granted, allowed_env, worktree, runner_path)
     if effective:
         k = _program_len(granted)
         if step_profile["kind"] == "pytest":
@@ -868,30 +902,30 @@ def command_diff(step_profile: dict, step: dict, allowed_env: set[str]) -> list[
     return problems
 
 
-def node_diff(step_profile: dict, step: dict, covered: set[str] = frozenset()) -> tuple[list[str], list[str], list[str]]:
+def node_diff(step_profile: dict, step: dict, covered: set[str] = frozenset(),
+              selected: list[str] | None = None) -> tuple[list[str], list[str], list[str]]:
     """(shrinkage, incomplete reasons, notes) of the executed node set.
 
-    The grant is the profile's `nodes` when it lists them; the runner's own
-    collection is used only when it does not, and is reported as such. Nodes
-    a verified waiver covers are not counted as missing."""
+    The grant is the profile's `nodes`, else the nodes of a verified
+    `selection` grant a grantor attached for this head. The runner's own
+    collection (`granted_nodes`) is evidence only and never grants anything.
+    Nodes a verified waiver covers are not counted as missing."""
     nodes = step.get("nodes")
     if nodes is None:
         return [], [], []
     executed = {n["id"] for n in nodes if n["outcome"] != "deselected"}
-    notes: list[str] = []
     if step_profile.get("nodes"):
         granted = list(step_profile["nodes"])
-    elif step.get("granted_nodes") is not None:
-        granted = step["granted_nodes"]
-        notes.append("granted set is the runner's own collection of the profile's argv "
-                     "(unverified); list nodes in the profile to pin it")
+    elif selected:
+        granted = list(selected)
     else:
-        return [], ["granted node set was not collected, so the selection cannot be checked"], []
+        return [], ["no granted node set: list nodes in the profile, or a grantor attaches a "
+                    "selection grant naming them for this head"], []
     missing = [g for g in granted if g not in executed and g not in covered]
     if not missing:
-        return [], [], notes
+        return [], [], []
     sample = ", ".join(missing[:3]) + (f" (+{len(missing) - 3})" if len(missing) > 3 else "")
-    return [f"{len(missing)} granted node(s) not run: {sample}"], [], notes
+    return [f"{len(missing)} granted node(s) not run: {sample}"], [], []
 
 
 # ---- grants (§4) -------------------------------------------------------------
@@ -926,6 +960,8 @@ def grant_problems(grant: dict, profile: dict | None, grantors: set[str]) -> lis
         problems.append(f"step {grant['step']} is not waivable")
     if grant["kind"] == "variance" and not grant.get("cmd_digest"):
         problems.append("a variance grant binds a command digest")
+    if grant["kind"] == "selection" and not grant.get("nodes"):
+        problems.append("a selection grant names the granted nodes")
     if step is not None and grant.get("nodes") and step.get("nodes"):
         outside = [n for n in grant["nodes"] if n not in step["nodes"]]
         if outside:
@@ -942,7 +978,7 @@ def _covering(grants: list[dict], receipt: dict, step_name: str, kind: str) -> t
             continue
         is_cited = g["label"] in cited
         if kind == "waiver" and not is_cited:
-            continue  # the runner cites waivers; variance grants apply on their own
+            continue  # the runner cites waivers; variance and selection grants apply on their own
         why = list(g.get("problems") or [])
         if g["head_sha"] != receipt["head_sha"]:
             why.append(f"head {short(receipt['head_sha'])} ≠ grant {short(g['head_sha'])}")
@@ -1133,7 +1169,7 @@ def _eval_inputs(receipt: dict, profile: dict) -> list[dict]:
                           + (f" ({inp['locator']})" if inp["locator"] else "")))
         elif inp["state"] == "unbound" or not inp["content_id"]:
             what = ("a query/window is not an immutable identity; bind snapshot: or rows:"
-                    if inp["kind"] == "db" else "no content id")
+                    if inp["kind"] == "db" else inp.get("note") or "no content id")
             out.append(_r("incomplete", f"input {decl['name']} unbound ({what})"))
         elif not inp["content_id"].startswith(CONTENT_PREFIXES[inp["kind"]]):
             out.append(_r("incomplete", f"input {decl['name']}: content id must start with "
@@ -1217,10 +1253,15 @@ def evaluate(receipt: dict, profile: dict | None, grants: list[dict], *,
             step_reasons.append(_r("incomplete", f"{name}: {st['state'].replace('_', ' ')}"
                                    + (f" ({st['reason']})" if st.get("reason") else ""), name))
         else:
-            weak = command_diff(sp, st, allowed_env)
+            weak = command_diff(sp, st, allowed_env, receipt)
             shrink: list[str] = []
             if sp["kind"] == "pytest":
-                shrink, unknown, notes = node_diff(sp, st, covered_nodes)
+                selections, _ = _covering(grants, receipt, name, "selection")
+                selected = sorted({n for g in selections for n in (g.get("nodes") or [])})
+                if selected:
+                    reasons.append(_r("waived", f"{name}: node set granted by "
+                                      f"{', '.join(g['label'] for g in selections)}", name))
+                shrink, unknown, notes = node_diff(sp, st, covered_nodes, selected or None)
                 step_reasons += [_r("incomplete", f"{name}: {u}", name) for u in unknown]
                 step_reasons += [_r("note", f"{name}: {n}", name) for n in notes]
             if weak:

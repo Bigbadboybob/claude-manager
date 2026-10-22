@@ -117,6 +117,8 @@ If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
 - Gate results go on the item as receipts, not prose: run `cm-gate run --item N`
   (CM checkout `scripts/`) or `gate_report`. CM computes PASS / FAIL / VOID /
   INCOMPLETE / STALE from the evidence; read `gate_receipts(n)` before ruling.
+  A pytest gate profile must list its granted `nodes` (or a grantor attaches
+  a `selection` grant naming them); otherwise the step is INCOMPLETE.
 - Only DMs, `mentions`, a body `@Name` of a current member, `mention_here` and
   session monitors wake anyone; read `warnings` on every send. After
   dispatching, end your turn and let the wake arrive.

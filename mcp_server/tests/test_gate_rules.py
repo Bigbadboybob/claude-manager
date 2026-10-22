@@ -7,6 +7,7 @@ grant and staleness rules they rest on.
 from __future__ import annotations
 
 import copy
+import json
 import unittest
 
 from dispatch import gate_rules as g
@@ -21,6 +22,15 @@ TREE = "1" * 40
 RUNNER = "2" * 40
 EP = "agent:d1:ep-uid"
 
+PYTEST_NODES = [
+    {"id": "tests/sejd/test_a.py::test_one", "outcome": "passed"},
+    {"id": "tests/sejd/test_a.py::test_two", "outcome": "passed"},
+    {"id": "tests/a320/test_nodes.py::test_node", "outcome": "passed"},
+    {"id": "tests/sejd/test_gpu.py::test_cuda", "outcome": "skipped"},
+]
+GRANTED = [n["id"] for n in PYTEST_NODES]
+
+
 PROFILE_RAW = {
     "steps": [
         {"name": "must_fail", "kind": "pytest", "at": "mf",
@@ -30,7 +40,7 @@ PROFILE_RAW = {
                          "tests/sejd/test_fuse.py::test_new_path": ["AssertionError",
                                                                     "AttributeError"]}},
         {"name": "pytest", "kind": "pytest", "argv": ["pytest", "-n", "2", "tests/sejd", "tests/a320"],
-         "min_passed": 1, "must_run": ["tests/a320/test_nodes.py"],
+         "nodes": list(GRANTED), "min_passed": 1, "must_run": ["tests/a320/test_nodes.py"],
          "skip_policy": {"allow_reasons": ["^requires CUDA$"]}},
         {"name": "mypy", "kind": "mypy", "argv": ["mypy", "prediction"]},
         {"name": "ruff", "kind": "ruff", "argv": ["ruff", "check", "."]},
@@ -45,15 +55,6 @@ PROFILE_RAW = {
     "accept_unverified": ["db"],
 }
 PROFILE = g.validate_profile(PROFILE_RAW)
-
-PYTEST_NODES = [
-    {"id": "tests/sejd/test_a.py::test_one", "outcome": "passed"},
-    {"id": "tests/sejd/test_a.py::test_two", "outcome": "passed"},
-    {"id": "tests/a320/test_nodes.py::test_node", "outcome": "passed"},
-    {"id": "tests/sejd/test_gpu.py::test_cuda", "outcome": "skipped"},
-]
-GRANTED = [n["id"] for n in PYTEST_NODES]
-
 
 def receipt(**over) -> dict:
     raw = {
@@ -348,14 +349,15 @@ class Evidence(unittest.TestCase):
         self.assertEqual(v["verdict"], "INCOMPLETE")
         self.assertIn("ruff: summary has no ruff result line (unparsed)", texts(v))
 
-    def test_vacuous_pytest_is_incomplete(self):
+    def test_vacuous_pytest_never_passes(self):
         r = receipt()
         st = step(r, "pytest")
         st.update(rc=5, summary="no tests ran in 0.01s", nodes=[], skips=[], deselected=[],
                   granted_nodes=[])
         v = verdict(r)
-        self.assertEqual(v["verdict"], "INCOMPLETE")
+        self.assertEqual(v["verdict"], "FAIL", "the granted nodes did not run")
         self.assertIn("vacuous: 0 passed", texts(v))
+        self.assertIn("4 granted node(s) not run", texts(v))
 
     def test_code_moving_or_dirty_during_the_run_is_incomplete(self):
         r = receipt(worktree={"head_before": HEAD, "head_after": HEAD2, "dirty_before": False,
@@ -480,6 +482,55 @@ class Hardening(unittest.TestCase):
         r["waivers"] = ["g-sejd-14-2"]
         nodes = grant(label="g-sejd-14-2", step="pytest", nodes=["tests/sejd/test_a.py::test_two"])
         self.assertEqual(verdict(r, [var, nodes])["verdict"], "PASS", texts(verdict(r, [var, nodes])))
+
+    def test_without_profile_nodes_only_a_selection_grant_grants(self):
+        raw = json.loads(json.dumps(PROFILE_RAW))
+        del raw["steps"][1]["nodes"]
+        prof = g.validate_profile(raw)
+        r = receipt()  # carries the runner's own granted_nodes
+        v = g.evaluate(r, prof, [])
+        self.assertEqual(v["verdict"], "INCOMPLETE")
+        self.assertIn("no granted node set", texts(v))
+        sel = grant(kind="selection", step="pytest", nodes=list(GRANTED))
+        self.assertEqual(sel["problems"], [])
+        self.assertEqual(g.evaluate(r, prof, [sel])["verdict"], "PASS",
+                         texts(g.evaluate(r, prof, [sel])))
+        other_head = grant(kind="selection", step="pytest", nodes=list(GRANTED), head_sha=HEAD2)
+        self.assertEqual(g.evaluate(r, prof, [other_head])["verdict"], "INCOMPLETE")
+        narrow = grant(kind="selection", step="pytest", nodes=GRANTED + ["tests/sejd/test_a.py::test_x"])
+        narrow["problems"] = g.grant_problems(narrow, prof, {"owner", EP})
+        self.assertEqual(g.evaluate(r, prof, [narrow])["verdict"], "FAIL", "a granted node did not run")
+        self.assertIn("a selection grant names the granted nodes",
+                      grant(kind="selection", step="pytest")["problems"])
+
+    def test_the_program_must_resolve_to_the_granted_one(self):
+        def run(token):
+            r = receipt()
+            step(r, "pytest")["effective_cmd"]["argv"][0] = token
+            return verdict(r)
+
+        self.assertEqual(run("/tmp/evil/pytest")["verdict"], "FAIL")
+        self.assertIn("is not the granted 'pytest'", texts(run("/tmp/evil/pytest")))
+        self.assertEqual(run("/w/lane/.venv/bin/pytest")["verdict"], "PASS")
+        self.assertEqual(run("/w/lane/.venv/bin/../../../tmp/pytest")["verdict"], "FAIL")
+        r = receipt(worktree=dict(receipt()["worktree"], path=None))
+        step(r, "pytest")["effective_cmd"]["argv"][0] = "/w/lane/.venv/bin/pytest"
+        self.assertEqual(verdict(r)["verdict"], "FAIL", "no daemon-known worktree, no venv match")
+
+    def test_a_posted_resolved_path_counts_for_nothing(self):
+        inp = g.normalize_input({"name": "h", "kind": "dir", "resolved_path": "/tmp/empty",
+                                 "content_id": "tree:" + "1" * 64})
+        self.assertEqual((inp["resolved_path"], inp["key"], inp["verification"]),
+                         (None, None, "self_supplied_unverified"))
+        capped = g.normalize_input({"name": "h", "kind": "dir", "resolved_path": "/data/h",
+                                    "daemon_hash": {"unverifiable": "more than 500000 files"}})
+        self.assertEqual(capped["state"], "unbound")
+        r = receipt(inputs=[{"name": "harvest_a320", "kind": "dir", "resolved_path": "/data/h",
+                             "daemon_hash": {"unverifiable": "hashing cap reached (64 GiB)"}},
+                            {"name": "ticks", "kind": "db", "content_id": "snapshot:x"}])
+        v = verdict(r)
+        self.assertEqual(v["verdict"], "INCOMPLETE")
+        self.assertIn("hashing cap reached", texts(v))
 
     def test_grant_messages_must_name_the_step_and_the_kind(self):
         check = {"found": True, "sender": EP, "contains_head": True, "contains_step": False,

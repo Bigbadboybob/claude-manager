@@ -34,7 +34,7 @@ const DAEMON_INPUT_FIELDS: &[&str] = &["daemon_hash", "verification", "hashed_by
 
 pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     let result = Ctx::capture(state, req).and_then(|ctx| match req.method.as_str() {
-        "gate.report" => report(&ctx, &req.params),
+        "gate.report" => report(state, &ctx, &req.params),
         "gate.receipts" => receipts(state, &ctx, &req.params),
         "gate.waive" => waive(state, &ctx, &req.params),
         "gate.profile" => profile(&ctx, &req.params),
@@ -89,7 +89,7 @@ fn compact_receipt(r: &Value) -> Value {
     out
 }
 
-fn report(ctx: &Ctx, params: &Value) -> RpcResult {
+fn report(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> RpcResult {
     let n = item_n(params)?;
     if str_param(params, "head").is_none() {
         return Err(bad("head is required (the full commit SHA the gate ran on)"));
@@ -104,12 +104,20 @@ fn report(ctx: &Ctx, params: &Value) -> RpcResult {
         }
     }
     let board = resolve_board(ctx, params)?;
+    // Authorization comes before any path is derived or hashed, so an
+    // unauthorized caller learns nothing about what exists on this host.
     authorize_edit(ctx, params, &board)?;
     let slug = slug(&board)?;
+    let site = caller_site(state, ctx.uid.as_deref());
+    // The receipt's worktree is the caller's registered one, not the poster's.
+    let worktree = receipt.entry("worktree").or_insert_with(|| json!({}));
+    if worktree.is_object() {
+        worktree["path"] = json!(site.worktree.as_ref().map(|w| w.display().to_string()));
+    }
     if let Some(inputs) = receipt.get_mut("inputs").and_then(Value::as_array_mut) {
-        for input in inputs.iter_mut() {
-            stamp_input(input);
-        }
+        let profile = ctx.api.get(&format!("/boards/{slug}/gate-profiles"), &[("n", n.to_string())])?;
+        let decls = profile["profile"]["inputs"].as_array().cloned().unwrap_or_default();
+        stamp_inputs(inputs, &decls, &site);
     }
     let mut body = json!({"actor": ctx.actor(), "receipt": receipt});
     if let Some(request_id) = str_param(params, "request_id") {
@@ -123,48 +131,184 @@ fn report(ctx: &Ctx, params: &Value) -> RpcResult {
     Ok(out)
 }
 
-/// Drop the poster's verification claims, then rehash a local file/dir
-/// input from its resolved path on this host (the only way an input is
-/// `hashed_at_run`). Runs without any lock held.
-pub(crate) fn stamp_input(input: &mut Value) {
-    let Some(obj) = input.as_object_mut() else { return };
-    for key in DAEMON_INPUT_FIELDS {
-        obj.remove(*key);
+/// Hash-work caps for one report, well under the 900 s RPC budget. Hitting
+/// one leaves the input unverifiable (INCOMPLETE), never bound.
+const HASH_MAX_BYTES: u64 = 64 << 30;
+const HASH_MAX_FILES: u64 = 500_000;
+const HASH_DEADLINE: Duration = Duration::from_secs(300);
+
+pub(crate) struct Budget {
+    pub bytes: u64,
+    pub files: u64,
+    pub deadline: std::time::Instant,
+}
+
+impl Budget {
+    pub(crate) fn new() -> Self {
+        Budget { bytes: HASH_MAX_BYTES, files: HASH_MAX_FILES, deadline: std::time::Instant::now() + HASH_DEADLINE }
     }
-    let kind = obj.get("kind").and_then(Value::as_str).unwrap_or_default();
-    if !matches!(kind, "file" | "dir" | "artifact") {
-        return;
-    }
-    let Some(path) = obj.get("resolved_path").and_then(Value::as_str).map(std::path::PathBuf::from) else {
-        return;
+}
+
+pub(crate) enum Hashed {
+    Bound(String, u64),
+    Missing,
+    Capped(String),
+}
+
+/// Where a declared input lives, derived by the daemon alone.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Derived {
+    Path(std::path::PathBuf),
+    Unverifiable(String),
+}
+
+/// The caller's own checkout and session environment, as this daemon knows
+/// them (never the poster's word).
+pub(crate) struct CallerSite {
+    pub worktree: Option<std::path::PathBuf>,
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// The caller's registered worktree and, for a daemon-owned session, the
+/// environment of its process (`/proc/<pid>/environ`).
+pub(crate) fn caller_site(state: &Arc<Mutex<DaemonState>>, uid: Option<&str>) -> CallerSite {
+    let (worktree, pid) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        match uid {
+            Some(uid) => match s.sessions.get(uid) {
+                Some(sess) => (
+                    s.workspaces.get(&sess.workspace_id).and_then(|w| w.worktree_path.clone()),
+                    Some(sess.pid),
+                ),
+                None => (s.tui_sessions.get(uid).and_then(|t| t.worktree_path.clone()).map(Into::into), None),
+            },
+            None => (None, None),
+        }
     };
-    if !path.is_absolute() {
-        return;
+    let env = pid
+        .and_then(|pid| std::fs::read(format!("/proc/{pid}/environ")).ok())
+        .map(|raw| {
+            raw.split(|b| *b == 0)
+                .filter_map(|kv| {
+                    let kv = String::from_utf8_lossy(kv);
+                    kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    CallerSite { worktree: worktree.and_then(|w| std::fs::canonicalize(w).ok()), env }
+}
+
+/// The input's path from its declaration: `root_env`'s value in the
+/// caller's session environment, else the caller's worktree root, joined
+/// with the declared relative `path`. It must stay inside that root after
+/// canonicalisation (no `..`, no symlink escape).
+pub(crate) fn derive_input_path(decl: &Value, site: &CallerSite) -> Derived {
+    use std::path::Component;
+    let rel = decl["path"].as_str().unwrap_or("");
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() || rel_path.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+        return Derived::Unverifiable("the declared path must be relative, without ..".into());
     }
-    let hash = match content_hash(&path) {
-        Some((content_id, bytes)) => json!({"content_id": content_id, "bytes": bytes}),
-        None => json!({"missing": true}),
+    let root: std::path::PathBuf = if let Some(var) = decl["root_env"].as_str() {
+        match site.env.get(var).filter(|v| Path::new(v.as_str()).is_absolute()) {
+            Some(v) => v.into(),
+            None => return Derived::Unverifiable(format!("${var} is not set in this session's environment")),
+        }
+    } else if !rel.is_empty() {
+        match &site.worktree {
+            Some(w) => w.clone(),
+            None => return Derived::Unverifiable("this session has no registered worktree".into()),
+        }
+    } else {
+        return Derived::Unverifiable("the profile declares neither path nor root_env".into());
     };
-    obj.insert("daemon_hash".into(), hash);
+    let Ok(root_c) = std::fs::canonicalize(&root) else {
+        return Derived::Path(root.join(rel)); // the root itself is missing
+    };
+    let target = root_c.join(rel);
+    let mut probe = target.clone();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&probe) {
+            if !c.starts_with(&root_c) {
+                return Derived::Unverifiable("the path escapes its declared root".into());
+            }
+            return Derived::Path(if probe == target { c } else { target });
+        }
+        if !probe.pop() {
+            return Derived::Path(target);
+        }
+    }
+}
+
+/// Stamp the inputs of a report the caller is authorized to post: drop
+/// every daemon-only field and any poster `resolved_path`, derive each
+/// declared file/dir/artifact input's path, and hash it under the budget.
+pub(crate) fn stamp_inputs(inputs: &mut [Value], decls: &[Value], site: &CallerSite) {
+    let mut budget = Budget::new();
+    for input in inputs.iter_mut() {
+        let Some(obj) = input.as_object_mut() else { continue };
+        for key in DAEMON_INPUT_FIELDS {
+            obj.remove(*key);
+        }
+        obj.remove("resolved_path");
+        let kind = obj.get("kind").and_then(Value::as_str).unwrap_or_default().to_string();
+        if !matches!(kind.as_str(), "file" | "dir" | "artifact") {
+            continue;
+        }
+        let name = obj.get("name").and_then(Value::as_str).unwrap_or_default();
+        let Some(decl) = decls.iter().find(|d| d["name"] == name && d["kind"] == kind.as_str()) else {
+            continue; // undeclared: stays self-supplied
+        };
+        let stamp = match derive_input_path(decl, site) {
+            Derived::Unverifiable(why) => json!({"unverifiable": why}),
+            Derived::Path(path) => {
+                obj.insert("resolved_path".into(), json!(path.display().to_string()));
+                match content_hash(&path, &mut budget) {
+                    Hashed::Bound(id, bytes) => json!({"content_id": id, "bytes": bytes}),
+                    Hashed::Missing => json!({"missing": true}),
+                    Hashed::Capped(why) => json!({"unverifiable": why}),
+                }
+            }
+        };
+        obj.insert("daemon_hash".into(), stamp);
+    }
 }
 
 /// `sha256:<hex>` for a file; for a directory `tree:<sha256 of the sorted
 /// (relpath, size, sha256) lines>`, the same manifest cm-gate computes
 /// (files of a directory first, then its subdirectories, symlinks skipped).
-pub(crate) fn content_hash(path: &Path) -> Option<(String, u64)> {
+pub(crate) fn content_hash(path: &Path, budget: &mut Budget) -> Hashed {
     use sha2::{Digest, Sha256};
-    fn file_sha(path: &Path) -> Option<String> {
-        let mut file = std::fs::File::open(path).ok()?;
-        let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher).ok()?;
-        Some(format!("{:x}", hasher.finalize()))
+    fn take(budget: &mut Budget, size: u64) -> Result<(), String> {
+        if std::time::Instant::now() > budget.deadline {
+            return Err(format!("hashing timed out after {}s", HASH_DEADLINE.as_secs()));
+        }
+        if budget.files == 0 {
+            return Err(format!("more than {HASH_MAX_FILES} files to hash"));
+        }
+        if size > budget.bytes {
+            return Err(format!("more than {} GiB to hash", HASH_MAX_BYTES >> 30));
+        }
+        budget.files -= 1;
+        budget.bytes -= size;
+        Ok(())
     }
-    fn walk(root: &Path, dir: &Path, lines: &mut Vec<String>, total: &mut u64) -> Option<()> {
-        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.filter_map(Result::ok).collect();
+    fn file_sha(path: &Path) -> Result<String, String> {
+        let mut file = std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+    fn walk(root: &Path, dir: &Path, lines: &mut Vec<String>, total: &mut u64, budget: &mut Budget) -> Result<(), String> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| format!("cannot list {}: {e}", dir.display()))?
+            .filter_map(Result::ok)
+            .collect();
         entries.sort_by_key(|e| e.file_name());
         let mut subdirs = vec![];
         for e in entries {
-            let ft = e.file_type().ok()?;
+            let Ok(ft) = e.file_type() else { continue };
             if ft.is_symlink() {
                 continue;
             }
@@ -172,28 +316,37 @@ pub(crate) fn content_hash(path: &Path) -> Option<(String, u64)> {
                 subdirs.push(e.path());
             } else if ft.is_file() {
                 let p = e.path();
-                let size = e.metadata().ok()?.len();
+                let size = e.metadata().map_err(|e| e.to_string())?.len();
+                take(budget, size)?;
                 *total += size;
-                let rel = p.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+                let rel = p.strip_prefix(root).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
                 lines.push(format!("{rel}\t{size}\t{}", file_sha(&p)?));
             }
         }
         for d in subdirs {
-            walk(root, &d, lines, total)?;
+            walk(root, &d, lines, total, budget)?;
         }
-        Some(())
+        Ok(())
     }
-    let meta = std::fs::symlink_metadata(path).ok()?;
+    let Ok(meta) = std::fs::metadata(path) else { return Hashed::Missing };
     if meta.is_file() {
-        return Some((format!("sha256:{}", file_sha(path)?), meta.len()));
+        if let Err(why) = take(budget, meta.len()) {
+            return Hashed::Capped(why);
+        }
+        return match file_sha(path) {
+            Ok(sha) => Hashed::Bound(format!("sha256:{sha}"), meta.len()),
+            Err(why) => Hashed::Capped(why),
+        };
     }
     if !meta.is_dir() {
-        return None;
+        return Hashed::Missing;
     }
     let (mut lines, mut total) = (vec![], 0u64);
-    walk(path, path, &mut lines, &mut total)?;
+    if let Err(why) = walk(path, path, &mut lines, &mut total, budget) {
+        return Hashed::Capped(why);
+    }
     let digest = Sha256::digest(lines.join("\n").as_bytes());
-    Some((format!("tree:{digest:x}"), total))
+    Hashed::Bound(format!("tree:{digest:x}"), total)
 }
 
 /// `{found, sender, contains_head, contains_base?, contains_step, contains_kind}`
@@ -238,7 +391,11 @@ pub(crate) fn check_body(found: Option<(String, String)>, head: &str, base: Opti
         s.len() == 40 && has_token(&lower, &s, |c| c.is_ascii_alphanumeric())
     };
     let ident = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
-    let kind_word = if kind == "variance" { "variance" } else { "waive" };
+    let kind_word = match kind {
+        "variance" => "variance",
+        "selection" => "selection",
+        _ => "waive",
+    };
     let contains_kind = lower.match_indices(kind_word).any(|(i, _)| {
         lower[..i].chars().next_back().is_none_or(|c| !c.is_ascii_alphanumeric())
     });
@@ -629,39 +786,101 @@ mod tests {
         let variance = check_body(ep(format!("variance for pytest on {base}→{head}")), head, Some(&base), "pytest", "variance");
         assert_eq!((variance["contains_head"].clone(), variance["contains_base"].clone(), variance["contains_kind"].clone()),
                    (json!(true), json!(true), json!(true)));
+        let selection = check_body(ep(format!("selection for pytest on {head}: tests/a")), head, None, "pytest", "selection");
+        assert_eq!(selection["contains_kind"], true);
         let half = check_body(ep(format!("variance for pytest on {head}")), head, Some(&base), "pytest", "variance");
         assert_eq!(half["contains_base"], false, "a base→head grant names both");
     }
 
+    fn site(worktree: &Path, env: &[(&str, &Path)]) -> CallerSite {
+        CallerSite {
+            worktree: Some(std::fs::canonicalize(worktree).unwrap()),
+            env: env.iter().map(|(k, v)| (k.to_string(), v.display().to_string())).collect(),
+        }
+    }
+
+    fn stamped(input: Value, decl: Value, site: &CallerSite) -> Value {
+        let mut inputs = vec![input];
+        stamp_inputs(&mut inputs, &[decl], site);
+        inputs.pop().unwrap()
+    }
+
     #[test]
-    fn stamped_inputs_carry_only_the_daemons_own_hash() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("b.json"), "[1]").unwrap();
-        std::fs::write(dir.path().join("sub/a.txt"), "hi").unwrap();
-        let mut forged = json!({"name": "h", "kind": "dir", "resolved_path": dir.path(),
-                                "content_id": "tree:00", "verification": "hashed_at_run",
-                                "hashed_by": "cm-gate", "daemon_hash": {"content_id": "tree:00"}});
-        stamp_input(&mut forged);
-        assert!(forged.get("verification").is_none() && forged.get("hashed_by").is_none());
-        // The documented manifest: files of a directory, then its subdirectories.
+    fn a_forged_resolved_path_is_ignored_and_the_declared_one_hashed() {
+        let wt = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap(); // an empty dir the poster points at
+        let decl = json!({"name": "harvest", "kind": "dir", "path": "harvest"});
+        let forged = json!({"name": "harvest", "kind": "dir", "resolved_path": elsewhere.path(),
+                            "content_id": "tree:00", "verification": "hashed_at_run",
+                            "hashed_by": "cm-gate", "daemon_hash": {"content_id": "tree:00"}});
+        let out = stamped(forged.clone(), decl.clone(), &site(wt.path(), &[]));
+        let want = std::fs::canonicalize(wt.path()).unwrap().join("harvest");
+        assert_eq!(out["resolved_path"], json!(want.display().to_string()), "derived, not posted");
+        assert_eq!(out["daemon_hash"], json!({"missing": true}), "EP's missing harvest stays VOID");
+        assert!(out.get("verification").is_none() && out.get("hashed_by").is_none());
+        // With the harvest present: the documented manifest, files before subdirectories.
+        std::fs::create_dir_all(wt.path().join("harvest/sub")).unwrap();
+        std::fs::write(wt.path().join("harvest/b.json"), "[1]").unwrap();
+        std::fs::write(wt.path().join("harvest/sub/a.txt"), "hi").unwrap();
+        let out = stamped(forged, decl, &site(wt.path(), &[]));
         use sha2::{Digest, Sha256};
         let sha = |b: &[u8]| format!("{:x}", Sha256::digest(b));
         let lines = format!("b.json\t3\t{}\nsub/a.txt\t2\t{}", sha(b"[1]"), sha(b"hi"));
-        assert_eq!(forged["daemon_hash"], json!({"content_id": format!("tree:{}", sha(lines.as_bytes())), "bytes": 5}));
-        let mut file = json!({"name": "f", "kind": "file", "resolved_path": dir.path().join("b.json")});
-        stamp_input(&mut file);
-        assert_eq!(file["daemon_hash"]["content_id"], format!("sha256:{}", sha(b"[1]")));
-        let mut gone = json!({"name": "h", "kind": "dir", "resolved_path": dir.path().join("harvest"),
-                              "content_id": format!("tree:{}", "0".repeat(64))});
-        stamp_input(&mut gone);
-        assert_eq!(gone["daemon_hash"], json!({"missing": true}), "a typed hash never stands in");
-        let mut db = json!({"name": "t", "kind": "db", "content_id": "snapshot:x", "daemon_hash": {"content_id": "x"}});
-        stamp_input(&mut db);
-        assert!(db.get("daemon_hash").is_none(), "only file/dir inputs are rehashed");
-        let mut relative = json!({"name": "r", "kind": "file", "resolved_path": "b.json"});
-        stamp_input(&mut relative);
-        assert!(relative.get("daemon_hash").is_none());
+        assert_eq!(out["daemon_hash"], json!({"content_id": format!("tree:{}", sha(lines.as_bytes())), "bytes": 5}));
+    }
+
+    #[test]
+    fn root_env_comes_from_the_session_environment() {
+        let wt = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nodes.json"), "[1]").unwrap();
+        let decl = json!({"name": "nodes", "kind": "file", "root_env": "HARVEST", "path": "nodes.json"});
+        let input = json!({"name": "nodes", "kind": "file", "resolved_path": "/etc/hostname"});
+        let out = stamped(input.clone(), decl.clone(), &site(wt.path(), &[("HARVEST", root.path())]));
+        assert!(out["daemon_hash"]["content_id"].as_str().unwrap().starts_with("sha256:"));
+        let unset = stamped(input, decl, &site(wt.path(), &[]));
+        assert_eq!(unset["daemon_hash"], json!({"unverifiable": "$HARVEST is not set in this session's environment"}));
+        assert!(unset.get("resolved_path").is_none());
+    }
+
+    #[test]
+    fn escaping_paths_are_unverifiable() {
+        let wt = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("x"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), wt.path().join("link")).unwrap();
+        let s = site(wt.path(), &[]);
+        for path in ["../x", "/etc", "link", "link/x", "a/../../x"] {
+            let decl = json!({"name": "h", "kind": "dir", "path": path});
+            assert!(matches!(derive_input_path(&decl, &s), Derived::Unverifiable(_)), "{path}");
+            let out = stamped(json!({"name": "h", "kind": "dir"}), decl, &s);
+            assert!(out["daemon_hash"]["unverifiable"].is_string(), "{path}: {out}");
+            assert!(out["daemon_hash"].get("content_id").is_none());
+        }
+        let no_wt = CallerSite { worktree: None, env: Default::default() };
+        let decl = json!({"name": "h", "kind": "dir", "path": "harvest"});
+        assert_eq!(derive_input_path(&decl, &no_wt),
+                   Derived::Unverifiable("this session has no registered worktree".into()));
+        // Undeclared or non-local inputs are never rehashed.
+        let mut inputs = vec![json!({"name": "other", "kind": "dir", "resolved_path": "/tmp"}),
+                              json!({"name": "h", "kind": "db", "daemon_hash": {"content_id": "x"}})];
+        stamp_inputs(&mut inputs, &[decl], &s);
+        assert!(inputs.iter().all(|i| i.get("daemon_hash").is_none() && i.get("resolved_path").is_none()));
+    }
+
+    #[test]
+    fn hashing_stops_at_its_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(f), "xx").unwrap();
+        }
+        let mut few = Budget { files: 2, ..Budget::new() };
+        assert!(matches!(content_hash(dir.path(), &mut few), Hashed::Capped(m) if m.contains("files")));
+        let mut small = Budget { bytes: 3, ..Budget::new() };
+        assert!(matches!(content_hash(dir.path(), &mut small), Hashed::Capped(m) if m.contains("GiB")));
+        let mut late = Budget { deadline: std::time::Instant::now() - Duration::from_secs(1), ..Budget::new() };
+        assert!(matches!(content_hash(dir.path(), &mut late), Hashed::Capped(m) if m.contains("timed out")));
+        assert!(matches!(content_hash(dir.path(), &mut Budget::new()), Hashed::Bound(..)));
     }
 
     #[test]

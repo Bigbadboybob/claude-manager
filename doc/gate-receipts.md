@@ -641,27 +641,46 @@ review of `4b6d422`):
   cannot attest"). That requirement becomes satisfiable only when CM itself
   verifies run evidence (deferred).
 - **Input verification** (EP, 2026-10-22). The reporting daemon drops any
-  posted `verification`, `hashed_by` or `daemon_hash`, then rehashes each
-  file, dir and artifact input from its absolute `resolved_path` on its own
-  host (`sha256:` for a file; for a dir `tree:` = sha256 of the
+  posted `verification`, `hashed_by`, `daemon_hash` and `resolved_path`.
+  After `authorize_edit` (so an unauthorised caller learns nothing about
+  the host's files), it derives each declared file, dir and artifact
+  input's path itself: the declared `root_env`'s value in the calling
+  session's own process environment, else the caller's registered
+  worktree, joined with the declared relative `path`. The result must stay
+  inside that root after canonicalisation (no `..`, no absolute path, no
+  symlink escape); if it cannot be derived (unset root, no registered
+  worktree, an escape) the input is `self_supplied_unverified` and
+  INCOMPLETE. The daemon then rehashes it (`sha256:` for a file; for a dir `tree:` = sha256 of the
   `relpath\tsize\tsha256` lines, files of a directory before its
   subdirectories, symlinks skipped; cm-gate uses the same manifest). Only
   those inputs are `hashed_at_run`; a typed id that differs is kept as
   `poster_content_id`, and a path that is not there is `missing` (VOID)
-  whatever id was typed. Everything else (gcs, db, inputs without a local
+  whatever id was typed. Hashing is capped per report at 64 GiB, 500 000
+  files and 300 s (the RPC allows 900 s); hitting a cap leaves the input
+  unverifiable, so INCOMPLETE. The receipt's `worktree.path` is likewise the
+  caller's registered worktree, not the poster's. Everything else (gcs, db, inputs without a local
   path) is `self_supplied_unverified` and binds only when the profile's
   `accept_unverified` lists its kind; otherwise it is INCOMPLETE.
-- **root_env + path.** cm-gate joins the root and `path` and resolves both;
-  an unset root or a missing sub-path is `missing` (VOID). The locator stored
-  is the resolved path, never `$ENV`.
-- **Input keys.** `input_changed` and `input_void` are keyed by the resolved
-  path or object URL; an input with neither (a db query, a bare name) is
-  keyed per item (`item:<id>:<name>`), so unrelated items never collide.
+- **root_env + path.** The daemon's derivation (above) decides; cm-gate
+  joins and resolves the same way for its own display and log. A missing
+  sub-path under a derivable root is `missing` (VOID); an unset root is
+  unverifiable (INCOMPLETE). The stored locator is the derived path, never
+  `$ENV`.
+- **Input keys.** `input_changed` and `input_void` are keyed across items
+  only by a daemon-derived path. Every other input (a db query, a gcs URL, a
+  poster's locator) is keyed per item (`item:<id>:<name>`), so a poster can
+  never restale another item's receipts.
 - **Granted nodes.** The profile's `nodes` are the grant and are never
-  overridden. Only when a profile lists none is the runner's own collection
-  of the profile's argv used, and the verdict notes it as unverified.
-- **Dirty tree.** Modified, staged and untracked files count; gitignored
-  files do not.
+  overridden. When a profile lists none, only a verified `selection` grant
+  (a grantor-attached grant naming the nodes for that head) supplies the
+  set; otherwise the step is INCOMPLETE ("no granted node set"). The
+  runner's own collection (`granted_nodes`) is kept as evidence and never
+  grants anything. Profiles for pytest classes therefore list their nodes,
+  or rely on a selection grant per head.
+- **Dirty tree.** Modified, staged and untracked files count. Gitignored
+  files do not, by design (build outputs, caches, `.venv`), but they can
+  still change a run (a local `.env`, generated fixtures): bind such files
+  as declared inputs if the gate depends on them.
 - **Wrappers.** Only bounded forms may precede the granted program:
   `timeout [-s SIG] [-k D] D`, `nice [-n N]`, `ionice -c N [-n N]`,
   `taskset [-c LIST | MASK]`, `numactl` with CPU/node/memory binding,
@@ -672,6 +691,10 @@ review of `4b6d422`):
 - **Variance scope.** A variance grant accepts exactly the argv/env change
   whose digest it binds. Granted nodes that did not run still need a waiver
   naming those nodes.
+- **Program.** The executed program must be the granted token itself, or
+  the same basename resolving to the caller's worktree venv
+  (`<worktree>/.venv/bin/<name>`, `venv/bin`) or to the registered runner's
+  path in that worktree. Any other spelling (`/tmp/x/pytest`) is weakened.
 - **The class is the item's.** A receipt naming another class is refused
   (`class_mismatch`). Changing an item's `gate_class`, the board's
   `gate_default_class`, or setting a profile as the default restales the

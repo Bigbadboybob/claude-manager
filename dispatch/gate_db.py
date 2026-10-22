@@ -500,7 +500,7 @@ async def attach_grant(pool, ref: str, actor: dict, n: int, body: dict) -> dict:
     now = items_db.utcnow()
     kind = body.get("kind") or "waiver"
     if kind not in gr.GRANT_KINDS:
-        raise gr.bad("kind is waiver or variance", "kind")
+        raise gr.bad("kind is waiver, variance or selection", "kind")
     head = gr._sha(body.get("head"), "head", required=True)
     base = gr._sha(body.get("base"), "base")
     step = gr._str(body.get("step"), "step", 40, required=True)
@@ -535,7 +535,7 @@ async def attach_grant(pool, ref: str, actor: dict, n: int, body: dict) -> dict:
                      "risk": risk, "message_check": check, "revoked_at": None}
             problems = gr.grant_problems(draft, profile, grantors(board))
             structural = [p for p in problems if p.startswith(("step ", "nodes outside",
-                                                                "a variance"))]
+                                                                "a variance", "a selection"))]
             if structural:
                 # A generic or mis-scoped grant is refused outright.
                 raise GateError(422, "invalid_grant", "; ".join(structural), field="step")

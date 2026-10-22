@@ -472,15 +472,18 @@ def gate_waive(
     """Grantors only (Owner and the board's waiver_grantors): attach a grant
     to item n. First post the grant in chat, naming the full 40-character
     HEAD SHA (and the base SHA for a base→head grant), the step, the kind
-    ("waive" / "variance"), the reason and the real risk; pass that
+    ("waive" / "variance" / "selection"), the reason and the real risk; pass that
     message's id here. Your daemon checks that you sent it and that it
     names all of those.
 
     kind="waiver" lets a receipt that cites the grant id count `step` (or
-    just `nodes`) as satisfied on exactly that head. kind="variance"
-    accepts a weakened run (fewer nodes, a narrower filter, a changed
-    command) for exactly that head and cmd_digest (from the FAIL reason or
-    gate_receipts). A grant for another SHA, or for "the gate", never
+    just `nodes`, e.g. granted nodes that did not run) as satisfied on
+    exactly that head. kind="variance" accepts a changed command (a narrower
+    filter, other options or env) for exactly that head and cmd_digest
+    (from the FAIL reason or gate_receipts); it never covers dropped nodes.
+    kind="selection" with `nodes` grants the node set of a pytest step whose
+    profile lists none; without profile nodes or a selection grant such a
+    step is INCOMPLETE. A grant for another SHA, or for "the gate", never
     covers a run. revoke=<grant id> withdraws one and makes receipts that
     relied on it STALE.
     """
@@ -500,7 +503,8 @@ def gate_profile(
     """Read a board's gate profile (by klass, or n for that item's class),
     or write one: Owner, the board orchestrator and gate_editors only, with a
     reason. A profile lists the steps a valid run must contain (kind pytest /
-    mypy / ruff / rc, argv as granted, must_run nodes, skip_policy, MF
+    mypy / ruff / rc, argv as granted, the granted `nodes` of every pytest
+    step (or a grantor's selection grant), must_run nodes, skip_policy, MF
     expect_fail types), its waivable steps, required identities
     (require.mf_sha / runner / ruling_id / attestation), its base
     {ref, scope: paths|tree} and declared inputs. Every edit is logged and
