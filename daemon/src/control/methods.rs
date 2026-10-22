@@ -17493,8 +17493,14 @@ fn org_lead_candidates(state: &DaemonState, task_id: &str) -> Vec<(String, Strin
     out
 }
 
-/// `{session_uid, name, label, engine, pinned}` for the task's lead, or null.
+/// `{session_uid, name, label, engine, pinned}` for the task's lead session,
+/// `{owner: true, stand_in}` when Owner leads it (pinned `"owner"`, or a
+/// division root with no live lead), or null.
 fn org_lead(state: &DaemonState, task: &Value) -> Value {
+    org_lead_with(state, task, crate::org::is_division_root(task))
+}
+
+fn org_lead_with(state: &DaemonState, task: &Value, division_root: bool) -> Value {
     let Some(task_id) = task.get("id").and_then(Value::as_str) else {
         return Value::Null;
     };
@@ -17504,8 +17510,10 @@ fn org_lead(state: &DaemonState, task: &Value) -> Value {
         .iter()
         .map(|(uid, engine)| crate::org::LeadCandidate { uid, engine, live: true })
         .collect();
-    let Some(uid) = crate::org::lead_session_uid(pinned, &candidates) else {
-        return Value::Null;
+    let uid = match crate::org::task_lead(pinned, &candidates, division_root) {
+        crate::org::Lead::Session(uid) => uid,
+        crate::org::Lead::Owner { stand_in } => return json!({ "owner": true, "stand_in": stand_in }),
+        crate::org::Lead::None => return Value::Null,
     };
     let engine = owned.iter().find(|(u, _)| *u == uid).map(|(_, e)| e.clone());
     let label = state
@@ -17664,11 +17672,24 @@ pub fn org(
             let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
             let unit = org_unit(&me);
             let is_division = unit.get("kind").and_then(Value::as_str) == Some("division");
+            // Who you report to: the nearest ancestor with a lead, which is
+            // `{owner: true, stand_in}` when that is Owner (an Owner-led
+            // division root, or a task pinned to Owner).
+            let boss_lead = chain.iter().find_map(|t| {
+                let lead = org_lead(&state, t);
+                if lead.is_null() {
+                    return None;
+                }
+                let mut lead = lead;
+                lead["task_id"] = t.get("id").cloned().unwrap_or(Value::Null);
+                Some(lead)
+            });
             Ok(json!({
                 "view": "me",
                 "session_uid": caller_uid,
                 "task": org_task(&state, &me),
                 "boss": chain.first().map(|t| org_task(&state, t)),
+                "boss_lead": boss_lead,
                 "chain": chain.iter().map(|t| org_task(&state, t)).collect::<Vec<_>>(),
                 "division": if is_division { unit.clone() } else { Value::Null },
                 "initiative": if is_division { Value::Null } else { unit },
@@ -17715,6 +17736,19 @@ pub fn org(
             let tasks = api_list_tasks(&creds, None, None, Some(&init_id)).map_err(|e| e.to_method_err())?;
             let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
             let (tree, unattached) = org_build_tree(&root, &tasks, &|t| org_task(&state, t));
+            // The division's leader: its root task's lead, Owner (stand-in)
+            // when the root has no live lead.
+            let kind = init.get("kind").and_then(Value::as_str).unwrap_or("initiative");
+            let leader = if root.is_empty() {
+                Value::Null
+            } else {
+                let row = tasks
+                    .iter()
+                    .find(|t| t.get("id").and_then(Value::as_str) == Some(root.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"id": root}));
+                org_lead_with(&state, &row, kind == "division")
+            };
             Ok(json!({
                 "view": "division",
                 "division": {
@@ -17722,8 +17756,9 @@ pub fn org(
                     "slug": init.get("slug"),
                     "name": init.get("name"),
                     "status": init.get("status"),
-                    "kind": init.get("kind").and_then(Value::as_str).unwrap_or("initiative"),
+                    "kind": kind,
                     "root_task_id": root,
+                    "leader": leader,
                 },
                 "tree": tree,
                 "unattached": unattached,
@@ -17739,6 +17774,11 @@ pub fn org(
 
 /// `org(action="set_lead" | "clear_lead")`: only on the caller's own task,
 /// and only naming a live agent session bound to it on this host.
+///
+/// `session_uid="owner"` (Owner leads the task) is different: never on the
+/// caller's own task, and only from Owner (the operator, with `task_id`) or
+/// an orchestrator: a session with global permissions, or one whose task is
+/// an ancestor of the target.
 fn org_set_lead(
     state_arc: &Arc<Mutex<DaemonState>>,
     creds: &PlanningApiCreds,
@@ -17747,6 +17787,48 @@ fn org_set_lead(
     caller_uid: Option<&str>,
     caller_task: Option<String>,
 ) -> MethodResult {
+    if action == "set_lead" && p.session_uid.as_deref().is_some_and(crate::org::is_owner_pin) {
+        let target = p.task_id.clone().ok_or((
+            ErrorCode::InvalidParams,
+            "org: set_lead to owner needs task_id (the task Owner should lead)".to_string(),
+        ))?;
+        if let Some(caller) = caller_uid {
+            if caller_task.as_deref() == Some(target.as_str()) {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    "org: an agent can't make Owner the lead of its own task; ask your orchestrator or Owner".into(),
+                ));
+            }
+            let global = {
+                let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                state.sessions.get(caller).is_some_and(|s| s.global_perms)
+            };
+            let ancestor = !global
+                && caller_task.as_deref().is_some_and(|own| {
+                    let mut cur = target.clone();
+                    for _ in 0..ORG_CHAIN_MAX {
+                        let Ok(row) = api_get_task(creds, &cur) else { return false };
+                        match row.get("parent_task_id").and_then(Value::as_str) {
+                            Some(parent) if parent == own => return true,
+                            Some(parent) => cur = parent.to_string(),
+                            None => return false,
+                        }
+                    }
+                    false
+                });
+            if !global && !ancestor {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!(
+                        "org: only Owner or an orchestrator (global permissions, or a task above {target}) can make Owner its lead"
+                    ),
+                ));
+            }
+        }
+        let task = api_set_task_lead(creds, &target, Some(crate::org::OWNER_LEAD)).map_err(|e| e.to_method_err())?;
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        return Ok(json!({"action": action, "task": org_task(&state, &task)}));
+    }
     let Some(caller) = caller_uid else {
         return Err((ErrorCode::Unauthorized, "org: set_lead is for agent sessions; Owner uses A-e".into()));
     };
@@ -35553,6 +35635,75 @@ while True:
         let requests = stub.requests.lock().unwrap();
         let post = requests.iter().find(|r| r.method == "POST").expect("lead POST");
         assert_eq!(serde_json::from_str::<Value>(&post.body).unwrap(), json!({"session_uid": "ts-10-0"}));
+        drop(requests);
+        kill_all_sessions(&state);
+    }
+
+    /// Owner as leader (2026-10-22): a division root with no live lead is led
+    /// by Owner as stand-in (`me` shows it as the boss, `division` as the
+    /// leader); `set_lead` to "owner" only from Owner or an orchestrator,
+    /// never on the caller's own task.
+    #[test]
+    fn org_owner_leads_division_roots_and_set_lead_owner_is_guarded() {
+        let state = make_state_arc();
+        let div = r#""initiative":{"id":"div-1","slug":"pt-misc","name":"PT misc","status":"active",
+                      "kind":"division","coordinator_task_id":"task-root"}"#;
+        let stub = spawn_routed_stub(move |method, path, _body| match (method, path) {
+            ("GET", "/tasks/task-me") => (200, format!(r#"{{"id":"task-me","name":"me","parent_task_id":"task-root",{div}}}"#)),
+            ("GET", "/tasks/task-root") => (200, format!(r#"{{"id":"task-root","name":"root","parent_task_id":null,{div}}}"#)),
+            ("GET", "/tasks/task-child") => (200, r#"{"id":"task-child","name":"child","parent_task_id":"task-me"}"#.to_string()),
+            ("GET", "/tasks/task-other") => (200, r#"{"id":"task-other","name":"other","parent_task_id":null}"#.to_string()),
+            ("POST", p) if p.ends_with("/lead") => {
+                let id = p.trim_start_matches("/tasks/").trim_end_matches("/lead");
+                (200, format!(r#"{{"id":"{id}","name":"x","metadata":{{"lead_session_uid":"owner"}}}}"#))
+            }
+            ("GET", "/initiatives/pt-misc") => (200, r#"{"id":"div-1","slug":"pt-misc","name":"PT misc","status":"active",
+                "kind":"division","coordinator_task_id":"task-root"}"#.to_string()),
+            ("GET", p) if p.starts_with("/tasks?") => (200, format!(
+                r#"[{{"id":"task-root","name":"root","parent_task_id":null,{div}}},
+                    {{"id":"task-me","name":"me","parent_task_id":"task-root",{div}}}]"#)),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "test-token".to_string();
+        }
+        seed_tasked_caller(&state, "ts-10-0", "ws-me", "task-me");
+        state.lock().unwrap().sessions.get_mut("ts-10-0").unwrap().session_type = "codex".to_string();
+
+        let me = org(&state, &json!({}), Some("ts-10-0")).expect("org me");
+        assert_eq!(me["boss"]["id"], "task-root");
+        assert_eq!(me["boss"]["lead"], json!({"owner": true, "stand_in": true}), "no session on the root: Owner stands in");
+        assert_eq!(me["boss_lead"], json!({"owner": true, "stand_in": true, "task_id": "task-root"}));
+        assert_eq!(me["task"]["lead"]["session_uid"], "ts-10-0", "a member task keeps its session lead");
+
+        let division = org(&state, &json!({"view": "division", "division": "pt-misc"}), Some("ts-10-0")).expect("division");
+        assert_eq!(division["division"]["leader"], json!({"owner": true, "stand_in": true}));
+        assert_eq!(division["tree"]["lead"], json!({"owner": true, "stand_in": true}));
+
+        // set_lead to Owner: not on your own task, not on an unrelated one...
+        let set = |params: Value, caller: Option<&str>| org(&state, &params, caller);
+        let owner = |task: &str| json!({"action": "set_lead", "session_uid": "owner", "task_id": task});
+        assert_eq!(set(owner("task-me"), Some("ts-10-0")).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(set(owner("task-other"), Some("ts-10-0")).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(
+            set(json!({"action": "set_lead", "session_uid": "owner"}), Some("ts-10-0")).unwrap_err().0,
+            ErrorCode::InvalidParams,
+            "needs task_id"
+        );
+        assert!(stub.requests.lock().unwrap().iter().all(|r| r.method == "GET"), "no write yet");
+        // ...but yes on a task below yours (you orchestrate it), from Owner,
+        // and from a global session.
+        let out = set(owner("task-child"), Some("ts-10-0")).expect("orchestrator");
+        assert_eq!(out["task"]["lead"], json!({"owner": true, "stand_in": false}), "explicit Owner");
+        set(owner("task-other"), None).expect("Owner (operator)");
+        state.lock().unwrap().sessions.get_mut("ts-10-0").unwrap().global_perms = true;
+        set(owner("task-other"), Some("ts-10-0")).expect("global");
+        let requests = stub.requests.lock().unwrap();
+        let posts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+        assert_eq!(posts.len(), 3);
+        assert_eq!(serde_json::from_str::<Value>(&posts[0].body).unwrap(), json!({"session_uid": "owner"}));
         drop(requests);
         kill_all_sessions(&state);
     }
