@@ -1669,21 +1669,19 @@ impl App {
                         // cell with a blank cell between, so a terminal that
                         // draws a mark two cells wide never covers the next.
                         // The live activity badge (agent_state.rs) sits just
-                        // left of those, the label keeping at least 8 cells.
+                        // left of those when the whole label fits beside it.
                         let room = w.saturating_sub(4 + 7);
-                        let badge = self.row_badge(ts);
                         let label_w = ts.label.chars().count();
-                        let badge_w = badge.as_ref().map_or(0, |b| super::agent_state::badge_width(b).min(room.saturating_sub(label_w.min(8) + 1)));
-                        let label_room = room.saturating_sub(badge_w + usize::from(badge_w > 0));
-                        let label = crate::planning::truncate_with_ellipsis(&ts.label, label_room);
+                        let badge = self.row_badge(ts).filter(|b| super::agent_state::badge_fits(room, label_w, b));
+                        let label = crate::planning::truncate_with_ellipsis(&ts.label, room);
                         let label_style = if ts.session.exited { Style::default().fg(theme::DIM) } else { Style::default().fg(theme::TEXT) };
                         put(buf, p.x + 1, y, &" ".repeat(w - 2), bg(Style::default()));
                         put(buf, p.x + 1, y, s.mark.unwrap_or(" "), bg(Style::default().fg(theme::ATTN)));
                         put(buf, p.x + 2, y, g, bg(gs));
                         put(buf, p.x + 4, y, &label, bg(label_style));
-                        if let Some(b) = badge.filter(|_| badge_w > 0) {
-                            let mut x = p.x + 4 + room as i32 - badge_w as i32;
-                            for span in super::agent_state::badge_spans(&b, badge_w) {
+                        if let Some(b) = badge {
+                            let mut x = p.x + 4 + room as i32 - super::agent_state::badge_width(&b) as i32;
+                            for span in super::agent_state::badge_spans(&b) {
                                 put(buf, x, y, &span.content, bg(span.style));
                                 x += span.width() as i32;
                             }
@@ -3187,8 +3185,8 @@ mod tests {
         app.orgchart.hide_info = true;
         let s = screen(&mut app, 200, 40);
         let row = |s: &str, label: &str| s.lines().find(|l| l.contains(label)).unwrap_or_else(|| panic!("{label}:\n{s}")).to_owned();
-        assert!(row(&s, "mid-1").contains("\u{26a0} rate limit"), "{}", row(&s, "mid-1"));
-        assert!(row(&s, "leaf-1").contains("\u{29d7} cargo test"), "{}", row(&s, "leaf-1"));
+        assert!(row(&s, "mid-1").contains("\u{26a0}15m") || row(&s, "mid-1").contains("\u{26a0}14m"), "{}", row(&s, "mid-1"));
+        assert!(row(&s, "leaf-1").contains("\u{29d7}1") && !s.contains("cargo test"), "{}", row(&s, "leaf-1"));
         assert!(!row(&s, "root-a").contains('\u{2699}'), "no state, no badge");
         // Engine and host marks keep their cells.
         assert!(row(&s, "mid-1").contains("\u{2b21} s"), "{}", row(&s, "mid-1"));

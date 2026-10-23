@@ -1938,6 +1938,12 @@ impl App {
                 if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
                     out.push(PeekLine::Field { label: "Status".into(), value: note.to_string() });
                 }
+                // The activity badge in full (job labels, the waiting tool,
+                // the error kind), F9 toggle or not.
+                if let Some(b) = self.session_badge(ts) {
+                    let (mark, _) = super::symbols::doing(b.kind);
+                    out.push(PeekLine::Field { label: "Doing".into(), value: format!("{mark} {}", b.full) });
+                }
                 out.push(PeekLine::Blank);
                 match ts.task_id.as_deref().and_then(|t| self.find_task_entry(t)) {
                     Some(task) => {

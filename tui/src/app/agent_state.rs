@@ -245,15 +245,23 @@ impl App {
 }
 
 /// The live activity badge: what a session is doing right now, from its
-/// `agent_state` alone (no extra polling). `short` sits beside the row's
-/// state glyph in the sidebar and on org chart cards; `full` is the info
-/// pane's line. The mark and styles live in `symbols::doing`.
+/// `agent_state` alone (no extra polling). The compact form (`mark`, then
+/// `short`, at most [`BADGE_MAX`] cells) sits at the right of sidebar rows
+/// and org chart cards; `full` is the A-i peek's and the info pane's line,
+/// and the only place job labels, the waiting tool and error kinds appear.
+/// The marks and styles live in `symbols::doing`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Badge {
     pub kind: symbols::Doing,
+    /// The text after the mark: a time, a count, or nothing.
     pub short: String,
+    /// A space between mark and text (`⚙ 3m`; the others sit tight: `⚠12m`).
+    pub gap: bool,
     pub full: String,
 }
+
+/// The widest a compact badge gets, in cells (`⚙ 3m+2`).
+pub(crate) const BADGE_MAX: usize = 6;
 
 /// Whether an `error_kind` is a rate or usage limit: Claude's `rate_limit`
 /// / `rate_limited`, Codex's `usageLimitExceeded`, quota and HTTP 429
@@ -327,59 +335,59 @@ pub(crate) fn badge(v: &AgentStateView, now: f64) -> Option<Badge> {
             let resumes = detail["resumes_at"].as_f64().filter(|r| *r > now);
             if is_rate_limit(kind) {
                 let (short, full) = match resumes {
-                    Some(r) => (
-                        format!("rate limit {}", short_age(r - now)),
-                        format!("rate limited ({kind}), resumes in {}", short_age(r - now)),
-                    ),
-                    None => ("rate limit".into(), format!("rate limited ({kind}) for {}", short_age(age))),
+                    Some(r) => (short_age(r - now), format!("rate limited ({kind}), resumes in {}", short_age(r - now))),
+                    None => (String::new(), format!("rate limited ({kind}) for {}", short_age(age))),
                 };
                 (Doing::RateLimited, short, full)
             } else if kind.is_empty() {
-                (Doing::Errored, "error".into(), format!("errored {} ago", short_age(age)))
+                (Doing::Errored, String::new(), format!("errored {} ago", short_age(age)))
             } else {
-                (Doing::Errored, humanize(kind), format!("error: {} ({kind}), {} ago", humanize(kind), short_age(age)))
+                (Doing::Errored, String::new(), format!("error: {} ({kind}), {} ago", humanize(kind), short_age(age)))
             }
         }
         Activity::Waiting => {
             let reason = v.waiting_for.as_deref().map(waiting_word);
             let tool = detail["open_tool"].as_str().filter(|t| !t.is_empty());
-            let short = tool.map(str::to_owned).or_else(|| reason.clone()).unwrap_or_else(|| "input".into());
             let full = match (reason, tool) {
                 (Some(r), Some(t)) => format!("waiting on {r}: {t}"),
                 (Some(r), None) => format!("waiting on {r}"),
                 (None, Some(t)) => format!("waiting on {t}"),
                 (None, None) => "waiting on a human".into(),
             };
-            (Doing::Waiting, short, format!("{full} for {}", short_age(age)))
+            (Doing::Waiting, String::new(), format!("{full} for {}", short_age(age)))
         }
         Activity::Working if detail["retrying"].as_bool() == Some(true) => {
-            (Doing::Retrying, "retrying".into(), format!("retrying a failed request, {}", short_age(age)))
+            (Doing::Retrying, String::new(), format!("retrying a failed request, {}", short_age(age)))
         }
         Activity::Working if v.stalled => {
             let stalled_for = v.raw["stalled_since"].as_f64().map_or(age, |t| now - t);
-            (
-                Doing::Stalled,
-                format!("stalled {}", short_age(stalled_for)),
-                format!("working, no progress for {}", short_age(stalled_for)),
-            )
+            (Doing::Stalled, short_age(stalled_for), format!("working, no progress for {}", short_age(stalled_for)))
         }
         Activity::Working => {
-            let mut short = short_age(age);
             let mut full = format!("working {}", short_age(age));
             if jobs > 0 {
-                short.push_str(&format!(" +{jobs} bg"));
-                full.push_str(&format!(", {jobs} background: {}", labels.join(", ")));
+                full.push_str(&format!(", {jobs} background"));
+                if !labels.is_empty() {
+                    full.push_str(&format!(": {}", labels.join(", ")));
+                }
             }
-            (Doing::Working, short, full)
+            // `⚙ 3m+2`; a longer one loses its space, then its job count.
+            let time = short_age(age);
+            let with_jobs = if jobs > 0 { format!("{time}+{jobs}") } else { time.clone() };
+            let (short, gap) = [(with_jobs.clone(), true), (with_jobs, false), (time, false)]
+                .into_iter()
+                .find(|(t, gap)| 1 + usize::from(*gap) + t.chars().count() <= BADGE_MAX)
+                .unwrap_or_else(|| (String::new(), false));
+            return Some(Badge { kind: Doing::Working, short, gap, full });
         }
         Activity::Background => {
-            let short = match (jobs, labels.first()) {
-                (1, Some(l)) => l.clone(),
-                (0, _) => "bg".into(),
-                (n, _) => format!("{n} bg"),
-            };
+            let short = if jobs > 0 { jobs.to_string() } else { String::new() };
             let full = if labels.is_empty() {
-                "background work".into()
+                match jobs {
+                    0 => "background work".into(),
+                    1 => "1 background job".into(),
+                    n => format!("{n} background jobs"),
+                }
             } else {
                 format!("background: {}", labels.join(", "))
             };
@@ -387,48 +395,34 @@ pub(crate) fn badge(v: &AgentStateView, now: f64) -> Option<Badge> {
         }
         Activity::Idle | Activity::Starting | Activity::Exited | Activity::Unknown => return None,
     };
-    Some(Badge { kind, short, full })
+    // Counts and countdowns are short; anything past the cap is dropped
+    // rather than cut, the mark staying.
+    let short = if 1 + short.chars().count() <= BADGE_MAX { short } else { String::new() };
+    Some(Badge { kind, short, gap: false, full })
 }
 
-/// The badge as spans at most `width` cells wide: mark, a space, then the
-/// text truncated with an ellipsis. Under three cells, the mark alone.
-pub(crate) fn badge_spans(b: &Badge, width: usize) -> Vec<Span<'static>> {
+/// The compact badge as spans: the mark, then its text.
+pub(crate) fn badge_spans(b: &Badge) -> Vec<Span<'static>> {
     let (mark, mark_style) = symbols::doing(b.kind);
-    if width == 0 {
-        return Vec::new();
-    }
     let mut out = vec![Span::styled(mark, mark_style)];
-    if width >= 3 {
-        out.push(Span::raw(" "));
-        out.push(Span::styled(fit(&b.short, width - 2), symbols::doing_text(b.kind)));
+    if !b.short.is_empty() {
+        let text = if b.gap { format!(" {}", b.short) } else { b.short.clone() };
+        out.push(Span::styled(text, symbols::doing_text(b.kind)));
     }
     out
 }
 
-/// `s` cut to `width` cells, ending in `…` when cut.
-fn fit(s: &str, width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if s.width() <= width {
-        return s.to_owned();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
-        if used + w + 1 > width {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out.push('\u{2026}');
-    out
-}
-
-/// Cells the whole badge takes untruncated.
+/// Cells the compact badge takes (never more than [`BADGE_MAX`]).
 pub(crate) fn badge_width(b: &Badge) -> usize {
     use unicode_width::UnicodeWidthStr;
-    2 + b.short.width()
+    1 + usize::from(b.gap && !b.short.is_empty()) + b.short.width()
+}
+
+/// Whether a row with `room` cells shows a `label_w`-cell label and the
+/// badge with a blank cell between them. The name has priority: a row too
+/// narrow for both drops the badge rather than cut the name.
+pub(crate) fn badge_fits(room: usize, label_w: usize, b: &Badge) -> bool {
+    label_w + 1 + badge_width(b) <= room
 }
 
 impl App {
@@ -499,38 +493,48 @@ mod tests {
         badge(&AgentStateView::parse(&state), now)
     }
 
-    fn short(state: Value) -> (symbols::Doing, String) {
-        let x = b(state, 1000.0).expect("a badge");
-        (x.kind, x.short)
+    /// The compact badge as drawn: mark and text.
+    fn text(x: &Badge) -> String {
+        badge_spans(x).iter().map(|s| s.content.to_string()).collect()
     }
 
-    /// Owner 2026-10-22: what each state's badge says.
+    fn short(state: Value) -> (symbols::Doing, String) {
+        let x = b(state, 1000.0).expect("a badge");
+        (x.kind, text(&x))
+    }
+
+    /// Owner 2026-10-23: compact badges, no labels; the full line keeps them.
     #[test]
     fn badge_labels_follow_the_engine_state() {
         use symbols::Doing::*;
-        // Working: time in the turn, plus any background jobs.
-        assert_eq!(short(json!({"state":"working","since":820.0})), (Working, "3m".into()));
-        let w = b(json!({"state":"working","since":995.0,"background":{"jobs":[
+        // Working: time in the turn, plus a background job count.
+        assert_eq!(short(json!({"state":"working","since":820.0})), (Working, "\u{2699} 3m".into()));
+        let w = b(json!({"state":"working","since":820.0,"background":{"jobs":[
             {"id":"1","label":"cargo test"},{"id":"2","label":"npm run build"}]}}), 1000.0).unwrap();
-        assert_eq!((w.short.as_str(), w.full.as_str()), ("5s +2 bg", "working 5s, 2 background: cargo test, npm run build"));
-        assert_eq!(short(json!({"state":"working","since":0.0,"detail":{"retrying":true}})), (Retrying, "retrying".into()));
-        assert_eq!(short(json!({"state":"working","since":0.0,"stalled_since":640.0})), (Stalled, "stalled 6m".into()));
-        // Background: one job by its label, several by count.
-        assert_eq!(short(json!({"state":"working-background","background":{"jobs":[{"id":"1","label":"cargo   test\n-p tui"}]}})),
-            (Background, "cargo test -p tui".into()));
+        assert_eq!((text(&w).as_str(), w.full.as_str()), ("\u{2699} 3m+2", "working 3m, 2 background: cargo test, npm run build"));
+        // Too long for six cells: the space goes first, then the count.
+        let jobs = |n: usize| json!((0..n).map(|i| json!({"id": i.to_string()})).collect::<Vec<_>>());
+        assert_eq!(short(json!({"state":"working","since":400.0,"background":{"jobs":jobs(2)}})), (Working, "\u{2699}10m+2".into()));
+        assert_eq!(short(json!({"state":"working","since":400.0,"background":{"jobs":jobs(12)}})), (Working, "\u{2699}10m".into()));
+        assert_eq!(short(json!({"state":"working","since":0.0,"detail":{"retrying":true}})), (Retrying, "\u{21bb}".into()));
+        assert_eq!(short(json!({"state":"working","since":0.0,"stalled_since":640.0})), (Stalled, "\u{23f1}6m".into()));
+        // Background: the job count, never the job's label.
+        let one = b(json!({"state":"working-background","background":{"jobs":[{"id":"1","label":"cargo   test\n-p tui"}]}}), 1000.0).unwrap();
+        assert_eq!((text(&one).as_str(), one.full.as_str()), ("\u{29d7}1", "background: cargo test -p tui"));
         assert_eq!(short(json!({"state":"working-background","background":{"jobs":[{"id":"1","label":"a"},{"id":"2","label":"b"}]}})),
-            (Background, "2 bg".into()));
-        assert_eq!(short(json!({"state":"working-background","background":{"complete":false,"jobs":[]}})), (Background, "bg".into()));
-        // Waiting: the tool asking permission, else what it waits for.
+            (Background, "\u{29d7}2".into()));
+        assert_eq!(short(json!({"state":"working-background","background":{"complete":false,"jobs":[]}})), (Background, "\u{29d7}".into()));
+        // Waiting: the mark alone; the tool and reason stay in the full line.
         let p = b(json!({"state":"waiting-on-human","since":940.0,"detail":{"waiting_for":"permission_prompt","open_tool":"Bash"}}), 1000.0).unwrap();
-        assert_eq!((p.kind, p.short.as_str(), p.full.as_str()), (Waiting, "Bash", "waiting on permission: Bash for 1m"));
-        assert_eq!(short(json!({"state":"waiting-on-human","detail":{"waiting_for":"permission_prompt"}})), (Waiting, "permission".into()));
-        assert_eq!(short(json!({"state":"waiting-on-human","detail":{"waiting_for":"elicitation_dialog"}})), (Waiting, "question".into()));
-        assert_eq!(short(json!({"state":"waiting-on-human","detail":{"waiting_for":"UserInput"}})), (Waiting, "input".into()));
-        assert_eq!(short(json!({"state":"waiting-on-human"})), (Waiting, "input".into()));
-        // Other errors, by kind.
-        assert_eq!(short(json!({"state":"errored","detail":{"error_kind":"server_error"}})), (Errored, "server error".into()));
-        assert_eq!(short(json!({"state":"errored"})), (Errored, "error".into()));
+        assert_eq!((p.kind, text(&p).as_str(), p.full.as_str()), (Waiting, "\u{261b}", "waiting on permission: Bash for 1m"));
+        for detail in [json!({"waiting_for":"elicitation_dialog"}), json!({"waiting_for":"UserInput"}), json!({})] {
+            assert_eq!(short(json!({"state":"waiting-on-human","detail": detail})), (Waiting, "\u{261b}".into()));
+        }
+        assert!(b(json!({"state":"waiting-on-human","detail":{"waiting_for":"elicitation_dialog"}}), 1000.0).unwrap().full.contains("question"));
+        // Other errors: the mark alone, the kind in the full line.
+        let e = b(json!({"state":"errored","since":880.0,"detail":{"error_kind":"server_error"}}), 1000.0).unwrap();
+        assert_eq!((e.kind, text(&e).as_str(), e.full.as_str()), (Errored, "\u{2715}", "error: server error (server_error), 2m ago"));
+        assert_eq!(short(json!({"state":"errored"})), (Errored, "\u{2715}".into()));
         // Nothing to add for quiet or unknown states.
         for state in ["idle", "starting", "unknown", "exited", "something-new"] {
             assert_eq!(b(json!({"state": state}), 1000.0), None, "{state}");
@@ -549,11 +553,11 @@ mod tests {
         for kind in ["server_error", "authentication_failed", "api_error", "billing_error", "overloaded", ""] {
             assert!(!is_rate_limit(kind), "{kind}");
         }
-        // With a known resume time it counts down; without, it says so.
+        // With a known resume time it counts down; without, the mark alone.
         let r = b(json!({"state":"errored","since":400.0,"detail":{"error_kind":"usageLimitExceeded","resumes_at":1720.0}}), 1000.0).unwrap();
-        assert_eq!((r.short.as_str(), r.full.as_str()), ("rate limit 12m", "rate limited (usageLimitExceeded), resumes in 12m"));
+        assert_eq!((text(&r).as_str(), r.full.as_str()), ("\u{26a0}12m", "rate limited (usageLimitExceeded), resumes in 12m"));
         let r = b(json!({"state":"errored","since":400.0,"detail":{"error_kind":"rate_limit","resumes_at":10.0}}), 1000.0).unwrap();
-        assert_eq!((r.short.as_str(), r.full.as_str()), ("rate limit", "rate limited (rate_limit) for 10m"));
+        assert_eq!((text(&r).as_str(), r.full.as_str()), ("\u{26a0}", "rate limited (rate_limit) for 10m"));
         // Its mark is reversed and bold; no other badge's is.
         let (mark, style) = symbols::doing(RateLimited);
         assert_eq!(mark, "\u{26a0}");
@@ -564,22 +568,30 @@ mod tests {
         }
     }
 
+    /// No badge is wider than BADGE_MAX, and one only shows beside the
+    /// whole name.
     #[test]
-    fn badges_truncate_to_the_room_they_get() {
-        let x = Badge { kind: symbols::Doing::Background, short: "cargo test --workspace".into(), full: String::new() };
-        assert_eq!(badge_width(&x), 24);
-        let text = |w: usize| badge_spans(&x, w).iter().map(|s| s.content.to_string()).collect::<String>();
-        let width = |w: usize| badge_spans(&x, w).iter().map(|s| s.width()).sum::<usize>();
-        assert_eq!(text(24), "\u{29d7} cargo test --workspace");
-        assert_eq!(text(12), "\u{29d7} cargo tes\u{2026}");
-        for w in 0..30 {
-            assert!(width(w) <= w, "width {w}: {:?}", text(w));
+    fn badges_stay_compact_and_give_way_to_the_name() {
+        let ages = [0.0, 59.0, 600.0, 3599.0, 7200.0, 86_400.0 * 400.0];
+        for since in ages {
+            for n in [0usize, 1, 2, 9, 10, 99, 1000] {
+                let jobs: Vec<Value> = (0..n).map(|i| json!({"id": i.to_string(), "label": "a very long job label indeed"})).collect();
+                for state in [
+                    json!({"state":"working","since": 1e8 - since,"background":{"jobs":jobs}}),
+                    json!({"state":"working-background","since":0.0,"background":{"jobs":jobs}}),
+                    json!({"state":"working","since":0.0,"stalled_since": 1e8 - since}),
+                    json!({"state":"errored","detail":{"error_kind":"rate_limit","resumes_at": 1e8 + since + 1.0}}),
+                ] {
+                    let x = b(state.clone(), 1e8).unwrap();
+                    let drawn = badge_spans(&x).iter().map(|s| s.width()).sum::<usize>();
+                    assert_eq!(drawn, badge_width(&x), "{state}");
+                    assert!(drawn <= BADGE_MAX, "{state}: {:?}", text(&x));
+                }
+            }
         }
-        assert_eq!(text(2), "\u{29d7}", "too narrow for text: the mark alone");
-        assert_eq!(text(0), "");
-        // Wide characters count as two cells.
-        let wide = Badge { short: "テストテスト".into(), ..x };
-        assert_eq!(badge_spans(&wide, 7).iter().map(|s| s.width()).sum::<usize>(), 7);
+        let x = b(json!({"state":"working","since":820.0}), 1000.0).unwrap(); // ⚙ 3m, 4 cells
+        assert!(badge_fits(10, 5, &x));
+        assert!(!badge_fits(9, 5, &x), "one cell short: the badge goes, the name stays whole");
     }
 
     fn session(app: &mut App, wi: usize, uid: &str, label: &str) {
@@ -594,8 +606,8 @@ mod tests {
         (0..area.height).map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect()).collect()
     }
 
-    /// The sidebar row: the badge right-aligned, the label giving way, and
-    /// F9's toggle (previewed live) turning it off.
+    /// The sidebar row: the compact badge right-aligned, dropped before the
+    /// name would be cut, and F9's toggle (previewed live) turning it off.
     #[test]
     fn sidebar_rows_show_the_badge_and_f9_turns_it_off() {
         use super::super::sections::layout_tests::{bare_ws, sidebar_buffer, test_app};
@@ -605,22 +617,29 @@ mod tests {
         session(&mut app, 0, "ts-1-0", "worker");
         session(&mut app, 0, "ts-2-0", "a-rather-long-session-label-here");
         session(&mut app, 0, "ts-3-0", "quiet");
+        session(&mut app, 0, "ts-4-0", "builder");
         let host = HostId::local();
         let now = now_unix();
-        app.apply_agent_state(&host, "ts-1-0", &json!({"state":"errored","since":now - 60.0,"detail":{"error_kind":"rate_limited"}}));
+        app.apply_agent_state(&host, "ts-1-0", &json!({"state":"errored","since":now - 60.0,
+            "detail":{"error_kind":"rate_limited","resumes_at":now + 750.0}}));
         app.apply_agent_state(&host, "ts-2-0", &json!({"state":"working-background","since":now,
             "background":{"jobs":[{"id":"1","label":"cargo test --workspace --all-features"}]}}));
         app.apply_agent_state(&host, "ts-3-0", &json!({"state":"idle","since":now}));
+        app.apply_agent_state(&host, "ts-4-0", &json!({"state":"working-background","since":now,
+            "background":{"jobs":[{"id":"1","label":"cargo test --workspace"},{"id":"2","label":"npm run build"}]}}));
         let text = rows(&sidebar_buffer(&mut app, 12));
         let row = |needle: &str| text.iter().find(|r| r.contains(needle)).cloned().unwrap_or_else(|| panic!("{needle}\n{}", text.join("\n")));
-        // Right-aligned against the border (column 39).
+        // Right-aligned against the border, with a short countdown.
         let rl = row("worker");
-        assert!(rl.trim_end_matches('\u{2502}').ends_with("\u{26a0} rate limit"), "{rl}");
-        // The long label and the long job share the row: both cut, the
-        // label keeping at least 8 cells.
-        let bg = row("\u{29d7}");
-        assert!(bg.contains("a-rat") && bg.contains("...") && bg.contains("\u{2026}"), "{bg}");
-        assert_eq!(bg.chars().count(), 40, "{bg}");
+        assert!(rl.trim_end_matches('\u{2502}').trim_end().ends_with("\u{26a0}12m"), "{rl}");
+        // A job count, never the job's label.
+        let bl = row("builder");
+        assert!(bl.trim_end_matches('\u{2502}').trim_end().ends_with("\u{29d7}2"), "{bl}");
+        assert!(!text.join("\n").contains("cargo"), "{}", text.join("\n"));
+        // The long name doesn't leave room for both: the badge goes and
+        // the name is not cut for it.
+        let long = row("a-rather");
+        assert!(!long.contains('\u{29d7}'), "{long}");
         // Idle: no badge.
         assert!(!row("quiet").contains(['\u{2699}', '\u{29d7}', '\u{26a0}']));
         // F9 → ↓ → Space previews the toggle off; Esc restores it.
@@ -632,9 +651,32 @@ mod tests {
         assert!(!app.global_settings.activity_badges());
         let off = rows(&sidebar_buffer(&mut app, 12)).join("\n");
         assert!(!off.contains('\u{26a0}') && !off.contains('\u{29d7}'), "{off}");
-        assert!(off.contains("a-rather-long-session-label-here"), "the label gets its room back");
         app.global_settings.handle_event(&key(KeyCode::Esc));
         assert!(app.global_settings.activity_badges());
+    }
+
+    /// The A-i peek keeps the full line: job labels, the waiting tool.
+    #[test]
+    fn the_peek_spells_the_badge_out() {
+        use super::super::sections::layout_tests::{bare_ws, test_app};
+        let mut app = test_app();
+        app.workspaces = vec![bare_ws("w")];
+        session(&mut app, 0, "ts-1-0", "worker");
+        session(&mut app, 0, "ts-2-0", "asker");
+        let host = HostId::local();
+        let now = now_unix();
+        app.apply_agent_state(&host, "ts-1-0", &json!({"state":"working-background","since":now,
+            "background":{"jobs":[{"id":"1","label":"cargo test --workspace"}]}}));
+        app.apply_agent_state(&host, "ts-2-0", &json!({"state":"waiting-on-human","since":now,
+            "detail":{"waiting_for":"permission_prompt","open_tool":"Bash"}}));
+        let doing = |app: &App| app.build_peek_lines().into_iter().find_map(|l| match l {
+            PeekLine::Field { label, value } if label == "Doing" => Some(value),
+            _ => None,
+        });
+        app.cursor = Cursor::Session(0, 0);
+        assert_eq!(doing(&app).as_deref(), Some("\u{29d7} background: cargo test --workspace"));
+        app.cursor = Cursor::Session(0, 1);
+        assert_eq!(doing(&app).as_deref(), Some("\u{261b} waiting on permission: Bash for 0s"));
     }
 
     #[test]

@@ -124,13 +124,16 @@ show no engine name, so they are unchanged.
 
 ## Info pane
 
-Each session line on a full card carries the live activity badge between its
-label and the right-edge marks, as in the Sessions sidebar (`⚠ rate limit`,
-`⧗ cargo test`); F9 turns it off on cards.
+Each session line on a full card carries the compact activity badge between
+its label and the right-edge marks, as in the Sessions sidebar (`⚙ 3m+2`,
+`⧗2`, `☛`, `⚠12m`; at most 6 cells, no job labels). When the card is too
+narrow for the whole label and the badge, the badge is dropped rather than
+the label cut. F9 turns it off on cards.
 
 For the focused session, the pane shows:
 - name, engine, status and how long it has been in that status;
-- what it is doing (`doing`), the activity badge in full, F9 toggle or not;
+- what it is doing (`doing`), the activity badge in full (job labels, the
+  tool asking permission, the error kind), F9 toggle or not;
 - age since spawn (taken from the uid, so it survives restarts) and last
   activity;
 - task, boss (the parent box and its lead), and the number of direct reports;

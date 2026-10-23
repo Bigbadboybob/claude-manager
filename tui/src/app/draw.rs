@@ -2230,40 +2230,24 @@ impl App {
                     if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
                         tail.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
                     }
-                    // Live activity badge (agent_state.rs), right-aligned.
-                    // It takes the room the label doesn't need, the label
-                    // keeping at least BADGE_MIN_LABEL cells; a shorter
-                    // badge is truncated. Rows that already carry a status
+                    // Live activity badge (agent_state.rs), right-aligned,
+                    // at most BADGE_MAX cells. The name has priority: a row
+                    // too narrow for both drops the badge, never cuts the
+                    // name for it. Rows that already carry a status
                     // (hidden, owner-blocked, revive failed) show none.
+                    let width = |v: &[Span]| v.iter().map(|s| s.width()).sum::<usize>();
+                    let room = (inner.width as usize).saturating_sub(width(&spans) + width(&tail));
+                    let label_w = display.chars().count();
                     let badge = (!ts.hidden && !owner_blocked && !revive_failed)
                         .then(|| self.row_badge(ts))
-                        .flatten();
-                    match badge {
-                        Some(b) => {
-                            const BADGE_MIN_LABEL: usize = 8;
-                            let width = |v: &[Span]| v.iter().map(|s| s.width()).sum::<usize>();
-                            let room = (inner.width as usize).saturating_sub(width(&spans) + width(&tail));
-                            let label_w = display.chars().count();
-                            let pad_w = label_w - display.trim_start().chars().count();
-                            let keep = pad_w + (label_w - pad_w).min(BADGE_MIN_LABEL);
-                            let badge_w = super::agent_state::badge_width(&b)
-                                .min(room.saturating_sub(keep + 1));
-                            let label_room = room.saturating_sub(badge_w + usize::from(badge_w > 0));
-                            let display = if label_w > label_room {
-                                crate::planning::truncate_with_ellipsis(&display, label_room)
-                            } else {
-                                display
-                            };
-                            let pad = room.saturating_sub(display.chars().count() + badge_w);
-                            spans.push(Span::raw(display));
-                            spans.extend(tail);
-                            spans.push(Span::raw(" ".repeat(pad)));
-                            spans.extend(super::agent_state::badge_spans(&b, badge_w));
-                        }
-                        None => {
-                            spans.push(Span::raw(display));
-                            spans.extend(tail);
-                        }
+                        .flatten()
+                        .filter(|b| super::agent_state::badge_fits(room, label_w, b));
+                    spans.push(Span::raw(display));
+                    spans.extend(tail);
+                    if let Some(b) = badge {
+                        let pad = room - label_w - super::agent_state::badge_width(&b);
+                        spans.push(Span::raw(" ".repeat(pad)));
+                        spans.extend(super::agent_state::badge_spans(&b));
                     }
                     let line = Line::from(spans);
 
