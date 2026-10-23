@@ -4,7 +4,7 @@
 //! filtered read of the shared planning API, not a board poll) and marks each
 //! holder's sidebar row and workspace header with an amber diamond that
 //! alternates ◇/◆ about once a second plus a bold `OWNER` tag, ranked just
-//! below a pending ⚑ alert. The status bar counts the items.
+//! below a pending ⚑ alert. The status bar counts the holder sessions.
 
 use super::App;
 use crate::theme;
@@ -40,6 +40,13 @@ impl OwnerBlocked {
 
     pub(crate) fn count(&self) -> usize {
         self.items.len()
+    }
+
+    /// Distinct holder sessions with at least one item blocked on Owner:
+    /// the status bar's `◆N OWNER`. One orchestrator holding three items
+    /// counts once; unheld items count nowhere.
+    pub(crate) fn session_count(&self) -> usize {
+        self.sessions.len()
     }
 }
 
@@ -246,5 +253,21 @@ mod tests {
         assert!(!ob.sessions.contains("u3"));
         ob.set_items(vec![]);
         assert!(ob.sessions.is_empty());
+    }
+
+    /// Owner 2026-10-23: the status bar counts sessions, not items.
+    #[test]
+    fn the_status_bar_counts_holder_sessions_not_items() {
+        let mut app = app_with(&["orch", "lane-b"]);
+        app.owner_blocked.set_items(vec![
+            json!({"board": "sfd", "n": 1, "holders": [{"session_uid": "orch"}]}),
+            json!({"board": "sfd", "n": 2, "holders": [{"session_uid": "orch"}]}),
+            json!({"board": "ops", "n": 3, "holders": [{"session_uid": "orch"}]}),
+            json!({"board": "sfd", "n": 4, "holders": [{"session_uid": "lane-b"}]}),
+        ]);
+        assert_eq!((app.owner_blocked.count(), app.owner_blocked.session_count()), (4, 2));
+        app.control_bound = true; // no degraded-mode banner over the status bar
+        let full = render(&mut app, 140, false);
+        assert!(full.contains("\u{25c6}2 OWNER") && !full.contains("\u{25c6}4 OWNER"), "{full}");
     }
 }

@@ -2743,8 +2743,9 @@ impl App {
         if let Some(progress) = self.cleanup_progress() {
             rollup.push(Span::styled(format!("\u{27f2} {progress} "), Style::default().fg(theme::MUTED)));
         }
-        // Items blocked on an Owner decision, across every board.
-        let n_owner = self.owner_blocked.count();
+        // Sessions holding an item blocked on an Owner decision, across
+        // every board (one per session, however many items it holds).
+        let n_owner = self.owner_blocked.session_count();
         if n_owner > 0 {
             rollup.push(Span::styled(
                 format!("\u{25c6}{} OWNER ", n_owner),
