@@ -845,19 +845,24 @@ mod tests {
         assert!(dispatched(&state, a(), "open", json!({})).get("maintenance").is_none());
     }
 
-    /// While local messaging is still opening, the refusal reads plainly and
-    /// the maintenance line says the hub is restarting or unreachable.
+    /// While local messaging is still opening, the refusal and the
+    /// maintenance line both say nothing was sent; a store stuck for 10
+    /// minutes reads as a local failure.
     #[test]
     fn messaging_starting_reads_as_a_plain_explanation() {
         let root = tempfile::tempdir().unwrap();
         let state = uninitialized(root.path());
         assert_eq!(crate::maintenance::field_for(&state), None, "no opener yet: nothing to say");
-        state.lock().unwrap().messaging_startup.store(true, std::sync::atomic::Ordering::Release);
+        state.lock().unwrap().messaging_opening_since = Some(std::time::Instant::now());
         let r = dispatch(&state, &Request { id: "x".into(), caller: Caller::session("a"), method: "messaging.open".into(), params: json!({}) });
         let e = r.error.unwrap();
         assert!(e.message.starts_with("messaging_starting: CM messaging on this host is still starting"), "{}", e.message);
         assert!(e.message.contains("retry the same request"), "{}", e.message);
-        assert!(crate::maintenance::field_for(&state).unwrap().starts_with("CM messaging hub is restarting or unreachable"));
+        // Sends are refused, not queued: the line says so and blames no hub.
+        let line = crate::maintenance::field_for(&state).unwrap();
+        assert!(line.starts_with("CM messaging on this host is still starting") && !line.contains("saved"), "{line}");
+        state.lock().unwrap().messaging_opening_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(11 * 60));
+        assert!(crate::maintenance::field_for(&state).unwrap().contains("failed to start"));
     }
 
     /// The board's New DM picker leaves out bash sessions, which have no

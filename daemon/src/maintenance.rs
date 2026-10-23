@@ -28,6 +28,12 @@ use std::path::{Path, PathBuf};
 pub const GRACE_S: i64 = 15 * 60;
 /// `expect_until` when the operator gives none.
 pub const DEFAULT_EXPECT_S: i64 = 15 * 60;
+/// The latest accepted `expect_until`, from now: a longer window is refused
+/// (a deploy notice is not a status page).
+pub const MAX_EXPECT_S: i64 = 4 * 3600;
+/// Local messaging still not open after this long is a local failure, not a
+/// restart in progress.
+pub const STARTING_TOO_LONG_S: u64 = 10 * 60;
 /// Longest accepted reason, in characters.
 pub const REASON_MAX_CHARS: usize = 120;
 /// The replicated messaging event carrying a hub notice.
@@ -132,6 +138,12 @@ pub fn build_set(p: &Value, existing: &Value, now: DateTime<Utc>) -> Result<Valu
     if expect_until <= started_at {
         return Err("expect_until must be after started_at".into());
     }
+    if expect_until > now + chrono::Duration::seconds(MAX_EXPECT_S) {
+        return Err(format!(
+            "expect_until is at most 4 hours from now (latest {}); set the notice again to extend it",
+            rfc3339(now + chrono::Duration::seconds(MAX_EXPECT_S))
+        ));
+    }
     let id = match existing["id"].as_str() {
         Some(id) if ongoing => id.to_owned(),
         _ => uuid::Uuid::new_v4().to_string(),
@@ -194,39 +206,66 @@ fn hhmm(t: Option<DateTime<Utc>>) -> String {
     t.map_or_else(|| "?".into(), |t| t.format("%H:%MZ").to_string())
 }
 
-/// The one line agents read for an active notice.
-pub fn describe(notice: &Value, now: DateTime<Utc>) -> String {
+/// `<reason> in progress since 16:26Z (expected until ~16:35Z)`.
+fn headline(notice: &Value, now: DateTime<Utc>) -> String {
     let reason = notice["reason"].as_str().unwrap_or("CM redeploy");
     let until = parse(&notice["expect_until"]);
     let over = if until.is_some_and(|u| now > u) { ", running over" } else { "" };
     format!(
-        "{reason} in progress since {} (expected until ~{}{over}): {SAVED}",
+        "{reason} in progress since {} (expected until ~{}{over})",
         hhmm(parse(&notice["started_at"])),
         hhmm(until),
     )
 }
 
-/// The generic line when the hub is down or messaging is starting and no
-/// notice says why.
+/// The one line agents read for an active notice while local messaging is
+/// open (sends are accepted and queue for the hub).
+pub fn describe(notice: &Value, now: DateTime<Utc>) -> String {
+    format!("{}: {SAVED}", headline(notice, now))
+}
+
+/// A replica's line when its hub link is down and no notice says why. Only
+/// a replica says this: the hub is never "unreachable" from itself.
 pub fn hub_unreachable() -> String {
     format!("CM messaging hub is restarting or unreachable: {SAVED}")
 }
 
-/// What `messaging_starting` reads as to an agent.
+const STARTING: &str = "CM messaging on this host is still starting, likely during a CM restart. Nothing was sent; retry the same request (same request_id) in about 30 seconds.";
+
+/// What `messaging_starting` reads as to an agent: sends are refused, not
+/// queued.
 pub fn messaging_starting() -> String {
-    "CM messaging on this host is still starting, likely during a CM restart. Nothing was sent; retry the same request (same request_id) in about 30 seconds.".into()
+    STARTING.into()
+}
+
+/// Local messaging starting, under an active notice: the notice's headline
+/// with the starting wording (nothing was sent), never "sends are saved".
+pub fn messaging_starting_during(notice: &Value, now: DateTime<Utc>) -> String {
+    format!(
+        "{}: CM messaging on this host is still starting. Nothing was sent; retry the same request (same request_id) in about 30 seconds.",
+        headline(notice, now)
+    )
+}
+
+/// Local messaging still not open after [`STARTING_TOO_LONG_S`]: a local
+/// problem (e.g. a store that cannot open), not the hub.
+pub fn messaging_failed_to_start() -> String {
+    "CM messaging on this host failed to start (still not open after 10 minutes), so nothing can be sent from here; this is a local problem, not the hub. Tell Swarm-Coord.".into()
 }
 
 /// Whether a replica's last sync error looks like the hub restarting.
 pub fn hub_restart_signature(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
+    // Transport-level only: a bare "eof" would also match a payload's
+    // "EOF while parsing" (a bad record, not a restart).
     [
-        "eof",
         "failed to fill whole buffer",
+        "unexpected end of file",
+        "unexpected end of stream",
         "broken pipe",
-        "coordinator_unavailable",
         "connection reset",
         "connection refused",
+        "coordinator_unavailable",
     ]
         .iter()
         .any(|s| e.contains(s))
@@ -283,51 +322,80 @@ pub fn local_record(cm_root: &Path) -> Value {
 
 type State = std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>;
 
-/// The `maintenance` field for this daemon right now: the notice in force,
-/// else the generic hub line when the replica's hub link is down with a
-/// restart-shaped error or local messaging is still starting. Takes the
-/// daemon lock, then (without waiting) the store slot, never both at once.
-pub fn field_for(state: &State) -> Option<String> {
-    let (root, handle, opening) = {
-        let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        (
-            s.messaging_root.clone(),
-            s.messaging.clone(),
-            s.messaging_startup.load(std::sync::atomic::Ordering::Acquire),
-        )
-    };
-    let now = Utc::now();
-    if let Some(n) = current(&root, now) {
-        return Some(describe(&n, now));
+/// Where local messaging stands, for [`field_at`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Local {
+    /// The store is open; its sync status (`Store::sync_status`).
+    Open(Value),
+    /// The opener has run for this long without opening the store.
+    Starting(std::time::Duration),
+    /// The store is busy (never waited on) or messaging was never started.
+    Unknown,
+}
+
+/// The `maintenance` field given where local messaging stands:
+/// - starting: nothing was sent, retry (under a notice's headline when one
+///   is in force); after [`STARTING_TOO_LONG_S`], a local failure;
+/// - open: the notice in force, else (replicas only) the hub line;
+/// - unknown: the notice in force, if any.
+pub fn field_at(cm_root: &Path, local: &Local, now: DateTime<Utc>) -> Option<String> {
+    let notice = current(cm_root, now);
+    match local {
+        Local::Starting(age) if age.as_secs() > STARTING_TOO_LONG_S => Some(messaging_failed_to_start()),
+        Local::Starting(_) => Some(match &notice {
+            Some(n) => messaging_starting_during(n, now),
+            None => messaging_starting(),
+        }),
+        Local::Open(sync) => field(cm_root, sync, now),
+        Local::Unknown => notice.map(|n| describe(&n, now)),
     }
-    // No store yet: only "starting" once the opener runs (a daemon that
-    // never starts messaging, e.g. in tests, says nothing).
-    let starting = || opening.then(hub_unreachable);
-    // Never wait on a busy store for this (ping must stay quick): a held
-    // slot just skips the hub line this time.
-    let sync = match handle.try_lock() {
-        Ok(slot) => match slot.as_ref() {
-            Some(store) => store.sync_status(),
-            None => return starting(),
-        },
-        Err(std::sync::TryLockError::Poisoned(p)) => match p.into_inner().as_ref() {
-            Some(store) => store.sync_status(),
-            None => return starting(),
-        },
-        Err(std::sync::TryLockError::WouldBlock) => return None,
+}
+
+/// [`field_at`] for this daemon right now. Takes the daemon lock, then
+/// (without waiting) the store slot, never both at once.
+pub fn field_for(state: &State) -> Option<String> {
+    let (root, handle, opening_since) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        (s.messaging_root.clone(), s.messaging.clone(), s.messaging_opening_since)
     };
-    field(&root, &sync, now)
+    // Never wait on a busy store (ping must stay quick).
+    let status = |slot: &Option<crate::messaging::Store>| match slot.as_ref() {
+        Some(store) => Local::Open(store.sync_status()),
+        // No store yet: "starting" only once the opener runs (a daemon that
+        // never starts messaging, e.g. in tests, says nothing about it).
+        None => opening_since.map_or(Local::Unknown, |t| Local::Starting(t.elapsed())),
+    };
+    let local = match handle.try_lock() {
+        Ok(slot) => status(&slot),
+        Err(std::sync::TryLockError::Poisoned(p)) => status(&p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Local::Unknown,
+    };
+    field_at(&root, &local, Utc::now())
 }
 
 /// Note that `uid` just used chat.
 pub fn stamp_chat(state: &State, uid: &str) {
     let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
     s.last_chat_at.insert(uid.to_owned(), std::time::Instant::now());
+    // Keep it bounded between notices: only registry sessions matter.
+    if s.last_chat_at.len() > 2 * s.sessions.len() + 64 {
+        prune_chat(&mut s);
+    }
 }
 
-/// Live agent sessions that used chat within [`RECENT_CHAT_S`].
+/// Whether a session in this engine state should be told now: only one in
+/// the middle of a turn. Idle, waiting and reported agents are not woken;
+/// they see the `maintenance` field on their next chat call.
+pub fn wakeable(state: crate::agent_state::State, reported: bool) -> bool {
+    use crate::agent_state::State as S;
+    !reported && matches!(state, S::Working | S::WorkingBackground)
+}
+
+/// Live agent sessions mid-turn that used chat within [`RECENT_CHAT_S`].
+/// Also drops `last_chat_at` entries for sessions no longer registered.
 pub fn announce_targets(state: &State) -> Vec<String> {
-    let s = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+    prune_chat(&mut s);
     let window = std::time::Duration::from_secs(RECENT_CHAT_S as u64);
     let mut out: Vec<String> = s
         .sessions
@@ -335,11 +403,18 @@ pub fn announce_targets(state: &State) -> Vec<String> {
         .filter(|(uid, sess)| {
             matches!(sess.session_type.as_str(), "claude-code" | "claude" | "codex")
                 && s.last_chat_at.get(*uid).is_some_and(|t| t.elapsed() <= window)
+                && wakeable(crate::agent_state::current(sess).state, sess.reported_done().is_some())
         })
         .map(|(uid, _)| uid.clone())
         .collect();
     out.sort();
     out
+}
+
+/// Forget chat use of sessions no longer in the registry.
+pub fn prune_chat(s: &mut crate::state::DaemonState) {
+    let live: std::collections::HashSet<String> = s.sessions.keys().cloned().collect();
+    s.last_chat_at.retain(|uid, _| live.contains(uid));
 }
 
 #[cfg(test)]
@@ -427,16 +502,64 @@ mod tests {
         let now = at("2026-10-23T16:28:00Z");
         let down = |err: &str| json!({"enabled":true,"role":"replica","connected":false,"error":err});
         assert_eq!(field(tmp.path(), &Value::Null, now), None);
-        for err in ["transport EOF", "storage_error: failed to fill whole buffer", "storage_error: Broken pipe (os error 32)",
+        for err in ["storage_error: failed to fill whole buffer", "storage_error: Broken pipe (os error 32)",
+                    "storage_error: Connection reset by peer (os error 104)", "unexpected end of file",
                     "coordinator_unavailable: hub gone"] {
             let f = field(tmp.path(), &down(err), now).unwrap();
             assert!(f.starts_with("CM messaging hub is restarting or unreachable") && !f.contains("redeploy"), "{f}");
         }
         assert_eq!(field(tmp.path(), &down("enrollment revoked"), now), None);
+        // Review 2026-10-23: a payload's EOF is a bad record, not a restart.
+        assert_eq!(field(tmp.path(), &down("storage_error: EOF while parsing a value at line 1 column 0"), now), None);
+        assert_eq!(field(tmp.path(), &down("invalid_record: unexpected eof in frame body"), now), None);
         assert_eq!(field(tmp.path(), &json!({"enabled":true,"role":"replica","connected":true,"error":"eof"}), now), None);
         assert_eq!(field(tmp.path(), &json!({"enabled":true,"role":"coordinator","connected":false,"error":"eof"}), now), None);
         apply_local(tmp.path(), &json!({"action":"set","reason":"CM redeploy"}), now).unwrap();
         assert!(field(tmp.path(), &Value::Null, now).unwrap().starts_with("CM redeploy in progress since 16:28Z"));
+    }
+
+    /// Review 2026-10-23: expect_until is capped at now + 4 h.
+    #[test]
+    fn expect_until_is_capped_at_four_hours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = at("2026-10-23T16:00:00Z");
+        assert!(apply_local(tmp.path(), &json!({"action":"set","expect_until":"2026-10-23T20:00:00Z"}), now).is_ok());
+        let e = apply_local(tmp.path(), &json!({"action":"set","expect_until":"2026-10-23T20:00:01Z"}), now).unwrap_err();
+        assert!(e.contains("at most 4 hours") && e.contains("2026-10-23T20:00:00Z"), "{e}");
+    }
+
+    /// Review 2026-10-23: local messaging starting says nothing was sent
+    /// (never "sends are saved"), turns into a local failure after 10 min,
+    /// and the hub never calls itself unreachable.
+    #[test]
+    fn starting_open_and_failed_local_messaging_read_differently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = at("2026-10-23T16:28:00Z");
+        let mins = |m: u64| std::time::Duration::from_secs(m * 60);
+        let starting = field_at(tmp.path(), &Local::Starting(mins(1)), now).unwrap();
+        assert!(starting.contains("still starting") && starting.contains("Nothing was sent") && !starting.contains("saved"), "{starting}");
+        let failed = field_at(tmp.path(), &Local::Starting(mins(11)), now).unwrap();
+        assert!(failed.contains("failed to start") && failed.contains("Tell Swarm-Coord") && !failed.contains("hub is"), "{failed}");
+        assert_eq!(field_at(tmp.path(), &Local::Unknown, now), None);
+        let hub_down = json!({"enabled":true,"role":"coordinator","connected":false,"error":"storage_error: Broken pipe"});
+        assert_eq!(field_at(tmp.path(), &Local::Open(hub_down), now), None, "the hub never says hub unreachable");
+        // Under a notice: its headline, still with the starting wording.
+        apply_local(tmp.path(), &json!({"action":"set","reason":"CM redeploy"}), now).unwrap();
+        let during = field_at(tmp.path(), &Local::Starting(mins(1)), now).unwrap();
+        assert!(during.starts_with("CM redeploy in progress since 16:28Z") && during.contains("Nothing was sent") && !during.contains("saved"), "{during}");
+        assert!(field_at(tmp.path(), &Local::Open(json!({})), now).unwrap().contains("sends are saved locally"));
+        assert!(field_at(tmp.path(), &Local::Starting(mins(11)), now).unwrap().contains("failed to start"), "a stuck store outranks the notice");
+    }
+
+    /// Review 2026-10-23: only sessions mid-turn are woken.
+    #[test]
+    fn only_working_sessions_are_woken() {
+        use crate::agent_state::State as S;
+        assert!(wakeable(S::Working, false) && wakeable(S::WorkingBackground, false));
+        for st in [S::Idle, S::WaitingOnHuman, S::Errored, S::Starting, S::Exited, S::Unknown] {
+            assert!(!wakeable(st, false), "{st:?}");
+        }
+        assert!(!wakeable(S::Working, true), "a reported session is not woken");
     }
 
     #[test]

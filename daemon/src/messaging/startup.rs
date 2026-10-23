@@ -31,6 +31,7 @@ fn start_with(
     if started.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
+    state.lock().unwrap_or_else(|p| p.into_inner()).messaging_opening_since = Some(Instant::now());
     let weak = Arc::downgrade(state);
     let result = std::thread::Builder::new()
         .name("cm-messaging-open".into())

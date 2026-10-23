@@ -42,26 +42,30 @@ class MessagingToolsTests(unittest.TestCase):
         self.assertEqual(clock[0], 30.0)
         self.assertGreater(call.call_count, 1)
 
-    def test_startup_refusal_names_an_active_maintenance_notice(self):
-        clock = [0.0]
+    def test_startup_refusal_uses_the_daemons_starting_line(self):
         error = control_client.ControlError("conflict", "messaging_starting: retry shortly")
-        notice = ("CM redeploy in progress since 16:26Z (expected until ~16:35Z): sends are saved "
-                  "locally and will replicate automatically, so don't resend. Cross-host reads may be stale.")
-        def call(method, params=None, **_):
-            if method == "ping":
-                return {"pong": True, "maintenance": notice}
-            raise error
-        def sleep(delay):
-            clock[0] += delay
-        with patch.object(control_client, "call", side_effect=call), \
-             patch.object(server.time, "monotonic", side_effect=lambda: clock[0]), \
-             patch.object(server.time, "sleep", side_effect=sleep):
-            with self.assertRaises(control_client.ControlError) as raised:
-                server.chat_send("hi", "r-1", channel="general")
-        self.assertEqual(raised.exception.message,
-                         "CM messaging on this host is still starting: CM redeploy in progress since 16:26Z "
-                         "(expected until ~16:35Z). Nothing was sent; retry the same request (same request_id) "
-                         "in about 30 seconds.")
+        lines = [
+            ("CM redeploy in progress since 16:26Z (expected until ~16:35Z): CM messaging on this host is still "
+             "starting. Nothing was sent; retry the same request (same request_id) in about 30 seconds.", True),
+            ("CM messaging on this host failed to start (still not open after 10 minutes), so nothing can be sent "
+             "from here; this is a local problem, not the hub. Tell Swarm-Coord.", True),
+            # Never relay a "sends are saved" line for a refused send.
+            ("CM messaging hub is restarting or unreachable: sends are saved locally …", False),
+        ]
+        for note, verbatim in lines:
+            clock = [0.0]
+            def call(method, params=None, **_):
+                if method == "ping":
+                    return {"pong": True, "maintenance": note}
+                raise error
+            def sleep(delay):
+                clock[0] += delay
+            with self.subTest(note=note), patch.object(control_client, "call", side_effect=call), \
+                 patch.object(server.time, "monotonic", side_effect=lambda: clock[0]), \
+                 patch.object(server.time, "sleep", side_effect=sleep):
+                with self.assertRaises(control_client.ControlError) as raised:
+                    server.chat_send("hi", "r-1", channel="general")
+            self.assertEqual(raised.exception.message, note if verbatim else server._MESSAGING_STARTING)
 
     def test_the_maintenance_line_reaches_every_chat_tool_and_ping(self):
         note = "CM messaging hub is restarting or unreachable: sends are saved locally …"

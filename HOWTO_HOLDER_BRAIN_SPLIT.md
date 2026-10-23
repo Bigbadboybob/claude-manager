@@ -126,18 +126,24 @@ scripts/cm-op --ssh cm-sessions daemon.maintenance '{"action":"set","reason":"CM
 scripts/cm-op --ssh cm-manager daemon.maintenance '{"action":"clear"}'
 scripts/cm-op --ssh cm-sessions daemon.maintenance '{"action":"clear"}'
 ```
-`reason` defaults to "CM redeploy" and `expect_until` to 15 minutes from now;
-`{"action":"get"}` shows the state. The notice is written to
+`reason` defaults to "CM redeploy" and `expect_until` to 15 minutes from now
+(at most 4 hours ahead; set it again to extend); `{"action":"get"}` shows the
+state. Set and clear are refused while the brain is draining, so do both
+outside the restart itself. The notice is written to
 `~/.cm/maintenance.json`, so it survives the restart it announces, and expires
 on its own 15 minutes after `expect_until` if nobody clears it. The hub also
 replicates its notice to replicas, so a replica that loses the hub keeps
 showing it. While it is in force, `ping` and the chat tools carry a
 `maintenance` line ("CM redeploy in progress since 16:26Z (expected until
 ~16:35Z): sends are saved locally …"), the TUI status bar shows `⟳ CM deploy`,
-and each host tells its live agents that used chat in the last hour once per
-notice (re-setting an active notice extends it without a second message).
-Without a notice, a replica whose hub link drops with a restart-shaped error
-says only that the hub is restarting or unreachable.
+and each host tells its agents that are mid-turn and used chat in the last
+hour, once per notice (idle agents are not woken; they see the line on their
+next chat call, and re-setting an active notice sends nothing new). Without a
+notice, a replica whose hub link drops with a transport error says only that
+the hub is restarting or unreachable; the hub never says that of itself.
+While a host's own messaging is still opening, the line says nothing was sent
+and to retry in about 30 seconds; still not open after 10 minutes, it reports
+a local failure to raise with Swarm-Coord instead.
 
 **MCP server / workflows on cm-manager:** scp as before, then the same
 `daemon.restart` — the brain restart re-runs the MCP preflight; no

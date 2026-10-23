@@ -563,26 +563,22 @@ def _chat_call(method: str, params: dict) -> dict:
     return _messaging_ready_call("messaging." + method, params)
 
 
-_MESSAGING_STARTING_RETRY = ("Nothing was sent; retry the same request "
-                             "(same request_id) in about 30 seconds.")
+_MESSAGING_STARTING = ("CM messaging on this host is still starting, likely during a CM restart. "
+                       "Nothing was sent; retry the same request (same request_id) in about 30 seconds.")
 
 
 def _messaging_starting_error(exc: Exception) -> Exception:
     """The plain explanation for an agent whose chat call met local
-    messaging still starting: the daemon's maintenance line when it has one
-    (ping works while messaging starts), plus a retry hint."""
+    messaging still starting. ping works meanwhile and its `maintenance`
+    line says the same thing in context (an active notice's headline, or a
+    store that has failed to start); otherwise the generic wording."""
     try:
         note = (control_client.call("ping", timeout=5.0) or {}).get("maintenance")
     except Exception:  # noqa: BLE001 - the explanation is best-effort
         note = None
-    # A notice reads "<reason> in progress since … (expected until …): sends
-    # are saved …"; only its head applies, since this send was not saved.
-    head, sep, _ = (note or "").partition("): ")
-    if sep:
-        text = f"CM messaging on this host is still starting: {head})."
-    else:
-        text = "CM messaging on this host is still starting, likely during a CM restart."
-    return control_client.ControlError("messaging_starting", f"{text} {_MESSAGING_STARTING_RETRY}")
+    if not (isinstance(note, str) and ("Nothing was sent" in note or "failed to start" in note)):
+        note = _MESSAGING_STARTING
+    return control_client.ControlError("messaging_starting", note)
 
 
 def _messaging_ready_call(method: str, params: dict) -> dict:

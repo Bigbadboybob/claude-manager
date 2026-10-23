@@ -2092,7 +2092,19 @@ fn dispatch_daemon_maintenance(
     ) {
         return resp;
     }
-    let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+    let (root, draining) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        (s.messaging_root.clone(), s.draining)
+    };
+    // A notice is set before the restart and cleared after it: changing it
+    // while this brain is draining for the restart is refused (get is fine).
+    if draining && req.params["action"].as_str().is_some_and(|a| a != "get") {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Conflict,
+            "daemon.maintenance: this brain is draining for a restart; set the notice before the restart and clear it after",
+        );
+    }
     let now = chrono::Utc::now();
     let (mut out, fresh) = match crate::maintenance::apply_local(&root, &req.params, now) {
         Ok(r) => r,
@@ -3899,8 +3911,8 @@ mod tests {
         state.lock().unwrap().sessions.insert(uid.into(), sess);
     }
 
-    /// Operator-only; persists; shows on ping; tells agents that used chat
-    /// in the last hour once per notice; clear removes it.
+    /// Operator-only; refused while draining; persists; shows on ping;
+    /// wakes nobody who isn't mid-turn; clear removes it.
     #[test]
     fn maintenance_notice_is_operator_set_shown_on_ping_and_announced_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3917,14 +3929,24 @@ mod tests {
         };
         assert!(ping(&state).get("maintenance").is_none());
 
+        // Draining for a restart: set/clear refused, get allowed.
+        state.lock().unwrap().draining = true;
+        let refused = dispatch_request(&state, &operator_request("daemon.maintenance", set.clone())).into_response();
+        assert_eq!(refused.error.unwrap().code, ErrorCode::Conflict);
+        assert!(dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({"action":"get"}))).into_response().ok);
+        assert!(crate::maintenance::current_now(tmp.path()).is_none());
+        state.lock().unwrap().draining = false;
+
         let r = dispatch_request(&state, &operator_request("daemon.maintenance", set.clone())).into_response().result.unwrap();
-        assert_eq!((r["active"].clone(), r["notified"].clone()), (serde_json::json!(true), serde_json::json!(1)));
+        // Both agents are fresh (`starting`), not mid-turn: neither is woken;
+        // they see the field on their next chat call.
+        assert_eq!((r["active"].clone(), r["notified"].clone()), (serde_json::json!(true), serde_json::json!(0)));
         // No messaging store here: recorded locally, not replicated.
         assert_eq!(r["replicated"], false);
         assert!(ping(&state)["maintenance"].as_str().unwrap().starts_with("CM redeploy in progress since"));
         let id = crate::maintenance::notification_id(&r["notice"]);
-        assert!(crate::notifications::get(tmp.path(), "ts-chatty", &id).unwrap().is_some());
-        assert!(crate::notifications::get(tmp.path(), "ts-quiet", &id).unwrap().is_none(), "no recent chat: not woken");
+        assert!(crate::notifications::get(tmp.path(), "ts-chatty", &id).unwrap().is_none(), "not mid-turn: not woken");
+        assert!(crate::notifications::get(tmp.path(), "ts-quiet", &id).unwrap().is_none());
         // Re-setting extends the same notice and wakes nobody again.
         let again = dispatch_request(&state, &operator_request("daemon.maintenance", set)).into_response().result.unwrap();
         assert_eq!(again["notice"]["id"], r["notice"]["id"]);
@@ -3935,6 +3957,26 @@ mod tests {
         assert!(ping(&state).get("maintenance").is_none());
         let bad = dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({"action":"set","expect_until":"later"}))).into_response();
         assert_eq!(bad.error.unwrap().code, ErrorCode::InvalidParams);
+    }
+
+    /// Review 2026-10-23: chat-use stamps of sessions gone from the
+    /// registry are dropped.
+    #[test]
+    fn last_chat_at_forgets_sessions_that_left_the_registry() {
+        let state = make_state();
+        spawn_agent(&state, "ts-live");
+        crate::maintenance::stamp_chat(&state, "ts-live");
+        crate::maintenance::stamp_chat(&state, "ts-gone");
+        assert_eq!(state.lock().unwrap().last_chat_at.len(), 2);
+        crate::maintenance::announce_targets(&state);
+        let s = state.lock().unwrap();
+        assert!(s.last_chat_at.contains_key("ts-live") && !s.last_chat_at.contains_key("ts-gone"));
+        drop(s);
+        // stamp_chat also prunes once the map outgrows the registry.
+        for i in 0..80 {
+            crate::maintenance::stamp_chat(&state, &format!("ts-old-{i}"));
+        }
+        assert!(state.lock().unwrap().last_chat_at.len() <= 2 + 64 + 1);
     }
 
     // --- ping ---------------------------------------------------------
