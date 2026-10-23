@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -28,6 +29,35 @@ TAKEOVER_FRESH_S = 15.0
 # A holder that just acquired the lock keeps it at least this long, so two
 # live processes can never alternate ownership faster than this.
 HANDOFF_MIN_HOLD_S = 30.0
+# Receipt checks: a submitted/uncertain notice is checked on every poll for
+# its first RECEIPT_EAGER_CHECKS polls, then at a doubling interval capped at
+# RECEIPT_MAX_INTERVAL_S. This only spaces out checks; an observation still
+# flips the notice to observed, and nothing else changes its status.
+RECEIPT_EAGER_CHECKS = 10
+RECEIPT_MAX_INTERVAL_S = 30.0
+
+
+class ReceiptBackoff:
+    """When each unobserved notice is next due for a receipt check."""
+
+    def __init__(self):
+        self.state = {}  # event id -> (checks so far, next due monotonic)
+
+    def due(self, event_id: str, now: float) -> bool:
+        checks, next_at = self.state.get(event_id, (0, 0.0))
+        return now >= next_at
+
+    def checked(self, event_id: str, now: float) -> None:
+        checks, _ = self.state.get(event_id, (0, 0.0))
+        checks += 1
+        extra = checks - RECEIPT_EAGER_CHECKS
+        delay = 0.0 if extra < 0 else min(RECEIPT_MAX_INTERVAL_S, 2.0 ** extra)
+        self.state[event_id] = (checks, now + delay)
+
+    def retain(self, live_ids) -> None:
+        live = set(live_ids)
+        for event_id in [e for e in self.state if e not in live]:
+            del self.state[event_id]
 
 
 def delivery_health(events, now: float | None = None, threshold: float | None = None):
@@ -101,11 +131,33 @@ class Queue:
         return self.path / (hashlib.sha256(event_id.encode()).hexdigest() + ".json")
 
     def _events(self):
-        return [
-            json.loads(p.read_text())
-            for p in self.path.glob("*.json")
-            if p.name != "transport.json"
-        ]
+        """Every event file, parsed. Files are replaced atomically (a new
+        inode per write), so an unchanged (inode, size, mtime) is an
+        unchanged event and its cached parse is reused. Top-level copies are
+        returned (callers set fields on events, never inside nested ones)."""
+        cache = self.__dict__.setdefault("_event_cache", {})
+        seen = set()
+        out = []
+        for p in self.path.glob("*.json"):
+            if p.name == "transport.json":
+                continue
+            try:
+                info = p.stat()
+            except FileNotFoundError:
+                continue
+            key = (info.st_ino, info.st_size, info.st_mtime_ns)
+            seen.add(p.name)
+            hit = cache.get(p.name)
+            if hit is None or hit[0] != key:
+                try:
+                    hit = (key, json.loads(p.read_text()))
+                except FileNotFoundError:
+                    continue
+                cache[p.name] = hit
+            out.append(dict(hit[1]))
+        for name in [n for n in cache if n not in seen]:
+            del cache[name]
+        return out
 
     # Consumer handoff. A waiting consumer that proves it is attached to the
     # daemon-bound conversation files a request; the holder releases only with
@@ -406,8 +458,10 @@ async def consume(queue: Queue, adapter):
             queue.change(event["id"], {"submitting"}, status="uncertain")
         heartbeat = 0.0
         blocked = None
+        backoff = ReceiptBackoff()
         while True:
             events = queue.snapshot()["notifications"]
+            backoff.retain(e["id"] for e in events if e["status"] in {"submitted", "uncertain"})
             if time.monotonic() >= heartbeat:
                 assessment = await _diagnose(queue, adapter, events)
                 blocked = assessment["blocked"]
@@ -425,10 +479,14 @@ async def consume(queue: Queue, adapter):
                 if event["version"] != 1 or event["recipient"] != queue.uid:
                     continue  # Never deliver an unknown envelope or another identity.
                 if event["status"] in {"submitted", "uncertain"}:
+                    if not backoff.due(event["id"], time.monotonic()):
+                        continue
                     if await adapter.observed(event):
                         queue.change(
                             event["id"], {"submitted", "uncertain"}, status="observed"
                         )
+                    else:
+                        backoff.checked(event["id"], time.monotonic())
                     continue
                 if event["status"] != "pending" or blocked:
                     # A client known to drop these events keeps them pending
@@ -492,87 +550,202 @@ async def consume_supervised(queue: Queue, adapter, retry_s: float = 5):
             await asyncio.sleep(retry_s)
 
 
+# Receipt evidence is searched in the transcript's last TAIL_WINDOW bytes.
+TAIL_WINDOW = 2 * 1024 * 1024
+# Bytes compared at the file's head and just before the scanned offset to
+# detect a file rewritten in place (transcripts are append-only, so this only
+# guards odd writers; a new inode or a shrink is caught without reading).
+_FINGERPRINT = 4096
+# Transcripts tracked at once (one consumer watches a handful).
+_TAIL_FILES = 32
+
+
+class _Tail:
+    """Incremental view of one transcript's last TAIL_WINDOW bytes.
+
+    Only lines that could be receipt evidence are parsed and kept: every
+    evidence shape has an `"origin"` key (Claude) or names `cm_notification`
+    (Codex), so other lines are skipped with a substring check. Each refresh
+    reads only bytes appended since the last one, and an unchanged (inode,
+    size, mtime) reads nothing; a new inode, a shrink or changed bytes at the
+    head or before the offset (a rewrite) rescans the window."""
+
+    def __init__(self):
+        self.ino = None
+        self.seen = None         # (inode, size, mtime_ns) at the last refresh
+        self.offset = 0          # end of the last complete line scanned
+        self.head = b""          # the file's first bytes
+        self.fingerprint = b""   # the bytes just before `offset`
+        self.records = {}        # line start offset -> parsed candidate record
+        self.tail = None         # (start, record) for an unterminated last line
+
+    def _reset(self, ino):
+        self.ino, self.offset, self.head, self.fingerprint = ino, 0, b"", b""
+        self.records, self.tail = {}, None
+
+    def _read(self, stream, at, n, stats) -> bytes:
+        stream.seek(at)
+        data = stream.read(n)
+        stats["bytes_read"] = stats.get("bytes_read", 0) + len(data)
+        return data
+
+    def refresh(self, stream, stats) -> int:
+        """Bring the view up to date. Returns the bytes read."""
+        info = os.fstat(stream.fileno())
+        size = info.st_size
+        seen = (info.st_ino, size, info.st_mtime_ns)
+        if seen == self.seen:
+            return 0
+        self.seen = seen
+        if info.st_ino != self.ino or size < self.offset:
+            self._reset(info.st_ino)
+        elif self.offset and (
+                self._read(stream, 0, len(self.head), stats) != self.head
+                or self._read(stream, self.offset - len(self.fingerprint),
+                              len(self.fingerprint), stats) != self.fingerprint):
+            self._reset(info.st_ino)
+        window = max(0, size - TAIL_WINDOW)
+        start = max(self.offset, window)
+        data = self._read(stream, start, size - start, stats)
+        base = start
+        if start > self.offset:
+            # Starting mid-file past what was scanned: the first (possibly
+            # partial) line is outside the window, as a fresh scan from
+            # `window` has always treated it.
+            cut = data.find(b"\n")
+            data = b"" if cut < 0 else data[cut + 1:]
+            base = size - len(data)
+        self.tail = None
+        pos = base
+        for line in data.splitlines(keepends=True):
+            line_start, pos = pos, pos + len(line)
+            if b'"origin"' not in line and b"cm_notification" not in line:
+                continue
+            try:
+                item = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(item, dict):
+                continue
+            if line.endswith(b"\n"):
+                self.records[line_start] = item
+            else:
+                self.tail = (line_start, item)
+        # Advance past complete lines only: an unterminated last line may
+        # still be being written and is read again next time.
+        last_newline = data.rfind(b"\n")
+        if last_newline >= 0:
+            self.offset = base + last_newline + 1
+            n = min(_FINGERPRINT, self.offset)
+            self.fingerprint = self._read(stream, self.offset - n, n, stats)
+            self.head = self._read(stream, 0, n, stats)
+        # Drop records that slid out of the window (a line starting exactly
+        # at the window edge was treated as partial by a fresh scan).
+        if window:
+            for at in [at for at in self.records if at <= window]:
+                del self.records[at]
+        return len(data)
+
+    def items(self):
+        for at in sorted(self.records):
+            yield self.records[at]
+        if self.tail is not None:
+            yield self.tail[1]
+
+
+_tails: dict[str, _Tail] = {}
+_tails_lock = threading.Lock()
+# Counters for tests and profiling: bytes_read across all refreshes.
+tail_stats: dict[str, int] = {}
+
+
+def _tail_items(path: str):
+    """The candidate evidence records in `path`'s window, refreshed with the
+    bytes appended since the last call. Raises OSError like open()."""
+    with _tails_lock, open(path, "rb") as stream:
+        tail = _tails.pop(path, None) or _Tail()
+        _tails[path] = tail  # most recently used last
+        while len(_tails) > _TAIL_FILES:
+            _tails.pop(next(iter(_tails)))
+        tail.refresh(stream, tail_stats)
+        return list(tail.items())
+
+
+def _evidence(item: dict, engine: str, marker: str, binding: dict | None) -> bool:
+    """Whether one transcript record is positive receipt evidence for marker."""
+    if engine == "claude-code":
+        content = item.get("message", {})
+        origin = item.get("origin", {})
+        expected = binding or {}
+        channel_server = expected.get("channel_server")
+        if channel_server and expected.get("adapter") == "claude-mcp-channel-v1":
+            # Claude records idle events as meta user records and
+            # busy events as queued_command attachments. Require
+            # native origin; a user/assistant quoting <channel> or
+            # an enqueue record is not positive delivery evidence.
+            attachment = item.get("attachment", {})
+            return bool((
+                item.get("type") == "user"
+                and item.get("isMeta") is True
+                and content.get("role") == "user"
+                and origin == {"kind": "channel", "server": channel_server}
+                and marker in json.dumps(content.get("content"))
+            ) or (
+                item.get("type") == "attachment"
+                and attachment.get("type") == "queued_command"
+                and attachment.get("origin") == {"kind": "channel", "server": channel_server}
+                and marker in json.dumps(attachment.get("prompt"))
+            ))
+        if (
+            item.get("type") == "user"
+            and content.get("role") == "user"
+            and origin.get("kind") == "peer"
+            and origin.get("from") == "claude-manager"
+            and origin.get("selfSent") is True
+            and marker in json.dumps(content.get("content"))
+        ):
+            return True
+        # At a tool checkpoint Claude materializes the peer input
+        # as a queued_command attachment, not an idle user record.
+        # A queue-operation alone is never receipt evidence.
+        attachment = item.get("attachment", {})
+        origin = attachment.get("origin", {})
+        return bool(
+            item.get("type") == "attachment"
+            and attachment.get("type") == "queued_command"
+            and origin.get("kind") == "peer"
+            and origin.get("from") == "claude-manager"
+            and expected.get("peer_pid") is not None
+            and origin.get("verifiedPeerPid") == expected["peer_pid"]
+            and (
+                not expected.get("peer_start")
+                or str(origin.get("verifiedPeerProcStart"))
+                == expected["peer_start"]
+            )
+            and marker in json.dumps(attachment.get("prompt"))
+        )
+    if item.get("type") == "response_item":
+        payload = item.get("payload", {})
+        return bool(
+            payload.get("type") == "function_call_output"
+            and payload.get("name") == "cm_notification"
+            and marker in json.dumps(payload.get("output"))
+        )
+    return False
+
+
 def transcript_observed(
     path: str | None, engine: str, marker: str, binding: dict | None = None
 ) -> bool:
-    """Positive evidence only, in inbound records; assistant quotes don't count."""
+    """Positive evidence only, in inbound records; assistant quotes don't count.
+
+    Searches the transcript's last TAIL_WINDOW bytes, read incrementally
+    (see _Tail): repeated checks, for any number of markers, read only what
+    was appended since the previous one."""
     if not path or not marker:
         return False
     try:
-        with open(path, "rb") as stream:
-            stream.seek(0, 2)
-            start = max(0, stream.tell() - 2 * 1024 * 1024)
-            stream.seek(start)
-            if start:
-                stream.readline()
-            for line in stream:
-                try:
-                    item = json.loads(line)
-                except (ValueError, UnicodeError):
-                    continue
-                if engine == "claude-code":
-                    content = item.get("message", {})
-                    origin = item.get("origin", {})
-                    expected = binding or {}
-                    channel_server = expected.get("channel_server")
-                    if channel_server and expected.get("adapter") == "claude-mcp-channel-v1":
-                        # Claude records idle events as meta user records and
-                        # busy events as queued_command attachments. Require
-                        # native origin; a user/assistant quoting <channel> or
-                        # an enqueue record is not positive delivery evidence.
-                        attachment = item.get("attachment", {})
-                        if (
-                            item.get("type") == "user"
-                            and item.get("isMeta") is True
-                            and content.get("role") == "user"
-                            and origin == {"kind": "channel", "server": channel_server}
-                            and marker in json.dumps(content.get("content"))
-                        ) or (
-                            item.get("type") == "attachment"
-                            and attachment.get("type") == "queued_command"
-                            and attachment.get("origin") == {"kind": "channel", "server": channel_server}
-                            and marker in json.dumps(attachment.get("prompt"))
-                        ):
-                            return True
-                        continue
-                    if (
-                        item.get("type") == "user"
-                        and content.get("role") == "user"
-                        and origin.get("kind") == "peer"
-                        and origin.get("from") == "claude-manager"
-                        and origin.get("selfSent") is True
-                        and marker in json.dumps(content.get("content"))
-                    ):
-                        return True
-                    # At a tool checkpoint Claude materializes the peer input
-                    # as a queued_command attachment, not an idle user record.
-                    # A queue-operation alone is never receipt evidence.
-                    attachment = item.get("attachment", {})
-                    origin = attachment.get("origin", {})
-                    expected = binding or {}
-                    if (
-                        item.get("type") == "attachment"
-                        and attachment.get("type") == "queued_command"
-                        and origin.get("kind") == "peer"
-                        and origin.get("from") == "claude-manager"
-                        and expected.get("peer_pid") is not None
-                        and origin.get("verifiedPeerPid") == expected["peer_pid"]
-                        and (
-                            not expected.get("peer_start")
-                            or str(origin.get("verifiedPeerProcStart"))
-                            == expected["peer_start"]
-                        )
-                        and marker in json.dumps(attachment.get("prompt"))
-                    ):
-                        return True
-                elif item.get("type") == "response_item":
-                    payload = item.get("payload", {})
-                    if (
-                        payload.get("type") == "function_call_output"
-                        and payload.get("name") == "cm_notification"
-                        and marker in json.dumps(payload.get("output"))
-                    ):
-                        return True
+        items = _tail_items(path)
     except OSError:
-        pass
-    return False
+        return False
+    return any(_evidence(item, engine, marker, binding) for item in items)
