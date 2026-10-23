@@ -230,7 +230,7 @@ pub fn live_caller_ctx(
 ///     same workspace as the caller, regardless of its task_id.
 pub fn caller_authorized_for(
     caller: &CallerCtx,
-    tasks: &[crate::app::TaskEntry],
+    tasks: &(impl TaskParents + ?Sized),
     target_wi: usize,
     target_task_id: Option<&str>,
 ) -> bool {
@@ -259,8 +259,38 @@ const MAX_TASK_DEPTH: usize = 64;
 /// Is `target_id` either equal to `caller_id` or a (transitive) child
 /// of it via the parent_task_id chain? Walks up from target. Stops at
 /// `MAX_TASK_DEPTH` or the first task without a parent (top-level).
+/// Where the scope walk reads a task's parent. `Some(None)` is a
+/// top-level task, `None` one the view doesn't know.
+pub trait TaskParents {
+    fn parent_of(&self, task_id: &str) -> Option<Option<String>>;
+}
+
+impl TaskParents for [crate::app::TaskEntry] {
+    fn parent_of(&self, task_id: &str) -> Option<Option<String>> {
+        self.iter()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+            .map(|t| t.parent_task_id.clone())
+    }
+}
+
+impl TaskParents for Vec<crate::app::TaskEntry> {
+    fn parent_of(&self, task_id: &str) -> Option<Option<String>> {
+        self.as_slice().parent_of(task_id)
+    }
+}
+
+/// The App's view: the sidebar's running/blocked `tasks`, then the full
+/// planning ancestry from the last task snapshot, which keeps done,
+/// backlog and draft rows. Pre-fix a finished subtask fell out of
+/// `tasks`, and its parent's session was refused on it.
+impl TaskParents for crate::app::App {
+    fn parent_of(&self, task_id: &str) -> Option<Option<String>> {
+        self.tasks.parent_of(task_id).or_else(|| self.planning_task_parent(task_id))
+    }
+}
+
 pub fn task_is_self_or_descendant_of(
-    tasks: &[crate::app::TaskEntry],
+    tasks: &(impl TaskParents + ?Sized),
     target_id: &str,
     caller_id: &str,
 ) -> bool {
@@ -274,13 +304,7 @@ pub fn task_is_self_or_descendant_of(
             // Cycle detected — bail.
             return false;
         }
-        let Some(task) = tasks
-            .iter()
-            .find(|t| t.task_id.as_deref() == Some(cur.as_str()))
-        else {
-            return false;
-        };
-        let Some(parent) = task.parent_task_id.clone() else {
+        let Some(Some(parent)) = tasks.parent_of(&cur) else {
             return false;
         };
         if parent == caller_id {
@@ -427,7 +451,7 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
     match target {
         TargetLocation::Live { wi, si } => {
             let ts = &app.workspaces[wi].sessions[si];
-            if !caller_authorized_for(&caller, &app.tasks, wi, ts.task_id.as_deref()) {
+            if !caller_authorized_for(&caller, app, wi, ts.task_id.as_deref()) {
                 return Err((
                     ErrorCode::Unauthorized,
                     "session is outside caller's scope".into(),
@@ -454,7 +478,7 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
         }
         TargetLocation::Exited { wi, ti } => {
             let tomb = &app.workspaces[wi].tombstones[ti];
-            if !caller_authorized_for(&caller, &app.tasks, wi, tomb.task_id.as_deref()) {
+            if !caller_authorized_for(&caller, app, wi, tomb.task_id.as_deref()) {
                 return Err((
                     ErrorCode::Unauthorized,
                     "session is outside caller's scope".into(),
@@ -611,7 +635,7 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                     ));
                 }
                 Some(own) => {
-                    if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                    if !task_is_self_or_descendant_of(app, req, own) {
                         return Err((
                             ErrorCode::Unauthorized,
                             format!(
@@ -643,11 +667,11 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
             match scope_task.as_deref() {
                 // Explicit scope: only that task's own + descendants.
                 Some(scope) => task
-                    .map(|t| task_is_self_or_descendant_of(&app.tasks, t, scope))
+                    .map(|t| task_is_self_or_descendant_of(app, t, scope))
                     .unwrap_or(false),
                 // Default scope (no explicit task_id): everything the
                 // caller is authorized to see.
-                None => caller_authorized_for(&caller, &app.tasks, wi, task),
+                None => caller_authorized_for(&caller, app, wi, task),
             }
         };
         for ts in &ws.sessions {
@@ -697,9 +721,9 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                 let task = tomb.task_id.as_deref();
                 let included = match scope_task.as_deref() {
                     Some(scope) => task
-                        .map(|t| task_is_self_or_descendant_of(&app.tasks, t, scope))
+                        .map(|t| task_is_self_or_descendant_of(app, t, scope))
                         .unwrap_or(false),
-                    None => caller_authorized_for(&caller, &app.tasks, wi, task),
+                    None => caller_authorized_for(&caller, app, wi, task),
                 };
                 if !included {
                     continue;
@@ -758,7 +782,7 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
     let (wi, si) = find_live_session(&app.workspaces, &p.session_uid)
         .ok_or((ErrorCode::NotFound, "session_uid not found".into()))?;
     let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-    if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
+    if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
         return Err((
             ErrorCode::Unauthorized,
             "session is outside caller's scope".into(),
@@ -869,7 +893,7 @@ pub fn send_key(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult
             continue;
         };
         let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-        if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
+        if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
             results.insert(uid.clone(), outcome(uid, "unauthorized", "session is outside the caller's scope".into()));
             continue;
         }
@@ -994,7 +1018,7 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
         }
     };
     let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-    if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
+    if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
         return Err((
             ErrorCode::Unauthorized,
             "session is outside caller's scope".into(),
@@ -1157,7 +1181,7 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
             ));
         }
         (Some(req), Some(own)) => {
-            if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+            if !task_is_self_or_descendant_of(app, req, own) {
                 return Err((
                     ErrorCode::Unauthorized,
                     format!(
@@ -2343,7 +2367,7 @@ pub fn list_subtasks(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                 ErrorCode::Unauthorized,
                 format!("taskless caller cannot scope to task {}", req),
             ))?;
-            if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+            if !task_is_self_or_descendant_of(app, req, own) {
                 return Err((
                     ErrorCode::Unauthorized,
                     format!("task {} is not the caller's task or a descendant", req),
@@ -2411,7 +2435,7 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         ErrorCode::Unauthorized,
         "taskless caller cannot mark subtasks done".into(),
     ))?;
-    if !task_is_self_or_descendant_of(&app.tasks, &p.task_id, own) {
+    if !task_is_self_or_descendant_of(app, &p.task_id, own) {
         return Err((
             ErrorCode::Unauthorized,
             format!("task {} is not the caller's task or a descendant", p.task_id),
@@ -2765,7 +2789,7 @@ pub fn list_workflows(app: &App, caller_uid: &str, params: &Value) -> MethodResu
                 ));
             }
             Some(own) => {
-                if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                if !task_is_self_or_descendant_of(app, req, own) {
                     return Err((
                         ErrorCode::Unauthorized,
                         format!(

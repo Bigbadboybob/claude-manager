@@ -1843,15 +1843,7 @@ impl App {
     /// 5s-tick lag spike (reconcile_tasks fires this on every
     /// `TasksUpdated` event); now non-blocking on the main thread.
     pub(crate) fn push_task_tree_to_daemon(&self) {
-        let tasks: Vec<(String, Option<String>, Option<String>)> = self
-            .tasks
-            .iter()
-            .filter_map(|t| {
-                t.task_id.as_ref().map(|id| {
-                    (id.clone(), t.parent_task_id.clone(), t.workspace_id.clone())
-                })
-            })
-            .collect();
+        let tasks = self.task_tree_push_entries();
         let workspaces: Vec<(String, Option<String>)> = self
             .workspaces
             .iter()
@@ -1867,6 +1859,35 @@ impl App {
         let hosts: Vec<cm_daemon::host_id::HostId> =
             self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
         self.push_worker.push_task_tree(tasks, workspaces, hosts);
+    }
+
+    /// The `task.update_tree` rows: the sidebar's running/blocked tasks with
+    /// their workspaces, then the parent edge of every other subtask in the
+    /// last planning snapshot (done, backlog, draft, archived). The daemon's
+    /// descendant-scope checks walk this tree; pre-fix it carried only the
+    /// sidebar rows, so a finished subtask fell out of its parent's scope.
+    /// Top-level tasks outside the sidebar are left out: a task the tree
+    /// doesn't know already reads as top-level.
+    pub(crate) fn task_tree_push_entries(&self) -> Vec<(String, Option<String>, Option<String>)> {
+        let mut entries: Vec<(String, Option<String>, Option<String>)> = self
+            .tasks
+            .iter()
+            .filter_map(|t| {
+                t.task_id.as_ref().map(|id| {
+                    (id.clone(), t.parent_task_id.clone(), t.workspace_id.clone())
+                })
+            })
+            .collect();
+        let pushed: std::collections::HashSet<String> =
+            entries.iter().map(|(id, _, _)| id.clone()).collect();
+        let mut subtasks: Vec<(String, Option<String>, Option<String>)> = self
+            .planning_task_edges()
+            .filter(|(id, _)| !pushed.contains(*id))
+            .map(|(id, parent)| (id.to_string(), Some(parent.to_string()), None))
+            .collect();
+        subtasks.sort();
+        entries.extend(subtasks);
+        entries
     }
 
     /// Register a just-minted subtask with its host daemon SYNCHRONOUSLY

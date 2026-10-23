@@ -1507,6 +1507,30 @@ def get_task(task_id: str) -> dict:
     return _shape_task(task, full=True)
 
 
+def _require_reparent_in_scope(task_id: str, new_parent: str) -> None:
+    """A reparent moves a task between trees, so both the task and its new
+    parent must be the caller's task or descendants of it (or the caller
+    holds global perms). The daemon answers from the tree it scopes every
+    Session method with. This guards the direct-API branch below, which has
+    no daemon in the write path; the daemon route checks the same itself.
+    Fails closed when the daemon can't answer.
+    """
+    try:
+        answer = control_client.call("task.scope_check", {"task_ids": [task_id, new_parent]})
+    except Exception as exc:  # noqa: BLE001 — any failure refuses the move
+        raise ValueError(
+            f"update_task: can't verify the reparent of {task_id} under {new_parent} "
+            f"(scope check unavailable: {exc}); a task can only be moved within your own tree"
+        ) from exc
+    in_scope = answer.get("in_scope") or {}
+    outside = [t for t in (task_id, new_parent) if not in_scope.get(t)]
+    if outside:
+        raise ValueError(
+            "update_task: " + " and ".join(outside) + " not the caller's task or a descendant; "
+            "a task can only be moved within your own tree"
+        )
+
+
 @mcp.tool()
 def update_task(
     task_id: str,
@@ -1548,7 +1572,9 @@ def update_task(
         project: Reassign to a different project.
         depends: Replace the dependency list (task slugs).
         parent_task_id: Reparent this task under another task's UUID,
-            or "null" to detach (make it top-level).
+            or "null" to detach (make it top-level). A reparent needs both
+            this task and the new parent in your own tree (your task or its
+            descendants), unless you hold global perms.
         initiative_id: Attach to an initiative UUID/slug, or "null" to make
             the task standalone.
         metadata: Free-form JSONB bag for skill/agent attachments. PATCH
@@ -1587,6 +1613,8 @@ def update_task(
         fields["parent_task_id"] = None if parent_task_id == "null" else parent_task_id
     if not fields:
         raise ValueError("No fields to update — pass at least one field.")
+    if fields.get("parent_task_id"):
+        _require_reparent_in_scope(task_id, fields["parent_task_id"])
     try:
         client = PlanningClient()
     except Exception:

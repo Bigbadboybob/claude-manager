@@ -113,7 +113,7 @@ fn allowed(state: &DaemonState, caller: &Caller, uid: &str) -> bool {
         Some(task) => target
             .task_id
             .as_ref()
-            .is_some_and(|tid| auth::task_is_self_or_descendant_of(&state.task_tree, tid, &task)),
+            .is_some_and(|tid| auth::task_in_scope(&state, tid, &task)),
         None => {
             workspace(state, &c.session_uid).is_some()
                 && workspace(state, &c.session_uid) == workspace(state, uid)

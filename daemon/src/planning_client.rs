@@ -356,6 +356,36 @@ pub fn fetch_task_status(
         .map(|s| s.trim().to_ascii_lowercase()))
 }
 
+/// `GET <CM_API_URL>/tasks/{id}` → the row's `parent_task_id`, for the
+/// headless parent refresher (`crate::task_parent_refresh`). `Ok(None)`
+/// for a missing row. `timeout` bounds the whole request.
+pub fn fetch_task_parent(
+    task_id: &str,
+    api_url_override: Option<&str>,
+    api_token_override: Option<&str>,
+    timeout: Duration,
+) -> Result<Option<Option<String>>, PlanningClientError> {
+    let api_url = resolve_api_url(api_url_override)?;
+    let api_token = resolve_api_token(api_token_override)?;
+    let endpoint = format!("{}/tasks/{}", api_url, task_id);
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent
+        .get(&endpoint)
+        .header("Authorization", &format!("Bearer {}", api_token))
+        .call()
+        .map_err(|e| PlanningClientError::Transport(format!("GET {}: {}", endpoint, e)))?;
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    let row: serde_json::Value = decode_json_response(response, "task row")?;
+    Ok(Some(row.get("parent_task_id").and_then(|v| v.as_str()).map(str::to_string)))
+}
+
 /// POST to `<CM_API_URL>/tasks` with the propose-task body.
 /// Returns the API's JSON response on success (the new task
 /// row, including the assigned `id`).

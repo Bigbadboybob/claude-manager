@@ -193,6 +193,9 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # cli-routed PlanningClient is unavailable and the field set is more than
     # just `status`.
     "update_task",
+    # Read-only descendant-scope answer for the caller (no TUI handler):
+    # server.py's direct-API update_task asks it before a reparent.
+    "task.scope_check",
     # Headless planning READS — daemon serves these (it holds the planning-API
     # creds) so a daemon-spawned agent can inspect the board / its own task
     # when the cli-routed PlanningClient isn't installed. The server.py tools

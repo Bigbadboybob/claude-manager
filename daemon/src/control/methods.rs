@@ -2515,8 +2515,8 @@ pub fn list_sessions(
                     ));
                 }
                 Some(own_task) => {
-                    if !crate::control::auth::task_is_self_or_descendant_of(
-                        &state.task_tree,
+                    if !crate::control::auth::task_in_scope(
+                        &state,
                         req_task,
                         own_task,
                     ) {
@@ -2566,8 +2566,8 @@ pub fn list_sessions(
             return match scope_task.as_deref() {
                 Some(scope) => task_id
                     .map(|t| {
-                        crate::control::auth::task_is_self_or_descendant_of(
-                            &state.task_tree,
+                        crate::control::auth::task_in_scope(
+                            &state,
                             t,
                             scope,
                         )
@@ -2582,8 +2582,8 @@ pub fn list_sessions(
             // of the scope. Mirrors TUI's `Some(scope) =>` arm.
             (Some(scope), _) => task_id
                 .map(|t| {
-                    crate::control::auth::task_is_self_or_descendant_of(
-                        &state.task_tree,
+                    crate::control::auth::task_in_scope(
+                        &state,
                         t,
                         scope,
                     )
@@ -2757,8 +2757,8 @@ pub fn list_sessions(
                     .task_id
                     .as_deref()
                     .map(|t| {
-                        crate::control::auth::task_is_self_or_descendant_of(
-                            &state.task_tree,
+                        crate::control::auth::task_in_scope(
+                            &state,
                             t,
                             scope,
                         )
@@ -4611,8 +4611,8 @@ pub fn start_workflow(
                 let task_id = match p.task_id.clone() {
                     Some(req_task) => {
                         let ok = own_task.as_deref().map_or(false, |own| {
-                            crate::control::auth::task_is_self_or_descendant_of(
-                                &state.task_tree,
+                            crate::control::auth::task_in_scope(
+                                &state,
                                 &req_task,
                                 own,
                             )
@@ -5517,8 +5517,8 @@ pub fn list_workflows(
             }
             Some(own) => {
                 let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if !crate::control::auth::task_is_self_or_descendant_of(
-                    &state.task_tree,
+                if !crate::control::auth::task_in_scope(
+                    &state,
                     req,
                     own,
                 ) {
@@ -5675,8 +5675,8 @@ fn list_workflows_visible_daemon(
             Some(req) => {
                 let resolved_tid = resolve_run_task_id(state, run);
                 match resolved_tid {
-                    Some(rid) => crate::control::auth::task_is_self_or_descendant_of(
-                        &state.task_tree,
+                    Some(rid) => crate::control::auth::task_in_scope(
+                        &state,
                         &rid,
                         req,
                     ),
@@ -5695,8 +5695,8 @@ fn list_workflows_visible_daemon(
     let Some(rid) = resolved_tid else {
         return false;
     };
-    if !crate::control::auth::task_is_self_or_descendant_of(
-        &state.task_tree,
+    if !crate::control::auth::task_in_scope(
+        &state,
         &rid,
         own,
     ) {
@@ -5705,8 +5705,8 @@ fn list_workflows_visible_daemon(
     // If explicit_scope is set, the run's task must also be
     // self-or-descendant of that scope.
     if let Some(req) = explicit_scope {
-        return crate::control::auth::task_is_self_or_descendant_of(
-            &state.task_tree,
+        return crate::control::auth::task_in_scope(
+            &state,
             &rid,
             req,
         );
@@ -5728,8 +5728,8 @@ fn workflow_run_authorized_daemon(
     let Some(rid) = resolve_run_task_id(state, run) else {
         return false;
     };
-    crate::control::auth::task_is_self_or_descendant_of(
-        &state.task_tree,
+    crate::control::auth::task_in_scope(
+        &state,
         &rid,
         own,
     )
@@ -9260,8 +9260,8 @@ pub fn mcp_start_session(
                     ));
                 }
                 Some(own) => {
-                    if !crate::control::auth::task_is_self_or_descendant_of(
-                        &state.task_tree,
+                    if !crate::control::auth::task_in_scope(
+                        &state,
                         req_task,
                         own,
                     ) {
@@ -12390,8 +12390,8 @@ pub fn trigger(
             let own_task = sess.and_then(|x| x.task_id.clone());
             let size = sess.map(|x| (x.last_cols, x.last_rows));
             let ok = own_task.as_deref().map_or(false, |own| {
-                crate::control::auth::task_is_self_or_descendant_of(
-                    &state.task_tree,
+                crate::control::auth::task_in_scope(
+                    &state,
                     &p.task_id,
                     own,
                 )
@@ -17752,7 +17752,7 @@ fn session_fork_once(
                 ));
             };
             match task {
-                Some(t) if crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, t, own) => Ok(()),
+                Some(t) if crate::control::auth::task_in_scope(&state, t, own) => Ok(()),
                 Some(t) => Err((
                     ErrorCode::Unauthorized,
                     format!("task '{}' is not the caller's task or a descendant", t),
@@ -18372,7 +18372,7 @@ pub fn list_subtasks(
                     ErrorCode::Unauthorized,
                     format!("taskless caller cannot scope to task {}", req),
                 ))?;
-                if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, req, own) {
+                if !crate::control::auth::task_in_scope(&state, req, own) {
                     return Err((
                         ErrorCode::Unauthorized,
                         format!("task {} is not the caller's task or a descendant", req),
@@ -18487,7 +18487,7 @@ pub fn set_subtask_status(
             "taskless caller cannot set a task status; use propose_task for top-level tasks".into(),
         ))?;
         let target = p.task_id.clone().unwrap_or_else(|| own.clone());
-        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &target, &own) {
+        if !crate::control::auth::task_in_scope(&state, &target, &own) {
             return Err((
                 ErrorCode::Unauthorized,
                 format!("task {} is not the caller's task or a descendant", target),
@@ -18602,11 +18602,27 @@ pub fn update_task(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_else(|| own.clone());
-        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &target, &own) {
+        if !crate::control::auth::task_in_scope(&state, &target, &own) {
             return Err((
                 ErrorCode::Unauthorized,
                 format!("task {} is not the caller's task or a descendant", target),
             ));
+        }
+        // A reparent must land inside the caller's tree too: otherwise it
+        // could hang its tasks under someone else's, and (with the target
+        // check alone) the move is the only scope-crossing write update_task
+        // allows. Detaching (null) makes the task top-level, which takes it
+        // out of the caller's tree rather than widening it.
+        if let Some(new_parent) = fields.get("parent_task_id").and_then(|v| v.as_str()) {
+            if !caller.global_perms && !crate::control::auth::task_in_scope(&state, new_parent, &own) {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!(
+                        "update_task: new parent {new_parent} is not the caller's task or a descendant; \
+                         a task can only be moved within your own tree"
+                    ),
+                ));
+            }
         }
         (
             target,
@@ -18621,6 +18637,50 @@ pub fn update_task(
     // Re-read the row so the tool returns the updated task (api_update_task
     // discards the PATCH response body).
     api_get_task(&creds, &target_task_id).map_err(|e| e.to_method_err())
+}
+
+/// `task.scope_check` — Session-callable, read-only: which of `task_ids`
+/// are the caller's task or its descendants (the rule every Session
+/// method applies). The MCP server's direct-API `update_task` branch asks
+/// before a reparent, since that route has no daemon in the write path.
+/// A global-perms caller reaches every task. No HTTP: the answer comes
+/// from the pushed tree and the parent refresher's readings.
+///
+/// Returns `{"global": bool, "in_scope": {<task_id>: bool, ...}}`.
+pub fn task_scope_check(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let ids: Vec<String> = params
+        .get("task_ids")
+        .and_then(|v| v.as_array())
+        .ok_or((ErrorCode::InvalidParams, "task.scope_check: 'task_ids' must be an array".into()))?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<_>>()
+        .ok_or((ErrorCode::InvalidParams, "task.scope_check: task ids must be strings".into()))?;
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let cuid = caller_uid.ok_or((
+        ErrorCode::Unauthorized,
+        "task.scope_check is callable only by Session callers".into(),
+    ))?;
+    let caller = state.sessions.get(cuid).ok_or((
+        ErrorCode::Unauthorized,
+        format!("caller session '{}' not in daemon registry", cuid),
+    ))?;
+    let in_scope: serde_json::Map<String, Value> = ids
+        .iter()
+        .map(|id| {
+            let ok = caller.global_perms
+                || caller
+                    .task_id
+                    .as_deref()
+                    .is_some_and(|own| crate::control::auth::task_in_scope(&state, id, own));
+            (id.clone(), Value::Bool(ok))
+        })
+        .collect();
+    Ok(json!({ "global": caller.global_perms, "in_scope": in_scope }))
 }
 
 /// Read the daemon's planning-API creds from config (shared by the
@@ -19948,7 +20008,7 @@ pub fn mark_subtask_done(
             ErrorCode::Unauthorized,
             "taskless caller cannot mark subtasks done".into(),
         ))?;
-        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &p.task_id, own) {
+        if !crate::control::auth::task_in_scope(&state, &p.task_id, own) {
             return Err((
                 ErrorCode::Unauthorized,
                 format!("task {} is not the caller's task or a descendant", p.task_id),
@@ -20422,8 +20482,8 @@ mod tests {
         {
             let s = state.lock().unwrap();
             assert!(
-                crate::control::auth::task_is_self_or_descendant_of(
-                    &s.task_tree,
+                crate::control::auth::task_in_scope(
+                    &s,
                     "task-sub",
                     "task-orch",
                 ),
@@ -20454,8 +20514,8 @@ mod tests {
         {
             let s = state.lock().unwrap();
             assert!(
-                crate::control::auth::task_is_self_or_descendant_of(
-                    &s.task_tree,
+                crate::control::auth::task_in_scope(
+                    &s,
                     "task-sub",
                     "task-orch",
                 ),
@@ -20508,8 +20568,8 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/wt-parent")),
             "an omitted worktree_path must leave the inherited workspace intact",
         );
-        assert!(crate::control::auth::task_is_self_or_descendant_of(
-            &s.task_tree,
+        assert!(crate::control::auth::task_in_scope(
+            &s,
             "task-sub",
             "task-orch",
         ));
@@ -25856,8 +25916,8 @@ while True:
         // …and the descendant predicate — the one whose failure IS the
         // phantom-task `unauthorized` — answers correctly again.
         assert!(
-            crate::control::auth::task_is_self_or_descendant_of(
-                &st.task_tree,
+            crate::control::auth::task_in_scope(
+                &st,
                 "task-minted",
                 "task-parent",
             ),
@@ -36461,6 +36521,207 @@ while True:
 
             kill_all_sessions(&state);
             clear_api_env();
+        });
+    }
+
+    fn scope_call(
+        state: &Arc<Mutex<DaemonState>>,
+        caller: &str,
+        method: &str,
+        params: Value,
+    ) -> crate::control::protocol::Response {
+        use crate::control::dispatch::{dispatch_request, DispatchOutcome};
+        let req = crate::control::protocol::Request {
+            id: "t".into(),
+            caller: crate::control::protocol::Caller::session(caller),
+            method: method.into(),
+            params,
+        };
+        match dispatch_request(state, &req) {
+            DispatchOutcome::Done(r) => r,
+            _ => panic!("{method}: unexpected stream outcome"),
+        }
+    }
+
+    fn refused_out_of_scope(r: &crate::control::protocol::Response) -> bool {
+        !r.ok && r.error.as_ref().is_some_and(|e| e.code == ErrorCode::Unauthorized)
+    }
+
+    /// The TUI's `task.update_tree` push now carries the parent edges of
+    /// done/backlog/draft subtasks (it used to carry only running/blocked
+    /// rows), so an orchestrator reaches its own done subtask: update_task,
+    /// set_subtask_status, send_key and list_sessions. Dispatch makes no
+    /// planning call for scope: a task the tree doesn't know is simply
+    /// refused, and the stub sees only the methods' own writes.
+    #[test]
+    fn done_subtask_is_in_scope_after_a_full_tree_push_and_dispatch_never_fetches() {
+        with_home_and_repo("donepush", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-orch", "ws-orch", "orch");
+            seed_tasked_caller(&state, "ts-worker", "ws-worker", "sub-done");
+            seed_tasked_caller(&state, "ts-stranger", "ws-x", "unrelated");
+            let stub = spawn_routed_stub(|method, _path, _b| match method {
+                "PATCH" => (200, r#"{"id":"x","status":"running"}"#.into()),
+                _ => (200, r#"{"id":"sub-done","status":"running","parent_task_id":"orch"}"#.into()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            task_update_tree(
+                &state,
+                &json!({"tasks": [
+                    {"task_id": "orch", "parent_task_id": null, "workspace_id": "ws-orch"},
+                    {"task_id": "sub-done", "parent_task_id": "orch"},
+                    {"task_id": "sub-grand", "parent_task_id": "sub-done"},
+                    {"task_id": "unrelated", "parent_task_id": "other-root"},
+                ]}),
+            )
+            .unwrap();
+
+            let r = scope_call(&state, "ts-orch", "update_task", json!({"task_id": "sub-done", "fields": {"status": "running"}}));
+            assert!(r.ok, "done subtask: {:?}", r.error);
+            let r = scope_call(&state, "ts-orch", "set_subtask_status", json!({"task_id": "sub-grand", "status": "running"}));
+            assert!(r.ok, "done grandchild: {:?}", r.error);
+            let r = scope_call(&state, "ts-orch", "send_key", json!({"session_uids": ["ts-worker", "ts-stranger"], "key": "escape"}));
+            let statuses: Vec<String> = r.result.as_ref().unwrap()["results"].as_array().unwrap().iter()
+                .map(|x| x["status"].as_str().unwrap().to_string()).collect();
+            assert_eq!(statuses, ["ok", "unauthorized"], "{r:?}");
+            let rows = scope_call(&state, "ts-orch", "list_sessions", json!({}));
+            let uids: Vec<String> = rows.result.as_ref().unwrap().as_array().unwrap().iter()
+                .map(|x| x["session_uid"].as_str().unwrap().to_string()).collect();
+            assert!(uids.contains(&"ts-worker".to_string()) && !uids.contains(&"ts-stranger".to_string()), "{uids:?}");
+
+            let r = scope_call(&state, "ts-orch", "update_task", json!({"task_id": "unrelated", "fields": {"status": "running"}}));
+            assert!(refused_out_of_scope(&r), "unrelated: {r:?}");
+            let r = scope_call(&state, "ts-orch", "update_task", json!({"task_id": "never-pushed", "fields": {"status": "running"}}));
+            assert!(refused_out_of_scope(&r), "unknown task: {r:?}");
+
+            let reqs = stub.requests.lock().unwrap();
+            let seen: Vec<(String, String)> = reqs.iter().map(|r| (r.method.clone(), r.path.clone())).collect();
+            assert!(
+                seen.iter().all(|(m, p)| (m == "PATCH" || m == "GET") && (p == "/tasks/sub-done" || p == "/tasks/sub-grand")),
+                "only the methods' own writes and update_task's re-read reach the API: {seen:?}",
+            );
+            assert!(!seen.iter().any(|(_, p)| p.contains("unrelated") || p.contains("never-pushed") || p.contains("orch")));
+            drop(reqs);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// A host no TUI pushes to: the background refresher reads the parent
+    /// chain of the tasks its sessions reference, so the done subtask comes
+    /// into scope with no HTTP on dispatch. Readings are reused while
+    /// fresh; a cycle stops; an unrelated task stays out.
+    #[test]
+    fn headless_refresher_brings_a_done_subtask_into_scope() {
+        with_home_and_repo("donerefresh", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-orch", "ws-orch", "orch");
+            seed_tasked_caller(&state, "ts-worker", "ws-worker", "sub-done");
+            seed_tasked_caller(&state, "ts-cyc", "ws-c", "cyc-a");
+            let stub = spawn_routed_stub(|method, path, _b| {
+                let row = |p: &str| (200, format!(r#"{{"id":"x","status":"done","parent_task_id":{p}}}"#));
+                match (method, path) {
+                    ("PATCH", _) => (200, r#"{"id":"x"}"#.into()),
+                    ("GET", "/tasks/sub-done") => row(r#""orch""#),
+                    ("GET", "/tasks/orch") => row("null"),
+                    ("GET", "/tasks/cyc-a") => row(r#""cyc-b""#),
+                    ("GET", "/tasks/cyc-b") => row(r#""cyc-a""#),
+                    _ => (404, r#"{"detail":"not found"}"#.into()),
+                }
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            let status = |task: &str| scope_call(&state, "ts-orch", "set_subtask_status", json!({"task_id": task, "status": "running"}));
+            assert!(refused_out_of_scope(&status("sub-done")), "before any refresh the daemon doesn't know the edge");
+
+            let pass = crate::task_parent_refresh::refresh_once(&state);
+            assert_eq!(pass.failures, 0);
+            assert_eq!(pass.lookups, 4, "sub-done, orch, cyc-a, cyc-b — each once, the cycle stops");
+            assert!(status("sub-done").ok, "done subtask after a refresh");
+            assert!(refused_out_of_scope(&status("cyc-a")));
+            assert!(refused_out_of_scope(&status("unrelated")));
+            assert_eq!(crate::task_parent_refresh::refresh_once(&state).lookups, 0, "fresh readings are reused");
+
+            // A pushed edge wins over the refresher's reading.
+            task_update_tree(&state, &json!({"tasks": [{"task_id": "sub-done", "parent_task_id": "elsewhere"}]})).unwrap();
+            assert!(refused_out_of_scope(&status("sub-done")));
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// An unreachable API adds nothing, records the failure, and backs off
+    /// instead of asking again on the next pass; scope refuses as before.
+    #[test]
+    fn headless_refresher_backs_off_when_the_api_is_unreachable() {
+        with_home_and_repo("donerefreshoff", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-orch", "ws-orch", "orch");
+            seed_tasked_caller(&state, "ts-worker", "ws-worker", "sub-done");
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{port}");
+                s.config.api_token = "tok".to_string();
+            }
+            let first = crate::task_parent_refresh::refresh_once(&state);
+            assert_eq!((first.lookups, first.failures), (2, 2), "orch and sub-done each tried once");
+            assert!(state.lock().unwrap().planning_task_parents.is_empty());
+            assert_eq!(crate::task_parent_refresh::refresh_once(&state).lookups, 0, "failures back off");
+            let err = set_subtask_status(&state, &json!({"task_id": "sub-done", "status": "running"}), Some("ts-orch")).unwrap_err();
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// update_task with parent_task_id: the new parent must be in the
+    /// caller's tree too (unless the caller is global); `task.scope_check`
+    /// gives the MCP direct-API route the same answer.
+    #[test]
+    fn update_task_reparent_stays_inside_the_callers_tree() {
+        with_home_and_repo("reparent", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-orch", "ws-orch", "orch");
+            seed_tasked_caller(&state, "ts-global", "ws-g", "elsewhere");
+            state.lock().unwrap().sessions.get_mut("ts-global").unwrap().global_perms = true;
+            let stub = spawn_routed_stub(|_m, _p, _b| (200, r#"{"id":"x"}"#.into()));
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            task_update_tree(
+                &state,
+                &json!({"tasks": [
+                    {"task_id": "orch", "parent_task_id": null},
+                    {"task_id": "sub-a", "parent_task_id": "orch"},
+                    {"task_id": "sub-b", "parent_task_id": "orch"},
+                    {"task_id": "foreign", "parent_task_id": "foreign-root"},
+                ]}),
+            )
+            .unwrap();
+            let reparent = |caller: &str, task: &str, parent: Value| {
+                scope_call(&state, caller, "update_task", json!({"task_id": task, "fields": {"parent_task_id": parent}}))
+            };
+            let r = reparent("ts-orch", "sub-a", json!("foreign"));
+            assert!(refused_out_of_scope(&r) && r.error.as_ref().unwrap().message.contains("new parent foreign"), "{r:?}");
+            let r = reparent("ts-orch", "foreign", json!("orch"));
+            assert!(refused_out_of_scope(&r), "pulling a foreign task in: {r:?}");
+            assert!(reparent("ts-orch", "sub-a", json!("sub-b")).ok, "within the tree");
+            assert!(reparent("ts-orch", "sub-a", Value::Null).ok, "detach");
+            let patched = stub.requests.lock().unwrap().iter().filter(|r| r.method == "PATCH").count();
+            assert_eq!(patched, 2, "the refused moves never reached the API");
+
+            let check = scope_call(&state, "ts-orch", "task.scope_check", json!({"task_ids": ["sub-b", "foreign", "orch"]}));
+            assert_eq!(check.result.unwrap()["in_scope"], json!({"sub-b": true, "foreign": false, "orch": true}));
+            let check = scope_call(&state, "ts-global", "task.scope_check", json!({"task_ids": ["foreign"]}));
+            assert_eq!(check.result.unwrap()["in_scope"]["foreign"], true);
+            kill_all_sessions(&state);
         });
     }
 

@@ -98,6 +98,7 @@ pub mod screen_replay;
 pub mod log_pump;
 pub mod health;
 pub mod session;
+pub mod task_parent_refresh;
 pub mod terminal_sweep;
 pub mod session_watch;
 pub mod state;
@@ -1289,6 +1290,21 @@ pub fn run() -> anyhow::Result<()> {
             "cm-daemon: terminal-task sweep thread spawn failed: {e}; continuing \
              without it — finished tasks will keep their worker sessions, and \
              their checkouts stay unreapable until an operator closes them"
+        );
+    }
+
+    // Planning parent edges for tasks no TUI push carries (a headless host),
+    // so the descendant-scope checks know a done subtask's parent without any
+    // HTTP on the dispatch path. Non-fatal, like the sweep: without it scope
+    // falls back to the pushed tree alone.
+    let parent_refresher = std::sync::Arc::new(task_parent_refresh::TaskParentRefresher::new(
+        std::sync::Arc::clone(&state),
+    ));
+    if let Err(e) = parent_refresher.start() {
+        eprintln!(
+            "cm-daemon: task parent refresh thread spawn failed: {e}; continuing \
+             without it — on a host no TUI pushes to, done subtasks fall out of \
+             their parent's scope"
         );
     }
 

@@ -939,6 +939,19 @@ impl App {
         self.task_tree().items
     }
 
+    /// `parent_task_id` of any task in the last planning snapshot, whatever
+    /// its status. `Some(None)` = top-level; `None` = not in the snapshot.
+    pub(crate) fn planning_task_parent(&self, task_id: &str) -> Option<Option<String>> {
+        self.sidebar_task_parents.get(task_id).cloned()
+    }
+
+    /// `(task, parent)` for every subtask in the last planning snapshot.
+    pub(crate) fn planning_task_edges(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.sidebar_task_parents
+            .iter()
+            .filter_map(|(task, parent)| Some((task.as_str(), parent.as_deref()?)))
+    }
+
     /// Map each session task_id to its `parent_task_id`, including Done tasks.
     /// The respawn-robust link a continuous subtask keeps to its orchestrator:
     /// the orchestrator session's uid changes when it respawns (fresh context /
@@ -2726,5 +2739,61 @@ mod nav_quickswitch_tests {
         assert!(matches!(o, InputOutcome::Cancel));
         let o = handle_task_peek(&mut scroll, 0, &key(KeyCode::Char('q')));
         assert!(matches!(o, InputOutcome::Cancel));
+    }
+}
+
+#[cfg(test)]
+mod task_scope_tests {
+    //! The TUI-served descendant check reads the full planning ancestry, so
+    //! a done subtask (left out of the sidebar's running/blocked `tasks`)
+    //! stays in its parent's scope. Mirrors the daemon's planning fallback.
+    use crate::control::methods::task_is_self_or_descendant_of;
+
+    #[test]
+    fn done_subtasks_stay_in_scope_through_the_planning_ancestry() {
+        let mut app = crate::app::sections::layout_tests::test_app();
+        for (task, parent) in [
+            ("sub-done", Some("orch")),
+            ("sub-grand", Some("sub-done")),
+            ("unrelated", Some("other-root")),
+            ("other-root", None),
+            ("cyc-a", Some("cyc-b")),
+            ("cyc-b", Some("cyc-a")),
+        ] {
+            app.sidebar_task_parents.insert(task.into(), parent.map(str::to_string));
+        }
+        assert!(task_is_self_or_descendant_of(&app, "sub-done", "orch"));
+        assert!(task_is_self_or_descendant_of(&app, "sub-grand", "orch"));
+        assert!(!task_is_self_or_descendant_of(&app, "unrelated", "orch"));
+        assert!(!task_is_self_or_descendant_of(&app, "cyc-a", "orch"));
+        assert!(!task_is_self_or_descendant_of(&app, "never-seen", "orch"));
+        // Without the snapshot the old answer stands.
+        app.sidebar_task_parents.clear();
+        assert!(!task_is_self_or_descendant_of(&app, "sub-done", "orch"));
+    }
+
+    /// The daemon's `task.update_tree` carries every subtask edge from the
+    /// planning snapshot, not just the sidebar's running/blocked rows, so a
+    /// done subtask stays in its parent's scope on the daemon too.
+    #[test]
+    fn the_tree_push_carries_every_subtask_edge() {
+        let mut app = crate::app::sections::layout_tests::test_app();
+        for (task, parent) in [
+            ("sub-done", Some("orch")),
+            ("sub-backlog", Some("sub-done")),
+            ("orch", None),
+            ("old-root", None),
+        ] {
+            app.sidebar_task_parents.insert(task.into(), parent.map(str::to_string));
+        }
+        let rows = app.task_tree_push_entries();
+        assert_eq!(
+            rows,
+            vec![
+                ("sub-backlog".to_string(), Some("sub-done".to_string()), None),
+                ("sub-done".to_string(), Some("orch".to_string()), None),
+            ],
+            "subtask edges only; a top-level task the tree lacks already reads as top-level",
+        );
     }
 }

@@ -395,6 +395,14 @@ impl Drop for WorktreeSpawnTicket {
 
 pub type WorktreeSpawnQueues = Arc<Mutex<HashMap<PathBuf, Arc<WorktreeSpawnQueue>>>>;
 
+/// A planning-API `parent_task_id` reading, cached in
+/// [`DaemonState::planning_task_parents`].
+#[derive(Debug, Clone)]
+pub struct PlanningParent {
+    pub parent: Option<String>,
+    pub fetched_at: std::time::Instant,
+}
+
 /// Daemon process state. Lives behind `Arc<Mutex<DaemonState>>` in
 /// `run()`; per-connection threads lock it for the duration of one
 /// JSON-RPC dispatch. Mutex (not RwLock) because method handlers
@@ -596,6 +604,18 @@ pub struct DaemonState {
     /// (`daemon-sessions.json`) so the creator keeps scope over
     /// its spawned workers across a daemon restart.
     pub agent_task_edges: HashMap<String, String>,
+    /// `task → parent` edges read from the planning API for tasks the
+    /// pushed `task_tree` doesn't carry, for a host no TUI has pushed to
+    /// lately (a headless cm-manager). Written only by the background
+    /// `crate::task_parent_refresh` loop, never on the dispatch path, and
+    /// read by `auth::task_in_scope` after `task_tree` (whose edges win).
+    /// Pruned each pass to the tasks live/exited sessions and
+    /// `agent_task_edges` still reach. Not persisted.
+    pub planning_task_parents: HashMap<String, PlanningParent>,
+    /// Failed refresher lookups: task → (next retry, consecutive failures),
+    /// so an unreachable API or a bad id backs off instead of being asked
+    /// every pass.
+    pub planning_parent_failures: HashMap<String, (std::time::Instant, u32)>,
     /// Startup MCP preflight result: `Ok(summary)` or `Err(diagnosis)`
     /// (fix-loud-preflight). `None` only before startup has run it.
     ///
@@ -846,6 +866,8 @@ impl Default for DaemonState {
             task_workspaces: HashMap::new(),
             task_tree_pushed: false,
             agent_task_edges: HashMap::new(),
+            planning_task_parents: HashMap::new(),
+            planning_parent_failures: HashMap::new(),
             mcp_preflight: None,
             worktree_spawn_queues: Arc::new(Mutex::new(HashMap::new())),
             tui_sessions: HashMap::new(),

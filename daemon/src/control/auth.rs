@@ -126,6 +126,34 @@ pub fn task_is_self_or_descendant_of(
     target_id: &str,
     ancestor_id: &str,
 ) -> bool {
+    walk_to_ancestor(|id| task_tree.get(id).cloned(), target_id, ancestor_id)
+}
+
+/// The parent of `task_id` as the daemon knows it: the pushed
+/// `task_tree` (which carries agent-minted edges too), else the headless
+/// refresher's planning reading (`crate::task_parent_refresh`). Never
+/// fetches. `None` = unknown; `Some(None)` = top-level.
+pub fn known_parent(state: &DaemonState, task_id: &str) -> Option<Option<String>> {
+    if let Some(parent) = state.task_tree.get(task_id) {
+        return Some(parent.clone());
+    }
+    state.planning_task_parents.get(task_id).map(|e| e.parent.clone())
+}
+
+/// [`task_is_self_or_descendant_of`] over everything the daemon knows:
+/// the pushed tree, then the refresher's planning parents for a host no
+/// TUI has pushed to lately. The chain must still reach `ancestor_id`,
+/// the caller's own task; tasks it minted reach it through their
+/// `agent_task_edges` entries in `task_tree`.
+pub fn task_in_scope(state: &DaemonState, target_id: &str, ancestor_id: &str) -> bool {
+    walk_to_ancestor(|id| known_parent(state, id), target_id, ancestor_id)
+}
+
+fn walk_to_ancestor(
+    parent_of: impl Fn(&str) -> Option<Option<String>>,
+    target_id: &str,
+    ancestor_id: &str,
+) -> bool {
     if target_id == ancestor_id {
         return true;
     }
@@ -135,8 +163,8 @@ pub fn task_is_self_or_descendant_of(
         if !visited.insert(cur.clone()) {
             return false;
         }
-        let parent = match task_tree.get(&cur) {
-            Some(p) => p.clone(),
+        let parent = match parent_of(&cur) {
+            Some(p) => p,
             None => return false,
         };
         let parent_id = match parent {
@@ -263,11 +291,7 @@ fn caller_reaches_target(
             // caller cannot reach a taskless target.
             match target_task_id {
                 Some(target_task) => {
-                    if task_is_self_or_descendant_of(
-                        &state.task_tree,
-                        target_task,
-                        caller_task,
-                    ) {
+                    if task_in_scope(state, target_task, caller_task) {
                         AuthDecision::Allow
                     } else if state.task_tree.is_empty()
                         && !state.task_tree_pushed

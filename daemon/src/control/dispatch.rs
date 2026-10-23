@@ -839,6 +839,16 @@ pub fn dispatch_request(
         "update_task" => {
             DispatchOutcome::Done(dispatch_update_task(state, req))
         }
+        "task.scope_check" => {
+            let caller_uid = match &req.caller {
+                Caller::Operator(_) => None,
+                Caller::Session(s) => Some(s.session_uid.as_str()),
+            };
+            DispatchOutcome::Done(match methods::task_scope_check(state, &req.params, caller_uid) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+            })
+        }
 
         // Headless planning READS: a daemon-spawned agent (no cli-routed
         // PlanningClient) gets these served by the daemon, which holds the
