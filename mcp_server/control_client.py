@@ -129,6 +129,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "daemon.health",
     "daemon.reload_config",
     "daemon.drain",
+    "daemon.maintenance",
     "daemon.restart",
     "daemon.rollback_brain",
     "daemon.migrate_split",
