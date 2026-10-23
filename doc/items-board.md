@@ -338,7 +338,7 @@ Gate receipts add `gate.report`, `gate.receipts`, `gate.waive` and
 query, first reachable daemon) and marks each holder's sidebar row and its
 workspace header with an amber ◇/◆ alternating about once a second plus a bold
 `OWNER` tag, ranked just below a pending ⚑ alert; the status bar adds `◆N
-OWNER`. In the board overlay the item's badge is `OWNER` with the diamond in the
+OWNER`, N being the holder sessions (a session holding three such items counts once). In the board overlay the item's badge is `OWNER` with the diamond in the
 flag cell, the banner leads with "N blocked on Owner", and `s` → `O` lets Owner
 set the status (any other status clears it).
 
