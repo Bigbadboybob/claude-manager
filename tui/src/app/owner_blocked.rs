@@ -225,6 +225,21 @@ mod tests {
         assert!(full.contains("\u{25c6}1 OWNER"), "status bar count:\n{full}");
     }
 
+    /// The status bar shows `⟳ CM deploy` while a maintenance notice is in
+    /// force (app/maintenance.rs), and nothing otherwise.
+    #[test]
+    fn the_status_bar_shows_the_cm_deploy_marker_while_a_notice_is_in_force() {
+        let mut app = app_with(&["lane-a"]);
+        app.control_bound = true;
+        let tmp = tempfile::tempdir().unwrap();
+        app.maintenance = super::super::maintenance::Maintenance::at(tmp.path().into());
+        assert!(!render(&mut app, 140, false).contains("CM deploy"));
+        cm_daemon::maintenance::apply_local_now(tmp.path(), &json!({"action":"set"})).unwrap();
+        app.maintenance = super::super::maintenance::Maintenance::at(tmp.path().into());
+        let full = render(&mut app, 140, false);
+        assert!(full.contains("\u{27f3} CM deploy"), "{full}");
+    }
+
     #[test]
     fn a_pending_alert_outranks_the_owner_diamond() {
         let mut app = app_with(&["lane-a"]);

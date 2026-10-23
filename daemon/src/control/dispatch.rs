@@ -351,6 +351,8 @@ pub(crate) const RESTART_BARRIER_EXEMPT_METHODS: &[&str] = &[
     "daemon.drain",
     "daemon.reload_config",
     "daemon.restart",
+    // Announces the restart the coordinator runs; it must work mid-drain.
+    "daemon.maintenance",
     // DESIGN_SEAMLESS_RESTART phase 3b: the dev-gated re-exec
     // skeleton trigger RUNS the coordinator (begin → wait_quiesced →
     // gate freezes → exec) — counting it as a mutation would deadlock
@@ -587,6 +589,8 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_reload_config(state, req))
         }
         "daemon.drain" => DispatchOutcome::Done(dispatch_daemon_drain(state, req)),
+        // Operator maintenance notice ahead of a deploy (crate::maintenance).
+        "daemon.maintenance" => DispatchOutcome::Done(dispatch_daemon_maintenance(state, req)),
         // DESIGN_SEAMLESS_RESTART phase 6: the PRODUCTION in-place
         // restart. Always dispatched (no dev gate); strong-operator
         // gated (fail-closed, R14); pinned-artifact target policy; NO
@@ -2072,6 +2076,50 @@ fn dispatch_daemon_drain(
     }
 }
 
+/// `daemon.maintenance` — `{action: "get" | "set" | "clear", reason?,
+/// started_at?, expect_until?}`: this host's maintenance notice (see
+/// `crate::maintenance`). On the messaging hub a set or clear also
+/// replicates to every replica. A set that opens a new notice tells live
+/// agents that used chat in the last hour, once.
+fn dispatch_daemon_maintenance(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "daemon.maintenance is Operator-callable only — the notice is shown \
+         to every agent on the host",
+    ) {
+        return resp;
+    }
+    let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+    let now = chrono::Utc::now();
+    let (mut out, fresh) = match crate::maintenance::apply_local(&root, &req.params, now) {
+        Ok(r) => r,
+        Err(m) => return Response::err(req.id.clone(), ErrorCode::InvalidParams, m),
+    };
+    if req.params["action"].as_str().is_some_and(|a| a != "get") {
+        let record = crate::maintenance::local_record(&root);
+        let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+        let published = match handle.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            Some(store) => store.publish_maintenance(&record).map_err(|e| e.to_string()),
+            None => Err("messaging is still starting; set the notice again to replicate it".to_owned()),
+        };
+        match published {
+            Ok(hub) => out["replicated"] = serde_json::json!(hub),
+            Err(e) => {
+                out["replicated"] = serde_json::json!(false);
+                out["replication_error"] = serde_json::json!(e);
+            }
+        }
+    }
+    if let Some(notice) = fresh {
+        let targets = crate::maintenance::announce_targets(state);
+        out["notified"] = serde_json::json!(crate::maintenance::announce(&root, &notice, &targets, now));
+    }
+    Response::ok(req.id.clone(), out)
+}
+
 /// `daemon.restart` — the PRODUCTION in-place restart
 /// (DESIGN_SEAMLESS_RESTART phase 6): exec the target binary in the
 /// same process, sessions untouched. The production twin of
@@ -3139,9 +3187,8 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             // Owner availability from the messaging store's projection: a
             // small local file, so ping stays lock-free and network-free.
             let owner_availability = crate::owner_availability::exposure(&messaging_root);
-            Response::ok(
-                req.id.clone(),
-                serde_json::json!({
+            let maintenance = crate::maintenance::field_for(state);
+            let mut body = serde_json::json!({
                     "pong": true,
                     "uid": s.session_uid,
                     "caller_kind": "session",
@@ -3155,8 +3202,11 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     "managed_by_session_id": managed_by_session_id,
                     "worktree_path": worktree_path,
                     "owner_availability": owner_availability,
-                }),
-            )
+                });
+            if let Some(m) = maintenance {
+                body["maintenance"] = serde_json::json!(m);
+            }
+            Response::ok(req.id.clone(), body)
         }
         Caller::Operator(_) => Response::err(
             req.id.clone(),
@@ -3837,6 +3887,54 @@ mod tests {
         let st = state.lock().unwrap();
         assert!(!st.restarting, "refusal happens before the coordinator");
         assert!(!st.draining, "refusal must not leave the daemon draining");
+    }
+
+    // --- daemon.maintenance --------------------------------------------
+
+    fn spawn_agent(state: &Arc<Mutex<DaemonState>>, uid: &str) {
+        let mut sp = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+        sp.args = vec!["30".into()];
+        sp.session_type = "codex".into();
+        let sess = crate::session::DaemonSession::spawn(sp).unwrap();
+        state.lock().unwrap().sessions.insert(uid.into(), sess);
+    }
+
+    /// Operator-only; persists; shows on ping; tells agents that used chat
+    /// in the last hour once per notice; clear removes it.
+    #[test]
+    fn maintenance_notice_is_operator_set_shown_on_ping_and_announced_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_state();
+        state.lock().unwrap().messaging_root = tmp.path().into();
+        spawn_agent(&state, "ts-chatty");
+        spawn_agent(&state, "ts-quiet");
+        crate::maintenance::stamp_chat(&state, "ts-chatty");
+        let set = serde_json::json!({"action":"set","reason":"CM redeploy"});
+        let refused = dispatch_request(&state, &session_request("daemon.maintenance", set.clone(), "ts-chatty")).into_response();
+        assert_eq!(refused.error.unwrap().code, ErrorCode::Unauthorized);
+        let ping = |state: &Arc<Mutex<DaemonState>>| {
+            dispatch_request(state, &session_request("ping", serde_json::Value::Null, "ts-chatty")).into_response().result.unwrap()
+        };
+        assert!(ping(&state).get("maintenance").is_none());
+
+        let r = dispatch_request(&state, &operator_request("daemon.maintenance", set.clone())).into_response().result.unwrap();
+        assert_eq!((r["active"].clone(), r["notified"].clone()), (serde_json::json!(true), serde_json::json!(1)));
+        // No messaging store here: recorded locally, not replicated.
+        assert_eq!(r["replicated"], false);
+        assert!(ping(&state)["maintenance"].as_str().unwrap().starts_with("CM redeploy in progress since"));
+        let id = crate::maintenance::notification_id(&r["notice"]);
+        assert!(crate::notifications::get(tmp.path(), "ts-chatty", &id).unwrap().is_some());
+        assert!(crate::notifications::get(tmp.path(), "ts-quiet", &id).unwrap().is_none(), "no recent chat: not woken");
+        // Re-setting extends the same notice and wakes nobody again.
+        let again = dispatch_request(&state, &operator_request("daemon.maintenance", set)).into_response().result.unwrap();
+        assert_eq!(again["notice"]["id"], r["notice"]["id"]);
+        assert!(again.get("notified").is_none());
+        let got = dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({}))).into_response().result.unwrap();
+        assert_eq!(got["active"], true);
+        dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({"action":"clear"}))).into_response();
+        assert!(ping(&state).get("maintenance").is_none());
+        let bad = dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({"action":"set","expect_until":"later"}))).into_response();
+        assert_eq!(bad.error.unwrap().code, ErrorCode::InvalidParams);
     }
 
     // --- ping ---------------------------------------------------------

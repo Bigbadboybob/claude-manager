@@ -72,8 +72,17 @@ pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bo
     }
 }
 pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Caller::Session(c) = &req.caller {
+        crate::maintenance::stamp_chat(state, &c.session_uid);
+    }
     match execute(state, req) {
-        Ok(v) => {
+        Ok(mut v) => {
+            // Agents see why sync looks broken during a deploy or hub outage.
+            if matches!(req.caller, Caller::Session(_)) && v.is_object() {
+                if let Some(m) = crate::maintenance::field_for(state) {
+                    v["maintenance"] = json!(m);
+                }
+            }
             if matches!(
                 req.method.as_str(),
                 "messaging.send"
@@ -807,6 +816,50 @@ mod tests {
             },
         )
     }
+    fn dispatched(state: &Arc<Mutex<DaemonState>>, caller: Caller, method: &str, p: Value) -> Value {
+        let r = dispatch(state, &Request { id: "rpc-test".into(), caller, method: format!("messaging.{method}"), params: p });
+        assert!(r.ok, "{method}: {:?}", r.error);
+        r.result.unwrap()
+    }
+
+    /// A maintenance notice rides on every agent chat response while it is
+    /// in force, and each call stamps the caller's last chat use.
+    #[test]
+    fn chat_responses_carry_the_maintenance_line_while_a_notice_is_in_force() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        let a = || Caller::session("a");
+        let send = |key: &str| json!({"channel":"general","body":"hi","name":"Maint Scout","request_id":key});
+        for (method, p) in [("open", json!({})), ("read", json!({"channel":"general"})), ("send", send("s1"))] {
+            assert!(dispatched(&state, a(), method, p).get("maintenance").is_none(), "{method}: no notice, no field");
+        }
+        assert!(state.lock().unwrap().last_chat_at.contains_key("a"));
+        crate::maintenance::apply_local(root.path(), &json!({"action":"set","reason":"CM redeploy"}), chrono::Utc::now()).unwrap();
+        for (method, p) in [("open", json!({})), ("read", json!({"channel":"general"})), ("send", send("s2"))] {
+            let v = dispatched(&state, a(), method, p);
+            assert!(v["maintenance"].as_str().unwrap().starts_with("CM redeploy in progress since"), "{method}: {v}");
+        }
+        // Operator (TUI) reads are unchanged.
+        assert!(dispatched(&state, Caller::operator("t"), "read", json!({"channel":"general"})).get("maintenance").is_none());
+        crate::maintenance::apply_local(root.path(), &json!({"action":"clear"}), chrono::Utc::now()).unwrap();
+        assert!(dispatched(&state, a(), "open", json!({})).get("maintenance").is_none());
+    }
+
+    /// While local messaging is still opening, the refusal reads plainly and
+    /// the maintenance line says the hub is restarting or unreachable.
+    #[test]
+    fn messaging_starting_reads_as_a_plain_explanation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = uninitialized(root.path());
+        assert_eq!(crate::maintenance::field_for(&state), None, "no opener yet: nothing to say");
+        state.lock().unwrap().messaging_startup.store(true, std::sync::atomic::Ordering::Release);
+        let r = dispatch(&state, &Request { id: "x".into(), caller: Caller::session("a"), method: "messaging.open".into(), params: json!({}) });
+        let e = r.error.unwrap();
+        assert!(e.message.starts_with("messaging_starting: CM messaging on this host is still starting"), "{}", e.message);
+        assert!(e.message.contains("retry the same request"), "{}", e.message);
+        assert!(crate::maintenance::field_for(&state).unwrap().starts_with("CM messaging hub is restarting or unreachable"));
+    }
+
     /// The board's New DM picker leaves out bash sessions, which have no
     /// agent to read a DM, so the directory reports each session's engine.
     #[test]

@@ -73,6 +73,7 @@ pub mod items;
 pub mod keys;
 pub mod usage;
 pub mod worktree_watch;
+pub mod maintenance;
 pub mod manifest;
 pub mod messaging;
 pub mod mcp_config;

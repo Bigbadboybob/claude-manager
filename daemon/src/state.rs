@@ -410,6 +410,10 @@ pub struct DaemonState {
     pub messaging_delivery: Arc<Mutex<()>>,
     pub messaging_wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
     pub messaging_root: PathBuf,
+    /// When each session last called a `messaging.*` method, for the
+    /// one-time maintenance announcement (`crate::maintenance`). In memory
+    /// only: a notice is set before the restart it announces.
+    pub last_chat_at: std::collections::HashMap<String, std::time::Instant>,
     pub owner_notifications: Arc<crate::owner_notifications::Feed>,
     pub owner_alert_relay: Arc<crate::owner_alert_relay::Relay>,
     pub messaging_sync: Option<Arc<crate::messaging::sync::Runtime>>,
@@ -852,6 +856,7 @@ impl Default for DaemonState {
             messaging_delivery: Arc::new(Mutex::new(())),
             messaging_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             messaging_root: crate::messaging::rpc::default_root(),
+            last_chat_at: std::collections::HashMap::new(),
             owner_notifications: Arc::new(crate::owner_notifications::Feed::default()),
             owner_alert_relay: Arc::new(crate::owner_alert_relay::Relay::default()),
             messaging_sync: None,

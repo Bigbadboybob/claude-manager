@@ -112,6 +112,33 @@ scripts/cm-op --ssh cm-manager daemon.health     # holder_epoch +1, sessions sam
 with "Text file busy"; `install` creates a new inode). The holder pins the
 binary by fd at exec time, so an in-flight `cp` can never half-apply.
 
+**Maintenance notice (announce the restart to agents).** A hub restart drops
+chat sync on every replica for a minute or more; without a notice agents read
+that as their own failure and resend. Set the notice on BOTH hosts before
+restarting the hub (cm-manager), and clear it once the replica has reconnected
+(`sync.connected` true in any `chat_open`):
+```
+# before: hub first, then each replica (cm-sessions, laptop as needed)
+scripts/cm-op --ssh cm-manager daemon.maintenance '{"action":"set","reason":"CM redeploy","expect_until":"2026-10-23T16:35:00Z"}'
+scripts/cm-op --ssh cm-sessions daemon.maintenance '{"action":"set","reason":"CM redeploy","expect_until":"2026-10-23T16:35:00Z"}'
+# … deploy (hub first, wait for messaging-sync.sock, then replicas) …
+# after the replica reconnects:
+scripts/cm-op --ssh cm-manager daemon.maintenance '{"action":"clear"}'
+scripts/cm-op --ssh cm-sessions daemon.maintenance '{"action":"clear"}'
+```
+`reason` defaults to "CM redeploy" and `expect_until` to 15 minutes from now;
+`{"action":"get"}` shows the state. The notice is written to
+`~/.cm/maintenance.json`, so it survives the restart it announces, and expires
+on its own 15 minutes after `expect_until` if nobody clears it. The hub also
+replicates its notice to replicas, so a replica that loses the hub keeps
+showing it. While it is in force, `ping` and the chat tools carry a
+`maintenance` line ("CM redeploy in progress since 16:26Z (expected until
+~16:35Z): sends are saved locally …"), the TUI status bar shows `⟳ CM deploy`,
+and each host tells its live agents that used chat in the last hour once per
+notice (re-setting an active notice extends it without a second message).
+Without a notice, a replica whose hub link drops with a restart-shaped error
+says only that the hub is restarting or unreachable.
+
 **MCP server / workflows on cm-manager:** scp as before, then the same
 `daemon.restart` — the brain restart re-runs the MCP preflight; no
 `systemctl restart` needed anymore.

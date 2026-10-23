@@ -34,9 +34,51 @@ class MessagingToolsTests(unittest.TestCase):
              patch.object(server.time, "sleep", side_effect=sleep):
             with self.assertRaises(control_client.ControlError) as raised:
                 server.chat_open()
-        self.assertIs(raised.exception, error)
+        # The raw startup refusal reads as a plain explanation and retry hint.
+        self.assertEqual(raised.exception.code, "messaging_starting")
+        self.assertEqual(raised.exception.message,
+                         "CM messaging on this host is still starting, likely during a CM restart. "
+                         "Nothing was sent; retry the same request (same request_id) in about 30 seconds.")
         self.assertEqual(clock[0], 30.0)
         self.assertGreater(call.call_count, 1)
+
+    def test_startup_refusal_names_an_active_maintenance_notice(self):
+        clock = [0.0]
+        error = control_client.ControlError("conflict", "messaging_starting: retry shortly")
+        notice = ("CM redeploy in progress since 16:26Z (expected until ~16:35Z): sends are saved "
+                  "locally and will replicate automatically, so don't resend. Cross-host reads may be stale.")
+        def call(method, params=None, **_):
+            if method == "ping":
+                return {"pong": True, "maintenance": notice}
+            raise error
+        def sleep(delay):
+            clock[0] += delay
+        with patch.object(control_client, "call", side_effect=call), \
+             patch.object(server.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(server.time, "sleep", side_effect=sleep):
+            with self.assertRaises(control_client.ControlError) as raised:
+                server.chat_send("hi", "r-1", channel="general")
+        self.assertEqual(raised.exception.message,
+                         "CM messaging on this host is still starting: CM redeploy in progress since 16:26Z "
+                         "(expected until ~16:35Z). Nothing was sent; retry the same request (same request_id) "
+                         "in about 30 seconds.")
+
+    def test_the_maintenance_line_reaches_every_chat_tool_and_ping(self):
+        note = "CM messaging hub is restarting or unreachable: sends are saved locally …"
+        sync = {"enabled": True, "connected": False, "error": "storage_error: Broken pipe", "pending": 1}
+        responses = {
+            "messaging.send": {"event": {"id": "e1", "created_at": "t", "data": {}}, "sync": sync, "maintenance": note},
+            "messaging.read": {"items": [], "next_cursor": None, "receipt": {}, "maintenance": note},
+            "messaging.open": {"actor_id": "agent:x:a", "maintenance": note},
+            "ping": {"pong": True, "maintenance": note},
+        }
+        with patch.object(control_client, "call", side_effect=lambda m, p=None, **_: copy.deepcopy(responses[m])):
+            self.assertEqual(server.chat_send("hi", "r-2", channel="general")["maintenance"], note)
+            self.assertEqual(server.chat_send("hi", "r-3", channel="general", view="full")["maintenance"], note)
+            self.assertEqual(server.chat_read(channel="general")["maintenance"], note)
+            self.assertEqual(server.chat_read(channel="general", view="full")["maintenance"], note)
+            self.assertEqual(server.chat_open()["maintenance"], note)
+            self.assertEqual(server.ping()["maintenance"], note)
 
     def test_only_startup_refusal_is_retried(self):
         for error in [control_client.ControlError("conflict", "name_revision_conflict: stale"),

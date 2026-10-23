@@ -39,6 +39,7 @@ pub use norms::textual_diff as norms_diff;
 mod channels;
 mod membership;
 mod availability;
+mod maintenance;
 mod inbox;
 mod mentions;
 mod preferences;
@@ -776,6 +777,9 @@ impl Store {
         }
         if e["type"] == crate::owner_availability::EVENT_TYPE {
             self.reduce_owner_availability(e)?;
+        }
+        if e["type"] == crate::maintenance::EVENT_TYPE {
+            self.reduce_maintenance(e)?;
         }
         if e["type"] == "norms.update" {
             if e["data"]["scope"] == "global" {

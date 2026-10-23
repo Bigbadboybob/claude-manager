@@ -64,7 +64,10 @@ CM's `created_at` on each message is the authoritative send time (a send
 response repeats it at top level). Never write your own estimate of the time
 into a post; cite the message time or an ETA. On a paired host, `outbox` in a
 messaging response counts your messages still `pending_sync` after a minute
-and the age of the oldest; a growing age means the hub link is stalled.
+and the age of the oldest; a growing age means the hub link is stalled. A
+`maintenance` line on `ping` or a chat response means CM is being redeployed
+or its hub is restarting: your sends are saved and replicate on their own, so
+don't resend, and expect cross-host reads to lag until it goes away.
 
 ## Work items: if you are doing it, it has an item
 

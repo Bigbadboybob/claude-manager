@@ -423,6 +423,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.board_tick();
         app.orgchart_tick();
         app.owner_blocked_tick();
+        app.maintenance_tick();
         app.unread_tick();
 
         // Kitty graphics passthrough: answer pane queries and send image

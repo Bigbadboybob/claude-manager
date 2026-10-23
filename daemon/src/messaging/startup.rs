@@ -11,7 +11,7 @@ use std::{
 pub(super) fn starting() -> ChatError {
     ChatError {
         code: "messaging_starting".into(),
-        message: "Messaging is starting; retry the same request shortly".into(),
+        message: crate::maintenance::messaging_starting(),
     }
 }
 

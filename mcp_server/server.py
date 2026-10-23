@@ -563,6 +563,28 @@ def _chat_call(method: str, params: dict) -> dict:
     return _messaging_ready_call("messaging." + method, params)
 
 
+_MESSAGING_STARTING_RETRY = ("Nothing was sent; retry the same request "
+                             "(same request_id) in about 30 seconds.")
+
+
+def _messaging_starting_error(exc: Exception) -> Exception:
+    """The plain explanation for an agent whose chat call met local
+    messaging still starting: the daemon's maintenance line when it has one
+    (ping works while messaging starts), plus a retry hint."""
+    try:
+        note = (control_client.call("ping", timeout=5.0) or {}).get("maintenance")
+    except Exception:  # noqa: BLE001 - the explanation is best-effort
+        note = None
+    # A notice reads "<reason> in progress since … (expected until …): sends
+    # are saved …"; only its head applies, since this send was not saved.
+    head, sep, _ = (note or "").partition("): ")
+    if sep:
+        text = f"CM messaging on this host is still starting: {head})."
+    else:
+        text = "CM messaging on this host is still starting, likely during a CM restart."
+    return control_client.ControlError("messaging_starting", f"{text} {_MESSAGING_STARTING_RETRY}")
+
+
 def _messaging_ready_call(method: str, params: dict) -> dict:
     # The daemon's coordinator deadline is 30s. Leave time for it to return
     # outcome_unknown and retry guidance instead of masking that with socket IO.
@@ -578,7 +600,9 @@ def _messaging_ready_call(method: str, params: dict) -> dict:
                 exc.code == "conflict" and exc.message.startswith("messaging_starting:")
             )
             remaining = deadline - time.monotonic()
-            if not starting or remaining <= 0:
+            if starting and remaining <= 0:
+                raise _messaging_starting_error(exc) from None
+            if not starting:
                 raise
             time.sleep(min(backoff, remaining))
             backoff = min(backoff * 2, 2.0)
@@ -872,7 +896,8 @@ def _slim_message(item: dict) -> dict:
 # notice degraded coverage or pending watch results.
 _SLIM_KEEP = ("next_cursor", "receipt", "position", "coverage", "degraded",
               "delivery_note", "error", "outbox", "read_cursor",
-              "indexing", "retry_after", "search_truncated", "partial_scope")
+              "indexing", "retry_after", "search_truncated", "partial_scope",
+              "maintenance")
 
 
 def _view(view: str | None) -> str:

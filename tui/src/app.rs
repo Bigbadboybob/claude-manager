@@ -72,6 +72,7 @@ mod board;
 mod orgchart;
 mod symbols;
 mod owner_blocked;
+mod maintenance;
 mod color_grid;
 mod unread;
 
@@ -282,6 +283,7 @@ pub struct App {
     /// F6 org chart overlay (app/orgchart.rs).
     orgchart: orgchart::OrgChart,
     owner_blocked: owner_blocked::OwnerBlocked,
+    maintenance: maintenance::Maintenance,
     /// Reap requests submitted from the cleanup dialog, tracked after it closed.
     cleanup_jobs: Vec<worktree_cleanup::Menu>,
     unread: unread::Unread,
@@ -1019,6 +1021,7 @@ impl App {
             board: board::Board::default(),
             orgchart: orgchart::OrgChart::default(),
             owner_blocked: owner_blocked::OwnerBlocked::default(),
+            maintenance: maintenance::Maintenance::load(),
             cleanup_jobs: Vec::new(),
             unread: unread::Unread::default(),
             backend,

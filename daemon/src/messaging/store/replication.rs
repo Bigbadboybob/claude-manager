@@ -834,6 +834,9 @@ impl Store {
         if e["type"] == crate::owner_availability::EVENT_TYPE {
             Self::validate_owner_availability(e)?;
         }
+        if e["type"] == crate::maintenance::EVENT_TYPE {
+            Self::validate_maintenance(e)?;
+        }
         if e["type"] == "host.update" {
             if e["actor"]["id"] != "system" {
                 return Err(err("invalid_record", "Host enrollment is system-owned"));
@@ -2157,6 +2160,25 @@ mod tests {
             p.replica.cached_coverage("general")["checkpoint"]["through"],
             50
         );
+    }
+    #[test]
+    fn a_hub_maintenance_notice_reaches_the_replica_and_outlives_the_link() {
+        let mut p = pair();
+        let now = Utc::now();
+        let hub_root = p.hub.cm_root().to_path_buf();
+        let (_, rec) = crate::maintenance::apply_local(&hub_root, &json!({"action":"set","reason":"CM redeploy"}), now).unwrap();
+        let rec = rec.unwrap();
+        assert!(!p.replica.publish_maintenance(&rec).unwrap(), "a replica never publishes");
+        assert!(p.hub.publish_maintenance(&rec).unwrap());
+        catch_up(&mut p);
+        // The replica shows the hub's notice from its projection alone, so
+        // losing the hub afterwards changes nothing.
+        let shown = crate::maintenance::current(p.replica.cm_root(), now).expect("replicated");
+        assert_eq!(shown["id"], rec["id"]);
+        let clear = crate::maintenance::build_clear(&rec, now + chrono::Duration::seconds(60));
+        assert!(p.hub.publish_maintenance(&clear).unwrap());
+        catch_up(&mut p);
+        assert!(crate::maintenance::current(p.replica.cm_root(), now + chrono::Duration::seconds(61)).is_none());
     }
     #[test]
     fn owner_availability_replicates_to_every_host_and_is_hub_only() {

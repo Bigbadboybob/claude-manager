@@ -2743,6 +2743,10 @@ impl App {
         if let Some(progress) = self.cleanup_progress() {
             rollup.push(Span::styled(format!("\u{27f2} {progress} "), Style::default().fg(theme::MUTED)));
         }
+        // A CM maintenance notice (deploy/restart) is in force somewhere.
+        if let Some(span) = self.maintenance.status_span() {
+            rollup.push(span);
+        }
         // Sessions holding an item blocked on an Owner decision, across
         // every board (one per session, however many items it holds).
         let n_owner = self.owner_blocked.session_count();
