@@ -693,7 +693,8 @@ class StrictBoard(unittest.TestCase):
         msg = self.refused("holder_required", self.b.create, {"title": "later", "holders": []})
         self.assertIn("propose_task", msg)
         self.assertIn('item_resolve(n, "launch")', msg)
-        self.refused("holder_required", self.b.create, "owner's", actor=OWNER)
+        self.refused("holder_required", self.b.create, {"title": "x", "status": "active",
+                                                        "holders": []}, actor=LANE)
         self.refused("holder_required", self.b.set, 1, status="open")
         # An unheld item blocked on another is allowed: its trigger reaches someone.
         # (A refused create is rolled back in the database; here it stays in
@@ -714,6 +715,16 @@ class StrictBoard(unittest.TestCase):
         tx = self.b.tx(OTHER, NOW + timedelta(minutes=9))
         tx.touch([n], source="chat")
         self.assertEqual(self.b[n].launched_at, NOW + timedelta(minutes=9))
+
+    def test_owners_add_is_active_and_unheld_for_the_orchestrator_to_assign(self):
+        for spec in ("plain", {"title": "alt+b a", "status": "open", "holders": []}):
+            tx = self.b.create(spec, actor=OWNER)
+            n = tx.created[0]
+            self.assertEqual((self.b[n].status, self.b[n].holders, self.b[n].actionable_at),
+                             ("active", [], NOW))
+            self.assertTrue(any("unlaunched" in w for w in tx.warnings), tx.warnings)
+        # Only creation: Owner setting an existing item open is still refused.
+        self.refused("holder_required", self.b.set, 1, actor=OWNER, status="open")
 
     def test_a_handback_is_accepted_and_stays_active_unheld(self):
         tx = self.b.set(1, actor=LANE, holders=[])

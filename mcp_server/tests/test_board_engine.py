@@ -728,6 +728,37 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         s = await self.tick()
         self.assertIn((1, "unlaunched"), s["cleared"])
 
+    async def test_owners_add_on_a_strict_board_goes_unlaunched_to_the_orchestrator(self):
+        await self.beat(self.row(ORCH, "working", task=self.root))
+        await self.make_strict()
+        reply = await items_db.create_items(self.pool, self.ref, {"pid": "owner", "name": "Owner"},
+                                            [{"title": "from Owner", "status": "open"}])
+        self.assertEqual([(i["status"], i["holders"]) for i in reply["items"]], [("active", [])])
+        with self.assertRaises(items_db.ItemsError):
+            await items_db.create_items(self.pool, self.ref, HOLDER,
+                                        [{"title": "agent backlog", "holders": []}])
+        await self.age(16)
+        s = await self.tick()
+        self.assertIn((1, "unlaunched"), s["raised"])
+        (push,) = await self.pushes("board")
+        self.assertIn("#1 unlaunched", push["text"])
+
+    async def test_a_missed_overload_notice_is_sent_on_the_next_pass(self):
+        await self.beat(self.row(HOLDER, "working"))  # no orchestrator on the board
+        await self.make_strict()
+        await items_db.create_items(self.pool, self.ref, HOLDER,
+                                    [{"title": t} for t in ("a", "b", "c")])
+        s = await self.tick()
+        self.assertIn((1, "holder_overloaded"), s["raised"])
+        self.assertEqual(await self.pushes("board"), [])
+        await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
+        await self.tick()
+        (push,) = await self.pushes("board")
+        self.assertIn("#1 holder_overloaded", push["text"])
+        await self.age(6)
+        await self.tick()
+        self.assertEqual(len(await self.pushes("board")), 1, "once per episode")
+
     async def test_unlaunched_respects_a_declared_job_and_never_pages_owner(self):
         idle_lane = self.row(HOLDER, "idle", 3600)
         await self.beat(self.row(ORCH, "idle", 7200, task=self.root), idle_lane)

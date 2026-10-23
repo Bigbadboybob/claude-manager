@@ -148,7 +148,7 @@ re-read fully every ~30 s.
    |---|---|
    | entering `waiting` | `422 waiting_not_allowed`: active + `eta` + `job` for a job in flight, else `blocked_by` / `blocked_on` + `check_back` |
    | an `eta` with no status | keeps (or makes) the item `active` |
-   | `open`, or a new item with no holder | `422 holder_required`: give it a holder, `item_resolve(n, "launch")`, or file a planning task |
+   | `open`, or a new item with no holder | `422 holder_required`: give it a holder, `item_resolve(n, "launch")`, or file a planning task. Except Owner's add (Alt+B `a`): created `active` with no holder, so `unlaunched` reaches the orchestrator, which assigns it |
    | `holder="none"` on an `active` item | accepted: stays `active`, unheld, with a warning; `unlaunched` after `launch_s` |
    | `blocked` with neither trigger | `422 trigger_required` |
    | `blocked_on` as the only trigger without `check_back` | `422 check_back_required` |
@@ -426,7 +426,10 @@ board(board=None, view="slim", mine=False, group=None, include_closed=True,
       archived=False, query=None, settings=None)
   -> {board: {slug, orchestrator, health, backlog_allowed}, flags, items, recently_closed,
       free_capacity, untracked?, launch?}
-  # settings={...}: board.settings first (e.g. {"idle_s": 1800})
+  # settings={...}: board.settings first, e.g. {"stale_s": 9000}; the governed
+  # settings (orchestrator_pid, steward_pid, backlog_allowed, idle_s, launch_s,
+  # max_active_per_holder, check_back_max_s) are Owner's or the orchestrator's
+  # only, e.g. {"idle_s": 1800}
 
 item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"|"apply"|"dismiss",
              holder=None, blocked_by=None, blocked_on=None, check_back=None,

@@ -395,7 +395,9 @@ class BoardTx:
                           f'item_set({n}, "active", eta="40m", job="..."). Waiting on '
                           f"something: item_set({n}, blocked_by=[m]), or "
                           f'item_set({n}, blocked_on="...", check_back="4h")', field="status")
-        unheld = status == "open" or (creating and status == "active" and not holders)
+        # Owner's own add may be unheld: the orchestrator assigns it.
+        unheld = status == "open" or (creating and status == "active" and not holders
+                                      and self.actor["pid"] != OWNER_PID)
         if unheld and (entering or explicit == "open"):
             raise invalid("holder_required",
                           f"board {slug} keeps no backlog: give #{n if not creating else 'it'} "
@@ -579,6 +581,14 @@ class BoardTx:
                       and not it.blocked_on):
                     status = "active" if new_holders or strict_board else "open"
 
+        if (strict_board and creating and status == "open" and not new_holders
+                and self.actor["pid"] == OWNER_PID):
+            # Owner's add (Alt+B a) is not backlog: it is work for the
+            # orchestrator to assign. Active and unheld, it goes unlaunched.
+            status = "active"
+            self.warnings.append(
+                f"#{n} has no holder; the orchestrator is told if nobody takes it within "
+                f"{self._launch_min()} min (unlaunched)")
         if strict_board:
             self._check_strict(it, status, explicit, prev_status, creating, new_holders,
                                fields, blockers_given)

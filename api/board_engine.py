@@ -563,10 +563,9 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
             overloaded = {name for it in items.values()
                           for name in ((it.open_flags.get("holder_overloaded") or {})
                                        .get("detail") or {}).get("holders", [])}
-            # Holders whose overload episode starts this pass: the only
-            # holder_overloaded news for the orchestrator too, so the flag
-            # moving between items as the holder's focus changes is not.
-            overload_news: set[str] = set()
+            # Holders the orchestrator has already heard about in their
+            # current overload episode (an open flag that reached it).
+            notified = await _overload_notified(conn, board["id"])
             tx = BoardTx(board, items, ENGINE_ACTOR, now)
 
             for item in sorted(items.values(), key=lambda i: i.n):
@@ -610,7 +609,6 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
                             name = h.get("name") or h["pid"]
                             if name in detail["holders"] and name not in overloaded:
                                 overloaded.add(name)
-                                overload_news.add(name)
                                 # Counted like the flag: inside a job's ETA an
                                 # item does not need its holder.
                                 count = sum(1 for o in items.values() if o.status == "active"
@@ -627,10 +625,51 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
                         summary["cleared"].append((item.n, kind))
             await items_db._apply(conn, tx)
 
+            overload_news = await _overload_episodes(conn, board["id"], notified, now)
             await _push_orchestrator(conn, board, items, states, orch, now, summary,
                                      overload_news)
             await _escalate(conn, board, items, orch, now, summary)
     return summary
+
+
+def _flag_holders(detail) -> set[str]:
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    return set((detail or {}).get("holders", []))
+
+
+async def _overload_notified(conn, board_id: str) -> set[str]:
+    rows = await conn.fetch(
+        """SELECT f.detail FROM item_flags f JOIN items i ON i.id = f.item_id
+            WHERE i.board_id = $1 AND f.kind = 'holder_overloaded'
+              AND f.resolved_at IS NULL AND f.last_pushed_at IS NOT NULL""",
+        uuid.UUID(board_id))
+    return set().union(*(_flag_holders(r["detail"]) for r in rows))
+
+
+async def _overload_episodes(conn, board_id: str, notified: set[str], now: datetime) -> set[str]:
+    """holder_overloaded reaches the orchestrator once per holder episode.
+    A flag that moved to another item (the holder's focus changed) inherits
+    the notice already given; a holder nobody has told yet is news, and stays
+    news until a push to the orchestrator actually goes out (none goes out
+    with no live orchestrator), so a missed notice is sent on the next pass."""
+    rows = await conn.fetch(
+        """SELECT f.id, f.detail FROM item_flags f JOIN items i ON i.id = f.item_id
+            WHERE i.board_id = $1 AND f.kind = 'holder_overloaded'
+              AND f.resolved_at IS NULL AND f.last_pushed_at IS NULL""",
+        uuid.UUID(board_id))
+    news: set[str] = set()
+    carried = []
+    for r in rows:
+        holders = _flag_holders(r["detail"])
+        if holders and holders <= notified:
+            carried.append(r["id"])
+        else:
+            news |= holders - notified
+    if carried:
+        await conn.execute("UPDATE item_flags SET last_pushed_at = $2 WHERE id = ANY($1::bigint[])",
+                           carried, now)
+    return news
 
 
 async def _open_flags(conn, board_id: str) -> list[dict]:
