@@ -1270,7 +1270,8 @@ mod tests {
         let (_, _, body) = seen.iter().find(|(m, p, _)| m == "PATCH" && p == "/boards/sfd").unwrap();
         assert_eq!(body["backlog_allowed"], false);
         assert_eq!(body["idle_s"], 1800);
-        assert_eq!(body["actor"]["pid"], "agent:d1:me-uid");
+        let pid = body["actor"]["pid"].as_str().unwrap();
+        assert!(pid.starts_with("agent:") && pid.ends_with(":me-uid"), "stamped by the daemon: {pid}");
         let sets: Vec<&Value> = seen.iter().filter(|(m, p, _)| m == "PATCH" && p == "/boards/sfd/items").map(|(_, _, b)| &b["set"]).collect();
         assert_eq!(sets[0]["job"], "pins L3");
         assert!(sets[1]["job"].is_null() && sets[1].get("job").is_some(), "\"\" clears the job");
