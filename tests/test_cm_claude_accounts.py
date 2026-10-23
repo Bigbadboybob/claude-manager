@@ -53,11 +53,23 @@ class AccountsTests(unittest.TestCase):
         self.paths.claude_json.write_text(json.dumps({"numStartups": 7, "projects": {"x": 1}}))
         self.paths.claude_json.chmod(0o600)
         self.tokens = set()
+        # Fake Anthropic profile endpoint: access token -> account uuid.
+        self.anthropic = {}
+        self.fetches = []
+
+        def fetch(token):
+            self.fetches.append([d.exists() for d in self.paths.refresh_locks])
+            if token not in self.anthropic:
+                raise accounts.AccountError("Anthropic rejected the current access token (HTTP 401)")
+            return self.anthropic[token]
+
+        self.enterContext(mock.patch.object(accounts, "fetch_account_uuid", side_effect=fetch))
 
     # Simulate Owner's /login: Claude Code writes both files.
     def do_login(self, name, tag=None):
         oauth = login(tag or name)
         self.tokens.update({oauth["accessToken"], oauth["refreshToken"]})
+        self.anthropic[oauth["accessToken"]] = profile(name)["accountUuid"]
         creds = self.paths.credentials
         data = json.loads(creds.read_text()) if creds.exists() else {"mcpOAuth": self.mcp}
         data["claudeAiOauth"] = oauth
@@ -68,9 +80,11 @@ class AccountsTests(unittest.TestCase):
         self.paths.claude_json.write_text(json.dumps(cj))
 
     # Simulate a session's token refresh: rotates both tokens, profile untouched.
-    def session_refresh(self, tag):
+    def session_refresh(self, tag, owner=None):
         data = json.loads(self.paths.credentials.read_text())
         data["claudeAiOauth"] = login(tag)
+        if owner:
+            self.anthropic[data["claudeAiOauth"]["accessToken"]] = profile(owner)["accountUuid"]
         self.tokens.update({data["claudeAiOauth"]["accessToken"], data["claudeAiOauth"]["refreshToken"]})
         self.paths.credentials.write_text(json.dumps(data))
 
@@ -111,17 +125,90 @@ class AccountsTests(unittest.TestCase):
         self.assertNotIn("mcpOAuth", record)
         self.assertEqual(self.state()["active"], "alice-uuid-0000")
 
-    def test_capture_refuses_profile_that_lags_the_tokens(self):
-        self.capture_two()
-        # Tokens are bob's, but the profile now names alice (stale display data).
+    def write_profile_of(self, name):
         cj = json.loads(self.paths.claude_json.read_text())
-        cj["oauthAccount"] = profile("alice")
+        cj["oauthAccount"] = profile(name)
         self.paths.claude_json.write_text(json.dumps(cj))
+
+    def saved_refresh(self, name):
+        record = json.loads((self.paths.accounts / f"{name}-uuid-0000.json").read_text())
+        return record["claudeAiOauth"]["refreshToken"]
+
+    def test_capture_trusts_tokens_not_a_lagging_profile(self):
+        self.capture_two()
+        self.write_profile_of("alice")  # tokens are bob's; the profile lags
         code, text = self.run_cli("capture")
+        self.assertEqual(code, 0, text)
+        self.assertIn("captured bob@example.com", text)
+        self.assertIn("names another account", text)
+        self.assertEqual(self.saved_refresh("alice"), "sk-ant-ort-REFRESH-alice")
+        saved_bob = json.loads((self.paths.accounts / "bob-uuid-0000.json").read_text())
+        self.assertEqual(saved_bob["oauthAccount"]["emailAddress"], "bob@example.com")
+
+    def test_stale_profile_after_refresh_is_not_taken_as_a_login(self):
+        # Review scenario 1: on bob, a session writes alice's profile back,
+        # then bob's tokens rotate. Nothing may be saved under alice.
+        self.capture_two()
+        self.assertEqual(self.run_cli("switch", "alice@example.com")[0], 0)
+        self.assertEqual(self.run_cli("switch", "bob@example.com")[0], 0)
+        self.write_profile_of("alice")
+        self.session_refresh("bob-2", owner="bob")
+        code, text = self.run_cli("switch", "alice@example.com")
+        self.assertEqual(code, 0, text)
+        self.assertRegex(text, r"switched bob@example\.com \S+ -> alice@example\.com")
+        self.assertNotIn("already on", text)
+        self.assertEqual(self.saved_refresh("alice"), "sk-ant-ort-REFRESH-alice")
+        self.assertEqual(self.saved_refresh("bob"), "sk-ant-ort-REFRESH-bob-2")
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-alice")
+        self.assertNotIn("external-login", [h["event"] for h in self.state()["history"]])
+
+    def test_profile_write_failure_still_records_the_switch(self):
+        # Review scenario 2: the credentials changed, so state must follow
+        # even if ~/.claude.json cannot be updated.
+        self.capture_two()
+        with mock.patch.object(accounts, "write_profile",
+                               side_effect=accounts.AccountError("kept changing")):
+            code, text = self.run_cli("switch", "alice@example.com")
+        self.assertEqual(code, 0, text)
+        self.assertIn("warning: login switched", text)
+        self.assertEqual(self.state()["active"], "alice-uuid-0000")
+        self.assertEqual(self.live_email(), "bob@example.com")  # display lags; harmless
+        self.session_refresh("alice-2", owner="alice")
+        self.assertEqual(self.run_cli("switch", "bob@example.com")[0], 0)
+        self.assertEqual(self.saved_refresh("alice"), "sk-ant-ort-REFRESH-alice-2")
+        self.assertEqual(self.saved_refresh("bob"), "sk-ant-ort-REFRESH-bob")
+
+    def test_confirmation_runs_outside_the_lock_and_retries_after_a_refresh(self):
+        self.capture_two()
+        self.session_refresh("bob-3", owner="bob")
+        self.fetches.clear()
+        real = self.anthropic.copy()
+
+        def refresh_during_fetch(token):
+            self.fetches.append([d.exists() for d in self.paths.refresh_locks])
+            if len(self.fetches) == 1:
+                self.session_refresh("bob-4", owner="bob")  # lands mid-identification
+            return {**real, **self.anthropic}[token]
+
+        with mock.patch.object(accounts, "fetch_account_uuid", side_effect=refresh_during_fetch):
+            code, text = self.run_cli("switch", "alice@example.com")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.fetches, [[False, False], [False, False]])
+        self.assertEqual(self.saved_refresh("bob"), "sk-ant-ort-REFRESH-bob-4")
+
+    def test_expired_unmatched_login_is_refused_without_asking_anthropic(self):
+        self.capture_two()
+        self.session_refresh("bob-5", owner="bob")
+        data = self.live()
+        data["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) - 1000
+        self.paths.credentials.write_text(json.dumps(data))
+        before = self.paths.credentials.read_text()
+        self.fetches.clear()
+        code, text = self.run_cli("switch", "alice@example.com")
         self.assertEqual(code, 1)
-        self.assertIn("belongs to bob@example.com", text)
-        saved = json.loads((self.paths.accounts / "alice-uuid-0000.json").read_text())
-        self.assertEqual(saved["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-alice")
+        self.assertIn("access token has expired", text)
+        self.assertEqual(self.fetches, [])
+        self.assertEqual(self.paths.credentials.read_text(), before)
 
     def test_switch_swaps_in_place_and_keeps_other_secrets_and_settings(self):
         self.capture_two()
@@ -141,7 +228,7 @@ class AccountsTests(unittest.TestCase):
 
     def test_switch_writes_back_rotated_tokens_so_switching_back_works(self):
         self.capture_two()
-        self.session_refresh("bob-2")  # bob's tokens rotate; saved copy is now stale
+        self.session_refresh("bob-2", owner="bob")  # saved copy is now stale
         self.assertEqual(self.run_cli("switch", "alice")[0], 0)  # accepts uuid prefix
         saved_bob = json.loads((self.paths.accounts / "bob-uuid-0000.json").read_text())
         self.assertEqual(saved_bob["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob-2")
@@ -170,7 +257,7 @@ class AccountsTests(unittest.TestCase):
         self.paths.state.write_text(json.dumps(state))
         code, text = self.run_cli("switch", "alice@example.com")
         self.assertEqual(code, 1)
-        self.assertIn("cannot tell which account", text)
+        self.assertIn("cannot confirm which account", text)
         self.assertEqual(self.paths.credentials.read_text(), before)
 
     def test_expired_target_login_is_refused_and_marked(self):
@@ -214,7 +301,7 @@ class AccountsTests(unittest.TestCase):
 
         def session_finishes_refresh():
             time.sleep(0.5)
-            self.session_refresh("bob-3")
+            self.session_refresh("bob-3", owner="bob")
             os.rmdir(lock)
 
         worker = threading.Thread(target=session_finishes_refresh)

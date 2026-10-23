@@ -122,27 +122,30 @@ is revoked at once (validated). A saved copy therefore goes stale as soon
 as Claude Code refreshes it, and switching back to a stale copy would need
 a new `/login`.
 
-**Identifying the login in the file.** If refresh tokens rotate, the live
-`refreshToken` usually matches no saved copy, so token matching alone
-cannot identify the account. Resolve identity in this order:
+**Identifying the login in the file.** Refresh tokens rotate, so the live
+`refreshToken` usually matches no saved copy. The profile in
+`~/.claude.json` is **never** evidence of identity: running sessions can
+write a stale `oauthAccount` back (a review of `fb616fd` showed that
+trusting it saves one account's tokens under another). Resolve identity in
+this order:
 
 1. Exact `refreshToken` match with a saved copy.
-2. The active account recorded in `state.json`, provided
-   `oauthAccount.accountUuid` in `~/.claude.json` still equals that
-   account's UUID. A token that differs from the saved copy is then that
-   account's own refresh.
-3. If `oauthAccount.accountUuid` names a different account than
-   `state.json`, Owner ran `/login` outside the tool: treat the file as that
-   account's login (capture it, adding it if new) and update `state.json`.
-4. Otherwise refuse and ask Owner to `/login` + `capture`. Never overwrite
-   or discard a login the tool cannot identify.
+2. Otherwise ask Anthropic with the live access token:
+   `GET https://api.anthropic.com/api/oauth/profile` (headers
+   `Authorization: Bearer`, `Content-Type: application/json`,
+   `Cache-Control: no-cache`; the request Claude Code makes). Its
+   `account.uuid` equals `oauthAccount.accountUuid` (validated on the
+   laptop). Read-only; it never refreshes. A saved account with that UUID
+   gets the login; an unsaved one is added only if `~/.claude.json`
+   describes that same UUID (otherwise refuse and ask for `/login` +
+   `capture`).
+3. If the access token has expired, or Anthropic cannot be reached or
+   rejects it, refuse and change nothing. Never refresh to find out.
 
-This relies on the tool's own switches keeping `oauthAccount` in step with
-the credentials (switch step 3). If validation drops step 3, rule 3 is
-lost: out-of-band `/login`s become undetectable and the tool must
-instead identify the login by asking Anthropic (the profile request Claude
-Code makes; see `profileFetchedAt`). **Verify** which request that is, if
-needed.
+The network request runs **before** taking the refresh lock (holds must
+stay short); under the lock the switcher re-reads the file and starts over
+if a session refreshed in the meantime. `poll` repairs the profile only
+after this confirmation.
 
 `switch <target>` under the lock:
 
@@ -151,12 +154,12 @@ needed.
    refresher re-reads `.credentials.json` and, if the access token there
    differs from the one it held, adopts the file instead of refreshing.
    Holding the lock for steps 2–3 keeps any session from refreshing the
-   old account mid-switch. Keep the hold to a few seconds.
+   old account mid-switch. Keep the hold to a few seconds. Identify the
+   live login (rules above) before taking it.
 2. **Write back.** Read `.credentials.json`, identify it with the rules
    above, and save its `claudeAiOauth` block as that account's latest copy.
    Keep the account's `oauthAccount` from `capture`; never take it from the
-   live `~/.claude.json` here, which can lag the credentials (validation
-   saved one account's tokens with another's profile this way).
+   live `~/.claude.json` unless it names the confirmed account.
 3. **Swap credentials.** Replace only the `claudeAiOauth` key (the file
    can hold other secrets, such as MCP servers' OAuth tokens) and write
    `.credentials.json` in place (truncate + write, mode 0600), as `/login`
@@ -167,17 +170,15 @@ needed.
    `~/.claude.json` with the target's saved block: read, modify, write to a
    temp file, rename, and retry if the file changed underneath. Validated:
    it only affects display (`/status` keeps naming the old account if it is
-   skipped; billing follows `.credentials.json`). Still needed for identity
-   rule 3 and for a correct `/status`.
+   skipped; billing follows `.credentials.json`). Still needed for
+   a correct `/status`. Record and persist `state.json`'s active account
+   immediately after step 3, still under the lock, so a failure here can
+   only leave the display stale; a profile-write failure is a warning.
 5. **Expect the target's refresh.** The target's saved access token has
    probably expired while it was inactive, so a session will refresh it
-   and rewrite the file within moments. That is the target's own refresh:
-   after it, save the file as the target's latest copy. Step 1 is what
-   makes this unambiguous; without it a write here could also be the old
-   account's late refresh, and the two can't be told apart from the file
-   alone. If a write does contradict expectations (e.g. a session reports
-   the old account in `/status`), stop, alert Owner, and do not overwrite
-   anything.
+   and rewrite the file within moments. Nothing special is needed: the
+   next write-back (`switch`, `capture` or `poll`) confirms the new tokens
+   with Anthropic and saves them under the right account.
 6. Record the switch in `state.json` history and notify Owner.
 
 `capture` and `poll` also perform write-back (step 2) opportunistically,
@@ -240,9 +241,10 @@ full 6 s hold and landed 1.5 s after release.
 - **`poll` never refreshes a token.** If the live access token has
   expired (`expiresAt` passed, or the usage request returns 401), skip the
   cycle and record why; the next real request from a session refreshes it.
-- **`poll` repairs the profile.** Each cycle, after identifying the live
-  login, compare `oauthAccount.accountUuid` in `~/.claude.json` with that
-  account and rewrite the `oauthAccount` key (same atomic method as switch
+- **`poll` repairs the profile.** Each cycle, once the live login's
+  identity is confirmed (identity rules above), compare
+  `oauthAccount.accountUuid` in `~/.claude.json` with that account and
+  rewrite the `oauthAccount` key (same atomic method as switch
   step 4) if it names the wrong account. Running sessions rewrite
   `~/.claude.json` and could restore a stale in-memory profile.
 - **Inactive accounts:** last reading taken while active, its timestamp,
@@ -342,9 +344,10 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
 1. `cm-claude-accounts` CLI with `capture`, `list`, `switch` (including
    refresh lock, write-back and target-refresh handling) and tests against
    fake credential files. **Started:** `scripts/cm-claude-accounts` and
-   `tests/test_cm_claude_accounts.py` (12 tests; run
+   `tests/test_cm_claude_accounts.py` (16 tests; run
    `python3 -m unittest tests.test_cm_claude_accounts`). `capture` and
-   `list` checked on the laptop; a real `switch` has not run yet.
+   `list` checked on the laptop, including a real Anthropic confirmation;
+   a real `switch` has not run yet.
 2. `poll` + state + alerts + a systemd user timer (every ~5 min).
 3. `suggest` autoswitch, then `auto` behind a config flag.
 4. Laptop rollout, then cm-sessions and cm-manager (one host at a time,

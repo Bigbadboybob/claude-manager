@@ -18,6 +18,8 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 
 LOCK_WAIT_SECONDS = 10.0
@@ -213,64 +215,110 @@ class RefreshLock:
 
 # --- identity ----------------------------------------------------------------
 
-def identify(login: dict, profile: dict | None, accounts: dict[str, dict], state: dict) -> tuple[str, str]:
-    """Return (accountUuid, rule) for the live login, per the doc's rules."""
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+PROFILE_TIMEOUT_SECONDS = 10
+IDENTIFY_ATTEMPTS = 3
+
+
+def fetch_account_uuid(access_token: str) -> str:
+    """Ask Anthropic whose login this is: the request Claude Code itself makes.
+
+    Read-only; it never refreshes. Errors name the status only, never the token.
+    """
+    req = urllib.request.Request(PROFILE_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "User-Agent": "cm-claude-accounts",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=PROFILE_TIMEOUT_SECONDS) as resp:
+            uuid = json.load(resp).get("account", {}).get("uuid")
+    except urllib.error.HTTPError as exc:
+        raise AccountError(f"Anthropic rejected the current access token (HTTP {exc.code})") from None
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise AccountError(f"could not reach Anthropic to confirm the account ({type(exc).__name__})") from None
+    if not isinstance(uuid, str) or not uuid:
+        raise AccountError("Anthropic's profile response had no account uuid")
+    return uuid
+
+
+def identify(login: dict, accounts: dict[str, dict]) -> tuple[str, str]:
+    """Return (accountUuid, how) for a login. The profile in ~/.claude.json is
+    never evidence: sessions can write a stale one back."""
     for uuid, rec in accounts.items():
         if rec["claudeAiOauth"].get("refreshToken") == login["refreshToken"]:
             return uuid, "token"
-    live_uuid = profile["accountUuid"] if profile else None
-    active = state.get("active")
-    if active in accounts and live_uuid == active:
-        return active, "refreshed"
-    if live_uuid and live_uuid != active:
-        return live_uuid, "login"
-    raise AccountError("cannot tell which account the current login belongs to; "
-                       "run /login for it, then `capture`")
+    expires = login.get("expiresAt")
+    if isinstance(expires, (int, float)) and expires / 1000 <= time.time():
+        raise AccountError("the current login has rotated and its access token has expired, "
+                           "so its account cannot be confirmed; send any prompt in a Claude "
+                           "session (it refreshes the token) and retry, or run /login + `capture`")
+    try:
+        return fetch_account_uuid(login["accessToken"]), "confirmed"
+    except AccountError as exc:
+        raise AccountError(f"cannot confirm which account the current login belongs to: {exc}; "
+                           "retry, or run /login for it and `capture`") from None
 
 
-def write_back(paths: Paths, accounts: dict[str, dict], state: dict) -> tuple[str, str]:
-    """Save the live login as its account's latest copy (doc: switch step 2)."""
-    login = read_login(paths)
-    profile = read_profile(paths)
-    uuid, rule = identify(login, profile, accounts, state)
-    if rule == "login":
-        # Owner ran /login outside the tool: the profile was written with it.
-        record = accounts.get(uuid, {"captured_at": int(time.time())})
+def identify_locked(paths: Paths, accounts: dict[str, dict]):
+    """Identify the live login outside the lock (it may need the network), then
+    take the lock and check the file did not change meanwhile.
+
+    Returns (lock, login, uuid, how) with the lock held; the caller exits it.
+    """
+    for _ in range(IDENTIFY_ATTEMPTS):
+        login = read_login(paths)
+        uuid, how = identify(login, accounts)
+        lock = RefreshLock(paths).__enter__()
+        try:
+            if read_login(paths)["refreshToken"] == login["refreshToken"]:
+                return lock, login, uuid, how
+        except BaseException:
+            lock.__exit__(None, None, None)
+            raise
+        lock.__exit__(None, None, None)  # a session refreshed meanwhile; look again
+    raise AccountError("the login kept changing while being identified; try again")
+
+
+def save_login(paths: Paths, accounts: dict[str, dict], uuid: str, login: dict,
+               profile: dict | None) -> dict:
+    """Store a confirmed login. A new account needs a profile naming it."""
+    now = int(time.time())
+    record = accounts.get(uuid)
+    if record is None:
+        if not profile or profile["accountUuid"] != uuid:
+            raise AccountError(f"the current login is account {uuid[:8]}, which is not saved and "
+                               f"{paths.claude_json} does not describe it; run /login, then `capture`")
+        record = {"captured_at": now}
+    if profile and profile["accountUuid"] == uuid:
         record["oauthAccount"] = profile
-        record_history(state, "external-login", account=uuid)
-    else:
-        record = accounts[uuid]
-    record["claudeAiOauth"] = login
-    record["updated_at"] = int(time.time())
+    record.update(claudeAiOauth=login, updated_at=now)
     record.pop("needs_login", None)
     accounts[uuid] = record
     save_account(paths, record)
-    state["active"] = uuid
-    return uuid, rule
+    return record
+
+
+def persist_state(paths: Paths, state: dict) -> None:
+    atomic_write(paths.state, state, indent=2)
 
 
 # --- commands ------------------------------------------------------------------
 
 def cmd_capture(paths: Paths, state: dict, out) -> int:
     accounts = load_accounts(paths)
-    with RefreshLock(paths):
-        login = read_login(paths)
+    lock, login, uuid, how = identify_locked(paths, accounts)
+    with lock:
         profile = read_profile(paths)
-    if profile is None:
-        raise AccountError(f"no oauthAccount in {paths.claude_json}; run /login first")
-    uuid = profile["accountUuid"]
-    for other, rec in accounts.items():
-        if other != uuid and rec["claudeAiOauth"].get("refreshToken") == login["refreshToken"]:
-            raise AccountError(f"the login belongs to {label(rec)} but the profile names "
-                               f"{profile.get('emailAddress')}; run /login again, then `capture`")
-    now = int(time.time())
-    record = accounts.get(uuid, {"captured_at": now})
-    record.update(claudeAiOauth=login, oauthAccount=profile, updated_at=now)
-    record.pop("needs_login", None)
-    save_account(paths, record)
-    state["active"] = uuid
-    record_history(state, "capture", account=uuid)
+        record = save_login(paths, accounts, uuid, login, profile)
+        state["active"] = uuid
+        persist_state(paths, state)
+    record_history(state, "capture", account=uuid, identified_by=how)
     print(f"captured {label(record)}; active", file=out)
+    if not profile or profile["accountUuid"] != uuid:
+        print(f"warning: {paths.claude_json} names another account; /status may be wrong "
+              "until `switch` or `poll` repairs it", file=sys.stderr)
     return 0
 
 
@@ -300,9 +348,13 @@ def cmd_list(paths: Paths, state: dict, out) -> int:
 def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
     accounts = load_accounts(paths)
     target = resolve(accounts, target_name)
-    record = accounts[target]
-    with RefreshLock(paths) as lock:
-        current, rule = write_back(paths, accounts, state)
+    lock, login, current, how = identify_locked(paths, accounts)
+    with lock:
+        save_login(paths, accounts, current, login, read_profile(paths))
+        if current != state.get("active"):
+            record_history(state, "external-login", account=current, identified_by=how)
+        state["active"] = current
+        record = accounts[target]
         if current != target:
             expires = record["claudeAiOauth"].get("refreshTokenExpiresAt")
             if isinstance(expires, (int, float)) and expires / 1000 <= time.time():
@@ -314,17 +366,25 @@ def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
             creds = load_json(paths.credentials)
             creds["claudeAiOauth"] = record["claudeAiOauth"]
             write_in_place(paths.credentials, creds)
+            # The file now holds the target's tokens: record that before
+            # anything else can fail, or the next refresh is misattributed.
+            state["active"] = target
+            record_history(state, "switch", account=target, previous=current, identified_by=how)
+        persist_state(paths, state)
         if time.monotonic() - lock.acquired_at > MAX_HOLD_SECONDS:
             print("warning: refresh lock held longer than expected", file=sys.stderr)
-    profile = read_profile(paths)
-    if not profile or profile["accountUuid"] != target:
-        write_profile(paths, record["oauthAccount"])
+    # Identity is confirmed, so repairing the display profile is safe.
+    try:
+        profile = read_profile(paths)
+        if not profile or profile["accountUuid"] != target:
+            write_profile(paths, record["oauthAccount"])
+    except (AccountError, OSError, ValueError) as exc:
+        print(f"warning: login switched, but {paths.claude_json} was not updated ({exc}); "
+              "/status may show the previous account", file=sys.stderr)
     if current == target:
         print(f"already on {label(record)}", file=out)
-        return 0
-    state["active"] = target
-    record_history(state, "switch", account=target, previous=current, identified_by=rule)
-    print(f"switched {label(accounts[current])} -> {label(record)}", file=out)
+    else:
+        print(f"switched {label(accounts[current])} -> {label(record)}", file=out)
     return 0
 
 
@@ -369,7 +429,7 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
                 return cmd_remove(paths, state, args.account, out)
             finally:
                 # Keep what was learned (write-back, needs_login) even on refusal.
-                atomic_write(paths.state, state, indent=2)
+                persist_state(paths, state)
     except (AccountError, OSError, ValueError, KeyError) as exc:
         # Messages name accounts and files only, never token values.
         print(f"cm-claude-accounts: {exc}", file=sys.stderr)
