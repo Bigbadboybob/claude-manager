@@ -647,3 +647,105 @@ class SuggestionReview(unittest.TestCase):
         self.post("DONE", "done")
         self.post("STOP", "blocked", actor=self.STEWARD)
         self.assertNotIn("suggested_transition", self.b[1].open_flags)
+
+
+class StrictBoard(unittest.TestCase):
+    """backlog_allowed: false (doc/strict-boards.md §2): new non-conforming
+    intent is refused, naming the conforming call; releases are accepted."""
+
+    def setUp(self):
+        self.b = Board()
+        self.b.board.update(backlog_allowed=False, launch_s=900, check_back_max_s=259200)
+        self.b.create({"title": "job", "holders": [LANE]})
+
+    def refused(self, code, fn, *a, **kw):
+        with self.assertRaises(ItemsError) as cm:
+            fn(*a, **kw)
+        self.assertEqual(cm.exception.code, code)
+        return str(cm.exception.detail()["message"])
+
+    def test_waiting_is_refused_with_the_conforming_call(self):
+        msg = self.refused("waiting_not_allowed", self.b.set, 1, actor=LANE,
+                           status="waiting", eta="40m")
+        self.assertIn('item_set(1, "active", eta="40m", job="...")', msg)
+        self.assertIn("blocked_by=[m]", msg)
+        self.assertEqual(self.b[1].status, "active")
+
+    def test_a_bare_eta_keeps_it_active_and_a_job_needs_an_eta(self):
+        self.b.set(1, actor=LANE, eta="40m", job="pins L3 pid 41")
+        self.assertEqual((self.b[1].status, self.b[1].job), ("active", "pins L3 pid 41"))
+        self.assertIsNotNone(self.b[1].eta_at)
+        self.b.create({"title": "other", "holders": [LANE]})
+        msg = self.refused("eta_required", self.b.set, 2, actor=LANE, job="cell C2")
+        self.assertIn('item_set(2, "active", eta="40m", job="cell C2")', msg)
+        # Clearing the eta while the job stays is refused too.
+        self.refused("eta_required", self.b.set, 1, actor=LANE, eta=None)
+
+    def test_job_is_active_only_and_cleared_on_leaving_active(self):
+        self.b.set(1, actor=LANE, eta="40m", job="j")
+        self.b.set(1, actor=LANE, status="done")
+        self.assertIsNone(self.b[1].job)
+        self.b.create({"title": "x", "holders": [LANE]})
+        self.refused("invalid_field", self.b.set, 2, actor=LANE, status="blocked",
+                     blocked_on="EP", check_back="1h", job="j")
+
+    def test_open_and_unheld_new_items_are_refused(self):
+        msg = self.refused("holder_required", self.b.create, {"title": "later", "holders": []})
+        self.assertIn("propose_task", msg)
+        self.assertIn('item_resolve(n, "launch")', msg)
+        self.refused("holder_required", self.b.create, "owner's", actor=OWNER)
+        self.refused("holder_required", self.b.set, 1, status="open")
+        # An unheld item blocked on another is allowed: its trigger reaches someone.
+        # (A refused create is rolled back in the database; here it stays in
+        # the dict, so look the new item up by the number it got.)
+        n = self.b.create({"title": "queued", "holders": [], "blocked_by": [1]}).created[0]
+        self.assertEqual((self.b[n].status, self.b[n].holders), ("blocked", []))
+
+    def test_a_handback_is_accepted_and_stays_active_unheld(self):
+        tx = self.b.set(1, actor=LANE, holders=[])
+        self.assertEqual((self.b[1].status, self.b[1].holders), ("active", []))
+        self.assertTrue(any("unlaunched" in w for w in tx.warnings), tx.warnings)
+        self.assertEqual(self.b[1].actionable_at, NOW)
+
+    def test_blocked_needs_a_concrete_trigger(self):
+        msg = self.refused("trigger_required", self.b.set, 1, actor=LANE, status="blocked")
+        self.assertIn("blocked_by=[m]", msg)
+        msg = self.refused("check_back_required", self.b.set, 1, actor=LANE,
+                           status="blocked", blocked_on="EP GO")
+        self.assertIn('check_back="4h"', msg)
+        self.b.set(1, actor=LANE, blocked_on="EP GO", check_back="4h")
+        self.assertEqual(self.b[1].status, "blocked")
+        # Dropping the check-back off a text block is refused as well.
+        self.refused("check_back_required", self.b.set, 1, actor=LANE, check_back=None)
+        msg = self.refused("check_back_too_far", self.b.set, 1, actor=LANE, check_back="4d")
+        self.assertIn("72h", msg)
+
+    def test_an_unblock_leaves_an_unheld_item_active_and_starts_the_clock(self):
+        self.b.create({"title": "next", "holders": [], "blocked_by": [1]})
+        later = NOW + timedelta(hours=1)
+        self.b.set(1, actor=LANE, now=later, status="done")
+        self.assertEqual((self.b[2].status, self.b[2].actionable_at), ("active", later))
+
+    def test_legacy_items_stay_editable_with_a_warning(self):
+        legacy = Item(n=9, title="old", status="waiting", holders=[LANE], touched_at=NOW,
+                      eta_at=NOW + timedelta(hours=1), waiting_set_at=NOW)
+        self.b.items[9] = legacy
+        tx = self.b.set(9, actor=LANE, note="still parked")
+        self.assertEqual(legacy.status, "waiting")
+        self.assertTrue(any("item_set(n, \"active\"" in w for w in tx.warnings), tx.warnings)
+        # A bare eta converts it to the conforming shape.
+        self.b.set(9, actor=LANE, eta="2h", job="bench")
+        self.assertEqual(legacy.status, "active")
+
+    def test_other_boards_keep_todays_contract(self):
+        b = Board()
+        b.create({"title": "x", "holders": [LANE]})
+        b.set(1, actor=LANE, eta="40m")
+        self.assertEqual(b[1].status, "waiting")
+        b.set(1, actor=LANE, status="active", eta=None)
+        b.set(1, actor=ORCH, holders=[])
+        self.assertEqual(b[1].status, "open")
+        b.set(1, actor=ORCH, status="active", holders=[LANE], job="no eta needed here")
+        self.assertEqual(b[1].job, "no eta needed here")
+        b.create({"title": "y", "holders": []})
+        self.assertEqual(b[2].status, "open")

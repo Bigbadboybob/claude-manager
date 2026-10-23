@@ -58,7 +58,8 @@ before you message a lane for status.
 - `item("title", holder="lane-name", group="RL training")` creates and assigns
   in one call; the holder is woken (`assigned`). `item([...])` creates several.
 - `item_set(n, holder=...)` reassigns, `add_holder` / `remove_holder` adjust.
-  Workers set their own status: `done`, `waiting` with `eta`, `blocked`.
+  Workers set their own status: `done`, `blocked` (with `blocked_by`, or
+  `blocked_on` + `check_back`), and for a long job the form in section 4.
 - Dependencies: `item_set(15, blocked_by=[14])`. Only real open items on the
   same board, no cycles. An item blocked only by open items is exempt from the
   idle and stale flags, but every chain ends at an item that is not, so a
@@ -75,12 +76,15 @@ raises these flags and pushes you once per window with every open flag:
 |---|---|
 | `unassigned` | open with no holder for a few minutes |
 | `holder_gone` | a holder's session exited |
-| `holder_idle` | every holder sat at its prompt for 20 min (**off by default**; enabled per board once engine state is live on every host) |
+| `holder_idle` | every holder sat at its prompt for the board's `idle_s` (20 min by default; sejd 30 min), not while a declared job runs (**off by default**; enabled per board) |
 | `holder_waiting_on_human` / `holder_errored` | a holder needs a person, or failed |
 | `stale` | nobody touched it for 2 h (longer for a long declared job) |
 | `overdue` | waiting past its ETA plus a grace; the holder is asked first |
-| `check_back` | a free-text block reached its check-back time |
+| `check_back` | check-back due: decide (re-block with a new check-back, activate, drop). It is not a sign the blocker cleared |
 | `blocker_dropped` | something it waited on was dropped; decide what it needs now |
+| `unlaunched` | strict boards: active with no live holder on it for 15 min (after an unblock, handback or assignment): launch or reassign; `board()` lists who is free |
+| `needs_triage` | strict boards: does not fit (waiting, open, a block with no trigger or check-back, a job with no ETA): make it active + ETA + job, blocked with a trigger, or drop it. Never escalated to Owner |
+| `holder_overloaded` | strict boards: a session holds more active items than the board allows (`max_active_per_holder`, default 2) outside a job's ETA; block or hand back the extras. A warning, never escalated |
 
 Done, dropped and blocked items arrive batched (one wake per few minutes).
 
@@ -102,12 +106,27 @@ number Owner watches.
 ## 4. Long jobs are declared, not inferred
 
 A job you expect to run longer than 20 minutes (a build, a benchmark, a backtest,
-a long test suite) is declared as waiting, with an ETA and a one-line note: set its item to
-waiting, `item_set(n, "waiting", eta="40m", note="full daemon suite")`; for
-continuous subtasks also set `metadata.continuous_stage="waiting"` with
-`next_action`. A channel post is optional. An orchestrator does
-not guess activity from a spinner, a shell or a stale monitor; it trusts the
-declaration and follows up when the ETA passes.
+a long test suite) is declared on its item, with an ETA and a one-line note.
+
+- **Strict boards** (`backlog_allowed: false`, e.g. sejd): active + eta (job
+  noted). `item_set(n, "active", eta="40m", job="full daemon suite, pid
+  41231")`. The item stays active because someone's job is running; its
+  holder may sit idle meanwhile without being flagged, and at the ETA it is
+  asked (`eta_passed`). These boards refuse `waiting`, `open` and unheld new
+  items: anything else that cannot proceed is `blocked` with `blocked_by` or
+  `blocked_on` + `check_back` (at most 72 h out), and future work is a
+  planning task. A handback (`holder="none"`) leaves the item active and
+  unheld, and you are told if nobody launches it within 15 minutes.
+- **Other boards** keep the waiting form: `item_set(n, "waiting", eta="40m",
+  note="full daemon suite")`. The active + eta + job form works there too.
+
+For continuous subtasks also set `metadata.continuous_stage="waiting"` with
+`next_action` (the task's stage, not the item's status). A channel post is
+optional. An orchestrator does not guess activity from a spinner, a shell or a
+stale monitor; it trusts the declaration and follows up when the ETA passes.
+`board()` shows the holder's session state and the job side by side; a
+session that is idle is not a job that stopped, and a check-back that is due
+is not a blocker that cleared.
 
 ## 5. Know what wakes whom
 

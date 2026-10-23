@@ -53,6 +53,16 @@ class ItemToolsTests(unittest.TestCase):
         self.assertEqual(params, {"view": "slim", "mine": False, "include_closed": True,
                                   "archived": False})
 
+    def test_job_and_board_settings(self):
+        _, params = self.call(server.item_set, 14, eta="40m", job="pins L3")
+        self.assertEqual(params, {"n": 14, "eta": "40m", "job": "pins L3"})
+        with mock.patch.object(control_client, "call", return_value={"ok": 1}) as call:
+            server.board(board="sejd", settings={"idle_s": 1800})
+        calls = [c.args for c in call.call_args_list]
+        self.assertEqual(calls[0], ("board.settings", {"board": "sejd", "settings": {"idle_s": 1800}}))
+        self.assertEqual(calls[1][0], "board.read")
+        self.assertNotIn("settings", calls[1][1])
+
     def test_item_resolve_has_no_engine_default_and_launch_gets_a_request_id(self):
         method, params = self.call(server.item_resolve, 14, "launch")
         self.assertEqual(method, "item.resolve")
@@ -75,7 +85,8 @@ class ItemToolsTests(unittest.TestCase):
         self.assertIn("request_id='rq-7'", str(cm.exception))
 
     def test_methods_are_daemon_routed(self):
-        for method in ("item.create", "item.set", "item.resolve", "board.read", "gate.report",
+        for method in ("item.create", "item.set", "item.resolve", "board.read", "board.settings",
+                       "gate.report",
                        "gate.receipts", "gate.waive", "gate.profile"):
             self.assertIn(method, control_client.DAEMON_METHODS)
 

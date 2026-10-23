@@ -12,7 +12,8 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
 
-pub const METHODS: &[&str] = &["item.create", "item.set", "item.resolve", "board.read", "board.owner_blocked"];
+pub const METHODS: &[&str] =
+    &["item.create", "item.set", "item.resolve", "board.read", "board.settings", "board.owner_blocked"];
 
 pub(crate) type RpcResult<T = Value> = Result<T, (ErrorCode, String)>;
 
@@ -26,6 +27,7 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         "item.set" => item_set(&ctx, &req.params),
         "item.resolve" => item_resolve(state, &ctx, &req.params),
         "board.read" => board_read(&ctx, &req.params),
+        "board.settings" => board_settings(&ctx, &req.params),
         // Every item blocked on Owner, across boards (the TUI's sidebar marker).
         "board.owner_blocked" => ctx.api.get("/items/owner-blocked", &[]),
         other => Err((ErrorCode::UnknownMethod, format!("unknown items method {other}"))),
@@ -311,11 +313,11 @@ pub(crate) fn slug(board: &Value) -> RpcResult<String> {
 
 /// Fields passed straight through to the API; "" clears a text field.
 const PASS_FIELDS: &[&str] = &[
-    "status", "note", "group", "blocked_on", "check_back", "eta", "title", "links", "blocked_by",
+    "status", "note", "group", "blocked_on", "check_back", "eta", "job", "title", "links", "blocked_by",
     // Gate bindings (doc/gate-receipts.md §8).
     "head", "mf", "ruling", "gate_class",
 ];
-const CLEARABLE: &[&str] = &["note", "group", "blocked_on", "check_back", "eta", "head", "mf", "ruling", "gate_class"];
+const CLEARABLE: &[&str] = &["note", "group", "blocked_on", "check_back", "eta", "job", "head", "mf", "ruling", "gate_class"];
 
 fn item_fields(ctx: &Ctx, params: &Value, skip_title: bool) -> RpcResult<Map<String, Value>> {
     let mut fields = Map::new();
@@ -353,6 +355,7 @@ fn compact(item: &Value) -> Value {
         "blocked_by": item["blocked_by"],
         "blocked_on": item["blocked_on"],
         "eta_at": item["eta_at"],
+        "job": item["job"],
     })
 }
 
@@ -656,13 +659,23 @@ pub(crate) fn slim_item(item: &Value, now: DateTime<Utc>) -> String {
     if let Some(on) = item["blocked_on"].as_str() {
         line.push_str(&format!(" on \"{on}\""));
     }
-    if item["status"] == "waiting" {
+    // The job beside the holder's session state, never merged: an idle
+    // session with a job in flight is both (doc/strict-boards.md §2.3).
+    if let Some(job) = item["job"].as_str() {
+        line.push_str(&format!(" job: {job}"));
+    }
+    if item["status"] == "waiting" || item["status"] == "active" {
         if let Some(eta) = parse_ts(&item["eta_at"]) {
             let left = (eta - now).num_seconds();
-            if left >= 0 {
-                line.push_str(&format!(" eta {}", short_duration(left)));
+            let eta = if left >= 0 {
+                format!("eta {}", short_duration(left))
             } else {
-                line.push_str(&format!(" eta passed {} ago", short_duration(-left)));
+                format!("eta passed {} ago", short_duration(-left))
+            };
+            if item["job"].is_string() {
+                line.push_str(&format!(" ({eta})"));
+            } else {
+                line.push_str(&format!(" {eta}"));
             }
         }
     }
@@ -715,7 +728,38 @@ fn board_header(header: &Value) -> Value {
             ))
         },
         "health": header["health"],
+        "backlog_allowed": header["settings"]["backlog_allowed"],
     })
+}
+
+fn names(rows: &Value) -> Vec<Value> {
+    rows.as_array()
+        .map(|v| v.iter().map(|s| s["name"].as_str().map(|n| json!(n)).unwrap_or_else(|| s["pid"].clone())).collect())
+        .unwrap_or_default()
+}
+
+/// [`launch_line`] at the current time (for the TUI's Alt+B banner).
+pub fn launch_line_now(launch: &Value) -> Option<String> {
+    launch_line(launch, Utc::now())
+}
+
+/// `2 unlaunched (#1496 18m, #1501 4m) · free: Batch-Valid, P1-Ingest`, or
+/// None when nothing is unlaunched and nobody is free.
+pub fn launch_line(launch: &Value, now: DateTime<Utc>) -> Option<String> {
+    let unlaunched = launch["unlaunched"].as_array().cloned().unwrap_or_default();
+    let free: Vec<&str> = launch["free"].as_array().map(|v| v.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    if unlaunched.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = unlaunched
+        .iter()
+        .map(|u| match parse_ts(&u["since"]) {
+            Some(t) => format!("#{} {}", u["n"], short_duration((now - t).num_seconds())),
+            None => format!("#{}", u["n"]),
+        })
+        .collect();
+    let free = if free.is_empty() { "nobody".to_string() } else { free.join(", ") };
+    Some(format!("{} unlaunched ({}) · free: {free}", unlaunched.len(), list.join(", ")))
 }
 
 /// Shape a `GET /boards/{ref}` reply for `board()`; pure, for tests.
@@ -740,11 +784,18 @@ pub(crate) fn shape_board(read: &Value, pid: &str, params: &Value, now: DateTime
     } else {
         read["recently_closed"].as_array().map(|v| v.iter().filter(keep).collect()).unwrap_or_default()
     };
-    let free: Vec<Value> = read["free_capacity"]
-        .as_array()
-        .map(|v| v.iter().map(|s| s["name"].as_str().map(|n| json!(n)).unwrap_or_else(|| s["pid"].clone())).collect())
-        .unwrap_or_default();
-    let mut out = json!({"board": board_header(&read["board"]), "free_capacity": free});
+    let mut out = json!({"board": board_header(&read["board"]), "free_capacity": names(&read["free_capacity"])});
+    // Working sessions on the board that hold no item: work it can't see.
+    if read["untracked"].as_array().is_some_and(|u| !u.is_empty()) {
+        out["untracked"] = json!(names(&read["untracked"]));
+    }
+    if full {
+        if read["launch"].is_object() {
+            out["launch"] = read["launch"].clone();
+        }
+    } else if let Some(line) = launch_line(&read["launch"], now) {
+        out["launch"] = json!(line);
+    }
     if full {
         out["flags"] = json!(flags);
         out["items"] = json!(items);
@@ -771,6 +822,28 @@ pub(crate) fn shape_board(read: &Value, pid: &str, params: &Value, now: DateTime
         };
     }
     out
+}
+
+/// `board(settings={...})`: change a board's settings (board members only;
+/// the API further leaves backlog_allowed and steward_pid to Owner and the
+/// orchestrator) and return the new header. A write, so not `board.read`,
+/// which the restart barrier treats as read-only.
+fn board_settings(ctx: &Ctx, params: &Value) -> RpcResult {
+    let Some(settings) = params.get("settings").and_then(Value::as_object).filter(|s| !s.is_empty()) else {
+        return Err(bad("settings must be a non-empty object, e.g. {\"backlog_allowed\": false}"));
+    };
+    let board = resolve_board(ctx, params)?;
+    authorize_edit(ctx, params, &board)?;
+    let slug = slug(&board)?;
+    let mut body = json!({"actor": ctx.actor()});
+    for (k, v) in settings {
+        if k == "actor" {
+            return Err(bad("actor is stamped by the daemon"));
+        }
+        body[k] = v.clone();
+    }
+    let header = ctx.api.patch(&format!("/boards/{slug}"), &body)?;
+    Ok(json!({"board": slug, "settings": header["settings"]}))
 }
 
 fn board_read(ctx: &Ctx, params: &Value) -> RpcResult {
@@ -896,7 +969,9 @@ mod tests {
                  "blocked_by":[14],"blocked_on":null,"flags":[],"note":null}
             ],
             "recently_closed": [{"n":9,"status":"done","title":"x","closed_at":"2026-10-06T10:00:00Z","note":"abc123","holders":[]}],
-            "free_capacity": [{"pid":"agent:d1:f","name":"idle-lane","state":"idle"}]
+            "free_capacity": [{"pid":"agent:d1:f","name":"idle-lane","state":"idle"}],
+            "untracked": [{"pid":"agent:d1:u","name":"busy-lane","state":"working"}],
+            "launch": {"unlaunched": [{"n":15,"title":"bench","since":"2026-10-06T12:02:00Z"}], "free": ["idle-lane"]}
         })
     }
 
@@ -913,6 +988,21 @@ mod tests {
         ]));
         assert_eq!(out["recently_closed"], json!(["#9 done \"x\" 2h20m ago · abc123"]));
         assert_eq!(out["free_capacity"], json!(["idle-lane"]));
+        assert_eq!(out["untracked"], json!(["busy-lane"]));
+        assert_eq!(out["launch"], "1 unlaunched (#15 18m) · free: idle-lane");
+    }
+
+    #[test]
+    fn slim_item_shows_the_job_beside_the_holders_state() {
+        let now = DateTime::parse_from_rfc3339("2026-10-06T12:20:00Z").unwrap().with_timezone(&Utc);
+        let item = json!({"n":1216,"status":"active","title":"pins gate","eta_at":"2026-10-06T12:45:00Z",
+            "job":"cm-gate pins L3","holders":[{"pid":"p","name":"release-4","state":{"state":"idle","for_s":720}}],
+            "flags":[]});
+        assert_eq!(slim_item(&item, now), "#1216 active \"pins gate\" @release-4[idle 12m] job: cm-gate pins L3 (eta 25m)");
+        let no_job = json!({"n":2,"status":"active","title":"t","eta_at":"2026-10-06T12:00:00Z","holders":[],"flags":[]});
+        assert_eq!(slim_item(&no_job, now), "#2 active \"t\" (no holder) eta passed 20m ago");
+        assert_eq!(launch_line(&json!({"unlaunched":[],"free":["a"]}), now), None);
+        assert_eq!(launch_line(&json!({"unlaunched":[{"n":3}],"free":[]}), now).unwrap(), "1 unlaunched (#3) · free: nobody");
     }
 
     #[test]
@@ -1152,6 +1242,38 @@ mod tests {
         assert_eq!(body["set"]["mf"], json!("c".repeat(40)));
         assert_eq!(body["set"]["ruling"], "EP-A1");
         assert!(body["set"]["head"].is_null() && body["set"].get("head").is_some());
+    }
+
+    #[test]
+    fn board_settings_patches_the_board_and_job_passes_through() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("PATCH", "/boards/sfd") => (200, r#"{"slug":"sfd","settings":{"backlog_allowed":false,"launch_s":900}}"#.into()),
+            ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[],"unblocked":[],"warnings":[]}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let resp = call(&state, "me-uid", "board.settings", json!({"settings":{"backlog_allowed":false,"idle_s":1800}}));
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(resp.result.as_ref().unwrap()["settings"]["backlog_allowed"], false);
+        let resp = call(&state, "me-uid", "board.settings", json!({"settings":{}}));
+        assert!(!resp.ok);
+        let resp = call(&state, "me-uid", "board.settings", json!({"settings":{"actor":{"pid":"owner"}}}));
+        assert!(!resp.ok, "an agent cannot pose as Owner");
+        let resp = call(&state, "me-uid", "item.set", json!({"n":3,"eta":"40m","job":"pins L3"}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let resp = call(&state, "me-uid", "item.set", json!({"n":3,"job":""}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let seen = seen.lock().unwrap();
+        let (_, _, body) = seen.iter().find(|(m, p, _)| m == "PATCH" && p == "/boards/sfd").unwrap();
+        assert_eq!(body["backlog_allowed"], false);
+        assert_eq!(body["idle_s"], 1800);
+        assert_eq!(body["actor"]["pid"], "agent:d1:me-uid");
+        let sets: Vec<&Value> = seen.iter().filter(|(m, p, _)| m == "PATCH" && p == "/boards/sfd/items").map(|(_, _, b)| &b["set"]).collect();
+        assert_eq!(sets[0]["job"], "pins L3");
+        assert!(sets[1]["job"].is_null() && sets[1].get("job").is_some(), "\"\" clears the job");
     }
 
     #[test]

@@ -27,6 +27,7 @@ from dispatch.items_rules import SUGGESTED
 # orchestrator or Owner: a stale receipt to rerun, a suggestion to confirm.
 HOLDER_ONLY_FLAGS = GATE_HOLDER_ONLY | {SUGGESTED}
 from dispatch.items_rules import CLOSED, OWNER_BLOCKED, BoardTx, Item, iso
+from dispatch.items_rules import strict, strict_violation
 
 logger = logging.getLogger("cm.board_engine")
 
@@ -43,7 +44,12 @@ ENGINE_KINDS = frozenset({
     "unassigned", "holder_gone", "holder_idle", "holder_waiting_on_human",
     "holder_errored", "stale", "stale_background", "overdue", "check_back",
     "blocker_dropped", "eta_passed",
+    # Strict boards only (doc/strict-boards.md).
+    "needs_triage", "unlaunched", "holder_overloaded",
 })
+# Warnings for the orchestrator's sweep, never an Owner page: a migration
+# backlog (needs_triage) or a holder with too many items (holder_overloaded).
+NO_ESCALATE = frozenset({"needs_triage", "holder_overloaded"})
 # An active item whose ETA passed with no activity since becomes stale this
 # long after the ETA (Board-Steward, 2026-10-20: a fixed grace, not a formula).
 ETA_STALE_GRACE_S = 1800
@@ -261,6 +267,64 @@ def compute_flags(item: Item, states: dict, items: dict[int, Item], board: dict,
     if (item.blocked_on and item.check_back_at and now >= item.check_back_at
             and not eta_window):
         flags["check_back"] = {"check_back_at": iso(item.check_back_at)}
+
+    if strict(board):
+        flags.update(strict_flags(item, status, items, board, now, "holder_gone" in flags))
+    return flags
+
+
+def in_eta(item: Item, now: datetime) -> bool:
+    """Inside a declared job's ETA: the holder need not be on it right now."""
+    return item.status == "active" and item.eta_at is not None and now < item.eta_at
+
+
+def strict_flags(item: Item, status: dict, items: dict[int, Item], board: dict,
+                 now: datetime, gone: bool) -> dict[str, dict]:
+    """needs_triage, unlaunched and holder_overloaded (doc/strict-boards.md
+    §2.5, §3.2, §4.1). `status` is each holder's flag-purpose state."""
+    flags: dict[str, dict] = {}
+    reason = strict_violation(item, board, now)
+    if reason:
+        flags["needs_triage"] = {"reason": reason}
+    if item.status != "active":
+        return flags
+
+    # Unlaunched: actionable for launch_s and nobody live is on it. A holder
+    # is on it when it touched the item since it became actionable or is not
+    # sitting idle (unknown counts as live: it is never proof of absence).
+    # Gone holders are holder_gone's, the louder flag; a handback then
+    # starts this clock. A passed check_back never makes an item actionable.
+    anchor = item.actionable_at or max(
+        (t for t in (item.created_at, item.clock_reset_at, item.touched_at) if t is not None),
+        default=now)
+    on_it = bool(item.holders) and (
+        (item.touched_at is not None and item.touched_at > anchor)
+        or any(status[h["pid"]] != "idle" for h in item.holders))
+    launch_s = board.get("launch_s") or 900
+    if not gone and not on_it and _seconds(now - anchor) >= launch_s:
+        flags["unlaunched"] = {"actionable_at": iso(anchor)}
+
+    # Overloaded: a holder with more active items than the board allows,
+    # not counting items inside a job's ETA. Its most recently touched items
+    # are its focus; the rest carry the warning. The orchestrator and the
+    # steward hold coordination items and are exempt.
+    if not in_eta(item, now):
+        limit = board.get("max_active_per_holder") or 2
+        exempt = {board.get("orchestrator_pid"), board.get("steward_pid"),
+                  board.get("resolved_orchestrator_pid")}
+        over = []
+        for h in item.holders:
+            if h["pid"] in exempt:
+                continue
+            counted = sorted(
+                (o for o in items.values()
+                 if o.status == "active" and o.archived_at is None and not in_eta(o, now)
+                 and any(x["pid"] == h["pid"] for x in o.holders)),
+                key=lambda o: (o.touched_at or now, o.n), reverse=True)
+            if len(counted) > limit and item.n not in {o.n for o in counted[:limit]}:
+                over.append(h.get("name") or h["pid"])
+        if over:
+            flags["holder_overloaded"] = {"holders": sorted(over)}
     return flags
 
 
@@ -303,7 +367,8 @@ def _short(seconds: float) -> str:
     return f"{s // 86400}d"
 
 
-def describe(flag: dict, item: Item | None, states: dict, now: datetime) -> str:
+def describe(flag: dict, item: Item | None, states: dict, now: datetime,
+             free: list[str] | None = None) -> str:
     """`#14 holder_idle (rl-scale-out idle 24m)` for push texts."""
     kind, n, detail = flag["kind"], flag["n"], flag.get("detail") or {}
     why = ""
@@ -343,6 +408,19 @@ def describe(flag: dict, item: Item | None, states: dict, now: datetime) -> str:
         what = (f"runner {detail.get('runner_sha')}" if kind == "runner_void"
                 else f"input {detail.get('input')}")
         why = f"{what} VOID ×{detail.get('count')} in 24 h"
+    elif kind == "needs_triage":
+        why = f"{detail.get('reason')}: not allowed on this board"
+    elif kind == "unlaunched" and item is not None:
+        since = detail.get("actionable_at")
+        try:
+            age = _short(_seconds(now - datetime.fromisoformat(since)))
+        except (TypeError, ValueError):
+            age = "?"
+        why = f"no live holder on it {age}"
+        if free:
+            why += "; free: " + ", ".join(free[:3])
+    elif kind == "holder_overloaded":
+        why = f"{', '.join(detail.get('holders', []))} holds more active items than this board allows"
     elif kind == "blocker_dropped":
         why = "blocker " + ", ".join(f"#{b}" for b in detail.get("blockers", [])) + " dropped"
     return f"#{n} {kind}" + (f" ({why})" if why else "")
@@ -473,6 +551,13 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
             states = await _states(conn, pids)
             live = await _live_daemons(conn, now)
             snoozed = await _snoozed(conn, board["id"], now)
+            orch = await _orchestrator_row(conn, board, now)
+            board["resolved_orchestrator_pid"] = (orch or {}).get("pid")
+            # Holders already warned as overloaded (before this pass): a
+            # holder hears once per episode, not once per flagged item.
+            overloaded = {name for it in items.values()
+                          for name in ((it.open_flags.get("holder_overloaded") or {})
+                                       .get("detail") or {}).get("holders", [])}
             tx = BoardTx(board, items, ENGINE_ACTOR, now)
 
             for item in sorted(items.values(), key=lambda i: i.n):
@@ -511,12 +596,24 @@ async def tick_board(pool, board_id: str, now: datetime | None = None) -> dict:
                                      f"past its eta: update it (new eta, done, or hand back).")
                         _mark(item, f"{kind}:holder", kind, detail, now)
                         tx.dirty.add(item.n)
+                    if kind == "holder_overloaded":
+                        for h in item.holders:
+                            name = h.get("name") or h["pid"]
+                            if name in detail["holders"] and name not in overloaded:
+                                overloaded.add(name)
+                                count = sum(1 for o in items.values() if o.status == "active"
+                                            and any(x["pid"] == h["pid"] for x in o.holders))
+                                tx._push(item, h, kind,
+                                         f"[cm-board {board['slug']}] you hold {count} active items "
+                                         f"(this board allows {board.get('max_active_per_holder') or 2} "
+                                         f"outside a job's eta). Block or hand back the ones you're "
+                                         f"not on: item_set(n, blocked_by=[m]) / item_set(n, "
+                                         f"holder=\"none\").")
                 for kind in sorted(set(item.open_flags) - set(want)):
                     if kind in ENGINE_KINDS and tx.resolve_flag(item, kind, "cleared"):
                         summary["cleared"].append((item.n, kind))
             await items_db._apply(conn, tx)
 
-            orch = await _orchestrator_row(conn, board, now)
             await _push_orchestrator(conn, board, items, states, orch, now, summary)
             await _escalate(conn, board, items, orch, now, summary)
     return summary
@@ -571,7 +668,12 @@ async def _push_orchestrator(conn, board, items, states, orch, now, summary) -> 
                            uuid.UUID(board["id"]), now)
     if not due and not closed:
         return
-    parts = [describe(f, items.get(f["n"]), states, now) for f in due]
+    free = None
+    if any(f["kind"] == "unlaunched" for f in due):
+        rows, _ = await items_db._free_capacity(
+            conn, board, now, [orch.get("pid"), board.get("steward_pid")])
+        free = [r["name"] or r["pid"] for r in rows if r["state"] == "idle"]
+    parts = [describe(f, items.get(f["n"]), states, now, free) for f in due]
     text = compose(board["slug"], parts, closed)
     await _push(conn, board["id"], orch, "board", text, now)
     if due:
@@ -593,6 +695,7 @@ async def _escalate(conn, board, items, orch, now, summary) -> None:
     threshold = timedelta(seconds=board["escalate_s"])
     stuck = [f for f in flags if f["escalated_at"] is None and now - f["raised_at"] >= threshold
              and f["kind"] not in GATE_FLAG_KINDS and f["kind"] not in HOLDER_ONLY_FLAGS
+             and f["kind"] not in NO_ESCALATE
              and _due(f, items.get(f["n"]), ":escalated")]
     if not stuck:
         return

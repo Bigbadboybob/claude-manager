@@ -29,6 +29,7 @@ MAX_TITLE = 200
 MAX_NOTE = 500
 MAX_GROUP = 80
 MAX_BLOCKED_ON = 200
+MAX_JOB = 200
 MAX_LINKS = 20
 MAX_LINK = 500
 MAX_ITEMS_PER_CALL = 50
@@ -39,7 +40,51 @@ SNOOZE_SETTING = {
     "holder_idle": "idle_s",
     "stale": "stale_s",
     "unassigned": "unassigned_s",
+    "unlaunched": "launch_s",
 }
+
+# Strict boards (`backlog_allowed: false`, doc/strict-boards.md): what each
+# non-conforming shape is called on a needs_triage flag, and the call that
+# fixes it.
+TRIAGE_FIX = {
+    "waiting": 'item_set(n, "active", eta="40m", job="...") for a job in flight, '
+               'or block it with its trigger',
+    "open": 'give it a holder (item_set(n, holder=...)) or drop it and file a planning task',
+    "no_trigger": 'item_set(n, blocked_by=[m]) or item_set(n, blocked_on="...", check_back="4h")',
+    "no_check_back": 'item_set(n, check_back="4h")',
+    "check_back_too_far": 'item_set(n, check_back="24h") (a closer check-back)',
+    "job_without_eta": 'item_set(n, eta="40m")',
+}
+
+
+def strict(board: dict) -> bool:
+    """A board that holds only running or blocked work."""
+    return board.get("backlog_allowed") is False
+
+
+def check_back_max(board: dict) -> timedelta:
+    return timedelta(seconds=board.get("check_back_max_s") or 259200)
+
+
+def strict_violation(it: "Item", board: dict, now: datetime) -> str | None:
+    """Why an open item does not fit a strict board (a TRIAGE_FIX key), or None."""
+    if it.status in CLOSED:
+        return None
+    if it.status == "waiting":
+        return "waiting"
+    if it.status == "open":
+        return "open"
+    if it.status == "blocked" and not it.blocked_by:
+        if not it.blocked_on:
+            return "no_trigger"
+        if it.check_back_at is None:
+            return "no_check_back"
+        if it.check_back_at > now + check_back_max(board):
+            return "check_back_too_far"
+    if it.status == "active" and it.job and it.eta_at is None:
+        return "job_without_eta"
+    return None
+
 
 _DURATION = re.compile(r"^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
 
@@ -98,6 +143,8 @@ class Item:
     check_back_at: datetime | None = None
     eta_at: datetime | None = None
     waiting_set_at: datetime | None = None
+    job: str | None = None                            # the job in flight (active only)
+    actionable_at: datetime | None = None             # unlaunched clock start
     links: list = field(default_factory=list)
     touched_at: datetime | None = None
     clock_reset_at: datetime | None = None
@@ -123,6 +170,7 @@ class Item:
             "blocked_by": sorted(self.blocked_by),
             "check_back_at": iso(self.check_back_at),
             "eta_at": iso(self.eta_at),
+            "job": self.job,
             "links": list(self.links),
             "holders": [h["pid"] for h in self.holders],
         }
@@ -143,6 +191,8 @@ class Item:
             "check_back_at": iso(self.check_back_at),
             "eta_at": iso(self.eta_at),
             "waiting_set_at": iso(self.waiting_set_at),
+            "job": self.job,
+            "actionable_at": iso(self.actionable_at),
             "links": list(self.links),
             "touched_at": iso(self.touched_at),
             "clock_reset_at": iso(self.clock_reset_at),
@@ -325,6 +375,45 @@ class BoardTx:
                 return [frm, *rest]
         return None
 
+    # ---- strict boards -------------------------------------------------
+    def _launch_min(self) -> int:
+        return max(1, int((self.board.get("launch_s") or 900) // 60))
+
+    def _check_strict(self, it: Item, status: str, explicit, prev_status, creating: bool,
+                      holders: list, fields: dict, blockers_given: bool):
+        """Refuse new non-conforming intent on a strict board, naming the
+        call that conforms (doc/strict-boards.md §2.2). A write that leaves an
+        already non-conforming item as it was still succeeds (needs_triage
+        carries it); only entering such a state is refused."""
+        n, slug = it.n, self.board["slug"]
+        entering = creating or status != prev_status
+        if status == "waiting" and (entering or explicit == "waiting"):
+            raise invalid("waiting_not_allowed",
+                          f"board {slug} holds only running or blocked work. A job in flight: "
+                          f'item_set({n}, "active", eta="40m", job="..."). Waiting on '
+                          f"something: item_set({n}, blocked_by=[m]), or "
+                          f'item_set({n}, blocked_on="...", check_back="4h")', field="status")
+        unheld = status == "open" or (creating and status == "active" and not holders)
+        if unheld and (entering or explicit == "open"):
+            raise invalid("holder_required",
+                          f"board {slug} keeps no backlog: give #{n if not creating else 'it'} "
+                          f"a holder (holder=...), launch it with item_resolve(n, \"launch\"), "
+                          f"or file future work as a planning task (propose_task)",
+                          field="holders")
+        touches_block = blockers_given or "blocked_on" in fields or "check_back" in fields
+        if status == "blocked" and (entering or touches_block) and not it.blocked_by:
+            if not it.blocked_on:
+                raise invalid("trigger_required",
+                              f"on board {slug} a blocked item names its trigger: "
+                              f"item_set({n}, blocked_by=[m]) for an item, or "
+                              f'item_set({n}, blocked_on="...", check_back="4h")',
+                              field="blocked_by")
+            if it.check_back_at is None:
+                raise invalid("check_back_required",
+                              f"on board {slug} blocking on free text needs a check-back: "
+                              f'item_set({n}, blocked_on="{it.blocked_on}", check_back="4h")',
+                              field="check_back")
+
     # ---- operations ----------------------------------------------------
     def create(self, specs: list[dict]) -> list[int]:
         if not specs:
@@ -377,7 +466,7 @@ class BoardTx:
         it = self.item(n)
         unknown = set(fields) - {
             "status", "title", "note", "group", "blocked_by", "blocked_on",
-            "check_back", "eta", "links",
+            "check_back", "eta", "job", "links",
         }
         if unknown:
             raise invalid("invalid_field", f"unknown fields: {sorted(unknown)}",
@@ -385,6 +474,7 @@ class BoardTx:
         prev = None if creating else it.snapshot()
         prev_status = None if creating else it.status
         prev_pids = [] if creating else [h["pid"] for h in it.holders]
+        strict_board = strict(self.board)
 
         explicit = fields.get("status")
         if "status" in fields and (explicit is None or explicit not in STATUSES):
@@ -403,6 +493,16 @@ class BoardTx:
         if "check_back" in fields:
             it.check_back_at = (None if fields["check_back"] is None
                                 else parse_when(fields["check_back"], self.now, "check_back"))
+            if (strict_board and it.check_back_at is not None
+                    and it.check_back_at > self.now + check_back_max(self.board)):
+                hours = int(check_back_max(self.board).total_seconds() // 3600)
+                raise invalid("check_back_too_far",
+                              f"#{n}: board {self.board['slug']} takes a check_back at most "
+                              f"{hours}h out, so it stays a real next look: "
+                              f'item_set({n}, check_back="24h")', field="check_back")
+        job_given = "job" in fields and fields["job"] is not None
+        if "job" in fields:
+            it.job = _text(fields["job"], MAX_JOB, "job")
         eta_given = "eta" in fields and fields["eta"] is not None
         if "eta" in fields:
             it.eta_at = None if fields["eta"] is None else parse_when(fields["eta"], self.now, "eta")
@@ -448,7 +548,13 @@ class BoardTx:
             if creating:
                 status = "active" if new_holders else "open"
             elif holders_changed and status not in CLOSED:
-                if not new_holders and status == "active":
+                if not new_holders and status == "active" and strict_board:
+                    # A handback on a strict board is accepted: the item
+                    # stays active, unheld, and goes unlaunched.
+                    self.warnings.append(
+                        f"#{n} has no holder now; it stays active and the orchestrator is "
+                        f"told if nobody takes it within {self._launch_min()} min (unlaunched)")
+                elif not new_holders and status == "active":
                     status = "open"
                 elif not new_holders:
                     # Blocked/waiting keep their blockers or ETA; stale and
@@ -464,10 +570,16 @@ class BoardTx:
                 elif "blocked_on" in fields and it.blocked_on and status != OWNER_BLOCKED:
                     status = "blocked"
                 elif eta_given:
-                    status = "waiting"
+                    # A strict board has no waiting: an eta means a job in
+                    # flight on an active item.
+                    status = "active" if strict_board else "waiting"
                 elif (blockers_given and not it.blocked_by and status == "blocked"
                       and not it.blocked_on):
-                    status = "active" if new_holders else "open"
+                    status = "active" if new_holders or strict_board else "open"
+
+        if strict_board:
+            self._check_strict(it, status, explicit, prev_status, creating, new_holders,
+                               fields, blockers_given)
 
         # Blocked on Owner: who may enter and leave it.
         actor_pid = self.actor["pid"]
@@ -527,7 +639,30 @@ class BoardTx:
             it.eta_at = None
             it.waiting_set_at = None
 
+        # A job in flight rides on an active item; leaving active clears it.
+        # On a strict board it needs an eta, so it always expires.
+        if status != "active":
+            if job_given:
+                raise invalid("invalid_field",
+                              f'job requires status active: item_set({n}, "active", eta="40m", '
+                              f'job="...")', field="job")
+            it.job = None
+        elif strict_board and it.job and it.eta_at is None:
+            raise invalid("eta_required",
+                          f"#{n}: a job needs an eta on board {self.board['slug']}: "
+                          f'item_set({n}, "active", eta="40m", job="{it.job}")', field="eta")
+
+        # The unlaunched clock: created or entering active, or its holders
+        # changed (an assignment or a handback) while active.
+        if status == "active" and (creating or prev_status != "active" or holders_changed):
+            it.actionable_at = self.now
+
         it.status = status
+        if strict_board:
+            reason_ = strict_violation(it, self.board, self.now)
+            if reason_:
+                self.warnings.append(f"#{n} does not fit board {self.board['slug']} "
+                                     f"({reason_}): {TRIAGE_FIX[reason_]}")
         if (status == OWNER_BLOCKED) != (prev_status == OWNER_BLOCKED) and not creating:
             self.owner_transitions.append((n, status == OWNER_BLOCKED))
         elif creating and status == OWNER_BLOCKED:
@@ -591,8 +726,10 @@ class BoardTx:
                             new={"blocked_by": sorted(dep.blocked_by)},
                             reason=f"#{it.n} done")
                 continue
-            dep.status = "active" if dep.holders else "open"
+            dep.status = "active" if dep.holders or strict(self.board) else "open"
             dep.clock_reset_at = self.now
+            if dep.status == "active":
+                dep.actionable_at = self.now
             self.unblocked.append(dep.n)
             self._event(dep, "unblocked", prev={"status": "blocked", "blocked_by": [it.n]},
                         new={"status": dep.status, "blocked_by": []}, reason=f"#{it.n} done")
@@ -695,7 +832,8 @@ class BoardTx:
                 raise invalid("invalid_field", f"#{n} is not blocked on Owner", field="action")
             answer = _text(message, MAX_NOTE, "message", required=True)
             resolved = [k for k in sorted(it.open_flags) if self.resolve_flag(it, k, "answer")]
-            self.apply(n, {"status": "active" if it.holders else "open", "note": f"Owner: {answer}"},
+            self.apply(n, {"status": "active" if it.holders or strict(self.board) else "open",
+                           "note": f"Owner: {answer}"},
                        reason=f"answer: {answer}", answered=True)
             self._event(it, "resolved", new={"action": action, "flags": resolved},
                         reason=f"answer: {answer}")

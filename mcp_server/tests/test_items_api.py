@@ -459,7 +459,57 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(board["free_capacity"], [])  # lane holds an active item
         await self.patch(1, status="done")
         board = await self.read()
-        self.assertEqual([s["pid"] for s in board["free_capacity"]], [LANE["pid"]])
+        # Lane holds nothing now, but it is the board's orchestrator, which is
+        # never capacity (doc/strict-boards.md §4.2).
+        self.assertEqual(board["free_capacity"], [])
+
+    async def test_strict_board_setting_refusals_job_and_capacity(self):
+        now = datetime.now(timezone.utc)
+
+        async def live(who, state, engine="codex"):
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO session_states (pid, daemon_id, session_uid, task_id, name,
+                                                   engine, state, state_since, reported_at)
+                       VALUES ($1, 'd1', $2, $3, $4, $5, $6, $7, $7)""",
+                    who["pid"], who["session_uid"], uuid.UUID(self.root), who["name"],
+                    engine, state, now)
+
+        steward, busy, spare, sh = agent("steward"), agent("busy"), agent("spare"), agent("sh")
+        await live(ORCH, "working")
+        for who, st, engine in ((steward, "idle", "codex"), (busy, "working", "codex"),
+                                (spare, "idle", "claude-code"), (sh, "idle", "bash")):
+            await live(who, st, engine)
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "orchestrator_pid": ORCH["pid"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        # Only Owner or the orchestrator makes a board strict.
+        r = await self.http.patch(f"/boards/{self.ref}",
+                                  json={"actor": LANE, "backlog_allowed": False})
+        self.assertEqual(r.status_code, 403, r.text)
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": ORCH, "backlog_allowed": False, "steward_pid": steward["pid"],
+            "launch_s": 600, "max_active_per_holder": 3})
+        self.assertEqual(r.status_code, 200, r.text)
+        settings = r.json()["settings"]
+        self.assertEqual((settings["backlog_allowed"], settings["launch_s"],
+                          settings["max_active_per_holder"], settings["check_back_max_s"]),
+                         (False, 600, 3, 259200))
+        r = await self.create({"title": "later", "holders": []}, ok=False)
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "holder_required"))
+        await self.create({"title": "bench", "holders": [LANE]})
+        r = await self.patch(1, actor=LANE, ok=False, status="waiting", eta="40m")
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "waiting_not_allowed"))
+        await self.patch(1, actor=LANE, eta="40m", job="pins L3")
+        board = await self.read()
+        (it,) = board["items"]
+        self.assertEqual((it["status"], it["job"]), ("active", "pins L3"))
+        self.assertIsNotNone(it["actionable_at"])
+        # Free capacity: no bash pane, orchestrator or steward; a working
+        # session holding nothing is untracked, not free.
+        self.assertEqual([r["name"] for r in board["free_capacity"]], ["spare"])
+        self.assertEqual([r["name"] for r in board["untracked"]], ["busy"])
+        self.assertEqual(board["launch"], {"unlaunched": [], "free": ["spare"]})
 
     async def test_orchestrator_auto_pick_skips_bash_and_prefers_recent_agents(self):
         now = datetime.now(timezone.utc)

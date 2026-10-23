@@ -46,6 +46,7 @@ class ItemFields(_Strict):
     blocked_on: str | None = None
     check_back: When | None = None
     eta: When | None = None
+    job: Short | None = None
     links: list[str] | None = None
     # Gate bindings (doc/gate-receipts.md §8); item_set only.
     head: Short | None = None
@@ -78,6 +79,10 @@ class BoardPatchBody(_Strict):
     stale_background_s: Seconds | None = None
     nudge_grace_s: Seconds | None = None
     holder_idle_enabled: bool | None = None
+    backlog_allowed: bool | None = None
+    launch_s: Seconds | None = None
+    max_active_per_holder: Annotated[int, Field(ge=1, le=50)] | None = None
+    check_back_max_s: Seconds | None = None
     gate_default_class: Short | None = None
     gate_editors: list[Short] | None = Field(default=None, max_length=20)
     waiver_grantors: list[Short] | None = Field(default=None, max_length=20)

@@ -36,12 +36,19 @@ holder state is shown verbatim and never treated as idle or closed.
 | `blocked_by` | `[n]` | open items on the same board |
 | `blocked_on` | str ≤ 200 | free text; no flag exemption |
 | `check_back_at` | ts | re-flag time for `blocked_on` |
-| `eta_at`, `waiting_set_at` | ts | set with `waiting` |
+| `eta_at`, `waiting_set_at` | ts | set with `waiting`, or on `active` |
+| `job` | str ≤ 200 | the job in flight on an `active` item (lane, PID, cell id) |
+| `actionable_at` | ts | when it last became actionable (created or entered `active`, unblocked, handed back, assigned); the `unlaunched` clock |
 | `links` | `[str]` ≤ 20 | task id, branch/SHA, message id, path, URL |
 | `touched_at` | ts | last status/note/holder change |
 | `clock_reset_at` | ts | set on auto-unblock |
 | `closed_at`, `archived_at` | ts | |
 | `created_by` | pid | |
+
+**Strict boards.** A board with `backlog_allowed: false` (§4 settings) holds
+only running or blocked work; see §2 rule 11 and
+[strict-boards.md](strict-boards.md). Every other board keeps the rules
+below unchanged.
 
 Timestamps on the wire are RFC 3339 UTC strings from the **API server clock**.
 Durations sent by daemons are relative seconds, so host clock skew never matters.
@@ -64,6 +71,8 @@ re-read fully every ~30 s.
    Without an explicit status, a non-empty `blocked_by` or `blocked_on` sets
    `blocked`, an `eta` sets `waiting`, and clearing the last blocker of a
    `blocked` item with no `blocked_on` sets `active` (`open` if unheld).
+   On a strict board an `eta` keeps the item `active`, and a handback or an
+   unblock leaves an unheld item `active` (never `open`).
    Only a `blocked` item carries `blocked_by` / `blocked_on` / `check_back`:
    leaving `blocked` clears them, and passing them with another explicit
    status is `422 invalid_field`. `blocked` with neither returns a warning.
@@ -97,7 +106,10 @@ re-read fully every ~30 s.
    carry an ETA too (explicit `status="active"` with `eta`: working, expected
    done by then; kept on later edits while it stays `active`); `eta` with any
    other explicit status is refused. `waiting` stays for parked work.
-   `check_back` takes the same forms.
+   `check_back` takes the same forms. `job` rides on an `active` item like
+   its ETA: passing it with another explicit status is `422 invalid_field`,
+   and leaving `active` clears it. On a strict board a `job` needs an `eta`
+   (`422 eta_required`), so it always expires.
 5. **Done.** Remove edges where the item is a blocker. Each dependent left with
    no blockers, status `blocked` and no `blocked_on` returns to `active` with
    `clock_reset_at=now` and an `unblocked` push to its holders. Set
@@ -126,6 +138,22 @@ re-read fully every ~30 s.
 10. **Editing rights** (enforced by the daemon, §5): any session whose task
    resolves to the board, any current holder on it, a `global_perms` session,
    and Owner. Reading is open to every session.
+11. **Strict boards** (`backlog_allowed: false`). New non-conforming intent
+   is refused, and every refusal names the call that conforms; releases are
+   accepted and flagged. A write that leaves an already non-conforming item
+   as it was still succeeds, with a warning (`needs_triage` carries it).
+
+   | Write | Strict board |
+   |---|---|
+   | entering `waiting` | `422 waiting_not_allowed`: active + `eta` + `job` for a job in flight, else `blocked_by` / `blocked_on` + `check_back` |
+   | an `eta` with no status | keeps (or makes) the item `active` |
+   | `open`, or a new item with no holder | `422 holder_required`: give it a holder, `item_resolve(n, "launch")`, or file a planning task |
+   | `holder="none"` on an `active` item | accepted: stays `active`, unheld, with a warning; `unlaunched` after `launch_s` |
+   | `blocked` with neither trigger | `422 trigger_required` |
+   | `blocked_on` as the only trigger without `check_back` | `422 check_back_required` |
+   | `check_back` beyond `check_back_max_s` (72 h) | `422 check_back_too_far` |
+   | unheld `blocked` (by items, or on text with a check-back) | allowed: its trigger reaches someone |
+   | `blocked_on_owner` | unchanged |
 
 ## 3. Holder state
 
@@ -164,6 +192,10 @@ also raised by the write path. Thresholds are per board:
 | `orchestrator_pid` | null = auto (below) |
 | `steward_pid` | null; its `#N` posts are recorded on any item (§2). Set only by Owner or the board's current orchestrator (else `403`) |
 | `channel` | null; the conversation path whose `#N` means this board's item N |
+| `backlog_allowed` | true; false makes the board strict (§2 rule 11). Set only by Owner or the board's current orchestrator (else `403`) |
+| `launch_s` | 900 (strict boards: `unlaunched`) |
+| `max_active_per_holder` | 2 (strict boards: `holder_overloaded`) |
+| `check_back_max_s` | 259200 (72 h; strict boards) |
 
 | Kind | Raised when |
 |---|---|
@@ -177,6 +209,9 @@ also raised by the write path. Thresholds are per board:
 | `eta_passed` | `active` with an ETA (capped at `stale_background_s` after it was set, so a far ETA cannot silence an item for weeks), `now ≥ eta_at`, and no activity since (`max(touched_at, clock_reset_at) ≤ eta_at`); `ETA_STALE_GRACE_S` (1800, fixed) after the ETA, still without activity, `stale` too (detail `{eta_at}`, no nudge round). New activity or a new ETA clears both |
 | `check_back` | `blocked_on` set and `check_back_at` passed |
 | `blocker_dropped` | a blocker of this item was dropped |
+| `needs_triage` | strict board: the item does not fit (detail `{reason}`: `waiting`, `open`, `no_trigger`, `no_check_back`, `check_back_too_far`, `job_without_eta`). Raised for every legacy item when the board turns strict; statuses are never rewritten. Clears when it conforms, or when the board allows backlog again. Reaches only the orchestrator and is never escalated |
+| `unlaunched` | strict board: `active`, `now − actionable_at ≥ launch_s`, `holder_gone` not raised, and nobody live on it: no holder, or every holder `idle` with no touch since `actionable_at` (`unknown` counts as live). A passed `check_back` never starts this clock. Detail `{actionable_at}`. To the orchestrator, naming up to three idle free sessions; escalates like other flags |
+| `holder_overloaded` | strict board: a holder (not the orchestrator or steward) holds more than `max_active_per_holder` `active` items outside a job's ETA; raised on each such item beyond its most recently touched ones. Detail `{holders}`. The holder gets one push per episode; the orchestrator sees it in its push; never escalated, never reassigns |
 | `suggested_transition` | a holder's, the steward's or the orchestrator's post about exactly one item (a thread reply must name that item itself) says `DONE`, `GREEN` or `DEPLOYED` (→ done) or `STOP` (→ blocked), in capitals. Never counted: quoted lines, code (fences, backticks), a word followed by `?`, "GREEN light", or a negation, condition or future (`not`, `don't`, `once`, `will be`, …) in the four words before it; conflicting words suggest nothing. Not raised on items blocked on Owner. Detail `{to, keyword, by, message_id}`. A suggestion only: the holders and the steward get one push per target (a new target settles the old suggestion and is pushed afresh); it never reaches the orchestrator or Owner; any status change settles it. `item_resolve(n, "apply", to=…)` confirms exactly that target (409 `suggestion_changed` if it moved); `"dismiss"` rejects it, and that target is not suggested again until the item's status or head changes (Alt+B `x` → 5 / 6) |
 
 "Held" means `active`, `waiting`, `blocked`, or `open` with holders: an
@@ -206,8 +241,12 @@ item closes, or the action name when resolved by `item_resolve`. `nudge` sets
 `snooze_until = now + <that kind's threshold>`; the flag is resolved and may
 re-raise only after the snooze.
 
-**Free capacity** (not a flag): sessions on the board (task resolves to it or
-holding any item there) that are live and hold no `active`/`waiting` item.
+**Free capacity** (not a flag): live agent sessions on the board (task
+resolves to it or holding any item there) that hold no `active`/`waiting`
+item, never bash panes, the orchestrator or the steward, idle ones first.
+Those that are `working`/`working-background` are listed as `untracked`
+instead: busy with work the board does not show. `launch` pairs the
+`unlaunched` items with the free sessions.
 
 **Orchestrator.** `orchestrator_pid` if set; else a live session bound to the
 initiative's `coordinator_task_id` (task board: the root task). Bash panes
@@ -233,6 +272,7 @@ ids are acked on the next beat; unacked rows are re-sent.
 | `stale_nudge` | holder | `stale` first holds (the orchestrator hears only after `nudge_grace_s`) |
 | `owner_blocked` | orchestrator | an item enters or leaves `blocked_on_owner` (immediately, not batched) |
 | `nudge` | holders | `item_resolve(nudge)` |
+| `holder_overloaded` | the overloaded holder | once per episode (strict boards) |
 | `overdue` / `eta_passed` | holder when raised; orchestrator once the flag is `repush_s` old | flag |
 | `board` | orchestrator | flags that are news: raised, or open while their item changed since they last reached the orchestrator (below); done/dropped/blocked events by others than the orchestrator, batched over a `digest_s` window. One row per orchestrator per tick, carrying only the news; no push without a live orchestrator |
 | `escalation` (`owner_alert`) | Owner via the orchestrator's daemon (else the coordinator's most recent session, live or not) | no orchestrator, or it is `idle`/`unknown`/gone/`errored`/`waiting-on-human`, and flags unresolved for `escalate_s`; once per flag and item state |
@@ -263,14 +303,16 @@ Bearer token as for every endpoint. Errors are `{"detail": {"code", "message", �
 with codes `not_found` (404), `cycle` and `board_not_empty` (409, plus `cycle: [n…]` /
 `open_items`),
 `invalid_blocker`, `eta_required`, `invalid_status`, `invalid_field`,
-`no_holders`, `item_closed`, `check_back_required` (422). Malformed bodies get
+`no_holders`, `item_closed`, `check_back_required`, and on strict boards
+`waiting_not_allowed`, `holder_required`, `trigger_required`,
+`check_back_too_far` (422). Malformed bodies get
 FastAPI's standard 422.
 
 | Method + path | Body / query | Returns |
 |---|---|---|
 | `POST /boards/resolve` | `{task_id}` or `{ref}` | `board` header (creates if needed) |
 | `GET /boards` | `?open_only=true` | `[board header]` |
-| `GET /boards/{ref}` | `?since_version=&archived=false&q=&history=0` | `{board, items, flags, recently_closed, free_capacity}` (+ `archived` when `archived=true`) or `{unchanged: true, version}` |
+| `GET /boards/{ref}` | `?since_version=&archived=false&q=&history=0` | `{board, items, flags, recently_closed, free_capacity, untracked, launch: {unlaunched: [{n, title, since}], free: [name]}}` (+ `archived` when `archived=true`) or `{unchanged: true, version}` |
 | `DELETE /boards/{ref}` | (none) | `{deleted, id, items}`; `409 board_not_empty` with `open_items` while any item is open. Deletes the board's items, history, flags and pushes. For scratch boards |
 | `PATCH /boards/{ref}` | `{actor, settings…, orchestrator_pid?}` | `board` header |
 | `POST /boards/{ref}/items` | `{actor, items: [{title, holders?, status?, note?, group?, blocked_by?, blocked_on?, eta?, check_back?, links?}], request_id?}` (≤ 50, all-or-nothing) | `{board, items, unblocked, warnings}`; a repeated `request_id` on the board returns the first call's items with `replayed: true` |
@@ -324,8 +366,9 @@ by the daemon: it spawns the session, then calls `reassign`.
 ## 7. Daemon RPCs and MCP tools
 
 Daemon methods (daemon-only; no TUI handler, no CLI fallback): `item.create`,
-`item.set`, `item.resolve`, `board.read`, `board.owner_blocked` (both reads
-are restart-barrier read-only). The daemon resolves the caller's pid, task and
+`item.set`, `item.resolve`, `board.read`, `board.settings`,
+`board.owner_blocked` (both reads are restart-barrier read-only;
+`board.settings` is `PATCH /boards/{ref}` for board members). The daemon resolves the caller's pid, task and
 board, resolves holder names, enforces §2 rule 10, stamps `actor`, and
 forwards. The Operator (TUI) acts as `owner`.
 
@@ -361,20 +404,22 @@ Holder arguments accept a chat name, a session uid, a participant id, `me`, or
 
 ```
 item(title: str | list[str], holder=None, status="active", note=None, group=None,
-     blocked_by: list[int] | None = None, blocked_on=None, eta=None,
+     blocked_by: list[int] | None = None, blocked_on=None, eta=None, job=None,
      links: list[str] | None = None, board=None)
   -> {board, items: [{n, title, status, holders}]}
 
 item_set(n: int | list[int], status=None, note=None, holder=None, add_holder=None,
          remove_holder=None, group=None, blocked_by=None, blocked_on=None,
-         check_back=None, eta=None, title=None, links=None, reason=None, board=None,
+         check_back=None, eta=None, job=None, title=None, links=None, reason=None, board=None,
          head=None, mf=None, ruling=None, gate_class=None)
   -> {items, unblocked?, warnings?}
   # head / mf / ruling / gate_class: gate bindings (gate-receipts.md §8)
 
 board(board=None, view="slim", mine=False, group=None, include_closed=True,
-      archived=False, query=None)
-  -> {board: {slug, orchestrator, health}, flags, items, recently_closed, free_capacity}
+      archived=False, query=None, settings=None)
+  -> {board: {slug, orchestrator, health, backlog_allowed}, flags, items, recently_closed,
+      free_capacity, untracked?, launch?}
+  # settings={...}: board.settings first (e.g. {"idle_s": 1800})
 
 item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"|"apply"|"dismiss",
              holder=None, blocked_by=None, blocked_on=None, check_back=None,
@@ -396,7 +441,11 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"
 - `board.read` also takes `since_version` (for the TUI's poll) and then may
   answer `{unchanged: true, version}`.
 - `board(view="slim")` returns one line per item, flags first, then by group:
-  `#14 active "fuse SEJD" @rl-scale-out[idle 24m] ⚑holder_idle · waiting on JP`.
+  `#14 active "fuse SEJD" @rl-scale-out[idle 24m] ⚑holder_idle · waiting on JP`;
+  a job shows beside the holder's state, never merged with it:
+  `#1216 active "pins gate" @release-4[idle 12m] job: cm-gate pins L3 (eta 25m)`.
+  `launch` is one line, `2 unlaunched (#14 18m, #15 4m) · free: lane-a`, and
+  `untracked` lists working sessions that hold no item.
   `view="full"` returns the item dicts with the last 5 events each.
 - `item_resolve(launch)` spawns through the normal `start_session` path under
   the caller's permissions (`engine` defaults to the caller's own engine), with

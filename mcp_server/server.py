@@ -257,6 +257,7 @@ def item(
     blocked_by: list[int] | None = None,
     blocked_on: str | None = None,
     eta: str | None = None,
+    job: str | None = None,
     links: list[str] | None = None,
     board: str | None = None,
     request_id: str | None = None,
@@ -268,11 +269,17 @@ def item(
     top-level task's. The holder defaults to you; name others by chat name,
     session uid or participant id, or holder="none" to leave it unassigned.
     status: open/active/waiting/blocked/blocked_on_owner/done/dropped (default active).
-    eta ("40m", "2h" or a time) marks a long job as waiting, which keeps it
-    from being flagged idle; with status="active" it means "working, expected
-    done by then": no idle/stale flags before it, eta_passed after it. blocked_by takes open item numbers on the same
-    board (no cycles); blocked_on is free text ("EP GO") and gets no idle or
-    stale exemption.
+    A long job: status="active" with eta ("40m", "2h" or a time) and job (what
+    is running: "cm-gate pins L3 pid 41231", a cell id): no idle/stale flags
+    before the eta, eta_passed after it. On a board that allows backlog a
+    bare eta parks the item as waiting instead. blocked_by takes open item
+    numbers on the same board (no cycles); blocked_on is free text ("EP GO")
+    and gets no idle or stale exemption.
+
+    Strict boards (backlog_allowed false, e.g. sejd) hold only running or
+    blocked work: waiting, open and unheld new items are refused, a job needs
+    an eta, and blocked_on needs a check_back (at most 72 h out). Future work
+    there is a planning task (propose_task), not an item.
 
     request_id makes a retry safe: the same id returns the first call's items
     instead of creating duplicates (one is generated when omitted and named
@@ -298,6 +305,7 @@ def item_set(
     blocked_on: str | None = None,
     check_back: str | None = None,
     eta: str | None = None,
+    job: str | None = None,
     title: str | None = None,
     links: list[str] | None = None,
     reason: str | None = None,
@@ -310,8 +318,14 @@ def item_set(
 ) -> dict:
     """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
     note="needs EP GO"), item_set(15, blocked_by=[14]),
-    item_set(14, "waiting", eta="40m", note="full C2 run"),
-    item_set(14, "active", eta="2h", note="training; back by then").
+    item_set(14, "active", eta="40m", job="full C2 run, cell C2-07") (a job in
+    flight: no idle flags before the eta), or on a board that allows backlog
+    item_set(14, "waiting", eta="40m", note="parked until the C2 run").
+    On a strict board (backlog_allowed false) waiting is refused, a bare eta
+    keeps the item active, a job needs an eta, a free-text block needs a
+    check_back, and holder="none" leaves the item active and unheld: the
+    orchestrator is told if nobody takes it (unlaunched). Each refusal names
+    the call that fits.
 
     Waiting on a decision only Owner can make: item_set(14, "blocked_on_owner",
     blocked_on="approve 8xH100 for SEJD?") (you must hold the item and name the
@@ -347,18 +361,30 @@ def board(
     include_closed: bool = True,
     archived: bool = False,
     query: str | None = None,
+    settings: dict | None = None,
 ) -> dict:
     """Read your board: flags first, then items by group, recently closed
-    items (24 h) and free capacity (sessions on the board holding no active
-    item). Each item shows its holders' live state, e.g.
-    `#14 active "fuse SEJD" [RL] @rl-scale-out[idle 24m] ⚑holder_idle`.
+    items (24 h), free capacity (idle sessions on the board holding no
+    active item; never bash panes, the orchestrator or the steward),
+    untracked (sessions working on the board without an item) and launch
+    ("2 unlaunched (#14 18m) · free: lane-a"). Each item shows its holders'
+    live state beside any job, e.g.
+    `#14 active "fuse SEJD" [RL] @rl-scale-out[idle 24m] job: C2 run (eta 20m)`.
 
     view="full" returns item dicts with their last 5 history events.
     mine=True keeps only your items; group filters by heading; archived=True
     adds archived items; query searches titles, notes and groups. Any
     session may read any board by slug.
+
+    settings={...} changes the board's settings first (board members only),
+    e.g. {"idle_s": 1800} or {"backlog_allowed": False} (strict board: Owner
+    or the orchestrator only). Others: launch_s, max_active_per_holder,
+    check_back_max_s, holder_idle_enabled, stale_s, steward_pid, channel.
     """
-    return _items_call("board.read", locals())
+    params = dict(locals())
+    if params.pop("settings", None):
+        _items_call("board.settings", {"board": board, "settings": settings})
+    return _items_call("board.read", params)
 
 
 @mcp.tool()

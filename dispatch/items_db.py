@@ -18,6 +18,8 @@ STATE_FRESH_S = 90
 BOARD_SETTINGS = (
     "idle_s", "stale_s", "unassigned_s", "repush_s", "escalate_s", "digest_s",
     "stale_background_s", "nudge_grace_s",
+    # Strict boards (doc/strict-boards.md).
+    "launch_s", "max_active_per_holder", "check_back_max_s",
 )
 MAX_HISTORY = 50
 
@@ -42,6 +44,7 @@ def _str_ids(row: dict) -> dict:
 def _board_settings(board: dict) -> dict:
     out = {k: board[k] for k in BOARD_SETTINGS}
     out["holder_idle_enabled"] = board["holder_idle_enabled"]
+    out["backlog_allowed"] = board.get("backlog_allowed", True)
     out["orchestrator_pid"] = board["orchestrator_pid"]
     out["steward_pid"] = board.get("steward_pid")
     out["channel"] = board.get("channel")
@@ -154,6 +157,7 @@ def _item_from_row(row) -> Item:
         closed_at=row["closed_at"], archived_at=row["archived_at"],
         created_by=row["created_by"], created_at=row["created_at"],
         stale_nudged_at=row["stale_nudged_at"],
+        job=row.get("job"), actionable_at=row.get("actionable_at"),
         flag_pushed=dict(row.get("flag_pushed") or {}),
         gate_head=(row.get("gate_binding") or {}).get("head"),
     )
@@ -226,12 +230,13 @@ async def _apply(conn, tx: BoardTx) -> None:
                       blocked_on = $6, check_back_at = $7, eta_at = $8,
                       waiting_set_at = $9, links = $10, touched_at = $11,
                       clock_reset_at = $12, closed_at = $13, archived_at = $14,
-                      updated_at = $15, stale_nudged_at = $16, flag_pushed = flag_pushed || $17::jsonb
+                      updated_at = $15, stale_nudged_at = $16, flag_pushed = flag_pushed || $17::jsonb,
+                      job = $18, actionable_at = $19
                 WHERE id = $1""",
             it.id, it.title, it.status, it.note, it.group, it.blocked_on,
             it.check_back_at, it.eta_at, it.waiting_set_at, list(it.links),
             it.touched_at, it.clock_reset_at, it.closed_at, it.archived_at, now,
-            it.stale_nudged_at, dict(it.flag_pushed),
+            it.stale_nudged_at, dict(it.flag_pushed), it.job, it.actionable_at,
         )
     for n in sorted(tx.holders_changed):
         it = tx.items[n]
@@ -563,7 +568,7 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
                 raise ItemsError(422, "invalid_field", f"{key} must be a positive integer",
                                  field=key)
             sets[key] = value
-        elif key == "holder_idle_enabled":
+        elif key in ("holder_idle_enabled", "backlog_allowed"):
             if not isinstance(value, bool):
                 raise ItemsError(422, "invalid_field", f"{key} must be a boolean", field=key)
             sets[key] = value
@@ -611,6 +616,13 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
                                      "only Owner or the board's orchestrator sets steward_pid")
             # Who edits gate profiles and who may grant waivers is Owner's call;
             # the default class is a profile edit (doc/gate-receipts.md §2, §4).
+            # Making a board strict changes what every member may write:
+            # Owner's or the orchestrator's call (doc/strict-boards.md §1).
+            if "backlog_allowed" in sets and actor["pid"] != OWNER_PID:
+                orch = await _orchestrator_row(conn, board, now)
+                if not orch or orch.get("pid") != actor["pid"]:
+                    raise ItemsError(403, "forbidden",
+                                     "only Owner or the board's orchestrator sets backlog_allowed")
             if ({"gate_editors", "waiver_grantors"} & set(sets)) and actor["pid"] != OWNER_PID:
                 raise ItemsError(403, "forbidden", "only Owner sets gate_editors and waiver_grantors")
             if "gate_default_class" in sets:
@@ -779,9 +791,16 @@ async def list_boards(pool, *, open_only: bool = False) -> list[dict]:
         return [await _board_header(conn, _str_ids(dict(r)), now) for r in rows]
 
 
-async def _free_capacity(conn, board: dict, now: datetime) -> list[dict]:
-    """Live sessions on the board (task resolves to it, or holding an open item
-    there) that hold no active or waiting item on it."""
+BUSY_STATES = ("working", "working-background")
+
+
+async def _free_capacity(conn, board: dict, now: datetime,
+                         exclude: list[str] = ()) -> tuple[list[dict], list[dict]]:
+    """Live agent sessions on the board (task resolves to it, or holding an
+    open item there) that hold no active or waiting item on it, split into
+    `free` (not working: available to launch onto) and `untracked` (working
+    on something the board doesn't show). Bash panes, the orchestrator and
+    the steward are never capacity (doc/strict-boards.md §4.2)."""
     fresh = now - timedelta(seconds=STATE_FRESH_S)
     rows = await conn.fetch(
         """WITH RECURSIVE tree AS (
@@ -797,6 +816,8 @@ async def _free_capacity(conn, board: dict, now: datetime) -> list[dict]:
                 WHERE i.board_id = $1 AND i.closed_at IS NULL)
            SELECT s.pid, s.name, s.state FROM session_states s
             WHERE s.exited_at IS NULL AND s.reported_at > $4
+              AND COALESCE(s.engine, '') <> 'bash'
+              AND s.pid <> ALL($5::text[])
               AND (s.task_id IN (SELECT id FROM board_tasks)
                    OR s.pid IN (SELECT pid FROM holders))
               AND s.pid NOT IN (SELECT pid FROM holders WHERE status IN ('active', 'waiting'))
@@ -804,9 +825,14 @@ async def _free_capacity(conn, board: dict, now: datetime) -> list[dict]:
         uuid.UUID(board["id"]),
         uuid.UUID(board["root_task_id"]) if board.get("root_task_id") else None,
         uuid.UUID(board["initiative_id"]) if board.get("initiative_id") else None,
-        fresh,
+        fresh, [p for p in exclude if p],
     )
-    return [dict(r) for r in rows]
+    free, untracked = [], []
+    for r in rows:
+        (untracked if r["state"] in BUSY_STATES else free).append(dict(r))
+    # Idle sessions first: they are the ones to launch onto.
+    free.sort(key=lambda r: r["state"] != "idle")
+    return free, untracked
 
 
 async def read_board(pool, ref: str, *, since_version: int | None = None,
@@ -893,7 +919,21 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
             ],
             "items": live,
             "recently_closed": closed,
-            "free_capacity": await _free_capacity(conn, board, now),
+        }
+        orch_pid = (header.get("orchestrator") or {}).get("pid")
+        free, untracked = await _free_capacity(
+            conn, board, now, [orch_pid, board.get("steward_pid")])
+        out["free_capacity"] = free
+        out["untracked"] = untracked
+        # Unlaunched work beside who could take it, in one glance.
+        out["launch"] = {
+            "unlaunched": sorted(
+                ({"n": n, "title": items[n].title,
+                  "since": (f["detail"] or {}).get("actionable_at")}
+                 for n, fs in flags.items() for f in fs
+                 if f["kind"] == "unlaunched" and n in items),
+                key=lambda u: u["n"]),
+            "free": [r["name"] or r["pid"] for r in free],
         }
         out["flags"].sort(key=lambda f: (-f["age_s"], f["n"]))
         if archived:

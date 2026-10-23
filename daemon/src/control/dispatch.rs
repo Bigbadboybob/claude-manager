@@ -870,7 +870,8 @@ pub fn dispatch_request(
                 }
             },
         ),
-        "item.create" | "item.set" | "item.resolve" | "board.read" | "board.owner_blocked" => {
+        "item.create" | "item.set" | "item.resolve" | "board.read" | "board.settings"
+        | "board.owner_blocked" => {
             DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
         }
         // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.

@@ -517,12 +517,26 @@ impl App {
             if let Some(line) = blocked_summary(b.items(), width) {
                 lines.push(line);
             }
+            // Unlaunched work beside who could take it (doc/strict-boards.md §4.2).
+            if let Some(line) = cm_daemon::items::rpc::launch_line_now(&b.data["launch"]) {
+                lines.push(Line::styled(
+                    truncate(&format!("  \u{25b6} {line}"), width),
+                    Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD),
+                ));
+            }
             if b.show_free {
                 let free: Vec<&str> = b.data["free_capacity"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
                 lines.push(Line::styled(
                     truncate(&format!("  free: {}", free.join(", ")), width),
                     Style::default().fg(theme::MUTED),
                 ));
+                let untracked: Vec<&str> = b.data["untracked"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                if !untracked.is_empty() {
+                    lines.push(Line::styled(
+                        truncate(&format!("  untracked (working, no item): {}", untracked.join(", ")), width),
+                        Style::default().fg(theme::MUTED),
+                    ));
+                }
             }
             lines.push(Line::from(""));
         }
@@ -1711,6 +1725,21 @@ mod tests {
         tx.send(("list".into(), None, Ok(json!(app.board.boards.clone())))).unwrap();
         app.board_tick();
         assert_eq!(app.board.slug().as_deref(), Some("test-fake-board"));
+    }
+
+    #[test]
+    fn launch_line_and_untracked_show_beside_free_capacity() {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        loaded(&mut app);
+        let since = iso(-18 * 60);
+        app.board.data["launch"] = json!({"unlaunched":[{"n":2,"title":"docs","since":since}],"free":["lane-b","lane-d"]});
+        app.board.data["untracked"] = json!(["busy-lane"]);
+        let screen = screen_at(&mut app, 120, 30);
+        assert!(screen.contains("1 unlaunched (#2 18m) · free: lane-b, lane-d"), "{screen}");
+        assert!(!screen.contains("busy-lane"), "untracked folds with free capacity");
+        app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(screen_at(&mut app, 120, 30).contains("untracked (working, no item): busy-lane"));
     }
 
     #[test]

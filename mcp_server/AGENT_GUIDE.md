@@ -77,11 +77,14 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
 - Finished: `item_set(14, "done", note="abc123")`. Cancelled:
   `item_set(14, "dropped", reason="superseded by #15")`.
 - Running a job longer than about 20 minutes (tests, a backtest, training):
-  `item_set(14, "waiting", eta="40m", note="full C2 run")`. Waiting before its
-  ETA is never flagged idle; past ETA plus a grace it is flagged overdue and you
-  are asked first. Still actively working but expect to take a while:
-  `item_set(14, "active", eta="2h")` keeps it from idle/stale flags until then;
-  at the ETA without an update you are asked (`eta_passed`).
+  `item_set(14, "active", eta="40m", job="full C2 run, cell C2-07")`. Before its
+  ETA it is never flagged idle or stale; at the ETA without an update you are
+  asked (`eta_passed`). On a board that allows backlog, work parked with nobody
+  on it can instead be `item_set(14, "waiting", eta="40m", note=...)`.
+- Strict boards (`backlog_allowed: false`, e.g. sejd) hold only running or
+  blocked work: `waiting`, `open` and unheld new items are refused (the error
+  names the call that fits), a job needs an `eta`, a free-text block needs a
+  `check_back`, and future work is a planning task (`propose_task`).
 - Progress in chat counts: a top-level post naming `#14`, or a reply in its
   thread, refreshes the item when you hold it (or steward/orchestrate the
   board). Quoting someone (`>`) or mentioning another item does not.
@@ -114,7 +117,7 @@ If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
 - Every piece of work in flight is an item with one named holder; `board()` is
   the list Owner reads. Check it (holder states, flags) before messaging a lane
   for status, and resolve every flag you are woken for with `item_resolve`.
-- Declare a job longer than 20 minutes on its item: `item_set(n, "waiting", eta=..., note=...)`.
+- Declare a job longer than 20 minutes on its item. On strict boards: active + eta (job noted), `item_set(n, "active", eta=..., job=...)`; elsewhere `item_set(n, "waiting", eta=..., note=...)` also works.
 - Gate results go on the item as receipts, not prose: run `cm-gate run --item N`
   (CM checkout `scripts/`) or `gate_report`. CM computes PASS / FAIL / VOID /
   INCOMPLETE / STALE from the evidence; read `gate_receipts(n)` before ruling.

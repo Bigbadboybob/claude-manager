@@ -1,6 +1,13 @@
 # Strict boards: design
 
-Status: **design for review** (EP, then Swarm-Coord's go). No code yet.
+Status: **approved by EP (2026-10-23) and implemented** on `items/strict-boards`.
+EP's §8 answers: refuse intent and flag releases, with errors naming the
+conforming call; unheld blocked items allowed; `check_back_max_s` 72 h,
+sejd `idle_s` 1800, `launch_s` 15 min; `holder_overloaded` a warning only,
+with its threshold a board setting (`max_active_per_holder`, default 2:
+lane-job holders legitimately hold two); `job` requires `eta` on strict
+boards. The wire contract is [items-board.md](items-board.md) §2 rule 11
+and §4; this doc keeps the reasoning.
 Owner's ruling (relayed by EP, 2026-10-23 ~00:45Z): a board holds only work
 that is running or blocked. EP's correction, sent at 00:43Z, scopes this to a
 per-board opt-in: sejd first, and every other board keeps today's contract
@@ -37,8 +44,9 @@ blocked item has no holder. Seven sessions hold more than one active item
 One new board setting, `backlog_allowed` (bool, default `true`). `false` makes
 the board strict. It is set with `PATCH /boards/{ref}` by Owner or the board's
 current orchestrator (the same gate as `steward_pid`), and it is recorded as a
-`board_updated` event. The `board` MCP tool and the daemon's `board.read` gain
-`settings=` so EP can flip it without API access. Every rule below applies
+`board_updated` event. The `board` MCP tool gains `settings=` (the daemon's
+`board.settings` RPC; `board.read` stays read-only) so EP can flip it without
+API access. Every rule below applies
 only when `backlog_allowed` is false. Other boards are byte-for-byte
 unchanged, apart from the free-capacity cleanup in §4, which is shared.
 
@@ -201,24 +209,22 @@ sessions working on the board with no item.
 
 ### 4.1 `holder_overloaded` (warning; strict boards, or when `max_active_per_holder` is set)
 
-New setting: `max_active_per_holder` (default 1 on strict boards, null = off
-elsewhere). A session is overloaded when it holds more than that many
+New setting: `max_active_per_holder` (default 2, read only on strict boards). A session is overloaded when it holds more than that many
 `active` items **outside a job's ETA window**. An item with a declared job in
 flight doesn't need its holder's attention, so it doesn't count. The
 orchestrator and the steward are exempt, since they hold coordination items.
 
-The flag is raised on each of that holder's counted items **except** the one
-it touched most recently, which is its apparent focus. Detail is `{holder}`
+The flag is raised on each of that holder's counted items **except** the
+`max_active_per_holder` it touched most recently, which are its apparent
+focus. Detail is `{holders}`
 only, so a change of focus doesn't re-fingerprint every sibling. The holder
 gets one push per episode ("you hold 5 active items; block or hand back the
 ones you're not on"). The orchestrator gets the flags in its `board` push.
 Owner never gets them, since this is a warning and not a stall. CM never
 reassigns anything.
 
-Today on sejd this would raise about 24 flags across 7 holders (13 on
-Prod-Reads), fewer once the ETA windows are counted. **For EP:** is one active
-item per session the right cap for lanes like Prod-Reads, or should sejd start
-at 2?
+With the default of 2, today's sejd would warn on Prod-Reads (12 extras) and
+PointPF-Capacity (3) and P1-Integrator (2), fewer once ETA windows count.
 
 ### 4.2 Free capacity next to unlaunched
 
