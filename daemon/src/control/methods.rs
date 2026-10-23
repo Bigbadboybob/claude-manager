@@ -28634,10 +28634,37 @@ while True:
                 s.task_tree.insert("task-2".into(), Some("task-1".into()));
             }
             set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
-            let spawn = |params: Value| mcp_start_session(&state, &params, Some("ts-caller"));
-            let explicit = spawn(json!({"type": "codex", "label": "a", "model": "gpt-6-astra", "effort": "LOW"})).unwrap();
-            let task = spawn(json!({"type": "codex", "label": "b"})).unwrap();
-            let engine = spawn(json!({"type": "codex", "label": "c", "task_id": "task-2",
+            // Every codex spawn runs the real engine, and its transcript
+            // detector holds the worktree's spawn slot until a rollout
+            // appears or the session goes. Read each spawn's record and
+            // list_sessions row, then drop the session so the next spawn
+            // in this worktree doesn't wait 20 s on the slot. Whether the
+            // sandboxed codex exits on its own varies by host.
+            let recorded = |resp: &Value| {
+                let st = state.lock().unwrap();
+                let uid = resp["session_uid"].as_str().unwrap();
+                st.sessions.get(uid).map(|sess| sess.to_manifest_entry().model).unwrap_or_else(|| {
+                    st.recently_exited.iter().find(|t| t.session_uid == uid).and_then(|t| t.model.clone())
+                })
+            };
+            let listed = |resp: &Value| {
+                let rows = list_sessions(&state, &json!({"include_exited": true}), None).unwrap();
+                rows.as_array().unwrap().iter().find(|r| r["session_uid"] == resp["session_uid"]).cloned()
+            };
+            let spawn = |params: Value| {
+                let resp = mcp_start_session(&state, &params, Some("ts-caller"));
+                let seen = resp.as_ref().ok().map(|r| (recorded(r), listed(r)));
+                if let Some(uid) = resp.as_ref().ok().and_then(|r| r["session_uid"].as_str()) {
+                    if let Some(mut sess) = state.lock().unwrap().sessions.remove(uid) {
+                        let _ = sess.kill();
+                    }
+                }
+                resp.map(|r| (r, seen.unwrap()))
+            };
+            let (explicit, (_, explicit_row)) =
+                spawn(json!({"type": "codex", "label": "a", "model": "gpt-6-astra", "effort": "LOW"})).unwrap();
+            let (task, (task_recorded, _)) = spawn(json!({"type": "codex", "label": "b"})).unwrap();
+            let (engine, _) = spawn(json!({"type": "codex", "label": "c", "task_id": "task-2",
                                       "allow_shared_workspace": true})).unwrap();
             let bad = spawn(json!({"type": "codex", "label": "d", "model": "two words"})).unwrap_err();
             let bash = spawn(json!({"type": "bash", "label": "e", "model": "gpt-6-luna"})).unwrap_err();
@@ -28656,20 +28683,8 @@ while True:
             assert!(matches!(bash.0, ErrorCode::InvalidParams) && bash.1.contains("not 'bash'"), "{bash:?}");
             // The real codex child may already have exited in the sandbox:
             // the record lives on the session, or on its exit tombstone.
-            {
-                let st = state.lock().unwrap();
-                let uid = task["session_uid"].as_str().unwrap();
-                let recorded = match st.sessions.get(uid) {
-                    Some(sess) => sess.to_manifest_entry().model,
-                    None => st.recently_exited.iter().find(|t| t.session_uid == uid).and_then(|t| t.model.clone()),
-                };
-                assert_eq!(recorded.as_deref(), Some("gpt-6-luna"));
-            }
-            let rows = list_sessions(&state, &json!({"include_exited": true}), None).unwrap();
-            let row = rows.as_array().unwrap().iter()
-                .find(|r| r["session_uid"] == explicit["session_uid"]).cloned().unwrap();
-            assert_eq!(row["model"], "gpt-6-astra");
-            kill_all_sessions(&state);
+            assert_eq!(task_recorded.as_deref(), Some("gpt-6-luna"));
+            assert_eq!(explicit_row.unwrap()["model"], "gpt-6-astra");
         });
     }
 
