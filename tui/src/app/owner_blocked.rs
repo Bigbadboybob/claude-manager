@@ -4,7 +4,8 @@
 //! filtered read of the shared planning API, not a board poll) and marks each
 //! holder's sidebar row and workspace header with an amber diamond that
 //! alternates ◇/◆ about once a second plus a bold `OWNER` tag, ranked just
-//! below a pending ⚑ alert. The status bar counts the holder sessions.
+//! below a pending ⚑ alert. The status bar counts the holder sessions, plus
+//! one per item nobody holds.
 
 use super::App;
 use crate::theme;
@@ -42,11 +43,17 @@ impl OwnerBlocked {
         self.items.len()
     }
 
-    /// Distinct holder sessions with at least one item blocked on Owner:
-    /// the status bar's `◆N OWNER`. One orchestrator holding three items
-    /// counts once; unheld items count nowhere.
+    /// The status bar's `◆N OWNER`: distinct holder sessions with at least
+    /// one item blocked on Owner, plus one for each such item no session
+    /// holds (so an unheld decision never disappears). One orchestrator
+    /// holding three items counts once.
     pub(crate) fn session_count(&self) -> usize {
-        self.sessions.len()
+        let unheld = self
+            .items
+            .iter()
+            .filter(|i| !i["holders"].as_array().into_iter().flatten().any(|h| h["session_uid"].as_str().is_some()))
+            .count();
+        self.sessions.len() + unheld
     }
 }
 
@@ -266,8 +273,16 @@ mod tests {
             json!({"board": "sfd", "n": 4, "holders": [{"session_uid": "lane-b"}]}),
         ]);
         assert_eq!((app.owner_blocked.count(), app.owner_blocked.session_count()), (4, 2));
+        // An unheld item still counts, once each, so it never disappears.
+        let mut items = app.owner_blocked.items.clone();
+        items.push(json!({"board": "ops", "n": 5, "holders": []}));
+        app.owner_blocked.set_items(items);
+        assert_eq!((app.owner_blocked.count(), app.owner_blocked.session_count()), (5, 3));
         app.control_bound = true; // no degraded-mode banner over the status bar
         let full = render(&mut app, 140, false);
-        assert!(full.contains("\u{25c6}2 OWNER") && !full.contains("\u{25c6}4 OWNER"), "{full}");
+        assert!(full.contains("\u{25c6}3 OWNER") && !full.contains("\u{25c6}5 OWNER"), "{full}");
+        // No holders key, or holders without a session, is unheld too.
+        app.owner_blocked.set_items(vec![json!({"board": "ops", "n": 6}), json!({"board": "ops", "n": 7, "holders": [{"name": "x"}]})]);
+        assert_eq!(app.owner_blocked.session_count(), 2);
     }
 }
