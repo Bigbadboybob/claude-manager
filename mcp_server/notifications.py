@@ -29,35 +29,6 @@ TAKEOVER_FRESH_S = 15.0
 # A holder that just acquired the lock keeps it at least this long, so two
 # live processes can never alternate ownership faster than this.
 HANDOFF_MIN_HOLD_S = 30.0
-# Receipt checks: a submitted/uncertain notice is checked on every poll for
-# its first RECEIPT_EAGER_CHECKS polls, then at a doubling interval capped at
-# RECEIPT_MAX_INTERVAL_S. This only spaces out checks; an observation still
-# flips the notice to observed, and nothing else changes its status.
-RECEIPT_EAGER_CHECKS = 10
-RECEIPT_MAX_INTERVAL_S = 30.0
-
-
-class ReceiptBackoff:
-    """When each unobserved notice is next due for a receipt check."""
-
-    def __init__(self):
-        self.state = {}  # event id -> (checks so far, next due monotonic)
-
-    def due(self, event_id: str, now: float) -> bool:
-        checks, next_at = self.state.get(event_id, (0, 0.0))
-        return now >= next_at
-
-    def checked(self, event_id: str, now: float) -> None:
-        checks, _ = self.state.get(event_id, (0, 0.0))
-        checks += 1
-        extra = checks - RECEIPT_EAGER_CHECKS
-        delay = 0.0 if extra < 0 else min(RECEIPT_MAX_INTERVAL_S, 2.0 ** extra)
-        self.state[event_id] = (checks, now + delay)
-
-    def retain(self, live_ids) -> None:
-        live = set(live_ids)
-        for event_id in [e for e in self.state if e not in live]:
-            del self.state[event_id]
 
 
 def delivery_health(events, now: float | None = None, threshold: float | None = None):
@@ -458,10 +429,8 @@ async def consume(queue: Queue, adapter):
             queue.change(event["id"], {"submitting"}, status="uncertain")
         heartbeat = 0.0
         blocked = None
-        backoff = ReceiptBackoff()
         while True:
             events = queue.snapshot()["notifications"]
-            backoff.retain(e["id"] for e in events if e["status"] in {"submitted", "uncertain"})
             if time.monotonic() >= heartbeat:
                 assessment = await _diagnose(queue, adapter, events)
                 blocked = assessment["blocked"]
@@ -479,14 +448,13 @@ async def consume(queue: Queue, adapter):
                 if event["version"] != 1 or event["recipient"] != queue.uid:
                     continue  # Never deliver an unknown envelope or another identity.
                 if event["status"] in {"submitted", "uncertain"}:
-                    if not backoff.due(event["id"], time.monotonic()):
-                        continue
+                    # Every poll: evidence is only searched in the window
+                    # (TAIL_WINDOW), so a skipped poll can let it scroll out
+                    # for good. _Tail makes each check an incremental read.
                     if await adapter.observed(event):
                         queue.change(
                             event["id"], {"submitted", "uncertain"}, status="observed"
                         )
-                    else:
-                        backoff.checked(event["id"], time.monotonic())
                     continue
                 if event["status"] != "pending" or blocked:
                     # A client known to drop these events keeps them pending
@@ -671,6 +639,20 @@ def _tail_items(path: str):
         return list(tail.items())
 
 
+# Key under which a cached record keeps its json.dumps results (records are
+# this module's own parses; the key cannot collide with transcript JSON).
+_DUMPS = "\0dumps"
+
+
+def _dumped(item: dict, field: str, key: str) -> str:
+    """json.dumps(item.get(field, {}).get(key)), computed once per record:
+    every poll checks each pending marker against the same few records."""
+    memo = item.setdefault(_DUMPS, {})
+    if (field, key) not in memo:
+        memo[(field, key)] = json.dumps(item.get(field, {}).get(key))
+    return memo[(field, key)]
+
+
 def _evidence(item: dict, engine: str, marker: str, binding: dict | None) -> bool:
     """Whether one transcript record is positive receipt evidence for marker."""
     if engine == "claude-code":
@@ -689,12 +671,12 @@ def _evidence(item: dict, engine: str, marker: str, binding: dict | None) -> boo
                 and item.get("isMeta") is True
                 and content.get("role") == "user"
                 and origin == {"kind": "channel", "server": channel_server}
-                and marker in json.dumps(content.get("content"))
+                and marker in _dumped(item, "message", "content")
             ) or (
                 item.get("type") == "attachment"
                 and attachment.get("type") == "queued_command"
                 and attachment.get("origin") == {"kind": "channel", "server": channel_server}
-                and marker in json.dumps(attachment.get("prompt"))
+                and marker in _dumped(item, "attachment", "prompt")
             ))
         if (
             item.get("type") == "user"
@@ -702,7 +684,7 @@ def _evidence(item: dict, engine: str, marker: str, binding: dict | None) -> boo
             and origin.get("kind") == "peer"
             and origin.get("from") == "claude-manager"
             and origin.get("selfSent") is True
-            and marker in json.dumps(content.get("content"))
+            and marker in _dumped(item, "message", "content")
         ):
             return True
         # At a tool checkpoint Claude materializes the peer input
@@ -722,14 +704,14 @@ def _evidence(item: dict, engine: str, marker: str, binding: dict | None) -> boo
                 or str(origin.get("verifiedPeerProcStart"))
                 == expected["peer_start"]
             )
-            and marker in json.dumps(attachment.get("prompt"))
+            and marker in _dumped(item, "attachment", "prompt")
         )
     if item.get("type") == "response_item":
         payload = item.get("payload", {})
         return bool(
             payload.get("type") == "function_call_output"
             and payload.get("name") == "cm_notification"
-            and marker in json.dumps(payload.get("output"))
+            and marker in _dumped(item, "payload", "output")
         )
     return False
 

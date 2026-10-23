@@ -1,7 +1,9 @@
 """Incremental receipt checks (notifications._Tail): same answers as the old
 full 2 MiB rescan, while reading only appended bytes."""
+import asyncio
 import json
 import os
+import time
 import random
 import tempfile
 import unittest
@@ -9,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mcp_server import notifications
-from mcp_server.notifications import Queue, ReceiptBackoff, transcript_observed
+from mcp_server.notifications import Queue, transcript_observed
 
 
 def reference_observed(path, engine, marker, binding=None, window=2 * 1024 * 1024):
@@ -224,24 +226,76 @@ class ReadVolumeTests(unittest.TestCase):
             self.assertGreaterEqual(read, appended)
 
 
-class BackoffTests(unittest.TestCase):
-    def test_checks_space_out_after_the_eager_ones_and_cap(self):
-        b = ReceiptBackoff()
-        now = 100.0
-        for _ in range(notifications.RECEIPT_EAGER_CHECKS):
-            self.assertTrue(b.due("e", now))
-            b.checked("e", now)
-        self.assertFalse(b.due("e", now))
-        self.assertTrue(b.due("e", now + 1.0))
-        delays = []
-        for _ in range(10):
-            b.checked("e", now)
-            delays.append(b.state["e"][1] - now)
-        self.assertEqual(delays[:5], [2.0, 4.0, 8.0, 16.0, 30.0])
-        self.assertEqual(max(delays), notifications.RECEIPT_MAX_INTERVAL_S)
-        self.assertTrue(b.due("other", now), "a new notice is checked at once")
-        b.retain(["other"])
-        self.assertNotIn("e", b.state)
+class TranscriptAdapter:
+    """A consumer adapter whose receipts are real transcript checks."""
+    engine = "codex"
+
+    def __init__(self, path):
+        self.path = path
+        self.checks = 0
+
+    def identity(self):
+        return {"thread_id": "t"}
+
+    async def send(self, event):
+        return {"kind": "fixture_ack", "transcript_path": str(self.path)}
+
+    async def observed(self, event):
+        self.checks += 1
+        return await asyncio.to_thread(transcript_observed, str(self.path), "codex", event["marker"])
+
+
+class EveryPollTests(unittest.IsolatedAsyncioTestCase):
+    """Review 2026-10-23: a long-unobserved notice is still checked on every
+    poll. Evidence is searched only in the window, so a skipped poll lets it
+    scroll out for good (a 30 s backoff missed evidence followed by >2 MiB)."""
+
+    async def test_evidence_followed_by_more_than_the_window_is_still_observed(self):
+        notifications._tails.clear()
+        polls = [0]
+
+        async def fast_wait(self):
+            polls[0] += 1
+            await asyncio.sleep(0.005)
+
+        async def until(cond, timeout=20.0):
+            end = time.monotonic() + timeout
+            while not cond():
+                self.assertLess(time.monotonic(), end, "condition did not become true")
+                await asyncio.sleep(0.005)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(notifications.DirectoryWake, "wait", fast_wait):
+            path = Path(tmp) / "rollout.jsonl"
+            path.write_text(json.dumps({"type": "session_meta"}) + "\n")
+            q = Queue("uid-every-poll", Path(tmp))
+            adapter = TranscriptAdapter(path)
+            task = asyncio.create_task(notifications.consume(q, adapter))
+            try:
+                q.publish("n1", "cm", "[cm-late] hi", "[cm-late]")
+                await until(lambda: (q.get("n1") or {}).get("status") == "submitted")
+                # Unobserved for a dozen polls (past the 10 eager checks the
+                # reverted backoff allowed).
+                await until(lambda: adapter.checks >= 12)
+                with open(path, "a") as f:
+                    f.write(json.dumps({"type": "response_item", "payload": {
+                        "type": "function_call_output", "name": "cm_notification",
+                        "output": "[cm-late] hi"}}) + "\n")
+                # Two full polls pass, then the evidence is buried under 3 MB.
+                seen = polls[0]
+                await until(lambda: polls[0] >= seen + 2)
+                with open(path, "a") as f:
+                    filler = json.dumps({"type": "response_item", "payload": {
+                        "type": "message", "content": "z" * 4000}}) + "\n"
+                    f.write(filler * (3 * 1024 * 1024 // len(filler) + 1))
+                seen = polls[0]
+                await until(lambda: polls[0] >= seen + 5)
+                self.assertFalse(transcript_observed(str(path), "codex", "[cm-late]"),
+                                 "the evidence is now outside the window")
+                self.assertEqual(q.get("n1")["status"], "observed")
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 class EventCacheTests(unittest.TestCase):
