@@ -82,7 +82,7 @@ raises these flags and pushes you once per window with every open flag:
 | `overdue` | waiting past its ETA plus a grace; the holder is asked first |
 | `check_back` | check-back due: decide (re-block with a new check-back, activate, drop). It is not a sign the blocker cleared |
 | `blocker_dropped` | something it waited on was dropped; decide what it needs now |
-| `unlaunched` | strict boards: active with no live holder on it for 15 min (after an unblock, handback or assignment): launch or reassign; `board()` lists who is free |
+| `unlaunched` | strict boards: active with no live holder on it for 15 min (after an unblock, handback or assignment), outside a job's ETA: launch or reassign; `board()` lists who is free. Never escalated to Owner |
 | `needs_triage` | strict boards: does not fit (waiting, open, a block with no trigger or check-back, a job with no ETA): make it active + ETA + job, blocked with a trigger, or drop it. Never escalated to Owner |
 | `holder_overloaded` | strict boards: a session holds more active items than the board allows (`max_active_per_holder`, default 2) outside a job's ETA; block or hand back the extras. A warning, never escalated |
 

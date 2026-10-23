@@ -701,6 +701,20 @@ class StrictBoard(unittest.TestCase):
         n = self.b.create({"title": "queued", "holders": [], "blocked_by": [1]}).created[0]
         self.assertEqual((self.b[n].status, self.b[n].holders), ("blocked", []))
 
+    def test_a_holders_own_write_marks_it_launched_and_an_assignment_does_not(self):
+        mine = self.b.create("self-claimed", actor=LANE).created[0]
+        self.assertEqual((self.b[mine].actionable_at, self.b[mine].launched_at), (NOW, NOW))
+        later = NOW + timedelta(minutes=5)
+        n = self.b.create({"title": "for other", "holders": [OTHER]}).created[0]
+        self.assertEqual((self.b[n].actionable_at, self.b[n].launched_at), (NOW, None))
+        self.b.set(n, actor=ORCH, now=later, note="please start")
+        self.assertIsNone(self.b[n].launched_at, "the orchestrator's note is not the holder on it")
+        self.b.set(n, actor=OTHER, now=later, eta="40m", job="bench")
+        self.assertEqual(self.b[n].launched_at, later)
+        tx = self.b.tx(OTHER, NOW + timedelta(minutes=9))
+        tx.touch([n], source="chat")
+        self.assertEqual(self.b[n].launched_at, NOW + timedelta(minutes=9))
+
     def test_a_handback_is_accepted_and_stays_active_unheld(self):
         tx = self.b.set(1, actor=LANE, holders=[])
         self.assertEqual((self.b[1].status, self.b[1].holders), ("active", []))

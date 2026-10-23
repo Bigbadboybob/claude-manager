@@ -495,6 +495,20 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((settings["backlog_allowed"], settings["launch_s"],
                           settings["max_active_per_holder"], settings["check_back_max_s"]),
                          (False, 600, 3, 259200))
+        # A member cannot take the board over: naming itself orchestrator,
+        # making it strict, or loosening its caps (review of 94eedeb).
+        for change in ({"orchestrator_pid": LANE["pid"]}, {"steward_pid": LANE["pid"]},
+                       {"backlog_allowed": True}, {"launch_s": 86400}, {"idle_s": 86400},
+                       {"check_back_max_s": 2592000}, {"max_active_per_holder": 50},
+                       {"orchestrator_pid": LANE["pid"], "backlog_allowed": True}):
+            r = await self.http.patch(f"/boards/{self.ref}", json={"actor": LANE, **change})
+            self.assertEqual(r.status_code, 403, (change, r.text))
+        settings = (await self.read())["board"]["settings"]
+        self.assertEqual((settings["orchestrator_pid"], settings["backlog_allowed"],
+                          settings["launch_s"]), (ORCH["pid"], False, 600))
+        # Ungoverned settings stay open to members.
+        r = await self.http.patch(f"/boards/{self.ref}", json={"actor": LANE, "stale_s": 9000})
+        self.assertEqual(r.status_code, 200, r.text)
         r = await self.create({"title": "later", "holders": []}, ok=False)
         self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "holder_required"))
         await self.create({"title": "bench", "holders": [LANE]})

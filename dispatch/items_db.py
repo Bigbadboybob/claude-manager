@@ -22,6 +22,15 @@ BOARD_SETTINGS = (
     "launch_s", "max_active_per_holder", "check_back_max_s",
 )
 MAX_HISTORY = 50
+# Settings that decide who runs the board and what its members may write:
+# only Owner or the board's current orchestrator changes them. Otherwise a
+# member could name itself orchestrator (gaining steward rights and the
+# orchestrator's pushes) and then make the board strict, or loosen its caps
+# (doc/strict-boards.md §1).
+GOVERNED_SETTINGS = frozenset({
+    "orchestrator_pid", "steward_pid", "backlog_allowed", "launch_s", "check_back_max_s",
+    "idle_s", "max_active_per_holder",
+})
 
 
 def utcnow() -> datetime:
@@ -158,6 +167,7 @@ def _item_from_row(row) -> Item:
         created_by=row["created_by"], created_at=row["created_at"],
         stale_nudged_at=row["stale_nudged_at"],
         job=row.get("job"), actionable_at=row.get("actionable_at"),
+        launched_at=row.get("launched_at"),
         flag_pushed=dict(row.get("flag_pushed") or {}),
         gate_head=(row.get("gate_binding") or {}).get("head"),
     )
@@ -231,12 +241,12 @@ async def _apply(conn, tx: BoardTx) -> None:
                       waiting_set_at = $9, links = $10, touched_at = $11,
                       clock_reset_at = $12, closed_at = $13, archived_at = $14,
                       updated_at = $15, stale_nudged_at = $16, flag_pushed = flag_pushed || $17::jsonb,
-                      job = $18, actionable_at = $19
+                      job = $18, actionable_at = $19, launched_at = $20
                 WHERE id = $1""",
             it.id, it.title, it.status, it.note, it.group, it.blocked_on,
             it.check_back_at, it.eta_at, it.waiting_set_at, list(it.links),
             it.touched_at, it.clock_reset_at, it.closed_at, it.archived_at, now,
-            it.stale_nudged_at, dict(it.flag_pushed), it.job, it.actionable_at,
+            it.stale_nudged_at, dict(it.flag_pushed), it.job, it.actionable_at, it.launched_at,
         )
     for n in sorted(tx.holders_changed):
         it = tx.items[n]
@@ -607,22 +617,19 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
     async with pool.acquire() as conn:
         async with conn.transaction():
             board = await _board_by_ref(conn, ref, lock=True)
-            # Naming a steward gives it chat-activity rights on every item:
-            # only Owner or the board's current orchestrator may.
-            if "steward_pid" in sets and actor["pid"] != OWNER_PID:
+            # Who runs the board and what its members may write is Owner's or
+            # the current orchestrator's call (GOVERNED_SETTINGS). The
+            # orchestrator is the one BEFORE this patch, so naming yourself
+            # orchestrator authorizes nothing, itself included.
+            governed = sorted(GOVERNED_SETTINGS & set(sets))
+            if governed and actor["pid"] != OWNER_PID:
                 orch = await _orchestrator_row(conn, board, now)
                 if not orch or orch.get("pid") != actor["pid"]:
                     raise ItemsError(403, "forbidden",
-                                     "only Owner or the board's orchestrator sets steward_pid")
+                                     f"only Owner or the board's orchestrator sets "
+                                     f"{', '.join(governed)}", field=governed[0])
             # Who edits gate profiles and who may grant waivers is Owner's call;
             # the default class is a profile edit (doc/gate-receipts.md §2, §4).
-            # Making a board strict changes what every member may write:
-            # Owner's or the orchestrator's call (doc/strict-boards.md §1).
-            if "backlog_allowed" in sets and actor["pid"] != OWNER_PID:
-                orch = await _orchestrator_row(conn, board, now)
-                if not orch or orch.get("pid") != actor["pid"]:
-                    raise ItemsError(403, "forbidden",
-                                     "only Owner or the board's orchestrator sets backlog_allowed")
             if ({"gate_editors", "waiver_grantors"} & set(sets)) and actor["pid"] != OWNER_PID:
                 raise ItemsError(403, "forbidden", "only Owner sets gate_editors and waiver_grantors")
             if "gate_default_class" in sets:

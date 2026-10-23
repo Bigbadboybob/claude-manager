@@ -824,6 +824,16 @@ pub(crate) fn shape_board(read: &Value, pid: &str, params: &Value, now: DateTime
     out
 }
 
+/// The settings `board.settings` forwards; anything else is refused here
+/// rather than passed to `PATCH /boards`. Gate profile settings have their
+/// own tool (`gate.profile`). The API still decides who may change the
+/// governed ones (orchestrator_pid, steward_pid, backlog_allowed, the caps).
+const BOARD_SETTING_KEYS: &[&str] = &[
+    "name", "idle_s", "stale_s", "unassigned_s", "repush_s", "escalate_s", "digest_s",
+    "stale_background_s", "nudge_grace_s", "holder_idle_enabled", "orchestrator_pid", "steward_pid",
+    "channel", "backlog_allowed", "launch_s", "max_active_per_holder", "check_back_max_s",
+];
+
 /// `board(settings={...})`: change a board's settings (board members only;
 /// the API further leaves backlog_allowed and steward_pid to Owner and the
 /// orchestrator) and return the new header. A write, so not `board.read`,
@@ -837,8 +847,11 @@ fn board_settings(ctx: &Ctx, params: &Value) -> RpcResult {
     let slug = slug(&board)?;
     let mut body = json!({"actor": ctx.actor()});
     for (k, v) in settings {
-        if k == "actor" {
-            return Err(bad("actor is stamped by the daemon"));
+        if !BOARD_SETTING_KEYS.contains(&k.as_str()) {
+            return Err(bad(format!(
+                "unknown board setting {k}; settings are {}",
+                BOARD_SETTING_KEYS.join(", ")
+            )));
         }
         body[k] = v.clone();
     }
@@ -1262,6 +1275,10 @@ mod tests {
         assert!(!resp.ok);
         let resp = call(&state, "me-uid", "board.settings", json!({"settings":{"actor":{"pid":"owner"}}}));
         assert!(!resp.ok, "an agent cannot pose as Owner");
+        for key in ["gate_editors", "waiver_grantors", "next_number", "id"] {
+            let resp = call(&state, "me-uid", "board.settings", json!({"settings":{key: []}}));
+            assert!(!resp.ok && resp.error.as_ref().unwrap().message.contains("unknown board setting"), "{key}");
+        }
         let resp = call(&state, "me-uid", "item.set", json!({"n":3,"eta":"40m","job":"pins L3"}));
         assert!(resp.ok, "{:?}", resp.error);
         let resp = call(&state, "me-uid", "item.set", json!({"n":3,"job":""}));

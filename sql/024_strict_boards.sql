@@ -15,3 +15,6 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS job TEXT;
 -- When the item last became actionable: created active, entered active,
 -- unblocked, handed back or assigned. The unlaunched clock starts here.
 ALTER TABLE items ADD COLUMN IF NOT EXISTS actionable_at TIMESTAMPTZ;
+-- A holder's own last write or #N post: that holder is on the item.
+-- unlaunched holds only while this is older than actionable_at.
+ALTER TABLE items ADD COLUMN IF NOT EXISTS launched_at TIMESTAMPTZ;

@@ -377,9 +377,11 @@ def board(
     session may read any board by slug.
 
     settings={...} changes the board's settings first (board members only),
-    e.g. {"idle_s": 1800} or {"backlog_allowed": False} (strict board: Owner
-    or the orchestrator only). Others: launch_s, max_active_per_holder,
-    check_back_max_s, holder_idle_enabled, stale_s, steward_pid, channel.
+    e.g. {"stale_s": 9000}. Owner or the board's orchestrator only:
+    orchestrator_pid, steward_pid, backlog_allowed (strict board), idle_s,
+    launch_s, max_active_per_holder, check_back_max_s. Others: name, stale_s,
+    unassigned_s, repush_s, escalate_s, digest_s, stale_background_s,
+    nudge_grace_s, holder_idle_enabled, channel.
     """
     params = dict(locals())
     if params.pop("settings", None):

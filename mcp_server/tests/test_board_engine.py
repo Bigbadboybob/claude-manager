@@ -235,9 +235,23 @@ class StrictFlags(unittest.TestCase):
         idle = {LANE["pid"]: state("idle", since=ago(minutes=20))}
         assigned = item(actionable_at=ago(minutes=16), touched=ago(minutes=16))
         self.assertIn("unlaunched", self.strict(assigned, idle))
-        # A holder that touched it, or is working, or unknown, is on it.
-        touched = item(actionable_at=ago(minutes=16), touched=ago(minutes=3))
+        # A holder that wrote or posted about it itself, or is working, or
+        # unknown, is on it. Somebody else's touch (an orchestrator's note)
+        # is not.
+        noted = item(actionable_at=ago(minutes=16), touched=ago(minutes=3))
+        self.assertIn("unlaunched", self.strict(noted, idle))
+        touched = item(actionable_at=ago(minutes=16), touched=ago(minutes=3),
+                       launched_at=ago(minutes=3))
         self.assertNotIn("unlaunched", self.strict(touched, idle))
+        # The holder's own declaring write is at the same instant as the
+        # clock start: that is the holder on it.
+        claimed = item(actionable_at=ago(minutes=40), touched=ago(minutes=40),
+                       launched_at=ago(minutes=40))
+        self.assertNotIn("unlaunched", self.strict(claimed, idle))
+        # Inside a declared job's ETA it is being worked, whoever touched it.
+        job = item(actionable_at=ago(minutes=40), touched=ago(minutes=40), job="bench",
+                   eta_at=NOW + timedelta(hours=1))
+        self.assertNotIn("unlaunched", self.strict(job, idle))
         self.assertNotIn("unlaunched", self.strict(assigned, {LANE["pid"]: state("working")}))
         self.assertNotIn("unlaunched", self.strict(assigned))  # no state row: unknown
         # Never on other boards; never while blocked (a passed check-back
@@ -685,7 +699,7 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         job = await self.sql("SELECT job, status FROM items WHERE number = 1")
         self.assertEqual((job[0]["job"], job[0]["status"]), ("bench", "active"))
 
-    async def test_unlaunched_names_free_sessions_and_escalates_like_other_flags(self):
+    async def test_unlaunched_names_free_sessions(self):
         free = {"pid": "agent:d1:free-uid", "name": "spare", "session_uid": "free-uid"}
         bash = {"pid": "agent:d1:sh-uid", "name": "bash", "session_uid": "sh-uid"}
         rows = [self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"),
@@ -714,26 +728,67 @@ class EngineDb(unittest.IsolatedAsyncioTestCase):
         s = await self.tick()
         self.assertIn((1, "unlaunched"), s["cleared"])
 
+    async def test_unlaunched_respects_a_declared_job_and_never_pages_owner(self):
+        idle_lane = self.row(HOLDER, "idle", 3600)
+        await self.beat(self.row(ORCH, "idle", 7200, task=self.root), idle_lane)
+        await self.make_strict()
+        # The holder's own item with a job and its eta: the declaring write
+        # is the holder on it, and inside the eta it is being worked.
+        await items_db.create_items(self.pool, self.ref, HOLDER, [
+            {"title": "bench", "eta": "2h", "job": "C2 run"}])
+        # Assigned by the orchestrator to an idle holder that never starts.
+        await items_db.create_items(self.pool, self.ref, ORCH, [
+            {"title": "assigned", "holders": [HOLDER]}])
+        await self.age(20)
+        s = await self.tick()
+        self.assertEqual([n for n, k in s["raised"] if k == "unlaunched"], [2])
+        await self.age(61)
+        await self.tick()
+        self.assertEqual(await self.pushes("escalation"), [],
+                         "unlaunched is the orchestrator's, never an Owner page")
+        # The holder posting #2 is it on the item.
+        await items_db.touch_items(self.pool, self.ref, HOLDER, [2], source="chat")
+        s = await self.tick()
+        self.assertIn((2, "unlaunched"), s["cleared"])
+
     async def test_overloaded_holder_hears_once_per_episode(self):
         await self.beat(self.row(ORCH, "working", task=self.root), self.row(HOLDER, "working"))
         await self.make_strict()
         await items_db.create_items(self.pool, self.ref, HOLDER,
                                     [{"title": t} for t in ("a", "b", "c", "d")])
+        # A fifth inside its job's eta is counted neither by the flag nor by
+        # the holder's push.
+        await items_db.create_items(self.pool, self.ref, HOLDER,
+                                    [{"title": "e", "eta": "3h", "job": "bench"}])
         s = await self.tick()
         self.assertEqual(sorted(n for n, k in s["raised"] if k == "holder_overloaded"), [1, 2])
         (mine,) = await self.pushes("holder_overloaded")
         self.assertEqual(mine["session_uid"], "lane-uid")
         self.assertIn("you hold 4 active items (this board allows 2", mine["text"])
+        (board_push,) = await self.pushes("board")
+        self.assertIn("holder_overloaded", board_push["text"])
         await self.tick()
         self.assertEqual(len(await self.pushes("holder_overloaded")), 1)
+        # The focus moving (the holder touches #1, so #1's flag moves to #3)
+        # is the same episode: no new push to anyone.
+        await self.age(6)
+        await items_db.update_items(self.pool, self.ref, HOLDER, [1], {"note": "on #1 now"})
+        s = await self.tick()
+        self.assertIn((3, "holder_overloaded"), s["raised"])
+        self.assertIn((1, "holder_overloaded"), s["cleared"])
+        self.assertEqual(len(await self.pushes("holder_overloaded")), 1)
+        self.assertFalse(any("holder_overloaded" in p["text"] for p in (await self.pushes("board"))[1:]))
+        # An item inside its job's eta is not counted in the holder's push.
+        await items_db.update_items(self.pool, self.ref, HOLDER, [3], {"eta": "1h", "job": "j"})
         await self.beat(self.row(ORCH, "idle", 7200, task=self.root), self.row(HOLDER, "working"))
         await self.age(61)
-        await self.tick()
+        s = await self.tick()
+        self.assertIn((3, "holder_overloaded"), s["cleared"], "inside its eta it doesn't count")
         self.assertEqual(await self.pushes("escalation"), [])
         # Raising the board's threshold ends the episode.
         await items_db.patch_board(self.pool, self.ref, {"pid": "owner"}, {"max_active_per_holder": 4})
         s = await self.tick()
-        self.assertEqual(sorted(n for n, k in s["cleared"] if k == "holder_overloaded"), [1, 2])
+        self.assertEqual(sorted(n for n, k in s["cleared"] if k == "holder_overloaded"), [2])
 
     async def test_close_out_archives_and_prunes(self):
         await items_db.create_items(self.pool, self.ref, ORCH, [{"title": "a"}, {"title": "b"}])

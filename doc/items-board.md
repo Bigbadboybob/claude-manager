@@ -39,6 +39,7 @@ holder state is shown verbatim and never treated as idle or closed.
 | `eta_at`, `waiting_set_at` | ts | set with `waiting`, or on `active` |
 | `job` | str ≤ 200 | the job in flight on an `active` item (lane, PID, cell id) |
 | `actionable_at` | ts | when it last became actionable (created or entered `active`, unblocked, handed back, assigned); the `unlaunched` clock |
+| `launched_at` | ts | a holder's own last write or `#N` post on it |
 | `links` | `[str]` ≤ 20 | task id, branch/SHA, message id, path, URL |
 | `touched_at` | ts | last status/note/holder change |
 | `clock_reset_at` | ts | set on auto-unblock |
@@ -192,10 +193,16 @@ also raised by the write path. Thresholds are per board:
 | `orchestrator_pid` | null = auto (below) |
 | `steward_pid` | null; its `#N` posts are recorded on any item (§2). Set only by Owner or the board's current orchestrator (else `403`) |
 | `channel` | null; the conversation path whose `#N` means this board's item N |
-| `backlog_allowed` | true; false makes the board strict (§2 rule 11). Set only by Owner or the board's current orchestrator (else `403`) |
+| `backlog_allowed` | true; false makes the board strict (§2 rule 11) |
 | `launch_s` | 900 (strict boards: `unlaunched`) |
 | `max_active_per_holder` | 2 (strict boards: `holder_overloaded`) |
 | `check_back_max_s` | 259200 (72 h; strict boards) |
+
+`orchestrator_pid`, `steward_pid`, `backlog_allowed`, `idle_s`, `launch_s`,
+`max_active_per_holder` and `check_back_max_s` are set only by Owner or the
+board's current orchestrator, as it is before the change (else `403`): a
+member cannot name itself orchestrator and then use that. `board.settings`
+forwards only the settings in this table plus `name`.
 
 | Kind | Raised when |
 |---|---|
@@ -210,8 +217,8 @@ also raised by the write path. Thresholds are per board:
 | `check_back` | `blocked_on` set and `check_back_at` passed |
 | `blocker_dropped` | a blocker of this item was dropped |
 | `needs_triage` | strict board: the item does not fit (detail `{reason}`: `waiting`, `open`, `no_trigger`, `no_check_back`, `check_back_too_far`, `job_without_eta`). Raised for every legacy item when the board turns strict; statuses are never rewritten. Clears when it conforms, or when the board allows backlog again. Reaches only the orchestrator and is never escalated |
-| `unlaunched` | strict board: `active`, `now − actionable_at ≥ launch_s`, `holder_gone` not raised, and nobody live on it: no holder, or every holder `idle` with no touch since `actionable_at` (`unknown` counts as live). A passed `check_back` never starts this clock. Detail `{actionable_at}`. To the orchestrator, naming up to three idle free sessions; escalates like other flags |
-| `holder_overloaded` | strict board: a holder (not the orchestrator or steward) holds more than `max_active_per_holder` `active` items outside a job's ETA; raised on each such item beyond its most recently touched ones. Detail `{holders}`. The holder gets one push per episode; the orchestrator sees it in its push; never escalated, never reassigns |
+| `unlaunched` | strict board: `active`, not inside a job's ETA, `now − actionable_at ≥ launch_s`, `holder_gone` not raised, and nobody live on it: no holder, or every holder `idle` and no holder wrote or posted `#N` about it itself since `actionable_at` (`launched_at`; a holder's own claim or job declaration counts, an orchestrator's note does not; `unknown` counts as live). A passed `check_back` never starts this clock. Detail `{actionable_at}`. To the orchestrator, naming up to three idle free sessions; never escalated to Owner (only an orchestrator escalates) |
+| `holder_overloaded` | strict board: a holder (not the orchestrator or steward) holds more than `max_active_per_holder` `active` items outside a job's ETA; raised on each such item beyond its most recently touched ones. Detail `{holders}`. The holder and the orchestrator each hear once per holder episode (the flag moving between items as the focus changes is not news); never escalated, never reassigns |
 | `suggested_transition` | a holder's, the steward's or the orchestrator's post about exactly one item (a thread reply must name that item itself) says `DONE`, `GREEN` or `DEPLOYED` (→ done) or `STOP` (→ blocked), in capitals. Never counted: quoted lines, code (fences, backticks), a word followed by `?`, "GREEN light", or a negation, condition or future (`not`, `don't`, `once`, `will be`, …) in the four words before it; conflicting words suggest nothing. Not raised on items blocked on Owner. Detail `{to, keyword, by, message_id}`. A suggestion only: the holders and the steward get one push per target (a new target settles the old suggestion and is pushed afresh); it never reaches the orchestrator or Owner; any status change settles it. `item_resolve(n, "apply", to=…)` confirms exactly that target (409 `suggestion_changed` if it moved); `"dismiss"` rejects it, and that target is not suggested again until the item's status or head changes (Alt+B `x` → 5 / 6) |
 
 "Held" means `active`, `waiting`, `blocked`, or `open` with holders: an

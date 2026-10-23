@@ -195,7 +195,11 @@ Delivery: an `ENGINE_KINDS` flag (raised and cleared by the engine) that goes
 straight to the orchestrator in the next `board` push (not holder-first: if the
 holder is absent there is nobody else to ask). Its detail is
 `{actionable_at}`, which stays stable so it fingerprints once per episode, and
-any new activity starts a new one. It escalates to Owner like other flags.
+any new activity starts a new one. It is never escalated to Owner: it is the
+orchestrator's to act on, and only an orchestrator escalates (review of
+94eedeb). Inside a declared job's ETA it is not raised, and the holder's own
+write (claiming the item, declaring the job) counts as the holder on it
+(`launched_at`).
 Push text: `#1496 unlaunched (no live holder 18m; free: Batch-Valid, P1-Ingest)`.
 The text names up to three idle free sessions (§4) so the orchestrator can
 `item_resolve(n, "launch")` or `"reassign"` in one call.

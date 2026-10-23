@@ -106,6 +106,13 @@ impl Board {
         self.selected().and_then(|i| i["n"].as_i64())
     }
 
+    /// A strict board (`backlog_allowed: false`, doc/strict-boards.md)
+    /// refuses waiting and open: `w` declares a job's ETA on the active item
+    /// instead, and `o` is not offered.
+    fn strict(&self) -> bool {
+        self.data["board"]["backlog_allowed"] == false
+    }
+
     /// Apply a `board.read` reply: `{unchanged}` keeps the current data.
     fn accept(&mut self, v: Value) {
         if v["unchanged"] == true {
@@ -308,7 +315,8 @@ impl App {
             }
             PromptKind::WaitingEta if !text.is_empty() => {
                 if let Some(n) = n {
-                    self.board_write("item.set", json!({"n": n, "status": "waiting", "eta": text}));
+                    let status = if self.board.strict() { "active" } else { "waiting" };
+                    self.board_write("item.set", json!({"n": n, "status": status, "eta": text}));
                 }
             }
             PromptKind::ResolveBlock if !text.is_empty() => {
@@ -373,8 +381,9 @@ impl App {
             let n = self.board.selected_n();
             match (menu, key.code, n) {
                 (Menu::Status, KeyCode::Char(c), Some(n)) => {
+                    let strict = self.board.strict();
                     let status = match c {
-                        'o' => Some("open"),
+                        'o' if !strict => Some("open"),
                         'a' => Some("active"),
                         'w' => None,
                         'b' => Some("blocked"),
@@ -384,7 +393,8 @@ impl App {
                         _ => None,
                     };
                     if c == 'w' {
-                        // Waiting needs an ETA (e.g. 40m, 2h, or a time).
+                        // Waiting needs an ETA (e.g. 40m, 2h, or a time); on a
+                        // strict board the ETA is a job's on the active item.
                         self.board.prompt = Some((PromptKind::WaitingEta, String::new()));
                     } else if let Some(status) = status {
                         self.board_write("item.set", json!({"n": n, "status": status}));
@@ -917,6 +927,7 @@ impl App {
                 PromptKind::Drop | PromptKind::ResolveDrop => "Reason",
                 PromptKind::ResolveBlock => "Blocked on",
                 PromptKind::ResolveBlockCheck => "Check back (e.g. 2h; empty for none)",
+                PromptKind::WaitingEta if b.strict() => "Job ETA, item stays active (e.g. 40m, 2h)",
                 PromptKind::WaitingEta => "ETA (e.g. 40m, 2h)",
             };
             return Line::styled(format!("{label}: {text}\u{2588}"), bold);
@@ -924,6 +935,7 @@ impl App {
         if let Some(menu) = b.menu {
             return Line::styled(
                 match menu {
+                    Menu::Status if b.strict() => "Status (strict board): a active \u{00b7} w job eta (stays active) \u{00b7} b blocked \u{00b7} O on Owner \u{00b7} d done",
                     Menu::Status => "Status: o open \u{00b7} a active \u{00b7} w waiting \u{00b7} b blocked \u{00b7} O on Owner \u{00b7} d done",
                     Menu::Resolve => "Resolve flag: 1 nudge \u{00b7} 2 reassign \u{00b7} 3 block \u{00b7} 4 drop \u{00b7} 5 apply suggestion \u{00b7} 6 dismiss",
                 },
@@ -1948,6 +1960,20 @@ mod tests {
         for c in "40m".chars() { app.handle_event(&key(KeyCode::Char(c))); }
         app.handle_event(&key(KeyCode::Enter));
         assert_eq!(app.board.queued.back().unwrap().1, json!({"n":3,"status":"waiting","eta":"40m","board":"test-fake-board"}));
+        // On a strict board w declares a job's ETA on the active item, and o is gone.
+        app.board.data["board"]["backlog_allowed"] = json!(false);
+        app.handle_event(&key(KeyCode::Char('s')));
+        assert!(screen_at(&mut app, 140, 30).contains("w job eta (stays active)"));
+        app.handle_event(&key(KeyCode::Char('w')));
+        assert!(screen_at(&mut app, 140, 30).contains("Job ETA, item stays active"));
+        for c in "2h".chars() { app.handle_event(&key(KeyCode::Char(c))); }
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(app.board.queued.back().unwrap().1, json!({"n":3,"status":"active","eta":"2h","board":"test-fake-board"}));
+        let queued = app.board.queued.len();
+        app.handle_event(&key(KeyCode::Char('s')));
+        app.handle_event(&key(KeyCode::Char('o')));
+        assert_eq!(app.board.queued.len(), queued, "no open on a strict board");
+        app.board.data["board"]["backlog_allowed"] = json!(true);
         app.handle_event(&key(KeyCode::Char('x')));
         app.handle_event(&key(KeyCode::Char('3')));
         for c in "EP GO".chars() { app.handle_event(&key(KeyCode::Char(c))); }

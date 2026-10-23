@@ -145,6 +145,7 @@ class Item:
     waiting_set_at: datetime | None = None
     job: str | None = None                            # the job in flight (active only)
     actionable_at: datetime | None = None             # unlaunched clock start
+    launched_at: datetime | None = None               # a holder's own last write / #N post
     links: list = field(default_factory=list)
     touched_at: datetime | None = None
     clock_reset_at: datetime | None = None
@@ -193,6 +194,7 @@ class Item:
             "waiting_set_at": iso(self.waiting_set_at),
             "job": self.job,
             "actionable_at": iso(self.actionable_at),
+            "launched_at": iso(self.launched_at),
             "links": list(self.links),
             "touched_at": iso(self.touched_at),
             "clock_reset_at": iso(self.clock_reset_at),
@@ -653,9 +655,12 @@ class BoardTx:
                           f'item_set({n}, "active", eta="40m", job="{it.job}")', field="eta")
 
         # The unlaunched clock: created or entering active, or its holders
-        # changed (an assignment or a handback) while active.
+        # changed (an assignment or a handback) while active. A holder's own
+        # write (claiming it, declaring a job) is that holder on it.
         if status == "active" and (creating or prev_status != "active" or holders_changed):
             it.actionable_at = self.now
+        if self.actor["pid"] in [h["pid"] for h in it.holders]:
+            it.launched_at = self.now
 
         it.status = status
         if strict_board:
@@ -768,6 +773,7 @@ class BoardTx:
             else:
                 if self.actor["pid"] in [h["pid"] for h in it.holders]:
                     it.touched_at = self.now
+                    it.launched_at = self.now
                     self.dirty.add(n)
                 self._event(it, f"{source}_ref", new={
                     "message_id": message_id,
