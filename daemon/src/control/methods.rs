@@ -18639,6 +18639,9 @@ pub fn update_task(
     api_get_task(&creds, &target_task_id).map_err(|e| e.to_method_err())
 }
 
+/// Most task ids one `task.scope_check` call may ask about.
+pub const TASK_SCOPE_CHECK_MAX_IDS: usize = 64;
+
 /// `task.scope_check` — Session-callable, read-only: which of `task_ids`
 /// are the caller's task or its descendants (the rule every Session
 /// method applies). The MCP server's direct-API `update_task` branch asks
@@ -18660,6 +18663,16 @@ pub fn task_scope_check(
         .map(|v| v.as_str().map(str::to_string))
         .collect::<Option<_>>()
         .ok_or((ErrorCode::InvalidParams, "task.scope_check: task ids must be strings".into()))?;
+    // Every id is walked under the state lock; keep one call cheap.
+    if ids.len() > TASK_SCOPE_CHECK_MAX_IDS {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "task.scope_check: at most {TASK_SCOPE_CHECK_MAX_IDS} task_ids per call, got {}",
+                ids.len()
+            ),
+        ));
+    }
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let cuid = caller_uid.ok_or((
         ErrorCode::Unauthorized,
@@ -36721,6 +36734,12 @@ while True:
             assert_eq!(check.result.unwrap()["in_scope"], json!({"sub-b": true, "foreign": false, "orch": true}));
             let check = scope_call(&state, "ts-global", "task.scope_check", json!({"task_ids": ["foreign"]}));
             assert_eq!(check.result.unwrap()["in_scope"]["foreign"], true);
+            let ids = |n: usize| (0..n).map(|i| format!("t-{i}")).collect::<Vec<_>>();
+            assert!(scope_call(&state, "ts-orch", "task.scope_check", json!({"task_ids": ids(TASK_SCOPE_CHECK_MAX_IDS)})).ok);
+            let over = scope_call(&state, "ts-orch", "task.scope_check", json!({"task_ids": ids(TASK_SCOPE_CHECK_MAX_IDS + 1)}));
+            let err = over.error.expect("over the cap is refused");
+            assert_eq!(err.code, ErrorCode::InvalidParams);
+            assert!(err.message.contains("at most 64"), "{}", err.message);
             kill_all_sessions(&state);
         });
     }

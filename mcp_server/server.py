@@ -1574,7 +1574,8 @@ def update_task(
         parent_task_id: Reparent this task under another task's UUID,
             or "null" to detach (make it top-level). A reparent needs both
             this task and the new parent in your own tree (your task or its
-            descendants), unless you hold global perms.
+            descendants), unless you hold global perms. (The planning API
+            itself doesn't enforce this; this tool does.)
         initiative_id: Attach to an initiative UUID/slug, or "null" to make
             the task standalone.
         metadata: Free-form JSONB bag for skill/agent attachments. PATCH

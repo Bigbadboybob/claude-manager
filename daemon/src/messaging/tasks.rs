@@ -143,7 +143,16 @@ impl SessionGraph {
                     )
                 })
                 .collect(),
-            task_tree: s.task_tree.clone(),
+            // The scope view (`auth::task_in_scope`): pushed edges, then the
+            // headless refresher's planning readings, so a live worker on a
+            // done subtask keeps its continuous channel on a host no TUI
+            // pushes to as well.
+            task_tree: s
+                .planning_task_parents
+                .iter()
+                .map(|(task, p)| (task.clone(), p.parent.clone()))
+                .chain(s.task_tree.iter().map(|(task, parent)| (task.clone(), parent.clone())))
+                .collect(),
         }
     }
     /// Every LIVE session attributable to `task`: tagged with it, transitively
@@ -738,5 +747,22 @@ mod tests {
             members.into_iter().collect::<Vec<_>>(),
             vec!["helper-c", "orch-2", "worker-a", "worker-b", "worker-d"]
         );
+    }
+    /// A worker whose subtask is done is still a channel member: its edge
+    /// comes from the full-tree push, or on a headless host from the
+    /// parent refresher, and a pushed edge wins over a refresher reading.
+    #[test]
+    fn capture_keeps_done_subtask_edges_from_the_parent_refresher() {
+        let mut s = DaemonState::new();
+        s.task_tree.insert("pushed".into(), Some("plan-root".into()));
+        for (task, parent) in [("done-sub", "plan-root"), ("pushed", "elsewhere")] {
+            s.planning_task_parents.insert(
+                task.into(),
+                crate::state::PlanningParent { parent: Some(parent.into()), fetched_at: std::time::Instant::now() },
+            );
+        }
+        let graph = SessionGraph::capture(&s);
+        assert_eq!(graph.task_tree.get("done-sub"), Some(&Some("plan-root".to_string())));
+        assert_eq!(graph.task_tree.get("pushed"), Some(&Some("plan-root".to_string())), "the push wins");
     }
 }
