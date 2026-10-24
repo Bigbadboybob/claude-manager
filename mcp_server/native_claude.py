@@ -43,11 +43,12 @@ def _is_claude(argv: list[str]) -> bool:
 
 
 def claude_parent_argv(pid: int | None = None) -> list[str] | None:
-    """The owning Claude process: the MCP server's parent, or its grandparent
-    when CM's launcher shell sits in between. Nothing further up: a test or a
-    nested run must never inspect an unrelated ancestor Claude."""
+    """The owning Claude process: the MCP server's parent, or a nearer
+    ancestor when only CM's launcher shell and/or CM's stdio proxy
+    (mcp_proxy.py) sit in between. Nothing further up: a test or a nested
+    run must never inspect an unrelated ancestor Claude."""
     current = os.getpid() if pid is None else pid
-    for _ in range(2):
+    for _ in range(3):
         current = _ppid(current)
         if not current or current <= 1:
             return None
@@ -56,10 +57,16 @@ def claude_parent_argv(pid: int | None = None) -> list[str] | None:
             return None
         if _is_claude(argv):
             return argv
-        if not (os.path.basename(argv[0]) in {"sh", "bash", "dash"}
-                and any(a.endswith("launcher.sh") for a in argv)):
+        if not _is_cm_intermediary(argv):
             return None
     return None
+
+
+def _is_cm_intermediary(argv: list[str]) -> bool:
+    head = os.path.basename(argv[0])
+    if head in {"sh", "bash", "dash"}:
+        return any(a.endswith("launcher.sh") for a in argv)
+    return head.startswith("python") and len(argv) > 1 and argv[1].endswith("mcp_proxy.py")
 
 
 def argv_session_id(argv: list[str] | None) -> str | None:

@@ -133,6 +133,10 @@ fn build_env(
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
+    // Same per-spawn proxy decision as the daemon's composer.
+    if cm_daemon::mcp_config::mcp_proxy_enabled() {
+        env.insert("CM_MCP_PROXY_ENABLED".into(), "1".into());
+    }
     // Absolutize both candidate paths up-front. MCP agents run as
     // children of `claude` / `codex`, which inherit a cwd we don't
     // control; a relative path in our env would resolve against

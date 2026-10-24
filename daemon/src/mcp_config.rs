@@ -70,6 +70,31 @@ pub fn codex_screen_args(inline: bool) -> Vec<String> {
     if inline { vec!["--no-alt-screen".into()] } else { Vec::new() }
 }
 
+/// Whether a NEW session's MCP server runs behind `mcp_proxy.py`, the stable
+/// stdio proxy that lets CM activate new MCP code without a `/mcp`
+/// reconnect (doc/mcp-managed-activation.md). Per host and per spawn:
+/// `CM_MCP_PROXY_ENABLE=1|0` in the composing process wins, else the
+/// top-level `mcp_proxy = true` in this host's `daemon.toml` (re-read at
+/// every spawn, so no reload is needed). Default off. The decision is
+/// frozen into the session's MCP env as `CM_MCP_PROXY_ENABLED=1`, so a
+/// running session never changes mode, even across `/mcp` reconnects.
+pub fn mcp_proxy_enabled() -> bool {
+    match std::env::var("CM_MCP_PROXY_ENABLE").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+    mcp_proxy_from_toml(&crate::config::default_config_path())
+}
+
+fn mcp_proxy_from_toml(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Value>().ok())
+        .and_then(|value| value.get("mcp_proxy").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
 /// Per-session MCP config dir. `~/.cm/mcp/<session_uid>/`.
 fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -208,6 +233,13 @@ fn render_launcher_script(pairs: &[(String, String)]) -> String {
          \t[ -f \"$t_dir/$REL\" ] || return 1\n\
          \tif [ \"$REL\" = \"server.py\" ]; then\n\
          \t\t\"$t_py\" -c 'import mcp' >/dev/null 2>&1 || return 1\n\
+         \t\t# A session spawned with the proxy flag runs server.py behind the\n\
+         \t\t# stable stdio proxy, which re-runs this launcher for each backend\n\
+         \t\t# (CM_MCP_PROXY_CHILD=1). proxy.disabled is the host kill switch.\n\
+         \t\tif [ \"$CM_MCP_PROXY_ENABLED\" = 1 ] && [ -z \"$CM_MCP_PROXY_CHILD\" ] \\\n\
+         \t\t\t&& [ ! -e \"$HOME/.cm/mcp/proxy.disabled\" ] && [ -f \"$t_dir/mcp_proxy.py\" ]; then\n\
+         \t\t\texec \"$t_py\" \"$t_dir/mcp_proxy.py\" -- \"$0\" server.py \"$@\"\n\
+         \t\tfi\n\
          \telif [ \"$REL\" = \"native_codex.py\" ]; then\n\
          \t\t\"$t_py\" -c 'from websockets.asyncio.client import unix_connect; from websockets.asyncio.server import unix_serve' >/dev/null 2>&1 || return 1\n\
          \telse\n\
@@ -317,6 +349,9 @@ pub fn build_env(
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
+    if mcp_proxy_enabled() {
+        env.insert("CM_MCP_PROXY_ENABLED".into(), "1".into());
+    }
     env.insert(
         "CM_DAEMON_SOCKET".into(),
         absolutized_socket_or_raw(&crate::default_socket_path()),
@@ -1710,6 +1745,69 @@ mod tests {
             String::from_utf8_lossy(&out3.stderr).contains("no working"),
             "stderr must name the failure",
         );
+    }
+
+    /// The proxy runs only for a session spawned with the flag, never for
+    /// the proxy's own backend (`CM_MCP_PROXY_CHILD`), never with the host
+    /// kill switch present, and never from a payload without the proxy.
+    #[test]
+    fn launcher_runs_server_behind_proxy_only_for_flagged_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".cm/mcp")).unwrap();
+        let dir = root.path().join("mcp_server");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server.py"), "").unwrap();
+        std::fs::write(dir.join("mcp_proxy.py"), "").unwrap();
+        let py = root.path().join("python");
+        std::fs::write(&py, "#!/bin/sh
+if [ \"$1\" = \"-c\" ]; then exit 0; fi\necho \"$@\"\n").unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = root.path().join("launcher.sh");
+        let pairs = vec![(py.to_string_lossy().into_owned(),
+                          dir.join("server.py").to_string_lossy().into_owned())];
+        std::fs::write(&script, render_launcher_script(&pairs)).unwrap();
+        let run = |vars: &[(&str, &str)]| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg(&script).arg("server.py").env("HOME", &home)
+                .env_remove("CM_MCP_SERVER").env_remove("CM_MCP_PROXY_ENABLED")
+                .env_remove("CM_MCP_PROXY_CHILD");
+            for (k, v) in vars {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let direct = dir.join("server.py").display().to_string();
+        assert_eq!(run(&[]), direct);
+        assert_eq!(
+            run(&[("CM_MCP_PROXY_ENABLED", "1")]),
+            format!("{} -- {} server.py", dir.join("mcp_proxy.py").display(), script.display()),
+        );
+        assert_eq!(run(&[("CM_MCP_PROXY_ENABLED", "1"), ("CM_MCP_PROXY_CHILD", "1")]), direct);
+        std::fs::write(home.join(".cm/mcp/proxy.disabled"), "").unwrap();
+        assert_eq!(run(&[("CM_MCP_PROXY_ENABLED", "1")]), direct);
+        std::fs::remove_file(home.join(".cm/mcp/proxy.disabled")).unwrap();
+        std::fs::remove_file(dir.join("mcp_proxy.py")).unwrap();
+        assert_eq!(run(&[("CM_MCP_PROXY_ENABLED", "1")]), direct);
+    }
+
+    #[test]
+    fn mcp_proxy_flag_reads_the_hosts_daemon_toml() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("daemon.toml");
+        assert!(!mcp_proxy_from_toml(&path), "absent file = off");
+        std::fs::write(&path, "log_path = \"x\"\n").unwrap();
+        assert!(!mcp_proxy_from_toml(&path), "absent key = off");
+        std::fs::write(&path, "mcp_proxy = true\nlog_path = \"x\"\n[auth]\nmode = \"ssh-trust\"\n").unwrap();
+        assert!(mcp_proxy_from_toml(&path));
+        std::fs::write(&path, "mcp_proxy = \"yes\"\n").unwrap();
+        assert!(!mcp_proxy_from_toml(&path), "only a real bool enables it");
+        // The key is outside DaemonConfig's schema, which must keep loading.
+        std::fs::write(&path, "mcp_proxy = true\n").unwrap();
+        assert!(toml::from_str::<crate::config::DaemonConfig>("mcp_proxy = true\n").is_ok());
     }
 
     #[test]
