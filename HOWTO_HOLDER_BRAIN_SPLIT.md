@@ -149,6 +149,26 @@ a local failure to raise with Swarm-Coord instead.
 `daemon.restart` — the brain restart re-runs the MCP preflight; no
 `systemctl restart` needed anymore.
 
+**Activating MCP code in running sessions**
+([mcp-managed-activation](doc/mcp-managed-activation.md)): after the
+complete payload is in place on the host, stamp it there, as the last step:
+```
+ssh <host> python3 /opt/cm-daemon/mcp_server/mcp_version.py stamp --git <sha>
+```
+Sessions behind the MCP proxy then activate the new code on their own, at
+their next idle minute (or sooner with `ack_reconnect`); nothing restarts.
+An unstamped payload never activates anything. Watch the rollout with
+`scripts/cm-mcp-versions --ssh <host>`. It lists every live MCP server
+stalest first, and flags sessions without the proxy, which still need one
+manual `/mcp`. The proxy is per host and per new spawn: `mcp_proxy = true`
+at the top level of that host's `daemon.toml`, read at each spawn, so no
+reload is needed (default off; `CM_MCP_PROXY_ENABLE=1|0` overrides it).
+Existing sessions keep the mode they were spawned with. To make every
+proxy-flagged reconnect go direct to `server.py` on a host, create
+`~/.cm/mcp/proxy.disabled` there. Tool schemas must stay compatible with
+running Codex threads (`mcp_server/tests/test_tool_schema_compat.py`;
+`mcp_version.py snapshot --write [--allow-breaking "tool: reason"]`).
+
 **Config value** (`mcp_server_path`, `api_*`, `notify_command`, …):
 `scripts/cm-op daemon.reload_config` or `kill -HUP <brain_pid>` (the holder
 ignores HUP).

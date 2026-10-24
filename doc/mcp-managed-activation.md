@@ -1,8 +1,7 @@
 # CM-managed MCP activation at a safe boundary
 
-Status: design (2026-10-24), msgfix lane, Swarm Focused Design. Not built. A
-prototype proxy (`mcp_server/mcp_proxy.py`) and its tests are on this branch;
-§10 lists what they prove and what they don't.
+Status: built (slices 1–4, 2026-10-24), msgfix lane, Swarm Focused Design;
+not deployed, flag off by default. §10 lists what is proven and how.
 
 ## 1. Problem and recommendation
 
@@ -48,7 +47,7 @@ The split of responsibilities follows the holder/brain split:
 | Native notification queue | `~/.cm/notifications/<sha256(uid)>/` on disk, with flock | yes. The consumer lock is released when the old child exits. A notice left `submitting` becomes `uncertain`, with no resend, so the boundary rule excludes that case (§4) |
 | Claude channel / own-child socket consumer | The `server.py` child (`native_claude.run`) | it restarts in the new child. The channel's MCP session is bound on the replayed `tools/list` |
 | Codex notification consumer | `native_codex.py`, the launcher of the app-server, **not** `server.py` | unaffected |
-| Session monitors (`monitor_sessions`, auto monitors) | asyncio tasks in `server.py`, plus the journal `~/.cm/monitor-state/<uid>.json` | **no**: shutdown marks them `interrupted`, and nothing re-arms them. Needs §5 |
+| Session monitors (`monitor_sessions`, auto monitors) | asyncio tasks in `server.py`, plus the journal `~/.cm/monitor-state/<uid>.json` | yes, with §5: the successor adopts them from the journal (before this work, shutdown marked them `interrupted` and nothing re-armed them) |
 | Blocking tool calls (`wait_for_*`, `send_input_and_wait`, `get_backtest_result(wait)`) | The in-flight request | the proxy never swaps while any request is in flight |
 | Agent guide (`instructions`) and server capabilities | The `initialize` reply, read once by the engine | **no**: the engine keeps the first reply. See §8 |
 
@@ -89,8 +88,8 @@ proxy (§4).
 
 1. **Quiet check.** Wait until no request is in flight in either direction.
 2. **Preflight.** Start a candidate child with these env vars:
-   `CM_MCP_PROXY=<proxy version>`, `CM_MCP_PROXY_GENERATION=n`, and
-   `CM_MCP_PREDECESSOR_PID=<old child>`. Send it the saved `initialize`
+   `CM_MCP_PROXY_CHILD=1`, `CM_MCP_PROXY_VERSION=<proxy version>`,
+   `CM_MCP_PROXY_GENERATION=n`, and `CM_MCP_PREDECESSOR_PID=<old child>`. Send it the saved `initialize`
    params with a proxy-owned id, then `notifications/initialized`, then
    `tools/list`. The proxy reads both replies and doesn't forward them. If
    the candidate errors, exits, or doesn't answer within 30 s, it is killed
@@ -104,8 +103,11 @@ proxy (§4).
 5. **Switch.** Point routing at the candidate, flush the buffered input, and
    send `notifications/tools/list_changed` if the tool names differ.
 
-The pause is the old child's shutdown time (well under 1 s in the
-prototype). Requests that arrive during the pause are delayed, not lost.
+Client input is held only for the old child's shutdown (`hold_ms` in
+`proxy.json`; 237–531 ms in the live runs, 10 s when the old child was
+frozen and had to be SIGKILLed). The preflight (2–8 s, mostly `server.py`
+import) runs while the old child keeps serving. Requests that arrive during
+the hold are delayed, not lost.
 
 The candidate starts before the old child stops, so for a moment both
 children exist. Two rules make that safe:
@@ -145,9 +147,22 @@ manual `/mcp`; with the proxy it heals itself.
 - **Codex.** The proxy is the `claude-manager` MCP command that the owned
   app-server spawns. That command is set by
   `-c mcp_servers.claude-manager.command=…/launcher.sh` (`mcp_config.rs`).
-  The Codex 0.164 binary contains `notifications/tools/list_changed`
-  handling, but this is not yet proven end to end (§10). The notification
-  consumer lives in `native_codex.py` and is not affected by a swap.
+  The notification consumer lives in `native_codex.py` and is not affected
+  by a swap. **Measured on Codex 0.164** (§10): a swap applies new code to
+  existing tools at once, even mid-turn, and the app-server refreshes its
+  own tool cache on `list_changed` (a new thread sees new tools). But a
+  thread that is already live keeps the tool list it started with, through
+  later turns and `thread/resume`. So in a running Codex session new tools
+  stay invisible, description changes don't show, and a changed schema
+  stays the old one. Two rules handle this: tool schemas stay compatible
+  with what running threads hold (enforced by
+  `tests/test_tool_schema_compat.py` against `tool_schemas.json`: removing
+  a tool or parameter, adding a required parameter, or changing a type fails
+  unless marked with `mcp_version.py snapshot --write --allow-breaking
+  "tool: reason"`); and Codex sessions are told when their tool set changed
+  (`tools_changed_unseen` in `status.json`, a note in `ping().mcp` and in
+  the pending notice, "New tools appear after a restart"). `A-R` picks the
+  new tools up.
 
 ### 3.6 Alternatives rejected
 
@@ -171,11 +186,14 @@ manual `/mcp`; with the proxy it heals itself.
 The policy lives in the backend, `server.py`'s `activation` task, so it can
 change with ordinary deploys. The proxy only enforces "nothing in flight".
 
-**Pending.** Each deploy writes a version stamp last:
-`mcp_server/VERSION`, containing the git SHA and a content hash of the
-payload, written with an atomic rename. Every 10 s a backend stats that file
-in its own directory. When the stamp differs from the version it loaded,
-an update is pending.
+**Pending.** Each deploy runs `mcp_version.py stamp [--git SHA]` on the
+target after copying the payload. It writes `mcp_server/VERSION` (payload
+content hash, tool-schema hash, git SHA) with an atomic rename. Every 10 s
+a backend stats that file in its own directory. An update is pending when
+the stamp's payload hash differs from what the backend loaded **and**
+matches the files on disk (rehashed only when the stamp changes). So a copy
+still in progress, or files edited after stamping, never activate, and an
+unstamped dev checkout never activates anything.
 
 **Activate** when either of these holds:
 
@@ -186,11 +204,16 @@ an update is pending.
    written.
 2. **Idle:** all of the following hold, checked every 10 s through
    `resolve_authorized_session` and local state:
-   - the agent has been idle (`agent_state` not Working or
-     WorkingBackground) for at least 60 s;
-   - its unread inbox count (DMs + mentions) is 0;
-   - the native queue has no notice in `pending` or `submitting`;
-   - no tool call is in flight (the proxy also checks this).
+   - `agent_state.state` is `idle` and has been for at least 60 s
+     (`working`, `working-background`, `waiting-on-human`, `errored` and an
+     unknown state all block);
+   - the unread inbox (DMs + mentions) is empty;
+   - the native queue has no notice in `pending` or `submitting`, other
+     than this update's own notice;
+   - no tool call is in flight (the proxy checks this).
+
+   `status.json` records the current blocker (`working`,
+   `idle_too_recently`, `unread_inbox`, `notice_pending`, `no_proxy`, …).
 
    When they hold, the backend emits `notifications/cm/activate`.
 
@@ -204,88 +227,108 @@ Both rules are EP's (round 5, `cm-initiative/shared/ep-interviews.md`).
 
 ## 5. Monitors: re-arm, not lose
 
-Today shutdown flips `watching` and `fired` records to `interrupted`, and
-nothing picks them up again. Two changes fix this:
+Before this work, shutdown flipped `watching` and `fired` records to
+`interrupted`, and nothing picked them up again. Now:
 
-1. **Persist enough to resume.** Add `baseline`, `report_anchor`,
-   `deadline` (absolute), `edge`, and per-session completion state to the
-   journal `FIELDS`. All of these are small JSON values: `baseline_for`
-   returns `{"kind": "turn"|"size", "value": …}`.
-2. **Adopt on activation.** A backend started with
-   `CM_MCP_PREDECESSOR_PID` waits until that pid has exited (via pidfd, or
-   by polling `/proc`). It then takes every `interrupted` record of the
-   predecessor's producer. Producers record their pid for this. For each
-   record it:
-   - restarts the watch with the **original** baseline and deadline;
-   - marks the predecessor's copy `replaced` (already in `SETTLED`), in one
-     `monitor_state.publish`.
+1. **Persist enough to resume.** The journal keeps each record's `caller`,
+   original `baselines`, `report_anchors`, absolute `deadline_at`, launch
+   receipt and `interim_turn_ends`, plus each producer's `pid`.
+2. **Adopt after the predecessor exits.** A backend started with
+   `CM_MCP_PREDECESSOR_PID` waits until that pid has exited (its shutdown
+   writes its last journal state). `monitor_state.adopt` then moves every
+   unfinished record (`watching`, `fired`, `interrupted`) of that producer
+   in **one** atomic journal write: the predecessor's copy becomes
+   `replaced` (settled, `adopted_by`) and this producer's copy becomes
+   `watching` (`adopted_from`). Each watch restarts from its **original**
+   baseline and deadline, so a turn that ended during the swap is still a
+   new edge and fires. A watch whose deadline passed in the gap fires
+   `timed_out` at once. Records written before baselines were persisted are
+   not resumed, because without their original edge they could fire on old
+   news.
 
-   A turn that ended during the swap gap is then still a new edge against
-   the original baseline, and it fires. A watch that would have timed out
-   during the gap fires `timed_out`, as before.
+**Exactly once.** A record can't be resumed twice, because the handover is
+a single rename: before it, only the predecessor owns the record; after
+it, only the successor does. A failed write changes nothing and is
+retried. A successor killed after adopting is itself the next successor's
+predecessor, so the record moves on again. The notice can't be sent twice,
+because its queue ID is the monitor ID (`monitor:<id>`) and the queue
+refuses a second publication under that ID. If the predecessor published
+and died before recording the delivery, the successor re-detects the edge,
+finds the ID taken, and verifies the existing notice instead of sending
+another. The one residual case is the queue evicting that settled notice
+(past 512 retained events) during the gap; that is outside any realistic
+swap window.
 
-A fired monitor whose notice is already queued needs no adoption: the queue
-holds the notice durably, and `_refresh_native_receipts` already reconciles
-receipts across producers. A crash restart (§3.4) uses the same adoption
-path, because the predecessor pid is set for every proxy start after the
-first.
-
-Session exit and the continuous drain keep their current semantics. The
-drain still sees unfinished obligations in the journal until they are
-adopted.
+A crash restart (§3.4) uses the same path, because the proxy passes the
+dead backend's pid. Session exit and the continuous drain keep their
+current semantics: an `interrupted` record stays an obligation in the
+journal until someone adopts it.
 
 ## 6. How CM knows each session's MCP version
 
-Each backend writes `~/.cm/mcp/<uid>/status.json` (0600, atomic) at
-startup and whenever its state changes. It contains:
+Two files per session, both host-local, under `~/.cm/mcp/<uid>/`:
 
-- `version`, the stamp it loaded;
-- `proxy` (from `CM_MCP_PROXY`) and `generation`;
-- `pid` and `started_at`;
-- `pending`: the stamp on disk if newer, plus `pending_since` and the
-  reason activation is blocked (`working`, `inbox:3`, `notice_pending`,
-  `in_flight`);
-- `last_activation`: when, from which version, monitors carried, and any
-  preflight failure.
+- `status.json`, written by the backend at startup and on each policy tick.
+  It holds `version` (the stamp's, or the payload hash when unstamped),
+  `payload_hash`, `tools_hash`, `session_tools_hash` (the tool set the
+  engine saw first), `tools_changed_unseen` (Codex only), `engine`,
+  `proxy` (`{version, generation}` from the env), `pid`, `started_at`,
+  `pending` (`{version, payload_hash, tools_hash, tools_change}`) and
+  `blocked`.
+- `proxy.json`, written by the proxy: `proxy_version`, `proxy_pid`,
+  `state` (`running`, `activating`, `restarting`, `held_down`, `stopped`),
+  `generation`, `backend_pid`, `activations`, `recent_crashes`,
+  `last_error` and `last_activation` (`mode`, `ok`, `from_pid`/`to_pid`,
+  `preflight_ms`, `hold_ms`, `held_messages`, or the preflight `error`).
 
-`ping` returns the same object as `mcp`.
+`ping().mcp` is the agent-facing summary: `{version, proxy,
+update_pending?, note?}`.
 
-The brain reads these files directly. Status is host-local, as sessions
-are, so no new RPC is needed and `control/methods.rs` isn't touched. A
-later slice can add the field to `list_sessions` and the A-i peek.
+No new RPC, and `control/methods.rs` isn't touched. The release-lead
+script reads the files directly. A later slice can add them to
+`list_sessions` and the A-i peek.
 
 A session with no proxy (anything spawned before rollout, like EP today)
-has no fresh `status.json`. A `/proc` scan finds its `server.py` by
-`CM_TUI_SESSION_ID` in the environ, and the session is reported as
-`proxyless`.
+has no `proxy.json`. A `/proc` scan finds its `server.py` by
+`CM_TUI_SESSION_ID` in the environ, and it is reported as needing one
+manual `/mcp`.
 
 ## 7. What the agent and the release lead see
 
-**Agent.** One native notice per pending version, and only for an agent
-that is working (an idle agent is simply activated within about 60 s;
-waking it to say so would cost a turn):
+**Agent.** One native notice per pending version, and only while the agent
+is working (`working` or `working-background`). An idle agent is never
+woken; it is simply activated about a minute later:
 
-> `[cm-mcp-update] CM MCP update abc123 is pending. It activates when you
-> call ack_reconnect() or after 60 s idle. Your 3 monitors and all chat
-> watches carry over; nothing is re-sent.`
+> `[cm-mcp-update v4dd…] A CM MCP update (v4dd…) is pending. It activates
+> on its own after you have been idle for a minute (ack_reconnect() applies
+> it sooner); your 2 monitors and chat watches carry over and nothing is
+> re-sent.`
 
-The monitor count and the wording come from the backend, so the text can
-change with deploys. After activation, the agent sees nothing it has to act
-on. The tool list may refresh (`list_changed`), and `ping().mcp` shows the
-new version and `last_activation`.
+Codex sessions whose tool set changes get " New tools appear after a
+restart." added. The wording comes from the backend, so it can change with
+deploys. `ack_reconnect()` is documented as an optional shortcut. After
+activation the agent has nothing to do: Claude's tool list refreshes, and
+`ping().mcp` shows the new version.
 
-**Release lead.** `scripts/cm-mcp-versions [--ssh <host>]` prints one row
-per live agent session:
+**Release lead.** `scripts/cm-mcp-versions [--ssh <host>] [--json]`:
 
 ```
-uid  label  engine  proxy  version  pending  blocked  since  monitors
+host <host>: launcher payload /opt/cm-daemon/mcp_server version <stamp>
+  3 current, 2 behind, 68 pre-status code
+uid  name  engine  proxy  version  state  age_h  notes
 ```
 
-Rows are sorted by staleness. Proxyless sessions are listed separately as
-"needs one manual /mcp reconnect". Activation failures, crash-loop
-hold-downs and `blocked` reasons are flagged. This is the old-version view
-from EP's requirements. A `daemon.health` count (`mcp_outdated`) and a TUI
-marker can follow later; they are not needed to ship.
+Rows run stalest first: `pre-status code` (a server from before this
+work), then `behind`, then `current`. The notes column flags:
+
+- "no proxy: needs one manual /mcp reconnect";
+- the pending version and its blocker;
+- a failed last activation;
+- a proxy that is restarting or held down;
+- "tool set changed, not visible until restart".
+
+On cm-sessions today it lists 68 live servers, all pre-status and all
+proxyless. That is the expected starting point.
 
 ## 8. Limits
 
@@ -303,71 +346,116 @@ marker can follow later; they are not needed to ship.
   backend stays consistent with what the client was told: it reads
   `CM_CLAUDE_CHANNEL` from the frozen env, as now.
 - **The proxy itself.** Changing the proxy needs one real reconnect per
-  session. It should be as near-frozen as `cm-holder`: no MCP SDK import,
-  no policy, and a version string in `status.json` so the release lead can
-  see stale proxies.
+  session. It is kept near-frozen, like `cm-holder`: stdlib only, no MCP
+  SDK import, no policy. Its version is in `proxy.json`, and in
+  `status.json` through the env, so the release lead can see stale proxies.
+- **Codex threads keep their first tool list** (§3.5).
 
 ## 9. Failure and rollback
 
 | Failure | Behavior |
 |---|---|
-| New payload fails preflight (import error, `initialize` error, no reply in 30 s) | The candidate is killed and the old child keeps serving. `status.json` records `preflight_failed: <version>`. There is no retry until the stamp changes again, so it doesn't loop. |
+| New payload fails preflight (import error, `initialize` error, no reply in 30 s) | The candidate is killed and the old child keeps serving. `proxy.json` records `last_activation: {ok: false, error}`. The old backend's policy asks again at most once per minute while the stamp stays pending; a fixed stamp clears it. |
 | New payload passes preflight and then crashes | The §3.4 restart: errors for in-flight calls, backoff, then held down after 3 crashes in 10 minutes. |
 | Old child won't exit | stdin EOF, then SIGTERM, then SIGKILL, 5 s each. Monitors are adopted from the journal (a SIGKILL'd child may not have written `interrupted`, so a dead predecessor's `watching` records are adopted too). A notice it left `submitting` becomes `uncertain`, with no resend. |
 | Code rollback | Redeploy the previous payload and write a new stamp. It activates through the same boundary. A held-down proxy picks it up within 60 s. There is no special rollback path. |
-| Proxy bug | The engine sees the MCP server fail, as it does today when `server.py` dies. Recovery is a manual `/mcp` reconnect, and turning the launcher's proxy flag off (`CM_MCP_PROXY_DISABLE=1` in the launcher, written by `ensure_launcher`) makes that reconnect go direct to `server.py`. |
+| Proxy bug | The engine sees the MCP server fail, as it does today when `server.py` dies. Recovery is a manual `/mcp` reconnect. With `~/.cm/mcp/proxy.disabled` present on the host, that reconnect goes direct to `server.py`. New spawns stop getting the proxy once `mcp_proxy` is removed from `daemon.toml`. |
 | Activation during an Owner-visible prompt | Can't happen. A permission prompt is either a request in flight (elicitation) or an agent that is working. |
 
-## 10. Prototype: what is proven
+## 10. What is proven
 
-Branch head: `mcp_server/mcp_proxy.py` (prototype) and
-`mcp_server/tests/test_mcp_proxy.py`. The trigger is SIGUSR1 rather than
-`notifications/cm/activate`.
+Evidence is in `~/.local/share/msgfix/mcp-activation/` (probe runs) and
+`~/.local/share/msgfix/sb/e2e-slice{1,3,4}.log` (scratch `cm-daemon` from
+this branch with `mcp_proxy = true`, isolated HOME, real Claude Code
+2.1.310 sessions on Haiku 4.5, with real `server.py` behind the proxy).
 
-**Proven on Claude Code 2.1.310** with `claude -p` and Haiku 4.5. Evidence
-is in `~/.local/share/msgfix/mcp-activation/` (`run-claude.log` and the
-transcript copy). In one turn the model called `probe_version` and got
-`version=1 pid=769596 generation=1`. A Bash step then swapped the backend.
-The next call to the same tool returned `version=2 pid=770670
-generation=2` over the same connection, with no reconnect. The tool that
-exists only in v2 (`probe_new_tool`) became visible and was called
-successfully. So Claude honors `list_changed` mid-turn, and the swap is
-invisible to it.
+**Probe backend.**
 
-**Unit tests** (3, stdlib backend, passing) cover three cases:
+- **Claude (`claude -p`):** in one turn, the same tool returned v1, then v2
+  from a new pid after the swap. A v2-only tool became visible and was
+  called, without `/mcp`.
+- **Codex 0.164 (`codex exec` and a multi-turn `app-server` client):**
+  - existing tools return v2 mid-turn;
+  - a new thread sees the new tool;
+  - the live thread doesn't, even after `thread/resume` (§3.5).
 
-- a swap keeps the connection and announces new tools;
-- a slow call in flight finishes on the old backend before the swap, and the
-  next call goes to the new one;
-- a candidate that dies in preflight leaves the old backend serving.
+**Real `server.py` behind the proxy** (slice 1):
 
-**Not proven yet:**
+- `chat_open`/`chat_send` before and after a swap send from the same
+  participant ID and name, and `ping` shows the same UID.
+- A `wait_for_session_idle` call on a 40 s busy session, with an activation
+  requested 12 s in, returned `{idle: true}` to the agent first; the swap
+  ran after it.
+- A DM became a channel event into Claude, and the agent replied.
+- **Consumer-lock handoff with a pending notice:**
+  1. the serving backend was frozen (SIGSTOP) while holding
+     `consumer.lock`;
+  2. a DM queued as `pending`;
+  3. the activation SIGKILLed the frozen backend after 10 s;
+  4. the new backend took the lock and delivered the notice (`observed`),
+     and the agent replied.
 
-- Codex end to end: list_changed handling is visible in the binary but has
-  not been exercised.
-- Running real `server.py` behind the proxy with channel events and the
-  native consumer handoff.
-- Monitor adoption, which is new code (§5).
-- Long-session behavior.
+**Policy** (slice 3):
 
-These are the first build-phase tests.
+- **Idle path:** blocked as `idle_too_recently`, then activated 76 s after
+  the stamp (mode `idle`, hold 237 ms).
+- **Ack path:** the notice reached a working agent mid-turn. Its
+  `ack_reconnect` returned `{activating: true, version, from_version}`, and
+  the swap followed its reply (mode `ack`).
+- The live run found one bug: the notice also woke a just-idle agent. Fixed:
+  the notice now goes to working agents only.
 
-## 11. Rollout and build slices
+**Monitors** (slice 4): a monitor was armed on a busy session. The serving
+backend was frozen, and the watched turn ended during the gap. After the
+swap:
 
-1. Proxy hardened (crash restart, hold-down, `notifications/cm/` intercept),
-   `launcher.sh` integration behind a flag, and the `claude_parent_argv` fix.
-2. The `VERSION` stamp in the MCP payload deploy (HOWTO §3 and the release
-   script), `status.json`, `ping().mcp`, and `scripts/cm-mcp-versions`.
-3. The backend activation policy: `ack_reconnect`, the idle rule, and the
-   pending notice.
-4. Monitor persistence and adoption (§5).
-5. Turn the launcher flag on. **Every existing session then needs one last
-   manual `/mcp` reconnect** to get the proxy; new spawns get it
-   automatically. After that, MCP deploys activate without Owner.
+- the journal shows the predecessor's copy `replaced` and the successor's
+  copy `delivered`;
+- exactly one `monitor:<id>` notice was published (`observed`);
+- the agent replied once.
 
-Slices 1–2 alone already help the release lead (the version view and crash
-self-heal). Slices 3–4 remove "Owner, please reconnect X".
+**Unit tests** (all stdlib or mocked):
 
-Daemon changes are limited to `mcp_config.rs` (launcher rendering) and
-optionally reading `status.json`. There are no `control/methods.rs` changes
-and no RPCs.
+- **Proxy:** never forwards `notifications/cm/*`; in-flight calls finish on
+  the old backend; a failed preflight keeps the old one; backend-requested
+  ack and idle activation; idle refused after recent traffic; crash
+  restart; crash-loop hold-down and recovery.
+- **Launcher branch** and **`daemon.toml` flag** (Rust).
+- **`claude_parent_argv`** through the proxy.
+- **Stamp and pending consistency; status.json** and the Codex
+  tool-set flag.
+- **Schema compatibility guard.**
+- **Policy:** each blocker; no notice to idle agents; the Codex suffix;
+  ack.
+- **Monitor adoption:**
+  - a turn ending in the gap fires once;
+  - a predecessor that published and then died is not doubled;
+  - a successor that died after adopting hands over again;
+  - a failed or transient handover write;
+  - settled and pre-baseline records are left alone;
+  - a live predecessor is never adopted from;
+  - the deadline carries over;
+  - registration persists the resume fields.
+
+**Not proven:** real `server.py` behind the proxy under Codex (only the
+probe backend ran there), and multi-day sessions.
+
+## 11. Rollout
+
+Slices 1–4 are built on `cm-sub/msgfix-mcp-activation`, with the flag off.
+To deploy:
+
+1. Ship the brain, so new spawns stamp `CM_MCP_PROXY_ENABLED`.
+2. Ship the complete MCP payload, then run `mcp_version.py stamp` on each
+   host (HOWTO §3).
+
+**Slice 5, the canary:** set `mcp_proxy = true` in cm-sessions'
+`daemon.toml`. It is read at each spawn, so no reload is needed. New
+spawns there get the proxy. cm-manager stays off until the canary has run
+for a day. **Existing sessions need one last manual `/mcp`** to get the
+proxy, and only once their host has the flag. After that, MCP deploys
+activate without Owner. `scripts/cm-mcp-versions --ssh <host>` tracks the
+progress.
+
+The daemon change is limited to `mcp_config.rs`: the flag and the launcher
+rendering. There are no `control/methods.rs` changes and no new RPCs.

@@ -69,6 +69,17 @@ and the age of the oldest; a growing age means the hub link is stalled. A
 or its hub is restarting: your sends are saved and replicate on their own, so
 don't resend, and expect cross-host reads to lag until it goes away.
 
+**MCP updates.** Sessions started with CM's MCP proxy pick up a deployed MCP
+update without a `/mcp` reconnect. CM activates it on its own once you have
+been idle for a minute with nothing unread; nothing is needed from you. A
+`[cm-mcp-update <version>]` notice tells you one is pending while you work;
+`ack_reconnect()` applies it sooner if you want. The connection, identity,
+chat cursors and watches, and your monitors carry over, and nothing is
+re-sent. `ping().mcp` shows the version. In Codex sessions, new or changed
+tools appear only after a restart (`A-R`); updated code for existing tools
+applies immediately. Sessions without the proxy still need one manual
+reconnect.
+
 ## Work items: if you are doing it, it has an item
 
 Small units of work live as **items** on a shared board: your initiative's,
