@@ -24,7 +24,8 @@ except Exception:  # pragma: no cover - exercised only where the dep is absent
 # Add project root to path so cli.planning_client is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mcp_server.claude_channel import CmActivateNotification, CmActivateParams, NotificationMCP
+from mcp_server.claude_channel import (
+    CmActivateNotification, CmActivateParams, CmProxyNotification, NotificationMCP)
 
 try:
     from cli.planning_client import PlanningClient
@@ -80,37 +81,45 @@ AGENT_GUIDE = Path(__file__).with_name("AGENT_GUIDE.md").read_text(encoding="utf
 async def _lifespan(_server):
     if os.environ.get("CM_TUI_SESSION_ID"):
         async_monitor._persist_best_effort()
+    started: dict[str, asyncio.Task] = {}
+
+    async def promoted():
+        # Behind CM's proxy a new backend is first a CANDIDATE that may be
+        # abandoned: no notification consumer, policy, monitor adoption or
+        # status write until the backend it replaces has exited.
+        await activation.wait_promoted()
+        if not os.environ.get("CM_TUI_SESSION_ID"):
+            return
+        if ((_server.channel or os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"))
+                and os.environ.get("CM_AGENT_ENGINE") != "codex"):
+            from mcp_server.native_claude import run
+            started["bridge"] = asyncio.create_task(
+                run(_server.channel), name="cm-native-notifications")
+        if not activation.proxy():
+            return
         activation.write_status()
-    bridge = None
-    if (os.environ.get("CM_TUI_SESSION_ID")
-            and (_server.channel or os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"))
-            and os.environ.get("CM_AGENT_ENGINE") != "codex"):
-        from mcp_server.native_claude import run
-        bridge = asyncio.create_task(run(_server.channel), name="cm-native-notifications")
-    adoption = None
-    if os.environ.get("CM_TUI_SESSION_ID") and os.environ.get("CM_MCP_PREDECESSOR_PID"):
-        adoption = asyncio.create_task(async_monitor.adopt_predecessor(),
-                                       name="cm-monitor-adoption")
-    policy = None
-    if os.environ.get("CM_TUI_SESSION_ID") and activation.proxy():
+        await async_monitor.adopt_predecessor()
         from mcp_server.notifications import Queue
-        policy = asyncio.create_task(activation.Policy(
+        started["policy"] = asyncio.create_task(activation.Policy(
             _send_activate, control_client.call, Queue.own,
             lambda: len(async_monitor._active_monitors()),
         ).run(), name="cm-mcp-activation")
+        await _send_proxy("ready")  # the proxy stops holding client input
+
+    promotion = asyncio.create_task(promoted(), name="cm-mcp-promotion")
     try:
         yield {}
     finally:
-        if policy:
-            policy.cancel()
-        if adoption:
-            adoption.cancel()
+        promotion.cancel()
+        if "policy" in started:
+            started["policy"].cancel()
         # Shutdown retains unfinished watch obligations for continuous drain.
         for record in async_monitor._MONITORS.values():
             if record["state"] in ("watching", "fired"):
                 record["state"] = "interrupted"
         if os.environ.get("CM_TUI_SESSION_ID"):
             async_monitor._persist_best_effort()
+        bridge = started.get("bridge")
         if bridge:
             bridge.cancel()
             with suppress(asyncio.CancelledError):
@@ -127,6 +136,20 @@ async def _send_activate(mode: str) -> None:
         return
     await asyncio.wait_for(session.send_notification(
         CmActivateNotification(params=CmActivateParams(mode=mode))), 3)
+
+
+async def _send_proxy(what: str) -> None:
+    """Proxy-only notifications/cm/<what> (never forwarded to the engine)."""
+    session = mcp.client_session
+    for _ in range(50):  # the client session exists once tools/list ran
+        if session is not None:
+            break
+        await asyncio.sleep(0.1)
+        session = mcp.client_session
+    if session is None:
+        return
+    with suppress(Exception):
+        await asyncio.wait_for(session.send_notification(CmProxyNotification(method=f"notifications/cm/{what}")), 3)
 
 
 @mcp.tool()

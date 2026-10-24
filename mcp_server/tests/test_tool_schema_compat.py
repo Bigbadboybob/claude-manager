@@ -55,8 +55,86 @@ class BreakingChangeTests(unittest.TestCase):
                          ["a: parameter 'y' removed"])
 
     def test_optional_wrappers_compare_by_inner_type(self):
-        self.assertEqual(mcp_version._param_type(
-            {"anyOf": [{"type": "string"}, {"type": "null"}]}), "string")
+        self.assertEqual(mcp_version.signature(
+            {"anyOf": [{"type": "string"}, {"type": "null"}]}), {"type": "string"})
+
+
+def tool(param_schema, required=()):
+    return mcp_version.summarize([{"name": "t", "inputSchema": {
+        "type": "object", "properties": {"p": param_schema}, "required": list(required),
+        "$defs": {"Item": {"type": "object", "properties": {"id": {"type": "string"}},
+                           "required": ["id"]}}}}])
+
+
+class NestedSchemaTests(unittest.TestCase):
+    def breaks(self, old, new):
+        return mcp_version.breaking_changes(tool(old), tool(new))
+
+    def test_nested_breaking_shapes(self):
+        cases = [
+            ({"type": "array", "items": {"type": "string"}},
+             {"type": "array", "items": {"type": "integer"}}, "parameter 'p'[] changed type"),
+            ({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+             {"type": "object", "properties": {"a": {"type": "string"}}}, "parameter 'p'.b removed"),
+            ({"type": "object", "properties": {"a": {"type": "string"}}},
+             {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+             "parameter 'p'.a newly required"),
+            ({"type": "string", "enum": ["x", "y"]}, {"type": "string", "enum": ["x"]},
+             "no longer accepts \"y\""),
+            ({"type": "string"}, {"type": "string", "enum": ["x"]}, "no longer accepts"),
+            ({"type": "array", "items": {"$ref": "#/$defs/Item"}},
+             {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "integer"}}}},
+             "parameter 'p'[].id changed type"),
+        ]
+        for old, new, expected in cases:
+            with self.subTest(expected=expected):
+                problems = self.breaks(old, new)
+                self.assertTrue(any(expected in p for p in problems), problems)
+
+    def test_nested_additions_are_compatible(self):
+        old = {"type": "object", "properties": {"a": {"type": "string", "enum": ["x"]}},
+               "required": ["a"]}
+        new = {"type": "object", "properties": {"a": {"type": "string", "enum": ["x", "z"]},
+                                                "b": {"type": "integer"}}, "required": ["a"]}
+        self.assertEqual(self.breaks(old, new), [])
+        self.assertEqual(self.breaks({"type": "array", "items": {"$ref": "#/$defs/Item"}},
+                                     {"type": "array", "items": {"$ref": "#/$defs/Item"}}), [])
+
+    def test_the_toolset_hash_ignores_optional_parameters(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            def write(tools):
+                (root / mcp_version.SNAPSHOT).write_text(__import__("json").dumps({"tools": tools}))
+                return mcp_version.toolset_hash(root)
+            base = write({"t": {"required": ["a"], "params": {"a": {"type": "string"}}}})
+            optional = write({"t": {"required": ["a"], "params": {"a": {"type": "string"},
+                                                                   "b": {"type": "string"}}}})
+            self.assertEqual(base, optional)
+            self.assertNotEqual(base, write({"t": {"required": ["a"], "params": {}},
+                                             "u": {"required": [], "params": {}}}))
+            self.assertNotEqual(base, write({"t": {"required": ["a", "b"], "params": {}}}))
+        finally:
+            shutil.rmtree(root)
+
+
+class PayloadWalkTests(unittest.TestCase):
+    def test_virtualenvs_and_dot_dirs_are_not_payload(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            (root / "server.py").write_text("x = 1\n")
+            for junk in (".venv/lib/python3.12/site-packages/m.py", "venv/m.py",
+                         "lib/site-packages/m.py", ".git/hooks/h.py", "__pycache__/c.py"):
+                (root / junk).parent.mkdir(parents=True, exist_ok=True)
+                (root / junk).write_text("y = 2\n")
+            (root / "hooks").mkdir()
+            (root / "hooks" / "cm_stop_hook.py").write_text("z = 3\n")
+            names = [str(p.relative_to(root)) for p in mcp_version.payload_files(root)]
+            self.assertEqual(names, ["hooks/cm_stop_hook.py", "server.py"])
+            before = mcp_version.payload_hash(root)
+            (root / ".venv/lib/python3.12/site-packages/m.py").write_text("rebuilt\n")
+            self.assertEqual(mcp_version.payload_hash(root), before, "a venv rebuild is not a new version")
+        finally:
+            shutil.rmtree(root)
 
 
 class StampTests(unittest.TestCase):

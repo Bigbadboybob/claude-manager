@@ -115,6 +115,12 @@ class CmActivateNotification(types.Notification):
     params: CmActivateParams
 
 
+class CmProxyNotification(types.Notification):
+    """Proxy-only, parameterless (notifications/cm/ready)."""
+    method: str
+    params: types.NotificationParams | None = None
+
+
 class NotificationMCP(FastMCP):
     """FastMCP tools with channel capability only for opted-in Claude launches."""
 

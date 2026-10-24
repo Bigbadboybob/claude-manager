@@ -7,7 +7,9 @@
   },
   "acknowledge_continuous_drain": {
    "params": {
-    "request_id": "string"
+    "request_id": {
+     "type": "string"
+    }
    },
    "required": [
     "request_id"
@@ -15,10 +17,18 @@
   },
   "add_initiative_project": {
    "params": {
-    "initiative_id": "string",
-    "project": "string",
-    "project_channel": "string",
-    "role": "string"
+    "initiative_id": {
+     "type": "string"
+    },
+    "project": {
+     "type": "string"
+    },
+    "project_channel": {
+     "type": "string"
+    },
+    "role": {
+     "type": "string"
+    }
    },
    "required": [
     "initiative_id",
@@ -27,20 +37,38 @@
   },
   "board": {
    "params": {
-    "archived": "boolean",
-    "board": "string",
-    "group": "string",
-    "include_closed": "boolean",
-    "mine": "boolean",
-    "query": "string",
-    "settings": "object",
-    "view": "string"
+    "archived": {
+     "type": "boolean"
+    },
+    "board": {
+     "type": "string"
+    },
+    "group": {
+     "type": "string"
+    },
+    "include_closed": {
+     "type": "boolean"
+    },
+    "mine": {
+     "type": "boolean"
+    },
+    "query": {
+     "type": "string"
+    },
+    "settings": {
+     "type": "object"
+    },
+    "view": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "cancel_monitor": {
    "params": {
-    "monitor_id": "string"
+    "monitor_id": {
+     "type": "string"
+    }
    },
    "required": [
     "monitor_id"
@@ -48,63 +76,150 @@
   },
   "chat_channels": {
    "params": {
-    "action": "string",
-    "admins": "array",
-    "allow_agent_edits": "boolean",
-    "archived": "boolean",
-    "conversation": "string",
-    "cursor": "object",
-    "default_join": "boolean",
-    "description": "string",
-    "expected_revision": "string",
-    "joined_only": "boolean",
-    "limit": "integer",
-    "name": "string",
-    "origin_daemon_id": "string",
-    "participant_id": "string",
-    "path": "string",
-    "query": "string",
-    "request_id": "string",
-    "view": "string"
+    "action": {
+     "type": "string"
+    },
+    "admins": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "allow_agent_edits": {
+     "type": "boolean"
+    },
+    "archived": {
+     "type": "boolean"
+    },
+    "conversation": {
+     "type": "string"
+    },
+    "cursor": {
+     "type": "object"
+    },
+    "default_join": {
+     "type": "boolean"
+    },
+    "description": {
+     "type": "string"
+    },
+    "expected_revision": {
+     "type": "string"
+    },
+    "joined_only": {
+     "type": "boolean"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "participant_id": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string"
+    },
+    "query": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "view": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "chat_dms": {
    "params": {
-    "cursor": "object",
-    "limit": "integer",
-    "peer": "string",
-    "unread_only": "boolean"
+    "cursor": {
+     "type": "object"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "peer": {
+     "type": "string"
+    },
+    "unread_only": {
+     "type": "boolean"
+    }
    },
    "required": []
   },
   "chat_follow": {
    "params": {
-    "action": "string",
-    "bell": "boolean",
-    "cursor": "object",
-    "dnd": "boolean",
-    "expected_revision": "integer",
-    "inbox": "boolean",
-    "limit": "integer",
-    "muted": "boolean",
-    "origin_daemon_id": "string",
-    "request_id": "string",
-    "scope": "object",
-    "wake": "boolean"
+    "action": {
+     "type": "string"
+    },
+    "bell": {
+     "type": "boolean"
+    },
+    "cursor": {
+     "type": "object"
+    },
+    "dnd": {
+     "type": "boolean"
+    },
+    "expected_revision": {
+     "type": "integer"
+    },
+    "inbox": {
+     "type": "boolean"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "muted": {
+     "type": "boolean"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "scope": {
+     "type": "object"
+    },
+    "wake": {
+     "type": "boolean"
+    }
    },
    "required": []
   },
   "chat_monitor": {
    "params": {
-    "after": "object",
-    "expires_in": "string",
-    "include_self": "boolean",
-    "mode": "string",
-    "notify": "string",
-    "origin_daemon_id": "string",
-    "request_id": "string",
-    "scope": "object"
+    "after": {
+     "type": "object"
+    },
+    "expires_in": {
+     "type": "string"
+    },
+    "include_self": {
+     "type": "boolean"
+    },
+    "mode": {
+     "type": "string"
+    },
+    "notify": {
+     "type": "string"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "scope": {
+     "type": "object"
+    }
    },
    "required": [
     "request_id",
@@ -113,82 +228,186 @@
   },
   "chat_monitors": {
    "params": {
-    "action": "string",
-    "cursor": "object",
-    "limit": "integer",
-    "monitor_id": "string",
-    "origin_daemon_id": "string",
-    "receipt": "object",
-    "request_id": "string",
-    "unacknowledged_only": "boolean"
+    "action": {
+     "type": "string"
+    },
+    "cursor": {
+     "type": "object"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "monitor_id": {
+     "type": "string"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "receipt": {
+     "type": "object"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "unacknowledged_only": {
+     "type": "boolean"
+    }
    },
    "required": []
   },
   "chat_norms": {
    "params": {
-    "ack_revision": "string",
-    "action": "string",
-    "channel": "string",
-    "cursor": "object",
-    "expected_revision": "string",
-    "limit": "integer",
-    "limit_chars": "integer",
-    "origin_daemon_id": "string",
-    "request_id": "string",
-    "revision": "string",
-    "scope": "string",
-    "since": "object",
-    "summary": "string",
-    "text": "string"
+    "ack_revision": {
+     "type": "string"
+    },
+    "action": {
+     "type": "string"
+    },
+    "channel": {
+     "type": "string"
+    },
+    "cursor": {
+     "type": "object"
+    },
+    "expected_revision": {
+     "type": "string"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "limit_chars": {
+     "type": "integer"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "revision": {
+     "type": "string"
+    },
+    "scope": {
+     "type": "string"
+    },
+    "since": {
+     "type": "object"
+    },
+    "summary": {
+     "type": "string"
+    },
+    "text": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "chat_open": {
    "params": {
-    "channel": "string",
-    "conversation": "string",
-    "dm": [
-     "array",
-     "string"
-    ]
+    "channel": {
+     "type": "string"
+    },
+    "conversation": {
+     "type": "string"
+    },
+    "dm": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    }
    },
    "required": []
   },
   "chat_people": {
    "params": {
-    "cursor": "object",
-    "include_exited": "boolean",
-    "limit": "integer",
-    "query": "string",
-    "view": "string"
+    "cursor": {
+     "type": "object"
+    },
+    "include_exited": {
+     "type": "boolean"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "query": {
+     "type": "string"
+    },
+    "view": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "chat_pins": {
    "params": {
-    "action": "string",
-    "channel": "string",
-    "conversation": "string",
-    "cursor": "object",
-    "dm": [
-     "array",
-     "string"
-    ],
-    "expected_revision": "string",
-    "limit": "integer",
-    "message_id": "string",
-    "origin_daemon_id": "string",
-    "request_id": "string"
+    "action": {
+     "type": "string"
+    },
+    "channel": {
+     "type": "string"
+    },
+    "conversation": {
+     "type": "string"
+    },
+    "cursor": {
+     "type": "object"
+    },
+    "dm": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    },
+    "expected_revision": {
+     "type": "string"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "message_id": {
+     "type": "string"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "chat_react": {
    "params": {
-    "emoji": "string",
-    "message_id": "string",
-    "origin_daemon_id": "string",
-    "remove": "boolean",
-    "request_id": "string"
+    "emoji": {
+     "type": "string"
+    },
+    "message_id": {
+     "type": "string"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "remove": {
+     "type": "boolean"
+    },
+    "request_id": {
+     "type": "string"
+    }
    },
    "required": [
     "emoji",
@@ -198,41 +417,105 @@
   },
   "chat_read": {
    "params": {
-    "ack_receipt": "object",
-    "after": "object",
-    "channel": "string",
-    "conversation": "string",
-    "cursor": "object",
-    "dm": [
-     "array",
-     "string"
-    ],
-    "dms": "boolean",
-    "freshness": "string",
-    "inbox": "boolean",
-    "limit": "integer",
-    "mark_read": "boolean",
-    "mark_read_before": "string",
-    "mentions_only": "boolean",
-    "newest_first": "boolean",
-    "pinned_only": "boolean",
-    "query": "string",
-    "sender": "string",
-    "tags": "array",
-    "thread": "string",
-    "time": "object",
-    "time_basis": "string",
-    "unread_only": "boolean",
-    "view": "string"
+    "ack_receipt": {
+     "type": "object"
+    },
+    "after": {
+     "type": "object"
+    },
+    "channel": {
+     "type": "string"
+    },
+    "conversation": {
+     "type": "string"
+    },
+    "cursor": {
+     "type": "object"
+    },
+    "dm": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    },
+    "dms": {
+     "type": "boolean"
+    },
+    "freshness": {
+     "type": "string"
+    },
+    "inbox": {
+     "type": "boolean"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "mark_read": {
+     "type": "boolean"
+    },
+    "mark_read_before": {
+     "type": "string"
+    },
+    "mentions_only": {
+     "type": "boolean"
+    },
+    "newest_first": {
+     "type": "boolean"
+    },
+    "pinned_only": {
+     "type": "boolean"
+    },
+    "query": {
+     "type": "string"
+    },
+    "sender": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "thread": {
+     "type": "string"
+    },
+    "time": {
+     "type": "object"
+    },
+    "time_basis": {
+     "type": "string"
+    },
+    "unread_only": {
+     "type": "boolean"
+    },
+    "view": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "chat_rename": {
    "params": {
-    "expected_name_revision": "integer",
-    "name": "string",
-    "origin_daemon_id": "string",
-    "request_id": "string"
+    "expected_name_revision": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    }
    },
    "required": [
     "expected_name_revision",
@@ -242,24 +525,70 @@
   },
   "chat_send": {
    "params": {
-    "ack_receipt": "object",
-    "body": "string",
-    "channel": "string",
-    "conversation": "string",
-    "dm": [
-     "array",
-     "string"
-    ],
-    "links": "array",
-    "mention_here": "boolean",
-    "mentions": "array",
-    "name": "string",
-    "norms_seen": "object",
-    "origin_daemon_id": "string",
-    "reply_to": "string",
-    "request_id": "string",
-    "tags": "array",
-    "view": "string"
+    "ack_receipt": {
+     "type": "object"
+    },
+    "body": {
+     "type": "string"
+    },
+    "channel": {
+     "type": "string"
+    },
+    "conversation": {
+     "type": "string"
+    },
+    "dm": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    },
+    "links": {
+     "items": {
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "mention_here": {
+     "type": "boolean"
+    },
+    "mentions": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "norms_seen": {
+     "type": "object"
+    },
+    "origin_daemon_id": {
+     "type": "string"
+    },
+    "reply_to": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "view": {
+     "type": "string"
+    }
    },
    "required": [
     "body",
@@ -268,10 +597,18 @@
   },
   "checkpoint_continuous_drain": {
    "params": {
-    "background_work_complete": "boolean",
-    "notes": "string",
-    "request_id": "string",
-    "work_reconciled": "boolean"
+    "background_work_complete": {
+     "type": "boolean"
+    },
+    "notes": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "work_reconciled": {
+     "type": "boolean"
+    }
    },
    "required": [
     "background_work_complete",
@@ -282,8 +619,12 @@
   },
   "clear_continuous_hold": {
    "params": {
-    "dry_run": "boolean",
-    "reason": "string"
+    "dry_run": {
+     "type": "boolean"
+    },
+    "reason": {
+     "type": "string"
+    }
    },
    "required": [
     "reason"
@@ -291,14 +632,30 @@
   },
   "create_subtask": {
    "params": {
-    "base": "string",
-    "effort": "string",
-    "model": "string",
-    "model_engine": "string",
-    "name": "string",
-    "project": "string",
-    "prompt": "string",
-    "worktree_mode": "string"
+    "base": {
+     "type": "string"
+    },
+    "effort": {
+     "type": "string"
+    },
+    "model": {
+     "type": "string"
+    },
+    "model_engine": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "project": {
+     "type": "string"
+    },
+    "prompt": {
+     "type": "string"
+    },
+    "worktree_mode": {
+     "type": "string"
+    }
    },
    "required": [
     "name"
@@ -306,10 +663,18 @@
   },
   "enqueue": {
    "params": {
-    "dedupe_key": "string",
-    "payload": "object",
-    "queue": "string",
-    "source": "string"
+    "dedupe_key": {
+     "type": "string"
+    },
+    "payload": {
+     "type": "object"
+    },
+    "queue": {
+     "type": "string"
+    },
+    "source": {
+     "type": "string"
+    }
    },
    "required": [
     "payload",
@@ -318,19 +683,45 @@
   },
   "fork_session": {
    "params": {
-    "base": "string",
-    "effort": "string",
-    "label": "string",
-    "model": "string",
-    "notify_on_done": "boolean",
-    "notify_until": "string",
-    "parent_task_id": "string",
-    "prompt": "string",
-    "request_id": "string",
-    "session_uid": "string",
-    "task_id": "string",
-    "task_name": "string",
-    "top_level": "boolean"
+    "base": {
+     "type": "string"
+    },
+    "effort": {
+     "type": "string"
+    },
+    "label": {
+     "type": "string"
+    },
+    "model": {
+     "type": "string"
+    },
+    "notify_on_done": {
+     "type": "boolean"
+    },
+    "notify_until": {
+     "type": "string"
+    },
+    "parent_task_id": {
+     "type": "string"
+    },
+    "prompt": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "session_uid": {
+     "type": "string"
+    },
+    "task_id": {
+     "type": "string"
+    },
+    "task_name": {
+     "type": "string"
+    },
+    "top_level": {
+     "type": "boolean"
+    }
    },
    "required": [
     "session_uid"
@@ -338,22 +729,44 @@
   },
   "gate_profile": {
    "params": {
-    "board": "string",
-    "default": "boolean",
-    "delete": "boolean",
-    "klass": "string",
-    "n": "integer",
-    "profile": "object",
-    "reason": "string"
+    "board": {
+     "type": "string"
+    },
+    "default": {
+     "type": "boolean"
+    },
+    "delete": {
+     "type": "boolean"
+    },
+    "klass": {
+     "type": "string"
+    },
+    "n": {
+     "type": "integer"
+    },
+    "profile": {
+     "type": "object"
+    },
+    "reason": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "gate_receipts": {
    "params": {
-    "board": "string",
-    "gate": "string",
-    "history": "boolean",
-    "n": "integer"
+    "board": {
+     "type": "string"
+    },
+    "gate": {
+     "type": "string"
+    },
+    "history": {
+     "type": "boolean"
+    },
+    "n": {
+     "type": "integer"
+    }
    },
    "required": [
     "n"
@@ -361,24 +774,69 @@
   },
   "gate_report": {
    "params": {
-    "base": "object",
-    "board": "string",
-    "branch": "string",
-    "closure": "object",
-    "gate": "string",
-    "head": "string",
-    "inputs": "array",
-    "klass": "string",
-    "log_path": "string",
-    "mf": "string",
-    "n": "integer",
-    "repo": "string",
-    "request_id": "string",
-    "ruling": "string",
-    "runner": "object",
-    "steps": "array",
-    "waivers": "array",
-    "worktree": "object"
+    "base": {
+     "type": "object"
+    },
+    "board": {
+     "type": "string"
+    },
+    "branch": {
+     "type": "string"
+    },
+    "closure": {
+     "type": "object"
+    },
+    "gate": {
+     "type": "string"
+    },
+    "head": {
+     "type": "string"
+    },
+    "inputs": {
+     "items": {
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "klass": {
+     "type": "string"
+    },
+    "log_path": {
+     "type": "string"
+    },
+    "mf": {
+     "type": "string"
+    },
+    "n": {
+     "type": "integer"
+    },
+    "repo": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "ruling": {
+     "type": "string"
+    },
+    "runner": {
+     "type": "object"
+    },
+    "steps": {
+     "items": {
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "waivers": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "worktree": {
+     "type": "object"
+    }
    },
    "required": [
     "head",
@@ -388,19 +846,48 @@
   },
   "gate_waive": {
    "params": {
-    "base": "string",
-    "board": "string",
-    "cmd_digest": "string",
-    "gate": "string",
-    "head": "string",
-    "kind": "string",
-    "message_id": "string",
-    "n": "integer",
-    "nodes": "array",
-    "reason": "string",
-    "revoke": "string",
-    "risk": "string",
-    "step": "string"
+    "base": {
+     "type": "string"
+    },
+    "board": {
+     "type": "string"
+    },
+    "cmd_digest": {
+     "type": "string"
+    },
+    "gate": {
+     "type": "string"
+    },
+    "head": {
+     "type": "string"
+    },
+    "kind": {
+     "type": "string"
+    },
+    "message_id": {
+     "type": "string"
+    },
+    "n": {
+     "type": "integer"
+    },
+    "nodes": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "revoke": {
+     "type": "string"
+    },
+    "risk": {
+     "type": "string"
+    },
+    "step": {
+     "type": "string"
+    }
    },
    "required": [
     "head",
@@ -413,10 +900,18 @@
   },
   "get_backtest_result": {
    "params": {
-    "poll_interval_s": "number",
-    "task_id": "string",
-    "timeout_s": "number",
-    "wait": "boolean"
+    "poll_interval_s": {
+     "type": "number"
+    },
+    "task_id": {
+     "type": "string"
+    },
+    "timeout_s": {
+     "type": "number"
+    },
+    "wait": {
+     "type": "boolean"
+    }
    },
    "required": [
     "task_id"
@@ -432,7 +927,9 @@
   },
   "get_initiative": {
    "params": {
-    "initiative_id": "string"
+    "initiative_id": {
+     "type": "string"
+    }
    },
    "required": [
     "initiative_id"
@@ -440,7 +937,9 @@
   },
   "get_task": {
    "params": {
-    "task_id": "string"
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": [
     "task_id"
@@ -448,7 +947,9 @@
   },
   "get_workflow_state": {
    "params": {
-    "run_id": "string"
+    "run_id": {
+     "type": "string"
+    }
    },
    "required": [
     "run_id"
@@ -456,24 +957,68 @@
   },
   "item": {
    "params": {
-    "blocked_by": "array",
-    "blocked_on": "string",
-    "board": "string",
-    "eta": "string",
-    "group": "string",
-    "holder": [
-     "array",
-     "string"
-    ],
-    "job": "string",
-    "links": "array",
-    "note": "string",
-    "request_id": "string",
-    "status": "string",
-    "title": [
-     "array",
-     "string"
-    ]
+    "blocked_by": {
+     "items": {
+      "type": "integer"
+     },
+     "type": "array"
+    },
+    "blocked_on": {
+     "type": "string"
+    },
+    "board": {
+     "type": "string"
+    },
+    "eta": {
+     "type": "string"
+    },
+    "group": {
+     "type": "string"
+    },
+    "holder": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    },
+    "job": {
+     "type": "string"
+    },
+    "links": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "note": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    },
+    "title": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    }
    },
    "required": [
     "title"
@@ -481,23 +1026,61 @@
   },
   "item_resolve": {
    "params": {
-    "action": "string",
-    "blocked_by": "array",
-    "blocked_on": "string",
-    "board": "string",
-    "check_back": "string",
-    "engine": "string",
-    "holder": [
-     "array",
-     "string"
-    ],
-    "kind": "string",
-    "message": "string",
-    "n": "integer",
-    "reason": "string",
-    "request_id": "string",
-    "task_id": "string",
-    "to": "string"
+    "action": {
+     "type": "string"
+    },
+    "blocked_by": {
+     "items": {
+      "type": "integer"
+     },
+     "type": "array"
+    },
+    "blocked_on": {
+     "type": "string"
+    },
+    "board": {
+     "type": "string"
+    },
+    "check_back": {
+     "type": "string"
+    },
+    "engine": {
+     "type": "string"
+    },
+    "holder": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    },
+    "kind": {
+     "type": "string"
+    },
+    "message": {
+     "type": "string"
+    },
+    "n": {
+     "type": "integer"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "task_id": {
+     "type": "string"
+    },
+    "to": {
+     "type": "string"
+    }
    },
    "required": [
     "action",
@@ -506,41 +1089,121 @@
   },
   "item_set": {
    "params": {
-    "add_holder": [
-     "array",
-     "string"
-    ],
-    "blocked_by": "array",
-    "blocked_on": "string",
-    "board": "string",
-    "check_back": "string",
-    "each": "boolean",
-    "eta": "string",
-    "expect_status": "string",
-    "gate_class": "string",
-    "group": "string",
-    "head": "string",
-    "holder": [
-     "array",
-     "string"
-    ],
-    "job": "string",
-    "links": "array",
-    "mf": "string",
-    "n": [
-     "array",
-     "integer"
-    ],
-    "note": "string",
-    "reason": "string",
-    "remove_holder": [
-     "array",
-     "string"
-    ],
-    "reopen": "boolean",
-    "ruling": "string",
-    "status": "string",
-    "title": "string"
+    "add_holder": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    },
+    "blocked_by": {
+     "items": {
+      "type": "integer"
+     },
+     "type": "array"
+    },
+    "blocked_on": {
+     "type": "string"
+    },
+    "board": {
+     "type": "string"
+    },
+    "check_back": {
+     "type": "string"
+    },
+    "each": {
+     "type": "boolean"
+    },
+    "eta": {
+     "type": "string"
+    },
+    "expect_status": {
+     "type": "string"
+    },
+    "gate_class": {
+     "type": "string"
+    },
+    "group": {
+     "type": "string"
+    },
+    "head": {
+     "type": "string"
+    },
+    "holder": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    },
+    "job": {
+     "type": "string"
+    },
+    "links": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "mf": {
+     "type": "string"
+    },
+    "n": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "integer"
+       },
+       "type": "array"
+      },
+      {
+       "type": "integer"
+      }
+     ]
+    },
+    "note": {
+     "type": "string"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "remove_holder": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    },
+    "reopen": {
+     "type": "boolean"
+    },
+    "ruling": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    },
+    "title": {
+     "type": "string"
+    }
    },
    "required": [
     "n"
@@ -548,7 +1211,9 @@
   },
   "kill_session": {
    "params": {
-    "session_uid": "string"
+    "session_uid": {
+     "type": "string"
+    }
    },
    "required": [
     "session_uid"
@@ -556,10 +1221,18 @@
   },
   "list_initiatives": {
    "params": {
-    "include_archived": "boolean",
-    "kind": "string",
-    "project": "string",
-    "status": "string"
+    "include_archived": {
+     "type": "boolean"
+    },
+    "kind": {
+     "type": "string"
+    },
+    "project": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    }
    },
    "required": []
   },
@@ -573,15 +1246,23 @@
   },
   "list_sessions": {
    "params": {
-    "include_exited": "boolean",
-    "task_id": "string"
+    "include_exited": {
+     "type": "boolean"
+    },
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "list_sessions_grouped": {
    "params": {
-    "include_exited": "boolean",
-    "task_id": "string"
+    "include_exited": {
+     "type": "boolean"
+    },
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": []
   },
@@ -591,30 +1272,48 @@
   },
   "list_subtasks": {
    "params": {
-    "task_id": "string"
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "list_tasks": {
    "params": {
-    "initiative_id": "string",
-    "project": "string",
-    "source": "string",
-    "status": "string"
+    "initiative_id": {
+     "type": "string"
+    },
+    "project": {
+     "type": "string"
+    },
+    "source": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "list_workflows": {
    "params": {
-    "task_id": "string"
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "mark_subtask_done": {
    "params": {
-    "close_worktree": "boolean",
-    "force": "boolean",
-    "task_id": "string"
+    "close_worktree": {
+     "type": "boolean"
+    },
+    "force": {
+     "type": "boolean"
+    },
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": [
     "task_id"
@@ -622,12 +1321,27 @@
   },
   "monitor_sessions": {
    "params": {
-    "edge": "boolean",
-    "mode": "string",
-    "note": "string",
-    "session_uids": "array",
-    "timeout_s": "number",
-    "until": "string"
+    "edge": {
+     "type": "boolean"
+    },
+    "mode": {
+     "type": "string"
+    },
+    "note": {
+     "type": "string"
+    },
+    "session_uids": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "timeout_s": {
+     "type": "number"
+    },
+    "until": {
+     "type": "string"
+    }
    },
    "required": [
     "session_uids"
@@ -639,18 +1353,32 @@
   },
   "notify_user": {
    "params": {
-    "message": "string",
-    "urgency": "string"
+    "message": {
+     "type": "string"
+    },
+    "urgency": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "org": {
    "params": {
-    "action": "string",
-    "division": "string",
-    "session_uid": "string",
-    "task_id": "string",
-    "view": "string"
+    "action": {
+     "type": "string"
+    },
+    "division": {
+     "type": "string"
+    },
+    "session_uid": {
+     "type": "string"
+    },
+    "task_id": {
+     "type": "string"
+    },
+    "view": {
+     "type": "string"
+    }
    },
    "required": []
   },
@@ -660,14 +1388,30 @@
   },
   "propose_initiative": {
    "params": {
-    "color": "string",
-    "coordinator_project": "string",
-    "coordinator_task_id": "string",
-    "description": "string",
-    "docs_path": "string",
-    "kind": "string",
-    "name": "string",
-    "slug": "string"
+    "color": {
+     "type": "string"
+    },
+    "coordinator_project": {
+     "type": "string"
+    },
+    "coordinator_task_id": {
+     "type": "string"
+    },
+    "description": {
+     "type": "string"
+    },
+    "docs_path": {
+     "type": "string"
+    },
+    "kind": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "slug": {
+     "type": "string"
+    }
    },
    "required": [
     "coordinator_task_id",
@@ -676,17 +1420,42 @@
   },
   "propose_task": {
    "params": {
-    "depends": "array",
-    "description": "string",
-    "difficulty": "integer",
-    "effort": "string",
-    "initiative_id": "string",
-    "model": "string",
-    "model_engine": "string",
-    "name": "string",
-    "project": "string",
-    "prompt": "string",
-    "reports_to": "string"
+    "depends": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "description": {
+     "type": "string"
+    },
+    "difficulty": {
+     "type": "integer"
+    },
+    "effort": {
+     "type": "string"
+    },
+    "initiative_id": {
+     "type": "string"
+    },
+    "model": {
+     "type": "string"
+    },
+    "model_engine": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "project": {
+     "type": "string"
+    },
+    "prompt": {
+     "type": "string"
+    },
+    "reports_to": {
+     "type": "string"
+    }
    },
    "required": [
     "name",
@@ -695,7 +1464,9 @@
   },
   "queue_depth": {
    "params": {
-    "queue": "string"
+    "queue": {
+     "type": "string"
+    }
    },
    "required": [
     "queue"
@@ -703,8 +1474,12 @@
   },
   "read_last_turn": {
    "params": {
-    "context_messages": "integer",
-    "session_uid": "string"
+    "context_messages": {
+     "type": "integer"
+    },
+    "session_uid": {
+     "type": "string"
+    }
    },
    "required": [
     "session_uid"
@@ -712,9 +1487,15 @@
   },
   "read_session_output": {
    "params": {
-    "max_messages": "integer",
-    "session_uid": "string",
-    "since_cursor": "string"
+    "max_messages": {
+     "type": "integer"
+    },
+    "session_uid": {
+     "type": "string"
+    },
+    "since_cursor": {
+     "type": "string"
+    }
    },
    "required": [
     "session_uid"
@@ -722,16 +1503,26 @@
   },
   "report_done": {
    "params": {
-    "reason": "string"
+    "reason": {
+     "type": "string"
+    }
    },
    "required": []
   },
   "resolve_stuck": {
    "params": {
-    "action": "string",
-    "reason": "string",
-    "seq": "integer",
-    "task_id": "string"
+    "action": {
+     "type": "string"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "seq": {
+     "type": "integer"
+    },
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": [
     "action",
@@ -741,11 +1532,21 @@
   },
   "send_input": {
    "params": {
-    "notify_on_done": "boolean",
-    "notify_until": "string",
-    "session_uid": "string",
-    "submit": "boolean",
-    "text": "string"
+    "notify_on_done": {
+     "type": "boolean"
+    },
+    "notify_until": {
+     "type": "string"
+    },
+    "session_uid": {
+     "type": "string"
+    },
+    "submit": {
+     "type": "boolean"
+    },
+    "text": {
+     "type": "string"
+    }
    },
    "required": [
     "session_uid",
@@ -754,14 +1555,30 @@
   },
   "send_input_and_wait": {
    "params": {
-    "pending_idle_grace_s": "number",
-    "poll_interval_s": "number",
-    "schema": "object",
-    "schema_retries": "integer",
-    "session_uid": "string",
-    "submit": "boolean",
-    "text": "string",
-    "timeout_s": "number"
+    "pending_idle_grace_s": {
+     "type": "number"
+    },
+    "poll_interval_s": {
+     "type": "number"
+    },
+    "schema": {
+     "type": "object"
+    },
+    "schema_retries": {
+     "type": "integer"
+    },
+    "session_uid": {
+     "type": "string"
+    },
+    "submit": {
+     "type": "boolean"
+    },
+    "text": {
+     "type": "string"
+    },
+    "timeout_s": {
+     "type": "number"
+    }
    },
    "required": [
     "session_uid",
@@ -770,13 +1587,28 @@
   },
   "send_key": {
    "params": {
-    "key": "string",
-    "notify_on_done": "boolean",
-    "notify_until": "string",
-    "session_uids": [
-     "array",
-     "string"
-    ]
+    "key": {
+     "type": "string"
+    },
+    "notify_on_done": {
+     "type": "boolean"
+    },
+    "notify_until": {
+     "type": "string"
+    },
+    "session_uids": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    }
    },
    "required": [
     "key",
@@ -785,8 +1617,12 @@
   },
   "set_session_section": {
    "params": {
-    "section": "string",
-    "session_id": "string"
+    "section": {
+     "type": "string"
+    },
+    "session_id": {
+     "type": "string"
+    }
    },
    "required": [
     "section"
@@ -794,8 +1630,12 @@
   },
   "set_subtask_status": {
    "params": {
-    "status": "string",
-    "task_id": "string"
+    "status": {
+     "type": "string"
+    },
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": [
     "status"
@@ -803,23 +1643,57 @@
   },
   "start_session": {
    "params": {
-    "allow_shared_workspace": "boolean",
-    "effort": "string",
-    "global_perms": "boolean",
-    "isolated": "boolean",
-    "label": "string",
-    "model": "string",
-    "notify_on_done": "boolean",
-    "notify_until": "string",
-    "pending_idle_grace_s": "number",
-    "poll_interval_s": "number",
-    "prompt": "string",
-    "schema": "object",
-    "schema_retries": "integer",
-    "task_id": "string",
-    "timeout_s": "number",
-    "type": "string",
-    "wait": "boolean"
+    "allow_shared_workspace": {
+     "type": "boolean"
+    },
+    "effort": {
+     "type": "string"
+    },
+    "global_perms": {
+     "type": "boolean"
+    },
+    "isolated": {
+     "type": "boolean"
+    },
+    "label": {
+     "type": "string"
+    },
+    "model": {
+     "type": "string"
+    },
+    "notify_on_done": {
+     "type": "boolean"
+    },
+    "notify_until": {
+     "type": "string"
+    },
+    "pending_idle_grace_s": {
+     "type": "number"
+    },
+    "poll_interval_s": {
+     "type": "number"
+    },
+    "prompt": {
+     "type": "string"
+    },
+    "schema": {
+     "type": "object"
+    },
+    "schema_retries": {
+     "type": "integer"
+    },
+    "task_id": {
+     "type": "string"
+    },
+    "timeout_s": {
+     "type": "number"
+    },
+    "type": {
+     "type": "string"
+    },
+    "wait": {
+     "type": "boolean"
+    }
    },
    "required": [
     "label",
@@ -828,10 +1702,18 @@
   },
   "start_workflow": {
    "params": {
-    "goal": "string",
-    "role_sessions": "object",
-    "task_id": "string",
-    "workflow_name": "string"
+    "goal": {
+     "type": "string"
+    },
+    "role_sessions": {
+     "type": "object"
+    },
+    "task_id": {
+     "type": "string"
+    },
+    "workflow_name": {
+     "type": "string"
+    }
    },
    "required": [
     "task_id",
@@ -840,7 +1722,9 @@
   },
   "stop_workflow": {
    "params": {
-    "run_id": "string"
+    "run_id": {
+     "type": "string"
+    }
    },
    "required": [
     "run_id"
@@ -848,17 +1732,39 @@
   },
   "submit_backtest": {
    "params": {
-    "baseline_ref": "string",
-    "branch": "string",
-    "config": "string",
-    "label": "string",
-    "machine_type": "string",
-    "notify": "boolean",
-    "project": "string",
-    "regression": "boolean",
-    "repo_url": "string",
-    "script": "string",
-    "zone": "string"
+    "baseline_ref": {
+     "type": "string"
+    },
+    "branch": {
+     "type": "string"
+    },
+    "config": {
+     "type": "string"
+    },
+    "label": {
+     "type": "string"
+    },
+    "machine_type": {
+     "type": "string"
+    },
+    "notify": {
+     "type": "boolean"
+    },
+    "project": {
+     "type": "string"
+    },
+    "regression": {
+     "type": "boolean"
+    },
+    "repo_url": {
+     "type": "string"
+    },
+    "script": {
+     "type": "string"
+    },
+    "zone": {
+     "type": "string"
+    }
    },
    "required": [
     "branch",
@@ -867,11 +1773,21 @@
   },
   "trigger": {
    "params": {
-    "args": "object",
-    "fire_token": "string",
-    "mode": "string",
-    "prompt": "string",
-    "task_id": "string"
+    "args": {
+     "type": "object"
+    },
+    "fire_token": {
+     "type": "string"
+    },
+    "mode": {
+     "type": "string"
+    },
+    "prompt": {
+     "type": "string"
+    },
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": [
     "task_id"
@@ -879,18 +1795,45 @@
   },
   "update_task": {
    "params": {
-    "depends": "array",
-    "description": "string",
-    "difficulty": "integer",
-    "initiative_id": "string",
-    "metadata": "object",
-    "name": "string",
-    "parent_task_id": "string",
-    "priority": "integer",
-    "project": "string",
-    "prompt": "string",
-    "status": "string",
-    "task_id": "string"
+    "depends": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "description": {
+     "type": "string"
+    },
+    "difficulty": {
+     "type": "integer"
+    },
+    "initiative_id": {
+     "type": "string"
+    },
+    "metadata": {
+     "type": "object"
+    },
+    "name": {
+     "type": "string"
+    },
+    "parent_task_id": {
+     "type": "string"
+    },
+    "priority": {
+     "type": "integer"
+    },
+    "project": {
+     "type": "string"
+    },
+    "prompt": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    },
+    "task_id": {
+     "type": "string"
+    }
    },
    "required": [
     "task_id"
@@ -898,11 +1841,24 @@
   },
   "wait_for_any_session_idle": {
    "params": {
-    "pending_idle_grace_s": "number",
-    "poll_interval_s": "number",
-    "return_last_message": "boolean",
-    "session_uids": "array",
-    "timeout_s": "number"
+    "pending_idle_grace_s": {
+     "type": "number"
+    },
+    "poll_interval_s": {
+     "type": "number"
+    },
+    "return_last_message": {
+     "type": "boolean"
+    },
+    "session_uids": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "timeout_s": {
+     "type": "number"
+    }
    },
    "required": [
     "session_uids"
@@ -910,10 +1866,18 @@
   },
   "wait_for_session_idle": {
    "params": {
-    "pending_idle_grace_s": "number",
-    "poll_interval_s": "number",
-    "session_uid": "string",
-    "timeout_s": "number"
+    "pending_idle_grace_s": {
+     "type": "number"
+    },
+    "poll_interval_s": {
+     "type": "number"
+    },
+    "session_uid": {
+     "type": "string"
+    },
+    "timeout_s": {
+     "type": "number"
+    }
    },
    "required": [
     "session_uid"
@@ -921,9 +1885,15 @@
   },
   "wait_for_workflow_done": {
    "params": {
-    "poll_interval_s": "number",
-    "run_id": "string",
-    "timeout_s": "number"
+    "poll_interval_s": {
+     "type": "number"
+    },
+    "run_id": {
+     "type": "string"
+    },
+    "timeout_s": {
+     "type": "number"
+    }
    },
    "required": [
     "run_id"
@@ -931,10 +1901,18 @@
   },
   "wait_for_workflow_stop": {
    "params": {
-    "poll_interval_s": "number",
-    "run_id": "string",
-    "stuck_after_s": "number",
-    "timeout_s": "number"
+    "poll_interval_s": {
+     "type": "number"
+    },
+    "run_id": {
+     "type": "string"
+    },
+    "stuck_after_s": {
+     "type": "number"
+    },
+    "timeout_s": {
+     "type": "number"
+    }
    },
    "required": [
     "run_id"
@@ -942,7 +1920,9 @@
   },
   "workflow_done": {
    "params": {
-    "reason": "string"
+    "reason": {
+     "type": "string"
+    }
    },
    "required": [
     "reason"
@@ -950,7 +1930,9 @@
   },
   "workflow_reject_finding": {
    "params": {
-    "text": "string"
+    "text": {
+     "type": "string"
+    }
    },
    "required": [
     "text"
@@ -958,8 +1940,12 @@
   },
   "workflow_transition": {
    "params": {
-    "prompt": "string",
-    "to": "string"
+    "prompt": {
+     "type": "string"
+    },
+    "to": {
+     "type": "string"
+    }
    },
    "required": [
     "prompt",

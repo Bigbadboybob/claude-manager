@@ -19,13 +19,31 @@ from mcp_server import mcp_version
 
 HERE = Path(__file__).resolve().parent
 STARTED_AT = time.time()
-LOADED_HASH = mcp_version.payload_hash(HERE)
-LOADED_TOOLS = mcp_version.snapshot_hash(HERE)
-_loaded_stamp = mcp_version.read_stamp(HERE)
-# The stamp describes what was loaded only if it matches the loaded files.
-LOADED_VERSION = (_loaded_stamp["version"]
-                  if _loaded_stamp and _loaded_stamp.get("payload_hash") == LOADED_HASH
-                  else LOADED_HASH)
+_loaded: dict | None = None
+
+
+def loaded() -> dict:
+    """The payload this process runs: {payload_hash, tools_hash, toolset_hash,
+    version}. Computed once (a pruned walk of ~25 files, a few ms)."""
+    global _loaded
+    if _loaded is None:
+        digest = mcp_version.payload_hash(HERE)
+        stamp = mcp_version.read_stamp(HERE)
+        _loaded = {
+            "payload_hash": digest,
+            "tools_hash": mcp_version.snapshot_hash(HERE),
+            "toolset_hash": mcp_version.toolset_hash(HERE),
+            # The stamp names what was loaded only if it matches the files.
+            "version": (stamp["version"] if stamp and stamp.get("payload_hash") == digest
+                        else digest),
+        }
+    return _loaded
+
+
+# Behind the proxy the loaded version must be pinned before a deploy can
+# change the files, so hash at import there; elsewhere only when asked.
+if os.environ.get("CM_MCP_PROXY_CHILD") == "1":
+    loaded()
 
 _disk = {"mtime": None, "stamp": None, "consistent": False}
 
@@ -65,13 +83,16 @@ def disk_stamp(root: Path = HERE) -> tuple[dict | None, bool]:
 def pending(root: Path = HERE) -> dict | None:
     """A newer, consistently stamped payload than the one loaded."""
     stamp, consistent = disk_stamp(root)
-    if not stamp or stamp["payload_hash"] == LOADED_HASH:
+    if not stamp or stamp["payload_hash"] == loaded()["payload_hash"]:
         return None
     if not consistent:
         return None  # files changed after stamping, or a copy is in progress
+    # Only a change Codex threads can notice (tools added/removed, required
+    # parameters) counts; an additive optional parameter does not.
+    toolset = stamp.get("toolset_hash")
     return {"version": stamp["version"], "payload_hash": stamp["payload_hash"],
-            "tools_hash": stamp.get("tools_hash"),
-            "tools_change": stamp.get("tools_hash") != LOADED_TOOLS}
+            "toolset_hash": toolset,
+            "tools_change": bool(toolset) and toolset != loaded()["toolset_hash"]}
 
 
 def _previous() -> dict:
@@ -82,12 +103,12 @@ def _previous() -> dict:
         return {}
 
 
-def _session_tools_hash(previous: dict) -> str | None:
+def _session_toolset(previous: dict) -> str | None:
     """The tool set the engine saw first. A Codex thread keeps that list."""
     gen = (proxy() or {}).get("generation", 0)
-    if gen > 1 and previous.get("session_tools_hash"):
-        return previous["session_tools_hash"]
-    return LOADED_TOOLS
+    if gen > 1 and previous.get("session_toolset_hash"):
+        return previous["session_toolset_hash"]
+    return loaded()["toolset_hash"]
 
 
 _session_tools = None
@@ -96,13 +117,15 @@ _session_tools = None
 def status(extra: dict | None = None) -> dict:
     global _session_tools
     if _session_tools is None:
-        _session_tools = _session_tools_hash(_previous())
+        _session_tools = _session_toolset(_previous())
     engine = os.environ.get("CM_AGENT_ENGINE")
+    mine = loaded()
     value = {
-        "version": LOADED_VERSION,
-        "payload_hash": LOADED_HASH,
-        "tools_hash": LOADED_TOOLS,
-        "session_tools_hash": _session_tools,
+        "version": mine["version"],
+        "payload_hash": mine["payload_hash"],
+        "tools_hash": mine["tools_hash"],
+        "toolset_hash": mine["toolset_hash"],
+        "session_toolset_hash": _session_tools,
         "engine": engine,
         "proxy": proxy(),
         "pid": os.getpid(),
@@ -113,7 +136,7 @@ def status(extra: dict | None = None) -> dict:
     # Codex threads keep their first tool list: say so instead of implying
     # the new tools are usable.
     value["tools_changed_unseen"] = bool(
-        engine == "codex" and _session_tools and LOADED_TOOLS != _session_tools)
+        engine == "codex" and _session_tools and mine["toolset_hash"] != _session_tools)
     value.update(extra or {})
     return value
 
@@ -260,12 +283,59 @@ def ack(monitors: int) -> dict:
     update = pending()
     if not update:
         return {"activating": False, "pending": False,
-                "version": LOADED_VERSION, "note": "No CM MCP update is pending."}
+                "version": loaded()["version"], "note": "No CM MCP update is pending."}
     if not proxy():
         return {"activating": False, "pending": update["version"],
                 "note": "This session's MCP server has no proxy; a manual /mcp reconnect is needed once."}
     out = {"activating": True, "after": "this reply", "version": update["version"],
-           "from_version": LOADED_VERSION, "monitors_carried": monitors}
+           "from_version": loaded()["version"], "monitors_carried": monitors}
     if os.environ.get("CM_AGENT_ENGINE") == "codex" and update.get("tools_change"):
         out["note"] = "New tools appear after a restart."
     return out
+
+
+# ---- predecessor and promotion ---------------------------------------------
+# A backend the proxy starts while another serves is a CANDIDATE: it answers
+# the preflight but runs no notification consumer, policy or monitor
+# adoption until its predecessor has exited (it may yet be abandoned).
+
+
+def start_ticks(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def predecessor() -> tuple[int, str] | None:
+    try:
+        pid = int(os.environ.get("CM_MCP_PREDECESSOR_PID") or 0)
+    except ValueError:
+        return None
+    if not pid or pid == os.getpid():
+        return None
+    return pid, os.environ.get("CM_MCP_PREDECESSOR_START", "")
+
+
+def process_alive(pid: int, start: str = "") -> bool:
+    """Whether this exact process (pid plus start time) still runs."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False  # another user's process: not our predecessor
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    except (OSError, IndexError):
+        return False
+    if fields[0] == "Z":
+        return False  # exited; only waiting to be reaped
+    return not start or fields[19] == start  # a reused pid is not our predecessor
+
+
+async def wait_promoted(poll_s: float = 0.2) -> None:
+    import asyncio
+    before = predecessor()
+    while before and process_alive(*before):
+        await asyncio.sleep(poll_s)

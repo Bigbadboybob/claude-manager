@@ -27,10 +27,16 @@ WORKER = "ts-worker-2"
 BASELINE = {"kind": "turn", "value": "fingerprint-at-arm-time"}
 
 
-def dead_pid() -> int:
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+def start_of(pid: int) -> str:
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+
+
+def dead_pid() -> tuple[int, str]:
+    """(pid, start time) of a process that has exited."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"])
+    start = start_of(proc.pid)
     proc.wait()
-    return proc.pid
+    return proc.pid, start
 
 
 class AdoptionTests(unittest.TestCase):
@@ -53,7 +59,8 @@ class AdoptionTests(unittest.TestCase):
     def journal_path(self):
         return self.home / ".cm" / "monitor-state" / f"{CALLER}.json"
 
-    def write_predecessor(self, pid, state="watching", producer="pred", extra=None, **record):
+    def write_predecessor(self, ident, state="watching", producer="pred", extra=None, **record):
+        pid, start = ident
         mid = record.pop("monitor_id", "mon-aaaaaa")
         value = {
             "monitor_id": mid, "watching": [WORKER], "mode": "any", "until": "turn_end",
@@ -68,6 +75,7 @@ class AdoptionTests(unittest.TestCase):
             "schema_version": 1, "coverage_version": 0, "session_uid": CALLER,
             "revision": 1, "producers": {}}
         journal["producers"].setdefault(producer, {"started_at": time.time(), "pid": pid,
+                                                   "start": start,
                                                    "records": {}})["records"][mid] = value
         journal["revision"] += 1
         path.write_text(json.dumps(journal))
@@ -83,10 +91,10 @@ class AdoptionTests(unittest.TestCase):
                                "last_message": {"content": f"done at {time.time()}"}}],
                 "still_running": [], "timed_out": False}
 
-    def adopt(self, pid):
+    def adopt(self, ident):
         async def run():
             with mock.patch.object(async_monitor, "_monitor_sessions", self.finished_turn):
-                adopted = await async_monitor.adopt_predecessor(pid)
+                adopted = await async_monitor.adopt_predecessor(ident)
                 tasks = [async_monitor._MONITORS[m]["task"] for m in adopted]
                 await asyncio.gather(*tasks)
                 return adopted
@@ -131,8 +139,9 @@ class AdoptionTests(unittest.TestCase):
         mid = self.write_predecessor(first, state="interrupted")
         # Successor 1 adopted (one write) and was killed before its watch ran.
         with mock.patch.object(monitor_state, "PRODUCER_ID", "succ1"), \
-                mock.patch.object(os, "getpid", return_value=second):
-            self.assertEqual(list(monitor_state.adopt(first)), [mid])
+                mock.patch.object(monitor_state, "PRODUCER_START", second[1]), \
+                mock.patch.object(os, "getpid", return_value=second[0]):
+            self.assertEqual(list(monitor_state.adopt(*first)), [mid])
         self.assertEqual(self.journal()["producers"]["succ1"]["records"][mid]["state"],
                          "watching")
         self.assertEqual(self.adopt(first), [], "the first predecessor no longer owns it")
@@ -191,10 +200,19 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(self.monitor_events(), [])
 
     def test_a_live_predecessor_is_never_adopted_from(self):
-        mid = self.write_predecessor(os.getppid())
+        live = (os.getppid(), start_of(os.getppid()))
+        mid = self.write_predecessor(live)
         with mock.patch.object(async_monitor, "PREDECESSOR_EXIT_WAIT_S", 0.5):
-            self.assertEqual(self.adopt(os.getppid()), [])
+            self.assertEqual(self.adopt(live), [])
         self.assertEqual(self.journal()["producers"]["pred"]["records"][mid]["state"], "watching")
+
+    def test_a_reused_pid_is_not_the_predecessor(self):
+        pid, start = dead_pid()
+        mid = self.write_predecessor((pid, start))
+        # The successor was told the same pid but a different process.
+        self.assertEqual(self.adopt((pid, str(int(start) + 7))), [])
+        self.assertEqual(self.journal()["producers"]["pred"]["records"][mid]["state"], "watching")
+        self.assertEqual(self.adopt((pid, start)), [mid])
 
     def test_the_deadline_carries_over(self):
         pid = dead_pid()
@@ -229,7 +247,9 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(saved["baselines"], {WORKER: BASELINE})
         self.assertEqual(saved["caller"], CALLER)
         self.assertGreater(saved["deadline_at"], time.time() + 200)
-        self.assertEqual(self.journal()["producers"][monitor_state.PRODUCER_ID]["pid"], os.getpid())
+        producer = self.journal()["producers"][monitor_state.PRODUCER_ID]
+        self.assertEqual((producer["pid"], producer["start"]),
+                         (os.getpid(), monitor_state.PRODUCER_START))
 
 
 if __name__ == "__main__":

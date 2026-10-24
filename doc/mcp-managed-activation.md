@@ -86,37 +86,50 @@ proxy (§4).
 
 ### 3.3 Activation sequence
 
-1. **Quiet check.** Wait until no request is in flight in either direction.
-2. **Preflight.** Start a candidate child with these env vars:
-   `CM_MCP_PROXY_CHILD=1`, `CM_MCP_PROXY_VERSION=<proxy version>`,
-   `CM_MCP_PROXY_GENERATION=n`, and `CM_MCP_PREDECESSOR_PID=<old child>`. Send it the saved `initialize`
-   params with a proxy-owned id, then `notifications/initialized`, then
-   `tools/list`. The proxy reads both replies and doesn't forward them. If
-   the candidate errors, exits, or doesn't answer within 30 s, it is killed
-   and the old child keeps serving.
-3. **Hold.** Buffer client input. Wait for any request that arrived after
-   step 1 to finish on the old child.
-4. **Stop the old child.** Close its stdin, which is the normal MCP
-   shutdown, so its lifespan `finally` runs. Escalate to SIGTERM and then
-   SIGKILL, each after 5 s. Its exit releases `consumer.lock` and writes the
-   monitor journal.
-5. **Switch.** Point routing at the candidate, flush the buffered input, and
-   send `notifications/tools/list_changed` if the tool names differ.
+The activation runs as its own task, so a client EOF or a backend crash is
+handled while it waits. Every wait in it gives up when the proxy is closing
+or the serving child has died.
 
-Client input is held only for the old child's shutdown (`hold_ms` in
-`proxy.json`; 237–531 ms in the live runs, 10 s when the old child was
-frozen and had to be SIGKILLed). The preflight (2–8 s, mostly `server.py`
-import) runs while the old child keeps serving. Requests that arrive during
-the hold are delayed, not lost.
+1. **Quiet check.** "In flight" means requests actually forwarded to the
+   serving child, in either direction; input the proxy is holding never
+   counts. Wait at most `QUIET_WAIT_S` (10 s) for nothing to be in flight,
+   or give up until the next boundary.
+2. **Preflight.** Start a candidate child with `CM_MCP_PROXY_CHILD=1`,
+   `CM_MCP_PROXY_VERSION`, `CM_MCP_PROXY_GENERATION=n`, and the old
+   child's identity, `CM_MCP_PREDECESSOR_PID` plus `CM_MCP_PREDECESSOR_START`
+   (its start time, so a reused pid can't be mistaken for it). Send it the
+   saved `initialize` params with a proxy-owned id, then
+   `notifications/initialized`, then `tools/list`. The proxy reads both
+   replies and doesn't forward them. Meanwhile client traffic keeps flowing
+   to the old child. If the candidate errors, exits, or doesn't answer
+   within 30 s, it is killed and the old child keeps serving.
+3. **Switch.** A call that reached the old child during the preflight is
+   waited for, again for at most `QUIET_WAIT_S`, without holding anything.
+   If it's still running (a long `wait_for_*`), the activation is abandoned
+   and the candidate killed. Once the old child is quiet, routing moves to
+   the candidate. No `await` separates that check from the switch, so no
+   request can be split between two children. `list_changed` goes out if
+   the tool names differ.
+4. **Hold until ready.** New client input is buffered until the candidate
+   sends `notifications/cm/ready`, or for at most `HOLD_MAX_S` (5 s). Held
+   messages are not in flight anywhere. A client response to a backend's
+   request always goes straight to the backend that asked.
+5. **Retire the old child** in the background: stdin EOF (the normal MCP
+   shutdown, so its lifespan `finally` runs), then SIGTERM, then SIGKILL,
+   5 s each. Its exit releases `consumer.lock` and writes the monitor
+   journal.
 
-The candidate starts before the old child stops, so for a moment both
-children exist. Two rules make that safe:
+A candidate is passive until promoted. It answers the preflight, but
+starts its notification consumer, activation policy, status write and
+monitor adoption only once its predecessor (that pid with that start
+time; a PermissionError means another user's process, so not ours) has
+exited. It then adopts its monitors and sends `ready`. So an abandoned
+candidate never takes `consumer.lock` or sends a channel notice whose output
+the proxy would drop. Monitor tools can't run on the new child before
+adoption, because client input is held until `ready`.
 
-- The notification consumer already arbitrates this overlap: it was built
-  for the reconnect overlap ("A reconnect can briefly overlap the old MCP
-  child", `notifications.py::_wait_for_lock`). The candidate waits for the
-  lock, and the old child's exit hands it over.
-- Monitor adoption waits for the predecessor to exit (§5).
+Measured (§10): the preflight takes 2–8 s, mostly `server.py` import, while
+the old child keeps serving. Client input is held for well under a second.
 
 ### 3.4 Crash of a serving child
 
@@ -124,7 +137,12 @@ If the serving child exits outside an activation:
 
 - The proxy answers each in-flight client request with an error ("CM MCP
   backend restarted; retry the call"). It never replays requests.
-- It restarts the backend with backoff (1 s, 2 s, 4 s).
+- It restarts the backend with backoff (1 s, 2 s, 4 s). A client
+  `initialize` still pending is answered with an error, never left waiting.
+- A reply line over 64 MiB, or a failure in the proxy's reader, kills that
+  child loudly and goes through the same restart, so a reply never vanishes
+  silently. A broken pipe to the engine shuts the proxy down with every
+  child.
 
 After 3 crashes in 10 minutes the proxy is **held down**. It answers every
 request with a clear error naming the version and the crash count, and it
@@ -156,8 +174,10 @@ manual `/mcp`; with the proxy it heals itself.
   stay invisible, description changes don't show, and a changed schema
   stays the old one. Two rules handle this: tool schemas stay compatible
   with what running threads hold (enforced by
-  `tests/test_tool_schema_compat.py` against `tool_schemas.json`: removing
-  a tool or parameter, adding a required parameter, or changing a type fails
+  `tests/test_tool_schema_compat.py` against `tool_schemas.json`, including
+  nested `items`/`properties`/`enum` and `$ref`s: removing a tool,
+  parameter or nested property, adding a required parameter or nested
+  property, dropping an enum value, or changing a type fails
   unless marked with `mcp_version.py snapshot --write --allow-breaking
   "tool: reason"`); and Codex sessions are told when their tool set changed
   (`tools_changed_unseen` in `status.json`, a note in `ping().mcp` and in
@@ -234,9 +254,11 @@ Before this work, shutdown flipped `watching` and `fired` records to
    original `baselines`, `report_anchors`, absolute `deadline_at`, launch
    receipt and `interim_turn_ends`, plus each producer's `pid`.
 2. **Adopt after the predecessor exits.** A backend started with
-   `CM_MCP_PREDECESSOR_PID` waits until that pid has exited (its shutdown
-   writes its last journal state). `monitor_state.adopt` then moves every
-   unfinished record (`watching`, `fired`, `interrupted`) of that producer
+   `CM_MCP_PREDECESSOR_PID`/`_START` waits until that exact process has
+   exited (its shutdown writes its last journal state). Producers record
+   their pid and start time. `monitor_state.adopt(pid, start)` then moves
+   every unfinished record (`watching`, `fired`, `interrupted`) of the
+   producer matching both
    in **one** atomic journal write: the predecessor's copy becomes
    `replaced` (settled, `adopted_by`) and this producer's copy becomes
    `watching` (`adopted_from`). Each watch restarts from its **original**
@@ -270,8 +292,10 @@ Two files per session, both host-local, under `~/.cm/mcp/<uid>/`:
 
 - `status.json`, written by the backend at startup and on each policy tick.
   It holds `version` (the stamp's, or the payload hash when unstamped),
-  `payload_hash`, `tools_hash`, `session_tools_hash` (the tool set the
-  engine saw first), `tools_changed_unseen` (Codex only), `engine`,
+  `payload_hash`, `tools_hash`, `toolset_hash` (tool names plus required
+  parameters, which is what a Codex thread can notice; additive optional
+  parameters leave it alone), `session_toolset_hash` (the set the engine
+  saw first), `tools_changed_unseen` (Codex only), `engine`,
   `proxy` (`{version, generation}` from the env), `pid`, `started_at`,
   `pending` (`{version, payload_hash, tools_hash, tools_change}`) and
   `blocked`.
@@ -283,6 +307,13 @@ Two files per session, both host-local, under `~/.cm/mcp/<uid>/`:
 
 `ping().mcp` is the agent-facing summary: `{version, proxy,
 update_pending?, note?}`.
+
+Hashing is cheap and off the common path. The walk skips dot-dirs,
+`site-packages`, `venv` and tests: about 25 files and a few ms, against
+1,194 files and 0.5–1.6 s when it included `.venv`. A venv rebuild
+therefore never changes the version. Only a backend behind the proxy
+hashes at import, to pin what it loaded; elsewhere, nothing is hashed until
+`ping` asks.
 
 No new RPC, and `control/methods.rs` isn't touched. The release-lead
 script reads the files directly. A later slice can add them to
@@ -436,6 +467,25 @@ swap:
   - a live predecessor is never adopted from;
   - the deadline carries over;
   - registration persists the resume fields.
+
+**Review round (2026-10-24), proxy tests against a concurrent stub:**
+- the hold-window hang repro (ask, slow, probe during a 1 s candidate
+  start) now answers every call;
+- a long call reaching the old child during the preflight abandons the
+  activation and kills the candidate, with no input held (a concurrent call
+  is answered in well under 2 s);
+- EOF mid-activation leaves no process;
+- an old-child crash mid-wait recovers;
+- a pending `initialize` is answered on a backend death;
+- a client's answer goes back to the backend that asked;
+- an oversized line kills and restarts loudly;
+- a broken engine pipe shuts the proxy down;
+- `ready` ends the hold early.
+
+Real `server.py` behind the proxy without a daemon
+(`tests/test_proxy_real_server.py`): `ready` ends the hold, and status.json
+moves to the new backend only after promotion. The monitor-adoption tests
+now include a reused pid.
 
 **Not proven:** real `server.py` behind the proxy under Codex (only the
 probe backend ran there), and multi-day sessions.

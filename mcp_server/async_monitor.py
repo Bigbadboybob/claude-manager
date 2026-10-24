@@ -825,38 +825,25 @@ ADOPT_ATTEMPTS = 5
 ADOPT_RETRY_S = 2.0
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    try:  # a zombie has exited; it only awaits its parent's reap
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1][0] != "Z"
-    except (OSError, IndexError):
-        return False
-
-
-async def adopt_predecessor(pid: int | None = None) -> list[str]:
+async def adopt_predecessor(identity: tuple[int, str] | None = None) -> list[str]:
     """Resume the watches of the MCP process this one replaced.
 
-    Waits for the predecessor to exit first (its shutdown writes its last
-    journal state), then moves its unfinished records here in one atomic
-    journal write and restarts each watch from its ORIGINAL baseline and
-    deadline. A turn that ended during the swap is still a new edge
+    `identity` is the predecessor's (pid, start time), from the proxy's
+    CM_MCP_PREDECESSOR_PID/START by default; pid alone could name a reused
+    process. Waits for that process to exit first (its shutdown writes its
+    last journal state), then moves its unfinished records here in one
+    atomic journal write and restarts each watch from its ORIGINAL baseline
+    and deadline. A turn that ended during the swap is still a new edge
     against that baseline, so it fires exactly once: the notice ID is the
     monitor ID, and a predecessor's already-published notice is verified,
     never duplicated (_deliver_to_caller)."""
-    if pid is None:
-        try:
-            pid = int(os.environ.get("CM_MCP_PREDECESSOR_PID") or 0)
-        except ValueError:
-            return []
-    if not pid or pid == os.getpid():
+    from mcp_server import activation
+    identity = identity or activation.predecessor()
+    if not identity or not identity[1]:
         return []
+    pid, start = identity
     deadline = time.monotonic() + PREDECESSOR_EXIT_WAIT_S
-    while _pid_alive(pid):
+    while activation.process_alive(pid, start):
         if time.monotonic() > deadline:
             _log(f"predecessor {pid} still alive; not adopting its monitors")
             return []
@@ -864,7 +851,7 @@ async def adopt_predecessor(pid: int | None = None) -> list[str]:
     taken = None
     for attempt in range(ADOPT_ATTEMPTS):
         try:
-            taken = await asyncio.to_thread(monitor_state.adopt, pid)
+            taken = await asyncio.to_thread(monitor_state.adopt, pid, start)
             break
         except (OSError, ValueError) as exc:
             # A failed write changed nothing: the predecessor still owns its

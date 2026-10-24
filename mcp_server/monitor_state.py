@@ -17,6 +17,17 @@ import tempfile
 import time
 
 PRODUCER_ID = secrets.token_hex(16)
+
+
+def _own_start() -> str | None:
+    try:
+        return Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+# pid plus start time names this process unambiguously (pids are reused).
+PRODUCER_START = _own_start()
 MAX_BYTES = 4 * 1024 * 1024
 SETTLED = frozenset({"delivered", "cancelled", "replaced"})
 FIELDS = frozenset({
@@ -121,12 +132,13 @@ def publish(records: dict[str, dict]) -> None:
             "started_at": old.get("started_at", time.time()),
             "updated_at": time.time(),
             "pid": os.getpid(),
+            "start": PRODUCER_START,
             "records": retained,
         }
         _write(path, journal)
 
 
-def adopt(predecessor_pid: int) -> dict[str, dict]:
+def adopt(predecessor_pid: int, predecessor_start: str | None) -> dict[str, dict]:
     """Take over a dead predecessor producer's unfinished watches.
 
     One atomic journal write moves each record: the predecessor's copy
@@ -134,7 +146,8 @@ def adopt(predecessor_pid: int) -> dict[str, dict]:
     copy is `watching`. There is no moment where both own it or neither
     does. Records written before baselines were persisted are left alone:
     resuming them without their original edge could fire on old news.
-    The caller must have seen the predecessor exit."""
+    The predecessor is the producer with this pid AND start time; the caller
+    must have seen that process exit."""
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
@@ -143,7 +156,8 @@ def adopt(predecessor_pid: int) -> dict[str, dict]:
         journal = _load(path)
         taken: dict[str, dict] = {}
         for producer_id, producer in journal["producers"].items():
-            if producer_id == PRODUCER_ID or producer.get("pid") != predecessor_pid:
+            if (producer_id == PRODUCER_ID or producer.get("pid") != predecessor_pid
+                    or not predecessor_start or producer.get("start") != predecessor_start):
                 continue
             for mid, record in producer["records"].items():
                 if record.get("state") not in ADOPTABLE or "baselines" not in record:
@@ -158,6 +172,7 @@ def adopt(predecessor_pid: int) -> dict[str, dict]:
         mine["records"].update(taken)
         mine["updated_at"] = time.time()
         mine["pid"] = os.getpid()
+        mine["start"] = PRODUCER_START
         journal["revision"] += 1
         _write(path, journal)
         return taken
