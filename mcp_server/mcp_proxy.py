@@ -74,6 +74,7 @@ class Backend:
         self.exited = asyncio.Event()
         self.ready = asyncio.Event()
         self.error: str | None = None
+        self.start_ticks: str | None = None
 
     @property
     def pid(self) -> int | None:
@@ -87,6 +88,9 @@ class Backend:
             env=env,
             limit=LINE_LIMIT,
         )
+        # Read now: once the child is reaped /proc/<pid> is gone, and a crash
+        # restart still has to name it as the successor's predecessor.
+        self.start_ticks = start_ticks(self.proc.pid)
 
     def alive(self) -> bool:
         return bool(self.proc) and self.proc.returncode is None and not self.exited.is_set()
@@ -377,7 +381,7 @@ class Proxy:
             # consumer, no policy, no monitor adoption) until this process
             # is gone; pid plus start time cannot name an unrelated process.
             env["CM_MCP_PREDECESSOR_PID"] = str(predecessor.pid)
-            env["CM_MCP_PREDECESSOR_START"] = start_ticks(predecessor.pid) or ""
+            env["CM_MCP_PREDECESSOR_START"] = predecessor.start_ticks or ""
         await backend.start(env)
         self.backends.add(backend)
         asyncio.create_task(self.backend_loop(backend))

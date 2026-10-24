@@ -123,7 +123,13 @@ A candidate is passive until promoted. It answers the preflight, but
 starts its notification consumer, activation policy, status write and
 monitor adoption only once its predecessor (that pid with that start
 time; a PermissionError means another user's process, so not ours) has
-exited. It then adopts its monitors and sends `ready`. So an abandoned
+exited. It then adopts its monitors and sends `ready`. The proxy reads
+each child's start time when it spawns it, because after a crash the dead
+child is already reaped by the time its successor needs to name it. If
+the predecessor is still alive after 45 s, past anything the proxy allows
+an undecided candidate, the backend fails loudly. It logs and exits rather
+than start a second consumer. The proxy then treats that exit as a crash
+(a serving child) or a failed preflight (a candidate). So an abandoned
 candidate never takes `consumer.lock` or sends a channel notice whose output
 the proxy would drop. Monitor tools can't run on the new child before
 adoption, because client input is held until `ready`.

@@ -99,6 +99,36 @@ class RealServerTests(unittest.TestCase):
         self.assertIn("result", self.reply(3))
 
 
+    def test_a_crash_restart_adopts_the_armed_monitors(self):
+        first = self.wait_for(lambda: self.read("status.json"))
+        journal_path = self.home / ".cm" / "monitor-state" / f"{UID}.json"
+        journal = self.wait_for(lambda: journal_path.exists() and json.loads(journal_path.read_text()))
+        producer_id, producer = next((k, v) for k, v in journal["producers"].items()
+                                     if v.get("pid") == first["pid"])
+        self.assertTrue(producer.get("start"))
+        # An armed watch, as register_monitor persists it.
+        producer["records"]["mon-crash1"] = {
+            "monitor_id": "mon-crash1", "watching": ["ts-worker-9"], "mode": "any",
+            "until": "turn_end", "note": "", "source": "explicit", "state": "watching",
+            "caller": UID, "created_at": time.time(), "deadline_at": time.time() + 600,
+            "baselines": {"ts-worker-9": {"kind": "turn", "value": "fp"}},
+            "report_anchors": {}, "result": None}
+        journal["revision"] += 1
+        journal_path.write_text(json.dumps(journal))
+        os.kill(first["pid"], signal.SIGKILL)  # a crash, not an activation
+
+        def adopted():
+            current = json.loads(journal_path.read_text())
+            old = current["producers"][producer_id]["records"]["mon-crash1"]
+            new = [(k, v) for k, v in current["producers"].items()
+                   if k != producer_id and "mon-crash1" in v["records"]]
+            return old["state"] == "replaced" and new and new
+        (new_id, new_producer), = self.wait_for(adopted)
+        record = new_producer["records"]["mon-crash1"]
+        self.assertEqual(record["adopted_from"], producer_id)
+        self.assertNotEqual(new_producer["pid"], first["pid"])
+
+
 class StartupCostTests(unittest.TestCase):
     def test_a_session_without_the_proxy_does_not_hash_at_import(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("CM_MCP_")}

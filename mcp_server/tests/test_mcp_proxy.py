@@ -44,7 +44,10 @@ BACKEND = textwrap.dedent("""
         return {"content": [{"type": "text", "text": t}]}
 
     me = (f"version={version} pid={os.getpid()} gen={os.environ.get('CM_MCP_PROXY_GENERATION')} "
-          f"pred={os.environ.get('CM_MCP_PREDECESSOR_PID')}")
+          f"pred={os.environ.get('CM_MCP_PREDECESSOR_PID')} "
+          f"predstart={os.environ.get('CM_MCP_PREDECESSOR_START')}")
+    with open(here / "starts", "a") as f:
+        f.write(f"{os.getpid()} {open(f'/proc/{os.getpid()}/stat').read().rsplit(') ', 1)[1].split()[19]}\\n")
 
     def call(msg):
         # Each call runs on its own thread, as calls do in server.py.
@@ -273,6 +276,21 @@ class CrashTests(ProxyTests):
         self.call(5)
         second = self.text(self.recv())
         self.assertNotEqual(first.split("pid=")[1].split()[0], second.split("pid=")[1].split()[0])
+
+    def test_a_crash_restart_names_the_dead_child_by_pid_and_start(self):
+        # The dead child is reaped before the restart; its start time must
+        # still reach the successor or monitor adoption is skipped.
+        self.call(3)
+        first = self.text(self.recv())
+        dead = first.split("pid=")[1].split()[0]
+        self.call(4, "crash")
+        self.recv()
+        self.wait_status("running", min_generation=2)
+        self.call(5)
+        second = self.text(self.recv())
+        starts = dict(line.split() for line in (self.dir / "starts").read_text().splitlines())
+        self.assertIn(f"pred={dead} ", second)
+        self.assertIn(f"predstart={starts[dead]}", second)
 
     def test_crash_loop_holds_down_and_a_fixed_payload_recovers(self):
         self.version.write_text("dead\n")

@@ -75,6 +75,20 @@ class PredecessorTests(unittest.TestCase):
         proc.wait()
         self.assertFalse(activation.process_alive(proc.pid))
 
+    def test_promotion_fails_loudly_past_its_deadline(self):
+        import asyncio, subprocess, sys
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        try:
+            env = {"CM_MCP_PREDECESSOR_PID": str(proc.pid),
+                   "CM_MCP_PREDECESSOR_START": activation.start_ticks(proc.pid) or ""}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(activation.os, "_exit", side_effect=SystemExit(3)):
+                with self.assertRaises(SystemExit):
+                    asyncio.run(activation.wait_promoted(poll_s=0.05, deadline_s=0.3))
+        finally:
+            proc.kill()
+            proc.wait()
+
     def test_another_users_process_is_not_our_predecessor(self):
         with mock.patch.object(activation.os, "kill", side_effect=PermissionError):
             self.assertFalse(activation.process_alive(1))

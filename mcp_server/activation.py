@@ -334,8 +334,27 @@ def process_alive(pid: int, start: str = "") -> bool:
     return not start or fields[19] == start  # a reused pid is not our predecessor
 
 
-async def wait_promoted(poll_s: float = 0.2) -> None:
+# Longer than the proxy ever keeps an undecided candidate alive (a slow
+# preflight plus the old child's stop sequence, which ends in SIGKILL), so
+# reaching it means the predecessor survived its own replacement.
+PROMOTION_DEADLINE_S = float(os.environ.get("CM_MCP_PROMOTION_DEADLINE_S", 45))
+
+
+async def wait_promoted(poll_s: float = 0.2, deadline_s: float | None = None) -> None:
+    """Return once the predecessor has exited. Past the deadline this FAILS
+    LOUDLY: it logs and exits the process instead of starting the consumer
+    beside a live predecessor. Nothing has been started yet, so exiting is
+    clean; the proxy treats it as a crash and restarts (or, for a candidate
+    not yet switched to, keeps the old child serving)."""
     import asyncio
+    import sys
     before = predecessor()
+    budget = PROMOTION_DEADLINE_S if deadline_s is None else deadline_s
+    limit = time.monotonic() + budget
     while before and process_alive(*before):
+        if time.monotonic() > limit:
+            print(f"cm-mcp: predecessor {before[0]} still alive after "
+                  f"{budget:g} s; exiting rather than running two consumers",
+                  file=sys.stderr, flush=True)
+            os._exit(3)
         await asyncio.sleep(poll_s)
