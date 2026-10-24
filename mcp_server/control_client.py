@@ -300,6 +300,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "continuous.context",
     "continuous.ack_drain",
     "continuous.checkpoint_drain",
+    "continuous.self_clear_hold",
     "continuous.pause",
     "continuous.run_now",
     "continuous.delete",

@@ -53,6 +53,18 @@ pub struct Reconciliation {
     pub notes: String,
     pub items: BTreeMap<String, ItemOutcome>,
     pub batch_hash: String,
+    /// Set when the task's own orchestrator recorded this reconciliation
+    /// through `continuous.self_clear_hold` instead of an operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_clear: Option<SelfClear>,
+}
+/// Who self-cleared a hold and why. The orchestrator's own row is bound
+/// loosely (it keeps talking after the call); every other row is exact.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelfClear {
+    pub session_uid: String,
+    pub run_seq: u64,
+    pub reason: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Retirement {
@@ -170,7 +182,47 @@ struct Evidence {
     blockers: Vec<String>,
     sessions: Vec<drain::SessionObservation>,
 }
+impl Evidence {
+    /// The hash a reconciliation binds to. A self-clear excludes the
+    /// clearing orchestrator's row: its transcript, input and turn state move
+    /// on after the call, and recovery retires that session anyway.
+    fn binding_hash(&self, record: &Reconciliation) -> String {
+        match &record.self_clear {
+            Some(clear) => self_clear_digest(&self.value, &clear.session_uid),
+            None => self.hash.clone(),
+        }
+    }
+}
+
+fn self_clear_digest(value: &Value, uid: &str) -> String {
+    let mut bound = value.clone();
+    if let Some(rows) = bound["sessions"].as_array_mut() {
+        for row in rows.iter_mut().filter(|row| row["uid"] == uid) {
+            *row = json!({"uid": uid, "orchestrator": row["orchestrator"]});
+        }
+    }
+    evidence_digest(&bound)
+}
+
 fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Evidence {
+    evidence_with(state, t, None)
+}
+
+/// `self_clearing` names the orchestrator asking to clear its own hold: its
+/// in-progress turn is not a blocker. A self-clear (being requested or
+/// already recorded) also applies the strict checks an operator otherwise
+/// attests to: undelivered, interrupted or uncertain monitor deliveries,
+/// unconfirmed native notifications to live sessions, a missing orchestrator
+/// monitor journal, and running background jobs.
+fn evidence_with(
+    state: &Arc<Mutex<DaemonState>>,
+    t: &task::ContinuousTask,
+    self_clearing: Option<&str>,
+) -> Evidence {
+    let strict = self_clearing.is_some()
+        || t.reconciliation
+            .as_ref()
+            .is_some_and(|r| r.self_clear.is_some());
     // Held runs need the same descendant walk even outside an operator drain.
     let mut observed = t.clone();
     if observed.drain.is_none() {
@@ -229,7 +281,9 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
                     super::codex_probe::probe(Path::new(p), s.last_input_at.unwrap_or(0.0))
                 })
                 .is_some_and(|p| p.shape == super::probe::TailShape::TurnComplete);
-        if !s.exited && !(s.reported_done && s.final_turn_ended) && !account_terminal {
+        let clearing = s.orchestrator && self_clearing == Some(s.session_uid.as_str());
+        if !s.exited && !(s.reported_done && s.final_turn_ended) && !account_terminal && !clearing
+        {
             blockers.push(format!(
                 "{} still needs its completion report and final turn.",
                 s.session_uid
@@ -255,6 +309,18 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
                             for producer in producers.values() {
                                 if let Some(records) = producer["records"].as_object() {
                                     for (id, record) in records {
+                                        if strict
+                                            && (matches!(
+                                                record["state"].as_str(),
+                                                Some("undelivered" | "interrupted")
+                                            ) || record["delivery_uncertain"] == true)
+                                        {
+                                            blockers.push(format!(
+                                                "{} monitor {id} has an undelivered or uncertain delivery.",
+                                                s.session_uid
+                                            ));
+                                            continue;
+                                        }
                                         if !matches!(
                                             record["state"].as_str(),
                                             Some(
@@ -291,7 +357,17 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
                 }
                 Some(format!("{:x}", Sha256::digest(bytes)))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None, // explicit legacy evidence required below
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Operators attest legacy monitors explicitly; a self-clear
+                // needs the orchestrator's durable journal instead.
+                if strict && s.orchestrator {
+                    blockers.push(format!(
+                        "{} has no durable monitor journal.",
+                        s.session_uid
+                    ));
+                }
+                None
+            }
             Err(e) => {
                 blockers.push(format!(
                     "Cannot inspect {} monitor journal: {e}",
@@ -309,6 +385,46 @@ fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Eviden
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => blockers.push(format!("Cannot inspect inbox: {e}")),
+        }
+        if strict {
+            if engine.is_some() {
+                match crate::notifications::snapshot(&crate::path::dot_cm_dir(), &s.session_uid) {
+                    Ok((events, _)) => {
+                        let open = events
+                            .iter()
+                            .filter(|e| {
+                                matches!(
+                                    e["status"].as_str(),
+                                    Some("pending" | "submitted" | "uncertain")
+                                )
+                            })
+                            .count();
+                        if open > 0 {
+                            blockers.push(format!(
+                                "{} has {open} unconfirmed notification(s).",
+                                s.session_uid
+                            ));
+                        }
+                    }
+                    Err(e) => blockers.push(format!(
+                        "Cannot inspect {} notifications: {e}",
+                        s.session_uid
+                    )),
+                }
+            }
+            let jobs: Vec<&str> = agent_state["background"]["jobs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|job| job["label"].as_str().unwrap_or("job"))
+                .collect();
+            if !jobs.is_empty() || agent_state["state"] == "working-background" {
+                blockers.push(format!(
+                    "{} has background work running: {}.",
+                    s.session_uid,
+                    if jobs.is_empty() { "unlisted".to_string() } else { jobs.join(", ") }
+                ));
+            }
         }
         let transcript_stamp = transcript.as_deref().map(|p| {
             match std::fs::metadata(p) {
@@ -368,10 +484,9 @@ fn evidence_digest(value: &Value) -> String {
 }
 
 fn reconciled(t: &task::ContinuousTask, e: &Evidence) -> bool {
-    t.reconciliation
-        .as_ref()
-        .is_some_and(|r| r.evidence_hash == e.hash && artifact_valid(t, &r.handover).is_ok())
-        && e.blockers.is_empty()
+    t.reconciliation.as_ref().is_some_and(|r| {
+        r.evidence_hash == e.binding_hash(r) && artifact_valid(t, &r.handover).is_ok()
+    }) && e.blockers.is_empty()
 }
 
 pub fn reconciled_drain_status(
@@ -464,16 +579,7 @@ pub fn handle(
                 .ok_or_else(|| conflict("A verified handover artifact is required."))?;
             artifact_valid(&t, &handover)?;
             let notes = p.notes.filter(|s| !s.trim().is_empty() && s.len() <= 8192).ok_or_else(|| conflict("Supply 1–8192 bytes describing the inspected transcripts, legacy monitors, artifacts and background work."))?;
-            let expected_ids: BTreeSet<_> = batch(&t)?.into_iter().map(|i| i.id).collect();
-            if p.items.keys().cloned().collect::<BTreeSet<_>>() != expected_ids
-                || p.items.values().any(|v| {
-                    v.status == ItemStatus::Ambiguous
-                        || v.evidence.trim().is_empty()
-                        || v.evidence.len() > 8192
-                })
-            {
-                return Err(conflict("Every staged item needs a completed or unfinished outcome with evidence; missing, extra or ambiguous IDs remain held."));
-            }
+            validate_items(&t, &p.items)?;
             if p.dry_run {
                 return Ok(json!({"valid":true,"committed":false}));
             }
@@ -489,6 +595,7 @@ pub fn handle(
                 notes,
                 items: p.items,
                 batch_hash: digest(&json!(batch(&t)?)),
+                self_clear: None,
             };
             task::modify(&t.task_id, |t| t.reconciliation = Some(record)).map_err(internal)?;
             Ok(json!({"task_id":t.task_id,"reconciled":true,"paused":t.paused}))
@@ -497,6 +604,193 @@ pub fn handle(
         "continuous.migrate_engine" => migrate(state, &t, &p),
         _ => Err((ErrorCode::UnknownMethod, method.into())),
     }
+}
+
+fn validate_items(t: &task::ContinuousTask, items: &BTreeMap<String, ItemOutcome>) -> Result<()> {
+    let expected_ids: BTreeSet<_> = batch(t)?.into_iter().map(|i| i.id).collect();
+    if items.keys().cloned().collect::<BTreeSet<_>>() != expected_ids
+        || items.values().any(|v| {
+            v.status == ItemStatus::Ambiguous
+                || v.evidence.trim().is_empty()
+                || v.evidence.len() > 8192
+        })
+    {
+        return Err(conflict("Every staged item needs a completed or unfinished outcome with evidence; missing, extra or ambiguous IDs remain held."));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelfClearParams {
+    reason: String,
+    #[serde(default)]
+    items: BTreeMap<String, ItemOutcome>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `continuous.self_clear_hold`: the task's current orchestrator records the
+/// reconciliation of its own recovery hold when the daemon can verify that
+/// nothing from the held run is still in flight. It is `continuous.reconcile`
+/// with the operator's attestations replaced by daemon checks: the daemon
+/// computes the hashes, writes the handover evidence itself, and refuses with
+/// the specific blockers otherwise. `recover_codex` then releases the hold
+/// exactly as it does after an operator reconcile.
+pub fn self_clear_hold(
+    state: &Arc<Mutex<DaemonState>>,
+    caller_uid: &str,
+    params: &Value,
+) -> methods::MethodResult {
+    let p: SelfClearParams = serde_json::from_value(params.clone()).map_err(|e| {
+        (
+            ErrorCode::InvalidParams,
+            format!("continuous.self_clear_hold: {e}"),
+        )
+    })?;
+    let reason = p.reason.trim().to_string();
+    if reason.is_empty() || reason.len() > 2048 {
+        return Err((
+            ErrorCode::InvalidParams,
+            "Supply a 1–2048 byte reason for clearing the hold.".into(),
+        ));
+    }
+    let unauthorized = |m: &str| Err((ErrorCode::Unauthorized, m.to_string()));
+    let task_id = {
+        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(session) = state.sessions.get(caller_uid) else {
+            return Err((ErrorCode::NotFound, "Caller session is not live.".into()));
+        };
+        session.continuous_task_id.clone()
+    };
+    let Some(task_id) = task_id else {
+        return unauthorized("Only a continuous task's own orchestrator can clear its hold.");
+    };
+    let _lifecycle = task::lock_lifecycle(&task_id).map_err(internal)?;
+    let t = task::load_one(&task_id)
+        .ok_or((ErrorCode::NotFound, "Continuous task is missing.".into()))?;
+    if t.current_session_uid.as_deref() != Some(caller_uid) {
+        return unauthorized(
+            "This session is not the task's current orchestrator (a replaced instance cannot clear the hold).",
+        );
+    }
+    let hold = t
+        .recovery_hold
+        .clone()
+        .ok_or_else(|| conflict("The task has no recovery hold."))?;
+    if t.engine != task::Engine::Codex {
+        return Err(conflict("Only Codex recovery holds are released by recovery."));
+    }
+    if t.drain.is_some() || t.paused {
+        return Err(conflict("An operator drain or pause is in progress; finish it with checkpoint_continuous_drain, or the operator reconciles."));
+    }
+    if t.recovery.is_some() || t.retirement.is_some() {
+        return Err(conflict("Recovery is already in progress."));
+    }
+    if t.reconciliation.as_ref().is_some_and(|r| {
+        r.self_clear
+            .as_ref()
+            .is_none_or(|c| c.session_uid != caller_uid)
+    }) {
+        return Err(conflict("A reconciliation from the operator or another session is already recorded; the operator path owns this hold."));
+    }
+    let run = t
+        .last_run
+        .as_ref()
+        .filter(|r| r.seq == hold.run_seq && r.fire_token == hold.fire_token)
+        .ok_or_else(|| conflict("The held run no longer identifies the hold; the operator reconciles it."))?;
+    let e = evidence_with(state, &t, Some(caller_uid));
+    let mut blockers = e.blockers.clone();
+    for uid in [Some(&hold.session_uid), run.session_uid.as_ref()].into_iter().flatten() {
+        if !e.sessions.iter().any(|s| &s.session_uid == uid) {
+            blockers.push(format!("{uid} is unknown: no live session or retained exit record."));
+        }
+    }
+    if let Err(error) = validate_items(&t, &p.items) {
+        blockers.push(error.1);
+    }
+    blockers.dedup();
+    let probe_ok = {
+        let root = crate::path::dot_cm_dir();
+        super::codex_account::ok_after(
+            &root.join("codex-probe-config.json"),
+            &root.join("codex-probe-state.json"),
+            hold.detected_at,
+            task::now_unix() as f64,
+        )
+    };
+    if !blockers.is_empty() {
+        if p.dry_run {
+            return Ok(json!({"task_id":t.task_id,"eligible":false,"blockers":blockers,"committed":false}));
+        }
+        return Err(conflict(format!(
+            "Hold not cleared: {} Use the operator reconcile for these cases.",
+            blockers.join(" ")
+        )));
+    }
+    if p.dry_run {
+        return Ok(json!({"task_id":t.task_id,"eligible":true,"blockers":[],"committed":false,"pool_probe_ok":probe_ok}));
+    }
+    let clear = SelfClear {
+        session_uid: caller_uid.to_string(),
+        run_seq: hold.run_seq,
+        reason,
+    };
+    let recorded_at = task::now_unix();
+    let dir = crate::path::dot_cm_dir().join("migrations").join(&t.task_id);
+    std::fs::create_dir_all(&dir).map_err(internal)?;
+    let path = dir.join(format!("self-clear-{}-{recorded_at}.json", hold.run_seq));
+    let artifact = json!({"task_id":t.task_id,"hold":hold,"self_clear":clear,"recorded_at":recorded_at,
+        "items":p.items,"evidence":e.value});
+    retirement::write_json(&path, &artifact).map_err(internal)?;
+    let handover = Artifact {
+        path: path.to_string_lossy().into_owned(),
+        sha256: file_hash(&path, 4 * 1024 * 1024)?,
+    };
+    let mut record = Reconciliation {
+        request_id: format!("self-clear-{}", hold.run_seq),
+        evidence_hash: String::new(),
+        recorded_at,
+        handover,
+        notes: format!("Self-cleared by orchestrator {caller_uid}: {}", clear.reason),
+        items: p.items,
+        batch_hash: digest(&json!(batch(&t)?)),
+        self_clear: Some(clear.clone()),
+    };
+    record.evidence_hash = e.binding_hash(&record);
+    let expected = state_hash(&t);
+    match task::try_modify(&t.task_id, |current| {
+        if state_hash(current) != expected {
+            return Err(());
+        }
+        current.reconciliation = Some(record.clone());
+        Ok(())
+    }) {
+        task::TryModifyOutcome::Ok(_) => {}
+        task::TryModifyOutcome::Aborted(()) => {
+            return Err(conflict("Task state changed during the self-clear; retry."))
+        }
+        task::TryModifyOutcome::Persist(e) => return Err(internal(e)),
+    }
+    let audit = super::runlog::ContinuousRunLog::append(&super::runlog::RunLogLine {
+        seq: hold.run_seq,
+        ts: recorded_at as f64,
+        task_id: t.task_id.clone(),
+        event: "hold_self_cleared".into(),
+        fire_token: Some(hold.fire_token.clone()),
+        session_uid: Some(caller_uid.to_string()),
+        run_mode: None,
+        trigger_source: Some("orchestrator".into()),
+        status: Some("held".into()),
+        detail: Some(json!({"reason":clear.reason,"handover":record.handover.path})),
+    });
+    let next = if probe_ok {
+        "Recovery retires this thread and fires a fresh one on the next scheduler pass after your turn ends. Finish your reply and end the turn; do not start new work."
+    } else {
+        "Recovery retires this thread and fires a fresh one once a Codex pool probe newer than the hold is healthy. End your turn; do not start new work."
+    };
+    Ok(json!({"task_id":t.task_id,"committed":true,"run_seq":hold.run_seq,"handover":record.handover,
+        "pool_probe_ok":probe_ok,"next":next,"audit_pending":audit.is_err()}))
 }
 
 fn retire(

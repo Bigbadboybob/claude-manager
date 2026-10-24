@@ -214,8 +214,20 @@ pub fn handle(
     if method == "continuous.context" {
         let task = task::load_one(&task_id)
             .ok_or((ErrorCode::NotFound, "Continuous task is missing.".into()))?;
+        // A non-capacity hold on this orchestrator's run can be cleared by
+        // the orchestrator itself (continuous.self_clear_hold).
+        let self_clear = task
+            .recovery_hold
+            .as_ref()
+            .filter(|h| {
+                !h.auto_releasable()
+                    && task.engine == task::Engine::Codex
+                    && task.current_session_uid.as_deref() == Some(uid.as_str())
+            })
+            .map(|_| crate::continuous::scheduler::SELF_CLEAR_HINT);
         return Ok(
-            json!({"task_id": task_id, "paused": task.paused, "drain": task.drain, "notice": notice(&task)}),
+            json!({"task_id": task_id, "paused": task.paused, "drain": task.drain, "notice": notice(&task),
+                "recovery_hold": task.recovery_hold, "self_clear": self_clear}),
         );
     }
     let receipt: ReceiptParams = serde_json::from_value(params.clone()).map_err(|e| {

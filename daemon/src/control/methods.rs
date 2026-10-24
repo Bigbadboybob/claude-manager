@@ -39594,6 +39594,138 @@ while True:
         });
     }
 
+
+    /// A Codex task held for recovery: a live orchestrator bound as the
+    /// current session, its held run, and one live worker it manages.
+    fn held_codex_fixture(state: &Arc<Mutex<DaemonState>>, home: &std::path::Path, id: &str) -> (String, String) {
+        use crate::continuous::task;
+        let orchestrator=fresh_test_uid(); let worker=fresh_test_uid();
+        let mut t=fresh_task_running(id,home,&orchestrator); t.engine=task::Engine::Codex;
+        t.run_mode=task::RunMode::Persistent; t.current_session_uid=Some(orchestrator.clone());
+        let run=t.last_run.as_mut().unwrap(); run.status=task::RunStatus::Failed; run.finished_at=Some(100);
+        t.recovery_hold=Some(task::RecoveryHold{run_seq:1,session_uid:orchestrator.clone(),fire_token:"ft-stuck-1".into(),detected_at:100,
+            detail:"Codex turn ended without report_done.".into(),capacity:false});
+        task::save(&t).unwrap();
+        insert_continuous_session(state,&orchestrator,id);
+        insert_continuous_session(state,&worker,id);
+        {
+            let mut state=state.lock().unwrap();
+            state.sessions.get_mut(&orchestrator).unwrap().session_type="codex".into();
+            let w=state.sessions.get_mut(&worker).unwrap(); w.continuous_task_id=None; w.managed_by_uid=Some(orchestrator.clone());
+        }
+        write_drain_monitor_journal(&orchestrator,json!({}));
+        (orchestrator,worker)
+    }
+
+    /// The held orchestrator's rollout ends in a completed turn.
+    fn set_completed_codex_rollout(state: &Arc<Mutex<DaemonState>>, uid: &str, home: &std::path::Path) {
+        let transcript=home.join("rollout.jsonl");
+        std::fs::write(&transcript,"{\"timestamp\":\"2026-09-06T22:00:00.500Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"error\":{\"codex_error_info\":\"usage_limit_exceeded\"}}}\n").unwrap();
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().transcript_path=Some(transcript.to_string_lossy().into_owned());
+    }
+
+    fn finish_worker(state: &Arc<Mutex<DaemonState>>, worker: &str) {
+        report_done(state,&Caller::session(worker.to_string()),&json!({})).unwrap();
+        state.lock().unwrap().sessions[worker].stamp_turn_end();
+    }
+
+    #[test]
+    fn continuous_self_clear_releases_a_settled_hold_through_recovery() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear");
+            finish_worker(&state,&worker);
+            let reason=json!({"reason":"Both workers reported; artifacts are in the index."});
+            let preview=m::self_clear_hold(&state,&orchestrator,&json!({"reason":"check","dry_run":true})).unwrap();
+            assert_eq!(preview["eligible"],true,"{preview}");
+            assert!(task::load_one("self-clear").unwrap().reconciliation.is_none(),"dry run records nothing");
+            let cleared=m::self_clear_hold(&state,&orchestrator,&reason).unwrap();
+            assert_eq!(cleared["committed"],true);
+            let t=task::load_one("self-clear").unwrap();
+            let record=t.reconciliation.clone().unwrap();
+            let clear=record.self_clear.clone().unwrap();
+            assert_eq!((clear.session_uid.as_str(),clear.run_seq),(orchestrator.as_str(),1));
+            assert_eq!(clear.reason,"Both workers reported; artifacts are in the index.");
+            let evidence:Value=serde_json::from_slice(&std::fs::read(&record.handover.path).unwrap()).unwrap();
+            assert_eq!(evidence["self_clear"]["reason"],clear.reason);
+            assert!(t.recovery_hold.is_some(),"recovery, not the call, lifts the hold");
+            // The orchestrator keeps talking after the call and then ends its
+            // turn; its own row moving does not invalidate the record.
+            set_completed_codex_rollout(&state,&orchestrator,home);
+            migration_probe_fixture(home,101.0);
+            assert!(!m::recover_codex(&state,"self-clear",111).unwrap(),"retire both sessions first");
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+            for uid in [&orchestrator,&worker] {
+                while !state.lock().unwrap().sessions[uid].last_exit.kernel_set() { assert!(std::time::Instant::now()<deadline); std::thread::sleep(std::time::Duration::from_millis(10)); }
+                handle_session_exit(&mut state.lock().unwrap(),uid);
+            }
+            assert!(m::recover_codex(&state,"self-clear",111).unwrap());
+            let after=task::load_one("self-clear").unwrap();
+            assert!(after.recovery_hold.is_none() && after.reconciliation.is_none() && after.current_session_uid.is_none());
+            let receipt:Value=serde_json::from_slice(&std::fs::read(task::task_dir("self-clear").join("recoveries/1.json")).unwrap()).unwrap();
+            assert_eq!(receipt["progress"]["reconciliation"]["self_clear"]["reason"],clear.reason,"the reason survives in the run's recovery receipt");
+        });
+    }
+
+    #[test]
+    fn continuous_self_clear_refuses_live_work_and_pending_deliveries() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear-held");
+            let reason=json!({"reason":"settled"});
+            let refused=m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err();
+            assert_eq!(refused.0,ErrorCode::Conflict);
+            assert!(refused.1.contains(&format!("{worker} still needs its completion report")),"{}",refused.1);
+            let dry=m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled","dry_run":true})).unwrap();
+            assert_eq!(dry["eligible"],false); assert!(dry["blockers"].as_array().unwrap().iter().any(|b| b.as_str().unwrap().contains(&worker)));
+            finish_worker(&state,&worker);
+            let root=crate::path::dot_cm_dir();
+            crate::notifications::publish(&root,&orchestrator,"wake-1","session_monitor","[cm-monitor m1] done","[cm-monitor m1]").unwrap();
+            let refused=m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err();
+            assert!(refused.1.contains("unconfirmed notification"),"{}",refused.1);
+            crate::notifications::update_pending(&root,&orchestrator,"wake-1",None).unwrap();
+            write_drain_monitor_journal(&orchestrator,json!({"m1":{"monitor_id":"m1","state":"undelivered"}}));
+            let refused=m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err();
+            assert!(refused.1.contains("monitor m1 has an undelivered or uncertain delivery"),"{}",refused.1);
+            write_drain_monitor_journal(&orchestrator,json!({"m1":{"monitor_id":"m1","state":"delivered","delivery_uncertain":true}}));
+            assert!(m::self_clear_hold(&state,&orchestrator,&reason).is_err());
+            std::fs::remove_file(root.join("monitor-state").join(format!("{orchestrator}.json"))).unwrap();
+            let refused=m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err();
+            assert!(refused.1.contains("no durable monitor journal"),"{}",refused.1);
+            assert!(task::load_one("self-clear-held").unwrap().reconciliation.is_none(),"no refusal records anything");
+            // The operator path is unchanged: it attests what the self-clear
+            // must prove, and still reconciles this hold.
+            set_completed_codex_rollout(&state,&orchestrator,home);
+            m::handle(&state,"continuous.reconcile",&migration_request(&state,"self-clear-held",home)).unwrap();
+            let record=task::load_one("self-clear-held").unwrap().reconciliation.unwrap();
+            assert!(record.self_clear.is_none());
+            assert!(m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err().1.contains("operator"),"an operator record is not replaced");
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_self_clear_is_only_for_the_current_orchestrator() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear-auth");
+            finish_worker(&state,&worker);
+            let reason=json!({"reason":"settled"});
+            assert_eq!(m::self_clear_hold(&state,&worker,&reason).unwrap_err().0,ErrorCode::Unauthorized,"a worker cannot clear its orchestrator's hold");
+            let stale=fresh_test_uid(); insert_continuous_session(&state,&stale,"self-clear-auth");
+            let refused=m::self_clear_hold(&state,&stale,&reason).unwrap_err();
+            assert_eq!(refused.0,ErrorCode::Unauthorized); assert!(refused.1.contains("replaced instance"),"{}",refused.1);
+            assert_eq!(m::self_clear_hold(&state,"ts-not-live",&reason).unwrap_err().0,ErrorCode::NotFound);
+            assert_eq!(m::self_clear_hold(&state,&orchestrator,&json!({"reason":"  "})).unwrap_err().0,ErrorCode::InvalidParams);
+            task::modify("self-clear-auth",|t| t.recovery_hold=None).unwrap();
+            assert!(m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err().1.contains("no recovery hold"));
+            kill_all_sessions(&state);
+        });
+    }
+
 }
 
 #[cfg(test)]
