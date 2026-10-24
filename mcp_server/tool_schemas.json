@@ -280,6 +280,15 @@
     "work_reconciled"
    ]
   },
+  "clear_continuous_hold": {
+   "params": {
+    "dry_run": "boolean",
+    "reason": "string"
+   },
+   "required": [
+    "reason"
+   ]
+  },
   "create_subtask": {
    "params": {
     "base": "string",
@@ -507,6 +516,7 @@
     "check_back": "string",
     "each": "boolean",
     "eta": "string",
+    "expect_status": "string",
     "gate_class": "string",
     "group": "string",
     "head": "string",
@@ -527,6 +537,7 @@
      "array",
      "string"
     ],
+    "reopen": "boolean",
     "ruling": "string",
     "status": "string",
     "title": "string"
