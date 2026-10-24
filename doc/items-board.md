@@ -121,7 +121,14 @@ re-read fully every ~30 s.
    dependent gets a `blocker_dropped` flag; the edge stays until someone acts.
    A `reason` is recommended and stored on the event.
 7. **Reopen.** Any non-closed status on a closed item clears `closed_at` and
-   `archived_at`. Blockers named in a reopen are re-validated by rule 3.
+   `archived_at`. A **done** item reopens only on purpose (2026-10-24, sejd
+   #1665/#1643/#1505: done → blocked writes from stale reads): any write that
+   would give it another status, `dropped` included and on every route
+   (`item_set`, bulk, `item_resolve`), is refused `409 reopen_required`
+   naming who closed it and when (`closed_by`, `closed_at`) unless it passes
+   `reopen: true`. Owner's writes (the TUI, Alt+B) imply it. The `updated`
+   event records `reopened: "reopen=true"` or `"owner"`. Writes that keep it
+   done (a note) are unaffected. Blockers named in a reopen are re-validated by rule 3.
    Reopening a dropped blocker clears its dependents' `blocker_dropped`, as
    does re-pointing a dependent's `blocked_by` away from dropped items.
 8. **Assigned.** A holder added by an actor other than that holder queues an
@@ -308,7 +315,8 @@ searchable with `archived=true`). Delivered pushes, state rows exited and
 
 Bearer token as for every endpoint. Errors are `{"detail": {"code", "message", …}}`
 with codes `not_found` (404), `cycle` and `board_not_empty` (409, plus `cycle: [n…]` /
-`open_items`),
+`open_items`), `reopen_required` (409, plus `closed_by`, `closed_at`,
+`would_be`) and `status_changed` (409, plus `current_status`, `expected`),
 `invalid_blocker`, `eta_required`, `invalid_status`, `invalid_field`,
 `no_holders`, `item_closed`, `check_back_required`, and on strict boards
 `waiting_not_allowed`, `holder_required`, `trigger_required`,
@@ -323,7 +331,7 @@ FastAPI's standard 422.
 | `DELETE /boards/{ref}` | (none) | `{deleted, id, items}`; `409 board_not_empty` with `open_items` while any item is open. Deletes the board's items, history, flags and pushes. For scratch boards |
 | `PATCH /boards/{ref}` | `{actor, settings…, orchestrator_pid?}` | `board` header |
 | `POST /boards/{ref}/items` | `{actor, items: [{title, holders?, status?, note?, group?, blocked_by?, blocked_on?, eta?, check_back?, links?}], request_id?}` (≤ 50, all-or-nothing) | `{board, items, unblocked, warnings}`; a repeated `request_id` on the board returns the first call's items with `replayed: true` |
-| `PATCH /boards/{ref}/items` | `{actor, ns: [n], set: {…}, add_holders?, remove_holders?, reason?}` | `{items, unblocked: [n], warnings: [str]}` |
+| `PATCH /boards/{ref}/items` | `{actor, ns: [n], set: {…}, add_holders?, remove_holders?, reason?, each?, reopen?, expect_status?}` | `{items, unblocked: [n], warnings: [str]}`. `expect_status` is a compare-and-set checked under the board-row lock: `409 status_changed` (with `current_status`) unless each item has that status. A list is all-or-nothing (one refusal refuses the write); `each: true` reports per-item `results` and applies the rest |
 | `POST /boards/{ref}/items/{n}/resolve` | `{actor, action, kind?, holders?, blocked_by?, blocked_on?, check_back?, reason?, message?}` | `{board, item, flags_resolved: [kind], unblocked, warnings}` |
 | `GET /items` | `?holder_pid=&open=true` | `[{board, n, title, status}]` |
 | `POST /boards/{ref}/items/touch` | `{actor, ns: [n], source: "chat", message_id?, excerpt?}` | `{board, touched: [n], skipped: [{n, reason: not_found|closed|not_holder}]}`; only open items the actor holds; never changes status or note |
@@ -418,8 +426,11 @@ item(title: str | list[str], holder=None, status="active", note=None, group=None
 item_set(n: int | list[int], status=None, note=None, holder=None, add_holder=None,
          remove_holder=None, group=None, blocked_by=None, blocked_on=None,
          check_back=None, eta=None, job=None, title=None, links=None, reason=None, board=None,
-         head=None, mf=None, ruling=None, gate_class=None)
-  -> {items, unblocked?, warnings?}
+         head=None, mf=None, ruling=None, gate_class=None, each=False,
+         reopen=False, expect_status=None)
+  -> {items, unblocked?, warnings?, results?}
+  # reopen=True: needed to move a done item to any other status (§2 rule 7)
+  # expect_status: refuse unless the item's status is still the one you read
   # head / mf / ruling / gate_class: gate bindings (gate-receipts.md §8)
 
 board(board=None, view="slim", mine=False, group=None, include_closed=True,

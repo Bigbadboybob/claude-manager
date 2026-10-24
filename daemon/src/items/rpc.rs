@@ -433,6 +433,14 @@ fn item_set(ctx: &Ctx, params: &Value) -> RpcResult {
     if params["each"] == true {
         body["each"] = json!(true);
     }
+    // A done item reopens only on purpose; expect_status is the
+    // compare-and-set, checked by the API under the board-row lock.
+    if params["reopen"] == true {
+        body["reopen"] = json!(true);
+    }
+    if let Some(expect) = params.get("expect_status").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+        body["expect_status"] = json!(expect.trim());
+    }
     if body["set"].as_object().is_some_and(Map::is_empty)
         && body.get("add_holders").is_none()
         && body.get("remove_holders").is_none()
@@ -1292,6 +1300,24 @@ mod tests {
         let sets: Vec<&Value> = seen.iter().filter(|(m, p, _)| m == "PATCH" && p == "/boards/sfd/items").map(|(_, _, b)| &b["set"]).collect();
         assert_eq!(sets[0]["job"], "pins L3");
         assert!(sets[1]["job"].is_null() && sets[1].get("job").is_some(), "\"\" clears the job");
+    }
+
+    #[test]
+    fn item_set_forwards_reopen_and_expect_status() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[],"unblocked":[],"warnings":[]}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        assert!(call(&state, "me-uid", "item.set", json!({"n":3,"status":"blocked","reopen":true,"expect_status":"done"})).ok);
+        assert!(call(&state, "me-uid", "item.set", json!({"n":3,"note":"x","reopen":false})).ok);
+        let seen = seen.lock().unwrap();
+        let bodies: Vec<&Value> = seen.iter().filter(|(m, _, _)| m == "PATCH").map(|(_, _, b)| b).collect();
+        assert_eq!((bodies[0]["reopen"].clone(), bodies[0]["expect_status"].clone()), (json!(true), json!("done")));
+        assert!(bodies[1].get("reopen").is_none() && bodies[1].get("expect_status").is_none());
     }
 
     #[test]

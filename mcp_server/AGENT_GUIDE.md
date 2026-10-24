@@ -78,7 +78,12 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
 - Starting something: `item("fuse SEJD hot operators")` (you hold it, status
   active). Several at once: `item(["a", "b", "c"])`.
 - Finished: `item_set(14, "done", note="abc123")`. Cancelled:
-  `item_set(14, "dropped", reason="superseded by #15")`.
+  `item_set(14, "dropped", reason="superseded by #15")`. A done item stays
+  done: a write that would change its status is refused (`reopen_required`,
+  naming who closed it and when), because it usually comes from a stale read.
+  Re-read the board; reopen on purpose with `reopen=True`. Writing from a
+  read, pass `expect_status=<the status you read>` so the write is refused
+  if the item changed since (`status_changed`).
 - Running a job longer than about 20 minutes (tests, a backtest, training):
   `item_set(14, "active", eta="40m", job="full C2 run, cell C2-07")`. Before its
   ETA it is never flagged idle or stale; at the ETA without an update you are

@@ -103,6 +103,10 @@ class ItemsPatchBody(_Strict):
     reason: Reason | None = None
     # Per-item results: each item is written on its own (bulk edits).
     each: bool = False
+    # A done item reopens only with reopen=true (Owner's writes imply it).
+    reopen: bool = False
+    # Compare-and-set: refused (409 status_changed) unless the item's status is this.
+    expect_status: Short | None = None
 
 
 class ItemsTouchBody(_Strict):

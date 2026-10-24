@@ -315,6 +315,8 @@ def item_set(
     ruling: str | None = None,
     gate_class: str | None = None,
     each: bool = False,
+    reopen: bool = False,
+    expect_status: str | None = None,
 ) -> dict:
     """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
     note="needs EP GO"), item_set(15, blocked_by=[14]),
@@ -344,11 +346,21 @@ def item_set(
     items waiting only on it and wakes their holders. Anyone on the board may
     edit any item; history is kept, so give a reason for drops and handoffs.
 
+    A done item stays done: a write that would make it anything else
+    (blocked, active, dropped, ...) is refused with reopen_required, naming
+    who closed it and when; usually your read is stale, so re-read the board.
+    To reopen it on purpose pass reopen=True (recorded on the item's history).
+    expect_status="blocked" (what you read) makes the write a compare-and-set:
+    it is refused with status_changed if the item's status is anything else
+    by the time it lands. With each=True both apply per item.
+
     Returns {board, items, unblocked?, warnings?}.
     """
     params = dict(locals())
     if not each:
         params.pop("each")
+    if not reopen:
+        params.pop("reopen")
     return _items_call("item.set", params)
 
 

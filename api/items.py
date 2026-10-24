@@ -93,7 +93,8 @@ async def update_items(ref: str, body: ItemsPatchBody, request: Request):
     return await _call(write(
         _pool(request), ref, body.actor.model_dump(), body.ns, fields,
         add_holders=[h.model_dump() for h in body.add_holders or []],
-        remove_holders=body.remove_holders, reason=body.reason))
+        remove_holders=body.remove_holders, reason=body.reason,
+        reopen=body.reopen, expect_status=body.expect_status))
 
 
 @router.post("/boards/{ref}/items/touch")

@@ -53,6 +53,13 @@ class ItemToolsTests(unittest.TestCase):
         self.assertEqual(params, {"view": "slim", "mine": False, "include_closed": True,
                                   "archived": False})
 
+    def test_item_set_reopen_and_expect_status(self):
+        _, params = self.call(server.item_set, 14, "blocked", reopen=True, expect_status="done")
+        self.assertEqual(params, {"n": 14, "status": "blocked", "reopen": True,
+                                  "expect_status": "done"})
+        _, params = self.call(server.item_set, 14, "done")
+        self.assertEqual(params, {"n": 14, "status": "done"})
+
     def test_job_and_board_settings(self):
         _, params = self.call(server.item_set, 14, eta="40m", job="pins L3")
         self.assertEqual(params, {"n": 14, "eta": "40m", "job": "pins L3"})
