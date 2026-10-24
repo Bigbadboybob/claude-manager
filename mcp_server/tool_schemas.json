@@ -1,0 +1,955 @@
+{
+ "breaking": [],
+ "tools": {
+  "acknowledge_continuous_drain": {
+   "params": {
+    "request_id": "string"
+   },
+   "required": [
+    "request_id"
+   ]
+  },
+  "add_initiative_project": {
+   "params": {
+    "initiative_id": "string",
+    "project": "string",
+    "project_channel": "string",
+    "role": "string"
+   },
+   "required": [
+    "initiative_id",
+    "project"
+   ]
+  },
+  "board": {
+   "params": {
+    "archived": "boolean",
+    "board": "string",
+    "group": "string",
+    "include_closed": "boolean",
+    "mine": "boolean",
+    "query": "string",
+    "settings": "object",
+    "view": "string"
+   },
+   "required": []
+  },
+  "cancel_monitor": {
+   "params": {
+    "monitor_id": "string"
+   },
+   "required": [
+    "monitor_id"
+   ]
+  },
+  "chat_channels": {
+   "params": {
+    "action": "string",
+    "admins": "array",
+    "allow_agent_edits": "boolean",
+    "archived": "boolean",
+    "conversation": "string",
+    "cursor": "object",
+    "default_join": "boolean",
+    "description": "string",
+    "expected_revision": "string",
+    "joined_only": "boolean",
+    "limit": "integer",
+    "name": "string",
+    "origin_daemon_id": "string",
+    "participant_id": "string",
+    "path": "string",
+    "query": "string",
+    "request_id": "string",
+    "view": "string"
+   },
+   "required": []
+  },
+  "chat_dms": {
+   "params": {
+    "cursor": "object",
+    "limit": "integer",
+    "peer": "string",
+    "unread_only": "boolean"
+   },
+   "required": []
+  },
+  "chat_follow": {
+   "params": {
+    "action": "string",
+    "bell": "boolean",
+    "cursor": "object",
+    "dnd": "boolean",
+    "expected_revision": "integer",
+    "inbox": "boolean",
+    "limit": "integer",
+    "muted": "boolean",
+    "origin_daemon_id": "string",
+    "request_id": "string",
+    "scope": "object",
+    "wake": "boolean"
+   },
+   "required": []
+  },
+  "chat_monitor": {
+   "params": {
+    "after": "object",
+    "expires_in": "string",
+    "include_self": "boolean",
+    "mode": "string",
+    "notify": "string",
+    "origin_daemon_id": "string",
+    "request_id": "string",
+    "scope": "object"
+   },
+   "required": [
+    "request_id",
+    "scope"
+   ]
+  },
+  "chat_monitors": {
+   "params": {
+    "action": "string",
+    "cursor": "object",
+    "limit": "integer",
+    "monitor_id": "string",
+    "origin_daemon_id": "string",
+    "receipt": "object",
+    "request_id": "string",
+    "unacknowledged_only": "boolean"
+   },
+   "required": []
+  },
+  "chat_norms": {
+   "params": {
+    "ack_revision": "string",
+    "action": "string",
+    "channel": "string",
+    "cursor": "object",
+    "expected_revision": "string",
+    "limit": "integer",
+    "limit_chars": "integer",
+    "origin_daemon_id": "string",
+    "request_id": "string",
+    "revision": "string",
+    "scope": "string",
+    "since": "object",
+    "summary": "string",
+    "text": "string"
+   },
+   "required": []
+  },
+  "chat_open": {
+   "params": {
+    "channel": "string",
+    "conversation": "string",
+    "dm": [
+     "array",
+     "string"
+    ]
+   },
+   "required": []
+  },
+  "chat_people": {
+   "params": {
+    "cursor": "object",
+    "include_exited": "boolean",
+    "limit": "integer",
+    "query": "string",
+    "view": "string"
+   },
+   "required": []
+  },
+  "chat_pins": {
+   "params": {
+    "action": "string",
+    "channel": "string",
+    "conversation": "string",
+    "cursor": "object",
+    "dm": [
+     "array",
+     "string"
+    ],
+    "expected_revision": "string",
+    "limit": "integer",
+    "message_id": "string",
+    "origin_daemon_id": "string",
+    "request_id": "string"
+   },
+   "required": []
+  },
+  "chat_react": {
+   "params": {
+    "emoji": "string",
+    "message_id": "string",
+    "origin_daemon_id": "string",
+    "remove": "boolean",
+    "request_id": "string"
+   },
+   "required": [
+    "emoji",
+    "message_id",
+    "request_id"
+   ]
+  },
+  "chat_read": {
+   "params": {
+    "ack_receipt": "object",
+    "after": "object",
+    "channel": "string",
+    "conversation": "string",
+    "cursor": "object",
+    "dm": [
+     "array",
+     "string"
+    ],
+    "dms": "boolean",
+    "freshness": "string",
+    "inbox": "boolean",
+    "limit": "integer",
+    "mark_read": "boolean",
+    "mark_read_before": "string",
+    "mentions_only": "boolean",
+    "newest_first": "boolean",
+    "pinned_only": "boolean",
+    "query": "string",
+    "sender": "string",
+    "tags": "array",
+    "thread": "string",
+    "time": "object",
+    "time_basis": "string",
+    "unread_only": "boolean",
+    "view": "string"
+   },
+   "required": []
+  },
+  "chat_rename": {
+   "params": {
+    "expected_name_revision": "integer",
+    "name": "string",
+    "origin_daemon_id": "string",
+    "request_id": "string"
+   },
+   "required": [
+    "expected_name_revision",
+    "name",
+    "request_id"
+   ]
+  },
+  "chat_send": {
+   "params": {
+    "ack_receipt": "object",
+    "body": "string",
+    "channel": "string",
+    "conversation": "string",
+    "dm": [
+     "array",
+     "string"
+    ],
+    "links": "array",
+    "mention_here": "boolean",
+    "mentions": "array",
+    "name": "string",
+    "norms_seen": "object",
+    "origin_daemon_id": "string",
+    "reply_to": "string",
+    "request_id": "string",
+    "tags": "array",
+    "view": "string"
+   },
+   "required": [
+    "body",
+    "request_id"
+   ]
+  },
+  "checkpoint_continuous_drain": {
+   "params": {
+    "background_work_complete": "boolean",
+    "notes": "string",
+    "request_id": "string",
+    "work_reconciled": "boolean"
+   },
+   "required": [
+    "background_work_complete",
+    "notes",
+    "request_id",
+    "work_reconciled"
+   ]
+  },
+  "create_subtask": {
+   "params": {
+    "base": "string",
+    "effort": "string",
+    "model": "string",
+    "model_engine": "string",
+    "name": "string",
+    "project": "string",
+    "prompt": "string",
+    "worktree_mode": "string"
+   },
+   "required": [
+    "name"
+   ]
+  },
+  "enqueue": {
+   "params": {
+    "dedupe_key": "string",
+    "payload": "object",
+    "queue": "string",
+    "source": "string"
+   },
+   "required": [
+    "payload",
+    "queue"
+   ]
+  },
+  "fork_session": {
+   "params": {
+    "base": "string",
+    "effort": "string",
+    "label": "string",
+    "model": "string",
+    "notify_on_done": "boolean",
+    "notify_until": "string",
+    "parent_task_id": "string",
+    "prompt": "string",
+    "request_id": "string",
+    "session_uid": "string",
+    "task_id": "string",
+    "task_name": "string",
+    "top_level": "boolean"
+   },
+   "required": [
+    "session_uid"
+   ]
+  },
+  "gate_profile": {
+   "params": {
+    "board": "string",
+    "default": "boolean",
+    "delete": "boolean",
+    "klass": "string",
+    "n": "integer",
+    "profile": "object",
+    "reason": "string"
+   },
+   "required": []
+  },
+  "gate_receipts": {
+   "params": {
+    "board": "string",
+    "gate": "string",
+    "history": "boolean",
+    "n": "integer"
+   },
+   "required": [
+    "n"
+   ]
+  },
+  "gate_report": {
+   "params": {
+    "base": "object",
+    "board": "string",
+    "branch": "string",
+    "closure": "object",
+    "gate": "string",
+    "head": "string",
+    "inputs": "array",
+    "klass": "string",
+    "log_path": "string",
+    "mf": "string",
+    "n": "integer",
+    "repo": "string",
+    "request_id": "string",
+    "ruling": "string",
+    "runner": "object",
+    "steps": "array",
+    "waivers": "array",
+    "worktree": "object"
+   },
+   "required": [
+    "head",
+    "n",
+    "steps"
+   ]
+  },
+  "gate_waive": {
+   "params": {
+    "base": "string",
+    "board": "string",
+    "cmd_digest": "string",
+    "gate": "string",
+    "head": "string",
+    "kind": "string",
+    "message_id": "string",
+    "n": "integer",
+    "nodes": "array",
+    "reason": "string",
+    "revoke": "string",
+    "risk": "string",
+    "step": "string"
+   },
+   "required": [
+    "head",
+    "message_id",
+    "n",
+    "reason",
+    "risk",
+    "step"
+   ]
+  },
+  "get_backtest_result": {
+   "params": {
+    "poll_interval_s": "number",
+    "task_id": "string",
+    "timeout_s": "number",
+    "wait": "boolean"
+   },
+   "required": [
+    "task_id"
+   ]
+  },
+  "get_continuous_context": {
+   "params": {},
+   "required": []
+  },
+  "get_current_task": {
+   "params": {},
+   "required": []
+  },
+  "get_initiative": {
+   "params": {
+    "initiative_id": "string"
+   },
+   "required": [
+    "initiative_id"
+   ]
+  },
+  "get_task": {
+   "params": {
+    "task_id": "string"
+   },
+   "required": [
+    "task_id"
+   ]
+  },
+  "get_workflow_state": {
+   "params": {
+    "run_id": "string"
+   },
+   "required": [
+    "run_id"
+   ]
+  },
+  "item": {
+   "params": {
+    "blocked_by": "array",
+    "blocked_on": "string",
+    "board": "string",
+    "eta": "string",
+    "group": "string",
+    "holder": [
+     "array",
+     "string"
+    ],
+    "job": "string",
+    "links": "array",
+    "note": "string",
+    "request_id": "string",
+    "status": "string",
+    "title": [
+     "array",
+     "string"
+    ]
+   },
+   "required": [
+    "title"
+   ]
+  },
+  "item_resolve": {
+   "params": {
+    "action": "string",
+    "blocked_by": "array",
+    "blocked_on": "string",
+    "board": "string",
+    "check_back": "string",
+    "engine": "string",
+    "holder": [
+     "array",
+     "string"
+    ],
+    "kind": "string",
+    "message": "string",
+    "n": "integer",
+    "reason": "string",
+    "request_id": "string",
+    "task_id": "string",
+    "to": "string"
+   },
+   "required": [
+    "action",
+    "n"
+   ]
+  },
+  "item_set": {
+   "params": {
+    "add_holder": [
+     "array",
+     "string"
+    ],
+    "blocked_by": "array",
+    "blocked_on": "string",
+    "board": "string",
+    "check_back": "string",
+    "each": "boolean",
+    "eta": "string",
+    "gate_class": "string",
+    "group": "string",
+    "head": "string",
+    "holder": [
+     "array",
+     "string"
+    ],
+    "job": "string",
+    "links": "array",
+    "mf": "string",
+    "n": [
+     "array",
+     "integer"
+    ],
+    "note": "string",
+    "reason": "string",
+    "remove_holder": [
+     "array",
+     "string"
+    ],
+    "ruling": "string",
+    "status": "string",
+    "title": "string"
+   },
+   "required": [
+    "n"
+   ]
+  },
+  "kill_session": {
+   "params": {
+    "session_uid": "string"
+   },
+   "required": [
+    "session_uid"
+   ]
+  },
+  "list_initiatives": {
+   "params": {
+    "include_archived": "boolean",
+    "kind": "string",
+    "project": "string",
+    "status": "string"
+   },
+   "required": []
+  },
+  "list_monitors": {
+   "params": {},
+   "required": []
+  },
+  "list_projects": {
+   "params": {},
+   "required": []
+  },
+  "list_sessions": {
+   "params": {
+    "include_exited": "boolean",
+    "task_id": "string"
+   },
+   "required": []
+  },
+  "list_sessions_grouped": {
+   "params": {
+    "include_exited": "boolean",
+    "task_id": "string"
+   },
+   "required": []
+  },
+  "list_sidebar_sections": {
+   "params": {},
+   "required": []
+  },
+  "list_subtasks": {
+   "params": {
+    "task_id": "string"
+   },
+   "required": []
+  },
+  "list_tasks": {
+   "params": {
+    "initiative_id": "string",
+    "project": "string",
+    "source": "string",
+    "status": "string"
+   },
+   "required": []
+  },
+  "list_workflows": {
+   "params": {
+    "task_id": "string"
+   },
+   "required": []
+  },
+  "mark_subtask_done": {
+   "params": {
+    "close_worktree": "boolean",
+    "force": "boolean",
+    "task_id": "string"
+   },
+   "required": [
+    "task_id"
+   ]
+  },
+  "monitor_sessions": {
+   "params": {
+    "edge": "boolean",
+    "mode": "string",
+    "note": "string",
+    "session_uids": "array",
+    "timeout_s": "number",
+    "until": "string"
+   },
+   "required": [
+    "session_uids"
+   ]
+  },
+  "notification_status": {
+   "params": {},
+   "required": []
+  },
+  "notify_user": {
+   "params": {
+    "message": "string",
+    "urgency": "string"
+   },
+   "required": []
+  },
+  "org": {
+   "params": {
+    "action": "string",
+    "division": "string",
+    "session_uid": "string",
+    "task_id": "string",
+    "view": "string"
+   },
+   "required": []
+  },
+  "ping": {
+   "params": {},
+   "required": []
+  },
+  "propose_initiative": {
+   "params": {
+    "color": "string",
+    "coordinator_project": "string",
+    "coordinator_task_id": "string",
+    "description": "string",
+    "docs_path": "string",
+    "kind": "string",
+    "name": "string",
+    "slug": "string"
+   },
+   "required": [
+    "coordinator_task_id",
+    "name"
+   ]
+  },
+  "propose_task": {
+   "params": {
+    "depends": "array",
+    "description": "string",
+    "difficulty": "integer",
+    "effort": "string",
+    "initiative_id": "string",
+    "model": "string",
+    "model_engine": "string",
+    "name": "string",
+    "project": "string",
+    "prompt": "string",
+    "reports_to": "string"
+   },
+   "required": [
+    "name",
+    "project"
+   ]
+  },
+  "queue_depth": {
+   "params": {
+    "queue": "string"
+   },
+   "required": [
+    "queue"
+   ]
+  },
+  "read_last_turn": {
+   "params": {
+    "context_messages": "integer",
+    "session_uid": "string"
+   },
+   "required": [
+    "session_uid"
+   ]
+  },
+  "read_session_output": {
+   "params": {
+    "max_messages": "integer",
+    "session_uid": "string",
+    "since_cursor": "string"
+   },
+   "required": [
+    "session_uid"
+   ]
+  },
+  "report_done": {
+   "params": {
+    "reason": "string"
+   },
+   "required": []
+  },
+  "resolve_stuck": {
+   "params": {
+    "action": "string",
+    "reason": "string",
+    "seq": "integer",
+    "task_id": "string"
+   },
+   "required": [
+    "action",
+    "seq",
+    "task_id"
+   ]
+  },
+  "send_input": {
+   "params": {
+    "notify_on_done": "boolean",
+    "notify_until": "string",
+    "session_uid": "string",
+    "submit": "boolean",
+    "text": "string"
+   },
+   "required": [
+    "session_uid",
+    "text"
+   ]
+  },
+  "send_input_and_wait": {
+   "params": {
+    "pending_idle_grace_s": "number",
+    "poll_interval_s": "number",
+    "schema": "object",
+    "schema_retries": "integer",
+    "session_uid": "string",
+    "submit": "boolean",
+    "text": "string",
+    "timeout_s": "number"
+   },
+   "required": [
+    "session_uid",
+    "text"
+   ]
+  },
+  "send_key": {
+   "params": {
+    "key": "string",
+    "notify_on_done": "boolean",
+    "notify_until": "string",
+    "session_uids": [
+     "array",
+     "string"
+    ]
+   },
+   "required": [
+    "key",
+    "session_uids"
+   ]
+  },
+  "set_session_section": {
+   "params": {
+    "section": "string",
+    "session_id": "string"
+   },
+   "required": [
+    "section"
+   ]
+  },
+  "set_subtask_status": {
+   "params": {
+    "status": "string",
+    "task_id": "string"
+   },
+   "required": [
+    "status"
+   ]
+  },
+  "start_session": {
+   "params": {
+    "allow_shared_workspace": "boolean",
+    "effort": "string",
+    "global_perms": "boolean",
+    "isolated": "boolean",
+    "label": "string",
+    "model": "string",
+    "notify_on_done": "boolean",
+    "notify_until": "string",
+    "pending_idle_grace_s": "number",
+    "poll_interval_s": "number",
+    "prompt": "string",
+    "schema": "object",
+    "schema_retries": "integer",
+    "task_id": "string",
+    "timeout_s": "number",
+    "type": "string",
+    "wait": "boolean"
+   },
+   "required": [
+    "label",
+    "type"
+   ]
+  },
+  "start_workflow": {
+   "params": {
+    "goal": "string",
+    "role_sessions": "object",
+    "task_id": "string",
+    "workflow_name": "string"
+   },
+   "required": [
+    "task_id",
+    "workflow_name"
+   ]
+  },
+  "stop_workflow": {
+   "params": {
+    "run_id": "string"
+   },
+   "required": [
+    "run_id"
+   ]
+  },
+  "submit_backtest": {
+   "params": {
+    "baseline_ref": "string",
+    "branch": "string",
+    "config": "string",
+    "label": "string",
+    "machine_type": "string",
+    "notify": "boolean",
+    "project": "string",
+    "regression": "boolean",
+    "repo_url": "string",
+    "script": "string",
+    "zone": "string"
+   },
+   "required": [
+    "branch",
+    "config"
+   ]
+  },
+  "trigger": {
+   "params": {
+    "args": "object",
+    "fire_token": "string",
+    "mode": "string",
+    "prompt": "string",
+    "task_id": "string"
+   },
+   "required": [
+    "task_id"
+   ]
+  },
+  "update_task": {
+   "params": {
+    "depends": "array",
+    "description": "string",
+    "difficulty": "integer",
+    "initiative_id": "string",
+    "metadata": "object",
+    "name": "string",
+    "parent_task_id": "string",
+    "priority": "integer",
+    "project": "string",
+    "prompt": "string",
+    "status": "string",
+    "task_id": "string"
+   },
+   "required": [
+    "task_id"
+   ]
+  },
+  "wait_for_any_session_idle": {
+   "params": {
+    "pending_idle_grace_s": "number",
+    "poll_interval_s": "number",
+    "return_last_message": "boolean",
+    "session_uids": "array",
+    "timeout_s": "number"
+   },
+   "required": [
+    "session_uids"
+   ]
+  },
+  "wait_for_session_idle": {
+   "params": {
+    "pending_idle_grace_s": "number",
+    "poll_interval_s": "number",
+    "session_uid": "string",
+    "timeout_s": "number"
+   },
+   "required": [
+    "session_uid"
+   ]
+  },
+  "wait_for_workflow_done": {
+   "params": {
+    "poll_interval_s": "number",
+    "run_id": "string",
+    "timeout_s": "number"
+   },
+   "required": [
+    "run_id"
+   ]
+  },
+  "wait_for_workflow_stop": {
+   "params": {
+    "poll_interval_s": "number",
+    "run_id": "string",
+    "stuck_after_s": "number",
+    "timeout_s": "number"
+   },
+   "required": [
+    "run_id"
+   ]
+  },
+  "workflow_done": {
+   "params": {
+    "reason": "string"
+   },
+   "required": [
+    "reason"
+   ]
+  },
+  "workflow_reject_finding": {
+   "params": {
+    "text": "string"
+   },
+   "required": [
+    "text"
+   ]
+  },
+  "workflow_transition": {
+   "params": {
+    "prompt": "string",
+    "to": "string"
+   },
+   "required": [
+    "prompt",
+    "to"
+   ]
+  }
+ }
+}

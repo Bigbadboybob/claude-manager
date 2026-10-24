@@ -70,7 +70,7 @@ from mcp_server.monitor import (
     SEMANTIC_IDLE_GRACE_S,
     transcript_turn_complete,
 )
-from mcp_server import async_monitor
+from mcp_server import activation, async_monitor
 
 # Supplied in the MCP initialization response, independent of the agent's
 # project. Keep the short introduction with the deployed MCP server.
@@ -80,6 +80,7 @@ AGENT_GUIDE = Path(__file__).with_name("AGENT_GUIDE.md").read_text(encoding="utf
 async def _lifespan(_server):
     if os.environ.get("CM_TUI_SESSION_ID"):
         async_monitor._persist_best_effort()
+        activation.write_status()
     bridge = None
     if (os.environ.get("CM_TUI_SESSION_ID")
             and (_server.channel or os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"))
@@ -1710,7 +1711,11 @@ def ping() -> dict:
          global_perms: bool,        # ← do you have global permissions?
          task_id: str | null,       # ← the task you're bound to (if any)
          workspace_id: str | null,  # ← the workspace you live in
-         owner_availability: {level, set, changed_at, age_s, ...}}
+         owner_availability: {level, set, changed_at, age_s, ...},
+         mcp: {version, proxy, update_pending?, note?}}
+
+    `mcp` is this session's CM MCP server code. `update_pending` names a
+    newer deploy; CM activates it on its own when you are idle.
 
     `owner_availability.level` is informational: away, around, focused,
     on-call, or null when unset. All notifications deliver at every level;
@@ -1728,7 +1733,10 @@ def ping() -> dict:
     the host at spawn time).
     """
     try:
-        return control_client.call("ping")
+        result = control_client.call("ping")
+        if isinstance(result, dict):
+            result["mcp"] = activation.brief()
+        return result
     except control_client.ControlError as e:
         return {"ok": False, "error": str(e)}
     except control_client.TransportError as e:
