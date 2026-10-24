@@ -150,6 +150,7 @@ class Item:
     touched_at: datetime | None = None
     clock_reset_at: datetime | None = None
     closed_at: datetime | None = None
+    closed_by: str | None = None                      # name (else pid) of who closed it
     archived_at: datetime | None = None
     created_by: str | None = None
     created_at: datetime | None = None
@@ -199,6 +200,7 @@ class Item:
             "touched_at": iso(self.touched_at),
             "clock_reset_at": iso(self.clock_reset_at),
             "closed_at": iso(self.closed_at),
+            "closed_by": self.closed_by,
             "archived_at": iso(self.archived_at),
             "created_by": self.created_by,
             "created_at": iso(self.created_at),
@@ -444,7 +446,8 @@ class BoardTx:
         return created
 
     def update(self, ns: list[int], fields: dict, *, add_holders=None,
-               remove_holders=None, reason: str | None = None) -> list[int]:
+               remove_holders=None, reason: str | None = None, reopen: bool = False,
+               expect_status: str | None = None) -> list[int]:
         if not ns:
             raise invalid("invalid_field", "ns must not be empty", field="ns")
         if len(ns) > MAX_ITEMS_PER_CALL:
@@ -457,15 +460,27 @@ class BoardTx:
             replace = [_holder(h) for h in (fields.pop("holders") or [])]
         adds = [_holder(h) for h in (add_holders or [])]
         removes = [h if isinstance(h, str) else _holder(h)["pid"] for h in (remove_holders or [])]
+        if expect_status is not None and expect_status not in STATUSES:
+            raise invalid("invalid_status",
+                          f"expect_status must be one of {', '.join(STATUSES)}",
+                          field="expect_status")
         out = []
         for n in dict.fromkeys(ns):
-            self.item(n)
-            self.apply(n, fields, holders=replace, add=adds, remove=removes, reason=reason)
+            it = self.item(n)
+            # Compare-and-set: checked here, under the board-row lock the
+            # write holds, so nothing can change the item in between.
+            if expect_status is not None and it.status != expect_status:
+                raise ItemsError(409, "status_changed",
+                                 f"#{n} is {it.status} now, not {expect_status}: re-read it "
+                                 f"(board(query=...)) before writing", n=n,
+                                 current_status=it.status, expected=expect_status)
+            self.apply(n, fields, holders=replace, add=adds, remove=removes, reason=reason,
+                       reopen=reopen)
             out.append(n)
         return out
 
     def apply(self, n: int, fields: dict, *, holders=None, add=(), remove=(),
-              reason=None, creating=False, answered=False):
+              reason=None, creating=False, answered=False, reopen=False):
         """Apply one item's field changes and every rule that follows from them."""
         it = self.item(n)
         unknown = set(fields) - {
@@ -596,6 +611,21 @@ class BoardTx:
         # Blocked on Owner: who may enter and leave it.
         actor_pid = self.actor["pid"]
         is_owner = actor_pid == OWNER_PID
+
+        # A done item reopens only on purpose (rule 7): a write from a stale
+        # read (sejd #1665, #1643, #1505, 2026-10-24) otherwise turns finished
+        # work back into blocked work. Owner acts deliberately, so Owner's
+        # writes (the TUI, Alt+B) reopen without the flag.
+        reopened = prev_status == "done" and status != "done"
+        if reopened and not (reopen or is_owner):
+            who = it.closed_by or "unknown"
+            when = iso(it.closed_at) or "an unknown time"
+            raise ItemsError(409, "reopen_required",
+                             f"#{n} is done (closed by {who} at {when}); this write would make "
+                             f"it {status}. If that is a stale read, re-read the board. To "
+                             f"reopen it on purpose: item_set({n}, \"{status}\", ..., reopen=True)",
+                             n=n, current_status="done", closed_by=it.closed_by,
+                             closed_at=iso(it.closed_at), would_be=status)
         if status == OWNER_BLOCKED and prev_status != OWNER_BLOCKED:
             if not is_owner:
                 if actor_pid not in prev_pids and actor_pid not in [h["pid"] for h in it.holders]:
@@ -694,6 +724,7 @@ class BoardTx:
         was_closed = prev_status in CLOSED
         if status in CLOSED and not was_closed:
             it.closed_at = self.now
+            it.closed_by = self.actor.get("name") or self.actor["pid"]
             for kind in sorted(it.open_flags):
                 self.resolve_flag(it, kind, "closed")
         elif status not in CLOSED and was_closed:
@@ -725,8 +756,12 @@ class BoardTx:
         else:
             changed = [k for k in new if new[k] != prev[k]]
             if changed:
+                after = {k: new[k] for k in changed}
+                if reopened:
+                    # Recorded: which writes reopened finished work, and how.
+                    after["reopened"] = "owner" if is_owner and not reopen else "reopen=true"
                 self._event(it, "updated", prev={k: prev[k] for k in changed},
-                            new={k: new[k] for k in changed}, reason=reason)
+                            new=after, reason=reason)
             else:
                 self._event(it, "touched", new={"via": "item_set"}, reason=reason)
 

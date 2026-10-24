@@ -138,6 +138,9 @@ const CAPACITY_HOLD_RELEASE_MAX_SECS: u64 = 4 * 3600;
 /// How often (seconds) a held task's release eligibility is re-checked (the
 /// check reads the probe files; the held branch otherwise runs every tick).
 const HOLD_RELEASE_CHECK_INTERVAL_SECS: u64 = 60;
+/// How a held orchestrator learns it may clear its own hold
+/// (`continuous.self_clear_hold`, migration.rs).
+pub const SELF_CLEAR_HINT: &str = "Orchestrator: if every worker of this run has exited or reported done, the run staged no batch items, no monitor delivery or notification is pending and no background job is running, call clear_continuous_hold(reason=...) yourself (dry_run=true lists any blockers). Otherwise the operator reconciles: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`.";
 /// A recovery hold older than this pages the operator (`notify_command`),
 /// then re-pages every [`STALE_HOLD_REALERT_SECS`] while it persists. The
 /// raise-time alert is a single push that is easy to miss; nothing else
@@ -1121,8 +1124,9 @@ impl ContinuousScheduler {
             )
         } else {
             format!(
-                "Run seq {seq} of {} is HELD for recovery: {detail} The scheduler will not refire it. Operator: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`; recovery then replaces the thread automatically once the pool probe is healthy.",
-                tk.task_id
+                "Run seq {seq} of {} is HELD for recovery: {detail} The scheduler will not refire it. {} Recovery then replaces the thread automatically once the pool probe is healthy.",
+                tk.task_id,
+                SELF_CLEAR_HINT
             )
         };
         if let Err(e) = crate::messaging::tasks::notify_task_channel(
@@ -1307,7 +1311,7 @@ impl ContinuousScheduler {
         let next = if hold.auto_releasable() {
             "Capacity hold: the scheduler resumes it once a post-hold Codex pool probe is OK and its session is live; check the probe cron and the session."
         } else {
-            "Operator: continuous.migration_preview -> HANDOVER_CODEX.md -> continuous.reconcile."
+            "Operator: continuous.migration_preview -> HANDOVER_CODEX.md -> continuous.reconcile, unless the orchestrator self-clears it (clear_continuous_hold) once nothing is in flight."
         };
         crate::notify::notify_operator(
             notify_cmd,

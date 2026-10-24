@@ -109,7 +109,7 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
 
     async def patch(self, ns, actor=ORCH, ok=True, **kw):
         body = {"actor": actor, "ns": ns if isinstance(ns, list) else [ns]}
-        for key in ("add_holders", "remove_holders", "reason"):
+        for key in ("add_holders", "remove_holders", "reason", "reopen", "expect_status"):
             if key in kw:
                 body[key] = kw.pop(key)
         body["set"] = kw
@@ -126,6 +126,56 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
     async def fetch(self, sql, *args):
         async with self.pool.acquire() as conn:
             return await conn.fetch(sql, *args)
+
+    # ---- reopen guard (2026-10-24, sejd #1665 / #1643 / #1505) ----------
+    async def test_a_done_item_reopens_only_on_purpose_on_every_write_route(self):
+        await self.create({"title": "gate", "holders": [LANE]}, {"title": "other", "holders": [LANE]})
+        await self.patch(1, actor=LANE, status="done")
+        # The incident write: done -> blocked from a stale read.
+        r = await self.patch(1, ok=False, status="blocked", blocked_on="renewal", check_back="2h",
+                             reason="post-outage renewal; trigger met")
+        self.assertEqual(r.status_code, 409, r.text)
+        detail = r.json()["detail"]
+        self.assertEqual((detail["code"], detail["closed_by"], detail["current_status"]),
+                         ("reopen_required", "lane", "done"))
+        # Bulk, all-or-nothing (the default): one done item refuses the whole
+        # write, so #2 is unchanged.
+        r = await self.patch([2, 1], ok=False, note="bulk note", status="active")
+        self.assertEqual(r.status_code, 409)
+        items = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertNotEqual(items[2]["note"], "bulk note")
+        # Bulk with each=True: per-item results, #2 applied, #1 refused.
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": ORCH, "ns": [2, 1], "each": True, "set": {"note": "each note", "status": "active"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        results = {x["n"]: x for x in r.json()["results"]}
+        self.assertTrue(results[2]["ok"])
+        self.assertEqual(results[1]["error"]["code"], "reopen_required")
+        # expect_status: a compare-and-set against the status read.
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": ORCH, "ns": [2], "expect_status": "blocked", "set": {"note": "x"}})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (409, "status_changed"))
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": ORCH, "ns": [2], "expect_status": "active", "set": {"note": "cas ok"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        # reopen=true reopens and is recorded.
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": ORCH, "ns": [1], "reopen": True,
+            "set": {"status": "blocked", "blocked_on": "regression", "check_back": "1h"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        ev = await self.fetch("SELECT new FROM item_events WHERE item_number = 1 AND type = 'updated' "
+                              "ORDER BY id DESC LIMIT 1")
+        self.assertEqual(ev[0]["new"]["reopened"], "reopen=true")
+        # Owner's route (the TUI acts as owner) reopens without the flag.
+        await self.patch(1, actor=LANE, status="done")
+        await self.patch(1, actor={"pid": "owner", "name": "Owner"}, status="active")
+        self.assertEqual({i["n"]: i for i in (await self.read())["items"]}[1]["status"], "active")
+        # A closer recorded before sql/025 is read from the item's history.
+        await self.patch(1, actor=LANE, status="done")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET closed_by = NULL WHERE number = 1")
+        r = await self.patch(1, ok=False, status="active")
+        self.assertIn("closed by lane at", r.json()["detail"]["message"])
 
     # ---- boards ---------------------------------------------------------
     async def test_task_board_is_shared_by_the_subtree(self):
@@ -283,7 +333,7 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         holders = await self.fetch("SELECT pid FROM item_holders")
         self.assertEqual([h["pid"] for h in holders], [LANE["pid"]])
         await self.patch(1, status="done")
-        await self.patch(1, status="active")
+        await self.patch(1, status="active", reopen=True)
         row = (await self.fetch("SELECT closed_at, status FROM items"))[0]
         self.assertIsNone(row["closed_at"])
         self.assertEqual(row["status"], "active")

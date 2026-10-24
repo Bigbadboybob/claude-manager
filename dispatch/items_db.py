@@ -164,6 +164,7 @@ def _item_from_row(row) -> Item:
         waiting_set_at=row["waiting_set_at"], links=list(row["links"] or []),
         touched_at=row["touched_at"], clock_reset_at=row["clock_reset_at"],
         closed_at=row["closed_at"], archived_at=row["archived_at"],
+        closed_by=row.get("closed_by"),
         created_by=row["created_by"], created_at=row["created_at"],
         stale_nudged_at=row["stale_nudged_at"],
         job=row.get("job"), actionable_at=row.get("actionable_at"),
@@ -206,6 +207,18 @@ async def _load_items(conn, board_id: str, extra_ns=(), *, archived: bool = Fals
         blocker = by_id.get(d["blocker_id"])
         if blocker is not None:
             by_id[d["item_id"]].blocked_by.add(blocker.n)
+    # Items closed before sql/025 recorded closed_by: their closer is the
+    # actor of the latest event that closed them.
+    legacy = [it.id for it in items.values() if it.closed_at is not None and not it.closed_by]
+    if legacy:
+        for r in await conn.fetch(
+            """SELECT DISTINCT ON (item_id) item_id, COALESCE(actor_name, actor_pid) AS who
+                 FROM item_events
+                WHERE item_id = ANY($1::bigint[]) AND new->>'status' IN ('done', 'dropped')
+                ORDER BY item_id, id DESC""",
+            legacy,
+        ):
+            by_id[r["item_id"]].closed_by = r["who"]
     for f in await conn.fetch(
         """SELECT item_id, kind, detail, raised_at FROM item_flags
             WHERE item_id = ANY($1::bigint[]) AND resolved_at IS NULL""",
@@ -241,12 +254,13 @@ async def _apply(conn, tx: BoardTx) -> None:
                       waiting_set_at = $9, links = $10, touched_at = $11,
                       clock_reset_at = $12, closed_at = $13, archived_at = $14,
                       updated_at = $15, stale_nudged_at = $16, flag_pushed = flag_pushed || $17::jsonb,
-                      job = $18, actionable_at = $19, launched_at = $20
+                      job = $18, actionable_at = $19, launched_at = $20, closed_by = $21
                 WHERE id = $1""",
             it.id, it.title, it.status, it.note, it.group, it.blocked_on,
             it.check_back_at, it.eta_at, it.waiting_set_at, list(it.links),
             it.touched_at, it.clock_reset_at, it.closed_at, it.archived_at, now,
             it.stale_nudged_at, dict(it.flag_pushed), it.job, it.actionable_at, it.launched_at,
+            it.closed_by,
         )
     for n in sorted(tx.holders_changed):
         it = tx.items[n]
@@ -413,19 +427,21 @@ async def create_items(pool, ref: str, actor: dict, specs: list[dict], *,
 
 
 async def update_items(pool, ref: str, actor: dict, ns: list[int], fields: dict, *,
-                       add_holders=None, remove_holders=None, reason=None) -> dict:
+                       add_holders=None, remove_holders=None, reason=None,
+                       reopen: bool = False, expect_status: str | None = None) -> dict:
     from dispatch import gate_db  # gate bindings (doc/gate-receipts.md §8)
 
     fields, gate = gate_db.split_binding(dict(fields))
     only_gate = gate and not fields and not add_holders and not remove_holders
 
     def run(tx):
-        if only_gate:
+        if only_gate and expect_status is None:
             for n in ns:
                 tx.item(n)
             return list(ns)
         return tx.update(ns, fields, add_holders=add_holders,
-                         remove_holders=remove_holders, reason=reason)
+                         remove_holders=remove_holders, reason=reason, reopen=reopen,
+                         expect_status=expect_status)
 
     async def after(conn, tx):
         if gate:
@@ -441,7 +457,8 @@ DB_LOST = (asyncpg.exceptions.ConnectionDoesNotExistError, asyncpg.exceptions.In
 
 
 async def update_items_each(pool, ref: str, actor: dict, ns: list[int], fields: dict, *,
-                            add_holders=None, remove_holders=None, reason=None) -> dict:
+                            add_holders=None, remove_holders=None, reason=None,
+                            reopen: bool = False, expect_status: str | None = None) -> dict:
     """Bulk edit with per-item results (Board-Steward's ask): each item is
     its own write, so one refused item never blocks the rest. Any failure is
     that item's result; if the database goes away mid-way, the items already
@@ -454,7 +471,7 @@ async def update_items_each(pool, ref: str, actor: dict, ns: list[int], fields: 
         try:
             reply = await update_items(pool, ref, actor, [n], dict(fields),
                                        add_holders=add_holders, remove_holders=remove_holders,
-                                       reason=reason)
+                                       reason=reason, reopen=reopen, expect_status=expect_status)
         except ItemsError as exc:
             results.append({"n": n, "ok": False, "error": exc.detail()})
             continue

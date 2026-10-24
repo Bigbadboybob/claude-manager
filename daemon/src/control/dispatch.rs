@@ -967,6 +967,7 @@ pub fn dispatch_request(
         "continuous.context" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
         "continuous.ack_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
         "continuous.checkpoint_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
+        "continuous.self_clear_hold" => DispatchOutcome::Done(dispatch_continuous_self_clear(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
         "continuous.ensure_channel" => {
@@ -1494,6 +1495,23 @@ fn dispatch_continuous_pause(state: &Arc<Mutex<DaemonState>>, req: &Request) -> 
 
 fn dispatch_continuous_receipt(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     match super::continuous_drain::handle(state, &req.caller, &req.method, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.self_clear_hold` — Session-callable only: the task's current
+/// orchestrator clears its own recovery hold when nothing from the held run is
+/// in flight. Operators reconcile with `continuous.reconcile` instead.
+fn dispatch_continuous_self_clear(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let Caller::Session(session) = &req.caller else {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            "continuous.self_clear_hold is the orchestrator's own call; operators use continuous.reconcile",
+        );
+    };
+    match crate::continuous::migration::self_clear_hold(state, &session.session_uid, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

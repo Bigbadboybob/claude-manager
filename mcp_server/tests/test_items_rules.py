@@ -48,8 +48,11 @@ class Board:
         add = fields.pop("add_holders", None)
         remove = fields.pop("remove_holders", None)
         reason = fields.pop("reason", None)
+        reopen = fields.pop("reopen", False)
+        expect = fields.pop("expect_status", None)
         tx.update(ns if isinstance(ns, list) else [ns], fields,
-                  add_holders=add, remove_holders=remove, reason=reason)
+                  add_holders=add, remove_holders=remove, reason=reason, reopen=reopen,
+                  expect_status=expect)
         return tx
 
     def __getitem__(self, n) -> Item:
@@ -289,9 +292,88 @@ class DoneAndDropped(unittest.TestCase):
     def test_reopen_clears_closed_and_archived(self):
         self.b.set(1, status="done")
         self.b[1].archived_at = NOW
-        self.b.set(1, status="active")
+        self.b.set(1, status="active", reopen=True)
         self.assertIsNone(self.b[1].closed_at)
         self.assertIsNone(self.b[1].archived_at)
+
+
+class ReopenGuard(unittest.TestCase):
+    """A done item reopens only on purpose (sejd 2026-10-24: #1665, #1643 and
+    #1505 were each a done → blocked write from a stale read or none)."""
+
+    def setUp(self):
+        self.b = Board()
+        self.b.create({"title": "gate", "holders": [LANE]}, {"title": "dep", "holders": [LANE]})
+        self.closed_at = NOW + timedelta(minutes=1)
+        self.b.set(1, actor=LANE, now=self.closed_at, status="done")
+        self.later = NOW + timedelta(minutes=6)
+
+    def refused(self, **fields):
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, actor=OTHER, now=self.later, **fields)
+        self.assertEqual(cm.exception.code, "reopen_required")
+        self.assertEqual(self.b[1].status, "done")
+        return cm.exception.detail()
+
+    def test_the_three_incident_shapes_are_refused_naming_closer_and_time(self):
+        # #1665: a ~5 min old read, blocked with a check-back renewal.
+        detail = self.refused(status="blocked", blocked_on="post-outage renewal",
+                              check_back="2h", reason="post-outage renewal; trigger met")
+        self.assertIn(f"closed by lane at {self.closed_at.isoformat()}", detail["message"])
+        self.assertIn('item_set(1, "blocked", ..., reopen=True)', detail["message"])
+        self.assertEqual((detail["closed_by"], detail["would_be"]), ("lane", "blocked"))
+        # #1643: no read at all, written from someone's chat post.
+        self.refused(status="blocked", blocked_by=[2])
+        # #1505: 5 s after the close.
+        with self.assertRaises(ItemsError):
+            self.b.set(1, actor=ORCH, now=self.closed_at + timedelta(seconds=5),
+                       status="blocked", blocked_on="EP GO", check_back="1h")
+        # Any non-done status counts, dropped included (also via item_resolve).
+        self.refused(status="active")
+        self.refused(status="dropped")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.tx(OTHER, self.later).resolve(1, "drop", reason="stale")
+        self.assertEqual(cm.exception.code, "reopen_required")
+
+    def test_writes_that_keep_it_done_still_work(self):
+        self.b.set(1, actor=OTHER, now=self.later, note="SHA abc123")
+        self.b.set(1, actor=OTHER, now=self.later, status="done", note="re-confirmed")
+        self.assertEqual((self.b[1].status, self.b[1].note), ("done", "re-confirmed"))
+
+    def test_reopen_true_reopens_and_is_recorded(self):
+        tx = self.b.set(1, actor=OTHER, now=self.later, status="blocked", blocked_on="regression",
+                        check_back="1h", reopen=True)
+        self.assertEqual((self.b[1].status, self.b[1].closed_at), ("blocked", None))
+        (ev,) = [e for e in tx.events if e["type"] == "updated"]
+        self.assertEqual(ev["new"]["reopened"], "reopen=true")
+        self.assertEqual(ev["prev"]["status"], "done")
+
+    def test_owner_reopens_without_the_flag(self):
+        tx = self.b.set(1, actor=OWNER, now=self.later, status="active")
+        self.assertEqual(self.b[1].status, "active")
+        (ev,) = [e for e in tx.events if e["type"] == "updated"]
+        self.assertEqual(ev["new"]["reopened"], "owner")
+
+    def test_expect_status_is_a_compare_and_set(self):
+        # Mismatch: read blocked, the item is done now.
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, actor=OTHER, now=self.later, status="blocked", blocked_by=[2],
+                       expect_status="blocked", reopen=True)
+        self.assertEqual((cm.exception.code, cm.exception.detail()["current_status"]),
+                         ("status_changed", "done"))
+        # Match.
+        self.b.set(2, actor=LANE, now=self.later, note="still on it", expect_status="active")
+        self.assertEqual(self.b[2].note, "still on it")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(2, actor=LANE, expect_status="later")
+        self.assertEqual(cm.exception.code, "invalid_status")
+
+    def test_a_list_write_is_refused_whole(self):
+        # The database rolls back the whole refused transaction (#2's change
+        # too); test_items_api covers that and the per-item each=True mode.
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set([2, 1], actor=OTHER, now=self.later, status="active", note="bulk")
+        self.assertEqual(cm.exception.code, "reopen_required")
 
 
 class Waiting(unittest.TestCase):
