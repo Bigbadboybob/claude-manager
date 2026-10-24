@@ -4467,6 +4467,8 @@ def get_continuous_context() -> dict:
 
     A stop request asks you to finish the current period/claimed batch and its
     workers. New periods are gated by the daemon. Receipt is not completion.
+    `recovery_hold` is set while your task is held for recovery; when
+    `self_clear` is present you may clear it with clear_continuous_hold.
     """
     return control_client.call("continuous.context", {})
 
@@ -4501,6 +4503,29 @@ def checkpoint_continuous_drain(request_id: str, notes: str,
         "background_work_complete": background_work_complete,
         "work_reconciled": work_reconciled,
     })
+
+
+@mcp.tool()
+def clear_continuous_hold(reason: str, dry_run: bool = False) -> dict:
+    """Clear your continuous task's recovery hold when nothing is in flight.
+
+    Only the task's current orchestrator can call this, for a recovery hold
+    whose run staged no batch items. The daemon allows it only if every
+    session of the held run has exited or reported done with its final turn
+    ended, no monitor delivery is undelivered or uncertain, no notification
+    to a live session is unconfirmed, and no background job is running.
+    `reason` (1–2048 bytes) says why the held run is settled; it is recorded
+    in the task state and the run's evidence. `dry_run=True` returns
+    {eligible, blockers} without recording anything.
+
+    A refusal names each blocker. Those cases, staged batch items, and
+    capacity holds (the scheduler resumes those itself) stay with the
+    operator's continuous.reconcile. After success, finish your reply and end
+    the turn: recovery retires this thread and fires a fresh one.
+    """
+    async_monitor.persist_state()
+    return control_client.call("continuous.self_clear_hold",
+                               {"reason": reason, "dry_run": dry_run})
 
 
 @mcp.tool()

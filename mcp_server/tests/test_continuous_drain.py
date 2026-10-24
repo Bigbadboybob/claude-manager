@@ -27,6 +27,21 @@ class ContinuousDrainToolsTests(unittest.TestCase):
                 server.checkpoint_continuous_drain("request-a", "checkpoint", True, True)
             call.assert_not_called()
 
+    def test_clear_hold_publishes_monitors_first_and_routes_to_the_daemon(self):
+        self.assertIn("continuous.self_clear_hold", control_client.DAEMON_METHODS)
+        events = []
+        with mock.patch.object(server.async_monitor, "persist_state", side_effect=lambda: events.append("persist")), mock.patch.object(control_client, "call", side_effect=lambda method, params: events.append((method, params))):
+            server.clear_continuous_hold("workers reported", dry_run=True)
+            server.clear_continuous_hold("settled")
+        self.assertEqual(events, [
+            "persist", ("continuous.self_clear_hold", {"reason": "workers reported", "dry_run": True}),
+            "persist", ("continuous.self_clear_hold", {"reason": "settled", "dry_run": False}),
+        ])
+        with mock.patch.object(server.async_monitor, "persist_state", side_effect=OSError("disk full")), mock.patch.object(control_client, "call") as call:
+            with self.assertRaises(OSError):
+                server.clear_continuous_hold("settled")
+            call.assert_not_called()
+
     def test_stop_hook_reports_continuation_when_it_resumes_agent_with_inbox(self):
         for messages in [[], ["monitor final report"]]:
             with self.subTest(messages=messages), mock.patch.dict(os.environ, {"CM_TUI_SESSION_ID": "ts-root"}), mock.patch.object(cm_stop_hook, "_drain_inbox", return_value=messages), mock.patch.object(control_client, "call", return_value={}) as call, mock.patch("sys.stdin", io.StringIO("{}")), mock.patch("sys.stdout", new_callable=io.StringIO) as output:

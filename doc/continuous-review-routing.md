@@ -66,6 +66,24 @@ If cleanup reports `live_process_reference`, identify the specific process and i
 
 **Check host routing before declaring a worker missing.** Chat spans paired hosts, but an agent's session-control MCP calls query only its local daemon. A cm-sessions reviewer cannot address a cm-manager worker by passing its UID to local `send_input`; post in the task channel instead. Use the existing `scripts/cm-op --ssh cm-manager ...` route only for Owner-authorized remote inspection or control that chat cannot do (kill, force_done, transcript reads). A local `not_found` does not justify replacement or reimplementation. See [cross-host session control](AGENT_QUICKSTART.md#controlling-a-session-on-another-host).
 
+## Recovery holds: self-clear
+
+When a Codex run fails or ends without `report_done`, the scheduler holds the task: it posts a `HELD for recovery` notice in the task channel, and `get_continuous_context()` returns `recovery_hold` with a `self_clear` hint. Capacity holds (`server_overloaded`) are released by the scheduler itself and need nothing from you.
+
+If the held run is actually settled, the task's **current** orchestrator can clear the hold itself with `clear_continuous_hold(reason=...)` (daemon `continuous.self_clear_hold`). Call it with `dry_run=true` first to see any blockers. The daemon allows it only when it can verify all of these:
+
+- every session from the run (workers, their children, the hold's session) has exited, or has reported done with its final turn ended, and none is unknown;
+- no monitor delivery is undelivered, interrupted or uncertain, no monitor is still watching, and no native notification to a live session is pending, submitted or uncertain;
+- no background job is running in any of those sessions, and the orchestrator's monitor journal exists (the tool publishes it before the call);
+- the task is not paused or draining, and has no recovery, retirement or operator reconciliation already in progress;
+- the held run staged no batch items, and the hold is not a capacity hold.
+
+Per-item outcomes for a staged Consumer batch are an operator attestation, so a run with staged items is refused with the item count. The reason (1–2048 bytes) is stored on the task's reconciliation and in a daemon-written evidence file under `~/.cm/migrations/<task>/`, and is logged as a `hold_self_cleared` run-log event and in the recovery receipt.
+
+The call records the same reconciliation an operator's `continuous.reconcile` would, with hashes the daemon computes itself. The existing recovery then retires the thread and fires a fresh one after your turn ends, once a Codex pool probe newer than the hold is healthy. Finish your reply and end the turn; start no new work. A worker, another session, or a replaced orchestrator instance is refused. Every other case is refused with its specific blocker and stays with the operator path: `continuous.migration_preview` → handover → `continuous.reconcile`. The operator path is unchanged: it never applies the self-clear's strict checks, and an operator reconcile replaces a recorded self-clear.
+
+**Limits:** the liveness check walks this host's session registry, and its retained exit records keep only the last 256 exits. Workers on another host, or long-exited descendants, are not seen. The self-clear is for local, recently finished runs. Recovery binds every other session's evidence exactly. If a settled worker is given new input after the self-clear, recovery stays held until the orchestrator self-clears again or the operator reconciles.
+
 ## Visible stages
 
 The continuous column colors each subtask's label by its lifecycle stage, leaving the full available width for the task name. Focused labels use the normal white/bold selection highlight, overriding their stage color; moving focus away restores the stage color. Idle age does not replace stage color. The spinner remains agent activity; idle is never an approval signal. A fixed legend below the list explains the colors and the distinction between the review queue and active review. Missing or unrecognized metadata uses the **Unstaged** color. Terminal planning status overrides stale stage metadata; legacy `metadata.stage` and operator-blocked rows remain readable.
