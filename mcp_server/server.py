@@ -87,6 +87,10 @@ async def _lifespan(_server):
             and os.environ.get("CM_AGENT_ENGINE") != "codex"):
         from mcp_server.native_claude import run
         bridge = asyncio.create_task(run(_server.channel), name="cm-native-notifications")
+    adoption = None
+    if os.environ.get("CM_TUI_SESSION_ID") and os.environ.get("CM_MCP_PREDECESSOR_PID"):
+        adoption = asyncio.create_task(async_monitor.adopt_predecessor(),
+                                       name="cm-monitor-adoption")
     policy = None
     if os.environ.get("CM_TUI_SESSION_ID") and activation.proxy():
         from mcp_server.notifications import Queue
@@ -99,6 +103,8 @@ async def _lifespan(_server):
     finally:
         if policy:
             policy.cancel()
+        if adoption:
+            adoption.cancel()
         # Shutdown retains unfinished watch obligations for continuous drain.
         for record in async_monitor._MONITORS.values():
             if record["state"] in ("watching", "fired"):

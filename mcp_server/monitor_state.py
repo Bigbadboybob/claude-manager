@@ -23,7 +23,13 @@ FIELDS = frozenset({
     "monitor_id", "watching", "mode", "until", "note", "source", "state",
     "created_at", "result", "delivered", "delivery_uncertain",
     "notification_id", "delivery_status", "cancellation_retracted",
+    # Enough to resume the watch in a successor after an MCP activation
+    # (doc/mcp-managed-activation.md §5): the ORIGINAL edge, not a new one.
+    "caller", "baselines", "report_anchors", "deadline_at", "interim_turn_ends",
+    "launch_receipt", "launch_socket_path", "adopted_from", "adopted_by",
 })
+# Unfinished states a successor producer takes over.
+ADOPTABLE = frozenset({"watching", "fired", "interrupted"})
 
 
 def _refresh_native_receipts(uid: str, records: dict[str, dict]) -> bool:
@@ -114,26 +120,68 @@ def publish(records: dict[str, dict]) -> None:
         journal["producers"][PRODUCER_ID] = {
             "started_at": old.get("started_at", time.time()),
             "updated_at": time.time(),
+            "pid": os.getpid(),
             "records": retained,
         }
-        data = json.dumps(journal, sort_keys=True, allow_nan=False).encode()
-        if len(data) > MAX_BYTES:
-            raise ValueError("monitor journal exceeds size limit; inspect retained obligations")
-        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        _write(path, journal)
+
+
+def adopt(predecessor_pid: int) -> dict[str, dict]:
+    """Take over a dead predecessor producer's unfinished watches.
+
+    One atomic journal write moves each record: the predecessor's copy
+    becomes `replaced` (settled, never resumed again) and this producer's
+    copy is `watching`. There is no moment where both own it or neither
+    does. Records written before baselines were persisted are left alone:
+    resuming them without their original edge could fire on old news.
+    The caller must have seen the predecessor exit."""
+    path = _path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(lock_fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        journal = _load(path)
+        taken: dict[str, dict] = {}
+        for producer_id, producer in journal["producers"].items():
+            if producer_id == PRODUCER_ID or producer.get("pid") != predecessor_pid:
+                continue
+            for mid, record in producer["records"].items():
+                if record.get("state") not in ADOPTABLE or "baselines" not in record:
+                    continue
+                taken[mid] = {**record, "state": "watching", "adopted_from": producer_id}
+                record["state"] = "replaced"
+                record["adopted_by"] = PRODUCER_ID
+        if not taken:
+            return {}
+        mine = journal["producers"].setdefault(
+            PRODUCER_ID, {"started_at": time.time(), "records": {}})
+        mine["records"].update(taken)
+        mine["updated_at"] = time.time()
+        mine["pid"] = os.getpid()
+        journal["revision"] += 1
+        _write(path, journal)
+        return taken
+
+
+def _write(path: Path, journal: dict) -> None:
+    data = json.dumps(journal, sort_keys=True, allow_nan=False).encode()
+    if len(data) > MAX_BYTES:
+        raise ValueError("monitor journal exceeds size limit; inspect retained obligations")
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            with os.fdopen(fd, "wb") as output:
-                output.write(data)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(directory_fd)
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def read() -> dict:

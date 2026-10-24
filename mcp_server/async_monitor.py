@@ -35,6 +35,7 @@ import os
 import secrets
 import sys
 import time
+from pathlib import Path
 
 from mcp_server import control_client, monitor_state
 from mcp_server.launch_confirmation import await_launch_confirmation
@@ -302,6 +303,8 @@ def register_monitor(
         "caller": caller,
         "state": "watching",
         "created_at": time.time(),
+        # Absolute, so a successor resuming the watch keeps the same budget.
+        "deadline_at": time.time() + max(1.0, min(timeout_s, 86400.0)),
         "result": None,
         "delivered": None,
         "baselines": baselines,
@@ -385,7 +388,9 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
     baselines = record.get("baselines")
     if not baselines and until != "final":
         baselines = None
-    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    # A negative budget is an adopted watch whose deadline already passed.
+    budget = 0.0 if timeout_s < 0 else max(1.0, min(timeout_s, 86400.0))
+    deadline = time.monotonic() + budget
     try:
         result = None
         launch = record.get("launch_receipt")
@@ -684,8 +689,15 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
     # shutdown or cancellation racing the native consumer's claim.
     record["delivery_uncertain"] = True
     persist_state()
-    queue.publish(event_id, "session_monitor", message,
-                  f"[cm-monitor {record['monitor_id']}")
+    try:
+        queue.publish(event_id, "session_monitor", message,
+                      f"[cm-monitor {record['monitor_id']}")
+    except ValueError:
+        # The ID is already taken: a predecessor MCP process published this
+        # monitor's notice before handing the watch over. One monitor is one
+        # wake, so verify that notice instead of sending a second one.
+        if queue.get(event_id) is None:
+            raise
     deadline = time.monotonic() + VERIFY_WINDOW_S
     while time.monotonic() < deadline:
         event = queue.get(event_id)
@@ -804,3 +816,83 @@ def list_monitors() -> dict:
     except (OSError, ValueError):
         durable = {"available": False, "error": "Durable monitor journal is unreadable."}
     return {"monitors": out, "durable": durable}
+
+
+# ── Adoption across an MCP activation (doc/mcp-managed-activation.md §5) ──
+
+PREDECESSOR_EXIT_WAIT_S = 120.0
+ADOPT_ATTEMPTS = 5
+ADOPT_RETRY_S = 2.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:  # a zombie has exited; it only awaits its parent's reap
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1][0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+async def adopt_predecessor(pid: int | None = None) -> list[str]:
+    """Resume the watches of the MCP process this one replaced.
+
+    Waits for the predecessor to exit first (its shutdown writes its last
+    journal state), then moves its unfinished records here in one atomic
+    journal write and restarts each watch from its ORIGINAL baseline and
+    deadline. A turn that ended during the swap is still a new edge
+    against that baseline, so it fires exactly once: the notice ID is the
+    monitor ID, and a predecessor's already-published notice is verified,
+    never duplicated (_deliver_to_caller)."""
+    if pid is None:
+        try:
+            pid = int(os.environ.get("CM_MCP_PREDECESSOR_PID") or 0)
+        except ValueError:
+            return []
+    if not pid or pid == os.getpid():
+        return []
+    deadline = time.monotonic() + PREDECESSOR_EXIT_WAIT_S
+    while _pid_alive(pid):
+        if time.monotonic() > deadline:
+            _log(f"predecessor {pid} still alive; not adopting its monitors")
+            return []
+        await asyncio.sleep(0.2)
+    taken = None
+    for attempt in range(ADOPT_ATTEMPTS):
+        try:
+            taken = await asyncio.to_thread(monitor_state.adopt, pid)
+            break
+        except (OSError, ValueError) as exc:
+            # A failed write changed nothing: the predecessor still owns its
+            # records, so retrying cannot duplicate them.
+            _log(f"could not adopt monitors from {pid} ({type(exc).__name__}); "
+                 f"attempt {attempt + 1}/{ADOPT_ATTEMPTS}")
+            await asyncio.sleep(ADOPT_RETRY_S)
+    if taken is None:
+        return []
+    loop = asyncio.get_running_loop()
+    for mid, saved in taken.items():
+        if mid in _MONITORS:
+            continue
+        record = {
+            "note": "", "source": "explicit", "result": None, "delivered": None,
+            "report_anchors": {}, "launch_receipt": None, "launch_socket_path": None,
+            **saved,
+            "caller": saved.get("caller") or _self_uid(),
+            "state": "watching",
+            "task": None,
+        }
+        record["baselines"] = record.get("baselines") or {}
+        remaining = float(record.get("deadline_at") or 0) - time.time()
+        _MONITORS[mid] = record
+        record["task"] = loop.create_task(
+            _run_monitor(record, timeout_s=remaining if remaining > 0 else -1.0),
+            name=f"cm-monitor-{mid}")
+    if taken:
+        _persist_best_effort()
+        _log(f"adopted {len(taken)} monitor(s) from predecessor {pid}")
+    return list(taken)
