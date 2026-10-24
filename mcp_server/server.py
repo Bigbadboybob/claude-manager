@@ -4494,31 +4494,26 @@ def checkpoint_continuous_drain(request_id: str, notes: str,
 
 
 @mcp.tool()
-def clear_continuous_hold(reason: str, items: dict | None = None,
-                          dry_run: bool = False) -> dict:
+def clear_continuous_hold(reason: str, dry_run: bool = False) -> dict:
     """Clear your continuous task's recovery hold when nothing is in flight.
 
-    Only the task's current orchestrator can call this. The daemon allows it
-    only if every worker session of the held run has exited or reported done
-    with its final turn ended, no monitor delivery is undelivered or
-    uncertain, no notification to a live session is unconfirmed, and no
-    background job is running. `reason` (1–2048 bytes) says why the held run
-    is settled; it is recorded in the task state and the run's evidence.
+    Only the task's current orchestrator can call this, for a recovery hold
+    whose run staged no batch items. The daemon allows it only if every
+    session of the held run has exited or reported done with its final turn
+    ended, no monitor delivery is undelivered or uncertain, no notification
+    to a live session is unconfirmed, and no background job is running.
+    `reason` (1–2048 bytes) says why the held run is settled; it is recorded
+    in the task state and the run's evidence. `dry_run=True` returns
+    {eligible, blockers} without recording anything.
 
-    For a Consumer task with a staged batch, `items` gives every item an
-    outcome: {"<item id>": {"status": "completed" | "unfinished",
-    "evidence": "..."}}; unfinished items are re-queued by recovery.
-    `dry_run=True` returns {eligible, blockers} without recording anything.
-
-    A refusal names each blocker; those cases stay with the operator's
-    continuous.reconcile. After success, finish your reply and end the turn:
-    recovery retires this thread and fires a fresh one.
+    A refusal names each blocker. Those cases, staged batch items, and
+    capacity holds (the scheduler resumes those itself) stay with the
+    operator's continuous.reconcile. After success, finish your reply and end
+    the turn: recovery retires this thread and fires a fresh one.
     """
     async_monitor.persist_state()
-    params: dict = {"reason": reason, "dry_run": dry_run}
-    if items:
-        params["items"] = items
-    return control_client.call("continuous.self_clear_hold", params)
+    return control_client.call("continuous.self_clear_hold",
+                               {"reason": reason, "dry_run": dry_run})
 
 
 @mcp.tool()

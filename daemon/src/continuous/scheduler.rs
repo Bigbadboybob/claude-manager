@@ -140,7 +140,7 @@ const CAPACITY_HOLD_RELEASE_MAX_SECS: u64 = 4 * 3600;
 const HOLD_RELEASE_CHECK_INTERVAL_SECS: u64 = 60;
 /// How a held orchestrator learns it may clear its own hold
 /// (`continuous.self_clear_hold`, migration.rs).
-pub const SELF_CLEAR_HINT: &str = "Orchestrator: if every worker of this run has exited or reported done, no monitor delivery or notification is pending and no background job is running, call clear_continuous_hold(reason=...) yourself (dry_run=true lists any blockers). Otherwise the operator reconciles: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`.";
+pub const SELF_CLEAR_HINT: &str = "Orchestrator: if every worker of this run has exited or reported done, the run staged no batch items, no monitor delivery or notification is pending and no background job is running, call clear_continuous_hold(reason=...) yourself (dry_run=true lists any blockers). Otherwise the operator reconciles: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`.";
 /// A recovery hold older than this pages the operator (`notify_command`),
 /// then re-pages every [`STALE_HOLD_REALERT_SECS`] while it persists. The
 /// raise-time alert is a single push that is easy to miss; nothing else

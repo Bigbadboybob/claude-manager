@@ -39707,6 +39707,63 @@ while True:
     }
 
     #[test]
+    fn continuous_self_clear_record_does_not_make_the_operator_path_strict() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear-op");
+            finish_worker(&state,&worker);
+            m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled"})).unwrap();
+            let evidence_dir=crate::path::dot_cm_dir().join("migrations/self-clear-op");
+            assert_eq!(std::fs::read_dir(&evidence_dir).unwrap().count(),1);
+            // A notice to the live orchestrator turns uncertain after the
+            // self-clear: recovery of that record is held...
+            let root=crate::path::dot_cm_dir();
+            crate::notifications::publish(&root,&orchestrator,"wake-1","session_monitor","[cm-monitor m1] done","[cm-monitor m1]").unwrap();
+            for entry in std::fs::read_dir(crate::notifications::directory(&root,&orchestrator)).unwrap() {
+                let path=entry.unwrap().path();
+                if path.extension().is_some_and(|x| x=="json") && path.file_name().is_some_and(|n| n!="transport.json") {
+                    let mut event:Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    event["status"]=json!("uncertain"); std::fs::write(&path,event.to_string()).unwrap();
+                }
+            }
+            set_completed_codex_rollout(&state,&orchestrator,home);
+            migration_probe_fixture(home,101.0);
+            assert!(!m::recover_codex(&state,"self-clear-op",111).unwrap());
+            assert!(!state.lock().unwrap().sessions[&orchestrator].last_exit.operator_kill_requested(),"strict recovery waits on the uncertain notice");
+            // ...but the operator attests deliveries as before and replaces it.
+            m::handle(&state,"continuous.reconcile",&migration_request(&state,"self-clear-op",home)).unwrap();
+            assert!(task::load_one("self-clear-op").unwrap().reconciliation.unwrap().self_clear.is_none());
+            assert!(!m::recover_codex(&state,"self-clear-op",111).unwrap(),"retires before releasing");
+            assert!(state.lock().unwrap().sessions[&orchestrator].last_exit.operator_kill_requested(),"the operator record proceeds past the notice");
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_self_clear_refuses_staged_batches_and_capacity_holds() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear-batch");
+            finish_worker(&state,&worker);
+            task::modify("self-clear-batch",|t| t.schedule=task::Schedule::Consumer{queue:"canary".into(),batch_max:2,window_secs:1,depth_threshold:0}).unwrap();
+            std::fs::create_dir_all(home.join(".queue")).unwrap();
+            std::fs::write(home.join(".queue/batch-1.json"),json!({"queue":"canary","task_id":"self-clear-batch","seq":1,"items":[
+                {"id":uuid::Uuid::new_v4().to_string(),"payload":{},"dedupe_key":"a","enqueued_at":"2026-09-06T20:00:00Z"}]}).to_string()).unwrap();
+            let refused=m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled"})).unwrap_err();
+            assert!(refused.1.contains("staged batch has 1 item(s)"),"{}",refused.1);
+            assert_eq!(m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled","items":{}})).unwrap_err().0,ErrorCode::InvalidParams,"no caller-asserted outcomes");
+            std::fs::write(home.join(".queue/batch-1.json"),json!({"queue":"canary","task_id":"self-clear-batch","seq":1,"items":[]}).to_string()).unwrap();
+            assert_eq!(m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled","dry_run":true})).unwrap()["eligible"],true,"an empty batch clears");
+            task::modify("self-clear-batch",|t| t.recovery_hold.as_mut().unwrap().capacity=true).unwrap();
+            assert!(m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled"})).unwrap_err().1.contains("capacity hold"));
+            assert!(task::load_one("self-clear-batch").unwrap().reconciliation.is_none());
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
     fn continuous_self_clear_is_only_for_the_current_orchestrator() {
         with_continuous_home(|home| {
             use crate::continuous::{task,migration as m};

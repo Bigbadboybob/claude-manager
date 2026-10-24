@@ -204,25 +204,34 @@ fn self_clear_digest(value: &Value, uid: &str) -> String {
     evidence_digest(&bound)
 }
 
+/// Operator-path evidence (preview, reconcile, retire, drain status): the
+/// operator attests deliveries and background work, so nothing strict.
 fn evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Evidence {
-    evidence_with(state, t, None)
+    evidence_with(state, t, None, false)
+}
+
+/// Recovery re-checks a self-clear record with the strict checks it was
+/// recorded under; an operator record keeps the operator's evidence.
+fn recovery_evidence(state: &Arc<Mutex<DaemonState>>, t: &task::ContinuousTask) -> Evidence {
+    let self_cleared = t
+        .reconciliation
+        .as_ref()
+        .is_some_and(|r| r.self_clear.is_some());
+    evidence_with(state, t, None, self_cleared)
 }
 
 /// `self_clearing` names the orchestrator asking to clear its own hold: its
-/// in-progress turn is not a blocker. A self-clear (being requested or
-/// already recorded) also applies the strict checks an operator otherwise
-/// attests to: undelivered, interrupted or uncertain monitor deliveries,
-/// unconfirmed native notifications to live sessions, a missing orchestrator
-/// monitor journal, and running background jobs.
+/// in-progress turn is not a blocker. `strict` applies the checks an operator
+/// otherwise attests to: undelivered, interrupted or uncertain monitor
+/// deliveries, unconfirmed native notifications to live sessions, a missing
+/// orchestrator monitor journal, and running background jobs. Only the
+/// self-clear request and recovery of a self-clear record are strict.
 fn evidence_with(
     state: &Arc<Mutex<DaemonState>>,
     t: &task::ContinuousTask,
     self_clearing: Option<&str>,
+    strict: bool,
 ) -> Evidence {
-    let strict = self_clearing.is_some()
-        || t.reconciliation
-            .as_ref()
-            .is_some_and(|r| r.self_clear.is_some());
     // Held runs need the same descendant walk even outside an operator drain.
     let mut observed = t.clone();
     if observed.drain.is_none() {
@@ -579,7 +588,16 @@ pub fn handle(
                 .ok_or_else(|| conflict("A verified handover artifact is required."))?;
             artifact_valid(&t, &handover)?;
             let notes = p.notes.filter(|s| !s.trim().is_empty() && s.len() <= 8192).ok_or_else(|| conflict("Supply 1–8192 bytes describing the inspected transcripts, legacy monitors, artifacts and background work."))?;
-            validate_items(&t, &p.items)?;
+            let expected_ids: BTreeSet<_> = batch(&t)?.into_iter().map(|i| i.id).collect();
+            if p.items.keys().cloned().collect::<BTreeSet<_>>() != expected_ids
+                || p.items.values().any(|v| {
+                    v.status == ItemStatus::Ambiguous
+                        || v.evidence.trim().is_empty()
+                        || v.evidence.len() > 8192
+                })
+            {
+                return Err(conflict("Every staged item needs a completed or unfinished outcome with evidence; missing, extra or ambiguous IDs remain held."));
+            }
             if p.dry_run {
                 return Ok(json!({"valid":true,"committed":false}));
             }
@@ -606,26 +624,10 @@ pub fn handle(
     }
 }
 
-fn validate_items(t: &task::ContinuousTask, items: &BTreeMap<String, ItemOutcome>) -> Result<()> {
-    let expected_ids: BTreeSet<_> = batch(t)?.into_iter().map(|i| i.id).collect();
-    if items.keys().cloned().collect::<BTreeSet<_>>() != expected_ids
-        || items.values().any(|v| {
-            v.status == ItemStatus::Ambiguous
-                || v.evidence.trim().is_empty()
-                || v.evidence.len() > 8192
-        })
-    {
-        return Err(conflict("Every staged item needs a completed or unfinished outcome with evidence; missing, extra or ambiguous IDs remain held."));
-    }
-    Ok(())
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SelfClearParams {
     reason: String,
-    #[serde(default)]
-    items: BTreeMap<String, ItemOutcome>,
     #[serde(default)]
     dry_run: bool,
 }
@@ -681,6 +683,9 @@ pub fn self_clear_hold(
     if t.engine != task::Engine::Codex {
         return Err(conflict("Only Codex recovery holds are released by recovery."));
     }
+    if hold.auto_releasable() {
+        return Err(conflict("This is a capacity hold: the scheduler resumes the same run on this thread once the pool probe is healthy, so there is nothing to clear."));
+    }
     if t.drain.is_some() || t.paused {
         return Err(conflict("An operator drain or pause is in progress; finish it with checkpoint_continuous_drain, or the operator reconciles."));
     }
@@ -699,15 +704,22 @@ pub fn self_clear_hold(
         .as_ref()
         .filter(|r| r.seq == hold.run_seq && r.fire_token == hold.fire_token)
         .ok_or_else(|| conflict("The held run no longer identifies the hold; the operator reconciles it."))?;
-    let e = evidence_with(state, &t, Some(caller_uid));
+    let e = evidence_with(state, &t, Some(caller_uid), true);
     let mut blockers = e.blockers.clone();
     for uid in [Some(&hold.session_uid), run.session_uid.as_ref()].into_iter().flatten() {
         if !e.sessions.iter().any(|s| &s.session_uid == uid) {
             blockers.push(format!("{uid} is unknown: no live session or retained exit record."));
         }
     }
-    if let Err(error) = validate_items(&t, &p.items) {
-        blockers.push(error.1);
+    // Per-item outcomes are an operator attestation; a self-clear only
+    // covers a run with nothing staged.
+    match batch(&t) {
+        Ok(items) if items.is_empty() => {}
+        Ok(items) => blockers.push(format!(
+            "The staged batch has {} item(s); the operator reconciles their outcomes.",
+            items.len()
+        )),
+        Err(error) => blockers.push(error.1),
     }
     blockers.dedup();
     let probe_ok = {
@@ -739,13 +751,21 @@ pub fn self_clear_hold(
     let recorded_at = task::now_unix();
     let dir = crate::path::dot_cm_dir().join("migrations").join(&t.task_id);
     std::fs::create_dir_all(&dir).map_err(internal)?;
-    let path = dir.join(format!("self-clear-{}-{recorded_at}.json", hold.run_seq));
+    let path = dir.join(format!(
+        "self-clear-{}-{recorded_at}-{}.json",
+        hold.run_seq,
+        uuid::Uuid::new_v4().simple()
+    ));
     let artifact = json!({"task_id":t.task_id,"hold":hold,"self_clear":clear,"recorded_at":recorded_at,
-        "items":p.items,"evidence":e.value});
+        "evidence":e.value});
     retirement::write_json(&path, &artifact).map_err(internal)?;
+    let discard = |error: (ErrorCode, String)| {
+        let _ = std::fs::remove_file(&path);
+        error
+    };
     let handover = Artifact {
         path: path.to_string_lossy().into_owned(),
-        sha256: file_hash(&path, 4 * 1024 * 1024)?,
+        sha256: file_hash(&path, 4 * 1024 * 1024).map_err(discard)?,
     };
     let mut record = Reconciliation {
         request_id: format!("self-clear-{}", hold.run_seq),
@@ -753,8 +773,8 @@ pub fn self_clear_hold(
         recorded_at,
         handover,
         notes: format!("Self-cleared by orchestrator {caller_uid}: {}", clear.reason),
-        items: p.items,
-        batch_hash: digest(&json!(batch(&t)?)),
+        items: BTreeMap::new(),
+        batch_hash: digest(&json!(batch(&t).map_err(discard)?)),
         self_clear: Some(clear.clone()),
     };
     record.evidence_hash = e.binding_hash(&record);
@@ -768,8 +788,9 @@ pub fn self_clear_hold(
     }) {
         task::TryModifyOutcome::Ok(_) => {}
         task::TryModifyOutcome::Aborted(()) => {
-            return Err(conflict("Task state changed during the self-clear; retry."))
+            return Err(discard(conflict("Task state changed during the self-clear; retry.")))
         }
+        // The write may have landed; keep the evidence it would point at.
         task::TryModifyOutcome::Persist(e) => return Err(internal(e)),
     }
     let audit = super::runlog::ContinuousRunLog::append(&super::runlog::RunLogLine {
@@ -1125,7 +1146,7 @@ pub fn recover_codex(state: &Arc<Mutex<DaemonState>>, task_id: &str, now: u64) -
         }
         progress.clone()
     } else {
-        let initial = evidence(state, &t);
+        let initial = recovery_evidence(state, &t);
         if !reconciled(&t, &initial) {
             return Ok(false);
         }
@@ -1144,7 +1165,7 @@ pub fn recover_codex(state: &Arc<Mutex<DaemonState>>, task_id: &str, now: u64) -
             .collect();
         let current =
             task::load_one(task_id).ok_or_else(|| conflict("Recovery task disappeared."))?;
-        if state_hash(&current) != state_hash(&t) || !reconciled(&t, &evidence(state, &t)) {
+        if state_hash(&current) != state_hash(&t) || !reconciled(&t, &recovery_evidence(state, &t)) {
             return Ok(false);
         }
         let run = t

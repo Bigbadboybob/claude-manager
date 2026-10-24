@@ -32,11 +32,10 @@ class ContinuousDrainToolsTests(unittest.TestCase):
         events = []
         with mock.patch.object(server.async_monitor, "persist_state", side_effect=lambda: events.append("persist")), mock.patch.object(control_client, "call", side_effect=lambda method, params: events.append((method, params))):
             server.clear_continuous_hold("workers reported", dry_run=True)
-            server.clear_continuous_hold("settled", items={"i1": {"status": "completed", "evidence": "artifact"}})
+            server.clear_continuous_hold("settled")
         self.assertEqual(events, [
             "persist", ("continuous.self_clear_hold", {"reason": "workers reported", "dry_run": True}),
-            "persist", ("continuous.self_clear_hold", {"reason": "settled", "dry_run": False,
-                                                      "items": {"i1": {"status": "completed", "evidence": "artifact"}}}),
+            "persist", ("continuous.self_clear_hold", {"reason": "settled", "dry_run": False}),
         ])
         with mock.patch.object(server.async_monitor, "persist_state", side_effect=OSError("disk full")), mock.patch.object(control_client, "call") as call:
             with self.assertRaises(OSError):

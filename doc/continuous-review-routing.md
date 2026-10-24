@@ -75,13 +75,14 @@ If the held run is actually settled, the task's **current** orchestrator can cle
 - every session from the run (workers, their children, the hold's session) has exited, or has reported done with its final turn ended, and none is unknown;
 - no monitor delivery is undelivered, interrupted or uncertain, no monitor is still watching, and no native notification to a live session is pending, submitted or uncertain;
 - no background job is running in any of those sessions, and the orchestrator's monitor journal exists (the tool publishes it before the call);
-- the task is not paused or draining, and has no recovery, retirement or operator reconciliation already in progress.
+- the task is not paused or draining, and has no recovery, retirement or operator reconciliation already in progress;
+- the held run staged no batch items, and the hold is not a capacity hold.
 
-For a Consumer task with a staged batch, also pass `items={"<id>": {"status": "completed" | "unfinished", "evidence": "..."}}` covering every staged item; recovery re-queues the unfinished ones. The reason (1–2048 bytes) is stored on the task's reconciliation and in a daemon-written evidence file under `~/.cm/migrations/<task>/`, and is logged as a `hold_self_cleared` run-log event and in the recovery receipt.
+Per-item outcomes for a staged Consumer batch are an operator attestation, so a run with staged items is refused with the item count. The reason (1–2048 bytes) is stored on the task's reconciliation and in a daemon-written evidence file under `~/.cm/migrations/<task>/`, and is logged as a `hold_self_cleared` run-log event and in the recovery receipt.
 
-The call records the same reconciliation an operator's `continuous.reconcile` would, with hashes the daemon computes itself. The existing recovery then retires the thread and fires a fresh one after your turn ends, once a Codex pool probe newer than the hold is healthy. Finish your reply and end the turn; start no new work. A worker, another session, or a replaced orchestrator instance is refused. Every other case is refused with its specific blocker and stays with the operator path: `continuous.migration_preview` → handover → `continuous.reconcile`.
+The call records the same reconciliation an operator's `continuous.reconcile` would, with hashes the daemon computes itself. The existing recovery then retires the thread and fires a fresh one after your turn ends, once a Codex pool probe newer than the hold is healthy. Finish your reply and end the turn; start no new work. A worker, another session, or a replaced orchestrator instance is refused. Every other case is refused with its specific blocker and stays with the operator path: `continuous.migration_preview` → handover → `continuous.reconcile`. The operator path is unchanged: it never applies the self-clear's strict checks, and an operator reconcile replaces a recorded self-clear.
 
-**Limit:** recovery binds every other session's evidence exactly. If a settled worker is given new input after the self-clear, recovery stays held until the orchestrator self-clears again or the operator reconciles.
+**Limits:** the liveness check walks this host's session registry, and its retained exit records keep only the last 256 exits. Workers on another host, or long-exited descendants, are not seen. The self-clear is for local, recently finished runs. Recovery binds every other session's evidence exactly. If a settled worker is given new input after the self-clear, recovery stays held until the orchestrator self-clears again or the operator reconciles.
 
 ## Visible stages
 
