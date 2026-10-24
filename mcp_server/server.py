@@ -24,7 +24,7 @@ except Exception:  # pragma: no cover - exercised only where the dep is absent
 # Add project root to path so cli.planning_client is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mcp_server.claude_channel import NotificationMCP
+from mcp_server.claude_channel import CmActivateNotification, CmActivateParams, NotificationMCP
 
 try:
     from cli.planning_client import PlanningClient
@@ -87,9 +87,18 @@ async def _lifespan(_server):
             and os.environ.get("CM_AGENT_ENGINE") != "codex"):
         from mcp_server.native_claude import run
         bridge = asyncio.create_task(run(_server.channel), name="cm-native-notifications")
+    policy = None
+    if os.environ.get("CM_TUI_SESSION_ID") and activation.proxy():
+        from mcp_server.notifications import Queue
+        policy = asyncio.create_task(activation.Policy(
+            _send_activate, control_client.call, Queue.own,
+            lambda: len(async_monitor._active_monitors()),
+        ).run(), name="cm-mcp-activation")
     try:
         yield {}
     finally:
+        if policy:
+            policy.cancel()
         # Shutdown retains unfinished watch obligations for continuous drain.
         for record in async_monitor._MONITORS.values():
             if record["state"] in ("watching", "fired"):
@@ -103,6 +112,32 @@ async def _lifespan(_server):
 
 
 mcp = NotificationMCP("claude-manager", instructions=AGENT_GUIDE, lifespan=_lifespan)
+
+
+async def _send_activate(mode: str) -> None:
+    """Ask CM's stdio proxy to activate the pending payload (never forwarded)."""
+    session = mcp.client_session
+    if session is None or not activation.proxy():
+        return
+    await asyncio.wait_for(session.send_notification(
+        CmActivateNotification(params=CmActivateParams(mode=mode))), 3)
+
+
+@mcp.tool()
+async def ack_reconnect() -> dict:
+    """Apply a pending CM MCP update now instead of waiting until you are idle.
+
+    Optional. CM activates a deployed MCP update on its own once you have been
+    idle for a minute with nothing unread; call this only if you want it
+    sooner. It takes effect right after this reply, with the same connection,
+    identity and chat state; your monitors and chat watches carry over and
+    nothing is re-sent. Returns {activating, version, monitors_carried} or
+    {activating: false, note} when nothing is pending.
+    """
+    result = activation.ack(len(async_monitor._active_monitors()))
+    if result.get("activating"):
+        await _send_activate("ack")
+    return result
 
 
 @mcp.tool()

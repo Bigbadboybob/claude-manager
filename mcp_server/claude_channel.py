@@ -105,6 +105,16 @@ def channel_content(event) -> str:
     return content
 
 
+class CmActivateParams(types.NotificationParams):
+    mode: str
+
+
+class CmActivateNotification(types.Notification):
+    """Proxy-only: CM's stdio proxy consumes it and never forwards it."""
+    method: Literal["notifications/cm/activate"] = "notifications/cm/activate"
+    params: CmActivateParams
+
+
 class NotificationMCP(FastMCP):
     """FastMCP tools with channel capability only for opted-in Claude launches."""
 
@@ -116,15 +126,19 @@ class NotificationMCP(FastMCP):
             kwargs["instructions"] = kwargs.get("instructions", "") + "\n\n" + CHANNEL_INSTRUCTIONS
         super().__init__(*args, **kwargs)
 
+    client_session = None  # the initialized connection, for server-initiated messages
+
     async def list_tools(self):
         tools = await super().list_tools()
+        # Lifespan runs BEFORE initialize. tools/list gives us the actual
+        # initialized connection (behind CM's proxy, its preflight replays
+        # one). Never write during the initialize reply.
+        try:
+            self.client_session = self.get_context().session
+        except ValueError:
+            return tools  # --selftest / direct in-process tool enumeration
         if self.channel:
-            # Lifespan runs BEFORE initialize. tools/list gives us the actual
-            # initialized connection. Never write during the initialize reply.
-            try:
-                self.channel.session = self.get_context().session
-            except ValueError:
-                pass  # --selftest / direct in-process tool enumeration
+            self.channel.session = self.client_session
         return tools
 
     def initialization_options(self):

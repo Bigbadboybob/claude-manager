@@ -1,6 +1,10 @@
 {
  "breaking": [],
  "tools": {
+  "ack_reconnect": {
+   "params": {},
+   "required": []
+  },
   "acknowledge_continuous_drain": {
    "params": {
     "request_id": "string"

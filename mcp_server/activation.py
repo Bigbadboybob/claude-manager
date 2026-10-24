@@ -142,3 +142,130 @@ def brief() -> dict:
     if value["tools_changed_unseen"]:
         out["note"] = "New CM tools appear in this session after a restart (A-R)."
     return out
+
+
+# ---- activation policy -----------------------------------------------------
+# EP's rule: activate only at an agent-approved boundary, i.e. an explicit
+# ack_reconnect() or idle for IDLE_S with nothing unread, no wake pending and
+# no tool call in flight (the proxy checks the last part itself).
+
+IDLE_S = float(os.environ.get("CM_MCP_ACTIVATION_IDLE_S", 60))
+POLL_S = float(os.environ.get("CM_MCP_ACTIVATION_POLL_S", 10))
+NOTICE_SOURCE = "mcp_update"
+
+
+def notice_text(version: str, monitors: int, codex_tools_unseen: bool, can_ack: bool) -> str:
+    """One line. Idle activation is the default; acking is only a shortcut."""
+    watched = (f"your {monitors} monitor{'s' if monitors != 1 else ''} and chat watches carry over"
+               if monitors else "your chat watches carry over")
+    text = (f"[cm-mcp-update {version}] A CM MCP update ({version}) is pending. It activates "
+            f"on its own after you have been idle for a minute"
+            + (" (ack_reconnect() applies it sooner)" if can_ack else "")
+            + f"; {watched} and nothing is re-sent.")
+    if codex_tools_unseen:
+        text += " New tools appear after a restart."
+    return text
+
+
+async def blocked_reason(uid: str, call, queue) -> str | None:
+    """Why this session is not at an idle boundary right now (None = it is)."""
+    import asyncio
+    try:
+        resolved = await asyncio.to_thread(
+            call, "resolve_authorized_session", {"session_uid": uid}, timeout=5)
+    except Exception:  # noqa: BLE001 - no evidence of idleness is not idle
+        return "daemon_unreachable"
+    if not isinstance(resolved, dict):
+        return "state_unknown"
+    if resolved.get("exited"):
+        return "exited"
+    agent = resolved.get("agent_state")
+    if not isinstance(agent, dict):
+        return "state_unknown"
+    if agent.get("state") != "idle":
+        return str(agent.get("state") or "state_unknown")
+    since = agent.get("since")
+    if not isinstance(since, (int, float)) or time.time() - since < IDLE_S:
+        return "idle_too_recently"
+    try:
+        inbox = await asyncio.to_thread(
+            call, "messaging.read",
+            {"inbox": True, "unread_only": True, "limit": 1, "view": "slim"}, timeout=10)
+        if inbox.get("items"):
+            return "unread_inbox"
+    except Exception:  # noqa: BLE001
+        return "inbox_unknown"
+    events = await asyncio.to_thread(lambda: queue.snapshot()["notifications"])
+    if any(e["status"] in {"pending", "submitting"} and e.get("source") != NOTICE_SOURCE
+           for e in events):
+        return "notice_pending"
+    return None
+
+
+class Policy:
+    """Polls for a pending update; tells a working agent once, then asks the
+    proxy to activate at the first idle boundary."""
+
+    def __init__(self, send_activate, call, queue_factory, monitors, can_ack=lambda: True):
+        self.send_activate = send_activate
+        self.call = call
+        self.queue_factory = queue_factory
+        self.monitors = monitors
+        self.can_ack = can_ack
+        self.noticed: set[str] = set()
+        self.requested_at = 0.0
+
+    async def tick(self) -> dict:
+        update = pending()
+        uid = _uid()
+        if not update or not uid:
+            return write_status({"blocked": None})
+        if not proxy():
+            return write_status({"blocked": "no_proxy"})
+        queue = self.queue_factory()
+        blocked = await blocked_reason(uid, self.call, queue)
+        # Only an agent mid-turn hears about it: a notice would wake an idle
+        # one, and an idle one is simply activated within about a minute.
+        if update["version"] not in self.noticed and blocked in {"working", "working-background"}:
+            unseen = (os.environ.get("CM_AGENT_ENGINE") == "codex"
+                      and update.get("tools_change", False))
+            text = notice_text(update["version"], self.monitors(), unseen, self.can_ack())
+            try:
+                queue.publish(f"mcp-update:{update['version']}", NOTICE_SOURCE, text,
+                              f"[cm-mcp-update {update['version']}]")
+                self.noticed.add(update["version"])
+            except (OSError, ValueError, RuntimeError):
+                pass  # the notice is a courtesy; activation does not depend on it
+        if blocked is None and time.monotonic() - self.requested_at >= IDLE_S:
+            # The proxy also requires IDLE_S without client requests, so a
+            # refused request is simply repeated on a later tick.
+            self.requested_at = time.monotonic()
+            await self.send_activate("idle")
+        return write_status({"blocked": blocked})
+
+    async def run(self):
+        import asyncio
+        while True:
+            await asyncio.sleep(POLL_S)
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - policy failure must never touch tools
+                pass
+
+
+def ack(monitors: int) -> dict:
+    """ack_reconnect's answer. The caller sends the activation request."""
+    update = pending()
+    if not update:
+        return {"activating": False, "pending": False,
+                "version": LOADED_VERSION, "note": "No CM MCP update is pending."}
+    if not proxy():
+        return {"activating": False, "pending": update["version"],
+                "note": "This session's MCP server has no proxy; a manual /mcp reconnect is needed once."}
+    out = {"activating": True, "after": "this reply", "version": update["version"],
+           "from_version": LOADED_VERSION, "monitors_carried": monitors}
+    if os.environ.get("CM_AGENT_ENGINE") == "codex" and update.get("tools_change"):
+        out["note"] = "New tools appear after a restart."
+    return out
