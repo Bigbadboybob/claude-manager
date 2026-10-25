@@ -399,6 +399,8 @@ pub enum ModelSource {
     Explicit,
     /// The task's (or an ancestor's) default.
     Task,
+    /// Owner's work-kind staffing rule, after explicit/task choices.
+    StaffingRule,
     /// Recorded on the session being revived, resumed or restored.
     Recorded,
     /// The engine default from config.
@@ -422,6 +424,7 @@ impl ModelSource {
         match self {
             ModelSource::Explicit => "explicit",
             ModelSource::Task => "task",
+            ModelSource::StaffingRule => "staffing_rule",
             ModelSource::Recorded => "recorded",
             ModelSource::Engine => "engine_default",
             ModelSource::Transcript => "transcript",
@@ -442,6 +445,7 @@ impl ModelSource {
         [
             ModelSource::Explicit,
             ModelSource::Task,
+            ModelSource::StaffingRule,
             ModelSource::Recorded,
             ModelSource::Engine,
             ModelSource::Transcript,

@@ -9,7 +9,7 @@ continuous orchestrators and workers, workflow roles, and MCP
 agent spawn that names no model or no effort; a viewer older than the daemon
 gets that refusal and must be updated. Bash sessions have neither.
 
-Effort works exactly like the model: the same resolution order, recorded on
+Effort follows the same resolution order except for model-only staffing rules, recorded on
 the session the same way, shown beside it, and set the same ways. The
 sections below name the model; each applies to the effort too.
 
@@ -57,7 +57,10 @@ not a later spawn. `gpt-6-luna` is the cheap Codex option.
 2. **Task default**: `metadata.models.<claude|codex>` (effort:
    `metadata.efforts.<claude|codex>`) on the task, else on the nearest
    ancestor that sets one (subtasks inherit).
-3. **Engine default** from `[models]`.
+3. **Staffing work-rule model** for `start_session(work_kind=...)`, when the
+   rule matches the selected engine. Task defaults override it and return a
+   `staffing_note`; the selected source is `staffing_rule`. Effort has no rule.
+4. **Engine default** from `[models]`.
 
 A respawn of an existing session (revive, resume, restore, fork, workflow
 `fresh` activation, continuous re-fire) reuses the value recorded on the

@@ -8,5 +8,5 @@ CREATE TABLE IF NOT EXISTS staffing_policy (
     updated_by TEXT NOT NULL
 );
 INSERT INTO staffing_policy (org_key, version, policy, updated_by)
-VALUES ('default', 1, '{"default_engine":"codex","rules":{"math":"codex","design":"codex","architecture":"codex","metric":"codex","coding":"claude-code","fanout":"claude-code"},"preference":null}', 'initial')
+VALUES ('default', 1, '{"default_engine":"codex","rules":{"math":"codex","design":"codex","architecture":"codex","metric":"codex","coding":"claude-code","fanout":"claude-code","busywork":{"engine":"codex","model":"gpt-6-luna"}},"preference":null}', 'initial')
 ON CONFLICT (org_key) DO NOTHING;

@@ -16,9 +16,9 @@ question was buried in a progress log. The rules below exist to close those gaps
 ## 1. Pick the engine for the work
 
 Read `ping().staffing` for Owner's current engine guidance and policy version.
-It includes rules by kind of work, the default, and any expiring preference.
+It includes rules by kind of work, the default, and any preference (optionally expiring).
 Use `start_session(label=..., work_kind="math" | "design" | "architecture" |
-"metric" | "coding" | "fanout", isolated=true, ...)` to let that policy choose.
+"metric" | "coding" | "fanout" | "busywork", isolated=true, ...)` to let that policy choose.
 An explicit `type` or `model` wins; otherwise precedence is strong preference,
 matching work rule, lean preference, default. A `staffing_note` explains a
 choice against the policy or preference. Forks keep their source engine and
@@ -28,10 +28,12 @@ report the same note. See [staffing policy](staffing-policy.md).
 out of each other's checkouts; share a checkout only when you mean to.
 
 Pick the model too. Every spawn names one: the `model=` you pass, else the
-task's default (`metadata.models`, inherited by subtasks), else the host's
+task's default (`metadata.models`, inherited by subtasks), else the compatible
+work-rule model, else the host's
 `[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-sol`).
 **Busywork and low-intelligence work goes to Codex Luna** (Owner, 2026-10-25:
-Luna is very cheap): `start_session(type="codex", model="gpt-6-luna")`. That
+Luna is very cheap): `start_session(type="codex", model="gpt-6-luna")`, or
+`work_kind="busywork"` with a configured Luna rule (task defaults still win). That
 covers mechanical edits, renames and reformatting, running and triaging known
 tests or scripts, collecting logs or data, filling templates, checklist
 verification, and simple well-specified fixes. Keep the default model for

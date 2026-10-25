@@ -140,7 +140,9 @@ If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
 - Read `ping().staffing` for Owner's live engine guidance. Omit `type` and
   pass `work_kind` to `start_session` to use it; explicit type/model wins,
   then strong preference, work rule, lean preference, default. Read any
-  `staffing_note` returned by a launch or fork; expiring preferences can change.
+  `staffing_note` returned by a launch or fork. Preferences may have no expiry.
+  Models use explicit spawn > task default > work-rule model > host default;
+  `work_kind="busywork"` can select the configured Codex Luna rule.
 - Reuse a session that holds good context: give it the next piece with
   `send_input` rather than a new `start_session`.
 - Every piece of work in flight is an item with one named holder; `board()` is

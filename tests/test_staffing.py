@@ -106,3 +106,29 @@ class StaffingApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.put("/staffing", json={"expected_version": 2, "actor": "owner", "policy": policy})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIsNone(response.json()["policy"]["preference"])
+
+    async def test_indefinite_preference_and_legacy_or_model_rules(self):
+        policy = (await self.client.get("/staffing")).json()["policy"]
+        policy["rules"]["busywork"] = {"engine": "codex", "model": "gpt-6-luna"}
+        policy["preference"] = {"engine": "codex", "strength": "strong", "reason": "foreseeable future"}
+        for version in (1, 2):  # omitted, then explicit null expiry
+            response = await self.client.put("/staffing", json={"expected_version": version, "actor": "owner", "policy": policy})
+            self.assertEqual(response.status_code, 200, response.text)
+            policy = response.json()["policy"]
+            self.assertIsNone(policy["preference"]["expires_at"])
+            self.assertEqual(policy["rules"]["fanout"], "claude-code")
+            self.assertEqual(policy["rules"]["busywork"]["model"], "gpt-6-luna")
+        await self.pool.execute(SQL.read_text())
+        self.assertEqual((await self.client.get("/staffing")).json()["policy"], policy)
+
+    async def test_rule_model_validation(self):
+        policy = (await self.client.get("/staffing")).json()["policy"]
+        for rule in ({"engine": "claude-code", "model": "gpt-6-luna"},
+                     {"engine": "codex", "model": "claude-opus-5-5"},
+                     {"engine": "codex", "model": "-unsafe"},
+                     {"engine": "codex", "model": "bad model"},
+                     {"engine": "codex", "model": "x" * 129},
+                     {"engine": "codex", "model": "gpt-6-luna", "typo": True}):
+            policy["rules"]["busywork"] = rule
+            response = await self.client.put("/staffing", json={"expected_version": 1, "actor": "owner", "policy": policy})
+            self.assertEqual(response.status_code, 422, response.text)

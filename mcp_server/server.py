@@ -2296,7 +2296,8 @@ async def start_session(
     Args:
         type: "claude-code", "codex", or "bash". Omit for the cached Owner
             staffing policy (ping().staffing); an explicit type or model wins.
-            work_kind may be math, design, architecture, metric, coding or fanout.
+            work_kind may be math, design, architecture, metric, coding, fanout or busywork.
+            Model order: explicit model, task default, matching rule, host default.
             A conflicting choice returns staffing_note with the policy precedence.
             A bash session is a raw
             shell in the workspace's worktree — useful when you want to

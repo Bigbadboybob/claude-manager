@@ -198,23 +198,27 @@ so it can ship first; hires (§4.2) use it once members exist.
   - **rules by kind of work**, starting with Owner's: Codex for math, design,
     architecture-heavy work and maximizing specific metrics; Claude for
     large-scale coding and work that fans out to many agents (better subagent
-    management);
+    management); each rule may also name a model. Busywork uses Codex Luna
+    (`gpt-6-luna`); legacy engine-only rules remain valid;
   - a **default engine** for work that matches no rule;
-  - an optional **current preference** with a reason and an expiry ("prefer
-    Codex: Codex limits are higher, until 2026-11-08").
+  - an optional **current preference** with a reason and optional expiry.
+    Omitted/null expiry means indefinite (Owner: "for the foreseeable future").
 - **Precedence**, stated in every `staffing_note`: an explicit `type` or
   `model` from the caller wins (the policy only comments); then the current
   preference if its strength is `strong`; then the matching rule; then a
   `lean` preference; then the default. Owner's "Codex limits are higher" is a
-  `strong` preference: it tips even fan-out coding to Codex until it expires.
+  `strong` preference: it tips even fan-out coding to Codex until it expires
+  or Owner changes it. Model order is explicit spawn model, task default
+  (including inherited defaults), compatible work-rule model, host default.
+  A task default overriding the rule returns a `staffing_note`.
 - **Delivery, so nobody has to remember:**
   - `start_session`, `fork_session` and `hire` return a one-line
     `staffing_note` when the chosen engine goes against the policy or the
     current preference;
   - `start_session` may omit `type`; the policy picks the engine from an
     optional `work_kind` hint (`math`, `design`, `architecture`, `metric`,
-    `coding`, `fanout`), else the default. A-n, A-s and the A-f launch dialogs
-    preselect the policy's engine (A-f stops resetting to `claude`);
+    `coding`, `fanout`, `busywork`), else the default. A-n, A-s and the A-f launch dialogs
+    preselect the cached policy's engine when opened;
   - daemons cache the policy, so a spawn never waits on the API: they use the
     last policy seen, else today's default, and `ping` serves it from the
     daemon (headless continuous orchestrators included);
@@ -223,7 +227,7 @@ so it can ship first; hires (§4.2) use it once members exist.
   - `doc/ORCHESTRATION.md` §1, the agent guide and the `orchestrate-swarm`
     skill point at the live policy instead of restating it.
 - **Owner edits it** in a Staffing panel in F9 Global Settings (rules, default,
-  preference with reason and expiry) or with `cm-op staffing.set`.
+  per-rule models, preference with reason and optional expiry) or with `cm-op staffing.set`.
 - **Later:** CM suggests a preference from account usage ("Claude is at 85% of
   its weekly limit; shift to Codex?"), and a hire records the engine, model and
   reason in its `org_event`, so the policy can favour reusing a member's

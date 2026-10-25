@@ -9267,7 +9267,7 @@ pub fn mcp_start_session(
             .snapshot.clone();
         snapshot
     };
-    let selection = staffing.policy.select(
+    let mut selection = staffing.policy.select(
         params.get("type").and_then(Value::as_str),
         p.model.as_deref().filter(|s| !s.trim().is_empty()),
         p.work_kind.as_deref(), chrono::Utc::now(),
@@ -9696,16 +9696,27 @@ pub fn mcp_start_session(
         },
     };
 
-    // Explicit model/effort → task default → config default. Like the
+    // Explicit model → task default → staffing rule → config default.
+    // Effort keeps its existing resolution order. Like the
     // prompt lookup, the planning round trip happens before the slot is
     // claimed.
-    let (resolved_model, resolved_effort) = resolve_spawn_pick(
+    let (resolved_model, resolved_effort) = resolve_spawn_pick_with_rule(
         state_arc,
         &p.type_,
         p.model.as_deref(),
         p.effort.as_deref(),
         task_id_for_spawn.as_deref(),
+        selection.rule_model.as_deref(),
     )?;
+    if let (Some(rule), Some((model, crate::models::ModelSource::Task))) =
+        (selection.rule_model.as_deref(), resolved_model.as_ref())
+    {
+        if model != rule {
+            let note = format!("Staffing: task default model {model} overrides work-rule model {rule}. Model precedence: {}. Engine precedence: {}.",
+                crate::staffing::MODEL_PRECEDENCE, crate::staffing::PRECEDENCE);
+            selection.note = Some(selection.note.map_or_else(|| note.clone(), |old| format!("{old} {note}")));
+        }
+    }
 
     // Sub-2b-3 review-7: per-worktree slot wraps
     // {pre-snapshot + spawn + detect}, not just {detect}.
@@ -16611,6 +16622,17 @@ pub(crate) fn resolve_spawn_pick(
     explicit_effort: Option<&str>,
     task_id: Option<&str>,
 ) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
+    resolve_spawn_pick_with_rule(state_arc, engine, explicit_model, explicit_effort, task_id, None)
+}
+
+fn resolve_spawn_pick_with_rule(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    engine: &str,
+    explicit_model: Option<&str>,
+    explicit_effort: Option<&str>,
+    task_id: Option<&str>,
+    rule_model: Option<&str>,
+) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
     use crate::models::Setting;
     let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
     let task = if crate::models::takes_model(engine) && (blank(explicit_model) || blank(explicit_effort)) {
@@ -16621,6 +16643,19 @@ pub(crate) fn resolve_spawn_pick(
     let one = |setting: Setting, explicit: Option<&str>| {
         if explicit.is_some_and(|v| !v.trim().is_empty()) {
             return setting.resolve(engine, explicit, None).map_err(|e| (ErrorCode::InvalidParams, e));
+        }
+        if setting == Setting::Model && crate::models::takes_model(engine) {
+            if let Some(rule) = rule_model {
+                let task_model = task.get(setting);
+                if task_model.as_deref().is_none_or(|m| crate::models::validate_model(m).is_err()) {
+                    crate::models::check_engine(engine, rule).map_err(|e| (ErrorCode::InvalidParams, e))?;
+                    // A timed-out task lookup remains provisional on restore.
+                    let source = if task.timed_out { crate::models::ModelSource::LookupTimeout }
+                        else { crate::models::ModelSource::StaffingRule };
+                    return setting.resolve(engine, None, Some((rule, source)))
+                        .map_err(|e| (ErrorCode::InvalidParams, e));
+                }
+            }
         }
         resolve_default(setting, task_id.unwrap_or("-"), engine, &task)
     };
@@ -29356,7 +29391,7 @@ while True:
                         engine: crate::staffing::Engine::Codex,
                         strength: crate::staffing::Strength::Strong,
                         reason: "limits".into(),
-                        expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                        expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
                     });
             }
             let explicit = mcp_start_session(
@@ -29370,6 +29405,57 @@ while True:
                 .as_str()
                 .unwrap()
                 .contains(crate::staffing::PRECEDENCE));
+            kill_all_sessions(&state);
+            set_spawn_program_override_for_test(None);
+        });
+    }
+
+    #[test]
+    fn mcp_start_session_staffing_models_follow_explicit_task_rule_precedence() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let task_has_model = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let toggle = task_has_model.clone();
+            let stub = spawn_routed_stub(move |method, path, _| {
+                assert!(method == "GET" && path.starts_with("/tasks/task-1/model"));
+                let model = toggle.load(std::sync::atomic::Ordering::SeqCst).then_some("gpt-6-astra");
+                (200, json!({"engine":"codex","model":model,"effort":"medium"}).to_string())
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".into();
+                let mut cache = s.staffing.lock().unwrap();
+                cache.snapshot.policy = crate::staffing::Policy::default();
+                cache.snapshot.policy.preference = Some(crate::staffing::Preference {
+                    engine: crate::staffing::Engine::Codex,
+                    strength: crate::staffing::Strength::Strong,
+                    reason: "foreseeable future".into(), expires_at: None,
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            for (explicit, task_default, want, source, note) in [
+                (None, false, "gpt-6-luna", "staffing_rule", false),
+                (Some("gpt-6.1-sol"), true, "gpt-6.1-sol", "explicit", false),
+                (None, true, "gpt-6-astra", "task", true),
+            ] {
+                task_has_model.store(task_default, std::sync::atomic::Ordering::SeqCst);
+                let mut params = json!({"label":"busy-worker","work_kind":"busywork"});
+                if let Some(model) = explicit { params["model"] = json!(model); }
+                let result = mcp_start_session(&state, &params, Some("ts-caller")).unwrap();
+                assert_eq!(result["session_type"], "codex");
+                assert_eq!(result["model"], want);
+                assert_eq!(result["model_source"], source);
+                assert_eq!(result["effort"], "medium");
+                assert_eq!(result.get("staffing_note").is_some(), note);
+                if note {
+                    assert!(result["staffing_note"].as_str().unwrap().contains(crate::staffing::MODEL_PRECEDENCE));
+                }
+                let mut child = state.lock().unwrap().sessions.remove(result["session_uid"].as_str().unwrap()).unwrap();
+                assert_eq!(child.to_manifest_entry().model.as_deref(), Some(want));
+                let _ = child.kill();
+            }
             kill_all_sessions(&state);
             set_spawn_program_override_for_test(None);
         });

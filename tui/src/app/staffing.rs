@@ -1,6 +1,6 @@
 //! F9 Staffing: central Owner policy; all RPC work stays off the input thread.
 use super::*;
-use cm_daemon::staffing::{Engine, Policy, Preference, Snapshot, Strength, KINDS};
+use cm_daemon::staffing::{Engine, Policy, Preference, Rule, Snapshot, Strength, KINDS};
 use crossterm::event::KeyModifiers;
 use serde_json::{json, Value};
 use std::sync::mpsc;
@@ -8,6 +8,17 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 type Target = (String, PathBuf, String);
 type Reply = Result<(Snapshot, Target), String>;
+const PREFERENCE_ROW: usize = 1 + KINDS.len() * 2;
+const STRENGTH_ROW: usize = PREFERENCE_ROW + 1;
+const REASON_ROW: usize = PREFERENCE_ROW + 2;
+const EXPIRY_ROW: usize = PREFERENCE_ROW + 3;
+const ROW_COUNT: usize = PREFERENCE_ROW + 4;
+fn model_index(row: usize) -> Option<usize> {
+    (row >= 2 && row < PREFERENCE_ROW && row % 2 == 0).then(|| (row - 2) / 2)
+}
+fn text_row(row: usize) -> bool {
+    matches!(row, REASON_ROW | EXPIRY_ROW) || model_index(row).is_some()
+}
 #[derive(Clone, Copy, PartialEq)]
 enum Operation {
     Poll,
@@ -17,6 +28,7 @@ enum Operation {
 struct Dialog {
     version: u64,
     policy: Policy,
+    models: Vec<String>,
     preference: Option<Engine>,
     strength: Strength,
     reason: String,
@@ -30,24 +42,60 @@ impl Dialog {
         Self {
             version: snapshot.version,
             policy: snapshot.policy.clone(),
+            models: KINDS
+                .iter()
+                .map(|k| {
+                    snapshot
+                        .policy
+                        .rules
+                        .get(*k)
+                        .and_then(Rule::model)
+                        .unwrap_or("")
+                        .to_owned()
+                })
+                .collect(),
             preference: p.map(|p| p.engine),
             strength: p.map_or(Strength::Strong, |p| p.strength),
             reason: p.map_or(String::new(), |p| p.reason.clone()),
-            expires: p.map_or(String::new(), |p| p.expires_at.to_rfc3339()),
+            expires: p
+                .and_then(|p| p.expires_at)
+                .map_or(String::new(), |e| e.to_rfc3339()),
             row: 0,
             error: None,
         }
     }
+    fn text_field(&mut self) -> Option<&mut String> {
+        match self.row {
+            REASON_ROW => Some(&mut self.reason),
+            EXPIRY_ROW => Some(&mut self.expires),
+            row => model_index(row).map(|i| &mut self.models[i]),
+        }
+    }
     fn policy(&self) -> Result<Policy, String> {
         let mut policy = self.policy.clone();
+        for (i, kind) in KINDS.iter().enumerate() {
+            let model = self.models[i].trim();
+            if let Some(rule) = policy.rules.get_mut(*kind) {
+                *rule = Rule::new(rule.engine(), (!model.is_empty()).then(|| model.to_owned()));
+            } else if !model.is_empty() {
+                return Err(format!("Set the {kind} engine before its model"));
+            }
+        }
         policy.preference = self
             .preference
             .map(|engine| -> Result<Preference, String> {
-                let expires_at = chrono::DateTime::parse_from_rfc3339(&self.expires)
-                    .map_err(|_| {
-                        "Expiry needs a date and timezone, e.g. 2026-11-08T00:00:00Z".to_string()
-                    })?
-                    .with_timezone(&chrono::Utc);
+                let expires_at = if self.expires.trim().is_empty() {
+                    None
+                } else {
+                    Some(
+                        chrono::DateTime::parse_from_rfc3339(self.expires.trim())
+                            .map_err(|_| {
+                                "Expiry needs a date and timezone, or blank for no expiry"
+                                    .to_string()
+                            })?
+                            .with_timezone(&chrono::Utc),
+                    )
+                };
                 Ok(Preference {
                     engine,
                     strength: self.strength,
@@ -227,8 +275,8 @@ impl Staffing {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.pending = Some((Operation::Reload, json!({"refresh":true})));
             }
-            KeyCode::Tab | KeyCode::Down => d.row = (d.row + 1) % 11,
-            KeyCode::BackTab | KeyCode::Up => d.row = (d.row + 10) % 11,
+            KeyCode::Tab | KeyCode::Down => d.row = (d.row + 1) % ROW_COUNT,
+            KeyCode::BackTab | KeyCode::Up => d.row = (d.row + ROW_COUNT - 1) % ROW_COUNT,
             KeyCode::Enter => match d.policy() {
                 Ok(policy) => {
                     d.error = None;
@@ -239,63 +287,68 @@ impl Staffing {
                 }
                 Err(error) => d.error = Some(error),
             },
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if d.row < 9 => match d.row {
-                0 => {
-                    d.policy.default_engine = if d.policy.default_engine == Engine::Codex {
-                        Engine::Claude
-                    } else {
-                        Engine::Codex
-                    }
-                }
-                1..=6 => {
-                    let kind = KINDS[d.row - 1];
-                    match d.policy.rules.get(kind) {
-                        None => {
-                            d.policy.rules.insert(kind.into(), Engine::Codex);
-                        }
-                        Some(Engine::Codex) => {
-                            d.policy.rules.insert(kind.into(), Engine::Claude);
-                        }
-                        Some(Engine::Claude) => {
-                            d.policy.rules.remove(kind);
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if !text_row(d.row) => {
+                match d.row {
+                    0 => {
+                        d.policy.default_engine = if d.policy.default_engine == Engine::Codex {
+                            Engine::Claude
+                        } else {
+                            Engine::Codex
                         }
                     }
-                }
-                7 => {
-                    d.preference = match d.preference {
-                        None => Some(Engine::Codex),
-                        Some(Engine::Codex) => Some(Engine::Claude),
-                        Some(Engine::Claude) => None,
+                    row if row < PREFERENCE_ROW => {
+                        let i = (row - 1) / 2;
+                        let kind = KINDS[i];
+                        match d.policy.rules.get(kind).map(Rule::engine) {
+                            None => {
+                                d.policy
+                                    .rules
+                                    .insert(kind.into(), Rule::Engine(Engine::Codex));
+                            }
+                            Some(Engine::Codex) => {
+                                d.policy
+                                    .rules
+                                    .insert(kind.into(), Rule::Engine(Engine::Claude));
+                            }
+                            Some(Engine::Claude) => {
+                                d.policy.rules.remove(kind);
+                                d.models[i].clear();
+                            }
+                        }
                     }
-                }
-                8 => {
-                    d.strength = if d.strength == Strength::Strong {
-                        Strength::Lean
-                    } else {
-                        Strength::Strong
+                    PREFERENCE_ROW => {
+                        d.preference = match d.preference {
+                            None => Some(Engine::Codex),
+                            Some(Engine::Codex) => Some(Engine::Claude),
+                            Some(Engine::Claude) => None,
+                        }
                     }
-                }
-                _ => (),
-            },
-            KeyCode::Backspace if d.row >= 9 => {
-                if d.row == 9 {
-                    d.reason.pop();
-                } else {
-                    d.expires.pop();
+                    STRENGTH_ROW => {
+                        d.strength = if d.strength == Strength::Strong {
+                            Strength::Lean
+                        } else {
+                            Strength::Strong
+                        }
+                    }
+                    _ => (),
                 }
             }
+            KeyCode::Backspace if text_row(d.row) => {
+                d.text_field().unwrap().pop();
+            }
             KeyCode::Char(c)
-                if d.row >= 9
+                if text_row(d.row)
                     && !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                let value = if d.row == 9 {
-                    &mut d.reason
+                let limit = if model_index(d.row).is_some() {
+                    cm_daemon::models::MAX_MODEL_LEN
                 } else {
-                    &mut d.expires
+                    500
                 };
-                if value.chars().count() < 500 && !c.is_control() {
+                let value = d.text_field().unwrap();
+                if value.chars().count() < limit && !c.is_control() {
                     value.push(c);
                 }
             }
@@ -308,7 +361,7 @@ impl Staffing {
             return;
         };
         let width = area.width.min(100);
-        let height = area.height.min(20);
+        let height = area.height.min((ROW_COUNT + 6) as u16);
         let area = Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -322,12 +375,23 @@ impl Staffing {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let mut rows = vec![format!("Default: {}", d.policy.default_engine.wire())];
-        rows.extend(KINDS.iter().map(|kind| {
-            format!(
+        for (i, kind) in KINDS.iter().enumerate() {
+            rows.push(format!(
                 "{kind}: {}",
-                d.policy.rules.get(*kind).map_or("no rule", |e| e.wire())
-            )
-        }));
+                d.policy
+                    .rules
+                    .get(*kind)
+                    .map_or("no rule", |r| r.engine().wire())
+            ));
+            rows.push(format!(
+                "  model: {}",
+                if d.models[i].is_empty() {
+                    "(task/host default)"
+                } else {
+                    &d.models[i]
+                }
+            ));
+        }
         rows.push(format!(
             "Current preference: {}",
             d.preference.map_or("none", |e| e.wire())
@@ -341,13 +405,13 @@ impl Staffing {
             }
         ));
         rows.push(format!("Reason: {}", d.reason));
-        rows.push(format!("Expires (RFC3339): {}", d.expires));
-        let mut lines: Vec<Line> = rows
+        rows.push(format!("Expires (blank = no expiry): {}", d.expires));
+        let lines: Vec<Line> = rows
             .into_iter()
             .enumerate()
             .map(|(i, s)| {
                 // Text editing appends at the end; keep that end visible.
-                let s = if i == d.row && i >= 9 && s.width() + 2 > inner.width as usize {
+                let s = if i == d.row && text_row(i) && s.width() + 2 > inner.width as usize {
                     let mut width = 0;
                     let tail: String = s
                         .chars()
@@ -376,34 +440,42 @@ impl Staffing {
                 )
             })
             .collect();
-        lines.push(Line::from(
-            "Tab/↑/↓ field · ←/→ change · type reason/expiry",
-        ));
-        lines.push(Line::from("Enter save · Esc back · Ctrl+r reload/discard"));
-        lines.push(Line::from(
-            "Explicit choice → strong preference → rule → lean → default",
-        ));
-        if self
+        let footer_height = inner.height.min(4);
+        let body = Rect {
+            height: inner.height - footer_height,
+            ..inner
+        };
+        let footer = Rect {
+            y: inner.y + body.height,
+            height: footer_height,
+            ..inner
+        };
+        let scroll = d.row.saturating_sub(body.height.saturating_sub(1) as usize) as u16;
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
+        let busy = self
             .io
             .as_ref()
             .is_some_and(|(op, _)| *op != Operation::Poll)
             || self
                 .pending
                 .as_ref()
-                .is_some_and(|(op, _)| *op != Operation::Poll)
-        {
-            lines.push(Line::from("Loading/saving…"));
-        }
-        if let Some(error) = &d.error {
-            lines.push(Line::styled(
-                error.clone(),
-                Style::default().fg(theme::ERROR),
-            ));
-        }
-        let scroll = d
-            .row
-            .saturating_sub(inner.height.saturating_sub(2) as usize) as u16;
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+                .is_some_and(|(op, _)| *op != Operation::Poll);
+        let status = if let Some(error) = &d.error {
+            Line::styled(error.clone(), Style::default().fg(theme::ERROR))
+        } else if busy {
+            Line::from("Loading/saving…")
+        } else {
+            Line::from("Model: explicit → task → work rule → host")
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from("Tab/↑/↓ field · ←/→ engine · type model/reason/expiry"),
+                Line::from("Enter save · Esc back · Ctrl+r reload/discard"),
+                Line::from("Blank model uses task/host; blank expiry never expires"),
+                status,
+            ]),
+            footer,
+        );
     }
 }
 impl App {
@@ -447,7 +519,7 @@ mod tests {
         ui.open();
         ui.pending = None;
         let d = ui.dialog.as_mut().unwrap();
-        d.row = 7;
+        d.row = PREFERENCE_ROW;
         ui.event(&key(KeyCode::Right)); // enable a Codex preference
         ui.event(&key(KeyCode::Enter));
         assert!(ui.pending.is_none());
@@ -460,6 +532,31 @@ mod tests {
         assert!(*op == Operation::Save);
         assert_eq!(body["expected_version"], 8);
         assert_eq!(body["policy"]["preference"]["engine"], "codex");
+    }
+    #[test]
+    fn staffing_editor_round_trips_rule_models_and_indefinite_preference() {
+        let mut snapshot = Snapshot {
+            policy: Policy::default(),
+            ..Snapshot::default()
+        };
+        snapshot.policy.preference = Some(Preference {
+            engine: Engine::Codex,
+            strength: Strength::Strong,
+            reason: "foreseeable future".into(),
+            expires_at: None,
+        });
+        let mut dialog = Dialog::new(&snapshot);
+        assert!(dialog.expires.is_empty());
+        let policy = dialog.policy().unwrap();
+        assert_eq!(policy, snapshot.policy);
+        assert_eq!(policy.rules["busywork"].model(), Some("gpt-6-luna"));
+        let busywork = KINDS.iter().position(|k| *k == "busywork").unwrap();
+        dialog.models[busywork] = "claude-opus-5-5".into();
+        assert!(dialog.policy().is_err());
+        dialog.models[busywork].clear();
+        assert!(dialog.policy().unwrap().rules["busywork"].model().is_none());
+        dialog.expires = "not a date".into();
+        assert!(dialog.policy().is_err());
     }
     #[test]
     fn staffing_cancel_loading_and_small_terminal_render() {
@@ -485,11 +582,11 @@ mod tests {
             engine: Engine::Codex,
             strength: Strength::Strong,
             reason: "limits".into(),
-            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
         });
         assert_eq!(ui.engine(), LaunchEngine::Codex);
         ui.snapshot.policy.preference.as_mut().unwrap().expires_at =
-            chrono::Utc::now() - chrono::Duration::seconds(1);
+            Some(chrono::Utc::now() - chrono::Duration::seconds(1));
         assert_eq!(ui.engine(), LaunchEngine::Claude);
     }
 

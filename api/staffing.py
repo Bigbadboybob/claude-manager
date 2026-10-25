@@ -5,15 +5,46 @@ sessions cannot call staffing.set; a shared API token is a trusted-host token.
 """
 from datetime import datetime
 import unicodedata
+import re
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from api.auth import verify_token
+from api.models import MODEL_PATTERN
 
 Engine = Literal["codex", "claude-code"]
-WorkKind = Literal["math", "design", "architecture", "metric", "coding", "fanout"]
+WorkKind = Literal["math", "design", "architecture", "metric", "coding", "fanout", "busywork"]
+
+
+class Rule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    engine: Engine
+    model: str | None = Field(default=None, pattern=MODEL_PATTERN)
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def trim_model(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def compatible_engine(self):
+        # Same family checks as daemon models::check_engine. Unknown model
+        # names remain opaque; the daemon also knows host-specific presets.
+        if self.model:
+            lower = self.model.lower()
+            words = re.split(r"[-./:@]", lower)
+            first = words[0]
+            known = None
+            if lower.startswith("claude") or first in ("opus", "sonnet", "haiku", "fable"):
+                known = "claude-code"
+            elif (lower.startswith(("gpt-", "codex")) or re.fullmatch(r"o\d+", first)
+                  or any(w in ("luna", "sol", "astra") for w in words)):
+                known = "codex"
+            if known and known != self.engine:
+                raise ValueError(f"{self.model} is a {known} model, not {self.engine}")
+        return self
 
 
 class Preference(BaseModel):
@@ -21,7 +52,7 @@ class Preference(BaseModel):
     engine: Engine
     strength: Literal["strong", "lean"]
     reason: str = Field(min_length=1, max_length=500)
-    expires_at: datetime
+    expires_at: datetime | None = None
 
     @field_validator("reason")
     @classmethod
@@ -32,8 +63,8 @@ class Preference(BaseModel):
 
     @field_validator("expires_at")
     @classmethod
-    def timezone_required(cls, value: datetime) -> datetime:
-        if value.tzinfo is None:
+    def timezone_required(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
             raise ValueError("expires_at must include a timezone")
         return value
 
@@ -41,7 +72,7 @@ class Preference(BaseModel):
 class Policy(BaseModel):
     model_config = ConfigDict(extra="forbid")
     default_engine: Engine
-    rules: dict[WorkKind, Engine]
+    rules: dict[WorkKind, Engine | Rule]
     preference: Preference | None = None
 
 
