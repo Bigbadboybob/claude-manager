@@ -136,6 +136,17 @@ pub struct ExitedTombstone {
     /// entry absent from a surviving holder's records).
     #[serde(default)]
     pub status_lost: bool,
+    /// The exited session's org object (doc/org-model.md §12, S0b),
+    /// carried so a revive from this tombstone keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<cm_holder_proto::org::OrgObject>,
+}
+
+/// Whether a workspace's task bindings are set centrally (its org object
+/// carries a `binding_epoch`, doc/org-model.md §12): local reconstruction
+/// and older TUI snapshots must then leave them alone.
+pub fn binding_guarded(ws: &ManifestWorkspace) -> bool {
+    cm_holder_proto::org::binding_epoch(ws.org.as_ref()).is_some()
 }
 
 /// Bound on [`DaemonState::kill_requests`]. A request is normally
@@ -1161,9 +1172,13 @@ impl DaemonState {
         // binding is fully reconstructable here. Merge (`or_insert`) so an explicit
         // persisted binding always wins over a derived one. Collect first to avoid
         // borrowing `self.workspaces` while mutating `self.bindings`.
+        // doc/org-model.md §12: a workspace with a `binding_epoch` has its
+        // bindings set centrally; its sessions' task ids are the work they
+        // are on, not a binding to re-infer.
         let derived: Vec<(String, String)> = self
             .workspaces
             .iter()
+            .filter(|(_, ws)| !binding_guarded(ws))
             .flat_map(|(ws_id, ws)| {
                 ws.sessions
                     .iter()
@@ -1549,6 +1564,7 @@ mod tests {
 
     fn tomb(uid: &str) -> ExitedTombstone {
         ExitedTombstone {
+            org: None,
             incarnation: None,
             status_lost: false,
             session_uid: uid.to_string(),
@@ -1644,6 +1660,7 @@ mod tests {
 
     fn entry(uid: &str) -> ManifestEntry {
         ManifestEntry {
+            org: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,

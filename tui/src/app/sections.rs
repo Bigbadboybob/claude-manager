@@ -395,6 +395,7 @@ pub(crate) mod layout_tests {
 
     pub(crate) fn bare_ws(id: &str) -> Workspace {
         Workspace {
+            org: None,
             id: id.to_string(),
             name: id.to_string(),
             is_closed: false,

@@ -223,6 +223,7 @@ impl App {
         session: crate::session::Session,
     ) -> TerminalSession {
         TerminalSession {
+            org: entry.org.clone(),
             model: entry.model.clone(),
             model_source: entry.model_source.clone(),
             effort: entry.effort.clone(),
@@ -1705,6 +1706,11 @@ mod remote_reconnect_tests {
             entry.color = Some("green".into()); entry.idle_timeout_secs = 17;
             entry.burst_threshold = 19; entry.generation = 42;
             entry.seeded_from_snapshot = Some("seed".into());
+            // doc/org-model.md §12: the viewer round-trips the org object
+            // (unknown keys included), apart from the transcript generation.
+            entry.org = serde_json::json!({"member_id": "m-7", "occupancy_generation": 11, "later": {"x": 1}})
+                .as_object()
+                .cloned();
             let restored = App::build_remote_terminal_session(&entry, old.session);
             assert_eq!(serde_json::to_value(restored.to_manifest_entry()).unwrap(), serde_json::to_value(&entry).unwrap());
         }
@@ -1720,6 +1726,7 @@ mod remote_reconnect_tests {
         session: crate::session::Session,
     ) -> TerminalSession {
         TerminalSession {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -1758,6 +1765,7 @@ mod remote_reconnect_tests {
 
     fn workspace_with(ts: TerminalSession) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-remote".into(),
@@ -2199,6 +2207,7 @@ mod remote_reconnect_tests {
         let rendered: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
         assert!(rendered.contains("(no session)"), "sessionless row must actually render");
         let summary = crate::client_session::DaemonSessionSummary {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -4186,6 +4195,7 @@ mod remote_reconnect_tests {
             s.workspaces.insert(
                 "ws-l".into(),
                 cm_daemon::manifest::ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-l".into(),

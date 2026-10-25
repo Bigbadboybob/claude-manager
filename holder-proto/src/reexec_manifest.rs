@@ -409,6 +409,12 @@ pub struct SessionRecord {
     /// degrades loudly to fresh watcher policy — never a manifest
     /// validation failure.
     pub watcher_checkpoint: Option<serde_json::Value>,
+    /// The org-model preservation object (doc/org-model.md §12, S0b):
+    /// opaque, carried unchanged across the handoff. Additive: absent
+    /// when unset, so older readers and older manifests are unaffected
+    /// (no schema bump). See [`crate::org`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<crate::org::OrgObject>,
 }
 
 /// The `report_done` marker's manifest projection (schema v2, R11) —
@@ -1503,6 +1509,17 @@ mod tests {
                         "protected": [4242],
                         "last_high": 2,
                     })),
+                    // S0b bridge fixture: an org object with keys this
+                    // build doesn't know, and an occupancy generation
+                    // distinct from the transcript `generation`.
+                    org: serde_json::json!({
+                        "member_id": "m-7",
+                        "occupancy_generation": 11,
+                        "acting_as": "main",
+                        "from_a_later_stage": {"nested": [1, 2]},
+                    })
+                    .as_object()
+                    .cloned(),
                 },
                 SessionRecord {
                     uid: "sess-b".into(),
@@ -1531,6 +1548,7 @@ mod tests {
                     pidfd: 23,
                     cgroup_prefix: None,
                     watcher_checkpoint: None,
+                    org: None,
                 },
             ],
             listener_fd: 11,
@@ -1556,6 +1574,31 @@ mod tests {
     }
 
     /// Full write → read round trip: every field survives intact.
+    /// S0b (doc/org-model.md §12): the holder's reverse-migration path
+    /// stores a brain-composed blob and re-parses it as a `SessionRecord`
+    /// (`Holder::rollback_manifest`). An org object in the blob, unknown
+    /// keys included, survives that parse and the re-serialization; a blob
+    /// from a pre-feature brain has none and still parses.
+    #[test]
+    fn rollback_blob_parse_keeps_the_org_object() {
+        let rec = sample_manifest().sessions[0].clone();
+        let org = rec.org.clone().expect("fixture carries org");
+        let blob = serde_json::to_value(&rec).unwrap();
+        let parsed: SessionRecord = serde_json::from_value(blob.clone()).unwrap();
+        assert_eq!(parsed.org.as_ref(), Some(&org));
+        assert_eq!(parsed.generation, rec.generation);
+        assert_ne!(
+            org["occupancy_generation"].as_u64(),
+            Some(parsed.generation),
+            "the two counters are set apart in the fixture",
+        );
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), blob);
+        let mut old = blob;
+        old.as_object_mut().unwrap().remove("org");
+        let parsed: SessionRecord = serde_json::from_value(old).unwrap();
+        assert!(parsed.org.is_none());
+    }
+
     #[test]
     fn round_trip_write_read_equality() {
         let m = sample_manifest();
@@ -2090,6 +2133,7 @@ mod tests {
                 pidfd: 101 + 2 * i,
                 cgroup_prefix: None,
                 watcher_checkpoint: None,
+                org: None,
             })
             .collect();
 

@@ -1619,6 +1619,7 @@ impl App {
             }
         }
         let ts = TerminalSession {
+            org: None,
             model: session.spawn_model.clone(),
             model_source: session.spawn_model_source.clone(),
             effort: session.spawn_effort.clone(),
@@ -2846,6 +2847,7 @@ impl App {
             } else if is_cloud || worktree_path.is_some() {
                 // Auto-provision a workspace so this task gets a sidebar row.
                 let ws = Workspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: new_workspace_id(),
@@ -3073,6 +3075,7 @@ mod apply_manifest_diff_tests {
         );
         // Minimal Workspace.
         let ws = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-test".into(),
@@ -5487,6 +5490,7 @@ pub(super) mod pending_workflow_events_tests {
 
     fn test_workspace(id: &str, worktree: std::path::PathBuf) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: id.to_string(),
@@ -5617,6 +5621,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-e2e".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-e2e".into(),
@@ -6078,6 +6083,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-mgr".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-mgr".into(),
@@ -6295,6 +6301,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-r".into(),
@@ -6397,6 +6404,7 @@ pub(super) mod pending_workflow_events_tests {
         // Manifest on disk: workspace ws-r with one session pinned to host
         // "manager".
         let entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -6428,6 +6436,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-r".into(),
@@ -6568,6 +6577,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-r".into(),
@@ -6622,6 +6632,7 @@ pub(super) mod pending_workflow_events_tests {
         // Manifest entry pinned to "manager" with a STALE workflow_run_id
         // (no active runs exist → it's Detached/Done from the TUI's POV).
         let entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -6653,6 +6664,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-r".into(),
@@ -6790,6 +6802,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-r".into(),
@@ -6844,6 +6857,7 @@ pub(super) mod pending_workflow_events_tests {
 
         // Manifest: [gone, live] — gone FIRST so its failure precedes live.
         let mk = |uid: &str| ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -6875,6 +6889,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-r".into(),
@@ -7003,6 +7018,7 @@ pub(super) mod pending_workflow_events_tests {
         std::fs::create_dir_all(&cm_dir).unwrap();
 
         let mk = |uid: &str| ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -7035,6 +7051,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("ghost"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-g".into(),
@@ -7154,6 +7171,7 @@ pub(super) mod pending_workflow_events_tests {
         let local_sock = cm_dir.join("daemon.sock");
 
         let entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -7185,6 +7203,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-ssh".into(),
@@ -7351,6 +7370,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-c".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-c".into(),
@@ -7497,6 +7517,7 @@ pub(super) mod pending_workflow_events_tests {
         // plus a queued reattach (with its preserved-on-disk copy) for the
         // live session.
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-c".into(),
@@ -7513,6 +7534,7 @@ pub(super) mod pending_workflow_events_tests {
             tombstones: Vec::new(),
         });
         let entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -7654,6 +7676,7 @@ pub(super) mod pending_workflow_events_tests {
             None,
         );
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-local".into(),
@@ -7680,6 +7703,7 @@ pub(super) mod pending_workflow_events_tests {
         );
         remote_sess.host_id = cm_daemon::host_id::HostId::new("manager");
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-remote".into(),
@@ -8210,6 +8234,7 @@ mod backtest_group_tests {
 
     fn empty_cloud_ws(id: &str, name: &str, worker_vm: Option<&str>) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: id.into(),

@@ -361,6 +361,10 @@ struct StartSessionParams {
     /// the workflow tags. See DESIGN_CONTINUOUS_TASKS.md §6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     continuous_task_id: Option<String>,
+    /// The org-model preservation object (doc/org-model.md §12) carried
+    /// by restore/revive from the persisted entry; opaque here.
+    #[serde(default)]
+    org: Option<cm_holder_proto::org::OrgObject>,
     /// Global-permissions grant for the spawned session. The TUI
     /// (operator caller) sets this when the human marks a session
     /// global; `mcp_start_session` (agent caller) gates it behind
@@ -822,6 +826,7 @@ pub(crate) fn start_session_with_spawn_fn(
     // Phase-1 continuous wire field: carry the continuous-task tag
     // onto the DaemonSession. `None` for ordinary spawns.
     spawn_params.continuous_task_id = p.continuous_task_id.clone();
+    spawn_params.org = p.org.clone();
     spawn_params.model_source = model.as_ref().and(
         p.model_source
             .as_deref()
@@ -1576,6 +1581,7 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             // idempotency key a redelivered exit_event matches.
             incarnation: holder_exit.as_ref().map(|h| h.incarnation),
             status_lost: false,
+            org: sess.org.clone(),
         }
     });
     // Continuous Tasks Phase 3b completion signal (b): capture this session's
@@ -2655,6 +2661,9 @@ pub fn list_sessions(
             "workflow_run_id": session.workflow_run_id,
             "workflow_role": session.workflow_role,
             "continuous_task_id": session.continuous_task_id,
+            // doc/org-model.md §12: the opaque org object, so an adopting
+            // TUI can round-trip it into its manifest. Absent when unset.
+            "org": session.org,
             "worktree_path": state
                 .workspaces
                 .get(&session.workspace_id)
@@ -3737,6 +3746,11 @@ struct TaskUpdateTreeWorkspaceEntry {
     /// workspaces that haven't been spawned into yet.
     #[serde(default)]
     worktree_path: Option<String>,
+    /// The `org.binding_epoch` the pushing TUI knows for this workspace
+    /// (doc/org-model.md §12). Older TUIs send none (0): their snapshot
+    /// cannot change a centrally bound workspace's relations.
+    #[serde(default)]
+    binding_epoch: u64,
 }
 
 pub fn task_update_tree(
@@ -3750,15 +3764,44 @@ pub fn task_update_tree(
     // distinguish "tree pushed and target genuinely out of scope"
     // from "tree hasn't been pushed yet" — see `DaemonState::task_tree_pushed`.
     state.task_tree_pushed = true;
+    // doc/org-model.md §12, the binding_epoch guard: a centrally bound
+    // workspace's task relations change only through a push that knows
+    // its current epoch. `held` = such workspaces this push is stale for.
+    let pushed_epochs: std::collections::HashMap<&str, u64> = p
+        .workspaces
+        .iter()
+        .map(|w| (w.workspace_id.as_str(), w.binding_epoch))
+        .collect();
+    let held: std::collections::HashSet<String> = state
+        .workspaces
+        .iter()
+        .filter_map(|(id, ws)| {
+            let stored = cm_holder_proto::org::binding_epoch(ws.org.as_ref())?;
+            (pushed_epochs.get(id.as_str()).copied().unwrap_or(0) < stored).then(|| id.clone())
+        })
+        .collect();
+    let held_relations: Vec<(String, String)> = state
+        .task_workspaces
+        .iter()
+        .filter(|(_, ws)| held.contains(*ws))
+        .map(|(t, ws)| (t.clone(), ws.clone()))
+        .collect();
     // Replace, not merge. The TUI sends the full tree on every
     // update; partial updates aren't a thing (see module doc).
     state.task_tree.clear();
     state.task_workspaces.clear();
     for entry in p.tasks {
         if let Some(ws) = entry.workspace_id.clone() {
-            state.task_workspaces.insert(entry.task_id.clone(), ws);
+            // A stale snapshot cannot bind a task to a held workspace.
+            if !held.contains(&ws) {
+                state.task_workspaces.insert(entry.task_id.clone(), ws);
+            }
         }
         state.task_tree.insert(entry.task_id, entry.parent_task_id);
+    }
+    // …nor unbind or rebind the tasks a held workspace already has.
+    for (task_id, ws) in held_relations {
+        state.task_workspaces.insert(task_id, ws);
     }
     // Re-apply agent-minted task edges over the fresh snapshot
     // (fix-start-session; see `DaemonState::agent_task_edges`).
@@ -3822,7 +3865,9 @@ pub fn task_update_tree(
         // owns the source of truth" rule) and accept the daemon-
         // discovered-path-cleared edge case. Tracked as a wire-
         // shape follow-up.
-        entry.worktree_path = ws_entry.worktree_path.map(std::path::PathBuf::from);
+        if !held.contains(&ws_entry.workspace_id) {
+            entry.worktree_path = ws_entry.worktree_path.map(std::path::PathBuf::from);
+        }
     }
     // GC workspaces that fell out of the TUI's push AND have no
     // live daemon-owned session anchoring them. Without this,
@@ -3848,10 +3893,12 @@ pub fn task_update_tree(
     // durable anchor that keeps the workspace alive until its agent spawns.
     let bound_ws_ids: std::collections::HashSet<String> =
         state.bindings.values().cloned().collect();
-    state.workspaces.retain(|ws_id, _| {
+    state.workspaces.retain(|ws_id, ws| {
         pushed_ws_ids.contains(ws_id)
             || live_ws_ids.contains(ws_id)
             || bound_ws_ids.contains(ws_id)
+            // A centrally bound workspace is never GC'd by a TUI snapshot.
+            || crate::state::binding_guarded(ws)
     });
     Ok(json!({
         "ok": true,
@@ -3900,6 +3947,11 @@ struct RegisterAgentSubtaskParams {
     /// leave the existing entry alone.
     #[serde(default)]
     worktree_path: Option<String>,
+    /// The TUI's `workspace_kind` for the subtask's workspace
+    /// (doc/org-model.md §12): `ephemeral` for a branch-mode mint. Set
+    /// only on a workspace that has no kind yet.
+    #[serde(default)]
+    workspace_kind: Option<String>,
 }
 
 pub fn register_agent_subtask(
@@ -3924,6 +3976,17 @@ pub fn register_agent_subtask(
                 ..Default::default()
             });
         entry.worktree_path = Some(std::path::PathBuf::from(path));
+    }
+    if let Some(kind) = p.workspace_kind.filter(|k| !k.is_empty()) {
+        if let Some(ws) = state.workspaces.get_mut(&p.workspace_id) {
+            if cm_holder_proto::org::workspace_kind(ws.org.as_ref()).is_none() {
+                cm_holder_proto::org::set(
+                    &mut ws.org,
+                    cm_holder_proto::org::WORKSPACE_KIND,
+                    Value::String(kind),
+                );
+            }
+        }
     }
     // `record_agent_task_edge` seeds BOTH the durable overlay and the
     // immediate `task_tree` edge the descendant walk reads.
@@ -4061,6 +4124,8 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "brain_restarts": brain_restarts,
         "holder_pings_unanswered": pings_unanswered,
         "previous_pin": previous_pin,
+        // doc/org-model.md §12: each role's list and their intersection.
+        "capabilities": crate::capabilities::report(previous_pin),
         "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
@@ -8893,6 +8958,13 @@ fn mint_task_workspace(
             .or_else(|| state.bindings.get(task_id))
             .cloned()
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        // A minted task worktree is ephemeral (doc/org-model.md §12); a
+        // re-registered identity keeps the org object it already had.
+        let org = state
+            .workspaces
+            .get(&workspace_id)
+            .and_then(|w| w.org.clone())
+            .or_else(crate::manifest::ephemeral_workspace_org);
         state.workspaces.insert(
             workspace_id.clone(),
             crate::manifest::ManifestWorkspace {
@@ -8901,6 +8973,7 @@ fn mint_task_workspace(
                 repo_url: Some(repo_url.clone()),
                 worktree_path: Some(minted.worktree_path.clone()),
                 main_repo_path: Some(main_repo.clone()),
+                org,
                 ..Default::default()
             },
         );
@@ -10728,9 +10801,13 @@ pub fn rehydrate_derived_state(
         }
     };
 
+    // doc/org-model.md §12: no re-inference for a centrally bound
+    // workspace (`binding_epoch` on the persisted row; the live row is
+    // checked again under the lock below).
     let derived_bindings: Vec<(String, String)> = manifest
         .workspaces
         .iter()
+        .filter(|(_, ws)| !crate::state::binding_guarded(ws))
         .flat_map(|(ws_id, ws)| {
             ws.sessions
                 .iter()
@@ -10771,9 +10848,15 @@ pub fn rehydrate_derived_state(
             .filter(|(ws_id, _)| !st.workspaces.contains_key(*ws_id))
             .count();
         for (ws_id, ws) in &manifest.workspaces {
-            st.workspaces
+            let live = st
+                .workspaces
                 .entry(ws_id.clone())
                 .or_insert_with(|| ws.clone());
+            // The org object is daemon-recorded (workspace kind, binding
+            // epoch): a TUI-loaded row without one takes the persisted one.
+            if live.org.is_none() {
+                live.org = ws.org.clone();
+            }
         }
         // Explicit persisted bindings first (recorded truth), then the
         // sessions-derived reconstruction — same precedence
@@ -10784,6 +10867,9 @@ pub fn rehydrate_derived_state(
                 .or_insert_with(|| ws_id.clone());
         }
         for (task_id, ws_id) in derived_bindings {
+            if st.workspaces.get(&ws_id).is_some_and(crate::state::binding_guarded) {
+                continue;
+            }
             st.bindings.entry(task_id).or_insert(ws_id);
         }
         for (child, parent) in tree_edges {
@@ -11263,6 +11349,11 @@ fn compose_restore_params_with(
         if let Some(ct) = &e.continuous_task_id {
             m.insert("continuous_task_id".into(), Value::String(ct.clone()));
         }
+        // doc/org-model.md §12: the restored/revived session keeps its org
+        // object.
+        if let Some(org) = &e.org {
+            m.insert("org".into(), Value::Object(org.clone()));
+        }
         // claude resume continues the SAME transcript file: set transcript_path
         // explicitly so resolve_authorized_session reports `ready` at once and
         // the persist hook re-records the (unchanged) transcript_id. A detector
@@ -11498,6 +11589,10 @@ struct ReviveSessionParams {
     /// Where `effort` came from (the same sources as `model_source`).
     #[serde(default)]
     effort_source: Option<String>,
+    /// The caller's copy of the session's org object (doc/org-model.md
+    /// §12), used only when the daemon's own record has none.
+    #[serde(default)]
+    org: Option<cm_holder_proto::org::OrgObject>,
 }
 
 /// `session.revive` — re-spawn one exited session at its same uid,
@@ -11704,8 +11799,14 @@ pub fn revive_session(
                 transcript_path: None,
                 reported_done_at: None,
                 report_reason: None,
+                org: tomb.as_ref().and_then(|t| t.org.clone()),
             },
         };
+        // A revive keeps the org object (doc/org-model.md §12) whichever
+        // record it started from.
+        if entry.org.is_none() {
+            entry.org = tomb.as_ref().and_then(|t| t.org.clone());
+        }
         // The tombstone snapshots the transcript as a PATH at exit time —
         // derive the resume key from it when the manifest entry lacks one
         // (e.g. the detector bound after the last manifest persist).
@@ -11742,6 +11843,9 @@ pub fn revive_session(
         }
         if let Some(gp) = p.global_perms {
             entry.global_perms = gp;
+        }
+        if entry.org.is_none() {
+            entry.org = p.org.clone();
         }
         entry.last_exit = None;
         (ws_id, worktree, entry)
@@ -17381,6 +17485,8 @@ fn create_subtask_core(
                     repo_url: Some(repo_url.clone()),
                     worktree_path: Some(wt.clone()),
                     main_repo_path: Some(main_repo.clone()),
+                    // Branch mode mints a new checkout: ephemeral (§12).
+                    org: crate::manifest::ephemeral_workspace_org(),
                     ..Default::default()
                 };
                 (wt, Some(ws))
@@ -20362,6 +20468,7 @@ mod tests {
         s.workspaces.insert(
             ws_id.into(),
             ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: ws_id.into(),
@@ -20523,6 +20630,133 @@ mod tests {
             !s.workspaces.contains_key("ws-orphan"),
             "unbound sessionless workspace is still GC'd",
         );
+    }
+
+    /// S0b binding_epoch guard (doc/org-model.md §12): a TUI snapshot that
+    /// doesn't know a centrally bound workspace's epoch cannot bind a task
+    /// to it, unbind its tasks, rewrite its path or GC it; a push carrying
+    /// the current epoch can. Unguarded workspaces behave as before.
+    #[test]
+    fn task_update_tree_binding_epoch_guard() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut s = state.lock().unwrap();
+            let mut home = crate::manifest::ManifestWorkspace::default();
+            home.id = "ws-home".into();
+            home.worktree_path = Some("/tmp/home-wt".into());
+            cm_holder_proto::org::set(&mut home.org, "binding_epoch", json!(4));
+            s.workspaces.insert("ws-home".into(), home);
+            s.task_workspaces.insert("task-a".into(), "ws-home".into());
+        }
+        // An old TUI: no epoch, task-a moved elsewhere, task-b onto the
+        // home workspace, a null path, and the home workspace left out.
+        task_update_tree(
+            &state,
+            &json!({
+                "tasks": [
+                    {"task_id": "task-a", "parent_task_id": null, "workspace_id": "ws-other"},
+                    {"task_id": "task-b", "parent_task_id": null, "workspace_id": "ws-home"},
+                ],
+                "workspaces": [{"workspace_id": "ws-other", "worktree_path": "/tmp/o"}],
+            }),
+        )
+        .unwrap();
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.task_workspaces.get("task-a").map(String::as_str), Some("ws-home"));
+            assert!(s.task_workspaces.get("task-b").is_none());
+            assert!(s.workspaces.contains_key("ws-home"), "never GC'd by a stale snapshot");
+            assert_eq!(s.workspaces["ws-home"].worktree_path.as_deref(), Some(std::path::Path::new("/tmp/home-wt")));
+        }
+        // A TUI that knows epoch 4 is authoritative again.
+        task_update_tree(
+            &state,
+            &json!({
+                "tasks": [{"task_id": "task-b", "parent_task_id": null, "workspace_id": "ws-home"}],
+                "workspaces": [{"workspace_id": "ws-home", "worktree_path": "/tmp/new-wt", "binding_epoch": 4}],
+            }),
+        )
+        .unwrap();
+        let s = state.lock().unwrap();
+        assert!(s.task_workspaces.get("task-a").is_none());
+        assert_eq!(s.task_workspaces.get("task-b").map(String::as_str), Some("ws-home"));
+        assert_eq!(s.workspaces["ws-home"].worktree_path.as_deref(), Some(std::path::Path::new("/tmp/new-wt")));
+    }
+
+    /// S0b: both reconstruction paths skip re-inferring bindings for a
+    /// centrally bound workspace; an unguarded one is rebuilt as before.
+    /// Register records the TUI's workspace kind once, and the persisted
+    /// org object fills a TUI-loaded row that has none.
+    #[test]
+    fn reconstruction_respects_binding_epoch_and_keeps_workspace_org() {
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let path = home.join(".cm/daemon-sessions.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut guarded = crate::manifest::ManifestWorkspace::default();
+            guarded.id = "ws-g".into();
+            cm_holder_proto::org::set(&mut guarded.org, "binding_epoch", json!(2));
+            let mut e = me("ts-g-0", "bash");
+            e.task_id = Some("task-g".into());
+            guarded.sessions = vec![e];
+            let mut plain = crate::manifest::ManifestWorkspace::default();
+            plain.id = "ws-p".into();
+            plain.org = crate::manifest::ephemeral_workspace_org();
+            let mut e = me("ts-p-0", "bash");
+            e.task_id = Some("task-p".into());
+            plain.sessions = vec![e];
+            let manifest = crate::manifest::Manifest {
+                workspaces: [("ws-g".to_string(), guarded.clone()), ("ws-p".to_string(), plain)].into(),
+                ..Default::default()
+            };
+            std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+            // state.rs: the TUI-file load path.
+            let mut loaded = DaemonState::new();
+            let tui = home.join(".cm/tui-sessions.json");
+            std::fs::write(&tui, serde_json::to_string(&manifest).unwrap()).unwrap();
+            loaded.load_manifest_from_disk(&tui).unwrap();
+            assert!(loaded.bindings.get("task-g").is_none(), "state.rs path guarded");
+            assert_eq!(loaded.bindings.get("task-p").map(String::as_str), Some("ws-p"));
+
+            // methods.rs: the durable-registry path, over a TUI-loaded row
+            // that lacks the org object.
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                s.daemon_sessions_path = Some(path.clone());
+                let mut tui_row = crate::manifest::ManifestWorkspace::default();
+                tui_row.id = "ws-p".into();
+                s.workspaces.insert("ws-p".into(), tui_row);
+            }
+            rehydrate_derived_state(&state);
+            let s = state.lock().unwrap();
+            assert!(s.bindings.get("task-g").is_none(), "methods.rs path guarded");
+            assert_eq!(s.bindings.get("task-p").map(String::as_str), Some("ws-p"));
+            assert_eq!(
+                cm_holder_proto::org::workspace_kind(s.workspaces["ws-p"].org.as_ref()),
+                Some("ephemeral"),
+            );
+            assert_eq!(s.workspaces["ws-g"].org, guarded.org);
+            drop(s);
+
+            register_agent_subtask(&state, &json!({
+                "task_id": "t-new", "parent_task_id": "t-parent", "workspace_id": "ws-new",
+                "worktree_path": "/tmp/ws-new", "workspace_kind": "ephemeral",
+            }))
+            .unwrap();
+            register_agent_subtask(&state, &json!({
+                "task_id": "t-new", "parent_task_id": "t-parent", "workspace_id": "ws-new",
+                "workspace_kind": "home",
+            }))
+            .unwrap();
+            let s = state.lock().unwrap();
+            assert_eq!(
+                cm_holder_proto::org::workspace_kind(s.workspaces["ws-new"].org.as_ref()),
+                Some("ephemeral"),
+                "a kind is recorded once, never overwritten by register",
+            );
+        });
     }
 
     /// `base` names the commit a NEW subtask branch is cut from, so it is
@@ -21938,6 +22172,7 @@ mod tests {
             s.workspaces.insert(
                 "ws-cloud".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-cloud".into(),
@@ -22556,6 +22791,7 @@ mod tests {
             s.workspaces.insert(
                 "ws-envinj".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-envinj".into(),
@@ -22735,6 +22971,7 @@ mod tests {
             s.workspaces.insert(
                 "ws-empty-cfg".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-empty-cfg".into(),
@@ -22855,6 +23092,7 @@ mod tests {
             s.workspaces.insert(
                 "ws-abs".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-abs".into(),
@@ -23320,6 +23558,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-t1").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    org: None,
                     model: None,
                     model_source: None,
                     effort: None,
@@ -23575,6 +23814,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-cap").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    org: None,
                     model: None,
                     model_source: None,
                     effort: None,
@@ -23781,6 +24021,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-opkill").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    org: None,
                     model: None,
                     model_source: None,
                     effort: None,
@@ -25355,6 +25596,7 @@ while True:
     /// Minimal live plain-session `ManifestEntry` for restore tests.
     fn me(uid: &str, session_type: &str) -> crate::manifest::ManifestEntry {
         crate::manifest::ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -25566,6 +25808,7 @@ while True:
 
     fn tombstone(uid: &str, engine: &str) -> crate::state::ExitedTombstone {
         crate::state::ExitedTombstone {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -26444,6 +26687,7 @@ while True:
             ws.sessions = vec![e];
             s.workspaces.insert("ws-rv".into(), ws);
             s.record_exited(crate::state::ExitedTombstone {
+                org: None,
                 model: None,
                 model_source: None,
                 effort: None,
@@ -26500,6 +26744,66 @@ while True:
         assert_eq!(restored.generation, 42);
         assert_eq!(restored.seeded_from_snapshot.as_deref(), Some("seed"));
         assert_eq!(restored.managed_by_uid.as_deref(), Some("ts-parent-0"));
+        s.sessions.clear();
+    }
+
+    /// S0b (doc/org-model.md §12): a revive rebuilt from the exit
+    /// tombstone alone keeps the org object, and the composed restore
+    /// params carry it, so the live session and its next persisted entry
+    /// have it — with the transcript generation kept apart.
+    #[test]
+    fn revive_from_a_tombstone_keeps_the_org_object() {
+        let uid = "ts-aaaa000000000002-0";
+        let wt = std::env::temp_dir();
+        let org = crate::manifest::tests::bridge_org();
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-org".into();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-org".into(), ws);
+            s.record_exited(crate::state::ExitedTombstone {
+                org: Some(org.clone()),
+                model: None,
+                model_source: None,
+                effort: None,
+                effort_source: None,
+                incarnation: None,
+                status_lost: false,
+                session_uid: uid.into(),
+                transcript_path: None,
+                generation: 7,
+                session_type: "bash".into(),
+                workspace_id: "ws-org".into(),
+                task_id: None,
+                managed_by_uid: None,
+                continuous_task_id: None,
+                label: "org".into(),
+                workflow_run_id: None,
+                workflow_role: None,
+                worktree_path: Some(wt.to_string_lossy().into_owned()),
+                global_perms: false,
+                exited_at: 1.0,
+                killed: false,
+                killed_by: None,
+                reported_done_at: None,
+                report_reason: None,
+            });
+        }
+        let mut e = me("ts-x-0", "bash");
+        e.org = Some(org.clone());
+        let params = compose_restore_params(&state, "ws-org", &wt, &e).expect("compose");
+        assert_eq!(params["org"], Value::Object(org.clone()));
+
+        revive_session(&state, &json!({ "uid": uid })).expect("revive ok");
+        let mut s = state.lock().unwrap();
+        assert_eq!(s.sessions[uid].org.as_ref(), Some(&org));
+        let persisted = s.build_daemon_manifest();
+        let entry = &persisted.workspaces["ws-org"].sessions[0];
+        assert_eq!(entry.org.as_ref(), Some(&org));
+        assert_eq!(entry.generation, 7);
+        assert_eq!(entry.org.as_ref().unwrap()["occupancy_generation"], 11);
         s.sessions.clear();
     }
 
@@ -26624,6 +26928,7 @@ while True:
         let wt = std::env::temp_dir();
         let state = make_state_arc();
         state.lock().unwrap().record_exited(crate::state::ExitedTombstone {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -38989,6 +39294,7 @@ while True:
             s.workspaces.insert(
                 "ws-child".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-child".into(),

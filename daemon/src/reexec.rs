@@ -1499,6 +1499,8 @@ pub(crate) fn session_record_for(
                     }
                 }
             }),
+            // doc/org-model.md §12: the org object rides the handoff.
+            org: s.org.clone(),
         })
     }
 }
@@ -2318,6 +2320,7 @@ fn adopted_meta_from_record(
         effort: None,
         effort_source: None,
         global_perms: rec.global_perms,
+        org: rec.org.clone(),
         generation: rec.generation,
         last_activity_at: cell(rec.last_activity_age_s),
         last_input_at: cell(rec.last_input_age_s),
@@ -2534,6 +2537,7 @@ fn swap_exit_tombstone(
         // status was reconstructed (waitid at commit) — never lost.
         incarnation: None,
         status_lost: false,
+        org: rec.org.clone(),
     }
 }
 
@@ -3612,6 +3616,7 @@ mod tests {
             pidfd: 31,
             cgroup_prefix: Some("/sys/fs/cgroup/x".into()),
             watcher_checkpoint: None,
+            org: None,
         };
         let meta = adopted_meta_from_record(&rec, anchor, None);
         assert_eq!(meta.title, "my worker");
@@ -3702,6 +3707,7 @@ mod tests {
             pidfd: 41,
             cgroup_prefix: None,
             watcher_checkpoint: None,
+            org: None,
         };
 
         // Report (age 5) is newer than the last input (age 30):
@@ -3725,6 +3731,40 @@ mod tests {
         let tomb = swap_exit_tombstone(&rec, None, 1_700_000_200.0);
         assert_eq!(tomb.reported_done_at, None, "superseded report dropped");
         assert_eq!(tomb.report_reason, None);
+    }
+
+    /// S0b (doc/org-model.md §12): the org object rides the in-place
+    /// handoff unchanged — live session → SessionRecord → wire bytes →
+    /// adopted meta, and onto a swap tombstone — with the transcript
+    /// `generation` (7) and `org.occupancy_generation` (11) kept apart.
+    /// A record from a pre-feature writer (no `org` key) still parses.
+    #[test]
+    fn s0b_org_rides_the_reexec_handoff() {
+        let org = crate::manifest::tests::bridge_org();
+        let mut sp = crate::session::SpawnParams::new("ts-s0b-reexec", "s0b", "/bin/sleep");
+        sp.args = vec!["120".into()];
+        sp.org = Some(org.clone());
+        let mut sess = crate::session::DaemonSession::spawn(sp).expect("spawn");
+        sess.generation = 7;
+        assert_eq!(sess.to_manifest_entry().org.as_ref(), Some(&org));
+
+        let rec = session_record_for("ts-s0b-reexec", &sess, Instant::now()).expect("record");
+        let wire: SessionRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(wire.org.as_ref(), Some(&org));
+        let meta = adopted_meta_from_record(&wire, Instant::now(), None);
+        assert_eq!(meta.org.as_ref(), Some(&org));
+        assert_eq!(meta.generation, 7);
+        assert_eq!(meta.org.as_ref().unwrap()["occupancy_generation"], 11);
+        let tomb = swap_exit_tombstone(&wire, None, 1.0);
+        assert_eq!(tomb.org.as_ref(), Some(&org));
+        assert_eq!(tomb.generation, 7);
+
+        let mut legacy = serde_json::to_value(&rec).unwrap();
+        legacy.as_object_mut().unwrap().remove("org");
+        let legacy: SessionRecord = serde_json::from_value(legacy).expect("pre-feature record");
+        assert!(legacy.org.is_none());
+        assert!(adopted_meta_from_record(&legacy, Instant::now(), None).org.is_none());
     }
 
     // ---------------------------------------------------------------
@@ -4062,6 +4102,7 @@ mod tests {
             pidfd: 51,
             cgroup_prefix: None,
             watcher_checkpoint: None,
+            org: None,
         }
     }
 
@@ -4239,6 +4280,7 @@ mod tests {
             pidfd: 61,
             cgroup_prefix: Some("cm-cap-4d".into()),
             watcher_checkpoint,
+            org: None,
         }
     }
 

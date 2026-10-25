@@ -187,6 +187,7 @@ mod tests {
             repos: HashMap::new(),
         });
         app.workspaces = vec![Workspace {
+            org: None,
             id: "ws".into(),
             name: "Scouts".into(),
             is_closed: false,

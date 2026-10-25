@@ -150,6 +150,10 @@ pub struct HelloReplyBody {
     /// The holder's brain-spawn counter (design § The holder).
     pub epoch: u64,
     pub session_count: usize,
+    /// Capabilities this holder image preserves (doc/org-model.md §12;
+    /// [`crate::org`]). Additive: an older holder sends none.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// Brain → holder: fork/exec a session child. The `env` map is the
@@ -381,6 +385,10 @@ pub struct RehelloBody {
     pub holder_proto_max: u32,
     pub epoch: u64,
     pub session_count: usize,
+    /// Capabilities this holder image preserves (doc/org-model.md §12;
+    /// [`crate::org`]). Additive: an older holder sends none.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// Holder → brain, the `status` reply.

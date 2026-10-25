@@ -49,6 +49,7 @@ pub(crate) fn remote_revive_entry(
     host: &cm_daemon::host_id::HostId,
 ) -> cm_daemon::manifest::ManifestEntry {
     let mut entry = tomb.entry.clone().unwrap_or_else(|| cm_daemon::manifest::ManifestEntry {
+        org: None,
         model: None,
         model_source: None,
         effort: None,
@@ -1846,7 +1847,7 @@ impl App {
     /// `TasksUpdated` event); now non-blocking on the main thread.
     pub(crate) fn push_task_tree_to_daemon(&self) {
         let tasks = self.task_tree_push_entries();
-        let workspaces: Vec<(String, Option<String>)> = self
+        let workspaces: Vec<(String, Option<String>, u64)> = self
             .workspaces
             .iter()
             .map(|w| {
@@ -1855,6 +1856,7 @@ impl App {
                     w.worktree_path
                         .as_ref()
                         .map(|p| p.display().to_string()),
+                    cm_daemon::org_bridge::binding_epoch(w.org.as_ref()).unwrap_or(0),
                 )
             })
             .collect();
@@ -1913,6 +1915,7 @@ impl App {
         parent_task_id: &str,
         workspace_id: &str,
         worktree_path: Option<&std::path::Path>,
+        workspace_kind: Option<&str>,
     ) -> Result<(), String> {
         let daemon_socket = self
             .host_pool
@@ -1931,6 +1934,7 @@ impl App {
             parent_task_id,
             workspace_id,
             worktree_path,
+            workspace_kind,
         )
         .map_err(|e| e.to_string())
     }
@@ -2378,6 +2382,7 @@ impl App {
         };
 
         let ts = TerminalSession {
+            org: None,
             model: s.spawn_model.clone(),
             model_source: s.spawn_model_source.clone(),
             effort: s.spawn_effort.clone(),
@@ -2422,6 +2427,7 @@ impl App {
             host_id: active_host.clone(),
         };
         let ws = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: workspace_id_pre,
@@ -2901,6 +2907,7 @@ impl App {
             Some(i) => i,
             None => {
                 let ws = Workspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: new_workspace_id(),
@@ -3285,6 +3292,7 @@ impl App {
                 let i = self.workspaces.len();
                 let path = PathBuf::from(&res.worktree_path);
                 self.workspaces.push(Workspace {
+                    org: None,
                     id: workspace_id.clone(),
                     name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| workspace_id.clone()),
                     worktree_path: Some(path), host_id: host.clone(),
@@ -3945,6 +3953,7 @@ impl App {
         }
 
         let ws = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: workspace_id_pre,
@@ -4106,6 +4115,7 @@ impl App {
                 if engine == "claude" { ts.transcript_id = result.resume_id; }
                 let wi = app.workspaces.len();
                 app.workspaces.push(Workspace {
+                    org: None,
                     id: ws_id.clone(), name, color: None, pinned: false, is_closed: false,
                     is_cloud: false, repo_url: Some(repo), worktree_path: Some(path),
                     main_repo_path: result.main_repo_path.map(PathBuf::from), worker_vm: None,
@@ -4445,6 +4455,7 @@ impl App {
             None => {
                 let main_repo = repo_url.as_deref().and_then(worktree::find_local_repo);
                 let ws = Workspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: new_workspace_id(),
@@ -4740,6 +4751,7 @@ mod slice_12e_tests {
         app.start_new_session();
         assert!(matches!(&app.input_mode, InputMode::NewSession { host_id, .. } if *host_id == HostId::new("manager")));
         app.workspaces.push(Workspace {
+            org: None,
             id:"ws-remote".into(), name:"remote".into(), color:None, pinned:false, is_closed:false, is_cloud:false,
             repo_url:Some("https://github.com/a/b".into()), worktree_path:Some(PathBuf::from("/remote/worktree")),
             main_repo_path:None, worker_vm:None, worker_zone:None, host_id:HostId::new("manager"),
@@ -4834,6 +4846,7 @@ mod slice_12e_tests {
             ts.host_id = HostId::new(*host_name);
             ts.status = SessionStatus::Idle;
             let ws = Workspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: format!("ws-{}", i),
@@ -4865,6 +4878,7 @@ mod slice_12e_tests {
         let (mut single_app, _tmp2) =
             build_app_with_hosts(&[("local", true)], &guard2);
         single_app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-only".into(),
@@ -4938,6 +4952,7 @@ mod slice_12e_tests {
                 ts
             };
             Workspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-0".into(),
@@ -5474,6 +5489,7 @@ mod slice_12e_tests {
         );
         caller_ts.host_id = HostId::local();
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-local-caller".into(),
@@ -5737,6 +5753,7 @@ mod slice_12e_tests {
         );
         caller_ts.host_id = HostId::new("manager");
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-mgr-caller".into(),
@@ -6054,6 +6071,7 @@ mod slice_12e_tests {
         // be skipped + preserved).
         let mut workspaces = HashMap::new();
         let local_entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -6085,6 +6103,7 @@ mod slice_12e_tests {
             host_id: HostId::local(),
         };
         let remote_entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -6116,6 +6135,7 @@ mod slice_12e_tests {
             global_perms: false,
         };
         let ws = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-acc".into(),
@@ -6314,6 +6334,7 @@ remote_socket = "/remote/manager.sock"
             workspaces.insert(
                 id.to_string(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: id.to_string(),
@@ -6374,6 +6395,7 @@ remote_socket = "/remote/manager.sock"
         // Mimic the clobber trigger: a single fresh workspace lands in live
         // state (as adoption would mint) and a save fires BEFORE restore.
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-fresh-adopted".into(),
@@ -8271,6 +8293,7 @@ pub(crate) mod revive_session_tests {
         .expect("dummy session");
         session.exited = exited;
         TerminalSession {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -8316,6 +8339,7 @@ pub(crate) mod revive_session_tests {
             repos: HashMap::new(),
         });
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-revive".into(),
@@ -8893,6 +8917,7 @@ mod spent_workspace_tests {
 
     fn ws(name: &str) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: format!("ws-{}", name.replace(' ', "-")),

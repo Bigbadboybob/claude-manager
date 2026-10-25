@@ -160,6 +160,7 @@ mod tests {
         }
         app.keybinding_helper_visible = false;
         let mut ws = Workspace {
+            org: None,
             id: "ws-1".into(),
             name: "swarm".into(),
             is_closed: false,

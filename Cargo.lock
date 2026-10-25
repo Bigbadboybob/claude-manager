@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "cm-holder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cm-holder-proto",
  "libc",

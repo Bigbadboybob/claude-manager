@@ -166,6 +166,10 @@ pub struct HolderClient {
     /// live value or the runbook's "holder_build_id changed" check
     /// reads stale until the next brain restart.
     holder_build_id: Mutex<String>,
+    /// The running holder image's preserved capabilities (doc/org-model.md
+    /// §12), from the hello reply and every rehello. Empty for a holder
+    /// that predates the field: it preserves nothing new.
+    holder_capabilities: Mutex<Vec<String>>,
     pub epoch: u64,
     /// The RUNNING holder's advertised proto range, from the hello
     /// reply (review F3): the S15 upgrade gate keys on THIS — every
@@ -261,6 +265,7 @@ impl HolderClient {
             exit_subs: Mutex::new(HashMap::new()),
             parked_exits: Mutex::new(Vec::new()),
             holder_build_id: Mutex::new(hr.holder_build_id),
+            holder_capabilities: Mutex::new(hr.capabilities),
             epoch: hr.epoch,
             holder_proto_min: hr.holder_proto_min,
             holder_proto_max: hr.holder_proto_max,
@@ -277,6 +282,15 @@ impl HolderClient {
     /// updated by every rehello).
     pub fn holder_build_id(&self) -> String {
         self.holder_build_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The RUNNING holder image's preserved capabilities (live across
+    /// upgrades — updated by every rehello).
+    pub fn holder_capabilities(&self) -> Vec<String> {
+        self.holder_capabilities
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
@@ -359,6 +373,10 @@ impl HolderClient {
                     .holder_build_id
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = rh.holder_build_id.clone();
+                *self
+                    .holder_capabilities
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = rh.capabilities.clone();
                 let reply = Frame::new(
                     verbs::HELLO,
                     Some(req_id),
@@ -1203,6 +1221,7 @@ pub fn holder_spawn(
         effort: params.effort.clone(),
         effort_source: params.effort_source.clone(),
         global_perms: params.global_perms,
+        org: params.org.clone(),
         generation: 0,
         last_activity_at: None,
         last_input_at: None,
@@ -2075,6 +2094,7 @@ pub fn adopt_at_boot(
                 report_reason: e.report_reason.clone(),
                 incarnation: None,
                 status_lost: true,
+                org: e.org.clone(),
             });
             eprintln!(
                 "cm-daemon: session '{}' is in the persisted registry but not \
@@ -2135,6 +2155,9 @@ fn adopted_meta_from_manifest_entry(
         effort: e.effort.clone(),
         effort_source: e.effort_source.clone(),
         global_perms: e.global_perms,
+        // doc/org-model.md §12: the persisted org object survives the
+        // brain restart unchanged (the holder carries no session metadata).
+        org: e.org.clone(),
         generation: e.generation,
         // Activity cells reset to adoption time — the state-inventory
         // delta's accepted reset (afterglow UI restarts; auth and
@@ -2283,6 +2306,7 @@ fn orphan_meta(uid: &str) -> AdoptedSessionMeta {
         effort: None,
         effort_source: None,
         global_perms: false,
+        org: None,
         generation: 0,
         last_activity_at: None,
         last_input_at: None,
@@ -2308,6 +2332,7 @@ mod tests {
             exit_subs: Mutex::new(HashMap::new()),
             parked_exits: Mutex::new(Vec::new()),
             holder_build_id: Mutex::new("test".into()),
+            holder_capabilities: Mutex::new(Vec::new()),
             epoch: 1,
             holder_proto_min: ch::PROTO_VERSION_MIN,
             holder_proto_max: ch::PROTO_VERSION_MAX,
@@ -2395,6 +2420,7 @@ mod tests {
         transcript_path: Option<String>,
     ) -> crate::manifest::ManifestEntry {
         crate::manifest::ManifestEntry {
+            org: None,
             uid: "ts-abc-1".into(),
             managed_by_uid: Some("ts-parent-1".into()),
             generation: 3,
@@ -2449,6 +2475,25 @@ mod tests {
         // slack for test scheduling.
         let age = dr.at_instant.elapsed().as_secs_f64();
         assert!((25.0..40.0).contains(&age), "age {age}");
+    }
+
+    /// S0b (doc/org-model.md §12): a brain restart's adopt-at-boot keeps
+    /// the persisted org object (the holder carries no session metadata),
+    /// with both generation counters apart; a pre-feature entry adopts
+    /// with none.
+    #[test]
+    fn adopt_at_boot_keeps_the_org_object() {
+        let mut e = entry_with(None, None, None);
+        e.generation = 7;
+        e.org = Some(crate::manifest::tests::bridge_org());
+        let meta = adopted_meta_from_manifest_entry("ws-1", &e);
+        assert_eq!(meta.org, e.org);
+        assert_eq!(meta.generation, 7);
+        assert_eq!(meta.org.as_ref().unwrap()["occupancy_generation"], 11);
+        assert_eq!(meta.org.as_ref().unwrap()["member_id"], "m-7");
+        assert_eq!(meta.org.as_ref().unwrap()["acting_as"], "main");
+        e.org = None;
+        assert!(adopted_meta_from_manifest_entry("ws-1", &e).org.is_none());
     }
 
     #[test]

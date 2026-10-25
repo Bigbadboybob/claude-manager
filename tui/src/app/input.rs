@@ -4811,6 +4811,7 @@ mod yank_clipboard_tests {
         )
         .expect("session for test");
         TerminalSession {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -4947,6 +4948,7 @@ mod yank_clipboard_tests {
         parser.advance(&mut *term, "héllo world".as_bytes());
         drop(term);
         app.workspaces = vec![Workspace {
+            org: None,
             id: "mouse-ws".into(), name: "mouse".into(), is_closed: false, is_cloud: false,
             repo_url: None, worktree_path: None, main_repo_path: None,
             worker_vm: None, worker_zone: None, host_id: crate::hosts::HostId::local(),
@@ -5078,6 +5080,7 @@ mod past_workspace_reopen_tests {
         app.workspaces.clear();
         app.tasks.clear();
         app.workspaces.push(Workspace {
+            org: None,
             id: "ws-past-worker".into(),
             name: "past-worker".into(),
             is_closed: true,
@@ -7431,6 +7434,7 @@ mod input_handler_tests {
     fn ws_fixture(id: &str, sessions: &[(&str, &str)]) -> Workspace {
         use std::collections::HashMap;
         let mut out = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: id.to_string(),
@@ -7458,6 +7462,7 @@ mod input_handler_tests {
             )
             .expect("dummy session for fixture");
             out.sessions.push(TerminalSession {
+                org: None,
                 model: None,
                 model_source: None,
                 effort: None,

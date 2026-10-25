@@ -698,6 +698,7 @@ mod tests {
             repos: HashMap::new(),
         });
         app.workspaces = vec![Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "captured-workspace".into(),

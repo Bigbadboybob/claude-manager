@@ -1126,6 +1126,7 @@ mod stop_workflow_local_cleanup_tests {
 
     fn entry_with_workflow(run_id: Option<&str>) -> ManifestEntry {
         ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -1305,6 +1306,7 @@ mod rotation_binding_tests {
         workflow: Option<(&str, &str)>,
     ) -> TerminalSession {
         TerminalSession {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -1343,6 +1345,7 @@ mod rotation_binding_tests {
 
     fn ws_with(sessions: Vec<TerminalSession>) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-1".into(),

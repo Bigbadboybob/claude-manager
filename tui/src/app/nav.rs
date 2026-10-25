@@ -2308,6 +2308,7 @@ mod pinned_sort_tests {
 
     fn bare_ws(id: &str, pinned: bool) -> Workspace {
         Workspace {
+            org: None,
             id: id.to_string(),
             name: id.to_string(),
             is_closed: false,

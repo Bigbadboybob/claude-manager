@@ -2687,6 +2687,7 @@ mod tests {
         let mut ws = crate::app::lifecycle::revive_session_tests::dummy_ts("ts-perf", false, sessions.clone());
         ws.label = "Native-Rollout-Perf".into();
         app.workspaces.push(Workspace {
+            org: None,
             color: None, pinned: false, id: "ws-perf".into(), name: "perf".into(), is_closed: false,
             is_cloud: false, repo_url: None, worktree_path: None, main_repo_path: None, worker_vm: None,
             worker_zone: None, host_id: sessions.clone(), sessions: vec![ws], tombstones: vec![],
@@ -2894,6 +2895,7 @@ mod tests {
         ts.task_id = Some("task".into());
         app.sessions_restored = true;
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "w".into(),

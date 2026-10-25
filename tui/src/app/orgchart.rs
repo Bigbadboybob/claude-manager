@@ -2080,6 +2080,7 @@ mod tests {
 
     fn ws(id: &str, host: HostId) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: id.into(),

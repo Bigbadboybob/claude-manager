@@ -219,6 +219,7 @@ impl App {
     fn finish_remote_create(&mut self, spec: RemoteCreateSpec, prepared: PreparedRemoteCreate) {
         let session_type = spec.engine.as_session_type();
         let ts = TerminalSession {
+            org: None,
             model: prepared.model.clone(),
             model_source: prepared.model_source.clone(),
             effort: prepared.effort.clone(),
@@ -261,6 +262,7 @@ impl App {
             host_id: spec.host.clone(),
         };
         let ws = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: spec.workspace_id,

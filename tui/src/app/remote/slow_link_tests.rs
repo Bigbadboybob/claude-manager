@@ -252,6 +252,7 @@ impl Fixture {
         app.host_pool = Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
         app.attach_worker = Some(crate::attach_worker::AttachWorker::spawn(app.host_pool.clone()));
         app.workspaces = vec![Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-slow".into(),

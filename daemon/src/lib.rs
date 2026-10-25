@@ -57,6 +57,10 @@ pub mod adopt;
 pub mod agent_state;
 pub mod attach;
 pub mod attach_output;
+pub mod capabilities;
+/// The org-model preservation object and capability names, shared with the
+/// holder (doc/org-model.md §12).
+pub use cm_holder_proto::org as org_bridge;
 pub mod claude_trust;
 pub mod claude_channels;
 pub mod claude_presence;
@@ -1136,6 +1140,12 @@ pub fn run() -> anyhow::Result<()> {
                 .expect("holder mode fetched the boot handshake at startup");
             holder_mode::adopt_at_boot(&state, client, boot);
         }
+        // doc/org-model.md §12: record this generation's capabilities so a
+        // later brain can vouch for it as its rollback pin. Off the boot
+        // path (it hashes the binary).
+        let _ = std::thread::Builder::new()
+            .name("cm-capabilities".into())
+            .spawn(crate::capabilities::record_boot);
         let preflight = mcp_config::run_mcp_preflight(server_override_owned.as_deref());
         {
             let mut st = state.lock().unwrap_or_else(|p| p.into_inner());

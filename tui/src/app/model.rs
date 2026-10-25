@@ -155,6 +155,10 @@ pub struct TerminalSession {
     /// clobber the field to `None` and the named acceptance
     /// criterion would fail.
     pub preserved_last_exit: Option<cm_daemon::manifest::LastExit>,
+    /// Read-through copy of `ManifestEntry.org` (doc/org-model.md §12):
+    /// opaque, loaded with the entry and written back unchanged, like
+    /// `preserved_last_exit`.
+    pub org: Option<cm_daemon::org_bridge::OrgObject>,
     /// 12b (Phase 3): tags the in-memory session with the host
     /// its daemon runs on. Read through from `ManifestEntry.host_id`
     /// on load; new sessions get the active host
@@ -251,6 +255,7 @@ impl TerminalSession {
             // Round-trip the host_id from the in-memory session so a
             // remote-pinned entry stays pinned to its host.
             host_id: self.host_id.clone(),
+            org: self.org.clone(),
         }
     }
 }
@@ -332,6 +337,10 @@ pub struct Workspace {
     /// settings. Cascades to sessions without their own color. Persisted
     /// in `ManifestWorkspace`.
     pub color: Option<String>,
+    /// The workspace's org object (`ManifestWorkspace.org`,
+    /// doc/org-model.md §12): its `workspace_kind` and `binding_epoch`.
+    /// Round-tripped through the manifest; echoed in `task.update_tree`.
+    pub org: Option<cm_daemon::org_bridge::OrgObject>,
     /// Pinned workspaces sort to the top of the sidebar, ahead of the
     /// status-ranked rest. Toggled in A-e settings; persisted in
     /// `ManifestWorkspace`.
@@ -526,6 +535,7 @@ pub(super) fn make_simple_session_with_uid(
     pending_jsonl_files: Option<Vec<String>>,
 ) -> TerminalSession {
     TerminalSession {
+        org: None,
         model: session.spawn_model.clone(),
         model_source: session.spawn_model_source.clone(),
         effort: session.spawn_effort.clone(),
@@ -643,6 +653,7 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn seeded_from_snapshot_round_trips() {
         let entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -699,6 +710,7 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn none_does_not_serialize() {
         let entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -770,6 +782,7 @@ mod manifest_entry_seeded_from_tests {
         // the round-trip preserves the flag so the toast renders
         // correctly post-restart.
         let entry = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -845,6 +858,7 @@ mod manifest_entry_seeded_from_tests {
             exited_at: 1_700_000_000.0,
         };
         let initial = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -900,6 +914,7 @@ mod manifest_entry_seeded_from_tests {
         // the pre-fix `last_exit: None`, the assertion at the end of
         // this test would fail.
         let rebuilt = ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -965,6 +980,7 @@ mod transcript_rebind_tests {
             crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
                 .expect("session for test");
         TerminalSession {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -1131,6 +1147,7 @@ mod worktree_mode_tests {
 
     fn ws(worktree: Option<&str>, main: Option<&str>) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "w".into(),

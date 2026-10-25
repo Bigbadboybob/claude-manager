@@ -471,6 +471,13 @@ pub struct ManifestEntry {
     pub reported_done_at: Option<f64>,
     #[serde(default)]
     pub report_reason: Option<String>,
+    /// The org-model preservation object (doc/org-model.md §12, S0b):
+    /// opaque and nested, carried unchanged by every path that rebuilds
+    /// this entry (persist, adopt, reexec, revive, resume, rollback). Its
+    /// `occupancy_generation` is unrelated to the transcript `generation`
+    /// above. See [`cm_holder_proto::org`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<cm_holder_proto::org::OrgObject>,
 }
 
 /// 12b: serde-default constructor for `ManifestEntry::host_id`.
@@ -519,6 +526,13 @@ pub struct ManifestWorkspace {
     /// ordering only — no daemon behavior keys off it.
     #[serde(default)]
     pub pinned: bool,
+    /// The workspace's org object (doc/org-model.md §12, S0b): its
+    /// `workspace_kind` (absent = unclassified; new isolated/branch-mode
+    /// mints are `ephemeral`) and `binding_epoch` (set by the central
+    /// org model; while set, local reconstruction never re-infers this
+    /// workspace's task bindings). Opaque otherwise; round-tripped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<cm_holder_proto::org::OrgObject>,
     #[serde(default)]
     pub sessions: Vec<ManifestEntry>,
     /// Recently-closed sessions kept around so `read_session_output` can
@@ -526,6 +540,19 @@ pub struct ManifestWorkspace {
     /// on TUI startup; see `TOMBSTONE_RETENTION_SECS`.
     #[serde(default)]
     pub tombstones: Vec<SessionTombstone>,
+}
+
+/// The org object a newly minted isolated/branch-mode workspace gets:
+/// `workspace_kind = ephemeral` (doc/org-model.md §12). Existing
+/// workspaces stay unclassified (no `org`).
+pub fn ephemeral_workspace_org() -> Option<cm_holder_proto::org::OrgObject> {
+    let mut org = None;
+    cm_holder_proto::org::set(
+        &mut org,
+        cm_holder_proto::org::WORKSPACE_KIND,
+        serde_json::Value::String(cm_holder_proto::org::KIND_EPHEMERAL.into()),
+    );
+    org
 }
 
 /// Lightweight record of a session that's been closed. Holds only what
@@ -671,7 +698,7 @@ pub struct SidebarSection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn sample_exit(memory_cap_kill: bool) -> LastExit {
@@ -1026,6 +1053,7 @@ mod tests {
     #[test]
     fn t_g3b_explicit_host_id() {
         let entry = ManifestEntry {
+            org: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -1067,6 +1095,65 @@ mod tests {
         assert_eq!(back.host_id, crate::host_id::HostId::new("manager"));
         assert_eq!(back.uid, entry.uid);
         assert_eq!(back.label, entry.label);
+    }
+
+    /// S0b fixtures (doc/org-model.md §12). A record written by a
+    /// pre-feature binary has no `org`; one written by a bridge-capable
+    /// binary carries keys this build does not know. Both round-trip
+    /// exactly, the occupancy generation stays apart from the transcript
+    /// `generation`, and a workspace's org object survives too.
+    pub(crate) fn bridge_org() -> cm_holder_proto::org::OrgObject {
+        serde_json::json!({
+            "member_id": "m-7",
+            "occupancy_id": "occ-3",
+            "occupancy_generation": 11,
+            "acting_as": "main",
+            "binding_epoch": 4,
+            "from_a_later_stage": {"nested": [1, 2], "flag": true},
+        })
+        .as_object()
+        .cloned()
+        .unwrap()
+    }
+
+    #[test]
+    fn s0b_pre_feature_record_has_no_org_and_stays_byte_stable() {
+        let pre = r#"{"uid":"ts","generation":7,"label":"x","session_type":"claude","transcript_id":null,"host_id":"local"}"#;
+        let loaded: ManifestEntry = serde_json::from_str(pre).expect("load");
+        assert!(loaded.org.is_none());
+        let saved = serde_json::to_string(&loaded).unwrap();
+        assert!(!saved.contains("\"org\""), "an unset org is not written: {saved}");
+        let ws: ManifestWorkspace = serde_json::from_str(r#"{"id":"w","sessions":[]}"#).unwrap();
+        assert!(ws.org.is_none(), "existing workspaces stay unclassified");
+        assert!(!serde_json::to_string(&ws).unwrap().contains("\"org\""));
+    }
+
+    #[test]
+    fn s0b_bridge_record_round_trips_unknown_org_keys() {
+        let org = bridge_org();
+        let entry: ManifestEntry = serde_json::from_value(serde_json::json!({
+            "uid": "ts", "generation": 7, "label": "x", "session_type": "codex",
+            "transcript_id": null, "org": org,
+        }))
+        .unwrap();
+        let back: ManifestEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(back.org.as_ref(), Some(&org));
+        assert_eq!(back.generation, 7, "the transcript generation is its own field");
+        assert_eq!(back.org.as_ref().unwrap()["occupancy_generation"], 11);
+        let ws: ManifestWorkspace = serde_json::from_value(serde_json::json!({
+            "id": "w", "org": {"workspace_kind": "ephemeral", "later": 1}, "sessions": [back],
+        }))
+        .unwrap();
+        let ws: ManifestWorkspace =
+            serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert_eq!(cm_holder_proto::org::workspace_kind(ws.org.as_ref()), Some("ephemeral"));
+        assert_eq!(ws.org.as_ref().unwrap()["later"], 1);
+        assert_eq!(ws.sessions[0].org.as_ref(), Some(&org));
+        assert_eq!(
+            cm_holder_proto::org::workspace_kind(ephemeral_workspace_org().as_ref()),
+            Some("ephemeral"),
+        );
     }
 
     /// T_g3b_serde_byte_stable_after_upgrade — load a pre-12
@@ -1139,6 +1226,7 @@ mod tests {
 
         // A continuous-tagged entry round-trips the id.
         let tagged = ManifestEntry {
+            org: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,

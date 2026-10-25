@@ -265,6 +265,8 @@ fn hello_negotiates_and_status_answers() {
     assert_eq!(hello.proto, ch::PROTO_VERSION_MAX);
     assert_eq!(hello.epoch, 1);
     assert_eq!(hello.session_count, 0);
+    // doc/org-model.md §12: the holder reports what it preserves.
+    assert_eq!(hello.capabilities, vec![cm_holder_proto::org::ORG_PRESERVE_V1.to_string()]);
 
     let (f, _) = brain.request(verbs::STATUS, serde_json::json!({}));
     let st: ch::StatusReplyBody = f.parse_body().unwrap();

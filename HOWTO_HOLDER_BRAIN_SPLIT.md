@@ -57,6 +57,7 @@ Key fields in split mode:
 | `holder_pending_exit_events` | exits the brain hasn't durably acked yet | 0 at rest |
 | `holder_status_error` | the holder didn't answer `status` | absent |
 | `mcp_ok` | MCP preflight at brain boot | `true` |
+| `capabilities` | org-model capabilities per role (doc/org-model.md §12): `brain`, `holder` (from its hello/rehello; `[]` from a holder older than S0b), `rollback_pin` (from `~/.cm/brain-capabilities.json`, `[]` when the pin predates S0b) and `advertised` = their intersection | `advertised` contains `org_preserve_v1` once the holder is the S0b build **and** the pin is an S0b-or-later brain (i.e. from the second S0b-era brain deploy on) |
 
 **The all-clear after any deploy:** `holder_epoch` went up by exactly one,
 sessions unchanged, `breaker_state == "running"` and `holder_epoch` still the
@@ -88,6 +89,15 @@ The holder also treats `ECONNRESET` as channel EOF, preserving an acknowledged
 arm when an older brain exits with unread frames. That change requires
 `daemon.upgrade_holder`; deploying only the brain does not update the running
 holder. Malformed frames and watchdog failures still take the crash path.
+
+**The org preservation bridge (S0b, doc/org-model.md §12)** needs the holder
+too: an older holder still runs an S0b brain fine (it carries no session
+metadata; the `org` object rides `daemon-sessions.json`), but its
+reverse-migration parse (`split_rollback`) drops `org`, and it reports no
+capabilities, so `daemon.health.capabilities.advertised` stays without
+`org_preserve_v1` until `daemon.upgrade_holder` runs with the S0b holder
+(crate 0.2.0). That upgrade is Owner's call; it is planned into a deploy, not
+run with it.
 
 **Check the pin first** (`ps -o cmd -p $(pgrep -f cm-holder)`): when the holder
 runs `--brain /opt/cm-daemon/cm-daemon` — true on cm-sessions since 2026-09-12

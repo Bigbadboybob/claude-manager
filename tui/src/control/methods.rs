@@ -1614,6 +1614,8 @@ fn mint_workspace_for_task(
 
     let new_ws_id = crate::app::new_workspace_id();
     app.workspaces.push(Workspace {
+        // A minted task worktree is ephemeral (doc/org-model.md §12).
+        org: cm_daemon::manifest::ephemeral_workspace_org(),
         color: None,
         pinned: false,
         id: new_ws_id.clone(),
@@ -1659,6 +1661,7 @@ fn mint_workspace_for_task(
             parent_task_id,
             &new_ws_id,
             Some(minted.worktree_path.as_path()),
+            Some(cm_daemon::org_bridge::KIND_EPHEMERAL),
         ) {
             // Non-fatal: the worktree exists and the TUI has the binding,
             // so failing the spawn would strand a checkout. The caller is
@@ -2182,6 +2185,8 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
                 // Register a fresh workspace for this subtask.
                 let new_ws_id = crate::app::new_workspace_id();
                 let new_ws = Workspace {
+                    // A branch-mode mint is ephemeral (doc/org-model.md §12).
+                    org: cm_daemon::manifest::ephemeral_workspace_org(),
                     color: None,
                     pinned: false,
                     id: new_ws_id.clone(),
@@ -2212,6 +2217,7 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
                 let main_repo = in_place_main_repo.expect("validated above");
                 let new_ws_id = crate::app::new_workspace_id();
                 let new_ws = Workspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: new_ws_id.clone(),
@@ -2264,7 +2270,8 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
                 .ok_or_else(|| anyhow::anyhow!("daemon socket unavailable"))?;
             crate::client_session::rpc_register_agent_subtask(&socket,
                 &host_pool.operator_token_for(&host), &new_task_id, &parent_task_id,
-                &workspace_id_for_new, Some(&worktree_path))
+                &workspace_id_for_new, Some(&worktree_path),
+                (p.worktree_mode == "branch").then_some(cm_daemon::org_bridge::KIND_EPHEMERAL))
         })();
         if let Err(e) = registration {
             eprintln!("cm-tui: create_subtask registration failed: {e} (async push will retry)");
@@ -3058,6 +3065,7 @@ mod tests {
 
     fn live_ts(uid: &str, task_id: Option<&str>) -> TerminalSession {
         TerminalSession {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -3096,6 +3104,7 @@ mod tests {
 
     fn workspace_with(sessions: Vec<TerminalSession>, tombstones: Vec<SessionTombstone>) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-1".into(),
@@ -3918,6 +3927,7 @@ mod tests {
             repos: HashMap::new(),
         });
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-caller".into(),
@@ -3975,6 +3985,7 @@ mod tests {
             git(&wt, &["add", "-A"]);
             git(&wt, &["commit", "-q", "-m", "fix"]);
             app.workspaces.push(Workspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-sub".into(),

@@ -1616,6 +1616,9 @@ pub struct DaemonSessionSummary {
     pub model_source: Option<String>,
     pub effort: Option<String>,
     pub effort_source: Option<String>,
+    /// The session's org object (doc/org-model.md §12), opaque; carried
+    /// into the adopted row's manifest entry.
+    pub org: Option<cm_daemon::org_bridge::OrgObject>,
 }
 
 /// Parse one `list_sessions` array entry into a [`DaemonSessionSummary`].
@@ -1656,6 +1659,7 @@ pub fn parse_daemon_session_summary(entry: &serde_json::Value) -> Option<DaemonS
         model_source: str_field("model_source"),
         effort: str_field("effort"),
         effort_source: str_field("effort_source"),
+        org: entry.get("org").and_then(|v| v.as_object()).cloned(),
     })
 }
 
@@ -1687,10 +1691,10 @@ pub fn rpc_list_daemon_sessions(
 /// The `list_sessions` row fields [`parse_daemon_session_summary`] reads.
 /// Asking for only these drops `agent_state` (three quarters of the reply;
 /// the TUI gets it from `manifest.watch`). Older daemons ignore the list.
-const SUMMARY_FIELDS: [&str; 17] = [
+const SUMMARY_FIELDS: [&str; 18] = [
     "session_uid", "label", "type", "managed_by_uid", "workspace_id", "task_id",
     "workflow_run_id", "workflow_role", "worktree_path", "continuous_task_id", "cols",
-    "rows", "global_perms", "model", "model_source", "effort", "effort_source",
+    "rows", "global_perms", "model", "model_source", "effort", "effort_source", "org",
 ];
 
 /// [`rpc_list_daemon_sessions`] for a poller: pass the etag of the list it
@@ -2097,6 +2101,9 @@ pub fn rpc_session_revive(
             "model_source": entry.model_source,
             "effort": entry.effort,
             "effort_source": entry.effort_source,
+            // doc/org-model.md §12: used when the host's own record has
+            // none; an older daemon ignores it.
+            "org": entry.org,
         }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
@@ -2327,6 +2334,7 @@ pub fn rpc_register_agent_subtask(
     parent_task_id: &str,
     workspace_id: &str,
     worktree_path: Option<&Path>,
+    workspace_kind: Option<&str>,
 ) -> anyhow::Result<()> {
     let req = Request {
         id: next_request_id(),
@@ -2337,6 +2345,8 @@ pub fn rpc_register_agent_subtask(
             "parent_task_id": parent_task_id,
             "workspace_id": workspace_id,
             "worktree_path": worktree_path.map(|p| p.display().to_string()),
+            // doc/org-model.md §12; an older daemon ignores it.
+            "workspace_kind": workspace_kind,
         }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
@@ -2346,7 +2356,7 @@ pub fn rpc_task_update_tree(
     daemon_socket: &Path,
     operator_token_id: &str,
     tasks: &[(String, Option<String>, Option<String>)],
-    workspaces: &[(String, Option<String>)],
+    workspaces: &[(String, Option<String>, u64)],
 ) -> anyhow::Result<()> {
     let tasks_json: Vec<serde_json::Value> = tasks
         .iter()
@@ -2360,10 +2370,13 @@ pub fn rpc_task_update_tree(
         .collect();
     let workspaces_json: Vec<serde_json::Value> = workspaces
         .iter()
-        .map(|(workspace_id, worktree_path)| {
+        .map(|(workspace_id, worktree_path, binding_epoch)| {
             serde_json::json!({
                 "workspace_id": workspace_id,
                 "worktree_path": worktree_path,
+                // The workspace's org.binding_epoch as this TUI knows it
+                // (doc/org-model.md §12); 0 when unset.
+                "binding_epoch": binding_epoch,
             })
         })
         .collect();
@@ -2610,6 +2623,7 @@ pub(crate) mod tests {
         state_inner.workspaces.insert(
             ws_id.into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: ws_id.into(),
@@ -3091,6 +3105,7 @@ time.sleep(60)
             start_test_daemon("ws-revive");
         let uid = test_uid();
         let entry = cm_daemon::manifest::ManifestEntry {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -3390,6 +3405,7 @@ while True:
             "task-orch",
             "ws-sub",
             Some(Path::new("/tmp/wt-sub")),
+            None,
         )
         .expect("register ok");
         {
@@ -3429,9 +3445,10 @@ while True:
             start_test_daemon("ws-finish-push");
         // Round 1: push workspace WITH a worktree_path
         // (pre-`finish_push` state).
-        let workspaces_pre: Vec<(String, Option<String>)> = vec![(
+        let workspaces_pre: Vec<(String, Option<String>, u64)> = vec![(
             "ws-pushed".to_string(),
             Some("/tmp/about-to-be-pushed-to-cloud".to_string()),
+            0,
         )];
         rpc_task_update_tree(&socket, "op-fp", &[], &workspaces_pre)
             .expect("pre push ok");
@@ -3451,8 +3468,8 @@ while True:
         // finish_push` produces via
         // `push_task_tree_to_daemon`'s iterator over
         // `self.workspaces`.
-        let workspaces_post: Vec<(String, Option<String>)> = vec![
-            ("ws-pushed".to_string(), None),
+        let workspaces_post: Vec<(String, Option<String>, u64)> = vec![
+            ("ws-pushed".to_string(), None, 0),
         ];
         rpc_task_update_tree(&socket, "op-fp", &[], &workspaces_post)
             .expect("post push ok");

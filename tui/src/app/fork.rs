@@ -681,6 +681,7 @@ impl App {
             Some(wi) => wi,
             None => {
                 self.workspaces.push(Workspace {
+                    org: None,
                     id: reply.workspace_id.clone(),
                     name: task_name.clone(),
                     is_closed: false,
@@ -1003,6 +1004,7 @@ mod tests {
         ts.transcript_id = transcript.map(str::to_string);
         ts.task_id = Some("task-src".into());
         app.workspaces.push(Workspace {
+            org: None,
             color: Some("teal".into()),
             pinned: false,
             id: "ws-1".into(),

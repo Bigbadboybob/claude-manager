@@ -86,6 +86,11 @@ impl History {
                 record.entry.transcript_id = old.entry.transcript_id.clone();
                 record.entry.transcript_path = old.entry.transcript_path.clone();
             }
+            // The identity's org object (its member id, doc/org-model.md
+            // §12) outlives a record that was rebuilt without one.
+            if record.entry.org.is_none() {
+                record.entry.org = old.entry.org.clone();
+            }
         }
         if let Some(id) = &record.entry.transcript_id {
             record.transcript_ids.insert(id.clone());
@@ -99,6 +104,9 @@ impl History {
         if let Some(old) = self.records.get(&e.uid) {
             Preferences::from_entry(&old.entry).apply(e);
             e.generation = e.generation.max(old.entry.generation);
+            if e.org.is_none() {
+                e.org = old.entry.org.clone();
+            }
         }
         if let Some(p) = self.preferences.get(&e.uid) {
             p.apply(e);
@@ -318,6 +326,7 @@ pub fn resolve_and_claim(
                 "generation": t.generation, "task_id": t.task_id,
                 "managed_by_uid": t.managed_by_uid, "global_perms": t.global_perms,
                 "workflow_run_id": t.workflow_run_id, "workflow_role": t.workflow_role,
+                "org": t.org,
             }))
             .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
             candidates.insert(
@@ -440,6 +449,28 @@ mod tests {
         assert_eq!(recovered.worktree_path, original.worktree_path);
         // Messaging ids are daemon-id + this UID; no person is minted on Resume.
         assert_eq!(recovered.entry.uid, "ts-abc-0");
+    }
+    /// S0b (doc/org-model.md §12): a resumed identity keeps its org
+    /// object (its member id) across a restart, and a later record rebuilt
+    /// without one does not erase it.
+    #[test]
+    fn resume_identity_keeps_the_org_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = DaemonState::new();
+        s.daemon_sessions_path = Some(tmp.path().join("daemon-sessions.json"));
+        let mut original = record("ts-org-0", "thread-o");
+        original.entry.org = Some(crate::manifest::tests::bridge_org());
+        remember(&s, original.clone()).unwrap();
+        remember(&s, record("ts-org-0", "thread-o")).unwrap();
+        persist(&s).unwrap();
+        let mut restarted = DaemonState::new();
+        restarted.daemon_sessions_path = s.daemon_sessions_path.clone();
+        let state = Arc::new(Mutex::new(restarted));
+        let (_claim, recovered) = resolve_and_claim(&state, "codex", "thread-o").unwrap();
+        let entry = recovered.unwrap().entry;
+        assert_eq!(entry.org, original.entry.org);
+        assert_eq!(entry.org.as_ref().unwrap()["member_id"], "m-7");
+        assert_eq!(entry.generation, 42, "the transcript generation is untouched");
     }
     #[test]
     fn resume_identity_claims_reject_simultaneous_resumes_and_release_on_failure() {

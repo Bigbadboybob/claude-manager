@@ -58,7 +58,7 @@ enum PushCommand {
     OwnerAttention(crate::owner_notification::Command),
     TaskTree {
         tasks: Vec<(String, Option<String>, Option<String>)>,
-        workspaces: Vec<(String, Option<String>)>,
+        workspaces: Vec<(String, Option<String>, u64)>,
         hosts: Vec<HostId>,
     },
     TuiSessions {
@@ -112,7 +112,7 @@ impl PushWorker {
     pub fn push_task_tree(
         &self,
         tasks: Vec<(String, Option<String>, Option<String>)>,
-        workspaces: Vec<(String, Option<String>)>,
+        workspaces: Vec<(String, Option<String>, u64)>,
         hosts: Vec<HostId>,
     ) {
         let _ = self.cmd_tx.send(PushCommand::TaskTree {
@@ -181,7 +181,7 @@ struct Pending {
     owner_attention: Vec<crate::owner_notification::Command>,
     task_tree: Option<(
         Vec<(String, Option<String>, Option<String>)>,
-        Vec<(String, Option<String>)>,
+        Vec<(String, Option<String>, u64)>,
         Vec<HostId>,
     )>,
     tui_sessions: Option<HashMap<HostId, Vec<TuiSessionRow>>>,
@@ -322,7 +322,7 @@ fn push_task_tree(
     last_hashes: &mut HashMap<(HostId, PushKind), u64>,
     host_id: &HostId,
     tasks: &[(String, Option<String>, Option<String>)],
-    workspaces: &[(String, Option<String>)],
+    workspaces: &[(String, Option<String>, u64)],
 ) {
     if host_pool.should_skip_for_push(host_id, Instant::now()) {
         return;

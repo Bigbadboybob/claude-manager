@@ -513,6 +513,7 @@ fn with_stub_ctx<T>(f: impl FnOnce(AgentCtx<'_>) -> T) -> T {
     )
     .expect("dummy session");
     let ts = crate::app::TerminalSession {
+        org: None,
         model: None,
         model_source: None,
         effort: None,
@@ -706,6 +707,7 @@ fn make_codex_test_session(transcript_id: &str) -> crate::app::TerminalSession {
     )
     .expect("dummy session");
     crate::app::TerminalSession {
+        org: None,
         model: None,
         model_source: None,
         effort: None,

@@ -97,6 +97,7 @@ impl App {
             workspaces.insert(
                 ws.id.clone(),
                 ManifestWorkspace {
+                    org: ws.org.clone(),
                     id: ws.id.clone(),
                     name: ws.name.clone(),
                     is_closed: ws.is_closed,
@@ -419,6 +420,7 @@ impl App {
                 && !bound_ws_ids.contains(&mw.id)
                 && !restored_tombstones.is_empty();
             let mut ws = Workspace {
+                org: mw.org.clone(),
                 id: mw.id.clone(),
                 name: if mw.name.is_empty() {
                     mw.worktree_path
@@ -1094,6 +1096,7 @@ impl App {
                     let new_id = s.workspace_id.clone().filter(|id| !id.is_empty())
                         .unwrap_or_else(new_workspace_id);
                     self.workspaces.push(Workspace {
+                        org: None,
                         color: None,
                         pinned: false,
                         id: new_id.clone(),
@@ -1135,6 +1138,7 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> TerminalSession {
         TerminalSession {
+            org: s.org.clone(),
             model: s.model.clone().or_else(|| session.spawn_model.clone()),
             model_source: s.model_source.clone().or_else(|| session.spawn_model_source.clone()),
             effort: s.effort.clone().or_else(|| session.spawn_effort.clone()),
@@ -1182,6 +1186,7 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
+            org: s.org.clone(),
             model: s.model.clone(),
             model_source: s.model_source.clone(),
             effort: s.effort.clone(),
@@ -1622,6 +1627,7 @@ impl App {
         // value used in `session_uid_for_mcp` above. Don't generate a
         // fresh one here.
         let ts = TerminalSession {
+            org: entry.org.clone(),
             model: s.spawn_model.clone().or_else(|| entry.model.clone()),
             model_source: s.spawn_model_source.clone().or_else(|| entry.model_source.clone()),
             effort: s.spawn_effort.clone().or_else(|| entry.effort.clone()),
@@ -1679,6 +1685,7 @@ mod adopt_daemon_session_tests {
 
     fn summary(uid: &str, managed_by_uid: Option<&str>) -> DaemonSessionSummary {
         DaemonSessionSummary {
+            org: None,
             model: None,
             model_source: None,
             effort: None,
@@ -1742,6 +1749,21 @@ mod adopt_daemon_session_tests {
         let tracked = |uid: &str| uid == "loose";
         App::settle_taskless(&mut seen, &all, &tracked, &in_flight, later);
         assert!(!seen.contains_key("loose"));
+    }
+
+    /// doc/org-model.md §12: an adopted daemon session's org object lands
+    /// in the viewer's manifest entry unchanged.
+    #[test]
+    fn adopted_summary_keeps_the_org_object() {
+        let mut s = summary("agent-org", Some("ts-parent"));
+        s.org = serde_json::json!({"member_id": "m-7", "later": [1]}).as_object().cloned();
+        let entry = App::manifest_entry_from_summary(&s, &cm_daemon::host_id::HostId::local());
+        assert_eq!(entry.org, s.org);
+        let parsed = crate::client_session::parse_daemon_session_summary(&serde_json::json!({
+            "session_uid": "u", "org": {"member_id": "m-7"},
+        }))
+        .unwrap();
+        assert_eq!(parsed.org.unwrap()["member_id"], "m-7");
     }
 
     #[test]
@@ -1813,6 +1835,29 @@ mod adopt_daemon_session_tests {
         assert!(!app.auto_close_workspaces.contains(&wid), "rename claims the wrapper");
         assert!(!app.close_agent_marker_if_empty(wi));
         assert!(!App::load_manifest().auto_close_workspaces.contains(&wid));
+    }
+
+    /// doc/org-model.md §12: a workspace's org object (its kind, unknown
+    /// keys) survives the viewer's full-replace manifest save, and the
+    /// task-tree push reports its binding_epoch.
+    #[test]
+    fn workspace_org_survives_the_manifest_save() {
+        let _guard = crate::test_support::home_lock();
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(), api_token: String::new(), gcp_project: String::new(),
+            gcp_zone: String::new(), repos: std::collections::HashMap::new(),
+        });
+        let host = cm_daemon::host_id::HostId::local();
+        let mut worker = summary("org-worker", Some("p"));
+        worker.workspace_id = Some("org-ws".into());
+        let wid = app.resolve_adopt_workspace(&worker, &host).0;
+        let wi = app.workspaces.iter().position(|w| w.id == wid).unwrap();
+        let org = serde_json::json!({"workspace_kind": "ephemeral", "binding_epoch": 3, "later": 1});
+        app.workspaces[wi].org = org.as_object().cloned();
+        app.sessions_restored = true;
+        assert!(app.try_save_session_manifest());
+        let disk = App::load_manifest();
+        assert_eq!(disk.workspaces[&wid].org, org.as_object().cloned());
     }
 
     #[test]

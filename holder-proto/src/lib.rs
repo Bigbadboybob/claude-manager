@@ -31,6 +31,7 @@
 
 pub mod channel;
 pub mod holder_manifest;
+pub mod org;
 pub mod reexec_manifest;
 
 #[cfg(test)]

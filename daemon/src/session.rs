@@ -669,6 +669,10 @@ pub struct SpawnParams {
     /// guard), so a normal agent can never self-promote. `false` is
     /// the default and the safe baseline (descendant-only scope).
     pub global_perms: bool,
+    /// The org-model preservation object (doc/org-model.md §12): opaque,
+    /// carried from the record this session was built from to every record
+    /// built from it.
+    pub org: Option<cm_holder_proto::org::OrgObject>,
     /// Human-readable label for the sidebar. Not used for routing.
     pub title: String,
     /// Program to exec. Typically `claude`, `codex`, or `bash`.
@@ -769,6 +773,7 @@ impl SpawnParams {
             // the safe baseline. Only the operator (TUI) or a global
             // caller can flip this true at spawn time.
             global_perms: false,
+            org: None,
             title: title.into(),
             shell: shell.into(),
             args: Vec::new(),
@@ -1186,6 +1191,10 @@ pub struct DaemonSession {
     /// `SpawnParams` through `arm_reaper`. See the field doc on
     /// `SpawnParams.global_perms` for the grant rules.
     pub global_perms: bool,
+    /// The org-model preservation object (doc/org-model.md §12): opaque,
+    /// carried from the record this session was built from to every record
+    /// built from it.
+    pub org: Option<cm_holder_proto::org::OrgObject>,
     /// Sub-2b-1 review-r#2 #2: transcript generation counter.
     /// Initialized to 0; incremented by `session.set_transcript_path`
     /// when the incoming path differs from `transcript_path`
@@ -1527,6 +1536,7 @@ impl DaemonSession {
             transcript_path: self.transcript_path.clone(),
             reported_done_at: self.reported_done().map(|r| r.at_unix),
             report_reason: self.reported_done().and_then(|r| r.reason),
+            org: self.org.clone(),
         }
     }
 
@@ -1612,6 +1622,7 @@ struct PendingSessionInner {
     effort_source: Option<String>,
     /// Global-perms grant, carried SpawnParams → DaemonSession.
     global_perms: bool,
+    org: Option<cm_holder_proto::org::OrgObject>,
     /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
     /// from `PendingSession::spawn` → `arm_reaper` →
     /// `DaemonSession`. The fanout already holds an Arc clone
@@ -1957,6 +1968,7 @@ impl PendingSession {
                 effort: params.effort,
                 effort_source: params.effort_source,
                 global_perms: params.global_perms,
+                org: params.org,
                 last_activity_at,
                 title: params.title,
                 fanout,
@@ -2028,6 +2040,7 @@ impl PendingSession {
             effort,
             effort_source,
             global_perms,
+            org,
             last_activity_at,
             title,
             fanout,
@@ -2133,6 +2146,7 @@ impl PendingSession {
             effort,
             effort_source,
             global_perms,
+            org,
             // Sub-2b-1 review-r#2 #2: generation starts at 0;
             // `session.set_transcript_path` increments on
             // path-change. Subscribed-from-spawn callers
@@ -2466,6 +2480,10 @@ pub struct AdoptedSessionMeta {
     /// Global-permissions grant — an orchestrator must not lose its
     /// scope across a deploy.
     pub global_perms: bool,
+    /// The org-model preservation object (doc/org-model.md §12): opaque,
+    /// carried from the record this session was built from to every record
+    /// built from it.
+    pub org: Option<cm_holder_proto::org::OrgObject>,
     /// Transcript generation counter, restored from the manifest so
     /// post-handoff cursor semantics don't reset.
     pub generation: u64,
@@ -2698,6 +2716,7 @@ impl AdoptedSessionBuild {
             effort: meta.effort,
             effort_source: meta.effort_source,
             global_perms: meta.global_perms,
+            org: meta.org,
             generation: meta.generation,
             last_activity_at,
             // Reconstructed status cells (ages → Instants, done in

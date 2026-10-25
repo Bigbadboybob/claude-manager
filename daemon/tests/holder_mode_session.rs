@@ -71,6 +71,7 @@ fn spawn_cat() -> (libc::pid_t, OwnedFd, OwnedFd) {
 
 fn test_meta(title: &str) -> AdoptedSessionMeta {
     AdoptedSessionMeta {
+        org: None,
         title: title.into(),
         session_type: "bash".into(),
         model: None,
