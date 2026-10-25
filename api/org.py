@@ -74,6 +74,17 @@ class CloseAssistantBody(_Strict):
     request_id: RequestId | None = None
 
 
+class PromoteBody(_Strict):
+    actor: Actor
+    pid: Annotated[str, Field(min_length=1, max_length=300)]
+    handle: Short
+    title: Short | None = None
+    team: Short | None = None
+    manager: Short | None = None
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    request_id: RequestId | None = None
+
+
 class MoveBody(_Strict):
     actor: Actor
     manager: Short | None = None
@@ -183,6 +194,17 @@ async def reinstate_member(ref: Ref, body: ReinstateBody, request: Request):
     return await _call(org_db.reinstate(
         _pool(request), body.actor.model_dump(), ref, reason=body.reason,
         request_id=body.request_id))
+
+
+@router.post("/assistants/promote")
+async def promote_assistant(body: PromoteBody, request: Request):
+    """A member's assistant becomes a new member managed by it (§4.2)."""
+    return await _call(org_db.promote(
+        _pool(request), body.actor.model_dump(), pid=body.pid, handle=body.handle,
+        title=body.title, team=body.team, manager=body.manager, reason=body.reason,
+        request_id=body.request_id))
+
+
 @router.post("/assistants/close")
 async def close_assistant(body: CloseAssistantBody, request: Request):
     """Deliberately close a member's assistant (O5): authority and the

@@ -30,6 +30,7 @@ pub const METHODS: &[&str] = &[
     "org.retire",
     "org.reinstate",
     "org.close_assistant",
+    "org.promote",
 ];
 
 /// The read-only ones (restart-barrier classification).
@@ -76,6 +77,7 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                 api(ctx.api.post(&format!("/org/members/{}/{verb}", encode(&member)), &with_actor(&ctx, p)))
             }
             "org.close_assistant" => close_assistant(state, &ctx, p),
+            "org.promote" => promote(state, &ctx, p),
             other => Err((ErrorCode::UnknownMethod, format!("unknown org method {other}"))),
         }
     });
@@ -287,6 +289,112 @@ pub(crate) fn hand_back_after_kill(state: &Arc<Mutex<DaemonState>>, req: &Reques
             eprintln!("cm org: holds of killed assistant {uid} not handed back: {e}");
         }
     });
+}
+
+/// `org.promote` (doc/org-model.md §4.2): one of a member's assistants on
+/// this daemon becomes the main session of a new member managed by that
+/// member. The planning API decides who may (the member's main session, a
+/// member up its manager chain, or Owner) and creates the member through
+/// the adopt/roster path. The session keeps its uid, context, checkout and
+/// holds. Then, here: the assistant stamp goes, the member cache learns the
+/// new main at once (so the backfill cannot re-stamp it before the next
+/// beat), its checkout becomes the member's `home`, and the session gets a
+/// native notice.
+fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>) -> RpcResult {
+    let uid = match take_str(&mut p, "session")? {
+        Some(uid) => uid,
+        None => take_str(&mut p, "session_uid")?.ok_or_else(|| bad("org.promote needs session"))?,
+    };
+    let handle = take_str(&mut p, "handle")?.ok_or_else(|| bad("org.promote needs handle"))?;
+    let reason = take_str(&mut p, "reason")?.ok_or_else(|| bad("org.promote needs reason"))?;
+    let boss = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(sess) = s.sessions.get(&uid) else {
+            return Err((ErrorCode::NotFound, format!("not_found: no live session '{uid}' on this daemon")));
+        };
+        if !matches!(sess.session_type.as_str(), "claude-code" | "codex") {
+            return Err((ErrorCode::Conflict, format!(
+                "not_an_agent: '{uid}' is a {} session; only agent sessions become members", sess.session_type)));
+        }
+        if sess.continuous_task_id.is_some() {
+            return Err((ErrorCode::Conflict, format!(
+                "continuous: '{uid}' is a continuous orchestrator; its scheduler owns it")));
+        }
+        match crate::assistants::of_session(sess) {
+            Some(m) if m.acting_as == crate::assistants::ASSISTANT => m.member_id,
+            Some(_) => {
+                return Err((ErrorCode::Conflict, format!("already_member: '{uid}' is already a member's main session")));
+            }
+            None => {
+                return Err((ErrorCode::Conflict, format!("not_an_assistant: '{uid}' is not an assistant of a member")));
+            }
+        }
+    };
+    let pid = format!("agent:{}:{uid}", ctx.daemon_id);
+    let mut body = Map::new();
+    body.insert("pid".into(), json!(pid));
+    body.insert("handle".into(), json!(handle));
+    body.insert("reason".into(), json!(reason));
+    for key in ["title", "team", "manager", "request_id"] {
+        if let Some(v) = p.get(key).filter(|v| !v.is_null()) {
+            body.insert(key.into(), v.clone());
+        }
+    }
+    let reply = api(ctx.api.post("/org/assistants/promote", &with_actor(ctx, body)))?;
+    let member = reply["member"].clone();
+    let member_id = member["id"].as_str().unwrap_or_default().to_string();
+    let (root, ws_marked) = {
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        note_main(&uid, &member);
+        let ws_id = match s.sessions.get_mut(&uid) {
+            Some(sess) => {
+                crate::assistants::unstamp(&mut sess.org);
+                Some(sess.workspace_id.clone())
+            }
+            None => None,
+        };
+        // The checkout is the new member's home now (the central mark says
+        // the same and is acked on the next beat).
+        let marked = ws_id.and_then(|w| s.workspaces.get_mut(&w)).map(|ws| {
+            use cm_holder_proto::org as bridge;
+            bridge::set(&mut ws.org, bridge::WORKSPACE_KIND, json!("home"));
+            bridge::set(&mut ws.org, OFFICE_OF, json!(member_id));
+            if let Some(o) = ws.org.as_mut() {
+                o.remove("stream_of");
+            }
+        }).is_some();
+        s.persist_sessions_best_effort();
+        (s.messaging_root.clone(), marked)
+    };
+    save_cache(&root);
+    let manager = reply["member"]["manager_handle"].as_str().unwrap_or("owner").to_string();
+    let marker = "[cm-org]";
+    let text = format!(
+        "{marker} You are now member {handle} (main session), reporting to {manager}. Promoted by {} \
+         ({reason}). You keep this conversation, checkout and your board holds; this checkout is \
+         your home workspace. Agents you spawn from now on are your assistants. org(view=\"me\") shows it.",
+        if ctx.owner { "Owner".to_string() } else { ctx.name.clone() });
+    let noticed = crate::notifications::publish(&root, &uid, &format!("org-promoted:{member_id}"), "cm", &text, marker)
+        .map_err(|e| eprintln!("cm org: promote notice to {uid}: {e}"))
+        .is_ok();
+    let mut out = reply;
+    out["session_uid"] = json!(uid);
+    out["was_assistant_of"] = json!(boss);
+    out["home_marked_here"] = json!(ws_marked);
+    out["noticed"] = json!(noticed);
+    Ok(out)
+}
+
+/// Record `uid` as `member`'s main session in the member cache before the
+/// next beat confirms it (a promote on this daemon).
+pub(crate) fn note_main(uid: &str, member: &Value) {
+    let mut entry = member.clone();
+    if !entry.is_object() {
+        return;
+    }
+    entry["acting_as"] = json!("main");
+    let mut c = cache().lock().unwrap_or_else(|p| p.into_inner());
+    c.by_uid.insert(uid.to_string(), entry);
 }
 
 /// `org.adopt`: Owner binds a live session to a new member. The TUI may

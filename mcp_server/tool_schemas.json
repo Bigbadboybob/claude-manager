@@ -1449,6 +1449,9 @@
     "division": {
      "type": "string"
     },
+    "handle": {
+     "type": "string"
+    },
     "manager": {
      "type": "string"
     },
@@ -1461,6 +1464,9 @@
     "request_id": {
      "type": "string"
     },
+    "session": {
+     "type": "string"
+    },
     "session_uid": {
      "type": "string"
     },
@@ -1468,6 +1474,9 @@
      "type": "string"
     },
     "team": {
+     "type": "string"
+    },
+    "title": {
      "type": "string"
     },
     "view": {

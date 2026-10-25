@@ -902,7 +902,7 @@ pub fn dispatch_request(
         // adoption, proxied like items. Roster and adoption are Owner's.
         "org.snapshot" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
         | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
-        | "org.reinstate" | "org.close_assistant" => {
+        | "org.reinstate" | "org.close_assistant" | "org.promote" => {
             DispatchOutcome::Done(crate::items::org::dispatch(state, req))
         }
         // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.
@@ -1769,13 +1769,15 @@ pub(crate) fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
     // `org(action="close_assistant", session_uid, reason)` (O5) is the
     // `org.close_assistant` RPC for any caller; the planning API checks who
     // may close it.
-    if req.params["action"] == "close_assistant" {
-        let mut close = req.clone();
-        close.method = "org.close_assistant".into();
-        if let Some(obj) = close.params.as_object_mut() {
+    // `org(action="promote", session, handle, title?, team?, manager?, reason)`
+    // (§4.2) likewise: the API decides who may promote whose assistant.
+    if let Some(verb @ ("close_assistant" | "promote")) = req.params["action"].as_str() {
+        let mut fwd = req.clone();
+        fwd.method = format!("org.{verb}");
+        if let Some(obj) = fwd.params.as_object_mut() {
             obj.remove("action");
         }
-        return crate::items::org::dispatch(state, &close);
+        return crate::items::org::dispatch(state, &fwd);
     }
     let caller_uid: Option<String> = match &req.caller {
         Caller::Operator(_) => None,

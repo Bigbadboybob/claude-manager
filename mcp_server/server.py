@@ -1548,6 +1548,9 @@ def org(
     manager: str | None = None,
     reason: str | None = None,
     request_id: str | None = None,
+    session: str | None = None,
+    handle: str | None = None,
+    title: str | None = None,
 ) -> dict:
     """Find your place in the org: your boss, your reports, your division.
 
@@ -1619,17 +1622,30 @@ def org(
         manager chain, or Owner. Its board holds go back to the member's
         main session; its own checkout then goes through the reaper's usual
         protections.
+      - `action="promote", session=<uid>, handle=..., title=None, team=None,
+        manager=None, reason=...`: the assistant becomes the main session of
+        a new member `handle` reporting to its member (or to `manager`: you
+        or a member below you, else `needs_owner`; `team` only one you
+        lead). It keeps its uid, conversation, checkout (now the new
+        member's home) and board holds, and gets a notice. Allowed for the
+        member's main session, a member up its manager chain, or Owner.
+        Refused for shells (`not_an_agent`), members' sessions
+        (`already_member`), continuous orchestrators (`continuous`) and
+        non-assistants (`not_an_assistant`); a taken handle is
+        `handle_taken`. The session must be on this host.
 
-    Adopting a session as a member (`action="adopt"`) and approving the
-    roster are Owner's, from the TUI; an agent's call is refused.
+    Adopting a session that is no member's assistant (`action="adopt"`) and
+    approving the roster are Owner's, from the TUI; an agent's call is
+    refused.
     """
-    if action in ("move", "retire", "reinstate", "close_assistant") and request_id is None:
+    if action in ("move", "retire", "reinstate", "close_assistant", "promote") and request_id is None:
         request_id = f"org-{action}-{uuid.uuid4()}"
     params = {key: value for key, value in {
         "view": view, "action": action, "task_id": task_id,
         "division": division, "session_uid": session_uid,
         "member": member, "team": team, "manager": manager,
-        "reason": reason, "request_id": request_id,
+        "reason": reason, "request_id": request_id, "session": session,
+        "handle": handle, "title": title,
     }.items() if value is not None}
     route = control_client.resolve_socket_route()
     if not route.chose_daemon:

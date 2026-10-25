@@ -603,3 +603,82 @@ fn shells_survive_the_sweeps_and_keep_their_checkout() {
     drop(st);
     kill_all(&state);
 }
+
+// ---- org.promote ---------------------------------------------------------
+
+fn promote(state: &Arc<Mutex<DaemonState>>, caller: Caller, uid: &str) -> crate::control::protocol::Response {
+    // Through the `org` MCP tool's route, as an agent calls it.
+    crate::control::dispatch::dispatch_org(state, &Request {
+        id: "t".into(),
+        caller,
+        method: "org".into(),
+        params: json!({"action": "promote", "session": uid, "handle": "asst", "title": "Asst",
+                       "team": "swarm", "reason": "owns the parser", "request_id": "p1"}),
+    })
+}
+
+#[test]
+fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    members(&[("ca-main", "mem_ep")]);
+    let root = tempfile::tempdir().unwrap();
+    let (url, seen) = crate::items::org::test_stub(|method, path, body| match (method, path) {
+        ("POST", "/org/assistants/promote") => (200, json!({
+            "member": {"id": "mem_new", "handle": body["handle"], "manager_member_id": "mem_ep",
+                       "manager_handle": "ep"},
+            "promoted_from": "mem_ep", "notes": [], "home_mark": {"state": "pending"}, "version": 9,
+        }).to_string()),
+        _ => (500, "{}".into()),
+    });
+    let state = rpc_state(&url, root.path());
+    {
+        let mut st = state.lock().unwrap();
+        let mut shell = session("ca-shell", Some("t-sub"), Some("ca-main"), "ws-asst");
+        shell.session_type = "bash".into();
+        stamp(&mut shell.org, "mem_ep", "spawn:ca-main");
+        st.sessions.insert("ca-shell".into(), shell);
+        let mut cont = session("ca-cont", None, Some("ca-main"), "ws-cont");
+        cont.continuous_task_id = Some("x".into());
+        stamp(&mut cont.org, "mem_ep", "spawn:ca-main");
+        st.sessions.insert("ca-cont".into(), cont);
+    }
+    // Refused here before the API is asked.
+    for (uid, code) in [("ca-shell", "not_an_agent"), ("ca-main", "already_member"),
+                        ("ca-plain", "not_an_assistant"), ("ca-cont", "continuous")] {
+        let err = promote(&state, Caller::session("ca-main"), uid).error.unwrap();
+        assert!(matches!(err.code, ErrorCode::Conflict) && err.message.starts_with(code), "{uid}: {err:?}");
+    }
+    assert!(seen.lock().unwrap().is_empty(), "local refusals never reach the API");
+
+    let resp = promote(&state, Caller::session("ca-main"), "ca-asst");
+    assert!(resp.ok, "{:?}", resp.error);
+    let out = resp.result.unwrap();
+    assert_eq!((out["was_assistant_of"].as_str(), out["noticed"].as_bool()), (Some("mem_ep"), Some(true)));
+    {
+        let mut st = state.lock().unwrap();
+        assert_eq!(main_member("ca-asst").as_deref(), Some("mem_new"), "the cache knows before the next beat");
+        assert_eq!(stamped_member(st.sessions["ca-asst"].org.as_ref()), None);
+        assert_eq!(of_session(&st.sessions["ca-asst"]).map(|m| m.acting_as), Some(MAIN));
+        let ws = st.workspaces["ws-asst"].org.clone().unwrap();
+        assert_eq!((ws.get("workspace_kind"), ws.get(crate::items::org::OFFICE_OF)),
+                   (Some(&json!("home")), Some(&json!("mem_new"))));
+        assert!(!ws.contains_key("stream_of"));
+        // The backfill does not turn it back into an assistant.
+        assert!(!backfill(&mut st).contains(&"ca-asst".to_string()));
+        assert_eq!(stamped_member(st.sessions["ca-asst"].org.as_ref()), None);
+    }
+    let notice = crate::notifications::get(root.path(), "ca-asst", "org-promoted:mem_new").unwrap().unwrap();
+    let text = notice.to_string();
+    assert!(text.contains("member asst") && text.contains("reporting to ep"), "{text}");
+    let seen = seen.lock().unwrap();
+    let (_, _, body) = seen.iter().find(|(m, _, _)| m == "POST").unwrap();
+    assert!(body["pid"].as_str().unwrap().ends_with(":ca-asst"));
+    assert!(body["actor"]["pid"].as_str().unwrap().ends_with(":ca-main"));
+    assert_eq!((&body["handle"], &body["title"], &body["team"], &body["request_id"]),
+               (&json!("asst"), &json!("Asst"), &json!("swarm"), &json!("p1")));
+    assert!(body.get("session").is_none() && body.get("action").is_none());
+    drop(seen);
+    kill_all(&state);
+    crate::items::org::reset_cache_for_test();
+}

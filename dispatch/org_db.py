@@ -1196,6 +1196,18 @@ async def _require_chain(conn, actor: dict, member_id: str, what: str, *,
     return actor_member
 
 
+async def _require_destination(conn, actor_member: str | None, manager_id: str, what: str) -> None:
+    """A non-Owner may place a member only under itself or a member of its
+    own reporting subtree; anywhere else (another lead's branch, Owner) is
+    Owner's call until an accept step exists. Shared by move and promote."""
+    if actor_member is None or manager_id == actor_member:
+        return
+    if actor_member not in [m["id"] for m in await _chain(conn, manager_id)]:
+        raise _err(403, "needs_owner",
+                   f"a lead may {what} only under itself or a member of its own subtree; "
+                   "anywhere else is Owner's call")
+
+
 async def _main_pid(conn, member_id: str | None) -> str | None:
     """The member's current main session's pid, if it has one."""
     if not member_id:
@@ -1327,6 +1339,83 @@ async def close_assistant(pool, actor: dict, *, pid: str, member_id: str, reason
         return response
 
 
+async def promote(pool, actor: dict, *, pid: str, handle: str, title: str | None = None,
+                  team=None, manager: str | None = None, reason: str,
+                  request_id: str | None = None) -> dict:
+    """Promote a member's assistant to a new member (doc/org-model.md §4.2):
+    the session becomes the main session of a new member managed by the
+    assistant's member M, keeping its session, uid, context, checkout and
+    holds; its checkout becomes the new member's `home`.
+
+    Allowed for M's main session, a member up M's manager chain acting as its
+    main, or Owner (`_require_chain(..., self_ok=True)`). `manager` defaults
+    to M; a non-Owner may name only itself or a member of its own subtree
+    (`needs_owner`, as for move), and may set `team` only on a team it leads.
+    Refused: a session that is not an agent (`not_an_agent`), already a
+    member's session (`already_member`), a continuous orchestrator
+    (`continuous`), or not an assistant (`not_an_assistant`). The member is
+    created by `_create_member`, the path adopt and the roster use."""
+    if not reason or not str(reason).strip():
+        raise _err(422, "invalid_field", "promoting an assistant needs a reason")
+
+    async def body(conn):
+        facts = await conn.fetchrow(
+            """SELECT s.daemon_id, s.session_uid, s.engine, f.workspace_id, f.worktree_path,
+                      f.continuous_task_id, f.member_id, f.acting_as
+                 FROM session_states s LEFT JOIN org_session_facts f ON f.pid = s.pid
+                WHERE s.pid = $1 AND s.exited_at IS NULL AND s.state <> 'exited'""", pid)
+        if facts is None:
+            raise _err(404, "not_found", f"{pid} is not a live session")
+        if facts["engine"] not in (None, "claude-code", "claude", "codex"):
+            raise _err(409, "not_an_agent", f"{pid} is a {facts['engine']} session, not an agent")
+        holder = await conn.fetchval(
+            """SELECT m.handle FROM incarnations i JOIN members m ON m.id = i.member_id
+                WHERE i.pid = $1 AND i.ended_at IS NULL""", pid)
+        if holder:
+            raise _err(409, "already_member", f"{pid} is already {holder}'s main session")
+        if facts["continuous_task_id"]:
+            raise _err(409, "continuous", f"{pid} is a continuous orchestrator; its scheduler owns it")
+        boss = facts["member_id"] if facts["acting_as"] == "assistant" else None
+        boss_row = await conn.fetchrow("SELECT id, status FROM members WHERE id = $1", boss) if boss else None
+        if boss_row is None or boss_row["status"] == "retired":
+            raise _err(409, "not_an_assistant", f"{pid} is not an assistant of a member")
+        actor_member = await _require_chain(conn, actor, boss, "promote an assistant of", self_ok=True)
+        manager_id = boss
+        if manager is not None:
+            manager_id = await _resolve_member_id(conn, manager)
+            if not manager_id:
+                raise _err(422, "unknown_manager", f"no member {manager!r}")
+            await _require_destination(conn, actor_member, manager_id, "place a promoted member")
+        team_id = None
+        if team is not None and str(team).strip():
+            try:
+                team_row = await _team_row(conn, team)
+            except OrgError:
+                raise _err(422, "unknown_team", f"no team {team}") from None
+            if actor_member is not None and team_row["lead_member_id"] != actor_member:
+                raise _err(403, "needs_owner", "a lead may give a promoted member only a team it leads")
+            team_id = str(team_row["id"])
+        home = _home_of({**dict(facts), "pid": pid})
+        member_id, notes = await _create_member(
+            conn, actor, handle=handle, kind="agent", title=title, manager_ref=manager_id,
+            team_id=team_id, pid=pid, home=home, source="promote", request_id=request_id,
+            reason=reason)
+        # No longer an assistant: sticky, so a stale beat cannot restore it.
+        await conn.execute(
+            "UPDATE org_session_facts SET acting_as = 'promoted' WHERE pid = $1", pid)
+        await _event(conn, "member", boss, "assistant_promoted", actor,
+                     prev={"assistant": pid}, new={"member_id": member_id, "handle": handle},
+                     reason=reason, request_id=request_id)
+        detail = await _detail(conn, member_id)
+        home_mark = detail["member"]["home_workspace"]
+        return {"member": detail["member"], "promoted_from": boss, "notes": notes,
+                "home_mark": {"state": home_mark["state"]} if home_mark else None}
+
+    response = await _member_write(pool, actor, request_id, "promote", body)
+    async with pool.acquire() as conn:
+        return {**response, "version": await version(conn)}
+
+
 async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primary_team_id=None,
                fields: set[str], expected_revision: int | None = None,
                request_id: str | None = None) -> dict:
@@ -1357,13 +1446,7 @@ async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primar
                     manager_id = await _resolve_member_id(conn, manager)
                     if not manager_id:
                         raise _err(422, "unknown_manager", f"no member {manager!r}")
-                    # A lead moves reports only within its own subtree; any
-                    # other destination is Owner's until an accept step exists.
-                    if actor_member is not None and manager_id != actor_member and actor_member not in [
-                            m["id"] for m in await _chain(conn, manager_id)]:
-                        raise _err(403, "needs_owner",
-                                   "a lead may move a report only under itself or a member of its "
-                                   "own subtree; moving it elsewhere is Owner's call")
+                    await _require_destination(conn, actor_member, manager_id, "move a report")
                     prev["manager_member_id"], new["manager_member_id"] = row["manager_member_id"], manager_id
                 if "primary_team_id" in fields:
                     team = None
@@ -1710,8 +1793,8 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                                CASE WHEN $9::text IS NULL THEN NULL ELSE $10 END, $11)
                        ON CONFLICT (pid) DO UPDATE SET
                            member_id = coalesce(EXCLUDED.member_id, org_session_facts.member_id),
-                           acting_as = CASE WHEN org_session_facts.acting_as = 'closed'
-                                            THEN 'closed'
+                           acting_as = CASE WHEN org_session_facts.acting_as IN ('closed', 'promoted')
+                                            THEN org_session_facts.acting_as
                                             ELSE coalesce(EXCLUDED.acting_as, org_session_facts.acting_as) END,
                            session_uid = EXCLUDED.session_uid, workspace_id = EXCLUDED.workspace_id,
                            worktree_path = EXCLUDED.worktree_path,

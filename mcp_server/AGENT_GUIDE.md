@@ -139,6 +139,10 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   one on purpose with `org(action="close_assistant", session_uid=...,
   reason=...)` (its member's main session, the member's manager chain or
   Owner) or `kill_session`; either way its holds go back to the member.
+  A long-lived assistant can be promoted to its own member with
+  `org(action="promote", session=..., handle=..., reason=...)` (same
+  authority; it keeps its session, context, checkout and holds, reports to
+  that member, and gets a notice).
 
 ## Orchestrating other sessions
 
